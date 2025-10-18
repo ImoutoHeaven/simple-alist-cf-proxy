@@ -13,6 +13,15 @@ function isIPv6(ip) {
   return ip && ip.includes(':');
 }
 
+function base64Encode(input) {
+  const bytes = new TextEncoder().encode(input);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
 // src/verify.ts
 const verify = async (data, _sign) => {
   const signSlice = _sign.split(":");
@@ -50,6 +59,24 @@ const hmacSha256Sign = async (data, expire) => {
   );
   return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_") + ":" + expire;
 };
+
+function createUnauthorizedResponse(origin, message) {
+  const safeHeaders = new Headers();
+  safeHeaders.set("content-type", "application/json;charset=UTF-8");
+  safeHeaders.set("Access-Control-Allow-Origin", origin);
+  safeHeaders.append("Vary", "Origin");
+
+  return new Response(
+    JSON.stringify({
+      code: 401,
+      message
+    }),
+    {
+      status: 401,
+      headers: safeHeaders
+    }
+  );
+}
 // src/handleDownload.ts
 async function handleDownload(request) {
   const origin = request.headers.get("origin") ?? "*";
@@ -58,22 +85,13 @@ async function handleDownload(request) {
   const sign = url.searchParams.get("sign") ?? "";
   const verifyResult = await verify(path, sign);
   if (verifyResult !== "") {
-    const safeHeaders = new Headers();
-    safeHeaders.set("content-type", "application/json;charset=UTF-8");
-    safeHeaders.set("Access-Control-Allow-Origin", origin);
-    safeHeaders.append("Vary", "Origin");
-    
-    const resp2 = new Response(
-      JSON.stringify({
-        code: 401,
-        message: verifyResult
-      }),
-      {
-        status: 401,
-        headers: safeHeaders
-      }
-    );
-    return resp2;
+    return createUnauthorizedResponse(origin, verifyResult);
+  }
+  const hashSign = url.searchParams.get("hashSign") ?? "";
+  const base64Path = base64Encode(path);
+  const hashVerifyResult = await verify(base64Path, hashSign);
+  if (hashVerifyResult !== "") {
+    return createUnauthorizedResponse(origin, hashVerifyResult);
   }
   
   // 发送请求到AList服务
