@@ -1,7 +1,7 @@
 // src/const.ts
-var ADDRESS = "YOUR_ADDRESS";
+var ADDRESS = "https://YOUR_ADDRESS";
 var TOKEN = "YOUR_TOKEN";
-var WORKER_ADDRESS = "YOUR_WORKER_ADDRESS";
+var WORKER_ADDRESS = "https://YOUR_WORKER_ADDRESS";
 var verifyHeader = "YOUR_HEADER";
 var verifySecret = "YOUR_HEADER_SECRET";
 var SIGN_CHECK = true; // Toggle ?sign= verification
@@ -26,21 +26,24 @@ function base64Encode(input) {
 }
 
 // src/verify.ts
-const verify = async (data, _sign) => {
+const verify = async (label, data, _sign) => {
+  if (!_sign) {
+    return `${label} missing`;
+  }
   const signSlice = _sign.split(":");
   if (!signSlice[signSlice.length - 1]) {
-    return "expire missing";
+    return `${label} expire missing`;
   }
   const expire = parseInt(signSlice[signSlice.length - 1]);
   if (isNaN(expire)) {
-    return "expire invalid";
+    return `${label} expire invalid`;
   }
   if (expire < Date.now() / 1e3 && expire > 0) {
-    return "expire expired";
+    return `${label} expired`;
   }
   const right = await hmacSha256Sign(data, expire);
   if (_sign !== right) {
-    return "sign mismatch";
+    return `${label} mismatch`;
   }
   return "";
 };
@@ -63,7 +66,7 @@ const hmacSha256Sign = async (data, expire) => {
   return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_") + ":" + expire;
 };
 
-function createUnauthorizedResponse(origin, message) {
+function createErrorResponse(origin, status, message) {
   const safeHeaders = new Headers();
   safeHeaders.set("content-type", "application/json;charset=UTF-8");
   safeHeaders.set("Access-Control-Allow-Origin", origin);
@@ -71,23 +74,38 @@ function createUnauthorizedResponse(origin, message) {
 
   return new Response(
     JSON.stringify({
-      code: 401,
+      code: status,
       message
     }),
     {
-      status: 401,
+      status,
       headers: safeHeaders
     }
   );
+}
+
+function createUnauthorizedResponse(origin, message) {
+  return createErrorResponse(origin, 401, message);
+}
+
+function safeDecodePathname(pathname) {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
 }
 // src/handleDownload.ts
 async function handleDownload(request) {
   const origin = request.headers.get("origin") ?? "*";
   const url = new URL(request.url);
-  const path = decodeURIComponent(url.pathname);
+  const path = safeDecodePathname(url.pathname);
+  if (path === null) {
+    return createErrorResponse(origin, 400, "invalid path encoding");
+  }
   const sign = url.searchParams.get("sign") ?? "";
   if (SIGN_CHECK) {
-    const verifyResult = await verify(path, sign);
+    const verifyResult = await verify("sign", path, sign);
     if (verifyResult !== "") {
       return createUnauthorizedResponse(origin, verifyResult);
     }
@@ -95,7 +113,7 @@ async function handleDownload(request) {
   const hashSign = url.searchParams.get("hashSign") ?? "";
   if (HASH_CHECK) {
     const base64Path = base64Encode(path);
-    const hashVerifyResult = await verify(base64Path, hashSign);
+    const hashVerifyResult = await verify("hashSign", base64Path, hashSign);
     if (hashVerifyResult !== "") {
       return createUnauthorizedResponse(origin, hashVerifyResult);
     }
@@ -109,7 +127,7 @@ async function handleDownload(request) {
     if (!clientIP) {
       return createUnauthorizedResponse(origin, "client ip missing");
     }
-    const ipVerifyResult = await verify(clientIP, ipSign);
+    const ipVerifyResult = await verify("ipSign", clientIP, ipSign);
     if (ipVerifyResult !== "") {
       return createUnauthorizedResponse(origin, ipVerifyResult);
     }
