@@ -4,6 +4,7 @@ var TOKEN = "YOUR_TOKEN";
 var WORKER_ADDRESS = "YOUR_WORKER_ADDRESS";
 var verifyHeader = "YOUR_HEADER";
 var verifySecret = "YOUR_HEADER_SECRET";
+var IP_CHECK = true; // Toggle ipSign verification
 
 // Add IPv4 only switch - set to true to block IPv6 access
 var IPV4_ONLY = true;  // Change to false to allow IPv6 access
@@ -93,9 +94,22 @@ async function handleDownload(request) {
   if (hashVerifyResult !== "") {
     return createUnauthorizedResponse(origin, hashVerifyResult);
   }
+  const clientIP = request.headers.get("CF-Connecting-IP") || "";
+  const ipSign = url.searchParams.get("ipSign") ?? "";
+  if (IP_CHECK) {
+    if (!ipSign) {
+      return createUnauthorizedResponse(origin, "ipSign missing");
+    }
+    if (!clientIP) {
+      return createUnauthorizedResponse(origin, "client ip missing");
+    }
+    const ipVerifyResult = await verify(clientIP, ipSign);
+    if (ipVerifyResult !== "") {
+      return createUnauthorizedResponse(origin, ipVerifyResult);
+    }
+  }
   
   // 发送请求到AList服务
-  const clientIP = request.headers.get("CF-Connecting-IP") || "";
   let resp = await fetch(`${ADDRESS}/api/fs/link`, {
     method: "POST",
     headers: {
