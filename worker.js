@@ -4,6 +4,8 @@ var TOKEN = "YOUR_TOKEN";
 var WORKER_ADDRESS = "YOUR_WORKER_ADDRESS";
 var verifyHeader = "YOUR_HEADER";
 var verifySecret = "YOUR_HEADER_SECRET";
+var SIGN_CHECK = true; // Toggle ?sign= verification
+var HASH_CHECK = true; // Toggle ?hashSign= verification
 var IP_CHECK = true; // Toggle ipSign verification
 
 // Add IPv4 only switch - set to true to block IPv6 access
@@ -84,15 +86,19 @@ async function handleDownload(request) {
   const url = new URL(request.url);
   const path = decodeURIComponent(url.pathname);
   const sign = url.searchParams.get("sign") ?? "";
-  const verifyResult = await verify(path, sign);
-  if (verifyResult !== "") {
-    return createUnauthorizedResponse(origin, verifyResult);
+  if (SIGN_CHECK) {
+    const verifyResult = await verify(path, sign);
+    if (verifyResult !== "") {
+      return createUnauthorizedResponse(origin, verifyResult);
+    }
   }
   const hashSign = url.searchParams.get("hashSign") ?? "";
-  const base64Path = base64Encode(path);
-  const hashVerifyResult = await verify(base64Path, hashSign);
-  if (hashVerifyResult !== "") {
-    return createUnauthorizedResponse(origin, hashVerifyResult);
+  if (HASH_CHECK) {
+    const base64Path = base64Encode(path);
+    const hashVerifyResult = await verify(base64Path, hashSign);
+    if (hashVerifyResult !== "") {
+      return createUnauthorizedResponse(origin, hashVerifyResult);
+    }
   }
   const clientIP = request.headers.get("CF-Connecting-IP") || "";
   const ipSign = url.searchParams.get("ipSign") ?? "";
