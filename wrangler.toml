@@ -1,0 +1,24 @@
+name = "simple-alist-cf-proxy"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Environment variables (configure these in Cloudflare Dashboard or use secrets)
+# [vars]
+# ADDRESS = "https://your-alist-server.com"
+# TOKEN = "your-hmac-token"
+# WORKER_ADDRESS = "https://your-worker.workers.dev"
+# VERIFY_HEADER = ""
+# VERIFY_SECRET = ""
+# SIGN_CHECK = "true"
+# HASH_CHECK = "true"
+# IP_CHECK = "true"
+# IPV4_ONLY = "true"
+# BLACKLIST_PREFIX = "/private,/admin"
+# BLACKLIST_ACTION = "block"
+# WHITELIST_PREFIX = "/public"
+# WHITELIST_ACTION = "skip-ip"
+
+# For local development, create a .dev.vars file with:
+# ADDRESS=https://your-alist-server.com
+# TOKEN=your-hmac-token
+# WORKER_ADDRESS=https://your-worker.workers.dev
