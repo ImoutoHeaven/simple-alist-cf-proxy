@@ -127,7 +127,8 @@ async function handleDownload(request) {
     if (!clientIP) {
       return createUnauthorizedResponse(origin, "client ip missing");
     }
-    const ipVerifyResult = await verify("ipSign", clientIP, ipSign);
+    const ipVerifyData = JSON.stringify({ path: path, ip: clientIP });
+    const ipVerifyResult = await verify("ipSign", ipVerifyData, ipSign);
     if (ipVerifyResult !== "") {
       return createUnauthorizedResponse(origin, ipVerifyResult);
     }
