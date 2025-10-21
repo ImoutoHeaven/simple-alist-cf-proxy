@@ -1,6 +1,6 @@
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
-const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-ip', 'asis']);
+const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-ip', 'asis']);
 
 // Utility: Parse boolean values from environment variables
 const parseBoolean = (value, defaultValue) => {
@@ -19,14 +19,37 @@ const parsePrefixList = (value) => {
   return value.split(',').map(p => p.trim()).filter(p => p.length > 0);
 };
 
-// Utility: Validate action value
-const validateAction = (action, paramName) => {
-  if (!action) return '';
-  const normalizedAction = String(action).trim().toLowerCase();
-  if (!VALID_ACTIONS.has(normalizedAction)) {
-    throw new Error(`${paramName} must be one of: ${Array.from(VALID_ACTIONS).join(', ')}`);
+// Utility: Validate action values (supports comma-separated list)
+const validateActions = (actions, paramName) => {
+  if (!actions) return [];
+
+  const actionList = String(actions)
+    .split(',')
+    .map(a => a.trim().toLowerCase())
+    .filter(a => a.length > 0);
+
+  // Validate each action
+  for (const action of actionList) {
+    if (!VALID_ACTIONS.has(action)) {
+      throw new Error(
+        `${paramName} contains invalid action '${action}'. Must be one of: ${Array.from(VALID_ACTIONS).join(', ')}`
+      );
+    }
   }
-  return normalizedAction;
+
+  // Validate combinations
+  const hasBlock = actionList.includes('block');
+  const hasAsis = actionList.includes('asis');
+
+  if (hasBlock && actionList.length > 1) {
+    throw new Error(`${paramName}: 'block' cannot be combined with other actions`);
+  }
+
+  if (hasAsis && actionList.length > 1) {
+    throw new Error(`${paramName}: 'asis' cannot be combined with other actions`);
+  }
+
+  return actionList;
 };
 
 // Ensure required environment variables are set
@@ -44,8 +67,8 @@ const resolveConfig = (env = {}) => {
 
   const blacklistPrefixes = parsePrefixList(env.BLACKLIST_PREFIX);
   const whitelistPrefixes = parsePrefixList(env.WHITELIST_PREFIX);
-  const blacklistAction = validateAction(env.BLACKLIST_ACTION, 'BLACKLIST_ACTION');
-  const whitelistAction = validateAction(env.WHITELIST_ACTION, 'WHITELIST_ACTION');
+  const blacklistActions = validateActions(env.BLACKLIST_ACTION, 'BLACKLIST_ACTION');
+  const whitelistActions = validateActions(env.WHITELIST_ACTION, 'WHITELIST_ACTION');
 
   return {
     address: String(env.ADDRESS).trim(),
@@ -55,12 +78,13 @@ const resolveConfig = (env = {}) => {
     verifySecret: env.VERIFY_SECRET ? String(env.VERIFY_SECRET).trim() : '',
     signCheck: parseBoolean(env.SIGN_CHECK, true),
     hashCheck: parseBoolean(env.HASH_CHECK, true),
+    workerCheck: parseBoolean(env.WORKER_CHECK, true),
     ipCheck: parseBoolean(env.IP_CHECK, true),
     ipv4Only: parseBoolean(env.IPV4_ONLY, true),
     blacklistPrefixes,
     whitelistPrefixes,
-    blacklistAction,
-    whitelistAction,
+    blacklistActions,
+    whitelistActions,
   };
 };
 
@@ -78,7 +102,7 @@ function base64Encode(input) {
   return btoa(binary);
 }
 
-// Check if a path matches blacklist or whitelist and return the action
+// Check if a path matches blacklist or whitelist and return the actions array
 const checkPathListAction = (path, config) => {
   let decodedPath;
   try {
@@ -89,25 +113,25 @@ const checkPathListAction = (path, config) => {
   }
 
   // Check blacklist first (higher priority)
-  if (config.blacklistPrefixes.length > 0 && config.blacklistAction) {
+  if (config.blacklistPrefixes.length > 0 && config.blacklistActions.length > 0) {
     for (const prefix of config.blacklistPrefixes) {
       if (decodedPath.startsWith(prefix)) {
-        return config.blacklistAction;
+        return config.blacklistActions;
       }
     }
   }
 
   // Check whitelist second
-  if (config.whitelistPrefixes.length > 0 && config.whitelistAction) {
+  if (config.whitelistPrefixes.length > 0 && config.whitelistActions.length > 0) {
     for (const prefix of config.whitelistPrefixes) {
       if (decodedPath.startsWith(prefix)) {
-        return config.whitelistAction;
+        return config.whitelistActions;
       }
     }
   }
 
   // No match
-  return null;
+  return [];
 };
 
 // src/verify.ts
@@ -190,32 +214,35 @@ async function handleDownload(request, config) {
   }
 
   // Check blacklist/whitelist
-  const action = checkPathListAction(path, config);
+  const actions = checkPathListAction(path, config);
 
   // Handle block action
-  if (action === 'block') {
+  if (actions.includes('block')) {
     return createErrorResponse(origin, 403, "access denied");
   }
 
-  // Determine which signature checks to perform based on action
+  // Initialize check flags from config (each *_CHECK only controls itself)
   let shouldCheckSign = config.signCheck;
   let shouldCheckHash = config.hashCheck;
+  let shouldCheckWorker = config.workerCheck;
   let shouldCheckIP = config.ipCheck;
 
-  if (action === 'skip-sign') {
-    // Skip all signature checks
-    shouldCheckSign = false;
-    shouldCheckHash = false;
-    shouldCheckIP = false;
-  } else if (action === 'skip-hash') {
-    // Only check sign, skip hashSign and ipSign
-    shouldCheckHash = false;
-    shouldCheckIP = false;
-  } else if (action === 'skip-ip') {
-    // Check sign and hashSign, skip ipSign only
-    shouldCheckIP = false;
+  // Apply action overrides (unless 'asis' is specified)
+  // Each skip-* only affects its own check, completely decoupled
+  if (!actions.includes('asis')) {
+    if (actions.includes('skip-sign')) {
+      shouldCheckSign = false;
+    }
+    if (actions.includes('skip-hash')) {
+      shouldCheckHash = false;
+    }
+    if (actions.includes('skip-worker')) {
+      shouldCheckWorker = false;
+    }
+    if (actions.includes('skip-ip')) {
+      shouldCheckIP = false;
+    }
   }
-  // action === 'asis' or null: use default config values
 
   // Sign verification
   const sign = url.searchParams.get("sign") ?? "";
@@ -233,6 +260,16 @@ async function handleDownload(request, config) {
     const hashVerifyResult = await verify("hashSign", base64Path, hashSign, config.token);
     if (hashVerifyResult !== "") {
       return createUnauthorizedResponse(origin, hashVerifyResult);
+    }
+  }
+
+  // WorkerSign verification
+  const workerSign = url.searchParams.get("workerSign") ?? "";
+  if (shouldCheckWorker) {
+    const workerVerifyData = JSON.stringify({ path: path, worker_addr: config.workerAddress });
+    const workerVerifyResult = await verify("workerSign", workerVerifyData, workerSign, config.token);
+    if (workerVerifyResult !== "") {
+      return createUnauthorizedResponse(origin, workerVerifyResult);
     }
   }
 
