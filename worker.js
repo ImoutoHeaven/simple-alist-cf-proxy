@@ -1,6 +1,7 @@
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
 const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-ip', 'asis']);
+const VALID_EXCEPT_ACTIONS = new Set(['block-except', 'skip-sign-except', 'skip-hash-except', 'skip-worker-except', 'skip-ip-except', 'asis-except']);
 
 // Utility: Parse boolean values from environment variables
 const parseBoolean = (value, defaultValue) => {
@@ -52,6 +53,47 @@ const validateActions = (actions, paramName) => {
   return actionList;
 };
 
+// Utility: Validate except action values (supports comma-separated list)
+const validateExceptActions = (actions, paramName) => {
+  if (!actions) return [];
+
+  const actionList = String(actions)
+    .split(',')
+    .map(a => a.trim().toLowerCase())
+    .filter(a => a.length > 0);
+
+  // Validate each action
+  for (const action of actionList) {
+    // Must end with -except
+    if (!action.endsWith('-except')) {
+      throw new Error(
+        `${paramName} contains invalid action '${action}'. All actions must use -except suffix (e.g., 'block-except', 'skip-sign-except')`
+      );
+    }
+
+    // Check if it's a valid except action
+    if (!VALID_EXCEPT_ACTIONS.has(action)) {
+      throw new Error(
+        `${paramName} contains invalid action '${action}'. Must be one of: ${Array.from(VALID_EXCEPT_ACTIONS).join(', ')}`
+      );
+    }
+  }
+
+  // Validate combinations (same rules as regular actions)
+  const hasBlock = actionList.includes('block-except');
+  const hasAsis = actionList.includes('asis-except');
+
+  if (hasBlock && actionList.length > 1) {
+    throw new Error(`${paramName}: 'block-except' cannot be combined with other actions`);
+  }
+
+  if (hasAsis && actionList.length > 1) {
+    throw new Error(`${paramName}: 'asis-except' cannot be combined with other actions`);
+  }
+
+  return actionList;
+};
+
 // Ensure required environment variables are set
 const ensureRequiredEnv = (env) => {
   REQUIRED_ENV.forEach((key) => {
@@ -67,8 +109,10 @@ const resolveConfig = (env = {}) => {
 
   const blacklistPrefixes = parsePrefixList(env.BLACKLIST_PREFIX);
   const whitelistPrefixes = parsePrefixList(env.WHITELIST_PREFIX);
+  const exceptPrefixes = parsePrefixList(env.EXCEPT_PREFIX);
   const blacklistActions = validateActions(env.BLACKLIST_ACTION, 'BLACKLIST_ACTION');
   const whitelistActions = validateActions(env.WHITELIST_ACTION, 'WHITELIST_ACTION');
+  const exceptActions = validateExceptActions(env.EXCEPT_ACTION, 'EXCEPT_ACTION');
 
   return {
     address: String(env.ADDRESS).trim(),
@@ -83,8 +127,10 @@ const resolveConfig = (env = {}) => {
     ipv4Only: parseBoolean(env.IPV4_ONLY, true),
     blacklistPrefixes,
     whitelistPrefixes,
+    exceptPrefixes,
     blacklistActions,
     whitelistActions,
+    exceptActions,
   };
 };
 
@@ -112,7 +158,7 @@ const checkPathListAction = (path, config) => {
     decodedPath = path;
   }
 
-  // Check blacklist first (higher priority)
+  // Check blacklist first (highest priority)
   if (config.blacklistPrefixes.length > 0 && config.blacklistActions.length > 0) {
     for (const prefix of config.blacklistPrefixes) {
       if (decodedPath.startsWith(prefix)) {
@@ -121,7 +167,7 @@ const checkPathListAction = (path, config) => {
     }
   }
 
-  // Check whitelist second
+  // Check whitelist second (second priority)
   if (config.whitelistPrefixes.length > 0 && config.whitelistActions.length > 0) {
     for (const prefix of config.whitelistPrefixes) {
       if (decodedPath.startsWith(prefix)) {
@@ -130,7 +176,25 @@ const checkPathListAction = (path, config) => {
     }
   }
 
-  // No match
+  // Check exception list third (third priority) - inverse matching logic
+  if (config.exceptPrefixes.length > 0 && config.exceptActions.length > 0) {
+    // Check if path matches any except prefix
+    let matchesExceptPrefix = false;
+    for (const prefix of config.exceptPrefixes) {
+      if (decodedPath.startsWith(prefix)) {
+        matchesExceptPrefix = true;
+        break;
+      }
+    }
+
+    // If path does NOT match except prefix, apply the actions (remove -except suffix)
+    if (!matchesExceptPrefix) {
+      return config.exceptActions.map(action => action.replace('-except', ''));
+    }
+    // If path matches except prefix, use default behavior (return empty array)
+  }
+
+  // No match - use default behavior
   return [];
 };
 
