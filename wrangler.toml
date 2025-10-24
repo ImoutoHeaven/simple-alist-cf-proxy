@@ -1,5 +1,5 @@
 name = "simple-alist-cf-proxy"
-main = "worker.js"
+main = "dist/worker.js"
 compatibility_date = "2024-01-01"
 
 # Environment variables (configure these in Cloudflare Dashboard or use secrets)
@@ -18,6 +18,52 @@ compatibility_date = "2024-01-01"
 # BLACKLIST_ACTION = "block"
 # WHITELIST_PREFIX = "/public"
 # WHITELIST_ACTION = "skip-ip"
+
+#
+# # Database Mode for Download Link Cache
+# # Options: "d1" (Cloudflare D1 Binding), "d1-rest" (Cloudflare D1 REST API), "custom-pg-rest" (Custom PostgreSQL + PostgREST)
+# # If not set, caching is completely disabled (always call AList API)
+# DB_MODE = ""
+#
+# # Link Cache TTL - how long to cache download links before re-fetching from AList
+# # Format: {number}{unit} where unit is h (hour), m (minute), s (second)
+# # Examples: "30m", "1h", "120s"
+# # Default: "30m" (1800 seconds)
+# LINK_TTL = "30m"
+#
+# # Cleanup Percentage - probability of triggering cache cleanup per request
+# # Range: 0-100 (supports decimals, e.g., "0.1" = 0.1% chance)
+# # Default: "1" (1% chance per request)
+# # Cleanup removes records older than LINK_TTL * 2
+# CLEANUP_PERCENTAGE = "1"
+#
+# # D1 (Cloudflare D1 Binding) Download Cache - requires DB_MODE="d1"
+# # Note: You must also configure d1_databases binding below
+# D1_DATABASE_BINDING = "DB"  # Optional, defaults to "DB"
+# D1_TABLE_NAME = "DOWNLOAD_CACHE_TABLE"  # Optional, defaults to DOWNLOAD_CACHE_TABLE
+#
+# # D1 REST API Download Cache - requires DB_MODE="d1-rest"
+# # Use this mode when you cannot use Workers binding (e.g., external API calls)
+# D1_ACCOUNT_ID = "your-cloudflare-account-id"
+# D1_DATABASE_ID = "your-d1-database-id"
+# D1_API_TOKEN = "your-cloudflare-api-token"
+# D1_TABLE_NAME = "DOWNLOAD_CACHE_TABLE"  # Optional, defaults to DOWNLOAD_CACHE_TABLE
+#
+# # Custom PostgreSQL + PostgREST Download Cache - requires DB_MODE="custom-pg-rest"
+# # Use this mode when you have self-hosted PostgreSQL with PostgREST REST API
+# # ⚠️ IMPORTANT: You MUST run init.sql on your PostgreSQL database first!
+# #   - Creates DOWNLOAD_CACHE_TABLE table
+# #   - Creates upsert_download_cache() stored procedure (required for atomic operations)
+# POSTGREST_URL = "https://your-domain.com/postgrest"  # PostgREST API endpoint (without table name)
+# POSTGREST_TABLE_NAME = "DOWNLOAD_CACHE_TABLE"  # Optional, defaults to DOWNLOAD_CACHE_TABLE
+# # Note: VERIFY_HEADER and VERIFY_SECRET (already defined above) are used for PostgREST authentication
+
+# D1 Database Binding (for DB_MODE="d1")
+# Uncomment and configure this section if using D1 binding mode
+# [[d1_databases]]
+# binding = "DB"  # Must match D1_DATABASE_BINDING env var (or use default "DB")
+# database_name = "alist-cache-db"
+# database_id = "your-d1-database-id"
 
 # For local development, create a .dev.vars file with:
 # ADDRESS=https://your-alist-server.com

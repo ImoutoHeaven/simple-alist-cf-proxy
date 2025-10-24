@@ -1,0 +1,26 @@
+{
+  "name": "simple-alist-cf-proxy",
+  "version": "1.0.0",
+  "description": "AList download proxy worker with signature verification and link caching",
+  "main": "src/worker.js",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "wrangler dev",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "alist",
+    "download",
+    "proxy"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "esbuild": "^0.23.0",
+    "wrangler": "^3.0.0"
+  }
+}

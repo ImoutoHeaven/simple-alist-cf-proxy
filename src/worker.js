@@ -1,18 +1,11 @@
+// Import cache manager and utilities
+import { createCacheManager } from './cache/factory.js';
+import { parseBoolean, parseNumber, parseWindowTime } from './utils.js';
+
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
 const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-ip', 'asis']);
 const VALID_EXCEPT_ACTIONS = new Set(['block-except', 'skip-sign-except', 'skip-hash-except', 'skip-worker-except', 'skip-ip-except', 'asis-except']);
-
-// Utility: Parse boolean values from environment variables
-const parseBoolean = (value, defaultValue) => {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') {
-    const normalized = value.toLowerCase().trim();
-    if (normalized === 'true' || normalized === '1') return true;
-    if (normalized === 'false' || normalized === '0') return false;
-  }
-  return defaultValue;
-};
 
 // Utility: Parse comma-separated prefix list
 const parsePrefixList = (value) => {
@@ -114,6 +107,87 @@ const resolveConfig = (env = {}) => {
   const whitelistActions = validateActions(env.WHITELIST_ACTION, 'WHITELIST_ACTION');
   const exceptActions = validateExceptActions(env.EXCEPT_ACTION, 'EXCEPT_ACTION');
 
+  // Parse database mode for download link cache
+  const dbMode = env.DB_MODE && typeof env.DB_MODE === 'string' ? env.DB_MODE.trim() : '';
+
+  // Parse cache configuration
+  const linkTTL = env.LINK_TTL && typeof env.LINK_TTL === 'string' ? env.LINK_TTL.trim() : '30m';
+  const linkTTLSeconds = parseWindowTime(linkTTL);
+  const cleanupPercentage = parseNumber(env.CLEANUP_PERCENTAGE, 1);
+  // Clamp between 0 and 100 (supports decimal percentages)
+  const validCleanupPercentage = Math.max(0, Math.min(100, cleanupPercentage));
+  // Convert to probability (0.0 to 1.0)
+  const cleanupProbability = validCleanupPercentage / 100;
+
+  // Parse database-specific configuration for cache
+  let cacheEnabled = false;
+  let cacheConfig = {};
+
+  if (dbMode) {
+    const normalizedDbMode = dbMode.toLowerCase();
+
+    if (normalizedDbMode === 'd1') {
+      // D1 (Cloudflare D1 Binding) configuration
+      const d1DatabaseBinding = env.D1_DATABASE_BINDING && typeof env.D1_DATABASE_BINDING === 'string' ? env.D1_DATABASE_BINDING.trim() : 'DB';
+      const d1TableName = env.D1_TABLE_NAME && typeof env.D1_TABLE_NAME === 'string' ? env.D1_TABLE_NAME.trim() : '';
+
+      if (d1DatabaseBinding && linkTTLSeconds > 0) {
+        cacheEnabled = true;
+        cacheConfig = {
+          env, // Pass env object so cache manager can access the binding
+          databaseBinding: d1DatabaseBinding,
+          tableName: d1TableName || 'DOWNLOAD_CACHE_TABLE',
+          linkTTL: linkTTLSeconds,
+          cleanupProbability,
+        };
+      } else {
+        throw new Error('DB_MODE is set to "d1" but LINK_TTL is missing or invalid');
+      }
+    } else if (normalizedDbMode === 'd1-rest') {
+      // D1 REST API configuration
+      const d1AccountId = env.D1_ACCOUNT_ID && typeof env.D1_ACCOUNT_ID === 'string' ? env.D1_ACCOUNT_ID.trim() : '';
+      const d1DatabaseId = env.D1_DATABASE_ID && typeof env.D1_DATABASE_ID === 'string' ? env.D1_DATABASE_ID.trim() : '';
+      const d1ApiToken = env.D1_API_TOKEN && typeof env.D1_API_TOKEN === 'string' ? env.D1_API_TOKEN.trim() : '';
+      const d1TableName = env.D1_TABLE_NAME && typeof env.D1_TABLE_NAME === 'string' ? env.D1_TABLE_NAME.trim() : '';
+
+      if (d1AccountId && d1DatabaseId && d1ApiToken && linkTTLSeconds > 0) {
+        cacheEnabled = true;
+        cacheConfig = {
+          accountId: d1AccountId,
+          databaseId: d1DatabaseId,
+          apiToken: d1ApiToken,
+          tableName: d1TableName || 'DOWNLOAD_CACHE_TABLE',
+          linkTTL: linkTTLSeconds,
+          cleanupProbability,
+        };
+      } else {
+        throw new Error('DB_MODE is set to "d1-rest" but required environment variables are missing: D1_ACCOUNT_ID, D1_DATABASE_ID, D1_API_TOKEN, LINK_TTL');
+      }
+    } else if (normalizedDbMode === 'custom-pg-rest') {
+      // Custom PostgreSQL REST API (PostgREST) configuration
+      const postgrestUrl = env.POSTGREST_URL && typeof env.POSTGREST_URL === 'string' ? env.POSTGREST_URL.trim() : '';
+      const postgrestTableName = env.POSTGREST_TABLE_NAME && typeof env.POSTGREST_TABLE_NAME === 'string' ? env.POSTGREST_TABLE_NAME.trim() : '';
+      const verifyHeader = env.VERIFY_HEADER && typeof env.VERIFY_HEADER === 'string' ? env.VERIFY_HEADER.trim() : '';
+      const verifySecret = env.VERIFY_SECRET && typeof env.VERIFY_SECRET === 'string' ? env.VERIFY_SECRET.trim() : '';
+
+      if (postgrestUrl && verifyHeader && verifySecret && linkTTLSeconds > 0) {
+        cacheEnabled = true;
+        cacheConfig = {
+          postgrestUrl,
+          verifyHeader,
+          verifySecret,
+          tableName: postgrestTableName || 'DOWNLOAD_CACHE_TABLE',
+          linkTTL: linkTTLSeconds,
+          cleanupProbability,
+        };
+      } else {
+        throw new Error('DB_MODE is set to "custom-pg-rest" but required environment variables are missing: POSTGREST_URL, VERIFY_HEADER, VERIFY_SECRET, LINK_TTL');
+      }
+    } else {
+      throw new Error(`Invalid DB_MODE: "${dbMode}". Valid options are: "d1", "d1-rest", "custom-pg-rest"`);
+    }
+  }
+
   return {
     address: String(env.ADDRESS).trim(),
     token: String(env.TOKEN).trim(),
@@ -131,6 +205,9 @@ const resolveConfig = (env = {}) => {
     blacklistActions,
     whitelistActions,
     exceptActions,
+    dbMode,
+    cacheEnabled,
+    cacheConfig,
   };
 };
 
@@ -269,7 +346,7 @@ function safeDecodePathname(pathname) {
   }
 }
 // src/handleDownload.ts
-async function handleDownload(request, config) {
+async function handleDownload(request, config, cacheManager, ctx) {
   const origin = request.headers.get("origin") ?? "*";
   const url = new URL(request.url);
   const path = safeDecodePathname(url.pathname);
@@ -353,70 +430,102 @@ async function handleDownload(request, config) {
       return createUnauthorizedResponse(origin, ipVerifyResult);
     }
   }
-  
-  // 发送请求到AList服务
-  const headers = {
-    "content-type": "application/json;charset=UTF-8",
-    Authorization: config.token,
-    "CF-Connecting-IP-WORKERS": clientIP, // Forward the client's IP address, since default CF-Connecting-IP will be overwritten by CF, we should include original CF-Connecting-IP and forward it into a new header.
-  };
-  if (config.verifyHeader && config.verifySecret) {
-    headers[config.verifyHeader] = config.verifySecret;
+
+  // Check cache (if enabled)
+  let res;
+  if (cacheManager) {
+    try {
+      const cached = await cacheManager.checkCache(path, { ...config.cacheConfig, ctx });
+      if (cached && cached.linkData) {
+        console.log(`[Cache] Hit for path: ${path}`);
+        // Use cached linkData, skip API call
+        res = { code: 200, data: cached.linkData };
+        // Skip to download logic below
+      }
+    } catch (error) {
+      // Cache failure should not block downloads, fall back to API call
+      console.error('[Cache] Check failed, fallback to API:', error instanceof Error ? error.message : String(error));
+    }
   }
-  let resp = await fetch(`${config.address}/api/fs/link`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      path
-    })
-  });
-  
-  // 检查响应类型
-  const contentType = resp.headers.get("content-type") || "";
-  
-  // 如果不是JSON格式，返回自定义错误响应
-  if (!contentType.includes("application/json")) {
-    // 获取原始响应的状态码
-    const originalStatus = resp.status;
-    // 创建一个简单的错误消息，不包含敏感信息
-    const safeErrorMessage = JSON.stringify({
-      code: originalStatus,
-      message: `Request failed with status: ${originalStatus}`
+
+  // If cache miss or not enabled, call AList API
+  if (!res) {
+    // 发送请求到AList服务
+    const headers = {
+      "content-type": "application/json;charset=UTF-8",
+      Authorization: config.token,
+      "CF-Connecting-IP-WORKERS": clientIP, // Forward the client's IP address, since default CF-Connecting-IP will be overwritten by CF, we should include original CF-Connecting-IP and forward it into a new header.
+    };
+    if (config.verifyHeader && config.verifySecret) {
+      headers[config.verifyHeader] = config.verifySecret;
+    }
+    let resp = await fetch(`${config.address}/api/fs/link`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        path
+      })
     });
-    
-    // 创建全新的headers对象，只添加必要的安全headers
-    const safeHeaders = new Headers();
-    safeHeaders.set("content-type", "application/json;charset=UTF-8");
-    safeHeaders.set("Access-Control-Allow-Origin", origin);
-    safeHeaders.append("Vary", "Origin");
-    
-    const safeErrorResp = new Response(safeErrorMessage, {
-      status: originalStatus,
-      statusText: "Error",  // 使用通用状态文本
-      headers: safeHeaders  // 使用安全的headers集合
-    });
-    
-    return safeErrorResp;
+
+    // 检查响应类型
+    const contentType = resp.headers.get("content-type") || "";
+
+    // 如果不是JSON格式，返回自定义错误响应
+    if (!contentType.includes("application/json")) {
+      // 获取原始响应的状态码
+      const originalStatus = resp.status;
+      // 创建一个简单的错误消息，不包含敏感信息
+      const safeErrorMessage = JSON.stringify({
+        code: originalStatus,
+        message: `Request failed with status: ${originalStatus}`
+      });
+
+      // 创建全新的headers对象，只添加必要的安全headers
+      const safeHeaders = new Headers();
+      safeHeaders.set("content-type", "application/json;charset=UTF-8");
+      safeHeaders.set("Access-Control-Allow-Origin", origin);
+      safeHeaders.append("Vary", "Origin");
+
+      const safeErrorResp = new Response(safeErrorMessage, {
+        status: originalStatus,
+        statusText: "Error",  // 使用通用状态文本
+        headers: safeHeaders  // 使用安全的headers集合
+      });
+
+      return safeErrorResp;
+    }
+
+    // 如果是JSON，按原来的逻辑处理
+    res = await resp.json();
+    if (res.code !== 200) {
+      // 将错误状态码也反映在HTTP响应中
+      const httpStatus = res.code >= 100 && res.code < 600 ? res.code : 500;
+
+      const safeHeaders = new Headers();
+      safeHeaders.set("content-type", "application/json;charset=UTF-8");
+      safeHeaders.set("Access-Control-Allow-Origin", origin);
+      safeHeaders.append("Vary", "Origin");
+
+      const errorResp = new Response(JSON.stringify(res), {
+        status: httpStatus,
+        headers: safeHeaders
+      });
+      return errorResp;
+    }
+
+    // API call successful, save to cache (if enabled)
+    if (cacheManager && res.data) {
+      try {
+        await cacheManager.saveCache(path, res.data, { ...config.cacheConfig, ctx });
+        console.log(`[Cache] Saved for path: ${path}`);
+      } catch (error) {
+        // Cache save failure should not block downloads
+        console.error('[Cache] Save failed:', error instanceof Error ? error.message : String(error));
+      }
+    }
   }
-  
-  // 如果是JSON，按原来的逻辑处理
-  let res = await resp.json();
-  if (res.code !== 200) {
-    // 将错误状态码也反映在HTTP响应中
-    const httpStatus = res.code >= 100 && res.code < 600 ? res.code : 500;
-    
-    const safeHeaders = new Headers();
-    safeHeaders.set("content-type", "application/json;charset=UTF-8");
-    safeHeaders.set("Access-Control-Allow-Origin", origin);
-    safeHeaders.append("Vary", "Origin");
-    
-    const errorResp = new Response(JSON.stringify(res), {
-      status: httpStatus,
-      headers: safeHeaders
-    });
-    return errorResp;
-  }
-  
+
+  // Use linkData from cache or API response
   request = new Request(res.data.url, request);
   if (res.data.header) {
     for (const k in res.data.header) {
@@ -432,7 +541,7 @@ async function handleDownload(request, config) {
     if (location) {
       if (location.startsWith(`${config.workerAddress}/`)) {
         request = new Request(location, request);
-        return await handleRequest(request, config);
+        return await handleRequest(request, config, cacheManager, ctx);
       } else {
         request = new Request(location, request);
         response = await fetch(request);
@@ -513,7 +622,7 @@ function handleOptions(request) {
 }
 
 // src/handleRequest.ts - Modified to check IPv6 addresses
-async function handleRequest(request, config) {
+async function handleRequest(request, config, cacheManager, ctx) {
   // Check for IPv6 access if IPv4_ONLY is enabled
   if (config.ipv4Only) {
     const clientIP = request.headers.get("CF-Connecting-IP") || "";
@@ -540,14 +649,16 @@ async function handleRequest(request, config) {
   if (request.method === "OPTIONS") {
     return handleOptions(request);
   }
-  return await handleDownload(request, config);
+  return await handleDownload(request, config, cacheManager, ctx);
 }
 // src/index.ts
 export default {
   async fetch(request, env, ctx) {
     try {
       const config = resolveConfig(env || {});
-      return await handleRequest(request, config);
+      // Create cache manager instance based on DB_MODE
+      const cacheManager = config.cacheEnabled ? createCacheManager(config.dbMode) : null;
+      return await handleRequest(request, config, cacheManager, ctx);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return createErrorResponse("*", 500, message);
