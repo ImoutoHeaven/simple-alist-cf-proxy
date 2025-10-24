@@ -18,6 +18,74 @@ compatibility_date = "2024-01-01"
 # BLACKLIST_ACTION = "block"
 # WHITELIST_PREFIX = "/public"
 # WHITELIST_ACTION = "skip-ip"
+# EXCEPT_PREFIX = "/api,/system"
+# EXCEPT_ACTION = "block-except"
+#
+# # ═══════════════════════════════════════════════════════════════
+# # Path Filtering System - Priority & Action Reference
+# # ═══════════════════════════════════════════════════════════════
+# #
+# # Priority Order (evaluated in this sequence):
+# # 1. BLACKLIST (highest priority) - matches prefix → apply actions
+# # 2. WHITELIST (second priority) - matches prefix → apply actions
+# # 3. EXCEPT (third priority) - does NOT match prefix → apply actions (inverse logic)
+# # 4. Default - no match → use global *_CHECK settings
+# #
+# # Available Actions (comma-separated, multiple allowed except for block/asis):
+# # ┌─────────────────┬──────────────────────────────────────────────────────┐
+# # │ Action          │ Description                                          │
+# # ├─────────────────┼──────────────────────────────────────────────────────┤
+# # │ block           │ Deny access (403). Cannot combine with other actions │
+# # │ skip-sign       │ Skip sign parameter verification                     │
+# # │ skip-hash       │ Skip hashSign parameter verification                 │
+# # │ skip-worker     │ Skip workerSign parameter verification               │
+# # │ skip-ip         │ Skip ipSign parameter verification                   │
+# # │ asis            │ Keep original behavior. Cannot combine with others   │
+# # └─────────────────┴──────────────────────────────────────────────────────┘
+# #
+# # Except Actions (must use -except suffix, inverse matching):
+# # ┌─────────────────┬──────────────────────────────────────────────────────┐
+# # │ Action          │ Description                                          │
+# # ├─────────────────┼──────────────────────────────────────────────────────┤
+# # │ block-except    │ Block paths NOT in EXCEPT_PREFIX                     │
+# # │ skip-sign-except│ Skip sign check for paths NOT in EXCEPT_PREFIX       │
+# # │ skip-hash-except│ Skip hash check for paths NOT in EXCEPT_PREFIX       │
+# # │ skip-worker-except│ Skip worker check for paths NOT in EXCEPT_PREFIX   │
+# # │ skip-ip-except  │ Skip IP check for paths NOT in EXCEPT_PREFIX         │
+# # │ asis-except     │ Use original behavior for paths NOT in EXCEPT_PREFIX │
+# # └─────────────────┴──────────────────────────────────────────────────────┘
+# #
+# # Examples:
+# #
+# # Example 1: Block private paths, allow public with reduced verification
+# #   BLACKLIST_PREFIX = "/private,/admin"
+# #   BLACKLIST_ACTION = "block"
+# #   WHITELIST_PREFIX = "/public"
+# #   WHITELIST_ACTION = "skip-ip,skip-worker"
+# #
+# # Example 2: Only allow specific paths, block everything else
+# #   EXCEPT_PREFIX = "/allowed,/safe"
+# #   EXCEPT_ACTION = "block-except"
+# #   # Paths matching /allowed or /safe → normal checks
+# #   # All other paths → blocked (403)
+# #
+# # Example 3: Skip IP check for all except sensitive paths
+# #   EXCEPT_PREFIX = "/sensitive,/private"
+# #   EXCEPT_ACTION = "skip-ip-except"
+# #   # Paths matching /sensitive or /private → IP check enabled
+# #   # All other paths → IP check skipped
+# #
+# # Example 4: Complex multi-level filtering
+# #   BLACKLIST_PREFIX = "/blocked"
+# #   BLACKLIST_ACTION = "block"
+# #   WHITELIST_PREFIX = "/media"
+# #   WHITELIST_ACTION = "skip-sign,skip-hash"
+# #   EXCEPT_PREFIX = "/api,/system"
+# #   EXCEPT_ACTION = "asis-except"
+# #   # Priority: /blocked → 403
+# #   #          /media → skip sign+hash checks
+# #   #          All except /api,/system → use original *_CHECK settings
+# #          /api,/system → default behavior
 
 #
 # # Database Mode for Download Link Cache
