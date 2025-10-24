@@ -1,6 +1,7 @@
 // Import cache manager and utilities
 import { createCacheManager } from './cache/factory.js';
-import { parseBoolean, parseNumber, parseWindowTime } from './utils.js';
+import { createThrottleManager } from './cache/throttle-factory.js';
+import { parseBoolean, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern } from './utils.js';
 
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
@@ -109,6 +110,7 @@ const resolveConfig = (env = {}) => {
 
   // Parse database mode for download link cache
   const dbMode = env.DB_MODE && typeof env.DB_MODE === 'string' ? env.DB_MODE.trim() : '';
+  const normalizedDbMode = dbMode ? dbMode.toLowerCase() : '';
 
   // Parse cache configuration
   const linkTTL = env.LINK_TTL && typeof env.LINK_TTL === 'string' ? env.LINK_TTL.trim() : '30m';
@@ -124,7 +126,6 @@ const resolveConfig = (env = {}) => {
   let cacheConfig = {};
 
   if (dbMode) {
-    const normalizedDbMode = dbMode.toLowerCase();
 
     if (normalizedDbMode === 'd1') {
       // D1 (Cloudflare D1 Binding) configuration
@@ -188,6 +189,59 @@ const resolveConfig = (env = {}) => {
     }
   }
 
+  // Parse throttle protection configuration
+  const throttleProtectHostname = env.THROTTLE_PROTECT_HOSTNAME && typeof env.THROTTLE_PROTECT_HOSTNAME === 'string' ? env.THROTTLE_PROTECT_HOSTNAME.trim() : '';
+  const throttleTimeWindow = env.THROTTLE_TIME_WINDOW && typeof env.THROTTLE_TIME_WINDOW === 'string' ? env.THROTTLE_TIME_WINDOW.trim() : '60s';
+  const throttleTimeWindowSeconds = parseWindowTime(throttleTimeWindow);
+
+  // Parse throttle hostname patterns (comma-separated, no spaces)
+  const throttleHostnamePatterns = throttleProtectHostname
+    ? throttleProtectHostname.split(',').map(p => p.trim()).filter(p => p.length > 0)
+    : [];
+
+  // Throttle protection enabled only if patterns are configured and DB mode is set
+  const throttleEnabled = throttleHostnamePatterns.length > 0 && dbMode && cacheEnabled;
+
+  // Throttle configuration
+  let throttleConfig = {};
+  if (throttleEnabled) {
+    // Use same database config as cache
+    if (normalizedDbMode === 'd1') {
+      const d1DatabaseBinding = env.D1_DATABASE_BINDING && typeof env.D1_DATABASE_BINDING === 'string' ? env.D1_DATABASE_BINDING.trim() : 'DB';
+      throttleConfig = {
+        env,
+        databaseBinding: d1DatabaseBinding,
+        tableName: 'THROTTLE_PROTECTION',
+        throttleTimeWindow: throttleTimeWindowSeconds,
+        cleanupProbability,
+      };
+    } else if (normalizedDbMode === 'd1-rest') {
+      const d1AccountId = env.D1_ACCOUNT_ID && typeof env.D1_ACCOUNT_ID === 'string' ? env.D1_ACCOUNT_ID.trim() : '';
+      const d1DatabaseId = env.D1_DATABASE_ID && typeof env.D1_DATABASE_ID === 'string' ? env.D1_DATABASE_ID.trim() : '';
+      const d1ApiToken = env.D1_API_TOKEN && typeof env.D1_API_TOKEN === 'string' ? env.D1_API_TOKEN.trim() : '';
+      throttleConfig = {
+        accountId: d1AccountId,
+        databaseId: d1DatabaseId,
+        apiToken: d1ApiToken,
+        tableName: 'THROTTLE_PROTECTION',
+        throttleTimeWindow: throttleTimeWindowSeconds,
+        cleanupProbability,
+      };
+    } else if (normalizedDbMode === 'custom-pg-rest') {
+      const postgrestUrl = env.POSTGREST_URL && typeof env.POSTGREST_URL === 'string' ? env.POSTGREST_URL.trim() : '';
+      const verifyHeader = env.VERIFY_HEADER && typeof env.VERIFY_HEADER === 'string' ? env.VERIFY_HEADER.trim() : '';
+      const verifySecret = env.VERIFY_SECRET && typeof env.VERIFY_SECRET === 'string' ? env.VERIFY_SECRET.trim() : '';
+      throttleConfig = {
+        postgrestUrl,
+        verifyHeader,
+        verifySecret,
+        tableName: 'THROTTLE_PROTECTION',
+        throttleTimeWindow: throttleTimeWindowSeconds,
+        cleanupProbability,
+      };
+    }
+  }
+
   return {
     address: String(env.ADDRESS).trim(),
     token: String(env.TOKEN).trim(),
@@ -208,6 +262,9 @@ const resolveConfig = (env = {}) => {
     dbMode,
     cacheEnabled,
     cacheConfig,
+    throttleEnabled,
+    throttleHostnamePatterns,
+    throttleConfig,
   };
 };
 
@@ -346,7 +403,7 @@ function safeDecodePathname(pathname) {
   }
 }
 // src/handleDownload.ts
-async function handleDownload(request, config, cacheManager, ctx) {
+async function handleDownload(request, config, cacheManager, throttleManager, ctx) {
   const origin = request.headers.get("origin") ?? "*";
   const url = new URL(request.url);
   const path = safeDecodePathname(url.pathname);
@@ -526,7 +583,71 @@ async function handleDownload(request, config, cacheManager, ctx) {
   }
 
   // Use linkData from cache or API response
-  request = new Request(res.data.url, request);
+  const downloadUrl = res.data.url;
+
+  // Throttle protection logic
+  let throttleStatus = null;
+  let throttleHostname = null;
+  let operationMode = 'normal_operation'; // 'normal_operation' or 'resume_operation'
+
+  if (config.throttleEnabled && throttleManager) {
+    try {
+      // Extract hostname from download URL
+      throttleHostname = extractHostname(downloadUrl);
+
+      if (throttleHostname) {
+        // Check if hostname matches any protection pattern
+        let hostnameMatched = false;
+        for (const pattern of config.throttleHostnamePatterns) {
+          if (matchHostnamePattern(throttleHostname, pattern)) {
+            hostnameMatched = true;
+            break;
+          }
+        }
+
+        if (hostnameMatched) {
+          // Check throttle protection status
+          throttleStatus = await throttleManager.checkThrottle(throttleHostname, { ...config.throttleConfig, ctx });
+
+          if (throttleStatus) {
+            if (throttleStatus.status === 'protected') {
+              // Still in protection window - return error without fetching
+              console.log(`[Throttle] Protected: ${throttleHostname}, returning error ${throttleStatus.errorCode}, retry after ${throttleStatus.retryAfter}s`);
+
+              const safeHeaders = new Headers();
+              safeHeaders.set("content-type", "application/json;charset=UTF-8");
+              safeHeaders.set("Access-Control-Allow-Origin", origin);
+              safeHeaders.append("Vary", "Origin");
+              safeHeaders.set("X-Throttle-Protected", "true");
+              safeHeaders.set("X-Throttle-Retry-After", String(throttleStatus.retryAfter));
+
+              return new Response(
+                JSON.stringify({
+                  code: throttleStatus.errorCode,
+                  message: `Service temporarily unavailable (throttle protected, retry after ${throttleStatus.retryAfter}s)`
+                }),
+                {
+                  status: throttleStatus.errorCode,
+                  headers: safeHeaders
+                }
+              );
+            } else if (throttleStatus.status === 'resume_operation') {
+              // Time window expired - resume operation (mark for potential state clear)
+              operationMode = 'resume_operation';
+              console.log(`[Throttle] Resume operation: ${throttleHostname}`);
+            }
+            // else: normal_operation (no protection)
+          }
+        }
+      }
+    } catch (error) {
+      // Throttle check failure should not block downloads
+      console.error('[Throttle] Check failed, proceeding with download:', error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  // Proceed with fetch
+  request = new Request(downloadUrl, request);
   if (res.data.header) {
     for (const k in res.data.header) {
       for (const v of res.data.header[k]) {
@@ -534,7 +655,7 @@ async function handleDownload(request, config, cacheManager, ctx) {
       }
     }
   }
-  
+
   let response = await fetch(request);
   while (response.status >= 300 && response.status < 400) {
     const location = response.headers.get("Location");
@@ -551,12 +672,83 @@ async function handleDownload(request, config, cacheManager, ctx) {
     }
   }
   
+  // Update throttle protection status based on fetch result
+  if (config.throttleEnabled && throttleManager && throttleHostname) {
+    try {
+      const statusCode = response.status;
+
+      if (statusCode >= 400 && statusCode < 600) {
+        // 4xx or 5xx error - set protection
+        console.log(`[Throttle] Error ${statusCode} from ${throttleHostname}, setting protection`);
+
+        const now = Math.floor(Date.now() / 1000);
+        // Don't await - async update (non-blocking)
+        const updatePromise = throttleManager.updateThrottle(
+          throttleHostname,
+          {
+            errorTimestamp: now,
+            isProtected: 1,
+            errorCode: statusCode,
+          },
+          { ...config.throttleConfig, ctx }
+        );
+
+        if (ctx && ctx.waitUntil) {
+          ctx.waitUntil(updatePromise);
+        }
+      } else if (statusCode >= 200 && statusCode < 400) {
+        // Success - check operation mode and record existence
+        if (operationMode === 'resume_operation') {
+          // Clear protection status (was protected, now recovered)
+          console.log(`[Throttle] Success from ${throttleHostname}, clearing protection (resume operation)`);
+
+          // Don't await - async update (non-blocking)
+          const updatePromise = throttleManager.updateThrottle(
+            throttleHostname,
+            {
+              errorTimestamp: null,
+              isProtected: null,
+              errorCode: null,
+            },
+            { ...config.throttleConfig, ctx }
+          );
+
+          if (ctx && ctx.waitUntil) {
+            ctx.waitUntil(updatePromise);
+          }
+        } else if (operationMode === 'normal_operation' && throttleStatus && !throttleStatus.recordExists) {
+          // First time accessing this hostname - create record with null protection
+          console.log(`[Throttle] Success from ${throttleHostname}, creating initial record (first time)`);
+
+          // Don't await - async update (non-blocking)
+          const updatePromise = throttleManager.updateThrottle(
+            throttleHostname,
+            {
+              errorTimestamp: null,
+              isProtected: null,
+              errorCode: null,
+            },
+            { ...config.throttleConfig, ctx }
+          );
+
+          if (ctx && ctx.waitUntil) {
+            ctx.waitUntil(updatePromise);
+          }
+        }
+        // else: normal_operation with existing record (recordExists=true) - skip write
+      }
+    } catch (error) {
+      // Throttle update failure should not block downloads
+      console.error('[Throttle] Update failed:', error instanceof Error ? error.message : String(error));
+    }
+  }
+
   // 创建仅包含安全必要headers的响应
   const safeHeaders = new Headers();
-  
+
   // 保留重要的内容相关headers
   const preserveHeaders = [
-  'content-type', 
+  'content-type',
   'content-disposition',
   'content-length',
   'cache-control',
@@ -567,10 +759,10 @@ async function handleDownload(request, config, cacheManager, ctx) {
   'content-language',  // Added for internationalization
   'expires',           // Added for cache control
   'pragma',            // Added for cache control
-  'etag',             
-  'last-modified'     
+  'etag',
+  'last-modified'
   ];
-  
+
   // 仅复制必要的headers
   preserveHeaders.forEach(header => {
     const value = response.headers.get(header);
@@ -578,18 +770,18 @@ async function handleDownload(request, config, cacheManager, ctx) {
       safeHeaders.set(header, value);
     }
   });
-  
+
   // 设置CORS headers
   safeHeaders.set("Access-Control-Allow-Origin", origin);
   safeHeaders.append("Vary", "Origin");
-  
+
   // 创建带有安全headers的新响应
   const safeResponse = new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
     headers: safeHeaders
   });
-  
+
   return safeResponse;
 }
 // src/handleOptions.ts
@@ -622,7 +814,7 @@ function handleOptions(request) {
 }
 
 // src/handleRequest.ts - Modified to check IPv6 addresses
-async function handleRequest(request, config, cacheManager, ctx) {
+async function handleRequest(request, config, cacheManager, throttleManager, ctx) {
   // Check for IPv6 access if IPv4_ONLY is enabled
   if (config.ipv4Only) {
     const clientIP = request.headers.get("CF-Connecting-IP") || "";
@@ -649,7 +841,7 @@ async function handleRequest(request, config, cacheManager, ctx) {
   if (request.method === "OPTIONS") {
     return handleOptions(request);
   }
-  return await handleDownload(request, config, cacheManager, ctx);
+  return await handleDownload(request, config, cacheManager, throttleManager, ctx);
 }
 // src/index.ts
 export default {
@@ -658,7 +850,9 @@ export default {
       const config = resolveConfig(env || {});
       // Create cache manager instance based on DB_MODE
       const cacheManager = config.cacheEnabled ? createCacheManager(config.dbMode) : null;
-      return await handleRequest(request, config, cacheManager, ctx);
+      // Create throttle manager instance based on DB_MODE (if throttle enabled)
+      const throttleManager = config.throttleEnabled ? createThrottleManager(config.dbMode) : null;
+      return await handleRequest(request, config, cacheManager, throttleManager, ctx);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return createErrorResponse("*", 500, message);

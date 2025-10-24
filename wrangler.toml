@@ -125,6 +125,36 @@ compatibility_date = "2024-01-01"
 # POSTGREST_URL = "https://your-domain.com/postgrest"  # PostgREST API endpoint (without table name)
 # POSTGREST_TABLE_NAME = "DOWNLOAD_CACHE_TABLE"  # Optional, defaults to DOWNLOAD_CACHE_TABLE
 # # Note: VERIFY_HEADER and VERIFY_SECRET (already defined above) are used for PostgREST authentication
+#
+# # ═══════════════════════════════════════════════════════════════
+# # Throttle Protection System - Prevent Repeated Requests to Failing Hostnames
+# # ═══════════════════════════════════════════════════════════════
+# #
+# # Purpose: Protect against repeated requests to hostnames that are returning errors
+# # (e.g., OneDrive throttling with 429, Google Drive service errors with 503)
+# #
+# # How it works:
+# # 1. When a download URL returns 4xx/5xx, the hostname is marked as "protected"
+# # 2. Subsequent requests to that hostname will return the cached error without fetching
+# # 3. After the time window expires, requests resume normally
+# # 4. If successful, protection is cleared automatically
+# #
+# # Requirements:
+# # - DB_MODE must be set (d1, d1-rest, or custom-pg-rest)
+# # - For custom-pg-rest: Run init.sql to create THROTTLE_PROTECTION table and stored procedures
+# #
+# # Configuration:
+# THROTTLE_PROTECT_HOSTNAME = ""  # Comma-separated hostname patterns to protect
+#                                  # Examples: "*.sharepoint.com,*.googleapis.com"
+#                                  #   - "*.sharepoint.com" matches both "xxx.sharepoint.com" and "sharepoint.com"
+#                                  #   - "example.com" matches only "example.com"
+#                                  # Default: "" (disabled - no protection)
+#
+# THROTTLE_TIME_WINDOW = "60s"    # Time window for protection (format: {number}{unit})
+#                                  # Units: s (seconds), m (minutes), h (hours)
+#                                  # Examples: "30s", "5m", "1h"
+#                                  # Default: "60s"
+#                                  # After this time, requests will resume to check if service recovered
 
 # D1 Database Binding (for DB_MODE="d1")
 # Uncomment and configure this section if using D1 binding mode

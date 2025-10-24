@@ -58,3 +58,53 @@ export const sha256Hash = async (text) => {
   const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
   return hashHex;
 };
+
+/**
+ * Extract hostname from a URL
+ * @param {string} url - Full URL string
+ * @returns {string} - Hostname or empty string if invalid
+ */
+export const extractHostname = (url) => {
+  if (!url || typeof url !== 'string') return '';
+  try {
+    const parsedUrl = new URL(url);
+    return parsedUrl.hostname.toLowerCase();
+  } catch (error) {
+    return '';
+  }
+};
+
+/**
+ * Match hostname against a pattern (supports wildcard)
+ * Pattern examples:
+ *   "*.sharepoint.com" matches "contoso-my.sharepoint.com" and "sharepoint.com"
+ *   "example.com" matches only "example.com"
+ *
+ * @param {string} hostname - Hostname to check (e.g., "contoso-my.sharepoint.com")
+ * @param {string} pattern - Pattern to match (e.g., "*.sharepoint.com")
+ * @returns {boolean} - True if hostname matches pattern
+ */
+export const matchHostnamePattern = (hostname, pattern) => {
+  if (!hostname || !pattern || typeof hostname !== 'string' || typeof pattern !== 'string') {
+    return false;
+  }
+
+  const normalizedHostname = hostname.toLowerCase();
+  const normalizedPattern = pattern.toLowerCase();
+
+  // Exact match
+  if (normalizedHostname === normalizedPattern) {
+    return true;
+  }
+
+  // Wildcard match: *.example.com
+  if (normalizedPattern.startsWith('*.')) {
+    const suffix = normalizedPattern.substring(1); // Remove '*' to get '.example.com'
+    const rootDomain = suffix.substring(1); // Remove '.' to get 'example.com'
+
+    // Match both "xxx.example.com" and "example.com" itself
+    return normalizedHostname.endsWith(suffix) || normalizedHostname === rootDomain;
+  }
+
+  return false;
+};
