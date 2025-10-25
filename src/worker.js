@@ -3,6 +3,8 @@ import { createCacheManager } from './cache/factory.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
 import { unifiedCheck } from './unified-check.js';
+import { unifiedCheckD1 } from './unified-check-d1.js';
+import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
 import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern } from './utils.js';
 
 // Configuration constants
@@ -556,31 +558,72 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
   let cacheHit = false;
   let linkData = null;
   
-  // Only use unified check if using custom-pg-rest mode
-  if (config.dbMode === 'custom-pg-rest' && config.rateLimitEnabled) {
+  // Use unified check for all database modes when rate limit is enabled
+  const supportsUnifiedCheck = config.rateLimitEnabled && (
+    config.dbMode === 'custom-pg-rest' ||
+    config.dbMode === 'd1' ||
+    config.dbMode === 'd1-rest'
+  );
+
+  if (supportsUnifiedCheck) {
     try {
-      console.log('[Unified Check] Using unified check for RTT optimization');
+      console.log(`[Unified Check] Using unified check for ${config.dbMode} mode (RTT optimization)`);
 
       const rateLimitConfig = config.rateLimitConfig || {};
       const cacheConfig = config.cacheConfig || {};
       const throttleConfig = config.throttleConfig || {};
       const limitConfigValue = rateLimitConfig.limit ?? config.ipSubnetLimit;
-      
-      unifiedResult = await unifiedCheck(path, clientIP, {
-        postgrestUrl: rateLimitConfig.postgrestUrl,
-        verifyHeader: rateLimitConfig.verifyHeader,
-        verifySecret: rateLimitConfig.verifySecret,
-        linkTTL: cacheConfig.linkTTL ?? 1800,
-        cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
-        windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
-        limit: limitConfigValue ?? 100,
-        blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
-        ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
-        ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
-        rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
-        throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
-        throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
-      });
+
+      if (config.dbMode === 'custom-pg-rest') {
+        unifiedResult = await unifiedCheck(path, clientIP, {
+          postgrestUrl: rateLimitConfig.postgrestUrl,
+          verifyHeader: rateLimitConfig.verifyHeader,
+          verifySecret: rateLimitConfig.verifySecret,
+          linkTTL: cacheConfig.linkTTL ?? 1800,
+          cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
+          windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
+          limit: limitConfigValue ?? 100,
+          blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
+          ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
+          ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
+          rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
+          throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
+          throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+        });
+      } else if (config.dbMode === 'd1') {
+        unifiedResult = await unifiedCheckD1(path, clientIP, {
+          env: cacheConfig.env || rateLimitConfig.env,
+          databaseBinding: cacheConfig.databaseBinding || rateLimitConfig.databaseBinding || 'DB',
+          linkTTL: cacheConfig.linkTTL ?? 1800,
+          cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
+          windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
+          limit: limitConfigValue ?? 100,
+          blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
+          ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
+          ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
+          rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
+          throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
+          throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+        });
+      } else if (config.dbMode === 'd1-rest') {
+        unifiedResult = await unifiedCheckD1Rest(path, clientIP, {
+          accountId: rateLimitConfig.accountId || throttleConfig.accountId || cacheConfig.accountId,
+          databaseId: rateLimitConfig.databaseId || throttleConfig.databaseId || cacheConfig.databaseId,
+          apiToken: rateLimitConfig.apiToken || throttleConfig.apiToken || cacheConfig.apiToken,
+          linkTTL: cacheConfig.linkTTL ?? 1800,
+          cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
+          windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
+          limit: limitConfigValue ?? 100,
+          blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
+          ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
+          ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
+          rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
+          throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
+          throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+        });
+      } else {
+        throw new Error(`Unsupported database mode for unified check: ${config.dbMode}`);
+      }
       
       // Check rate limit result
       if (!unifiedResult.rateLimit.allowed) {
@@ -643,19 +686,31 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
         const probability = config.rateLimitConfig.cleanupProbability || 0.01;
         if (Math.random() < probability) {
           console.log(`[Rate Limit Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
-          // Import and call cleanup function
-          const { cleanupExpiredRecords } = await import('./ratelimit/custom-pg-rest.js');
-          const cleanupPromise = cleanupExpiredRecords(
-            config.rateLimitConfig.postgrestUrl,
-            config.rateLimitConfig.verifyHeader,
-            config.rateLimitConfig.verifySecret,
-            config.rateLimitConfig.tableName,
-            config.rateLimitConfig.windowTimeSeconds
-          ).catch((error) => {
-            console.error('[Rate Limit Cleanup] Failed:', error instanceof Error ? error.message : String(error));
-          });
           
-          if (ctx && ctx.waitUntil) {
+          let cleanupPromise;
+          
+          if (config.dbMode === 'custom-pg-rest') {
+            const { cleanupExpiredRecords } = await import('./ratelimit/custom-pg-rest.js');
+            cleanupPromise = cleanupExpiredRecords(
+              config.rateLimitConfig.postgrestUrl,
+              config.rateLimitConfig.verifyHeader,
+              config.rateLimitConfig.verifySecret,
+              config.rateLimitConfig.tableName,
+              config.rateLimitConfig.windowTimeSeconds
+            ).catch((error) => {
+              console.error('[Rate Limit Cleanup] Failed:', error instanceof Error ? error.message : String(error));
+            });
+          } else if (config.dbMode === 'd1') {
+            // D1 cleanup is already triggered inside checkRateLimit's triggerCleanup
+            // No need to trigger here
+            console.log('[Rate Limit Cleanup] Skipped (D1 cleanup handled internally)');
+          } else if (config.dbMode === 'd1-rest') {
+            // D1-REST cleanup is already triggered inside checkRateLimit's triggerCleanup
+            // No need to trigger here
+            console.log('[Rate Limit Cleanup] Skipped (D1-REST cleanup handled internally)');
+          }
+          
+          if (cleanupPromise && ctx && ctx.waitUntil) {
             ctx.waitUntil(cleanupPromise);
           }
         }
@@ -681,8 +736,8 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
     }
   }
 } else {
-    // Fallback to original logic for non-custom-pg-rest modes or when rate limit is disabled
-    console.log('[Worker] Using original separate checks (non-custom-pg-rest mode or rate limit disabled)');
+    // Fallback to original logic when unified check is not supported
+    console.log('[Worker] Using original separate checks (unified check not supported or rate limit disabled)');
     
     if (rateLimiter && config.rateLimitEnabled && clientIP) {
       try {

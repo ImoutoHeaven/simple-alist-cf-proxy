@@ -12,10 +12,15 @@ const ensureTable = async (db, tableName) => {
       PATH_HASH TEXT PRIMARY KEY,
       PATH TEXT NOT NULL,
       LINK_DATA TEXT NOT NULL,
-      TIMESTAMP INTEGER NOT NULL
+      TIMESTAMP INTEGER NOT NULL,
+      HOSTNAME_HASH TEXT
     )
   `;
   await db.prepare(sql).run();
+
+  // Create index for hostname lookups if it does not already exist
+  const indexSql = `CREATE INDEX IF NOT EXISTS idx_cache_hostname ON ${tableName}(HOSTNAME_HASH)`;
+  await db.prepare(indexSql).run();
 };
 
 /**
@@ -52,7 +57,7 @@ export const checkCache = async (path, config) => {
     }
 
     // Query cache
-    const selectSql = `SELECT PATH_HASH, PATH, LINK_DATA, TIMESTAMP FROM ${tableName} WHERE PATH_HASH = ?`;
+    const selectSql = `SELECT PATH_HASH, PATH, LINK_DATA, TIMESTAMP, HOSTNAME_HASH FROM ${tableName} WHERE PATH_HASH = ?`;
     const result = await db.prepare(selectSql).bind(pathHash).first();
 
     if (!result) {
@@ -70,7 +75,7 @@ export const checkCache = async (path, config) => {
     // Parse and return link data
     try {
       const linkData = JSON.parse(result.LINK_DATA);
-      return { linkData };
+      return { linkData, hostnameHash: result.HOSTNAME_HASH || null };
     } catch (error) {
       console.error('[Cache] Failed to parse LINK_DATA:', error.message);
       return null;
@@ -115,6 +120,23 @@ export const saveCache = async (path, linkData, config) => {
       return;
     }
 
+    // Calculate hostname hash from linkData.url when available
+    let hostnameHash = null;
+    if (linkData && linkData.url) {
+      try {
+        const { extractHostname } = await import('../utils.js');
+        const hostname = extractHostname(linkData.url);
+        if (hostname) {
+          hostnameHash = await sha256Hash(hostname);
+          console.log(`[Cache] Calculated hostname hash for ${hostname}: ${hostnameHash}`);
+        } else {
+          console.warn(`[Cache] Failed to extract hostname from URL: ${linkData.url}`);
+        }
+      } catch (error) {
+        console.error('[Cache] Failed to calculate hostname hash:', error.message);
+      }
+    }
+
     const now = Math.floor(Date.now() / 1000);
 
     // Probabilistic cleanup helper
@@ -143,17 +165,18 @@ export const saveCache = async (path, linkData, config) => {
 
     // Atomic UPSERT with RETURNING
     const upsertSql = `
-      INSERT INTO ${tableName} (PATH_HASH, PATH, LINK_DATA, TIMESTAMP)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO ${tableName} (PATH_HASH, PATH, LINK_DATA, TIMESTAMP, HOSTNAME_HASH)
+      VALUES (?, ?, ?, ?, ?)
       ON CONFLICT (PATH_HASH) DO UPDATE SET
         LINK_DATA = excluded.LINK_DATA,
         TIMESTAMP = excluded.TIMESTAMP,
-        PATH = excluded.PATH
-      RETURNING PATH_HASH, LINK_DATA, TIMESTAMP
+        PATH = excluded.PATH,
+        HOSTNAME_HASH = excluded.HOSTNAME_HASH
+      RETURNING PATH_HASH, LINK_DATA, TIMESTAMP, HOSTNAME_HASH
     `;
 
     const result = await db.prepare(upsertSql)
-      .bind(pathHash, path, JSON.stringify(linkData), now)
+      .bind(pathHash, path, JSON.stringify(linkData), now, hostnameHash)
       .first();
 
     if (!result) {
