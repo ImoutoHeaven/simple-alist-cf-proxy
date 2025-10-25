@@ -92,6 +92,9 @@ compatibility_date = "2024-01-01"
 # # Options: "d1" (Cloudflare D1 Binding), "d1-rest" (Cloudflare D1 REST API), "custom-pg-rest" (Custom PostgreSQL + PostgREST)
 # # If not set, caching is completely disabled (always call AList API)
 # DB_MODE = ""
+# DOWNLOAD_CACHE_TABLE = "DOWNLOAD_CACHE_TABLE"
+# THROTTLE_PROTECTION_TABLE = "THROTTLE_PROTECTION"
+# DOWNLOAD_IP_RATELIMIT_TABLE = "DOWNLOAD_IP_RATELIMIT_TABLE"
 #
 # # Link Cache TTL - how long to cache download links before re-fetching from AList
 # # Format: {number}{unit} where unit is h (hour), m (minute), s (second)
@@ -108,23 +111,20 @@ compatibility_date = "2024-01-01"
 # # D1 (Cloudflare D1 Binding) Download Cache - requires DB_MODE="d1"
 # # Note: You must also configure d1_databases binding below
 # D1_DATABASE_BINDING = "DB"  # Optional, defaults to "DB"
-# D1_TABLE_NAME = "DOWNLOAD_CACHE_TABLE"  # Optional, defaults to DOWNLOAD_CACHE_TABLE
 #
 # # D1 REST API Download Cache - requires DB_MODE="d1-rest"
 # # Use this mode when you cannot use Workers binding (e.g., external API calls)
 # D1_ACCOUNT_ID = "your-cloudflare-account-id"
 # D1_DATABASE_ID = "your-d1-database-id"
 # D1_API_TOKEN = "your-cloudflare-api-token"
-# D1_TABLE_NAME = "DOWNLOAD_CACHE_TABLE"  # Optional, defaults to DOWNLOAD_CACHE_TABLE
 #
 # # Custom PostgreSQL + PostgREST Download Cache - requires DB_MODE="custom-pg-rest"
 # # Use this mode when you have self-hosted PostgreSQL with PostgREST REST API
 # # ⚠️ IMPORTANT: You MUST run init.sql on your PostgreSQL database first!
-# #   - Creates DOWNLOAD_CACHE_TABLE table
-# #   - Creates upsert_download_cache() stored procedure (required for atomic operations)
+# #   - Creates required tables & stored procedures (see init.sql)
 # POSTGREST_URL = "https://your-domain.com/postgrest"  # PostgREST API endpoint (without table name)
-# POSTGREST_TABLE_NAME = "DOWNLOAD_CACHE_TABLE"  # Optional, defaults to DOWNLOAD_CACHE_TABLE
 # # Note: VERIFY_HEADER and VERIFY_SECRET (already defined above) are used for PostgREST authentication
+#
 #
 # # ═══════════════════════════════════════════════════════════════
 # # Throttle Protection System - Prevent Repeated Requests to Failing Hostnames
@@ -155,6 +155,17 @@ compatibility_date = "2024-01-01"
 #                                  # Examples: "30s", "5m", "1h"
 #                                  # Default: "60s"
 #                                  # After this time, requests will resume to check if service recovered
+
+# # ═══════════════════════════════════════════════════════════════
+# # IP Subnet Rate Limiting (database-backed)
+# # ═══════════════════════════════════════════════════════════════
+# #
+# # WINDOW_TIME = "24h"                  # Counting window per subnet
+# # IPSUBNET_WINDOWTIME_LIMIT = "100"    # Max requests per subnet within WINDOW_TIME
+# # IPV4_SUFFIX = "/32"                  # IPv4 subnet mask applied before hashing
+# # IPV6_SUFFIX = "/60"                  # IPv6 subnet mask applied before hashing
+# # BLOCK_TIME = "10m"                   # Additional block duration after hitting the limit
+# # PG_ERROR_HANDLE = "fail-closed"      # Use "fail-open" to bypass DB errors gracefully
 
 # D1 Database Binding (for DB_MODE="d1")
 # Uncomment and configure this section if using D1 binding mode

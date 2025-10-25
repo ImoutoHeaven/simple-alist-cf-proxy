@@ -223,13 +223,14 @@ export const updateThrottle = async (hostname, updateData, config) => {
     };
 
     // Call atomic RPC stored procedure
-    const rpcUrl = `${postgrestUrl}/rpc/upsert_throttle_protection`;
+    const rpcUrl = `${postgrestUrl}/rpc/download_upsert_throttle_protection`;
     const rpcBody = {
       p_hostname_hash: hostnameHash,
       p_hostname: hostname,
       p_error_timestamp: updateData.errorTimestamp,
       p_is_protected: updateData.isProtected,
       p_last_error_code: updateData.errorCode,
+      p_table_name: tableName,
     };
 
     const rpcResponse = await fetch(rpcUrl, {
@@ -250,7 +251,7 @@ export const updateThrottle = async (hostname, updateData, config) => {
     // Parse RPC result (returns array with single row)
     const rpcResult = await rpcResponse.json();
     if (!rpcResult || rpcResult.length === 0) {
-      console.error('[Throttle] RPC upsert_throttle_protection returned no rows');
+      console.error('[Throttle] RPC download_upsert_throttle_protection returned no rows');
       return;
     }
 
@@ -282,9 +283,10 @@ const cleanupExpiredThrottle = async (postgrestUrl, verifyHeader, verifySecret, 
     console.log(`[Throttle Cleanup] Executing DELETE query (cutoff: ${cutoffTime}, timeWindow: ${throttleTimeWindow}s)`);
 
     // Use RPC function for cleanup to ensure proper NULL handling
-    const rpcUrl = `${postgrestUrl}/rpc/cleanup_throttle_protection`;
+    const rpcUrl = `${postgrestUrl}/rpc/download_cleanup_throttle_protection`;
     const rpcBody = {
       p_ttl_seconds: throttleTimeWindow * 2,
+      p_table_name: tableName,
     };
 
     const rpcResponse = await fetch(rpcUrl, {

@@ -1,7 +1,8 @@
-// Import cache manager and utilities
+// Import cache/throttle managers, rate limiter, and utilities
 import { createCacheManager } from './cache/factory.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
-import { parseBoolean, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern } from './utils.js';
+import { createRateLimiter } from './ratelimit/factory.js';
+import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern } from './utils.js';
 
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
@@ -101,6 +102,13 @@ const ensureRequiredEnv = (env) => {
 const resolveConfig = (env = {}) => {
   ensureRequiredEnv(env);
 
+  const normalizeString = (value, defaultValue = '') => {
+    if (value === undefined || value === null) return defaultValue;
+    if (typeof value !== 'string') return defaultValue;
+    const trimmed = value.trim();
+    return trimmed === '' ? defaultValue : trimmed;
+  };
+
   const blacklistPrefixes = parsePrefixList(env.BLACKLIST_PREFIX);
   const whitelistPrefixes = parsePrefixList(env.WHITELIST_PREFIX);
   const exceptPrefixes = parsePrefixList(env.EXCEPT_PREFIX);
@@ -108,36 +116,64 @@ const resolveConfig = (env = {}) => {
   const whitelistActions = validateActions(env.WHITELIST_ACTION, 'WHITELIST_ACTION');
   const exceptActions = validateExceptActions(env.EXCEPT_ACTION, 'EXCEPT_ACTION');
 
-  // Parse database mode for download link cache
-  const dbMode = env.DB_MODE && typeof env.DB_MODE === 'string' ? env.DB_MODE.trim() : '';
+  const dbMode = normalizeString(env.DB_MODE);
   const normalizedDbMode = dbMode ? dbMode.toLowerCase() : '';
 
-  // Parse cache configuration
-  const linkTTL = env.LINK_TTL && typeof env.LINK_TTL === 'string' ? env.LINK_TTL.trim() : '30m';
+  const linkTTL = normalizeString(env.LINK_TTL, '30m');
   const linkTTLSeconds = parseWindowTime(linkTTL);
   const cleanupPercentage = parseNumber(env.CLEANUP_PERCENTAGE, 1);
-  // Clamp between 0 and 100 (supports decimal percentages)
-  const validCleanupPercentage = Math.max(0, Math.min(100, cleanupPercentage));
-  // Convert to probability (0.0 to 1.0)
-  const cleanupProbability = validCleanupPercentage / 100;
+  const cleanupProbability = Math.max(0, Math.min(100, cleanupPercentage)) / 100;
 
-  // Parse database-specific configuration for cache
+  const downloadCacheTableName = (() => {
+    const explicit = normalizeString(env.DOWNLOAD_CACHE_TABLE);
+    if (explicit) return explicit;
+    const legacyD1 = normalizeString(env.D1_TABLE_NAME);
+    if (legacyD1) return legacyD1;
+    const legacyPg = normalizeString(env.POSTGREST_TABLE_NAME);
+    if (legacyPg) return legacyPg;
+    return 'DOWNLOAD_CACHE_TABLE';
+  })();
+  const throttleTableName = normalizeString(env.THROTTLE_PROTECTION_TABLE, 'THROTTLE_PROTECTION');
+  const rateLimitTableName = normalizeString(env.DOWNLOAD_IP_RATELIMIT_TABLE, 'DOWNLOAD_IP_RATELIMIT_TABLE');
+
+  const windowTime = normalizeString(env.WINDOW_TIME);
+  const windowTimeSeconds = parseWindowTime(windowTime);
+  const ipSubnetLimit = parseInteger(env.IPSUBNET_WINDOWTIME_LIMIT, 0);
+  const ipv4Suffix = normalizeString(env.IPV4_SUFFIX, '/32');
+  const ipv6Suffix = normalizeString(env.IPV6_SUFFIX, '/60');
+  const pgErrorHandleRaw = normalizeString(env.PG_ERROR_HANDLE, 'fail-closed').toLowerCase();
+  const pgErrorHandle = pgErrorHandleRaw === 'fail-open' ? 'fail-open' : 'fail-closed';
+  const blockTime = normalizeString(env.BLOCK_TIME, '10m');
+  const blockTimeSeconds = parseWindowTime(blockTime);
+
+  const throttleProtectHostname = normalizeString(env.THROTTLE_PROTECT_HOSTNAME);
+  const throttleTimeWindow = normalizeString(env.THROTTLE_TIME_WINDOW, '60s');
+  const throttleTimeWindowSeconds = parseWindowTime(throttleTimeWindow);
+
+  const throttleHostnamePatterns = throttleProtectHostname
+    ? throttleProtectHostname.split(',').map((p) => p.trim()).filter((p) => p.length > 0)
+    : [];
+
+  const verifyHeader = normalizeString(env.VERIFY_HEADER);
+  const verifySecret = normalizeString(env.VERIFY_SECRET);
+
+  const d1DatabaseBinding = normalizeString(env.D1_DATABASE_BINDING, 'DB');
+  const d1AccountId = normalizeString(env.D1_ACCOUNT_ID);
+  const d1DatabaseId = normalizeString(env.D1_DATABASE_ID);
+  const d1ApiToken = normalizeString(env.D1_API_TOKEN);
+  const postgrestUrl = normalizeString(env.POSTGREST_URL);
+
   let cacheEnabled = false;
   let cacheConfig = {};
 
   if (dbMode) {
-
     if (normalizedDbMode === 'd1') {
-      // D1 (Cloudflare D1 Binding) configuration
-      const d1DatabaseBinding = env.D1_DATABASE_BINDING && typeof env.D1_DATABASE_BINDING === 'string' ? env.D1_DATABASE_BINDING.trim() : 'DB';
-      const d1TableName = env.D1_TABLE_NAME && typeof env.D1_TABLE_NAME === 'string' ? env.D1_TABLE_NAME.trim() : '';
-
       if (d1DatabaseBinding && linkTTLSeconds > 0) {
         cacheEnabled = true;
         cacheConfig = {
-          env, // Pass env object so cache manager can access the binding
+          env,
           databaseBinding: d1DatabaseBinding,
-          tableName: d1TableName || 'DOWNLOAD_CACHE_TABLE',
+          tableName: downloadCacheTableName,
           linkTTL: linkTTLSeconds,
           cleanupProbability,
         };
@@ -145,19 +181,13 @@ const resolveConfig = (env = {}) => {
         throw new Error('DB_MODE is set to "d1" but LINK_TTL is missing or invalid');
       }
     } else if (normalizedDbMode === 'd1-rest') {
-      // D1 REST API configuration
-      const d1AccountId = env.D1_ACCOUNT_ID && typeof env.D1_ACCOUNT_ID === 'string' ? env.D1_ACCOUNT_ID.trim() : '';
-      const d1DatabaseId = env.D1_DATABASE_ID && typeof env.D1_DATABASE_ID === 'string' ? env.D1_DATABASE_ID.trim() : '';
-      const d1ApiToken = env.D1_API_TOKEN && typeof env.D1_API_TOKEN === 'string' ? env.D1_API_TOKEN.trim() : '';
-      const d1TableName = env.D1_TABLE_NAME && typeof env.D1_TABLE_NAME === 'string' ? env.D1_TABLE_NAME.trim() : '';
-
       if (d1AccountId && d1DatabaseId && d1ApiToken && linkTTLSeconds > 0) {
         cacheEnabled = true;
         cacheConfig = {
           accountId: d1AccountId,
           databaseId: d1DatabaseId,
           apiToken: d1ApiToken,
-          tableName: d1TableName || 'DOWNLOAD_CACHE_TABLE',
+          tableName: downloadCacheTableName,
           linkTTL: linkTTLSeconds,
           cleanupProbability,
         };
@@ -165,19 +195,13 @@ const resolveConfig = (env = {}) => {
         throw new Error('DB_MODE is set to "d1-rest" but required environment variables are missing: D1_ACCOUNT_ID, D1_DATABASE_ID, D1_API_TOKEN, LINK_TTL');
       }
     } else if (normalizedDbMode === 'custom-pg-rest') {
-      // Custom PostgreSQL REST API (PostgREST) configuration
-      const postgrestUrl = env.POSTGREST_URL && typeof env.POSTGREST_URL === 'string' ? env.POSTGREST_URL.trim() : '';
-      const postgrestTableName = env.POSTGREST_TABLE_NAME && typeof env.POSTGREST_TABLE_NAME === 'string' ? env.POSTGREST_TABLE_NAME.trim() : '';
-      const verifyHeader = env.VERIFY_HEADER && typeof env.VERIFY_HEADER === 'string' ? env.VERIFY_HEADER.trim() : '';
-      const verifySecret = env.VERIFY_SECRET && typeof env.VERIFY_SECRET === 'string' ? env.VERIFY_SECRET.trim() : '';
-
       if (postgrestUrl && verifyHeader && verifySecret && linkTTLSeconds > 0) {
         cacheEnabled = true;
         cacheConfig = {
           postgrestUrl,
           verifyHeader,
           verifySecret,
-          tableName: postgrestTableName || 'DOWNLOAD_CACHE_TABLE',
+          tableName: downloadCacheTableName,
           linkTTL: linkTTLSeconds,
           cleanupProbability,
         };
@@ -189,65 +213,109 @@ const resolveConfig = (env = {}) => {
     }
   }
 
-  // Parse throttle protection configuration
-  const throttleProtectHostname = env.THROTTLE_PROTECT_HOSTNAME && typeof env.THROTTLE_PROTECT_HOSTNAME === 'string' ? env.THROTTLE_PROTECT_HOSTNAME.trim() : '';
-  const throttleTimeWindow = env.THROTTLE_TIME_WINDOW && typeof env.THROTTLE_TIME_WINDOW === 'string' ? env.THROTTLE_TIME_WINDOW.trim() : '60s';
-  const throttleTimeWindowSeconds = parseWindowTime(throttleTimeWindow);
-
-  // Parse throttle hostname patterns (comma-separated, no spaces)
-  const throttleHostnamePatterns = throttleProtectHostname
-    ? throttleProtectHostname.split(',').map(p => p.trim()).filter(p => p.length > 0)
-    : [];
-
-  // Throttle protection enabled only if patterns are configured and DB mode is set
-  const throttleEnabled = throttleHostnamePatterns.length > 0 && dbMode && cacheEnabled;
-
-  // Throttle configuration
+  const throttleEnabled = throttleHostnamePatterns.length > 0 && Boolean(dbMode);
   let throttleConfig = {};
   if (throttleEnabled) {
-    // Use same database config as cache
     if (normalizedDbMode === 'd1') {
-      const d1DatabaseBinding = env.D1_DATABASE_BINDING && typeof env.D1_DATABASE_BINDING === 'string' ? env.D1_DATABASE_BINDING.trim() : 'DB';
       throttleConfig = {
         env,
         databaseBinding: d1DatabaseBinding,
-        tableName: 'THROTTLE_PROTECTION',
+        tableName: throttleTableName,
         throttleTimeWindow: throttleTimeWindowSeconds,
         cleanupProbability,
       };
     } else if (normalizedDbMode === 'd1-rest') {
-      const d1AccountId = env.D1_ACCOUNT_ID && typeof env.D1_ACCOUNT_ID === 'string' ? env.D1_ACCOUNT_ID.trim() : '';
-      const d1DatabaseId = env.D1_DATABASE_ID && typeof env.D1_DATABASE_ID === 'string' ? env.D1_DATABASE_ID.trim() : '';
-      const d1ApiToken = env.D1_API_TOKEN && typeof env.D1_API_TOKEN === 'string' ? env.D1_API_TOKEN.trim() : '';
+      if (!d1AccountId || !d1DatabaseId || !d1ApiToken) {
+        throw new Error('Throttle protection requires D1 account configuration when DB_MODE is "d1-rest"');
+      }
       throttleConfig = {
         accountId: d1AccountId,
         databaseId: d1DatabaseId,
         apiToken: d1ApiToken,
-        tableName: 'THROTTLE_PROTECTION',
+        tableName: throttleTableName,
         throttleTimeWindow: throttleTimeWindowSeconds,
         cleanupProbability,
       };
     } else if (normalizedDbMode === 'custom-pg-rest') {
-      const postgrestUrl = env.POSTGREST_URL && typeof env.POSTGREST_URL === 'string' ? env.POSTGREST_URL.trim() : '';
-      const verifyHeader = env.VERIFY_HEADER && typeof env.VERIFY_HEADER === 'string' ? env.VERIFY_HEADER.trim() : '';
-      const verifySecret = env.VERIFY_SECRET && typeof env.VERIFY_SECRET === 'string' ? env.VERIFY_SECRET.trim() : '';
+      if (!postgrestUrl || !verifyHeader || !verifySecret) {
+        throw new Error('Throttle protection requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
+      }
       throttleConfig = {
         postgrestUrl,
         verifyHeader,
         verifySecret,
-        tableName: 'THROTTLE_PROTECTION',
+        tableName: throttleTableName,
         throttleTimeWindow: throttleTimeWindowSeconds,
         cleanupProbability,
       };
     }
   }
 
+  const rateLimitParamsProvided = windowTime !== '' || env.IPSUBNET_WINDOWTIME_LIMIT !== undefined;
+  let rateLimitEnabled = false;
+  let rateLimitConfig = {};
+  if (dbMode && windowTimeSeconds > 0 && ipSubnetLimit > 0) {
+    if (normalizedDbMode === 'd1') {
+      rateLimitEnabled = true;
+      rateLimitConfig = {
+        env,
+        databaseBinding: d1DatabaseBinding,
+        tableName: rateLimitTableName,
+        windowTimeSeconds,
+        limit: ipSubnetLimit,
+        ipv4Suffix,
+        ipv6Suffix,
+        pgErrorHandle,
+        cleanupProbability,
+        blockTimeSeconds,
+      };
+    } else if (normalizedDbMode === 'd1-rest') {
+      if (!d1AccountId || !d1DatabaseId || !d1ApiToken) {
+        throw new Error('Rate limiting requires D1 account configuration when DB_MODE is "d1-rest"');
+      }
+      rateLimitEnabled = true;
+      rateLimitConfig = {
+        accountId: d1AccountId,
+        databaseId: d1DatabaseId,
+        apiToken: d1ApiToken,
+        tableName: rateLimitTableName,
+        windowTimeSeconds,
+        limit: ipSubnetLimit,
+        ipv4Suffix,
+        ipv6Suffix,
+        pgErrorHandle,
+        cleanupProbability,
+        blockTimeSeconds,
+      };
+    } else if (normalizedDbMode === 'custom-pg-rest') {
+      if (!postgrestUrl || !verifyHeader || !verifySecret) {
+        throw new Error('Rate limiting requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
+      }
+      rateLimitEnabled = true;
+      rateLimitConfig = {
+        postgrestUrl,
+        verifyHeader,
+        verifySecret,
+        tableName: rateLimitTableName,
+        windowTimeSeconds,
+        limit: ipSubnetLimit,
+        ipv4Suffix,
+        ipv6Suffix,
+        pgErrorHandle,
+        cleanupProbability,
+        blockTimeSeconds,
+      };
+    }
+  } else if (dbMode && rateLimitParamsProvided && (!windowTimeSeconds || !ipSubnetLimit)) {
+    throw new Error('Rate limiting configuration is incomplete. Ensure WINDOW_TIME and IPSUBNET_WINDOWTIME_LIMIT are valid positive values.');
+  }
+
   return {
     address: String(env.ADDRESS).trim(),
     token: String(env.TOKEN).trim(),
     workerAddress: String(env.WORKER_ADDRESS).trim(),
-    verifyHeader: env.VERIFY_HEADER ? String(env.VERIFY_HEADER).trim() : '',
-    verifySecret: env.VERIFY_SECRET ? String(env.VERIFY_SECRET).trim() : '',
+    verifyHeader,
+    verifySecret,
     signCheck: parseBoolean(env.SIGN_CHECK, true),
     hashCheck: parseBoolean(env.HASH_CHECK, true),
     workerCheck: parseBoolean(env.WORKER_CHECK, true),
@@ -265,6 +333,10 @@ const resolveConfig = (env = {}) => {
     throttleEnabled,
     throttleHostnamePatterns,
     throttleConfig,
+    rateLimitEnabled,
+    rateLimitConfig,
+    windowTime,
+    ipSubnetLimit,
   };
 };
 
@@ -395,6 +467,49 @@ function createUnauthorizedResponse(origin, message) {
   return createErrorResponse(origin, 401, message);
 }
 
+const formatRateLimitWindow = (windowLabel, windowSeconds) => {
+  if (windowLabel) {
+    return windowLabel;
+  }
+  if (!windowSeconds || windowSeconds <= 0) {
+    return 'configured window';
+  }
+  if (windowSeconds % 3600 === 0) {
+    return `${windowSeconds / 3600}h`;
+  }
+  if (windowSeconds % 60 === 0) {
+    return `${windowSeconds / 60}m`;
+  }
+  return `${windowSeconds}s`;
+};
+
+function createRateLimitResponse(origin, ipSubnet, limit, windowLabel, retryAfterSeconds) {
+  const safeHeaders = new Headers();
+  safeHeaders.set("content-type", "application/json;charset=UTF-8");
+  safeHeaders.set("Access-Control-Allow-Origin", origin);
+  safeHeaders.append("Vary", "Origin");
+
+  const sanitizedRetryAfter = retryAfterSeconds && retryAfterSeconds > 0
+    ? Math.max(1, Math.ceil(retryAfterSeconds))
+    : 0;
+  if (sanitizedRetryAfter) {
+    safeHeaders.set("Retry-After", String(sanitizedRetryAfter));
+  }
+
+  const payload = {
+    code: 429,
+    message: `${ipSubnet || 'current client'} exceeds the limit of ${limit} requests in ${windowLabel}`
+  };
+  if (sanitizedRetryAfter) {
+    payload['retry-after'] = sanitizedRetryAfter;
+  }
+
+  return new Response(JSON.stringify(payload), {
+    status: 429,
+    headers: safeHeaders
+  });
+}
+
 function safeDecodePathname(pathname) {
   try {
     return decodeURIComponent(pathname);
@@ -403,7 +518,7 @@ function safeDecodePathname(pathname) {
   }
 }
 // src/handleDownload.ts
-async function handleDownload(request, config, cacheManager, throttleManager, ctx) {
+async function handleDownload(request, config, cacheManager, throttleManager, rateLimiter, ctx) {
   const origin = request.headers.get("origin") ?? "*";
   const url = new URL(request.url);
   const path = safeDecodePathname(url.pathname);
@@ -417,6 +532,40 @@ async function handleDownload(request, config, cacheManager, throttleManager, ct
   // Handle block action
   if (actions.includes('block')) {
     return createErrorResponse(origin, 403, "access denied");
+  }
+
+  const clientIP = request.headers.get("CF-Connecting-IP") || "";
+
+  if (rateLimiter && config.rateLimitEnabled && clientIP) {
+    try {
+      const rateLimitResult = await rateLimiter.checkRateLimit(clientIP, { ...config.rateLimitConfig, ctx });
+      if (!rateLimitResult.allowed) {
+        if (rateLimitResult.error) {
+          console.error('[Rate Limit] fail-closed error:', rateLimitResult.error);
+          return createErrorResponse(origin, 500, rateLimitResult.error);
+        }
+        const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
+        console.warn(
+          '[Rate Limit] Subnet blocked:',
+          rateLimitResult.ipSubnet || clientIP,
+          `limit=${config.ipSubnetLimit}`,
+          `window=${windowLabel}`,
+          `retryAfter=${rateLimitResult.retryAfter || 0}s`
+        );
+        return createRateLimitResponse(
+          origin,
+          rateLimitResult.ipSubnet || clientIP,
+          config.ipSubnetLimit,
+          windowLabel,
+          rateLimitResult.retryAfter
+        );
+      }
+    } catch (error) {
+      console.error('[Rate Limit] Unexpected error:', error instanceof Error ? error.message : String(error));
+      if (config.rateLimitConfig?.pgErrorHandle === 'fail-closed') {
+        return createErrorResponse(origin, 500, 'Rate limit check failed');
+      }
+    }
   }
 
   // Initialize check flags from config (each *_CHECK only controls itself)
@@ -472,7 +621,6 @@ async function handleDownload(request, config, cacheManager, throttleManager, ct
   }
 
   // IpSign verification
-  const clientIP = request.headers.get("CF-Connecting-IP") || "";
   const ipSign = url.searchParams.get("ipSign") ?? "";
   if (shouldCheckIP) {
     if (!ipSign) {
@@ -662,7 +810,7 @@ async function handleDownload(request, config, cacheManager, throttleManager, ct
     if (location) {
       if (location.startsWith(`${config.workerAddress}/`)) {
         request = new Request(location, request);
-        return await handleRequest(request, config, cacheManager, ctx);
+        return await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
       } else {
         request = new Request(location, request);
         response = await fetch(request);
@@ -814,7 +962,7 @@ function handleOptions(request) {
 }
 
 // src/handleRequest.ts - Modified to check IPv6 addresses
-async function handleRequest(request, config, cacheManager, throttleManager, ctx) {
+async function handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx) {
   // Check for IPv6 access if IPv4_ONLY is enabled
   if (config.ipv4Only) {
     const clientIP = request.headers.get("CF-Connecting-IP") || "";
@@ -841,7 +989,7 @@ async function handleRequest(request, config, cacheManager, throttleManager, ctx
   if (request.method === "OPTIONS") {
     return handleOptions(request);
   }
-  return await handleDownload(request, config, cacheManager, throttleManager, ctx);
+  return await handleDownload(request, config, cacheManager, throttleManager, rateLimiter, ctx);
 }
 // src/index.ts
 export default {
@@ -852,7 +1000,8 @@ export default {
       const cacheManager = config.cacheEnabled ? createCacheManager(config.dbMode) : null;
       // Create throttle manager instance based on DB_MODE (if throttle enabled)
       const throttleManager = config.throttleEnabled ? createThrottleManager(config.dbMode) : null;
-      return await handleRequest(request, config, cacheManager, throttleManager, ctx);
+      const rateLimiter = config.rateLimitEnabled ? createRateLimiter(config.dbMode) : null;
+      return await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return createErrorResponse("*", 500, message);

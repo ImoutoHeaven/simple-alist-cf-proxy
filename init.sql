@@ -1,37 +1,40 @@
 -- ========================================
+-- Infrastructure Tables For simple-alist-cf-proxy
+-- ========================================
+-- Default table names align with environment variable defaults:
+--   DOWNLOAD_CACHE_TABLE           (env: DOWNLOAD_CACHE_TABLE)
+--   THROTTLE_PROTECTION            (env: THROTTLE_PROTECTION_TABLE)
+--   DOWNLOAD_IP_RATELIMIT_TABLE    (env: DOWNLOAD_IP_RATELIMIT_TABLE)
+--
+-- If you override the environment variables, adjust the CREATE TABLE
+-- statements accordingly before applying this script.
+
+
+-- ========================================
 -- Download Cache Table Schema
 -- ========================================
 -- Purpose: Cache AList /api/fs/link responses to reduce API calls
 -- Compatible with: SQLite (D1), PostgreSQL
 
 CREATE TABLE IF NOT EXISTS "DOWNLOAD_CACHE_TABLE" (
-  "PATH_HASH" TEXT PRIMARY KEY,      -- SHA256 hash of file path
-  "PATH" TEXT NOT NULL,              -- Original file path
-  "LINK_DATA" TEXT NOT NULL,         -- JSON string of response.data field
-  "TIMESTAMP" INTEGER NOT NULL       -- Unix timestamp (seconds) when link was fetched
+  "PATH_HASH" TEXT PRIMARY KEY,
+  "PATH" TEXT NOT NULL,
+  "LINK_DATA" TEXT NOT NULL,
+  "TIMESTAMP" INTEGER NOT NULL
 );
 
--- Create index to optimize cleanup queries
-CREATE INDEX IF NOT EXISTS idx_timestamp ON "DOWNLOAD_CACHE_TABLE"("TIMESTAMP");
+CREATE INDEX IF NOT EXISTS idx_download_cache_timestamp ON "DOWNLOAD_CACHE_TABLE"("TIMESTAMP");
 
 
 -- ========================================
 -- PostgreSQL Stored Procedure: Atomic UPSERT
 -- ========================================
--- Only used for custom-pg-rest mode
---
--- Function: Atomically insert or update download cache record
--- Returns: Updated PATH_HASH, LINK_DATA, TIMESTAMP for verification
---
--- Usage example (PostgREST):
---   POST /rpc/upsert_download_cache
---   Body: {"p_path_hash": "abc123...", "p_path": "/file.rar", "p_link_data": "{...}", "p_timestamp": 1700000000}
-
-CREATE OR REPLACE FUNCTION upsert_download_cache(
+CREATE OR REPLACE FUNCTION download_upsert_download_cache(
   p_path_hash TEXT,
   p_path TEXT,
   p_link_data TEXT,
-  p_timestamp INTEGER
+  p_timestamp INTEGER,
+  p_table_name TEXT DEFAULT 'DOWNLOAD_CACHE_TABLE'
 )
 RETURNS TABLE(
   "PATH_HASH" TEXT,
@@ -39,21 +42,21 @@ RETURNS TABLE(
   "LINK_DATA" TEXT,
   "TIMESTAMP" INTEGER
 ) AS $$
+DECLARE
+  sql TEXT;
 BEGIN
-  -- Atomic UPSERT: Insert new record or update existing one
-  RETURN QUERY
-  INSERT INTO "DOWNLOAD_CACHE_TABLE" ("PATH_HASH", "PATH", "LINK_DATA", "TIMESTAMP")
-  VALUES (p_path_hash, p_path, p_link_data, p_timestamp)
-  ON CONFLICT ON CONSTRAINT "DOWNLOAD_CACHE_TABLE_pkey" DO UPDATE SET
-    "LINK_DATA" = EXCLUDED."LINK_DATA",
-    "TIMESTAMP" = EXCLUDED."TIMESTAMP",
-    "PATH" = EXCLUDED."PATH"  -- Update path in case of encoding changes
+  sql := format(
+    'INSERT INTO %1$I ("PATH_HASH", "PATH", "LINK_DATA", "TIMESTAMP")
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT ("PATH_HASH") DO UPDATE SET
+       "LINK_DATA" = EXCLUDED."LINK_DATA",
+       "TIMESTAMP" = EXCLUDED."TIMESTAMP",
+       "PATH" = EXCLUDED."PATH"
+     RETURNING "PATH_HASH", "PATH", "LINK_DATA", "TIMESTAMP"',
+    p_table_name
+  );
 
-  -- Return updated record for application verification
-  RETURNING "DOWNLOAD_CACHE_TABLE"."PATH_HASH",
-            "DOWNLOAD_CACHE_TABLE"."PATH",
-            "DOWNLOAD_CACHE_TABLE"."LINK_DATA",
-            "DOWNLOAD_CACHE_TABLE"."TIMESTAMP";
+  RETURN QUERY EXECUTE sql USING p_path_hash, p_path, p_link_data, p_timestamp;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -61,25 +64,23 @@ $$ LANGUAGE plpgsql;
 -- ========================================
 -- Optional: Cleanup Function (PostgreSQL)
 -- ========================================
--- Function: Delete expired cache records older than specified TTL
--- Usage: Can be called manually or scheduled via pg_cron
---
--- Example (delete records older than 2 hours):
---   SELECT cleanup_expired_cache(7200);
-
-CREATE OR REPLACE FUNCTION cleanup_expired_cache(
-  p_ttl_seconds INTEGER
+CREATE OR REPLACE FUNCTION download_cleanup_expired_cache(
+  p_ttl_seconds INTEGER,
+  p_table_name TEXT DEFAULT 'DOWNLOAD_CACHE_TABLE'
 )
 RETURNS INTEGER AS $$
 DECLARE
   deleted_count INTEGER;
+  sql TEXT;
 BEGIN
-  WITH deleted AS (
-    DELETE FROM "DOWNLOAD_CACHE_TABLE"
-    WHERE EXTRACT(EPOCH FROM NOW())::INTEGER - "TIMESTAMP" > p_ttl_seconds
-    RETURNING 1
-  )
-  SELECT COUNT(*) INTO deleted_count FROM deleted;
+  sql := format(
+    'DELETE FROM %1$I
+     WHERE EXTRACT(EPOCH FROM NOW())::INTEGER - "TIMESTAMP" > $1',
+    p_table_name
+  );
+
+  EXECUTE sql USING p_ttl_seconds;
+  GET DIAGNOSTICS deleted_count = ROW_COUNT;
 
   RETURN deleted_count;
 END;
@@ -87,66 +88,29 @@ $$ LANGUAGE plpgsql;
 
 
 -- ========================================
--- Optional: pg_cron Scheduled Cleanup
--- ========================================
--- Automatically clean up expired cache every hour
--- Requires pg_cron extension: CREATE EXTENSION IF NOT EXISTS pg_cron;
---
--- Uncomment to enable (adjust TTL as needed):
---
--- SELECT cron.schedule(
---   'cleanup-download-cache',           -- Job name
---   '0 * * * *',                        -- Run every hour at minute 0
---   $$SELECT cleanup_expired_cache(7200)$$  -- Delete records older than 2 hours (adjust as needed)
--- );
-
-
--- ========================================
--- Migration Notes
--- ========================================
--- This is a new table, no migration needed from previous versions.
--- If you want to clear all cached data, run:
---
--- TRUNCATE TABLE "DOWNLOAD_CACHE_TABLE";
--- (or DELETE FROM "DOWNLOAD_CACHE_TABLE"; for SQLite)
-
-
--- ========================================
 -- Throttle Protection Table Schema
 -- ========================================
--- Purpose: Protect against repeated requests to failing hostnames
--- Compatible with: SQLite (D1), PostgreSQL
-
 CREATE TABLE IF NOT EXISTS "THROTTLE_PROTECTION" (
-  "HOSTNAME_HASH" TEXT PRIMARY KEY,      -- SHA256 hash of hostname
-  "HOSTNAME" TEXT NOT NULL,              -- Plain hostname (e.g., "contoso-my.sharepoint.com")
-  "ERROR_TIMESTAMP" INTEGER,             -- Unix timestamp (seconds) when last 4xx/5xx error occurred (NULL = no error)
-  "IS_PROTECTED" INTEGER,                -- 1 = protected, NULL = not protected
-  "LAST_ERROR_CODE" INTEGER              -- HTTP error code (e.g., 429, 503) or NULL
+  "HOSTNAME_HASH" TEXT PRIMARY KEY,
+  "HOSTNAME" TEXT NOT NULL,
+  "ERROR_TIMESTAMP" INTEGER,
+  "IS_PROTECTED" INTEGER,
+  "LAST_ERROR_CODE" INTEGER
 );
 
--- Create index to optimize cleanup queries
 CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON "THROTTLE_PROTECTION"("ERROR_TIMESTAMP");
 
 
 -- ========================================
--- PostgreSQL Stored Procedure: Atomic UPSERT for Throttle Protection
+-- PostgreSQL Stored Procedure: Atomic UPSERT (Throttle)
 -- ========================================
--- Only used for custom-pg-rest mode
---
--- Function: Atomically insert or update throttle protection record
--- Returns: Updated HOSTNAME_HASH, HOSTNAME, ERROR_TIMESTAMP, IS_PROTECTED, LAST_ERROR_CODE for verification
---
--- Usage example (PostgREST):
---   POST /rpc/upsert_throttle_protection
---   Body: {"p_hostname_hash": "abc123...", "p_hostname": "contoso-my.sharepoint.com", "p_error_timestamp": 1700000000, "p_is_protected": 1, "p_last_error_code": 429}
-
-CREATE OR REPLACE FUNCTION upsert_throttle_protection(
+CREATE OR REPLACE FUNCTION download_upsert_throttle_protection(
   p_hostname_hash TEXT,
   p_hostname TEXT,
   p_error_timestamp INTEGER,
   p_is_protected INTEGER,
-  p_last_error_code INTEGER
+  p_last_error_code INTEGER,
+  p_table_name TEXT DEFAULT 'THROTTLE_PROTECTION'
 )
 RETURNS TABLE(
   "HOSTNAME_HASH" TEXT,
@@ -155,23 +119,22 @@ RETURNS TABLE(
   "IS_PROTECTED" INTEGER,
   "LAST_ERROR_CODE" INTEGER
 ) AS $$
+DECLARE
+  sql TEXT;
 BEGIN
-  -- Atomic UPSERT: Insert new record or update existing one
-  RETURN QUERY
-  INSERT INTO "THROTTLE_PROTECTION" ("HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE")
-  VALUES (p_hostname_hash, p_hostname, p_error_timestamp, p_is_protected, p_last_error_code)
-  ON CONFLICT ON CONSTRAINT "THROTTLE_PROTECTION_pkey" DO UPDATE SET
-    "HOSTNAME" = EXCLUDED."HOSTNAME",
-    "ERROR_TIMESTAMP" = EXCLUDED."ERROR_TIMESTAMP",
-    "IS_PROTECTED" = EXCLUDED."IS_PROTECTED",
-    "LAST_ERROR_CODE" = EXCLUDED."LAST_ERROR_CODE"
+  sql := format(
+    'INSERT INTO %1$I ("HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE")
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT ("HOSTNAME_HASH") DO UPDATE SET
+       "HOSTNAME" = EXCLUDED."HOSTNAME",
+       "ERROR_TIMESTAMP" = EXCLUDED."ERROR_TIMESTAMP",
+       "IS_PROTECTED" = EXCLUDED."IS_PROTECTED",
+       "LAST_ERROR_CODE" = EXCLUDED."LAST_ERROR_CODE"
+     RETURNING "HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE"',
+    p_table_name
+  );
 
-  -- Return updated record for application verification
-  RETURNING "THROTTLE_PROTECTION"."HOSTNAME_HASH",
-            "THROTTLE_PROTECTION"."HOSTNAME",
-            "THROTTLE_PROTECTION"."ERROR_TIMESTAMP",
-            "THROTTLE_PROTECTION"."IS_PROTECTED",
-            "THROTTLE_PROTECTION"."LAST_ERROR_CODE";
+  RETURN QUERY EXECUTE sql USING p_hostname_hash, p_hostname, p_error_timestamp, p_is_protected, p_last_error_code;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -179,27 +142,24 @@ $$ LANGUAGE plpgsql;
 -- ========================================
 -- Optional: Throttle Cleanup Function (PostgreSQL)
 -- ========================================
--- Function: Delete throttle protection records that are no longer needed
--- Removes records where IS_PROTECTED IS NULL and ERROR_TIMESTAMP is older than specified TTL
--- Usage: Can be called manually or scheduled via pg_cron
---
--- Example (delete records older than 2 minutes):
---   SELECT cleanup_throttle_protection(120);
-
-CREATE OR REPLACE FUNCTION cleanup_throttle_protection(
-  p_ttl_seconds INTEGER
+CREATE OR REPLACE FUNCTION download_cleanup_throttle_protection(
+  p_ttl_seconds INTEGER,
+  p_table_name TEXT DEFAULT 'THROTTLE_PROTECTION'
 )
 RETURNS INTEGER AS $$
 DECLARE
   deleted_count INTEGER;
+  sql TEXT;
 BEGIN
-  WITH deleted AS (
-    DELETE FROM "THROTTLE_PROTECTION"
-    WHERE "IS_PROTECTED" IS NULL
-      AND ("ERROR_TIMESTAMP" IS NULL OR EXTRACT(EPOCH FROM NOW())::INTEGER - "ERROR_TIMESTAMP" > p_ttl_seconds)
-    RETURNING 1
-  )
-  SELECT COUNT(*) INTO deleted_count FROM deleted;
+  sql := format(
+    'DELETE FROM %1$I
+     WHERE "IS_PROTECTED" IS NULL
+       AND ("ERROR_TIMESTAMP" IS NULL OR EXTRACT(EPOCH FROM NOW())::INTEGER - "ERROR_TIMESTAMP" > $1)',
+    p_table_name
+  );
+
+  EXECUTE sql USING p_ttl_seconds;
+  GET DIAGNOSTICS deleted_count = ROW_COUNT;
 
   RETURN deleted_count;
 END;
@@ -207,15 +167,97 @@ $$ LANGUAGE plpgsql;
 
 
 -- ========================================
--- Optional: pg_cron Scheduled Cleanup for Throttle Protection
+-- Download IP Rate Limit Table Schema
 -- ========================================
--- Automatically clean up throttle protection records every hour
--- Requires pg_cron extension: CREATE EXTENSION IF NOT EXISTS pg_cron;
---
--- Uncomment to enable (adjust TTL as needed):
---
--- SELECT cron.schedule(
---   'cleanup-throttle-protection',       -- Job name
---   '0 * * * *',                          -- Run every hour at minute 0
---   $$SELECT cleanup_throttle_protection(120)$$  -- Delete records older than 2 minutes (adjust as needed)
--- );
+CREATE TABLE IF NOT EXISTS "DOWNLOAD_IP_RATELIMIT_TABLE" (
+  "IP_HASH" TEXT PRIMARY KEY,
+  "IP_RANGE" TEXT NOT NULL,
+  "ACCESS_COUNT" INTEGER NOT NULL,
+  "LAST_WINDOW_TIME" INTEGER NOT NULL,
+  "BLOCK_UNTIL" INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_download_rate_limit_window ON "DOWNLOAD_IP_RATELIMIT_TABLE"("LAST_WINDOW_TIME");
+CREATE INDEX IF NOT EXISTS idx_download_rate_limit_block ON "DOWNLOAD_IP_RATELIMIT_TABLE"("BLOCK_UNTIL") WHERE "BLOCK_UNTIL" IS NOT NULL;
+
+
+-- ========================================
+-- PostgreSQL Stored Procedure: Atomic UPSERT (Rate Limit)
+-- ========================================
+CREATE OR REPLACE FUNCTION download_upsert_rate_limit(
+  p_ip_hash TEXT,
+  p_ip_range TEXT,
+  p_now INTEGER,
+  p_window_seconds INTEGER,
+  p_limit INTEGER,
+  p_block_seconds INTEGER,
+  p_table_name TEXT DEFAULT 'DOWNLOAD_IP_RATELIMIT_TABLE'
+)
+RETURNS TABLE(
+  "ACCESS_COUNT" INTEGER,
+  "LAST_WINDOW_TIME" INTEGER,
+  "BLOCK_UNTIL" INTEGER
+) AS $$
+DECLARE
+  sql TEXT;
+BEGIN
+  sql := format(
+    'INSERT INTO %1$I ("IP_HASH", "IP_RANGE", "ACCESS_COUNT", "LAST_WINDOW_TIME", "BLOCK_UNTIL")
+     VALUES ($1, $2, 1, $3, NULL)
+     ON CONFLICT ("IP_HASH") DO UPDATE SET
+       "ACCESS_COUNT" = CASE
+         WHEN $3 - %1$I."LAST_WINDOW_TIME" >= $4 THEN 1
+         WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" <= $3 THEN 1
+         WHEN %1$I."ACCESS_COUNT" >= $5 THEN %1$I."ACCESS_COUNT"
+         ELSE %1$I."ACCESS_COUNT" + 1
+       END,
+       "LAST_WINDOW_TIME" = CASE
+         WHEN $3 - %1$I."LAST_WINDOW_TIME" >= $4 THEN $3
+         WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" <= $3 THEN $3
+         ELSE %1$I."LAST_WINDOW_TIME"
+       END,
+       "BLOCK_UNTIL" = CASE
+         WHEN $3 - %1$I."LAST_WINDOW_TIME" >= $4 THEN NULL
+         WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" <= $3 THEN NULL
+         WHEN %1$I."ACCESS_COUNT" >= $5 AND $6 > 0 THEN $3 + $6
+         ELSE %1$I."BLOCK_UNTIL"
+       END
+     RETURNING "ACCESS_COUNT", "LAST_WINDOW_TIME", "BLOCK_UNTIL"',
+    p_table_name
+  );
+
+  RETURN QUERY EXECUTE sql USING p_ip_hash, p_ip_range, p_now, p_window_seconds, p_limit, p_block_seconds;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
+-- Optional: Rate Limit Cleanup Function (PostgreSQL)
+-- ========================================
+CREATE OR REPLACE FUNCTION download_cleanup_ip_ratelimit(
+  p_window_seconds INTEGER,
+  p_table_name TEXT DEFAULT 'DOWNLOAD_IP_RATELIMIT_TABLE'
+)
+RETURNS INTEGER AS $$
+DECLARE
+  deleted_count INTEGER;
+  sql TEXT;
+  cutoff INTEGER;
+  now_ts INTEGER;
+BEGIN
+  now_ts := EXTRACT(EPOCH FROM NOW())::INTEGER;
+  cutoff := now_ts - (p_window_seconds * 2);
+
+  sql := format(
+    'DELETE FROM %1$I
+     WHERE "LAST_WINDOW_TIME" < $1
+       AND ("BLOCK_UNTIL" IS NULL OR "BLOCK_UNTIL" < $2)',
+    p_table_name
+  );
+
+  EXECUTE sql USING cutoff, now_ts;
+  GET DIAGNOSTICS deleted_count = ROW_COUNT;
+
+  RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;

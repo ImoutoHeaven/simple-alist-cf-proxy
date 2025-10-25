@@ -46,7 +46,7 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
         `  LINK_DATA TEXT NOT NULL,\\n` +
         `  TIMESTAMP INTEGER NOT NULL\\n` +
         `);\\n` +
-        `\\nAlso run: CREATE OR REPLACE FUNCTION upsert_download_cache(...) (see init.sql)`
+        `\\nAlso run: CREATE OR REPLACE FUNCTION download_upsert_download_cache(...) (see init.sql)`
       );
     }
 
@@ -210,12 +210,13 @@ export const saveCache = async (path, linkData, config) => {
     };
 
     // Call atomic RPC stored procedure
-    const rpcUrl = `${postgrestUrl}/rpc/upsert_download_cache`;
+    const rpcUrl = `${postgrestUrl}/rpc/download_upsert_download_cache`;
     const rpcBody = {
       p_path_hash: pathHash,
       p_path: path,
       p_link_data: JSON.stringify(linkData),
       p_timestamp: now,
+      p_table_name: tableName,
     };
 
     const rpcResponse = await fetch(rpcUrl, {
@@ -235,7 +236,7 @@ export const saveCache = async (path, linkData, config) => {
     // Parse RPC result (returns array with single row)
     const rpcResult = await rpcResponse.json();
     if (!rpcResult || rpcResult.length === 0) {
-      throw new Error('RPC upsert_download_cache returned no rows');
+      throw new Error('RPC download_upsert_download_cache returned no rows');
     }
 
     // Trigger cleanup probabilistically
