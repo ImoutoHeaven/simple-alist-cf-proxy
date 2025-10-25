@@ -43,6 +43,30 @@ const executeQuery = async (accountId, databaseId, apiToken, sql, params = []) =
 };
 
 /**
+ * Ensure the THROTTLE_PROTECTION table exists in the database
+ * @param {string} accountId
+ * @param {string} databaseId
+ * @param {string} apiToken
+ * @param {string} tableName
+ * @returns {Promise<void>}
+ */
+const ensureTable = async (accountId, databaseId, apiToken, tableName) => {
+  const createTableSql = `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      HOSTNAME_HASH TEXT PRIMARY KEY,
+      HOSTNAME TEXT NOT NULL,
+      ERROR_TIMESTAMP INTEGER,
+      IS_PROTECTED INTEGER,
+      LAST_ERROR_CODE INTEGER
+    )
+  `;
+  await executeQuery(accountId, databaseId, apiToken, createTableSql);
+
+  const indexSql = `CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${tableName}(ERROR_TIMESTAMP)`;
+  await executeQuery(accountId, databaseId, apiToken, indexSql);
+};
+
+/**
  * Check throttle protection status for a hostname
  * @param {string} hostname - Hostname to check
  * @param {Object} config - Throttle configuration
@@ -65,6 +89,8 @@ export const checkThrottle = async (hostname, config) => {
   try {
     const { accountId, databaseId, apiToken } = config;
     const tableName = config.tableName || 'THROTTLE_PROTECTION';
+
+    await ensureTable(accountId, databaseId, apiToken, tableName);
 
     // Calculate hostname hash
     const hostnameHash = await sha256Hash(hostname);
@@ -138,6 +164,8 @@ export const updateThrottle = async (hostname, updateData, config) => {
   try {
     const { accountId, databaseId, apiToken } = config;
     const tableName = config.tableName || 'THROTTLE_PROTECTION';
+
+    await ensureTable(accountId, databaseId, apiToken, tableName);
 
     // Calculate hostname hash
     const hostnameHash = await sha256Hash(hostname);

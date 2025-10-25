@@ -1,6 +1,53 @@
 import { sha256Hash, calculateIPSubnet } from './utils.js';
 
 /**
+ * Ensure cache, rate limit, and throttle tables exist using a single batch call
+ * @param {D1Database} db
+ * @param {Object} tableNames
+ * @param {string} tableNames.cacheTableName
+ * @param {string} tableNames.rateLimitTableName
+ * @param {string} tableNames.throttleTableName
+ * @returns {Promise<void>}
+ */
+const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttleTableName }) => {
+  const statements = [
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ${cacheTableName} (
+        PATH_HASH TEXT PRIMARY KEY,
+        PATH TEXT NOT NULL,
+        LINK_DATA TEXT NOT NULL,
+        TIMESTAMP INTEGER NOT NULL,
+        HOSTNAME_HASH TEXT
+      )
+    `),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_cache_hostname ON ${cacheTableName}(HOSTNAME_HASH)`),
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ${rateLimitTableName} (
+        IP_HASH TEXT PRIMARY KEY,
+        IP_RANGE TEXT NOT NULL,
+        ACCESS_COUNT INTEGER NOT NULL,
+        LAST_WINDOW_TIME INTEGER NOT NULL,
+        BLOCK_UNTIL INTEGER
+      )
+    `),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_rate_limit_window ON ${rateLimitTableName}(LAST_WINDOW_TIME)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_rate_limit_block ON ${rateLimitTableName}(BLOCK_UNTIL) WHERE BLOCK_UNTIL IS NOT NULL`),
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ${throttleTableName} (
+        HOSTNAME_HASH TEXT PRIMARY KEY,
+        HOSTNAME TEXT NOT NULL,
+        ERROR_TIMESTAMP INTEGER,
+        IS_PROTECTED INTEGER,
+        LAST_ERROR_CODE INTEGER
+      )
+    `),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${throttleTableName}(ERROR_TIMESTAMP)`),
+  ];
+
+  await db.batch(statements);
+};
+
+/**
  * Unified check for D1 binding (RTT 3→1 optimization)
  * Uses db.batch() to execute Rate Limit + Cache + Throttle in a single transaction
  * @param {string} path - File path
@@ -29,6 +76,8 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   const throttleTimeWindow = config.throttleTimeWindow ?? 60;
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
+
+  await ensureAllTables(db, { cacheTableName, rateLimitTableName, throttleTableName });
 
   console.log('[Unified Check D1] Starting unified check for path:', path);
 

@@ -35,6 +35,53 @@ const executeQuery = async (accountId, databaseId, apiToken, sql, params = []) =
 };
 
 /**
+ * Ensure cache, rate limit, and throttle tables exist before issuing queries
+ * @param {string} accountId
+ * @param {string} databaseId
+ * @param {string} apiToken
+ * @param {Object} tableNames
+ * @param {string} tableNames.cacheTableName
+ * @param {string} tableNames.rateLimitTableName
+ * @param {string} tableNames.throttleTableName
+ * @returns {Promise<void>}
+ */
+const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName, rateLimitTableName, throttleTableName }) => {
+  await executeQuery(accountId, databaseId, apiToken, `
+    CREATE TABLE IF NOT EXISTS ${cacheTableName} (
+      PATH_HASH TEXT PRIMARY KEY,
+      PATH TEXT NOT NULL,
+      LINK_DATA TEXT NOT NULL,
+      TIMESTAMP INTEGER NOT NULL,
+      HOSTNAME_HASH TEXT
+    )
+  `);
+  await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_cache_hostname ON ${cacheTableName}(HOSTNAME_HASH)`);
+
+  await executeQuery(accountId, databaseId, apiToken, `
+    CREATE TABLE IF NOT EXISTS ${rateLimitTableName} (
+      IP_HASH TEXT PRIMARY KEY,
+      IP_RANGE TEXT NOT NULL,
+      ACCESS_COUNT INTEGER NOT NULL,
+      LAST_WINDOW_TIME INTEGER NOT NULL,
+      BLOCK_UNTIL INTEGER
+    )
+  `);
+  await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_rate_limit_window ON ${rateLimitTableName}(LAST_WINDOW_TIME)`);
+  await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_rate_limit_block ON ${rateLimitTableName}(BLOCK_UNTIL) WHERE BLOCK_UNTIL IS NOT NULL`);
+
+  await executeQuery(accountId, databaseId, apiToken, `
+    CREATE TABLE IF NOT EXISTS ${throttleTableName} (
+      HOSTNAME_HASH TEXT PRIMARY KEY,
+      HOSTNAME TEXT NOT NULL,
+      ERROR_TIMESTAMP INTEGER,
+      IS_PROTECTED INTEGER,
+      LAST_ERROR_CODE INTEGER
+    )
+  `);
+  await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${throttleTableName}(ERROR_TIMESTAMP)`);
+};
+
+/**
  * Unified check for D1-REST (RTT 3→1-2 optimization)
  * Uses D1 REST API to execute multiple queries
  * @param {string} path - File path
@@ -59,6 +106,8 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
   const throttleTimeWindow = config.throttleTimeWindow ?? 60;
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
+
+  await ensureAllTables(accountId, databaseId, apiToken, { cacheTableName, rateLimitTableName, throttleTableName });
 
   console.log('[Unified Check D1-REST] Starting unified check for path:', path);
 
