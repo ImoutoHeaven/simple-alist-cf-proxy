@@ -149,6 +149,15 @@ const resolveConfig = (env = {}) => {
   const throttleProtectHostname = normalizeString(env.THROTTLE_PROTECT_HOSTNAME);
   const throttleTimeWindow = normalizeString(env.THROTTLE_TIME_WINDOW, '60s');
   const throttleTimeWindowSeconds = parseWindowTime(throttleTimeWindow);
+  const throttleProtectHttpCodeRaw = normalizeString(env.THROTTLE_PROTECT_HTTP_CODE, '429,500,503');
+  const throttleProtectHttpCodes = throttleProtectHttpCodeRaw
+    ? throttleProtectHttpCodeRaw
+        .split(',')
+        .map((code) => code.trim())
+        .filter((code) => code.length > 0)
+        .map((code) => Number.parseInt(code, 10))
+        .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
+    : [];
 
   const throttleHostnamePatterns = throttleProtectHostname
     ? throttleProtectHostname.split(',').map((p) => p.trim()).filter((p) => p.length > 0)
@@ -223,6 +232,7 @@ const resolveConfig = (env = {}) => {
         tableName: throttleTableName,
         throttleTimeWindow: throttleTimeWindowSeconds,
         cleanupProbability,
+        protectedHttpCodes: throttleProtectHttpCodes,
       };
     } else if (normalizedDbMode === 'd1-rest') {
       if (!d1AccountId || !d1DatabaseId || !d1ApiToken) {
@@ -235,6 +245,7 @@ const resolveConfig = (env = {}) => {
         tableName: throttleTableName,
         throttleTimeWindow: throttleTimeWindowSeconds,
         cleanupProbability,
+        protectedHttpCodes: throttleProtectHttpCodes,
       };
     } else if (normalizedDbMode === 'custom-pg-rest') {
       if (!postgrestUrl || !verifyHeader || !verifySecret) {
@@ -247,6 +258,7 @@ const resolveConfig = (env = {}) => {
         tableName: throttleTableName,
         throttleTimeWindow: throttleTimeWindowSeconds,
         cleanupProbability,
+        protectedHttpCodes: throttleProtectHttpCodes,
       };
     }
   }
@@ -824,8 +836,11 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
   if (config.throttleEnabled && throttleManager && throttleHostname) {
     try {
       const statusCode = response.status;
+      const protectedHttpCodes = Array.isArray(config.throttleConfig?.protectedHttpCodes)
+        ? config.throttleConfig.protectedHttpCodes
+        : [];
 
-      if (statusCode >= 400 && statusCode < 600) {
+      if (protectedHttpCodes.includes(statusCode)) {
         // 4xx or 5xx error - set protection
         console.log(`[Throttle] Error ${statusCode} from ${throttleHostname}, setting protection`);
 
