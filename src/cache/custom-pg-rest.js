@@ -1,4 +1,4 @@
-import { sha256Hash } from '../utils.js';
+import { sha256Hash, extractHostname } from '../utils.js';
 
 /**
  * Execute query via PostgREST API
@@ -183,6 +183,22 @@ export const saveCache = async (path, linkData, config) => {
       return;
     }
 
+    // Calculate hostname hash from linkData.url
+    let hostnameHash = null;
+    if (linkData && linkData.url) {
+      try {
+        const hostname = extractHostname(linkData.url);
+        if (hostname) {
+          hostnameHash = await sha256Hash(hostname);
+          console.log(`[Cache] Calculated hostname hash for ${hostname}: ${hostnameHash}`);
+        } else {
+          console.warn(`[Cache] Failed to extract hostname from URL: ${linkData.url}`);
+        }
+      } catch (error) {
+        console.error('[Cache] Failed to calculate hostname hash:', error instanceof Error ? error.message : String(error));
+      }
+    }
+
     const now = Math.floor(Date.now() / 1000);
 
     // Probabilistic cleanup helper
@@ -209,13 +225,14 @@ export const saveCache = async (path, linkData, config) => {
       }
     };
 
-    // Call atomic RPC stored procedure
+    // Call atomic RPC stored procedure (with hostname_hash)
     const rpcUrl = `${postgrestUrl}/rpc/download_upsert_download_cache`;
     const rpcBody = {
       p_path_hash: pathHash,
       p_path: path,
       p_link_data: JSON.stringify(linkData),
       p_timestamp: now,
+      p_hostname_hash: hostnameHash,
       p_table_name: tableName,
     };
 
@@ -238,6 +255,8 @@ export const saveCache = async (path, linkData, config) => {
     if (!rpcResult || rpcResult.length === 0) {
       throw new Error('RPC download_upsert_download_cache returned no rows');
     }
+
+    console.log(`[Cache] Saved with hostname_hash: ${hostnameHash}`);
 
     // Trigger cleanup probabilistically
     triggerCleanup();

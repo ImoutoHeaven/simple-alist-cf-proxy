@@ -2,6 +2,7 @@
 import { createCacheManager } from './cache/factory.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
+import { unifiedCheck } from './unified-check.js';
 import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern } from './utils.js';
 
 // Configuration constants
@@ -548,34 +549,170 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
 
   const clientIP = request.headers.get("CF-Connecting-IP") || "";
 
-  if (rateLimiter && config.rateLimitEnabled && clientIP) {
+  // ========================================
+  // UNIFIED CHECK (RTT 3→1 OPTIMIZATION)
+  // ========================================
+  let unifiedResult = null;
+  let cacheHit = false;
+  let linkData = null;
+  
+  // Only use unified check if using custom-pg-rest mode
+  if (config.dbMode === 'custom-pg-rest' && config.rateLimitEnabled) {
     try {
-      const rateLimitResult = await rateLimiter.checkRateLimit(clientIP, { ...config.rateLimitConfig, ctx });
-      if (!rateLimitResult.allowed) {
-        if (rateLimitResult.error) {
-          console.error('[Rate Limit] fail-closed error:', rateLimitResult.error);
-          return createErrorResponse(origin, 500, rateLimitResult.error);
+      console.log('[Unified Check] Using unified check for RTT optimization');
+
+      const rateLimitConfig = config.rateLimitConfig || {};
+      const cacheConfig = config.cacheConfig || {};
+      const throttleConfig = config.throttleConfig || {};
+      const limitConfigValue = rateLimitConfig.limit ?? config.ipSubnetLimit;
+      
+      unifiedResult = await unifiedCheck(path, clientIP, {
+        postgrestUrl: rateLimitConfig.postgrestUrl,
+        verifyHeader: rateLimitConfig.verifyHeader,
+        verifySecret: rateLimitConfig.verifySecret,
+        linkTTL: cacheConfig.linkTTL ?? 1800,
+        cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
+        windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
+        limit: limitConfigValue ?? 100,
+        blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
+        ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
+        ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
+        rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
+        throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
+        throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+      });
+      
+      // Check rate limit result
+      if (!unifiedResult.rateLimit.allowed) {
+        if (unifiedResult.rateLimit.error) {
+          console.error('[Rate Limit] fail-closed error:', unifiedResult.rateLimit.error);
+          return createErrorResponse(origin, 500, unifiedResult.rateLimit.error);
         }
+        
         const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
         console.warn(
           '[Rate Limit] Subnet blocked:',
-          rateLimitResult.ipSubnet || clientIP,
+          unifiedResult.rateLimit.ipSubnet || clientIP,
           `limit=${config.ipSubnetLimit}`,
           `window=${windowLabel}`,
-          `retryAfter=${rateLimitResult.retryAfter || 0}s`
+          `retryAfter=${unifiedResult.rateLimit.retryAfter || 0}s`
         );
         return createRateLimitResponse(
           origin,
-          rateLimitResult.ipSubnet || clientIP,
+          unifiedResult.rateLimit.ipSubnet || clientIP,
           config.ipSubnetLimit,
           windowLabel,
-          rateLimitResult.retryAfter
+          unifiedResult.rateLimit.retryAfter
         );
       }
-    } catch (error) {
-      console.error('[Rate Limit] Unexpected error:', error instanceof Error ? error.message : String(error));
-      if (config.rateLimitConfig?.pgErrorHandle === 'fail-closed') {
-        return createErrorResponse(origin, 500, 'Rate limit check failed');
+      
+      // Check cache result
+      if (unifiedResult.cache.hit) {
+        cacheHit = true;
+        linkData = unifiedResult.cache.linkData;
+        console.log('[Cache] Hit from unified check');
+      } else {
+        console.log('[Cache] Miss from unified check');
+      }
+      
+      // Check throttle result (if we have cache hit with hostname_hash)
+      if (config.throttleEnabled && unifiedResult.throttle.status === 'protected') {
+        console.log(`[Throttle] Protected from unified check, returning error ${unifiedResult.throttle.errorCode}, retry after ${unifiedResult.throttle.retryAfter}s`);
+        
+        const safeHeaders = new Headers();
+        safeHeaders.set("content-type", "application/json;charset=UTF-8");
+        safeHeaders.set("Access-Control-Allow-Origin", origin);
+        safeHeaders.append("Vary", "Origin");
+        safeHeaders.set("X-Throttle-Protected", "true");
+        safeHeaders.set("X-Throttle-Retry-After", String(unifiedResult.throttle.retryAfter));
+        
+        return new Response(
+          JSON.stringify({
+            code: unifiedResult.throttle.errorCode || 503,
+            message: `Service temporarily unavailable (throttle protected, retry after ${unifiedResult.throttle.retryAfter}s)`
+          }),
+          {
+            status: unifiedResult.throttle.errorCode || 503,
+            headers: safeHeaders
+          }
+        );
+      }
+      
+      // Trigger probabilistic cleanup for rate limit
+      if (rateLimiter && config.rateLimitConfig) {
+        const probability = config.rateLimitConfig.cleanupProbability || 0.01;
+        if (Math.random() < probability) {
+          console.log(`[Rate Limit Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
+          // Import and call cleanup function
+          const { cleanupExpiredRecords } = await import('./ratelimit/custom-pg-rest.js');
+          const cleanupPromise = cleanupExpiredRecords(
+            config.rateLimitConfig.postgrestUrl,
+            config.rateLimitConfig.verifyHeader,
+            config.rateLimitConfig.verifySecret,
+            config.rateLimitConfig.tableName,
+            config.rateLimitConfig.windowTimeSeconds
+          ).catch((error) => {
+            console.error('[Rate Limit Cleanup] Failed:', error instanceof Error ? error.message : String(error));
+          });
+          
+          if (ctx && ctx.waitUntil) {
+            ctx.waitUntil(cleanupPromise);
+          }
+        }
+      }
+      
+  } catch (error) {
+    console.error('[Unified Check] Failed:', error instanceof Error ? error.message : String(error));
+    console.error('[Unified Check] Stack:', error.stack);
+
+    // Respect PG_ERROR_HANDLE configuration
+    const pgErrorHandle = config.rateLimitConfig?.pgErrorHandle || 'fail-closed';
+
+    if (pgErrorHandle === 'fail-open') {
+      console.warn('[Unified Check] Fail-open mode: allowing request despite error');
+      // Reset unified check outputs so downstream logic can run without them
+      unifiedResult = null;
+      cacheHit = false;
+      linkData = null;
+      // Continue execution without returning
+    } else {
+      console.error('[Unified Check] Fail-closed mode: blocking request');
+      return createErrorResponse(origin, 500, `Unified check failed: ${error.message}`);
+    }
+  }
+} else {
+    // Fallback to original logic for non-custom-pg-rest modes or when rate limit is disabled
+    console.log('[Worker] Using original separate checks (non-custom-pg-rest mode or rate limit disabled)');
+    
+    if (rateLimiter && config.rateLimitEnabled && clientIP) {
+      try {
+        const rateLimitResult = await rateLimiter.checkRateLimit(clientIP, { ...config.rateLimitConfig, ctx });
+        if (!rateLimitResult.allowed) {
+          if (rateLimitResult.error) {
+            console.error('[Rate Limit] fail-closed error:', rateLimitResult.error);
+            return createErrorResponse(origin, 500, rateLimitResult.error);
+          }
+          const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
+          console.warn(
+            '[Rate Limit] Subnet blocked:',
+            rateLimitResult.ipSubnet || clientIP,
+            `limit=${config.ipSubnetLimit}`,
+            `window=${windowLabel}`,
+            `retryAfter=${rateLimitResult.retryAfter || 0}s`
+          );
+          return createRateLimitResponse(
+            origin,
+            rateLimitResult.ipSubnet || clientIP,
+            config.ipSubnetLimit,
+            windowLabel,
+            rateLimitResult.retryAfter
+          );
+        }
+      } catch (error) {
+        console.error('[Rate Limit] Unexpected error:', error instanceof Error ? error.message : String(error));
+        if (config.rateLimitConfig?.pgErrorHandle === 'fail-closed') {
+          return createErrorResponse(origin, 500, 'Rate limit check failed');
+        }
       }
     }
   }
@@ -648,19 +785,19 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
     }
   }
 
-  // Check cache (if enabled)
+  // Check cache (if not already resolved by unified check)
   let res;
-  if (cacheManager) {
+  if (cacheHit && linkData) {
+    console.log(`[Cache] Using cached linkData from unified check`);
+    res = { code: 200, data: linkData };
+  } else if (cacheManager && !unifiedResult) {
     try {
       const cached = await cacheManager.checkCache(path, { ...config.cacheConfig, ctx });
       if (cached && cached.linkData) {
         console.log(`[Cache] Hit for path: ${path}`);
-        // Use cached linkData, skip API call
         res = { code: 200, data: cached.linkData };
-        // Skip to download logic below
       }
     } catch (error) {
-      // Cache failure should not block downloads, fall back to API call
       console.error('[Cache] Check failed, fallback to API:', error instanceof Error ? error.message : String(error));
     }
   }
@@ -750,7 +887,12 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
   let throttleHostname = null;
   let operationMode = 'normal_operation'; // 'normal_operation' or 'resume_operation'
 
-  if (config.throttleEnabled && throttleManager) {
+  const shouldCheckThrottle = config.throttleEnabled && throttleManager && (
+    !unifiedResult ||
+    (unifiedResult && (!unifiedResult.cache.hit || !unifiedResult.cache.hostnameHash))
+  );
+
+  if (shouldCheckThrottle) {
     try {
       // Extract hostname from download URL
       throttleHostname = extractHostname(downloadUrl);
@@ -803,6 +945,17 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
     } catch (error) {
       // Throttle check failure should not block downloads
       console.error('[Throttle] Check failed, proceeding with download:', error instanceof Error ? error.message : String(error));
+    }
+  } else if (
+    unifiedResult &&
+    unifiedResult.cache &&
+    unifiedResult.cache.hit &&
+    unifiedResult.cache.hostnameHash
+  ) {
+    throttleHostname = extractHostname(downloadUrl);
+    throttleStatus = unifiedResult.throttle;
+    if (unifiedResult.throttle.status === 'resume_operation') {
+      operationMode = 'resume_operation';
     }
   }
 

@@ -201,7 +201,7 @@ export const checkRateLimit = async (ip, config) => {
 /**
  * Remove expired rate limit records.
  */
-const cleanupExpiredRecords = async (postgrestUrl, verifyHeader, verifySecret, tableName, windowTimeSeconds) => {
+export const cleanupExpiredRecords = async (postgrestUrl, verifyHeader, verifySecret, tableName, windowTimeSeconds) => {
   const now = Math.floor(Date.now() / 1000);
   const cutoffTime = now - (windowTimeSeconds * 2);
 
