@@ -210,6 +210,10 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   };
 
   // Parse throttle result (only if cache hit with hostname_hash)
+  // BREAKING CHANGE: IS_PROTECTED semantics
+  //   1 = protected (error detected)
+  //   0 = normal operation (initialized or recovered)
+  //   NULL = record does not exist
   let throttleResult = {
     status: 'normal_operation',
     recordExists: false,
@@ -242,7 +246,13 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
           throttleResult.status = 'resume_operation';
           console.log('[Unified Check D1] Throttle resume_operation (time window expired)');
         }
+      } else if (throttleQueryResult.IS_PROTECTED === 0) {
+        console.log('[Unified Check D1] Throttle normal_operation (IS_PROTECTED = 0)');
+      } else {
+        console.log('[Unified Check D1] Throttle normal_operation (IS_PROTECTED = NULL, invalid state)');
       }
+    } else {
+      console.log('[Unified Check D1] Throttle normal_operation (no record found)');
     }
   } else {
     console.log('[Unified Check D1] Skipping throttle check (no hostname_hash from cache)');

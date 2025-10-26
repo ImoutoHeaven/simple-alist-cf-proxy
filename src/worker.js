@@ -551,6 +551,74 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
 
   const clientIP = request.headers.get("CF-Connecting-IP") || "";
 
+  // Initialize check flags from config (each *_CHECK only controls itself)
+  let shouldCheckSign = config.signCheck;
+  let shouldCheckHash = config.hashCheck;
+  let shouldCheckWorker = config.workerCheck;
+  let shouldCheckIP = config.ipCheck;
+
+  // Apply action overrides (unless 'asis' is specified)
+  // Each skip-* only affects its own check, completely decoupled
+  if (!actions.includes('asis')) {
+    if (actions.includes('skip-sign')) {
+      shouldCheckSign = false;
+    }
+    if (actions.includes('skip-hash')) {
+      shouldCheckHash = false;
+    }
+    if (actions.includes('skip-worker')) {
+      shouldCheckWorker = false;
+    }
+    if (actions.includes('skip-ip')) {
+      shouldCheckIP = false;
+    }
+  }
+
+  // Sign verification
+  const sign = url.searchParams.get("sign") ?? "";
+  if (shouldCheckSign) {
+    const verifyResult = await verify("sign", path, sign, config.token);
+    if (verifyResult !== "") {
+      return createUnauthorizedResponse(origin, verifyResult);
+    }
+  }
+
+  // HashSign verification
+  const hashSign = url.searchParams.get("hashSign") ?? "";
+  if (shouldCheckHash) {
+    const base64Path = base64Encode(path);
+    const hashVerifyResult = await verify("hashSign", base64Path, hashSign, config.token);
+    if (hashVerifyResult !== "") {
+      return createUnauthorizedResponse(origin, hashVerifyResult);
+    }
+  }
+
+  // WorkerSign verification
+  const workerSign = url.searchParams.get("workerSign") ?? "";
+  if (shouldCheckWorker) {
+    const workerVerifyData = JSON.stringify({ path: path, worker_addr: config.workerAddress });
+    const workerVerifyResult = await verify("workerSign", workerVerifyData, workerSign, config.token);
+    if (workerVerifyResult !== "") {
+      return createUnauthorizedResponse(origin, workerVerifyResult);
+    }
+  }
+
+  // IpSign verification
+  const ipSign = url.searchParams.get("ipSign") ?? "";
+  if (shouldCheckIP) {
+    if (!ipSign) {
+      return createUnauthorizedResponse(origin, "ipSign missing");
+    }
+    if (!clientIP) {
+      return createUnauthorizedResponse(origin, "client ip missing");
+    }
+    const ipVerifyData = JSON.stringify({ path: path, ip: clientIP });
+    const ipVerifyResult = await verify("ipSign", ipVerifyData, ipSign, config.token);
+    if (ipVerifyResult !== "") {
+      return createUnauthorizedResponse(origin, ipVerifyResult);
+    }
+  }
+
   // ========================================
   // UNIFIED CHECK (RTT 3→1 OPTIMIZATION)
   // ========================================
@@ -769,74 +837,6 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
           return createErrorResponse(origin, 500, 'Rate limit check failed');
         }
       }
-    }
-  }
-
-  // Initialize check flags from config (each *_CHECK only controls itself)
-  let shouldCheckSign = config.signCheck;
-  let shouldCheckHash = config.hashCheck;
-  let shouldCheckWorker = config.workerCheck;
-  let shouldCheckIP = config.ipCheck;
-
-  // Apply action overrides (unless 'asis' is specified)
-  // Each skip-* only affects its own check, completely decoupled
-  if (!actions.includes('asis')) {
-    if (actions.includes('skip-sign')) {
-      shouldCheckSign = false;
-    }
-    if (actions.includes('skip-hash')) {
-      shouldCheckHash = false;
-    }
-    if (actions.includes('skip-worker')) {
-      shouldCheckWorker = false;
-    }
-    if (actions.includes('skip-ip')) {
-      shouldCheckIP = false;
-    }
-  }
-
-  // Sign verification
-  const sign = url.searchParams.get("sign") ?? "";
-  if (shouldCheckSign) {
-    const verifyResult = await verify("sign", path, sign, config.token);
-    if (verifyResult !== "") {
-      return createUnauthorizedResponse(origin, verifyResult);
-    }
-  }
-
-  // HashSign verification
-  const hashSign = url.searchParams.get("hashSign") ?? "";
-  if (shouldCheckHash) {
-    const base64Path = base64Encode(path);
-    const hashVerifyResult = await verify("hashSign", base64Path, hashSign, config.token);
-    if (hashVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, hashVerifyResult);
-    }
-  }
-
-  // WorkerSign verification
-  const workerSign = url.searchParams.get("workerSign") ?? "";
-  if (shouldCheckWorker) {
-    const workerVerifyData = JSON.stringify({ path: path, worker_addr: config.workerAddress });
-    const workerVerifyResult = await verify("workerSign", workerVerifyData, workerSign, config.token);
-    if (workerVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, workerVerifyResult);
-    }
-  }
-
-  // IpSign verification
-  const ipSign = url.searchParams.get("ipSign") ?? "";
-  if (shouldCheckIP) {
-    if (!ipSign) {
-      return createUnauthorizedResponse(origin, "ipSign missing");
-    }
-    if (!clientIP) {
-      return createUnauthorizedResponse(origin, "client ip missing");
-    }
-    const ipVerifyData = JSON.stringify({ path: path, ip: clientIP });
-    const ipVerifyResult = await verify("ipSign", ipVerifyData, ipSign, config.token);
-    if (ipVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, ipVerifyResult);
     }
   }
 
@@ -1069,6 +1069,10 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
         }
       } else if (statusCode >= 200 && statusCode < 400) {
         // Success - check operation mode and record existence
+        // BREAKING CHANGE: IS_PROTECTED semantics
+        //   1 = protected (error detected)
+        //   0 = normal operation (initialized or recovered)
+        //   NULL = record does not exist
         if (operationMode === 'resume_operation') {
           // Clear protection status (was protected, now recovered)
           console.log(`[Throttle] Success from ${throttleHostname}, clearing protection (resume operation)`);
@@ -1078,7 +1082,7 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
             throttleHostname,
             {
               errorTimestamp: null,
-              isProtected: null,
+              isProtected: 0,  // Changed from null to 0
               errorCode: null,
             },
             { ...config.throttleConfig, ctx }
@@ -1088,7 +1092,7 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
             ctx.waitUntil(updatePromise);
           }
         } else if (operationMode === 'normal_operation' && throttleStatus && !throttleStatus.recordExists) {
-          // First time accessing this hostname - create record with null protection
+          // First time accessing this hostname - create record with IS_PROTECTED = 0 (normal operation)
           console.log(`[Throttle] Success from ${throttleHostname}, creating initial record (first time)`);
 
           // Don't await - async update (non-blocking)
@@ -1096,7 +1100,7 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
             throttleHostname,
             {
               errorTimestamp: null,
-              isProtected: null,
+              isProtected: 0,  // Changed from null to 0
               errorCode: null,
             },
             { ...config.throttleConfig, ctx }

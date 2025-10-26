@@ -140,15 +140,20 @@ export const unifiedCheck = async (path, clientIP, config) => {
   };
   
   // Parse throttle result
+  // BREAKING CHANGE: IS_PROTECTED semantics
+  //   1 = protected (error detected)
+  //   0 = normal operation (initialized or recovered)
+  //   NULL = record does not exist
+
   let throttleResult = {
     status: 'normal_operation',
-    recordExists: row.throttle_is_protected !== null,
+    recordExists: row.throttle_record_exists === true,
     isProtected: row.throttle_is_protected,
     errorTimestamp: row.throttle_error_timestamp,
     errorCode: row.throttle_error_code,
     retryAfter: 0,
   };
-  
+
   if (row.throttle_is_protected === 1) {
     const errorTimestamp = parseInt(row.throttle_error_timestamp, 10);
     if (Number.isNaN(errorTimestamp)) {
@@ -157,7 +162,7 @@ export const unifiedCheck = async (path, clientIP, config) => {
       console.log('[Unified Check] Throttle PROTECTED with unknown timestamp, default retry after:', throttleResult.retryAfter);
     } else {
       const timeSinceError = now - errorTimestamp;
-    
+
       if (timeSinceError < throttleWindow) {
         throttleResult.status = 'protected';
         throttleResult.retryAfter = throttleWindow - timeSinceError;
@@ -167,8 +172,10 @@ export const unifiedCheck = async (path, clientIP, config) => {
         console.log('[Unified Check] Throttle resume_operation (time window expired)');
       }
     }
+  } else if (row.throttle_is_protected === 0) {
+    console.log('[Unified Check] Throttle normal_operation (IS_PROTECTED = 0)');
   } else {
-    console.log('[Unified Check] Throttle normal_operation');
+    console.log('[Unified Check] Throttle normal_operation (no record)');
   }
   
   console.log('[Unified Check] Completed successfully');

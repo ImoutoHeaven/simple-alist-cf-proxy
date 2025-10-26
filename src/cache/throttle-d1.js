@@ -71,9 +71,17 @@ export const checkThrottle = async (hostname, config) => {
       return { status: 'normal_operation', recordExists: false };
     }
 
+    // BREAKING CHANGE: IS_PROTECTED semantics
+    //   1 = protected (error detected)
+    //   0 = normal operation (initialized or recovered)
+    //   NULL = invalid state (should not exist in valid records)
     // Check protection status
-    if (result.IS_PROTECTED !== 1) {
-      // Not protected - normal operation (record exists)
+    if (result.IS_PROTECTED === 0) {
+      // Normal operation (record exists with IS_PROTECTED = 0)
+      return { status: 'normal_operation', recordExists: true };
+    } else if (result.IS_PROTECTED !== 1) {
+      // IS_PROTECTED is NULL or other invalid value - treat as normal but log warning
+      console.warn('[Throttle] Invalid IS_PROTECTED value:', result.IS_PROTECTED, 'for hostname:', hostname);
       return { status: 'normal_operation', recordExists: true };
     }
 
@@ -203,7 +211,7 @@ export const updateThrottle = async (hostname, updateData, config) => {
 
 /**
  * Clean up expired records from the database
- * Removes records where IS_PROTECTED IS NULL and ERROR_TIMESTAMP is older than throttleTimeWindow * 2
+ * BREAKING CHANGE: Removes records where IS_PROTECTED = 0 and ERROR_TIMESTAMP is older than throttleTimeWindow * 2
  * @param {D1Database} db - D1 Database instance
  * @param {string} tableName - Table name
  * @param {number} throttleTimeWindow - Time window in seconds
@@ -216,10 +224,10 @@ const cleanupExpiredThrottle = async (db, tableName, throttleTimeWindow) => {
   try {
     console.log(`[Throttle Cleanup] Executing DELETE query (cutoff: ${cutoffTime}, timeWindow: ${throttleTimeWindow}s)`);
 
-    // Delete records where IS_PROTECTED IS NULL and ERROR_TIMESTAMP is old or NULL
+    // Delete records where IS_PROTECTED = 0 and ERROR_TIMESTAMP is old or NULL
     const deleteSql = `
       DELETE FROM ${tableName}
-      WHERE IS_PROTECTED IS NULL
+      WHERE IS_PROTECTED = 0
         AND (ERROR_TIMESTAMP IS NULL OR ERROR_TIMESTAMP < ?)
     `;
     const result = await db.prepare(deleteSql).bind(cutoffTime).run();

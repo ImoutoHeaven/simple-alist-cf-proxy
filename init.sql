@@ -150,6 +150,11 @@ $$ LANGUAGE plpgsql;
 -- ========================================
 -- Optional: Throttle Cleanup Function (PostgreSQL)
 -- ========================================
+-- BREAKING CHANGE: IS_PROTECTED semantics changed
+--   1 = protected (error detected)
+--   0 = normal operation (initialized or recovered)
+--   NULL = record does not exist (query result only)
+-- Cleanup: Delete records with IS_PROTECTED = 0 and expired ERROR_TIMESTAMP
 CREATE OR REPLACE FUNCTION download_cleanup_throttle_protection(
   p_ttl_seconds INTEGER,
   p_table_name TEXT DEFAULT 'THROTTLE_PROTECTION'
@@ -161,7 +166,7 @@ DECLARE
 BEGIN
   sql := format(
     'DELETE FROM %1$I
-     WHERE "IS_PROTECTED" IS NULL
+     WHERE "IS_PROTECTED" = 0
        AND ("ERROR_TIMESTAMP" IS NULL OR EXTRACT(EPOCH FROM NOW())::INTEGER - "ERROR_TIMESTAMP" > $1)',
     p_table_name
   );
@@ -315,6 +320,7 @@ RETURNS TABLE(
   rate_block_until INTEGER,
 
   -- Throttle result (nullable if not found)
+  throttle_record_exists BOOLEAN,
   throttle_is_protected INTEGER,
   throttle_error_timestamp INTEGER,
   throttle_error_code INTEGER
@@ -335,7 +341,8 @@ BEGIN
   EXECUTE cache_sql INTO cache_rec USING p_path_hash;
 
   -- Check if cache exists and is not expired
-  IF cache_rec IS NOT NULL AND (p_now - cache_rec."TIMESTAMP") <= p_cache_ttl THEN
+  -- Note: EXECUTE INTO RECORD does not set FOUND correctly, check field instead
+  IF cache_rec."TIMESTAMP" IS NOT NULL AND (p_now - cache_rec."TIMESTAMP") <= p_cache_ttl THEN
     cache_link_data := cache_rec."LINK_DATA";
     cache_timestamp := cache_rec."TIMESTAMP";
     cache_hostname_hash_var := cache_rec."HOSTNAME_HASH";
@@ -371,17 +378,23 @@ BEGIN
     );
     EXECUTE throttle_sql INTO throttle_rec USING cache_hostname_hash_var;
 
-    IF throttle_rec IS NOT NULL THEN
+    -- Note: EXECUTE INTO RECORD does not set FOUND correctly, check field instead
+    IF throttle_rec."IS_PROTECTED" IS NOT NULL THEN
+      -- Record exists in database
+      throttle_record_exists := TRUE;
       throttle_is_protected := throttle_rec."IS_PROTECTED";
       throttle_error_timestamp := throttle_rec."ERROR_TIMESTAMP";
       throttle_error_code := throttle_rec."LAST_ERROR_CODE";
     ELSE
+      -- Record does not exist in database
+      throttle_record_exists := FALSE;
       throttle_is_protected := NULL;
       throttle_error_timestamp := NULL;
       throttle_error_code := NULL;
     END IF;
   ELSE
     -- No cache or no hostname_hash - skip throttle check
+    throttle_record_exists := FALSE;
     throttle_is_protected := NULL;
     throttle_error_timestamp := NULL;
     throttle_error_code := NULL;

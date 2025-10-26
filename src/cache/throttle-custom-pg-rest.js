@@ -138,9 +138,17 @@ export const checkThrottle = async (hostname, config) => {
 
     const result = records[0];
 
+    // BREAKING CHANGE: IS_PROTECTED semantics
+    //   1 = protected (error detected)
+    //   0 = normal operation (initialized or recovered)
+    //   NULL = invalid state (should not exist in valid records)
     // Check protection status
-    if (result.IS_PROTECTED !== 1) {
-      // Not protected - normal operation (record exists)
+    if (result.IS_PROTECTED === 0) {
+      // Normal operation (record exists with IS_PROTECTED = 0)
+      return { status: 'normal_operation', recordExists: true };
+    } else if (result.IS_PROTECTED !== 1) {
+      // IS_PROTECTED is NULL or other invalid value - treat as normal but log warning
+      console.warn('[Throttle] Invalid IS_PROTECTED value:', result.IS_PROTECTED, 'for hostname:', hostname);
       return { status: 'normal_operation', recordExists: true };
     }
 
