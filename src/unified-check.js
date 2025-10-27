@@ -1,4 +1,4 @@
-import { sha256Hash, calculateIPSubnet } from './utils.js';
+import { sha256Hash, calculateIPSubnet, applyVerifyHeaders, hasVerifyCredentials } from './utils.js';
 
 /**
  * Unified check that performs Rate Limit + Cache + Throttle in a single database RTT
@@ -8,7 +8,7 @@ import { sha256Hash, calculateIPSubnet } from './utils.js';
  * @returns {Promise<{cache, rateLimit, throttle}>}
  */
 export const unifiedCheck = async (path, clientIP, config) => {
-  if (!config.postgrestUrl || !config.verifyHeader || !config.verifySecret) {
+  if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
     throw new Error('[Unified Check] Missing PostgREST configuration');
   }
 
@@ -61,12 +61,12 @@ export const unifiedCheck = async (path, clientIP, config) => {
   
   console.log('[Unified Check] Calling RPC with params:', JSON.stringify(rpcBody, null, 2));
   
+  const rpcHeaders = { 'Content-Type': 'application/json' };
+  applyVerifyHeaders(rpcHeaders, config.verifyHeader, config.verifySecret);
+
   const response = await fetch(rpcUrl, {
     method: 'POST',
-    headers: {
-      [config.verifyHeader]: config.verifySecret,
-      'Content-Type': 'application/json',
-    },
+    headers: rpcHeaders,
     body: JSON.stringify(rpcBody),
   });
   

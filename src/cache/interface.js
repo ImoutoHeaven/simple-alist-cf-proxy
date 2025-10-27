@@ -22,8 +22,8 @@
  * @param {string} config.databaseId - D1 database ID (for D1-REST)
  * @param {string} config.apiToken - Cloudflare API token (for D1-REST)
  * @param {string} config.postgrestUrl - PostgREST API endpoint (for custom-pg-rest)
- * @param {string} config.verifyHeader - Authentication header name (for custom-pg-rest)
- * @param {string} config.verifySecret - Authentication header value (for custom-pg-rest)
+ * @param {string|string[]} config.verifyHeader - Authentication header name(s) (for custom-pg-rest)
+ * @param {string|string[]} config.verifySecret - Authentication header value(s) (for custom-pg-rest)
  * @param {string} config.tableName - Table name (defaults to 'DOWNLOAD_CACHE_TABLE')
  * @param {number} config.linkTTL - Link TTL in seconds
  * @param {Object} config.ctx - ExecutionContext for waitUntil (optional)

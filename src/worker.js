@@ -5,7 +5,7 @@ import { createRateLimiter } from './ratelimit/factory.js';
 import { unifiedCheck } from './unified-check.js';
 import { unifiedCheckD1 } from './unified-check-d1.js';
 import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
-import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern } from './utils.js';
+import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders } from './utils.js';
 
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
@@ -166,8 +166,22 @@ const resolveConfig = (env = {}) => {
     ? throttleProtectHostname.split(',').map((p) => p.trim()).filter((p) => p.length > 0)
     : [];
 
-  const verifyHeader = normalizeString(env.VERIFY_HEADER);
-  const verifySecret = normalizeString(env.VERIFY_SECRET);
+  const parseVerifyValues = (value) => {
+    if (!value || typeof value !== 'string') {
+      return [];
+    }
+    return value
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+  };
+
+  const verifyHeaders = parseVerifyValues(normalizeString(env.VERIFY_HEADER));
+  const verifySecrets = parseVerifyValues(normalizeString(env.VERIFY_SECRET));
+
+  if (verifyHeaders.length > 0 && verifySecrets.length > 0 && verifyHeaders.length !== verifySecrets.length) {
+    throw new Error('VERIFY_HEADER and VERIFY_SECRET must have the same number of comma-separated entries');
+  }
 
   const d1DatabaseBinding = normalizeString(env.D1_DATABASE_BINDING, 'DB');
   const d1AccountId = normalizeString(env.D1_ACCOUNT_ID);
@@ -207,12 +221,12 @@ const resolveConfig = (env = {}) => {
         throw new Error('DB_MODE is set to "d1-rest" but required environment variables are missing: D1_ACCOUNT_ID, D1_DATABASE_ID, D1_API_TOKEN, LINK_TTL');
       }
     } else if (normalizedDbMode === 'custom-pg-rest') {
-      if (postgrestUrl && verifyHeader && verifySecret && linkTTLSeconds > 0) {
+      if (postgrestUrl && verifyHeaders.length > 0 && verifySecrets.length > 0 && linkTTLSeconds > 0) {
         cacheEnabled = true;
         cacheConfig = {
           postgrestUrl,
-          verifyHeader,
-          verifySecret,
+          verifyHeader: verifyHeaders,
+          verifySecret: verifySecrets,
           tableName: downloadCacheTableName,
           linkTTL: linkTTLSeconds,
           cleanupProbability,
@@ -251,13 +265,13 @@ const resolveConfig = (env = {}) => {
         protectedHttpCodes: throttleProtectHttpCodes,
       };
     } else if (normalizedDbMode === 'custom-pg-rest') {
-      if (!postgrestUrl || !verifyHeader || !verifySecret) {
+      if (!postgrestUrl || verifyHeaders.length === 0 || verifySecrets.length === 0) {
         throw new Error('Throttle protection requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
       }
       throttleConfig = {
         postgrestUrl,
-        verifyHeader,
-        verifySecret,
+        verifyHeader: verifyHeaders,
+        verifySecret: verifySecrets,
         tableName: throttleTableName,
         throttleTimeWindow: throttleTimeWindowSeconds,
         cleanupProbability,
@@ -303,14 +317,14 @@ const resolveConfig = (env = {}) => {
         blockTimeSeconds,
       };
     } else if (normalizedDbMode === 'custom-pg-rest') {
-      if (!postgrestUrl || !verifyHeader || !verifySecret) {
+      if (!postgrestUrl || verifyHeaders.length === 0 || verifySecrets.length === 0) {
         throw new Error('Rate limiting requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
       }
       rateLimitEnabled = true;
       rateLimitConfig = {
         postgrestUrl,
-        verifyHeader,
-        verifySecret,
+        verifyHeader: verifyHeaders,
+        verifySecret: verifySecrets,
         tableName: rateLimitTableName,
         windowTimeSeconds,
         limit: ipSubnetLimit,
@@ -329,8 +343,8 @@ const resolveConfig = (env = {}) => {
     address: String(env.ADDRESS).trim(),
     token: String(env.TOKEN).trim(),
     workerAddress: String(env.WORKER_ADDRESS).trim(),
-    verifyHeader,
-    verifySecret,
+    verifyHeader: verifyHeaders,
+    verifySecret: verifySecrets,
     signCheck: parseBoolean(env.SIGN_CHECK, true),
     hashCheck: parseBoolean(env.HASH_CHECK, true),
     workerCheck: parseBoolean(env.WORKER_CHECK, true),
@@ -951,9 +965,7 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
       Authorization: config.token,
       "CF-Connecting-IP-WORKERS": clientIP, // Forward the client's IP address, since default CF-Connecting-IP will be overwritten by CF, we should include original CF-Connecting-IP and forward it into a new header.
     };
-    if (config.verifyHeader && config.verifySecret) {
-      headers[config.verifyHeader] = config.verifySecret;
-    }
+    applyVerifyHeaders(headers, config.verifyHeader, config.verifySecret);
     let resp = await fetch(`${config.address}/api/fs/link`, {
       method: "POST",
       headers,

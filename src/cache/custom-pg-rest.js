@@ -1,10 +1,10 @@
-import { sha256Hash, extractHostname } from '../utils.js';
+import { sha256Hash, extractHostname, applyVerifyHeaders, hasVerifyCredentials } from '../utils.js';
 
 /**
  * Execute query via PostgREST API
  * @param {string} postgrestUrl - PostgREST API base URL
- * @param {string} verifyHeader - Authentication header name
- * @param {string} verifySecret - Authentication header value
+ * @param {string|string[]} verifyHeader - Authentication header name(s)
+ * @param {string|string[]} verifySecret - Authentication header value(s)
  * @param {string} tableName - Table name
  * @param {string} method - HTTP method (GET, POST, PATCH, DELETE)
  * @param {string} filters - URL query filters (for GET/PATCH/DELETE)
@@ -16,10 +16,10 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
   const url = `${postgrestUrl}/${tableName}${filters ? `?${filters}` : ''}`;
 
   const headers = {
-    [verifyHeader]: verifySecret,
     'Content-Type': 'application/json',
     ...extraHeaders,
   };
+  applyVerifyHeaders(headers, verifyHeader, verifySecret);
 
   const options = {
     method,
@@ -98,7 +98,7 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
  * @returns {Promise<{linkData?: Object} | null>}
  */
 export const checkCache = async (path, config) => {
-  if (!config.postgrestUrl || !config.verifyHeader || !config.verifySecret || !config.linkTTL) {
+  if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret) || !config.linkTTL) {
     return null;
   }
 
@@ -165,7 +165,7 @@ export const checkCache = async (path, config) => {
  * @returns {Promise<void>}
  */
 export const saveCache = async (path, linkData, config) => {
-  if (!config.postgrestUrl || !config.verifyHeader || !config.verifySecret || !config.linkTTL) {
+  if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret) || !config.linkTTL) {
     return;
   }
 
@@ -236,12 +236,12 @@ export const saveCache = async (path, linkData, config) => {
       p_table_name: tableName,
     };
 
+    const rpcHeaders = { 'Content-Type': 'application/json' };
+    applyVerifyHeaders(rpcHeaders, verifyHeader, verifySecret);
+
     const rpcResponse = await fetch(rpcUrl, {
       method: 'POST',
-      headers: {
-        [verifyHeader]: verifySecret,
-        'Content-Type': 'application/json',
-      },
+      headers: rpcHeaders,
       body: JSON.stringify(rpcBody),
     });
 
@@ -270,8 +270,8 @@ export const saveCache = async (path, linkData, config) => {
  * Clean up expired records from the database
  * Removes records older than linkTTL * 2 (double buffer)
  * @param {string} postgrestUrl - PostgREST API base URL
- * @param {string} verifyHeader - Authentication header name
- * @param {string} verifySecret - Authentication header value
+ * @param {string|string[]} verifyHeader - Authentication header name(s)
+ * @param {string|string[]} verifySecret - Authentication header value(s)
  * @param {string} tableName - Table name
  * @param {number} linkTTL - Link TTL in seconds
  * @returns {Promise<number>} - Number of deleted records

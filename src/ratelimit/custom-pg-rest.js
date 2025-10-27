@@ -1,4 +1,4 @@
-import { calculateIPSubnet, sha256Hash } from '../utils.js';
+import { calculateIPSubnet, sha256Hash, applyVerifyHeaders, hasVerifyCredentials } from '../utils.js';
 
 const DEFAULT_TABLE = 'DOWNLOAD_IP_RATELIMIT_TABLE';
 
@@ -9,10 +9,10 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
   const url = `${postgrestUrl}/${tableName}${filters ? `?${filters}` : ''}`;
 
   const headers = {
-    [verifyHeader]: verifySecret,
     'Content-Type': 'application/json',
     ...extraHeaders,
   };
+  applyVerifyHeaders(headers, verifyHeader, verifySecret);
 
   const options = {
     method,
@@ -73,7 +73,7 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
  * Rate limit check via PostgREST RPC.
  */
 export const checkRateLimit = async (ip, config) => {
-  if (!config.postgrestUrl || !config.verifyHeader || !config.verifySecret || !config.windowTimeSeconds || !config.limit) {
+  if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret) || !config.windowTimeSeconds || !config.limit) {
     return { allowed: true };
   }
 
@@ -137,12 +137,12 @@ export const checkRateLimit = async (ip, config) => {
       p_table_name: tableName,
     };
 
+    const rpcHeaders = { 'Content-Type': 'application/json' };
+    applyVerifyHeaders(rpcHeaders, verifyHeader, verifySecret);
+
     const rpcResponse = await fetch(rpcUrl, {
       method: 'POST',
-      headers: {
-        [verifyHeader]: verifySecret,
-        'Content-Type': 'application/json',
-      },
+      headers: rpcHeaders,
       body: JSON.stringify(rpcBody),
     });
 

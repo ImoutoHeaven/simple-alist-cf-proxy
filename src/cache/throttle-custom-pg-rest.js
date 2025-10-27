@@ -1,10 +1,10 @@
-import { sha256Hash } from '../utils.js';
+import { sha256Hash, applyVerifyHeaders, hasVerifyCredentials } from '../utils.js';
 
 /**
  * Execute query via PostgREST API
  * @param {string} postgrestUrl - PostgREST API base URL
- * @param {string} verifyHeader - Authentication header name
- * @param {string} verifySecret - Authentication header value
+ * @param {string|string[]} verifyHeader - Authentication header name(s)
+ * @param {string|string[]} verifySecret - Authentication header value(s)
  * @param {string} tableName - Table name
  * @param {string} method - HTTP method (GET, POST, PATCH, DELETE)
  * @param {string} filters - URL query filters (for GET/PATCH/DELETE)
@@ -16,10 +16,10 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
   const url = `${postgrestUrl}/${tableName}${filters ? `?${filters}` : ''}`;
 
   const headers = {
-    [verifyHeader]: verifySecret,
     'Content-Type': 'application/json',
     ...extraHeaders,
   };
+  applyVerifyHeaders(headers, verifyHeader, verifySecret);
 
   const options = {
     method,
@@ -92,14 +92,14 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
  * @param {string} hostname - Hostname to check
  * @param {Object} config - Throttle configuration
  * @param {string} config.postgrestUrl - PostgREST API endpoint
- * @param {string} config.verifyHeader - Authentication header name
- * @param {string} config.verifySecret - Authentication header value
+ * @param {string|string[]} config.verifyHeader - Authentication header name(s)
+ * @param {string|string[]} config.verifySecret - Authentication header value(s)
  * @param {string} config.tableName - Table name (defaults to 'THROTTLE_PROTECTION')
  * @param {number} config.throttleTimeWindow - Time window in seconds
  * @returns {Promise<{status: 'normal_operation'|'resume_operation'|'protected', recordExists: boolean, errorCode?: number, retryAfter?: number} | null>}
  */
 export const checkThrottle = async (hostname, config) => {
-  if (!config.postgrestUrl || !config.verifyHeader || !config.verifySecret || !config.throttleTimeWindow) {
+  if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret) || !config.throttleTimeWindow) {
     return null;
   }
 
@@ -187,7 +187,7 @@ export const checkThrottle = async (hostname, config) => {
  * @returns {Promise<void>}
  */
 export const updateThrottle = async (hostname, updateData, config) => {
-  if (!config.postgrestUrl || !config.verifyHeader || !config.verifySecret) {
+  if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
     return;
   }
 
@@ -241,12 +241,12 @@ export const updateThrottle = async (hostname, updateData, config) => {
       p_table_name: tableName,
     };
 
+    const rpcHeaders = { 'Content-Type': 'application/json' };
+    applyVerifyHeaders(rpcHeaders, verifyHeader, verifySecret);
+
     const rpcResponse = await fetch(rpcUrl, {
       method: 'POST',
-      headers: {
-        [verifyHeader]: verifySecret,
-        'Content-Type': 'application/json',
-      },
+      headers: rpcHeaders,
       body: JSON.stringify(rpcBody),
     });
 
@@ -277,8 +277,8 @@ export const updateThrottle = async (hostname, updateData, config) => {
  * Clean up expired records from the database
  * Removes records where IS_PROTECTED IS NULL and ERROR_TIMESTAMP is older than throttleTimeWindow * 2
  * @param {string} postgrestUrl - PostgREST API base URL
- * @param {string} verifyHeader - Authentication header name
- * @param {string} verifySecret - Authentication header value
+ * @param {string|string[]} verifyHeader - Authentication header name(s)
+ * @param {string|string[]} verifySecret - Authentication header value(s)
  * @param {string} tableName - Table name
  * @param {number} throttleTimeWindow - Time window in seconds
  * @returns {Promise<number>} - Number of deleted records
@@ -297,12 +297,12 @@ const cleanupExpiredThrottle = async (postgrestUrl, verifyHeader, verifySecret, 
       p_table_name: tableName,
     };
 
+    const rpcHeaders = { 'Content-Type': 'application/json' };
+    applyVerifyHeaders(rpcHeaders, verifyHeader, verifySecret);
+
     const rpcResponse = await fetch(rpcUrl, {
       method: 'POST',
-      headers: {
-        [verifyHeader]: verifySecret,
-        'Content-Type': 'application/json',
-      },
+      headers: rpcHeaders,
       body: JSON.stringify(rpcBody),
     });
 

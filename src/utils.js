@@ -176,6 +176,52 @@ export const extractHostname = (url) => {
 };
 
 /**
+ * Apply verify header/secret pairs to a headers object.
+ * Supports both legacy string values and new array format.
+ * @param {Object} targetHeaders - Headers object to mutate
+ * @param {string|string[]} verifyHeader - Header name(s)
+ * @param {string|string[]} verifySecret - Header value(s)
+ */
+export const applyVerifyHeaders = (targetHeaders, verifyHeader, verifySecret) => {
+  if (!targetHeaders || typeof targetHeaders !== 'object') {
+    return;
+  }
+
+  if (Array.isArray(verifyHeader) && Array.isArray(verifySecret)) {
+    verifyHeader.forEach((headerName, index) => {
+      if (!headerName || typeof headerName !== 'string') {
+        return;
+      }
+      const secretValue = verifySecret[index];
+      if (secretValue === undefined || secretValue === null) {
+        return;
+      }
+      targetHeaders[headerName] = secretValue;
+    });
+    return;
+  }
+
+  if (typeof verifyHeader === 'string' && typeof verifySecret === 'string' && verifyHeader && verifySecret) {
+    targetHeaders[verifyHeader] = verifySecret;
+  }
+};
+
+/**
+ * Determine if verify header/secret values are present.
+ * Supports both legacy string format and new array format.
+ * @param {string|string[]} verifyHeader
+ * @param {string|string[]} verifySecret
+ * @returns {boolean}
+ */
+export const hasVerifyCredentials = (verifyHeader, verifySecret) => {
+  if (Array.isArray(verifyHeader) && Array.isArray(verifySecret)) {
+    return verifyHeader.length > 0 && verifySecret.length > 0;
+  }
+
+  return Boolean(verifyHeader) && Boolean(verifySecret);
+};
+
+/**
  * Match hostname against a pattern (supports wildcard)
  * Pattern examples:
  *   "*.sharepoint.com" matches "contoso-my.sharepoint.com" and "sharepoint.com"
