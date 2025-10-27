@@ -9,6 +9,17 @@ compatibility_date = "2024-01-01"
 # WORKER_ADDRESS = "https://your-worker.workers.dev"
 # VERIFY_HEADER = ""
 # VERIFY_SECRET = ""
+# # ⚠️ NEW: Multi-Authentication Header Support (comma-separated format)
+# # You can now specify multiple authentication header/secret pairs for different services
+# # Format: "header1,header2,header3"
+# # Example for AList + PostgREST:
+# #   VERIFY_HEADER = "X-Auth-Token,X-Postgrest-Auth"
+# #   VERIFY_SECRET = "alist-secret-key,postgrest-secret-key"
+# # Requirements:
+# #   - Both arrays must have the same length (if non-empty)
+# #   - No spaces between commas: "header1,header2" (spaces will be trimmed automatically)
+# #   - All header/secret pairs will be sent in requests to AList API and PostgREST
+# # Backward Compatible: Single value still works: VERIFY_HEADER = "X-Auth-Token"
 # SIGN_CHECK = "true"
 # HASH_CHECK = "true"
 # WORKER_CHECK = "true"
