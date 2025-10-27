@@ -335,6 +335,8 @@ const resolveConfig = (env = {}) => {
     hashCheck: parseBoolean(env.HASH_CHECK, true),
     workerCheck: parseBoolean(env.WORKER_CHECK, true),
     ipCheck: parseBoolean(env.IP_CHECK, true),
+    additionCheck: parseBoolean(env.ADDITION_CHECK, true),
+    additionExpireTimeCheck: parseBoolean(env.ADDITION_EXPIRETIME_CHECK, true),
     ipv4Only: parseBoolean(env.IPV4_ONLY, true),
     blacklistPrefixes,
     whitelistPrefixes,
@@ -367,6 +369,29 @@ function base64Encode(input) {
     binary += String.fromCharCode(byte);
   }
   return btoa(binary);
+}
+
+function base64DecodeToString(input) {
+  if (!input) {
+    return null;
+  }
+  try {
+    const binary = atob(input);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new TextDecoder().decode(bytes);
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function sha256Hex(text) {
+  const data = new TextEncoder().encode(text);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // Check if a path matches blacklist or whitelist and return the actions array
@@ -616,6 +641,57 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
     const ipVerifyResult = await verify("ipSign", ipVerifyData, ipSign, config.token);
     if (ipVerifyResult !== "") {
       return createUnauthorizedResponse(origin, ipVerifyResult);
+    }
+  }
+
+  const additionalInfo = url.searchParams.get("additionalInfo") ?? "";
+  const additionalInfoSign = url.searchParams.get("additionalInfoSign") ?? "";
+  if (config.additionCheck) {
+    if (!additionalInfo) {
+      return createUnauthorizedResponse(origin, "additionalInfo missing");
+    }
+    if (!additionalInfoSign) {
+      return createUnauthorizedResponse(origin, "additionalInfoSign missing");
+    }
+
+    const additionalVerifyResult = await verify("additionalInfoSign", additionalInfo, additionalInfoSign, config.token);
+    if (additionalVerifyResult !== "") {
+      return createUnauthorizedResponse(origin, additionalVerifyResult);
+    }
+
+    const decodedAdditional = base64DecodeToString(additionalInfo);
+    if (!decodedAdditional) {
+      return createUnauthorizedResponse(origin, "additionalInfo decode failed");
+    }
+
+    let additionalPayload;
+    try {
+      additionalPayload = JSON.parse(decodedAdditional);
+    } catch (_error) {
+      return createUnauthorizedResponse(origin, "additionalInfo invalid");
+    }
+
+    const expectedPathHash = await sha256Hex(path);
+    if (typeof additionalPayload.pathHash !== "string" || additionalPayload.pathHash !== expectedPathHash) {
+      return createUnauthorizedResponse(origin, "additionalInfo path mismatch");
+    }
+
+    if (config.additionExpireTimeCheck) {
+      let expireTimestamp = 0;
+      if (typeof additionalPayload.expireTime === "number") {
+        expireTimestamp = Math.trunc(additionalPayload.expireTime);
+      } else if (typeof additionalPayload.expireTime === "string") {
+        expireTimestamp = Number.parseInt(additionalPayload.expireTime, 10);
+      }
+
+      if (!Number.isFinite(expireTimestamp) || expireTimestamp <= 0) {
+        return createUnauthorizedResponse(origin, "additionalInfo expire invalid");
+      }
+
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      if (nowSeconds > expireTimestamp) {
+        return createUnauthorizedResponse(origin, "link expired");
+      }
     }
   }
 
