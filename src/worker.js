@@ -376,7 +376,17 @@ function base64DecodeToString(input) {
     return null;
   }
   try {
-    const binary = atob(input);
+    const normalized = (() => {
+      const remainder = input.length % 4;
+      if (remainder === 0) return input;
+      if (remainder === 1) return null;
+      const padding = 4 - remainder;
+      return `${input}${'='.repeat(padding)}`;
+    })();
+    if (normalized === null) {
+      return null;
+    }
+    const binary = atob(normalized);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i += 1) {
       bytes[i] = binary.charCodeAt(i);
