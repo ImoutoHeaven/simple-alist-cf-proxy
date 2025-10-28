@@ -1022,13 +1022,17 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
 
     // API call successful, save to cache (if enabled)
     if (cacheManager && res.data) {
-      try {
-        await cacheManager.saveCache(path, res.data, { ...config.cacheConfig, ctx });
-        console.log(`[Cache] Saved for path: ${path}`);
-      } catch (error) {
-        // Cache save failure should not block downloads
-        console.error('[Cache] Save failed:', error instanceof Error ? error.message : String(error));
-      }
+      ctx.waitUntil(
+        cacheManager
+          .saveCache(path, res.data, { ...config.cacheConfig, ctx })
+          .then(() => {
+            console.log(`[Cache] Saved for path: ${path}`);
+          })
+          .catch((error) => {
+            // Cache save failure should not block downloads
+            console.error('[Cache] Save failed:', error instanceof Error ? error.message : String(error));
+          })
+      );
     }
   }
 
