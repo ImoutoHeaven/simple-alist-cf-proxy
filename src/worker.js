@@ -5,6 +5,7 @@ import { createRateLimiter } from './ratelimit/factory.js';
 import { unifiedCheck } from './unified-check.js';
 import { unifiedCheckD1 } from './unified-check-d1.js';
 import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
+import { scheduleAllCleanups } from './cleanup-scheduler.js';
 import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders } from './utils.js';
 
 // Configuration constants
@@ -1330,7 +1331,14 @@ export default {
       // Create throttle manager instance based on DB_MODE (if throttle enabled)
       const throttleManager = config.throttleEnabled ? createThrottleManager(config.dbMode) : null;
       const rateLimiter = config.rateLimitEnabled ? createRateLimiter(config.dbMode) : null;
-      return await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
+      const response = await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
+
+      scheduleAllCleanups(config, env, ctx).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[Cleanup Scheduler] Error:', message);
+      });
+
+      return response;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return createErrorResponse("*", 500, message);

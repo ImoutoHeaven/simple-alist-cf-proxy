@@ -35,6 +35,47 @@ const executeQuery = async (accountId, databaseId, apiToken, sql, params = []) =
 };
 
 /**
+ * Execute multiple SQL queries via a single D1 REST API batch call.
+ * @param {string} accountId
+ * @param {string} databaseId
+ * @param {string} apiToken
+ * @param {Array<{sql: string, params?: unknown[]}>} statements
+ * @returns {Promise<Array<Object>>}
+ */
+const executeBatchQueries = async (accountId, databaseId, apiToken, statements) => {
+  if (!Array.isArray(statements) || statements.length === 0) {
+    throw new Error('[Unified Check D1-REST] Batch execution requires at least one statement');
+  }
+
+  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseId}/query`;
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(statements),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`D1 REST API batch error (${response.status}): ${errorText}`);
+  }
+
+  const result = await response.json();
+  if (!result.success) {
+    throw new Error(`D1 REST API batch failed: ${JSON.stringify(result.errors || 'Unknown error')}`);
+  }
+
+  if (!Array.isArray(result.result) || result.result.length !== statements.length) {
+    throw new Error('[Unified Check D1-REST] Batch result length mismatch');
+  }
+
+  return result.result;
+};
+
+/**
  * Ensure cache, rate limit, and throttle tables exist before issuing queries
  * @param {string} accountId
  * @param {string} databaseId
@@ -127,12 +168,7 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
     throw new Error('[Unified Check D1-REST] Failed to calculate IP hash');
   }
 
-  // Execute queries (D1 REST API)
-  console.log('[Unified Check D1-REST] Executing cache check');
   const cacheSql = `SELECT LINK_DATA, TIMESTAMP, HOSTNAME_HASH FROM ${cacheTableName} WHERE PATH_HASH = ?`;
-  const cacheResult = await executeQuery(accountId, databaseId, apiToken, cacheSql, [pathHash]);
-
-  console.log('[Unified Check D1-REST] Executing rate limit UPSERT');
   const rateLimitSql = `
     INSERT INTO ${rateLimitTableName} (IP_HASH, IP_RANGE, ACCESS_COUNT, LAST_WINDOW_TIME, BLOCK_UNTIL)
     VALUES (?, ?, 1, ?, NULL)
@@ -163,7 +199,37 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
     now, windowSeconds, now, now, now,
     now, windowSeconds, now, limit, blockSeconds, now, blockSeconds
   ];
-  const rateLimitResult = await executeQuery(accountId, databaseId, apiToken, rateLimitSql, rateLimitParams);
+
+  const throttleSql = `
+    SELECT IS_PROTECTED, ERROR_TIMESTAMP, LAST_ERROR_CODE
+    FROM ${throttleTableName} AS throttle
+    WHERE throttle.HOSTNAME_HASH = (
+      SELECT cache.HOSTNAME_HASH
+      FROM ${cacheTableName} AS cache
+      WHERE cache.PATH_HASH = ?
+      LIMIT 1
+    )
+      AND throttle.HOSTNAME_HASH IS NOT NULL
+  `;
+
+  const statements = [
+    { sql: cacheSql, params: [pathHash] },
+    { sql: rateLimitSql, params: rateLimitParams },
+    { sql: throttleSql, params: [pathHash] },
+  ];
+
+  console.log('[Unified Check D1-REST] Executing batch (3 queries in 1 RTT: cache + ratelimit + throttle)');
+  const batchResults = await executeBatchQueries(accountId, databaseId, apiToken, statements);
+
+  const [cacheResult, rateLimitResult, throttleResult] = batchResults.map((statementResult, index) => {
+    if (!statementResult) {
+      throw new Error(`[Unified Check D1-REST] Batch result missing for statement #${index + 1}`);
+    }
+    if (statementResult.success === false) {
+      throw new Error(`[Unified Check D1-REST] Batch statement #${index + 1} failed: ${JSON.stringify(statementResult.errors || 'Unknown error')}`);
+    }
+    return statementResult;
+  });
 
   // Parse cache
   let cacheData = {
@@ -242,9 +308,6 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
   };
 
   if (cacheData.hostnameHash) {
-    console.log('[Unified Check D1-REST] Executing throttle check');
-    const throttleSql = `SELECT IS_PROTECTED, ERROR_TIMESTAMP, LAST_ERROR_CODE FROM ${throttleTableName} WHERE HOSTNAME_HASH = ?`;
-    const throttleResult = await executeQuery(accountId, databaseId, apiToken, throttleSql, [cacheData.hostnameHash]);
     const throttleRow = throttleResult.results?.[0];
 
     if (throttleRow) {
