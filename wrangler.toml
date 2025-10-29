@@ -185,12 +185,115 @@ compatibility_date = "2024-01-01"
 # # BLOCK_TIME = "10m"                   # Additional block duration after hitting the limit
 # # PG_ERROR_HANDLE = "fail-closed"      # Use "fail-open" to bypass DB errors gracefully
 
+# # ═══════════════════════════════════════════════════════════════
+# # ⚠️ NEW: Cloudflare Rate Limiter (Binding-based, Stateless/Stateful)
+# # ═══════════════════════════════════════════════════════════════
+# #
+# # Purpose: First-layer rate limiting using Cloudflare's native Rate Limiter binding
+# # Benefits:
+# #   - Ultra-low latency (<10ms, edge-based enforcement)
+# #   - Works in both stateless (DB_MODE="") and stateful (DB_MODE set) modes
+# #   - Zero database cost for stateless deployments
+# #   - Can be used as additional protection layer when combined with DB rate limiting
+# #
+# # How it works:
+# # 1. Request arrives → CF Rate Limiter checks (based on IP subnet SHA256)
+# # 2. If limit exceeded → Return 429 immediately (no DB queries)
+# # 3. If allowed → Continue to DB rate limiting (if DB_MODE set) or handle request
+# #
+# # Dual Protection (Stateful Mode):
+# # - CF Rate Limiter: Blocks obvious abuse at edge (e.g., 10 req/10s)
+# # - DB Rate Limiting: Fine-grained control (e.g., 100 req/24h)
+# # - Advantages: CF absorbs high-frequency attacks, DB handles long-term limits
+# #
+# # Requirements:
+# # - Must configure [[rate_limit]] binding in wrangler.toml (see below)
+# # - ENABLE_CF_RATELIMITER must be "true" to activate
+# # - Binding validation enforced at startup (throws error if binding not found)
+# #
+# # Configuration:
+# ENABLE_CF_RATELIMITER = "false"      # Enable Cloudflare Rate Limiter binding
+#                                       # Default: "false" (disabled)
+#                                       # Set to "true" to enable first-layer rate limiting
+#                                       # Works in both stateless and stateful modes
+#                                       # If enabled but binding not found → startup error
+#
+# CF_RATELIMITER_BINDING = "CF_RATE_LIMITER"  # Rate Limiter binding name
+#                                              # Default: "CF_RATE_LIMITER"
+#                                              # Must match [[rate_limit]].binding below
+#                                              # Change if using custom binding name
+#
+# # Limiting Key Strategy:
+# # - Uses SHA256(IP subnet) as rate limiting key
+# # - Respects IPV4_SUFFIX and IPV6_SUFFIX settings (same as DB rate limiting)
+# # - Example: IPV4_SUFFIX="/24" → all IPs in 192.168.1.0/24 share the same limit
+# #
+# # Error Handling:
+# # - Binding not found when enabled → Throws startup error
+# # - Rate limit exceeded → Returns 429 with Retry-After: 60 header
+# # - CF Rate Limiter failure → fail-open (continues to DB or handles request)
+# #
+# # Example Configuration (Stateless Mode):
+# #   ENABLE_CF_RATELIMITER = "true"
+# #   CF_RATELIMITER_BINDING = "CF_RATE_LIMITER"
+# #   DB_MODE = ""  # No database, pure edge rate limiting
+# #   IPV4_SUFFIX = "/24"
+# #   IPV6_SUFFIX = "/60"
+# #
+# # Example Configuration (Stateful Dual Protection):
+# #   ENABLE_CF_RATELIMITER = "true"
+# #   CF_RATELIMITER_BINDING = "CF_RATE_LIMITER"
+# #   DB_MODE = "custom-pg-rest"
+# #   WINDOW_TIME = "24h"
+# #   IPSUBNET_WINDOWTIME_LIMIT = "100"  # 100 requests per 24h (DB layer)
+# #   # CF Rate Limiter configured in binding: 10 requests per 10s (edge layer)
+
 # D1 Database Binding (for DB_MODE="d1")
 # Uncomment and configure this section if using D1 binding mode
 # [[d1_databases]]
 # binding = "DB"  # Must match D1_DATABASE_BINDING env var (or use default "DB")
 # database_name = "alist-cache-db"
 # database_id = "your-d1-database-id"
+
+# ═══════════════════════════════════════════════════════════════
+# ⚠️ NEW: Cloudflare Rate Limiter Binding (for ENABLE_CF_RATELIMITER="true")
+# ═══════════════════════════════════════════════════════════════
+#
+# Uncomment and configure this section if enabling CF Rate Limiter
+# The rate limit rules (period, limit) are configured here, NOT in environment variables
+# Documentation: https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+#
+# [[rate_limit]]
+# binding = "CF_RATE_LIMITER"  # Must match CF_RATELIMITER_BINDING env var
+#
+# # Simple Algorithm (Fixed Window)
+# # Example: 10 requests per 10 seconds
+# simple = { period = 10, limit = 10 }
+#
+# # Alternative: Sliding Window Algorithm (More accurate)
+# # Example: 100 requests per 60 seconds (sliding window)
+# # sliding_window = { period = 60, limit = 100 }
+#
+# # Notes:
+# # - period: Time window in seconds (max 86400 = 24h)
+# # - limit: Maximum requests per period per key (IP subnet SHA256)
+# # - Choose simple for lower latency, sliding_window for more accurate enforcement
+# # - These parameters cannot be changed via environment variables
+# # - Must redeploy worker to change rate limit rules
+#
+# # Recommended Configurations:
+# #
+# # Light Protection (Edge layer):
+# #   simple = { period = 10, limit = 20 }
+# #   # 20 requests per 10 seconds = ~2 req/s burst
+# #
+# # Medium Protection (Edge layer):
+# #   simple = { period = 10, limit = 10 }
+# #   # 10 requests per 10 seconds = 1 req/s sustained
+# #
+# # Heavy Protection (Edge + DB layer):
+# #   simple = { period = 10, limit = 5 }
+# #   # Edge: 5 req/10s, DB: 100 req/24h (configure in WINDOW_TIME/IPSUBNET_WINDOWTIME_LIMIT)
 
 # For local development, create a .dev.vars file with:
 # ADDRESS=https://your-alist-server.com

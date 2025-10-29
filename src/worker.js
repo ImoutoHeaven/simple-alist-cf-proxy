@@ -6,7 +6,7 @@ import { unifiedCheck } from './unified-check.js';
 import { unifiedCheckD1 } from './unified-check-d1.js';
 import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
-import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders } from './utils.js';
+import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
 
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
@@ -122,6 +122,8 @@ const resolveConfig = (env = {}) => {
 
   const dbMode = normalizeString(env.DB_MODE);
   const normalizedDbMode = dbMode ? dbMode.toLowerCase() : '';
+  const enableCfRatelimiter = normalizeString(env.ENABLE_CF_RATELIMITER, 'false').toLowerCase() === 'true';
+  const cfRatelimiterBinding = normalizeString(env.CF_RATELIMITER_BINDING, 'CF_RATE_LIMITER');
 
   const linkTTL = normalizeString(env.LINK_TTL, '30m');
   const linkTTLSeconds = parseWindowTime(linkTTL);
@@ -340,6 +342,15 @@ const resolveConfig = (env = {}) => {
     throw new Error('Rate limiting configuration is incomplete. Ensure WINDOW_TIME and IPSUBNET_WINDOWTIME_LIMIT are valid positive values.');
   }
 
+  if (enableCfRatelimiter) {
+    const ratelimiter = env[cfRatelimiterBinding];
+    if (!ratelimiter || typeof ratelimiter.limit !== 'function') {
+      throw new Error(
+        `ENABLE_CF_RATELIMITER is true but binding "${cfRatelimiterBinding}" not found or invalid. Please configure [[rate_limit]] binding in wrangler.toml with name="${cfRatelimiterBinding}".`
+      );
+    }
+  }
+
   return {
     address: String(env.ADDRESS).trim(),
     token: String(env.TOKEN).trim(),
@@ -369,6 +380,10 @@ const resolveConfig = (env = {}) => {
     rateLimitConfig,
     windowTime,
     ipSubnetLimit,
+    enableCfRatelimiter,
+    cfRatelimiterBinding,
+    ipv4Suffix,
+    ipv6Suffix,
   };
 };
 
@@ -583,7 +598,7 @@ function safeDecodePathname(pathname) {
   }
 }
 // src/handleDownload.ts
-async function handleDownload(request, config, cacheManager, throttleManager, rateLimiter, ctx) {
+async function handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
   const origin = request.headers.get("origin") ?? "*";
   const url = new URL(request.url);
   const path = safeDecodePathname(url.pathname);
@@ -600,6 +615,34 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
   }
 
   const clientIP = request.headers.get("CF-Connecting-IP") || "";
+
+  // CF Rate Limiter检查（第一道防线）
+  if (config.enableCfRatelimiter) {
+    try {
+      const cfResult = await checkCfRatelimit(
+        env,
+        clientIP,
+        config.ipv4Suffix,
+        config.ipv6Suffix,
+        config.cfRatelimiterBinding
+      );
+
+      if (!cfResult.allowed) {
+        console.error(`[CF Rate Limiter] Blocked IP subnet: ${cfResult.ipSubnet}`);
+        return new Response('429 Too Many Requests - Rate limit exceeded', {
+          status: 429,
+          headers: {
+            'Content-Type': 'text/plain',
+            'Retry-After': '60',
+          },
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[CF Rate Limiter] Error during check:', message);
+      // fail-open: continue processing if rate limiter check fails
+    }
+  }
 
   // Initialize check flags from config (each *_CHECK only controls itself)
   let shouldCheckSign = config.signCheck;
@@ -736,7 +779,6 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
 
   if (supportsUnifiedCheck) {
     try {
-      console.log(`[Unified Check] Using unified check for ${config.dbMode} mode (RTT optimization)`);
 
       const rateLimitConfig = config.rateLimitConfig || {};
       const cacheConfig = config.cacheConfig || {};
@@ -822,9 +864,6 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
       if (unifiedResult.cache.hit) {
         cacheHit = true;
         linkData = unifiedResult.cache.linkData;
-        console.log('[Cache] Hit from unified check');
-      } else {
-        console.log('[Cache] Miss from unified check');
       }
       
       // Check throttle result (if we have cache hit with hostname_hash)
@@ -906,7 +945,6 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
   }
 } else {
     // Fallback to original logic when unified check is not supported
-    console.log('[Worker] Using original separate checks (unified check not supported or rate limit disabled)');
     
     if (rateLimiter && config.rateLimitEnabled && clientIP) {
       try {
@@ -944,13 +982,11 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
   // Check cache (if not already resolved by unified check)
   let res;
   if (cacheHit && linkData) {
-    console.log(`[Cache] Using cached linkData from unified check`);
     res = { code: 200, data: linkData };
   } else if (cacheManager && !unifiedResult) {
     try {
       const cached = await cacheManager.checkCache(path, { ...config.cacheConfig, ctx });
       if (cached && cached.linkData) {
-        console.log(`[Cache] Hit for path: ${path}`);
         res = { code: 200, data: cached.linkData };
       }
     } catch (error) {
@@ -1026,9 +1062,6 @@ async function handleDownload(request, config, cacheManager, throttleManager, ra
       ctx.waitUntil(
         cacheManager
           .saveCache(path, res.data, { ...config.cacheConfig, ctx })
-          .then(() => {
-            console.log(`[Cache] Saved for path: ${path}`);
-          })
           .catch((error) => {
             // Cache save failure should not block downloads
             console.error('[Cache] Save failed:', error instanceof Error ? error.message : String(error));
@@ -1292,7 +1325,31 @@ function handleOptions(request) {
 }
 
 // src/handleRequest.ts - Modified to check IPv6 addresses
-async function handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx) {
+/**
+ * Check Cloudflare Rate Limiter
+ * @param {Object} env - Worker环境对象
+ * @param {string} clientIP - 客户端IP
+ * @param {string} ipv4Suffix - IPv4子网掩码
+ * @param {string} ipv6Suffix - IPv6子网前缀
+ * @param {string} bindingName - Rate Limiter绑定名称
+ * @returns {Promise<{allowed: boolean, ipSubnet: string}>}
+ */
+async function checkCfRatelimit(env, clientIP, ipv4Suffix, ipv6Suffix, bindingName) {
+  const ipSubnet = calculateIPSubnet(clientIP, ipv4Suffix, ipv6Suffix);
+
+  if (!ipSubnet) {
+    return { allowed: true, ipSubnet };
+  }
+
+  const ipHash = await sha256Hash(ipSubnet);
+  const ratelimiter = env[bindingName];
+  const { success } = await ratelimiter.limit({ key: ipHash });
+
+  return { allowed: success, ipSubnet };
+}
+
+// src/handleRequest.ts - Modified to check IPv6 addresses
+async function handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
   // Check for IPv6 access if IPv4_ONLY is enabled
   if (config.ipv4Only) {
     const clientIP = request.headers.get("CF-Connecting-IP") || "";
@@ -1319,7 +1376,7 @@ async function handleRequest(request, config, cacheManager, throttleManager, rat
   if (request.method === "OPTIONS") {
     return handleOptions(request);
   }
-  return await handleDownload(request, config, cacheManager, throttleManager, rateLimiter, ctx);
+  return await handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 }
 // src/index.ts
 export default {
@@ -1331,7 +1388,7 @@ export default {
       // Create throttle manager instance based on DB_MODE (if throttle enabled)
       const throttleManager = config.throttleEnabled ? createThrottleManager(config.dbMode) : null;
       const rateLimiter = config.rateLimitEnabled ? createRateLimiter(config.dbMode) : null;
-      const response = await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
+      const response = await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 
       scheduleAllCleanups(config, env, ctx).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
