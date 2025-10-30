@@ -876,6 +876,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   const additionalInfo = url.searchParams.get("additionalInfo") ?? "";
   const additionalInfoSign = url.searchParams.get("additionalInfoSign") ?? "";
   const pathHash = await sha256Hex(path);
+  const quotaFilepathHash = quotaConfig.fileQuota?.enabled ? pathHash : null;
   let additionalPayload = null;
   if (config.additionCheck) {
     if (!additionalInfo) {
@@ -938,8 +939,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let deductBytes = 0;
   let actualFileMaxQuota = 0;
 
-  if ((quotaConfig.fileQuota?.enabled || quotaConfig.globalQuota?.enabled) && filesize !== null) {
+  if (request.method === 'HEAD' || request.method === 'OPTIONS') {
+    quotaConfig._runtimeFileMaxQuota = 0;
+    quotaConfig._runtimeDeductBytes = 0;
+  } else if ((quotaConfig.fileQuota?.enabled || quotaConfig.globalQuota?.enabled) && filesize !== null) {
     const rangeHeader = request.headers.get("Range");
+
     if (rangeHeader) {
       const match = rangeHeader.match(/bytes=(\d+)-(\d*)/i);
       if (match) {
@@ -956,29 +961,31 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       } else {
         deductBytes = filesize;
       }
-    } else {
-      deductBytes = filesize;
-    }
 
-    if (!Number.isFinite(deductBytes) || deductBytes < 0) {
-      deductBytes = 0;
-    }
-
-    if (quotaConfig.fileQuota?.enabled) {
-      let maxQuotaMultiplier = 1;
-      const maxQuotaRaw = quotaConfig.fileQuota.maxQuota || "";
-      if (typeof maxQuotaRaw === "string" && maxQuotaRaw.trim() !== "") {
-        const normalized = maxQuotaRaw.trim().toLowerCase();
-        const multiplierString = normalized.endsWith('x') ? normalized.slice(0, -1) : normalized;
-        const parsedMultiplier = Number.parseFloat(multiplierString);
-        if (Number.isFinite(parsedMultiplier) && parsedMultiplier > 0) {
-          maxQuotaMultiplier = parsedMultiplier;
-        }
+      if (!Number.isFinite(deductBytes) || deductBytes < 0) {
+        deductBytes = 0;
       }
 
-      const calculatedMaxQuota = Math.ceil(filesize * maxQuotaMultiplier);
-      const minAvailableBytes = parseSizeToBytes(quotaConfig.fileQuota.minAvailable || "0");
-      actualFileMaxQuota = Math.max(calculatedMaxQuota, minAvailableBytes);
+      if (quotaConfig.fileQuota?.enabled) {
+        let maxQuotaMultiplier = 1;
+        const maxQuotaRaw = quotaConfig.fileQuota.maxQuota || "";
+        if (typeof maxQuotaRaw === "string" && maxQuotaRaw.trim() !== "") {
+          const normalized = maxQuotaRaw.trim().toLowerCase();
+          const multiplierString = normalized.endsWith('x') ? normalized.slice(0, -1) : normalized;
+          const parsedMultiplier = Number.parseFloat(multiplierString);
+          if (Number.isFinite(parsedMultiplier) && parsedMultiplier > 0) {
+            maxQuotaMultiplier = parsedMultiplier;
+          }
+        }
+
+        const calculatedMaxQuota = Math.ceil(filesize * maxQuotaMultiplier);
+        const minAvailableBytes = parseSizeToBytes(quotaConfig.fileQuota.minAvailable || "0");
+        actualFileMaxQuota = Math.max(calculatedMaxQuota, minAvailableBytes);
+      }
+    } else {
+      // Skip quota deduction for non-range (200) responses
+      deductBytes = 0;
+      actualFileMaxQuota = 0;
     }
   }
 
@@ -1585,6 +1592,180 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // 创建带有安全headers的新响应
   // Quota is fully deducted during the unified check, so we can stream the original body directly.
   const finalBody = response.body;
+
+  const runtimeDeductBytes = Number.isFinite(quotaConfig._runtimeDeductBytes)
+    ? quotaConfig._runtimeDeductBytes
+    : 0;
+
+  const shouldRefund = runtimeDeductBytes > 0 && (
+    request.method !== 'GET' ||
+    response.status !== 206
+  );
+
+  if (shouldRefund && ctx && typeof ctx.waitUntil === 'function') {
+    const refundPromise = (async () => {
+      try {
+        const ipRangeHash = ipSubnet ? await sha256Hash(ipSubnet) : null;
+        if (!ipRangeHash) {
+          console.warn('[Quota Refund] Skip refund due to missing IP hash');
+          return;
+        }
+
+        const refundBytes = runtimeDeductBytes;
+        const fileQuotaEnabled = Boolean(quotaConfig.fileQuota?.enabled);
+        const globalQuotaEnabled = Boolean(quotaConfig.globalQuota?.enabled);
+        const refundFilepathHash = fileQuotaEnabled ? (quotaFilepathHash ?? pathHash) : null;
+
+        const refundConfig = {
+          fileQuotaTableName: config.fileQuotaTableName || 'file_ip_download_quota',
+          globalQuotaTableName: config.globalQuotaTableName || 'global_ip_download_quota',
+          fileQuotaEnabled,
+          globalQuotaEnabled,
+          fileQuotaWindowSeconds,
+          fileQuotaMaxBytes: quotaConfig._runtimeFileMaxQuota,
+          globalQuotaWindowSeconds,
+          globalQuotaMaxBytes,
+        };
+
+        if (config.dbMode === 'd1') {
+          const configCandidates = [config.rateLimitConfig, config.cacheConfig, config.throttleConfig];
+          let envBinding = null;
+          let databaseBinding = null;
+
+          for (const candidate of configCandidates) {
+            if (candidate && candidate.env && candidate.databaseBinding) {
+              envBinding = candidate.env;
+              databaseBinding = candidate.databaseBinding;
+              break;
+            }
+          }
+
+          if (envBinding && databaseBinding && envBinding[databaseBinding]) {
+            const db = envBinding[databaseBinding];
+            const { refundQuotaD1 } = await import('./unified-check-d1.js');
+            await refundQuotaD1(db, ipRangeHash, refundFilepathHash, refundBytes, refundConfig);
+            console.log(`[Quota Refund] Refunded ${refundBytes} bytes for ${request.method} ${response.status}`);
+          } else {
+            console.warn('[Quota Refund] D1 configuration missing env binding, skipping refund');
+          }
+        } else if (config.dbMode === 'd1-rest') {
+          const configCandidates = [config.rateLimitConfig, config.cacheConfig, config.throttleConfig];
+          let accountId = null;
+          let databaseId = null;
+          let apiToken = null;
+
+          for (const candidate of configCandidates) {
+            if (candidate && candidate.accountId && candidate.databaseId && candidate.apiToken) {
+              accountId = candidate.accountId;
+              databaseId = candidate.databaseId;
+              apiToken = candidate.apiToken;
+              break;
+            }
+          }
+
+          if (accountId && databaseId && apiToken) {
+            const { refundQuotaD1Rest } = await import('./unified-check-d1-rest.js');
+            await refundQuotaD1Rest(
+              accountId,
+              databaseId,
+              apiToken,
+              ipRangeHash,
+              refundFilepathHash,
+              refundBytes,
+              refundConfig
+            );
+            console.log(`[Quota Refund] Refunded ${refundBytes} bytes for ${request.method} ${response.status}`);
+          } else {
+            console.warn('[Quota Refund] D1-REST credentials missing, skipping refund');
+          }
+        } else if (config.dbMode === 'custom-pg-rest') {
+          const configCandidates = [config.rateLimitConfig, config.cacheConfig, config.throttleConfig];
+          let postgrestUrl = null;
+          let verifyHeader = null;
+          let verifySecret = null;
+
+          for (const candidate of configCandidates) {
+            if (candidate && candidate.postgrestUrl && candidate.verifyHeader && candidate.verifySecret) {
+              postgrestUrl = candidate.postgrestUrl;
+              verifyHeader = candidate.verifyHeader;
+              verifySecret = candidate.verifySecret;
+              break;
+            }
+          }
+
+          if (postgrestUrl) {
+            const refundPromises = [];
+            const nowSeconds = Math.floor(Date.now() / 1000);
+
+            if (fileQuotaEnabled && refundFilepathHash) {
+              const headers = { 'Content-Type': 'application/json' };
+              applyVerifyHeaders(headers, verifyHeader, verifySecret);
+              const body = JSON.stringify({
+                p_ip_range_hash: ipRangeHash,
+                p_filepath_hash: refundFilepathHash,
+                p_refund_bytes: refundBytes,
+                p_now: nowSeconds,
+                p_window_seconds: refundConfig.fileQuotaWindowSeconds,
+                p_max_quota: refundConfig.fileQuotaMaxBytes,
+                p_file_table_name: refundConfig.fileQuotaTableName,
+              });
+
+              refundPromises.push((async () => {
+                const response = await fetch(`${postgrestUrl}/rpc/download_refund_file_quota`, {
+                  method: 'POST',
+                  headers,
+                  body,
+                });
+                if (!response.ok) {
+                  const text = await response.text();
+                  throw new Error(`File quota refund failed (${response.status}): ${text}`);
+                }
+              })());
+            }
+
+            if (globalQuotaEnabled) {
+              const headers = { 'Content-Type': 'application/json' };
+              applyVerifyHeaders(headers, verifyHeader, verifySecret);
+              const body = JSON.stringify({
+                p_ip_range_hash: ipRangeHash,
+                p_refund_bytes: refundBytes,
+                p_now: nowSeconds,
+                p_window_seconds: refundConfig.globalQuotaWindowSeconds,
+                p_max_quota: refundConfig.globalQuotaMaxBytes,
+                p_global_table_name: refundConfig.globalQuotaTableName,
+              });
+
+              refundPromises.push((async () => {
+                const response = await fetch(`${postgrestUrl}/rpc/download_refund_global_quota`, {
+                  method: 'POST',
+                  headers,
+                  body,
+                });
+                if (!response.ok) {
+                  const text = await response.text();
+                  throw new Error(`Global quota refund failed (${response.status}): ${text}`);
+                }
+              })());
+            }
+
+            if (refundPromises.length > 0) {
+              await Promise.all(refundPromises);
+              console.log(`[Quota Refund] Refunded ${refundBytes} bytes for ${request.method} ${response.status}`);
+            }
+          } else {
+            console.warn('[Quota Refund] PostgREST configuration missing, skipping refund');
+          }
+        } else {
+          console.warn(`[Quota Refund] Unsupported DB mode '${config.dbMode}', skipping refund`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[Quota Refund] Failed:', message);
+      }
+    })();
+
+    ctx.waitUntil(refundPromise);
+  }
 
   const safeResponse = new Response(finalBody, {
     status: response.status,

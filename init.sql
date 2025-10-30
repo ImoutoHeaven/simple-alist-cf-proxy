@@ -440,6 +440,117 @@ $$ LANGUAGE plpgsql;
 
 
 -- ========================================
+-- PostgreSQL Stored Procedure: Refund File Quota
+-- ========================================
+CREATE OR REPLACE FUNCTION download_refund_file_quota(
+  p_ip_range_hash TEXT,
+  p_filepath_hash TEXT,
+  p_refund_bytes BIGINT,
+  p_now INTEGER,
+  p_window_seconds INTEGER,
+  p_max_quota BIGINT,
+  p_file_table_name TEXT DEFAULT 'file_ip_download_quota'
+)
+RETURNS VOID AS $$
+DECLARE
+  v_sql TEXT;
+  v_refund BIGINT := GREATEST(COALESCE(p_refund_bytes, 0), 0);
+  v_record RECORD;
+BEGIN
+  IF v_refund = 0 THEN
+    RETURN;
+  END IF;
+
+  v_sql := format(
+    'SELECT "bytes_downloaded", "last_window_time", "blocked_until"
+     FROM %1$I
+     WHERE "ip_range_hash" = $1 AND "filepath_hash" = $2',
+    p_file_table_name
+  );
+
+  EXECUTE v_sql INTO v_record USING p_ip_range_hash, p_filepath_hash;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF (p_now - v_record.last_window_time) >= p_window_seconds THEN
+    RETURN;
+  END IF;
+
+  v_sql := format(
+    'UPDATE %1$I
+     SET
+       "bytes_downloaded" = GREATEST("bytes_downloaded" - $1, 0),
+       "blocked_until" = CASE
+         WHEN GREATEST("bytes_downloaded" - $1, 0) < $2 THEN NULL
+         ELSE "blocked_until"
+       END
+     WHERE "ip_range_hash" = $3 AND "filepath_hash" = $4',
+    p_file_table_name
+  );
+
+  EXECUTE v_sql USING v_refund, p_max_quota, p_ip_range_hash, p_filepath_hash;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
+-- PostgreSQL Stored Procedure: Refund Global Quota
+-- ========================================
+CREATE OR REPLACE FUNCTION download_refund_global_quota(
+  p_ip_range_hash TEXT,
+  p_refund_bytes BIGINT,
+  p_now INTEGER,
+  p_window_seconds INTEGER,
+  p_max_quota BIGINT,
+  p_global_table_name TEXT DEFAULT 'global_ip_download_quota'
+)
+RETURNS VOID AS $$
+DECLARE
+  v_sql TEXT;
+  v_refund BIGINT := GREATEST(COALESCE(p_refund_bytes, 0), 0);
+  v_record RECORD;
+BEGIN
+  IF v_refund = 0 THEN
+    RETURN;
+  END IF;
+
+  v_sql := format(
+    'SELECT "total_bytes_downloaded", "last_window_time", "blocked_until"
+     FROM %1$I
+     WHERE "ip_range_hash" = $1',
+    p_global_table_name
+  );
+
+  EXECUTE v_sql INTO v_record USING p_ip_range_hash;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF (p_now - v_record.last_window_time) >= p_window_seconds THEN
+    RETURN;
+  END IF;
+
+  v_sql := format(
+    'UPDATE %1$I
+     SET
+       "total_bytes_downloaded" = GREATEST("total_bytes_downloaded" - $1, 0),
+       "blocked_until" = CASE
+         WHEN GREATEST("total_bytes_downloaded" - $1, 0) < $2 THEN NULL
+         ELSE "blocked_until"
+       END
+     WHERE "ip_range_hash" = $3',
+    p_global_table_name
+  );
+
+  EXECUTE v_sql USING v_refund, p_max_quota, p_ip_range_hash;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
 -- Optional: Rate Limit Cleanup Function (PostgreSQL)
 -- ========================================
 CREATE OR REPLACE FUNCTION download_cleanup_ip_ratelimit(

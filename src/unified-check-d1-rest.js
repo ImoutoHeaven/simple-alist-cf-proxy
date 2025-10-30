@@ -600,3 +600,123 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
     globalQuota: globalQuotaData,
   };
 };
+
+/**
+ * Refund quota for non-GET or failed requests (D1-REST)
+ * @param {string} accountId
+ * @param {string} databaseId
+ * @param {string} apiToken
+ * @param {string} ipRangeHash
+ * @param {string | null} filepathHash
+ * @param {number} refundBytes
+ * @param {Object} [config]
+ * @returns {Promise<void>}
+ */
+export const refundQuotaD1Rest = async (
+  accountId,
+  databaseId,
+  apiToken,
+  ipRangeHash,
+  filepathHash,
+  refundBytes,
+  config = {}
+) => {
+  if (!accountId || !databaseId || !apiToken || !ipRangeHash) {
+    return;
+  }
+
+  const normalizedBytes = Number.isFinite(refundBytes) ? Math.max(0, Math.trunc(refundBytes)) : 0;
+  if (normalizedBytes <= 0) {
+    return;
+  }
+
+  const {
+    fileQuotaTableName = 'file_ip_download_quota',
+    globalQuotaTableName = 'global_ip_download_quota',
+    fileQuotaEnabled,
+    globalQuotaEnabled,
+    fileQuotaWindowSeconds,
+    fileQuotaMaxBytes,
+    globalQuotaWindowSeconds,
+    globalQuotaMaxBytes,
+  } = config;
+
+  const now = Math.floor(Date.now() / 1000);
+  const statements = [];
+
+  if (
+    filepathHash &&
+    fileQuotaEnabled &&
+    fileQuotaWindowSeconds &&
+    fileQuotaMaxBytes
+  ) {
+    const checkSql = `SELECT last_window_time FROM ${fileQuotaTableName} WHERE ip_range_hash = ? AND filepath_hash = ?`;
+    const checkResult = await executeBatchQueries(accountId, databaseId, apiToken, [
+      { sql: checkSql, params: [ipRangeHash, filepathHash] }
+    ]);
+
+    const record = checkResult[0]?.results?.[0];
+    const lastWindowRaw = record ? record.last_window_time : null;
+    const lastWindowTime = typeof lastWindowRaw === 'number'
+      ? lastWindowRaw
+      : Number.parseInt(lastWindowRaw, 10);
+
+    if (Number.isFinite(lastWindowTime) && (now - lastWindowTime) < fileQuotaWindowSeconds) {
+      const fileRefundSql = `
+        UPDATE ${fileQuotaTableName}
+        SET 
+          bytes_downloaded = MAX(bytes_downloaded - ?, 0),
+          blocked_until = CASE
+            WHEN MAX(bytes_downloaded - ?, 0) < ? THEN NULL
+            ELSE blocked_until
+          END
+        WHERE ip_range_hash = ? AND filepath_hash = ?
+      `;
+      statements.push({
+        sql: fileRefundSql,
+        params: [normalizedBytes, normalizedBytes, fileQuotaMaxBytes, ipRangeHash, filepathHash]
+      });
+    }
+  }
+
+  if (
+    globalQuotaEnabled &&
+    globalQuotaWindowSeconds &&
+    globalQuotaMaxBytes
+  ) {
+    const checkSql = `SELECT last_window_time FROM ${globalQuotaTableName} WHERE ip_range_hash = ?`;
+    const checkResult = await executeBatchQueries(accountId, databaseId, apiToken, [
+      { sql: checkSql, params: [ipRangeHash] }
+    ]);
+
+    const record = checkResult[0]?.results?.[0];
+    const lastWindowRaw = record ? record.last_window_time : null;
+    const lastWindowTime = typeof lastWindowRaw === 'number'
+      ? lastWindowRaw
+      : Number.parseInt(lastWindowRaw, 10);
+
+    if (Number.isFinite(lastWindowTime) && (now - lastWindowTime) < globalQuotaWindowSeconds) {
+      const globalRefundSql = `
+        UPDATE ${globalQuotaTableName}
+        SET 
+          total_bytes_downloaded = MAX(total_bytes_downloaded - ?, 0),
+          blocked_until = CASE
+            WHEN MAX(total_bytes_downloaded - ?, 0) < ? THEN NULL
+            ELSE blocked_until
+          END
+        WHERE ip_range_hash = ?
+      `;
+      statements.push({
+        sql: globalRefundSql,
+        params: [normalizedBytes, normalizedBytes, globalQuotaMaxBytes, ipRangeHash]
+      });
+    }
+  }
+
+  if (statements.length === 0) {
+    return;
+  }
+
+  await executeBatchQueries(accountId, databaseId, apiToken, statements);
+  console.log(`[Quota Refund D1-REST] Refunded ${normalizedBytes} bytes for IP ${ipRangeHash}`);
+};
