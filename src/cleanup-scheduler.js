@@ -282,45 +282,38 @@ const buildD1RestCleanupTasks = (config) => {
 
   if (quotaRestConfig) {
     tasks.push({
-      name: 'file_quota_cleanup',
+      name: 'quota_transactions_cleanup',
       fn: async () => {
-        const now = Math.floor(Date.now() / 1000);
-        const fileQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.fileQuota?.window || '1h'));
-        const expirySeconds = Math.floor((fileQuotaTTL * 2) / 1000);
-        const fileQuotaExpiry = Math.max(0, now - expirySeconds);
+        const ttlMs = Math.max(0, parseDurationToMilliseconds(quotaConfig?.transactionsTTL || '7d'));
+        const cutoffMs = Math.max(0, Date.now() - ttlMs);
         const sql = `
-          DELETE FROM file_ip_download_quota
-          WHERE blocked_until IS NULL
-            AND last_window_time < ?
+          DELETE FROM quota_transactions
+          WHERE created_at < ?
         `;
         return executeD1RestStatement(
           quotaRestConfig.accountId,
           quotaRestConfig.databaseId,
           quotaRestConfig.apiToken,
           sql,
-          [fileQuotaExpiry]
+          [cutoffMs]
         );
       },
     });
 
     tasks.push({
-      name: 'global_quota_cleanup',
+      name: 'quota_blocks_cleanup',
       fn: async () => {
-        const now = Math.floor(Date.now() / 1000);
-        const globalQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.globalQuota?.window || '1h'));
-        const expirySeconds = Math.floor((globalQuotaTTL * 2) / 1000);
-        const globalQuotaExpiry = Math.max(0, now - expirySeconds);
+        const nowSeconds = Math.floor(Date.now() / 1000);
         const sql = `
-          DELETE FROM global_ip_download_quota
-          WHERE blocked_until IS NULL
-            AND last_window_time < ?
+          DELETE FROM quota_blocks
+          WHERE blocked_until < ?
         `;
         return executeD1RestStatement(
           quotaRestConfig.accountId,
           quotaRestConfig.databaseId,
           quotaRestConfig.apiToken,
           sql,
-          [globalQuotaExpiry]
+          [nowSeconds]
         );
       },
     });
@@ -408,36 +401,29 @@ const buildD1CleanupTasks = (config, env) => {
 
   if (quotaModuleConfig) {
     tasks.push({
-      name: 'file_quota_cleanup',
+      name: 'quota_transactions_cleanup',
       fn: async () => {
         const db = resolveBinding(quotaModuleConfig);
-        const now = Math.floor(Date.now() / 1000);
-        const fileQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.fileQuota?.window || '1h'));
-        const expirySeconds = Math.floor((fileQuotaTTL * 2) / 1000);
-        const fileQuotaExpiry = Math.max(0, now - expirySeconds);
+        const ttlMs = Math.max(0, parseDurationToMilliseconds(quotaConfig?.transactionsTTL || '7d'));
+        const cutoffMs = Math.max(0, Date.now() - ttlMs);
         const sql = `
-          DELETE FROM file_ip_download_quota
-          WHERE blocked_until IS NULL
-            AND last_window_time < ?
+          DELETE FROM quota_transactions
+          WHERE created_at < ?
         `;
-        return executeD1BindingStatement(db, sql, [fileQuotaExpiry]);
+        return executeD1BindingStatement(db, sql, [cutoffMs]);
       },
     });
 
     tasks.push({
-      name: 'global_quota_cleanup',
+      name: 'quota_blocks_cleanup',
       fn: async () => {
         const db = resolveBinding(quotaModuleConfig);
-        const now = Math.floor(Date.now() / 1000);
-        const globalQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.globalQuota?.window || '1h'));
-        const expirySeconds = Math.floor((globalQuotaTTL * 2) / 1000);
-        const globalQuotaExpiry = Math.max(0, now - expirySeconds);
+        const nowSeconds = Math.floor(Date.now() / 1000);
         const sql = `
-          DELETE FROM global_ip_download_quota
-          WHERE blocked_until IS NULL
-            AND last_window_time < ?
+          DELETE FROM quota_blocks
+          WHERE blocked_until < ?
         `;
-        return executeD1BindingStatement(db, sql, [globalQuotaExpiry]);
+        return executeD1BindingStatement(db, sql, [nowSeconds]);
       },
     });
   }
@@ -521,39 +507,35 @@ const buildCustomPgRestCleanupTasks = (config) => {
 
   if (quotaPostgrestConfig?.postgrestUrl) {
     tasks.push({
-      name: 'file_quota_cleanup',
+      name: 'quota_transactions_cleanup',
       fn: async () => {
-        const now = Math.floor(Date.now() / 1000);
-        const fileQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.fileQuota?.window || '1h'));
-        const expirySeconds = Math.floor((fileQuotaTTL * 2) / 1000);
-        const fileQuotaExpiry = Math.max(0, now - expirySeconds);
-        const filters = `blocked_until=is.null&last_window_time=lt.${fileQuotaExpiry}`;
+        const ttlMs = Math.max(0, parseDurationToMilliseconds(quotaConfig?.transactionsTTL || '7d'));
+        const cutoffMs = Math.max(0, Date.now() - ttlMs);
+        const cutoffIso = new Date(cutoffMs).toISOString();
+        const filters = `created_at=lt.${encodeURIComponent(cutoffIso)}`;
         return executePostgrestDelete(
           quotaPostgrestConfig.postgrestUrl,
           quotaPostgrestConfig.verifyHeader,
           quotaPostgrestConfig.verifySecret,
-          'file_ip_download_quota',
+          'quota_transactions',
           filters,
-          { Prefer: 'return=representation' }
+          { Prefer: 'count=exact' }
         );
       },
     });
 
     tasks.push({
-      name: 'global_quota_cleanup',
+      name: 'quota_blocks_cleanup',
       fn: async () => {
         const now = Math.floor(Date.now() / 1000);
-        const globalQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.globalQuota?.window || '1h'));
-        const expirySeconds = Math.floor((globalQuotaTTL * 2) / 1000);
-        const globalQuotaExpiry = Math.max(0, now - expirySeconds);
-        const filters = `blocked_until=is.null&last_window_time=lt.${globalQuotaExpiry}`;
+        const filters = `blocked_until=lt.${now}`;
         return executePostgrestDelete(
           quotaPostgrestConfig.postgrestUrl,
           quotaPostgrestConfig.verifyHeader,
           quotaPostgrestConfig.verifySecret,
-          'global_ip_download_quota',
+          'quota_blocks',
           filters,
-          { Prefer: 'return=representation' }
+          { Prefer: 'count=exact' }
         );
       },
     });
@@ -621,4 +603,3 @@ export async function scheduleAllCleanups(config, env, ctx) {
     await cleanupPromise;
   }
 }
-

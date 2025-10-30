@@ -84,15 +84,13 @@ const executeBatchQueries = async (accountId, databaseId, apiToken, statements) 
  * @param {string} tableNames.cacheTableName
  * @param {string} tableNames.rateLimitTableName
  * @param {string} tableNames.throttleTableName
- * @param {string} tableNames.fileQuotaTableName
- * @param {string} tableNames.globalQuotaTableName
  * @returns {Promise<void>}
  */
 const ensureAllTables = async (
   accountId,
   databaseId,
   apiToken,
-  { cacheTableName, rateLimitTableName, throttleTableName, fileQuotaTableName, globalQuotaTableName }
+  { cacheTableName, rateLimitTableName, throttleTableName }
 ) => {
   await executeQuery(accountId, databaseId, apiToken, `
     CREATE TABLE IF NOT EXISTS ${cacheTableName} (
@@ -127,26 +125,6 @@ const ensureAllTables = async (
     )
   `);
   await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${throttleTableName}(ERROR_TIMESTAMP)`);
-
-  await executeQuery(accountId, databaseId, apiToken, `
-    CREATE TABLE IF NOT EXISTS ${fileQuotaTableName} (
-      ip_range_hash TEXT,
-      filepath_hash TEXT,
-      bytes_downloaded BIGINT DEFAULT 0,
-      last_window_time INTEGER NOT NULL,
-      blocked_until INTEGER,
-      PRIMARY KEY (ip_range_hash, filepath_hash)
-    )
-  `);
-
-  await executeQuery(accountId, databaseId, apiToken, `
-    CREATE TABLE IF NOT EXISTS ${globalQuotaTableName} (
-      ip_range_hash TEXT PRIMARY KEY,
-      total_bytes_downloaded BIGINT DEFAULT 0,
-      last_window_time INTEGER NOT NULL,
-      blocked_until INTEGER
-    )
-  `);
 };
 
 /**
@@ -171,8 +149,6 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
   const cacheTableName = config.cacheTableName || 'DOWNLOAD_CACHE_TABLE';
   const rateLimitTableName = config.rateLimitTableName || 'DOWNLOAD_IP_RATELIMIT_TABLE';
   const throttleTableName = config.throttleTableName || 'THROTTLE_PROTECTION';
-  const fileQuotaTableName = config.fileQuotaTableName || 'file_ip_download_quota';
-  const globalQuotaTableName = config.globalQuotaTableName || 'global_ip_download_quota';
   const throttleTimeWindow = config.throttleTimeWindow ?? 60;
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
@@ -181,8 +157,6 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
     cacheTableName,
     rateLimitTableName,
     throttleTableName,
-    fileQuotaTableName,
-    globalQuotaTableName,
   });
 
   console.log('[Unified Check D1-REST] Starting unified check for path:', path);

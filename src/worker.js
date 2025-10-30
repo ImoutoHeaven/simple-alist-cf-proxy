@@ -7,6 +7,7 @@ import { unifiedCheckD1 } from './unified-check-d1.js';
 import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
 import { wrapStreamWithQuotaMonitoring } from './quota-stream.js';
+import { checkQuotaBalance, checkQuotaBlock, insertQuotaDebit } from './quota-service.js';
 import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
 
 // Configuration constants
@@ -419,6 +420,7 @@ const resolveConfig = (env = {}) => {
       },
       updateIntervalBase: quotaUpdateIntervalBase,
       updateIntervalRandom: quotaUpdateIntervalRandom,
+      transactionsTTL: normalizeString(env.QUOTA_TRANSACTIONS_TTL, '7d'),
     },
   };
 };
@@ -1002,6 +1004,39 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     ? parseSizeToBytes(quotaConfig.globalQuota.maxQuota || "0")
     : 0;
 
+  const shouldUseQuota = quotaConfig.additionQuotaCheck && (quotaConfig.fileQuota?.enabled || quotaConfig.globalQuota?.enabled) && (deductBytes > 0);
+
+  const quotaBalanceParams = {
+    fileWindowSeconds,
+    fileMaxBytes: quotaConfig.fileQuota?.enabled ? quotaConfig._runtimeFileMaxQuota || 0 : null,
+    fileBlockSeconds,
+    globalWindowSeconds,
+    globalMaxBytes: quotaConfig.globalQuota?.enabled ? globalQuotaMaxBytes : null,
+    globalBlockSeconds,
+  };
+
+  const quotaDbConfig = {
+    dbMode: config.dbMode,
+    postgrestUrl: config.rateLimitConfig?.postgrestUrl || config.cacheConfig?.postgrestUrl || config.postgrestUrl || '',
+    verifyHeader: config.rateLimitConfig?.verifyHeader || config.cacheConfig?.verifyHeader || config.verifyHeader,
+    verifySecret: config.rateLimitConfig?.verifySecret || config.cacheConfig?.verifySecret || config.verifySecret,
+    databaseBinding: config.cacheConfig?.databaseBinding || config.rateLimitConfig?.databaseBinding || config.databaseBinding || '',
+    env,
+    accountId: config.rateLimitConfig?.accountId || config.cacheConfig?.accountId,
+    databaseId: config.rateLimitConfig?.databaseId || config.cacheConfig?.databaseId,
+    apiToken: config.rateLimitConfig?.apiToken || config.cacheConfig?.apiToken,
+  };
+
+  const quotaState = {
+    enabled: shouldUseQuota,
+    requestId: null,
+    windowStartTime: null,
+    ipRangeHash: null,
+    expectedBytes: deductBytes,
+  };
+
+  const quotaErrorMode = (config.rateLimitConfig?.pgErrorHandle || 'fail-closed').toLowerCase();
+
   // ========================================
   // UNIFIED CHECK (RTT 3→1 OPTIMIZATION)
   // ========================================
@@ -1023,19 +1058,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const cacheConfig = config.cacheConfig || {};
       const throttleConfig = config.throttleConfig || {};
       const limitConfigValue = rateLimitConfig.limit ?? config.ipSubnetLimit;
-      const quotaParams = {
-        filepathHash: pathHash,
-        deductBytes: quotaConfig._runtimeDeductBytes || 0,
-        fileQuotaWindowSeconds,
-        fileQuotaMaxBytes: quotaConfig._runtimeFileMaxQuota || 0,
-        fileQuotaBlockSeconds,
-        globalQuotaWindowSeconds,
-        globalQuotaMaxBytes,
-        globalQuotaBlockSeconds,
-        fileQuotaTableName: "file_ip_download_quota",
-        globalQuotaTableName: "global_ip_download_quota",
-      };
-
       if (config.dbMode === 'custom-pg-rest') {
         const unifiedOptions = {
           postgrestUrl: rateLimitConfig.postgrestUrl,
@@ -1051,7 +1073,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
-          ...quotaParams,
         };
         unifiedResult = await unifiedCheck(path, clientIP, unifiedOptions);
       } else if (config.dbMode === 'd1') {
@@ -1068,7 +1089,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
-          ...quotaParams,
         };
         unifiedResult = await unifiedCheckD1(path, clientIP, unifiedOptions);
       } else if (config.dbMode === 'd1-rest') {
@@ -1086,7 +1106,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
-          ...quotaParams,
         };
         unifiedResult = await unifiedCheckD1Rest(path, clientIP, unifiedOptions);
       } else {
@@ -1146,46 +1165,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         );
       }
       
-      if (quotaConfig.fileQuota?.enabled && unifiedResult.fileQuota) {
-        if (unifiedResult.fileQuota.exceeded) {
-          const nowSeconds = Math.floor(Date.now() / 1000);
-          let retryAfter = 0;
-          if (typeof unifiedResult.fileQuota.blockedUntil === "number") {
-            retryAfter = Math.max(0, Math.ceil(unifiedResult.fileQuota.blockedUntil - nowSeconds));
-          }
-          if (!retryAfter && fileQuotaBlockSeconds) {
-            retryAfter = fileQuotaBlockSeconds;
-          }
-
-          return createQuotaLimitResponse(
-            origin,
-            429,
-            `File-level quota exceeded for ${path}. IP range ${ipSubnet || clientIP} downloaded ${unifiedResult.fileQuota.bytesDownloaded} bytes (limit: ${quotaConfig._runtimeFileMaxQuota} bytes in ${quotaConfig.fileQuota?.window || 'configured window'})`,
-            retryAfter
-          );
-        }
-      }
-
-      if (quotaConfig.globalQuota?.enabled && unifiedResult.globalQuota) {
-        if (unifiedResult.globalQuota.exceeded) {
-          const nowSeconds = Math.floor(Date.now() / 1000);
-          let retryAfter = 0;
-          if (typeof unifiedResult.globalQuota.blockedUntil === "number") {
-            retryAfter = Math.max(0, Math.ceil(unifiedResult.globalQuota.blockedUntil - nowSeconds));
-          }
-          if (!retryAfter && globalQuotaBlockSeconds) {
-            retryAfter = globalQuotaBlockSeconds;
-          }
-
-          return createQuotaLimitResponse(
-            origin,
-            429,
-            `Global quota exceeded for IP range ${ipSubnet || clientIP}. Total downloaded ${unifiedResult.globalQuota.bytesDownloaded} bytes (limit: ${globalQuotaMaxBytes} bytes in ${quotaConfig.globalQuota?.window || 'configured window'})`,
-            retryAfter
-          );
-        }
-      }
-
       // Trigger probabilistic cleanup for rate limit
       if (rateLimiter && config.rateLimitConfig) {
         const probability = config.rateLimitConfig.cleanupProbability || 0.01;
@@ -1446,6 +1425,81 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       operationMode = 'resume_operation';
     }
   }
+  
+  if (quotaState.enabled) {
+    try {
+      quotaState.ipRangeHash = await sha256Hex(ipSubnet || clientIP || '');
+      const nowSeconds = Math.floor(Date.now() / 1000);
+
+      const blockCheck = await checkQuotaBlock(quotaDbConfig, {
+        ipRangeHash: quotaState.ipRangeHash,
+        filepathHash: pathHash,
+        nowSeconds,
+      });
+
+      if (blockCheck.blocked) {
+        const blocks = Array.isArray(blockCheck.blocks) ? blockCheck.blocks : [];
+        const maxBlockedUntil = blocks.reduce((latest, block) => Math.max(latest, block.blockedUntil || 0), 0);
+        const retryAfter = maxBlockedUntil > nowSeconds
+          ? Math.max(0, maxBlockedUntil - nowSeconds)
+          : Math.max(quotaBalanceParams.fileBlockSeconds || 0, quotaBalanceParams.globalBlockSeconds || 0, 0);
+        const reason = blocks[0]?.reason || 'Quota temporarily blocked';
+        return createQuotaLimitResponse(origin, 429, reason, retryAfter);
+      }
+
+      const balance = await checkQuotaBalance(quotaDbConfig, {
+        ipRangeHash: quotaState.ipRangeHash,
+        filepathHash: pathHash,
+        deductBytes: quotaState.expectedBytes,
+        nowSeconds,
+        fileWindowSeconds: quotaBalanceParams.fileWindowSeconds,
+        fileMaxBytes: quotaBalanceParams.fileMaxBytes,
+        fileBlockSeconds: quotaBalanceParams.fileBlockSeconds,
+        globalWindowSeconds: quotaBalanceParams.globalWindowSeconds,
+        globalMaxBytes: quotaBalanceParams.globalMaxBytes,
+        globalBlockSeconds: quotaBalanceParams.globalBlockSeconds,
+      });
+
+      if (balance.fileInsufficient) {
+        const retryAfter = balance.fileBlockedUntil && balance.fileBlockedUntil > nowSeconds
+          ? Math.max(0, balance.fileBlockedUntil - nowSeconds)
+          : Math.max(quotaBalanceParams.fileBlockSeconds || 0, 0);
+        const limitBytes = balance.fileLimit ?? quotaBalanceParams.fileMaxBytes ?? quotaState.expectedBytes;
+        const fileUsage = balance.fileUsage ?? 0;
+        const windowLabel = quotaConfig.fileQuota?.window || 'configured window';
+        return createQuotaLimitResponse(
+          origin,
+          429,
+          `File-level quota exceeded for ${path}. IP range ${ipSubnet || clientIP} downloaded ${fileUsage} bytes (limit: ${limitBytes} bytes in ${windowLabel})`,
+          retryAfter
+        );
+      }
+
+      if (balance.globalInsufficient) {
+        const retryAfter = balance.globalBlockedUntil && balance.globalBlockedUntil > nowSeconds
+          ? Math.max(0, balance.globalBlockedUntil - nowSeconds)
+          : Math.max(quotaBalanceParams.globalBlockSeconds || 0, 0);
+        const limitBytes = balance.globalLimit ?? quotaBalanceParams.globalMaxBytes ?? quotaState.expectedBytes;
+        const totalUsage = balance.globalUsage ?? 0;
+        const windowLabel = quotaConfig.globalQuota?.window || 'configured window';
+        return createQuotaLimitResponse(
+          origin,
+          429,
+          `Global quota exceeded for IP range ${ipSubnet || clientIP}. Total downloaded ${totalUsage} bytes (limit: ${limitBytes} bytes in ${windowLabel})`,
+          retryAfter
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[Quota] Check failed:', message);
+      if (quotaErrorMode === 'fail-open') {
+        console.warn('[Quota] Fail-open mode: allowing request despite quota error');
+        quotaState.enabled = false;
+      } else {
+        return createErrorResponse(origin, 500, `Quota check failed: ${message}`);
+      }
+    }
+  }
 
   // Proceed with fetch
   request = new Request(downloadUrl, request);
@@ -1471,6 +1525,36 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     } else {
       break;
     }
+  }
+
+  let quotaDebitRecorded = false;
+  if (quotaState.enabled && request.method === 'GET' && response.status === 206) {
+    quotaState.requestId = crypto.randomUUID();
+    quotaState.windowStartTime = Date.now();
+
+    try {
+      const debitResult = await insertQuotaDebit(quotaDbConfig, {
+        requestId: quotaState.requestId,
+        ipRangeHash: quotaState.ipRangeHash,
+        filepathHash: pathHash,
+        estimatedBytes: quotaState.expectedBytes,
+        amount: quotaState.expectedBytes,
+        windowStartTime: quotaState.windowStartTime,
+      });
+
+      if (!debitResult?.success) {
+        console.error('[Quota] Debit insertion failed');
+        return createErrorResponse(origin, 500, 'Failed to record quota debit');
+      }
+
+      quotaDebitRecorded = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[Quota] Debit failed:', message);
+      return createErrorResponse(origin, 500, `Quota debit failed: ${message}`);
+    }
+  } else {
+    quotaState.enabled = false;
   }
   
   // Update throttle protection status based on fetch result
@@ -1584,35 +1668,27 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   safeHeaders.append("Vary", "Origin");
 
   // 创建带有安全headers的新响应
-  const shouldMonitorQuota = (response.status === 200 || response.status === 206) &&
-    (quotaConfig.fileQuota?.enabled || quotaConfig.globalQuota?.enabled) &&
-    quotaConfig.additionQuotaCheck;
+  const shouldWrapQuotaStream = quotaDebitRecorded && response.body;
 
   let finalBody = response.body;
-  if (shouldMonitorQuota && finalBody) {
-    finalBody = wrapStreamWithQuotaMonitoring(
-      response.body,
-      {
-        ipRange: ipSubnet,
-        ipRangeHash: await sha256Hex(ipSubnet || clientIP || ""),
-        filepath: path,
-        filepathHash: pathHash,
-        expectedBytes: quotaConfig._runtimeDeductBytes || 0,
-        config: quotaConfig,
-        dbConfig: {
-          dbMode: config.dbMode,
-          postgrestUrl: config.rateLimitConfig?.postgrestUrl || config.cacheConfig?.postgrestUrl || config.postgrestUrl || "",
-          databaseBinding: config.cacheConfig?.databaseBinding || config.rateLimitConfig?.databaseBinding || config.databaseBinding || "",
-          accountId: config.rateLimitConfig?.accountId || config.cacheConfig?.accountId || config.accountId || "",
-          databaseId: config.rateLimitConfig?.databaseId || config.cacheConfig?.databaseId || config.databaseId || "",
-          apiToken: config.rateLimitConfig?.apiToken || config.cacheConfig?.apiToken || config.apiToken || "",
-          fileQuotaTableName: quotaConfig.fileQuota?.tableName || 'file_ip_download_quota',
-          globalQuotaTableName: quotaConfig.globalQuota?.tableName || 'global_ip_download_quota',
-          env,
-        },
-        ctx,
-      }
-    );
+  if (shouldWrapQuotaStream) {
+    const windowList = [
+      quotaBalanceParams.fileWindowSeconds,
+      quotaBalanceParams.globalWindowSeconds,
+    ].filter((seconds) => Number.isFinite(seconds) && seconds > 0);
+
+    finalBody = wrapStreamWithQuotaMonitoring(response.body, {
+      requestId: quotaState.requestId,
+      ipRangeHash: quotaState.ipRangeHash,
+      filepathHash: pathHash,
+      expectedBytes: quotaState.expectedBytes,
+      windowStartTime: quotaState.windowStartTime,
+      windowSecondsList: windowList,
+      balanceParams: quotaBalanceParams,
+      dbConfig: quotaDbConfig,
+      quotaConfig,
+      ctx,
+    });
   }
 
   const safeResponse = new Response(finalBody, {

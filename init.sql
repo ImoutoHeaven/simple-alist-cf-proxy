@@ -9,12 +9,11 @@
 -- If you override the environment variables, adjust the CREATE TABLE
 -- statements accordingly before applying this script.
 
-
 -- ========================================
 -- Download Cache Table Schema
 -- ========================================
 -- Purpose: Cache AList /api/fs/link responses to reduce API calls
--- Compatible with: SQLite (D1), PostgreSQL
+-- Compatible with: PostgreSQL
 
 CREATE TABLE IF NOT EXISTS "DOWNLOAD_CACHE_TABLE" (
   "PATH_HASH" TEXT PRIMARY KEY,
@@ -28,7 +27,6 @@ CREATE INDEX IF NOT EXISTS idx_download_cache_timestamp
   ON "DOWNLOAD_CACHE_TABLE"("TIMESTAMP");
 CREATE INDEX IF NOT EXISTS idx_download_cache_hostname
   ON "DOWNLOAD_CACHE_TABLE"("HOSTNAME_HASH");
-
 
 -- ========================================
 -- PostgreSQL Stored Procedure: Atomic UPSERT (Download Cache)
@@ -67,7 +65,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-
 -- ========================================
 -- Optional: Cleanup Function (PostgreSQL)
 -- ========================================
@@ -93,7 +90,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-
 -- ========================================
 -- Throttle Protection Table Schema
 -- ========================================
@@ -107,7 +103,6 @@ CREATE TABLE IF NOT EXISTS "THROTTLE_PROTECTION" (
 
 CREATE INDEX IF NOT EXISTS idx_throttle_timestamp
   ON "THROTTLE_PROTECTION"("ERROR_TIMESTAMP");
-
 
 -- ========================================
 -- PostgreSQL Stored Procedure: Atomic UPSERT (Throttle)
@@ -146,15 +141,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-
 -- ========================================
 -- Optional: Throttle Cleanup Function (PostgreSQL)
 -- ========================================
--- BREAKING CHANGE: IS_PROTECTED semantics changed
---   1 = protected (error detected)
---   0 = normal operation (initialized or recovered)
---   NULL = record does not exist (query result only)
--- Cleanup: Delete records with IS_PROTECTED = 0 and expired ERROR_TIMESTAMP
 CREATE OR REPLACE FUNCTION download_cleanup_throttle_protection(
   p_ttl_seconds INTEGER,
   p_table_name TEXT DEFAULT 'THROTTLE_PROTECTION'
@@ -178,7 +167,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-
 -- ========================================
 -- Download IP Rate Limit Table Schema
 -- ========================================
@@ -195,35 +183,6 @@ CREATE INDEX IF NOT EXISTS idx_download_rate_limit_window
 CREATE INDEX IF NOT EXISTS idx_download_rate_limit_block
   ON "DOWNLOAD_IP_RATELIMIT_TABLE"("BLOCK_UNTIL")
   WHERE "BLOCK_UNTIL" IS NOT NULL;
-
-
--- ========================================
--- File Download Quota Table Schema
--- ========================================
--- Purpose: Track per-file download quotas per IP range
--- Compatible with: SQLite (D1), PostgreSQL
-CREATE TABLE IF NOT EXISTS file_ip_download_quota (
-  ip_range_hash TEXT,
-  filepath_hash TEXT,
-  bytes_downloaded BIGINT DEFAULT 0,
-  last_window_time INTEGER NOT NULL,
-  blocked_until INTEGER,
-  PRIMARY KEY (ip_range_hash, filepath_hash)
-);
-
-
--- ========================================
--- Global Download Quota Table Schema
--- ========================================
--- Purpose: Track global download quotas per IP range
--- Compatible with: SQLite (D1), PostgreSQL
-CREATE TABLE IF NOT EXISTS global_ip_download_quota (
-  ip_range_hash TEXT PRIMARY KEY,
-  total_bytes_downloaded BIGINT DEFAULT 0,
-  last_window_time INTEGER NOT NULL,
-  blocked_until INTEGER
-);
-
 
 -- ========================================
 -- PostgreSQL Stored Procedure: Atomic UPSERT (Rate Limit)
@@ -274,363 +233,375 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- ========================================
+-- Quota Transaction Log Schema
+-- ========================================
+CREATE TABLE IF NOT EXISTS quota_transactions (
+  id BIGSERIAL PRIMARY KEY,
+  request_id TEXT NOT NULL,
+  ip_range_hash TEXT NOT NULL,
+  filepath_hash TEXT NOT NULL,
+  transaction_type TEXT NOT NULL CHECK (transaction_type IN ('debit', 'settlement')),
+  estimated_bytes BIGINT,
+  actual_bytes BIGINT,
+  amount BIGINT NOT NULL,
+  window_start_time BIGINT NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  CONSTRAINT quota_transactions_amount_check
+    CHECK ((transaction_type = 'debit' AND amount >= 0) OR (transaction_type = 'settlement' AND amount <= 0)),
+  CONSTRAINT quota_transactions_estimated_check
+    CHECK (estimated_bytes IS NULL OR estimated_bytes >= 0),
+  CONSTRAINT quota_transactions_actual_check
+    CHECK (actual_bytes IS NULL OR actual_bytes >= 0),
+  CONSTRAINT quota_transactions_window_check
+    CHECK (window_start_time >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_transactions_request
+  ON quota_transactions (request_id);
+CREATE INDEX IF NOT EXISTS idx_quota_transactions_ip_window
+  ON quota_transactions (ip_range_hash, window_start_time);
+CREATE INDEX IF NOT EXISTS idx_quota_transactions_file_ip
+  ON quota_transactions (filepath_hash, ip_range_hash);
+CREATE INDEX IF NOT EXISTS idx_quota_transactions_created_at
+  ON quota_transactions (created_at);
 
 -- ========================================
--- PostgreSQL Stored Procedure: File Download Quota Check
+-- Quota Block Table Schema
 -- ========================================
-CREATE OR REPLACE FUNCTION download_check_file_quota(
+CREATE TABLE IF NOT EXISTS quota_blocks (
+  ip_range_hash TEXT NOT NULL,
+  filepath_hash TEXT,
+  block_type TEXT NOT NULL CHECK (block_type IN ('file_quota', 'global_quota', 'rate_limit')),
+  blocked_until BIGINT NOT NULL,
+  reason TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  filepath_hash_key TEXT GENERATED ALWAYS AS (COALESCE(filepath_hash, '')) STORED,
+  PRIMARY KEY (ip_range_hash, block_type, filepath_hash_key),
+  CONSTRAINT quota_blocks_blocked_until_check CHECK (blocked_until >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_quota_blocks_blocked_until
+  ON quota_blocks (blocked_until);
+CREATE INDEX IF NOT EXISTS idx_quota_blocks_created_at
+  ON quota_blocks (created_at);
+
+-- ========================================
+-- PostgreSQL Stored Procedure: Check Quota Blocks
+-- ========================================
+CREATE OR REPLACE FUNCTION check_quota_block(
+  p_ip_range_hash TEXT,
+  p_filepath_hash TEXT,
+  p_now BIGINT,
+  p_block_types TEXT[] DEFAULT ARRAY['file_quota', 'global_quota']::TEXT[]
+)
+RETURNS TABLE(
+  block_type TEXT,
+  blocked_until BIGINT,
+  reason TEXT
+) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT b.block_type, b.blocked_until, b.reason
+    FROM quota_blocks b
+   WHERE b.ip_range_hash = p_ip_range_hash
+     AND b.block_type = ANY(p_block_types)
+     AND b.blocked_until > p_now
+     AND (
+       (b.filepath_hash IS NULL)
+       OR (p_filepath_hash IS NOT NULL AND b.filepath_hash = p_filepath_hash)
+     );
+END;
+$$ LANGUAGE plpgsql;
+
+-- ========================================
+-- PostgreSQL Stored Procedure: Check Quota Balance
+-- ========================================
+CREATE OR REPLACE FUNCTION check_quota_balance(
   p_ip_range_hash TEXT,
   p_filepath_hash TEXT,
   p_deduct_bytes BIGINT,
-  p_now INTEGER,
-  p_window_seconds INTEGER,
-  p_max_quota BIGINT,
-  p_block_seconds INTEGER,
-  p_file_table_name TEXT DEFAULT 'file_ip_download_quota'
+  p_now BIGINT,
+  p_file_window_seconds INTEGER DEFAULT NULL,
+  p_file_max_bytes BIGINT DEFAULT NULL,
+  p_file_block_seconds INTEGER DEFAULT NULL,
+  p_global_window_seconds INTEGER DEFAULT NULL,
+  p_global_max_bytes BIGINT DEFAULT NULL,
+  p_global_block_seconds INTEGER DEFAULT NULL
 )
 RETURNS TABLE(
-  bytes_downloaded BIGINT,
-  last_window_time INTEGER,
-  blocked_until INTEGER,
-  quota_exceeded BOOLEAN
+  file_usage BIGINT,
+  file_projected BIGINT,
+  file_limit BIGINT,
+  file_remaining BIGINT,
+  file_insufficient BOOLEAN,
+  file_blocked_until BIGINT,
+  global_usage BIGINT,
+  global_projected BIGINT,
+  global_limit BIGINT,
+  global_remaining BIGINT,
+  global_insufficient BOOLEAN,
+  global_blocked_until BIGINT
 ) AS $$
 DECLARE
-  sql TEXT;
+  sanitized_deduct BIGINT := GREATEST(COALESCE(p_deduct_bytes, 0), 0);
+  cutoff_file_ms BIGINT;
+  cutoff_global_ms BIGINT;
+  block_until_value BIGINT;
 BEGIN
-  sql := format(
-    'WITH upsert AS (
-       INSERT INTO %1$I ("ip_range_hash", "filepath_hash", "bytes_downloaded", "last_window_time", "blocked_until")
-       VALUES (
-         $1,
-         $2,
-         CASE WHEN GREATEST(COALESCE($3, 0), 0) > $6 THEN 0 ELSE GREATEST(COALESCE($3, 0), 0) END,
-         $4,
-         CASE
-           WHEN GREATEST(COALESCE($3, 0), 0) > $6 THEN $4 + CASE WHEN COALESCE($7, 0) > 0 THEN COALESCE($7, 0) ELSE 1 END
-           ELSE NULL
-         END
-       )
-       ON CONFLICT ("ip_range_hash", "filepath_hash") DO UPDATE SET
-         "bytes_downloaded" = CASE
-           WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $4 THEN %1$I."bytes_downloaded"
-           WHEN $4 - %1$I."last_window_time" >= $5 THEN CASE WHEN GREATEST(COALESCE($3, 0), 0) > $6 THEN 0 ELSE GREATEST(COALESCE($3, 0), 0) END
-           WHEN %1$I."bytes_downloaded" + GREATEST(COALESCE($3, 0), 0) > $6 THEN %1$I."bytes_downloaded"
-           ELSE %1$I."bytes_downloaded" + GREATEST(COALESCE($3, 0), 0)
-         END,
-         "last_window_time" = CASE
-           WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $4 THEN %1$I."last_window_time"
-           WHEN $4 - %1$I."last_window_time" >= $5 THEN $4
-           ELSE %1$I."last_window_time"
-         END,
-         "blocked_until" = CASE
-           WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $4 THEN %1$I."blocked_until"
-           WHEN $4 - %1$I."last_window_time" >= $5 THEN CASE
-             WHEN GREATEST(COALESCE($3, 0), 0) > $6 THEN $4 + CASE WHEN COALESCE($7, 0) > 0 THEN COALESCE($7, 0) ELSE 1 END
-             ELSE NULL
-           END
-           WHEN %1$I."bytes_downloaded" + GREATEST(COALESCE($3, 0), 0) > $6 THEN $4 + CASE WHEN COALESCE($7, 0) > 0 THEN COALESCE($7, 0) ELSE 1 END
-           ELSE NULL
-         END
-       RETURNING
-         "bytes_downloaded",
-         "last_window_time",
-         "blocked_until"
-     )
-     SELECT
-       "bytes_downloaded",
-       "last_window_time",
-       "blocked_until",
-       ("blocked_until" IS NOT NULL AND "blocked_until" > $4) AS quota_exceeded
-     FROM upsert',
-    p_file_table_name
-  );
+  file_usage := NULL;
+  file_projected := NULL;
+  file_limit := NULL;
+  file_remaining := NULL;
+  file_insufficient := NULL;
+  file_blocked_until := NULL;
+  global_usage := NULL;
+  global_projected := NULL;
+  global_limit := NULL;
+  global_remaining := NULL;
+  global_insufficient := NULL;
+  global_blocked_until := NULL;
 
-  RETURN QUERY EXECUTE sql USING
+  IF p_file_window_seconds IS NOT NULL AND p_file_window_seconds > 0
+     AND p_file_max_bytes IS NOT NULL AND p_file_max_bytes > 0 THEN
+    cutoff_file_ms := (p_now - p_file_window_seconds) * 1000;
+    IF cutoff_file_ms < 0 THEN
+      cutoff_file_ms := 0;
+    END IF;
+
+    SELECT COALESCE(SUM(amount), 0)
+      INTO file_usage
+      FROM quota_transactions
+     WHERE ip_range_hash = p_ip_range_hash
+       AND filepath_hash = p_filepath_hash
+       AND window_start_time >= cutoff_file_ms;
+
+    file_projected := file_usage + sanitized_deduct;
+    file_limit := p_file_max_bytes;
+    file_remaining := GREATEST(p_file_max_bytes - file_usage, 0);
+    file_insufficient := file_projected > p_file_max_bytes;
+
+    IF file_insufficient THEN
+      IF p_file_block_seconds IS NOT NULL AND p_file_block_seconds > 0 THEN
+        block_until_value := p_now + p_file_block_seconds;
+
+        INSERT INTO quota_blocks (ip_range_hash, filepath_hash, block_type, blocked_until, reason)
+        VALUES (
+          p_ip_range_hash,
+          p_filepath_hash,
+          'file_quota',
+          block_until_value,
+          format('Quota exceeded: %s > %s bytes within %s seconds', file_projected, p_file_max_bytes, p_file_window_seconds)
+        )
+        ON CONFLICT (ip_range_hash, block_type, filepath_hash_key) DO UPDATE
+          SET blocked_until = GREATEST(quota_blocks.blocked_until, EXCLUDED.blocked_until),
+              reason = EXCLUDED.reason;
+
+        SELECT blocked_until
+          INTO file_blocked_until
+          FROM quota_blocks
+         WHERE ip_range_hash = p_ip_range_hash
+           AND block_type = 'file_quota'
+           AND (
+             (p_filepath_hash IS NULL AND filepath_hash IS NULL)
+             OR (p_filepath_hash IS NOT NULL AND filepath_hash = p_filepath_hash)
+           );
+      ELSE
+        file_blocked_until := NULL;
+      END IF;
+    ELSE
+      file_blocked_until := NULL;
+    END IF;
+  ELSE
+    file_usage := 0;
+    file_projected := sanitized_deduct;
+    file_limit := NULL;
+    file_remaining := NULL;
+    file_insufficient := FALSE;
+    file_blocked_until := NULL;
+  END IF;
+
+  IF p_global_window_seconds IS NOT NULL AND p_global_window_seconds > 0
+     AND p_global_max_bytes IS NOT NULL AND p_global_max_bytes > 0 THEN
+    cutoff_global_ms := (p_now - p_global_window_seconds) * 1000;
+    IF cutoff_global_ms < 0 THEN
+      cutoff_global_ms := 0;
+    END IF;
+
+    SELECT COALESCE(SUM(amount), 0)
+      INTO global_usage
+      FROM quota_transactions
+     WHERE ip_range_hash = p_ip_range_hash
+       AND window_start_time >= cutoff_global_ms;
+
+    global_projected := global_usage + sanitized_deduct;
+    global_limit := p_global_max_bytes;
+    global_remaining := GREATEST(p_global_max_bytes - global_usage, 0);
+    global_insufficient := global_projected > p_global_max_bytes;
+
+    IF global_insufficient THEN
+      IF p_global_block_seconds IS NOT NULL AND p_global_block_seconds > 0 THEN
+        block_until_value := p_now + p_global_block_seconds;
+
+        INSERT INTO quota_blocks (ip_range_hash, filepath_hash, block_type, blocked_until, reason)
+        VALUES (
+          p_ip_range_hash,
+          NULL,
+          'global_quota',
+          block_until_value,
+          format('Global quota exceeded: %s > %s bytes within %s seconds', global_projected, p_global_max_bytes, p_global_window_seconds)
+        )
+        ON CONFLICT (ip_range_hash, block_type, filepath_hash_key) DO UPDATE
+          SET blocked_until = GREATEST(quota_blocks.blocked_until, EXCLUDED.blocked_until),
+              reason = EXCLUDED.reason;
+
+        SELECT blocked_until
+          INTO global_blocked_until
+          FROM quota_blocks
+         WHERE ip_range_hash = p_ip_range_hash
+           AND block_type = 'global_quota'
+           AND filepath_hash IS NULL;
+      ELSE
+        global_blocked_until := NULL;
+      END IF;
+    ELSE
+      global_blocked_until := NULL;
+    END IF;
+  ELSE
+    global_usage := 0;
+    global_projected := sanitized_deduct;
+    global_limit := NULL;
+    global_remaining := NULL;
+    global_insufficient := FALSE;
+    global_blocked_until := NULL;
+  END IF;
+
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ========================================
+-- PostgreSQL Stored Procedure: Insert Quota Debit
+-- ========================================
+CREATE OR REPLACE FUNCTION insert_quota_debit(
+  p_request_id TEXT,
+  p_ip_range_hash TEXT,
+  p_filepath_hash TEXT,
+  p_estimated_bytes BIGINT,
+  p_amount BIGINT,
+  p_window_start_time BIGINT
+)
+RETURNS TABLE(success BOOLEAN) AS $$
+DECLARE
+  sanitized_amount BIGINT := GREATEST(COALESCE(p_amount, 0), 0);
+  sanitized_estimated BIGINT := GREATEST(COALESCE(p_estimated_bytes, 0), 0);
+  sanitized_window BIGINT := GREATEST(COALESCE(p_window_start_time, 0), 0);
+  full_request_id TEXT := p_request_id || '::debit';
+  inserted_id BIGINT;
+BEGIN
+  INSERT INTO quota_transactions (
+    request_id,
+    ip_range_hash,
+    filepath_hash,
+    transaction_type,
+    estimated_bytes,
+    actual_bytes,
+    amount,
+    window_start_time
+  )
+  VALUES (
+    full_request_id,
     p_ip_range_hash,
     p_filepath_hash,
-    p_deduct_bytes,
-    p_now,
-    p_window_seconds,
-    p_max_quota,
-    p_block_seconds;
+    'debit',
+    sanitized_estimated,
+    NULL,
+    sanitized_amount,
+    sanitized_window
+  )
+  ON CONFLICT (request_id) DO NOTHING
+  RETURNING id INTO inserted_id;
+
+  success := inserted_id IS NOT NULL;
+  RETURN NEXT;
 END;
 $$ LANGUAGE plpgsql;
 
-
 -- ========================================
--- PostgreSQL Stored Procedure: Global Download Quota Check
+-- PostgreSQL Stored Procedure: Insert Quota Settlement
 -- ========================================
-CREATE OR REPLACE FUNCTION download_check_global_quota(
+CREATE OR REPLACE FUNCTION insert_quota_settlement(
+  p_request_id TEXT,
   p_ip_range_hash TEXT,
-  p_deduct_bytes BIGINT,
-  p_now INTEGER,
-  p_window_seconds INTEGER,
-  p_max_quota BIGINT,
-  p_block_seconds INTEGER,
-  p_global_table_name TEXT DEFAULT 'global_ip_download_quota'
+  p_filepath_hash TEXT,
+  p_actual_bytes BIGINT,
+  p_refund_amount BIGINT,
+  p_window_start_time BIGINT
 )
-RETURNS TABLE(
-  total_bytes_downloaded BIGINT,
-  last_window_time INTEGER,
-  blocked_until INTEGER,
-  quota_exceeded BOOLEAN
-) AS $$
+RETURNS TABLE(success BOOLEAN) AS $$
 DECLARE
-  sql TEXT;
+  sanitized_actual BIGINT := GREATEST(COALESCE(p_actual_bytes, 0), 0);
+  sanitized_window BIGINT := GREATEST(COALESCE(p_window_start_time, 0), 0);
+  normalized_refund BIGINT := COALESCE(p_refund_amount, 0);
+  full_request_id TEXT := p_request_id || '::settlement';
+  inserted_id BIGINT;
 BEGIN
-  sql := format(
-    'WITH upsert AS (
-       INSERT INTO %1$I ("ip_range_hash", "total_bytes_downloaded", "last_window_time", "blocked_until")
-       VALUES (
-         $1,
-         CASE WHEN GREATEST(COALESCE($2, 0), 0) > $5 THEN 0 ELSE GREATEST(COALESCE($2, 0), 0) END,
-         $3,
-         CASE
-           WHEN GREATEST(COALESCE($2, 0), 0) > $5 THEN $3 + CASE WHEN COALESCE($6, 0) > 0 THEN COALESCE($6, 0) ELSE 1 END
-           ELSE NULL
-         END
-       )
-       ON CONFLICT ("ip_range_hash") DO UPDATE SET
-         "total_bytes_downloaded" = CASE
-           WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $3 THEN %1$I."total_bytes_downloaded"
-           WHEN $3 - %1$I."last_window_time" >= $4 THEN CASE WHEN GREATEST(COALESCE($2, 0), 0) > $5 THEN 0 ELSE GREATEST(COALESCE($2, 0), 0) END
-           WHEN %1$I."total_bytes_downloaded" + GREATEST(COALESCE($2, 0), 0) > $5 THEN %1$I."total_bytes_downloaded"
-           ELSE %1$I."total_bytes_downloaded" + GREATEST(COALESCE($2, 0), 0)
-         END,
-         "last_window_time" = CASE
-           WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $3 THEN %1$I."last_window_time"
-           WHEN $3 - %1$I."last_window_time" >= $4 THEN $3
-           ELSE %1$I."last_window_time"
-         END,
-         "blocked_until" = CASE
-           WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $3 THEN %1$I."blocked_until"
-           WHEN $3 - %1$I."last_window_time" >= $4 THEN CASE
-             WHEN GREATEST(COALESCE($2, 0), 0) > $5 THEN $3 + CASE WHEN COALESCE($6, 0) > 0 THEN COALESCE($6, 0) ELSE 1 END
-             ELSE NULL
-           END
-           WHEN %1$I."total_bytes_downloaded" + GREATEST(COALESCE($2, 0), 0) > $5 THEN $3 + CASE WHEN COALESCE($6, 0) > 0 THEN COALESCE($6, 0) ELSE 1 END
-           ELSE NULL
-         END
-       RETURNING
-         "total_bytes_downloaded",
-         "last_window_time",
-         "blocked_until"
-     )
-     SELECT
-       "total_bytes_downloaded",
-       "last_window_time",
-       "blocked_until",
-       ("blocked_until" IS NOT NULL AND "blocked_until" > $3) AS quota_exceeded
-     FROM upsert',
-    p_global_table_name
-  );
+  IF normalized_refund > 0 THEN
+    normalized_refund := -normalized_refund;
+  END IF;
 
-  RETURN QUERY EXECUTE sql USING
+  INSERT INTO quota_transactions (
+    request_id,
+    ip_range_hash,
+    filepath_hash,
+    transaction_type,
+    estimated_bytes,
+    actual_bytes,
+    amount,
+    window_start_time
+  )
+  VALUES (
+    full_request_id,
     p_ip_range_hash,
-    p_deduct_bytes,
-    p_now,
-    p_window_seconds,
-    p_max_quota,
-    p_block_seconds;
+    p_filepath_hash,
+    'settlement',
+    NULL,
+    sanitized_actual,
+    normalized_refund,
+    sanitized_window
+  )
+  ON CONFLICT (request_id) DO NOTHING
+  RETURNING id INTO inserted_id;
+
+  success := inserted_id IS NOT NULL;
+  RETURN NEXT;
 END;
 $$ LANGUAGE plpgsql;
 
-
 -- ========================================
--- PostgreSQL Stored Procedure: Update Quota Progress
+-- PostgreSQL Stored Procedure: Delete Quota Block
 -- ========================================
-CREATE OR REPLACE FUNCTION download_update_quota_progress(
+CREATE OR REPLACE FUNCTION delete_quota_block(
   p_ip_range_hash TEXT,
   p_filepath_hash TEXT,
-  p_update_bytes BIGINT,
-  p_now INTEGER,
-  p_file_table_name TEXT DEFAULT 'file_ip_download_quota',
-  p_global_table_name TEXT DEFAULT 'global_ip_download_quota'
+  p_block_type TEXT
 )
-RETURNS TABLE(
-  success BOOLEAN
-) AS $$
+RETURNS INTEGER AS $$
 DECLARE
-  file_select_sql TEXT;
-  file_insert_sql TEXT;
-  file_update_sql TEXT;
-  global_select_sql TEXT;
-  global_insert_sql TEXT;
-  global_update_sql TEXT;
-  file_record RECORD;
-  global_record RECORD;
-  current_file_bytes BIGINT;
-  new_file_bytes BIGINT;
-  delta BIGINT;
-  current_global_bytes BIGINT;
-  new_global_bytes BIGINT;
-  safe_update_bytes BIGINT;
+  deleted_count INTEGER;
 BEGIN
-  safe_update_bytes := GREATEST(COALESCE(p_update_bytes, 0), 0);
+  DELETE FROM quota_blocks
+   WHERE ip_range_hash = p_ip_range_hash
+     AND block_type = p_block_type
+     AND (
+       (p_filepath_hash IS NULL AND filepath_hash IS NULL)
+       OR (p_filepath_hash IS NOT NULL AND filepath_hash = p_filepath_hash)
+     );
 
-  file_select_sql := format(
-    'SELECT "ip_range_hash", "filepath_hash", "bytes_downloaded"
-       FROM %1$I
-       WHERE "ip_range_hash" = $1 AND "filepath_hash" = $2
-       FOR UPDATE',
-    p_file_table_name
-  );
-
-  EXECUTE file_select_sql INTO file_record USING p_ip_range_hash, p_filepath_hash;
-
-  IF file_record."ip_range_hash" IS NULL THEN
-    file_insert_sql := format(
-      'INSERT INTO %1$I ("ip_range_hash", "filepath_hash", "bytes_downloaded", "last_window_time", "blocked_until")
-         VALUES ($1, $2, $3, $4, NULL)
-         ON CONFLICT ("ip_range_hash", "filepath_hash") DO NOTHING',
-      p_file_table_name
-    );
-
-    EXECUTE file_insert_sql USING p_ip_range_hash, p_filepath_hash, safe_update_bytes, p_now;
-
-    EXECUTE file_select_sql INTO file_record USING p_ip_range_hash, p_filepath_hash;
-  END IF;
-
-  current_file_bytes := COALESCE(file_record."bytes_downloaded", 0);
-  new_file_bytes := safe_update_bytes;
-
-  file_update_sql := format(
-    'UPDATE %1$I
-       SET "bytes_downloaded" = $3
-       WHERE "ip_range_hash" = $1 AND "filepath_hash" = $2',
-    p_file_table_name
-  );
-  EXECUTE file_update_sql USING p_ip_range_hash, p_filepath_hash, new_file_bytes;
-
-  delta := new_file_bytes - current_file_bytes;
-
-  global_select_sql := format(
-    'SELECT "ip_range_hash", "total_bytes_downloaded"
-       FROM %1$I
-       WHERE "ip_range_hash" = $1
-       FOR UPDATE',
-    p_global_table_name
-  );
-  EXECUTE global_select_sql INTO global_record USING p_ip_range_hash;
-
-  IF global_record."ip_range_hash" IS NULL THEN
-    global_insert_sql := format(
-      'INSERT INTO %1$I ("ip_range_hash", "total_bytes_downloaded", "last_window_time", "blocked_until")
-         VALUES ($1, $2, $3, NULL)
-         ON CONFLICT ("ip_range_hash") DO NOTHING',
-      p_global_table_name
-    );
-    EXECUTE global_insert_sql USING p_ip_range_hash, GREATEST(delta, 0), p_now;
-
-    EXECUTE global_select_sql INTO global_record USING p_ip_range_hash;
-  END IF;
-
-  current_global_bytes := COALESCE(global_record."total_bytes_downloaded", 0);
-  new_global_bytes := current_global_bytes + delta;
-
-  IF new_global_bytes < 0 THEN
-    new_global_bytes := 0;
-  END IF;
-
-  global_update_sql := format(
-    'UPDATE %1$I
-       SET "total_bytes_downloaded" = $2
-       WHERE "ip_range_hash" = $1',
-    p_global_table_name
-  );
-  EXECUTE global_update_sql USING p_ip_range_hash, new_global_bytes;
-
-  RETURN QUERY SELECT TRUE;
+  GET DIAGNOSTICS deleted_count = ROW_COUNT;
+  RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql;
-
-
--- ========================================
--- PostgreSQL Stored Procedure: Refund Quota Progress
--- ========================================
-CREATE OR REPLACE FUNCTION download_refund_quota(
-  p_ip_range_hash TEXT,
-  p_filepath_hash TEXT,
-  p_refund_bytes BIGINT,
-  p_file_table_name TEXT DEFAULT 'file_ip_download_quota',
-  p_global_table_name TEXT DEFAULT 'global_ip_download_quota'
-)
-RETURNS TABLE(
-  success BOOLEAN
-) AS $$
-DECLARE
-  file_select_sql TEXT;
-  file_update_sql TEXT;
-  global_select_sql TEXT;
-  global_update_sql TEXT;
-  file_record RECORD;
-  global_record RECORD;
-  refund_amount BIGINT;
-  current_file_bytes BIGINT;
-  new_file_bytes BIGINT;
-  current_global_bytes BIGINT;
-  new_global_bytes BIGINT;
-  adjusted_delta BIGINT;
-BEGIN
-  refund_amount := GREATEST(COALESCE(p_refund_bytes, 0), 0);
-
-  file_select_sql := format(
-    'SELECT "ip_range_hash", "filepath_hash", "bytes_downloaded"
-       FROM %1$I
-       WHERE "ip_range_hash" = $1 AND "filepath_hash" = $2
-       FOR UPDATE',
-    p_file_table_name
-  );
-
-  EXECUTE file_select_sql INTO file_record USING p_ip_range_hash, p_filepath_hash;
-
-  IF file_record."ip_range_hash" IS NOT NULL THEN
-    current_file_bytes := COALESCE(file_record."bytes_downloaded", 0);
-    new_file_bytes := current_file_bytes - refund_amount;
-    IF new_file_bytes < 0 THEN
-      new_file_bytes := 0;
-    END IF;
-
-    file_update_sql := format(
-      'UPDATE %1$I
-         SET "bytes_downloaded" = $3
-         WHERE "ip_range_hash" = $1 AND "filepath_hash" = $2',
-      p_file_table_name
-    );
-    EXECUTE file_update_sql USING p_ip_range_hash, p_filepath_hash, new_file_bytes;
-
-    adjusted_delta := current_file_bytes - new_file_bytes;
-
-    global_select_sql := format(
-      'SELECT "ip_range_hash", "total_bytes_downloaded"
-         FROM %1$I
-         WHERE "ip_range_hash" = $1
-         FOR UPDATE',
-      p_global_table_name
-    );
-    EXECUTE global_select_sql INTO global_record USING p_ip_range_hash;
-
-    IF global_record."ip_range_hash" IS NOT NULL THEN
-      current_global_bytes := COALESCE(global_record."total_bytes_downloaded", 0);
-      new_global_bytes := current_global_bytes - adjusted_delta;
-      IF new_global_bytes < 0 THEN
-        new_global_bytes := 0;
-      END IF;
-
-      global_update_sql := format(
-        'UPDATE %1$I
-           SET "total_bytes_downloaded" = $2
-           WHERE "ip_range_hash" = $1',
-        p_global_table_name
-      );
-      EXECUTE global_update_sql USING p_ip_range_hash, new_global_bytes;
-    END IF;
-  END IF;
-
-  RETURN QUERY SELECT TRUE;
-END;
-$$ LANGUAGE plpgsql;
-
 
 -- ========================================
 -- Optional: Rate Limit Cleanup Function (PostgreSQL)
@@ -663,7 +634,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-
 -- ========================================
 -- Unified Check Function (RTT Optimization: 3→1)
 -- ========================================
@@ -691,76 +661,35 @@ CREATE OR REPLACE FUNCTION download_unified_check(
 
   -- Throttle params
   p_throttle_time_window INTEGER,
-  p_throttle_table_name TEXT,
-
-  -- Quota params
-  p_filepath_hash TEXT DEFAULT NULL,
-  p_deduct_bytes BIGINT DEFAULT 0,
-  p_file_quota_window_seconds INTEGER DEFAULT NULL,
-  p_file_quota_max_bytes BIGINT DEFAULT NULL,
-  p_file_quota_block_seconds INTEGER DEFAULT NULL,
-  p_global_quota_window_seconds INTEGER DEFAULT NULL,
-  p_global_quota_max_bytes BIGINT DEFAULT NULL,
-  p_global_quota_block_seconds INTEGER DEFAULT NULL,
-  p_file_quota_table_name TEXT DEFAULT 'file_ip_download_quota',
-  p_global_quota_table_name TEXT DEFAULT 'global_ip_download_quota'
+  p_throttle_table_name TEXT
 )
 RETURNS TABLE(
-  -- Cache result (nullable if not found or expired)
   cache_link_data TEXT,
   cache_timestamp INTEGER,
   cache_hostname_hash TEXT,
-
-  -- Rate limit result (always returns)
   rate_access_count INTEGER,
   rate_last_window_time INTEGER,
   rate_block_until INTEGER,
-
-  -- Throttle result (nullable if not found)
   throttle_record_exists BOOLEAN,
   throttle_is_protected INTEGER,
   throttle_error_timestamp INTEGER,
-  throttle_error_code INTEGER,
-
-  -- File quota result (nullable if not enabled)
-  file_quota_bytes_downloaded BIGINT,
-  file_quota_blocked_until INTEGER,
-  file_quota_exceeded BOOLEAN,
-
-  -- Global quota result (nullable if not enabled)
-  global_quota_bytes_downloaded BIGINT,
-  global_quota_blocked_until INTEGER,
-  global_quota_exceeded BOOLEAN
+  throttle_error_code INTEGER
 ) AS $$
 DECLARE
   cache_sql TEXT;
+  cache_rec RECORD;
   rate_result RECORD;
   throttle_sql TEXT;
-  cache_rec RECORD;
   throttle_rec RECORD;
   cache_hostname_hash_var TEXT;
-  file_quota_result RECORD;
-  global_quota_result RECORD;
-  deduct_bytes_value BIGINT;
 BEGIN
-  deduct_bytes_value := GREATEST(COALESCE(p_deduct_bytes, 0), 0);
-
-  file_quota_bytes_downloaded := NULL;
-  file_quota_blocked_until := NULL;
-  file_quota_exceeded := FALSE;
-  global_quota_bytes_downloaded := NULL;
-  global_quota_blocked_until := NULL;
-  global_quota_exceeded := FALSE;
-
-  -- Step 1: Check cache
+  -- Step 1: Cache lookup
   cache_sql := format(
     'SELECT "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH" FROM %1$I WHERE "PATH_HASH" = $1',
     p_cache_table_name
   );
   EXECUTE cache_sql INTO cache_rec USING p_path_hash;
 
-  -- Check if cache exists and is not expired
-  -- Note: EXECUTE INTO RECORD does not set FOUND correctly, check field instead
   IF cache_rec."TIMESTAMP" IS NOT NULL AND (p_now - cache_rec."TIMESTAMP") <= p_cache_ttl THEN
     cache_link_data := cache_rec."LINK_DATA";
     cache_timestamp := cache_rec."TIMESTAMP";
@@ -773,7 +702,7 @@ BEGIN
 
   cache_hostname_hash := cache_hostname_hash_var;
 
-  -- Step 2: Upsert rate limit (reuse existing function)
+  -- Step 2: Rate limit upsert
   SELECT * INTO rate_result FROM download_upsert_rate_limit(
     p_ip_hash,
     p_ip_range,
@@ -788,81 +717,31 @@ BEGIN
   rate_last_window_time := rate_result."LAST_WINDOW_TIME";
   rate_block_until := rate_result."BLOCK_UNTIL";
 
-  -- Step 3: Check throttle (only if we have hostname_hash from cache)
+  -- Step 3: Throttle lookup (conditional)
   IF cache_hostname_hash_var IS NOT NULL THEN
     throttle_sql := format(
       'SELECT "IS_PROTECTED", "ERROR_TIMESTAMP", "LAST_ERROR_CODE"
-       FROM %1$I WHERE "HOSTNAME_HASH" = $1',
+         FROM %1$I WHERE "HOSTNAME_HASH" = $1',
       p_throttle_table_name
     );
     EXECUTE throttle_sql INTO throttle_rec USING cache_hostname_hash_var;
 
-    -- Note: EXECUTE INTO RECORD does not set FOUND correctly, check field instead
     IF throttle_rec."IS_PROTECTED" IS NOT NULL THEN
-      -- Record exists in database
       throttle_record_exists := TRUE;
       throttle_is_protected := throttle_rec."IS_PROTECTED";
       throttle_error_timestamp := throttle_rec."ERROR_TIMESTAMP";
       throttle_error_code := throttle_rec."LAST_ERROR_CODE";
     ELSE
-      -- Record does not exist in database
       throttle_record_exists := FALSE;
       throttle_is_protected := NULL;
       throttle_error_timestamp := NULL;
       throttle_error_code := NULL;
     END IF;
   ELSE
-    -- No cache or no hostname_hash - skip throttle check
     throttle_record_exists := FALSE;
     throttle_is_protected := NULL;
     throttle_error_timestamp := NULL;
     throttle_error_code := NULL;
-  END IF;
-
-  -- Step 4: Check per-file quota when parameters are provided
-  IF p_filepath_hash IS NOT NULL
-     AND p_file_quota_window_seconds IS NOT NULL
-     AND p_file_quota_max_bytes IS NOT NULL
-     AND p_file_quota_block_seconds IS NOT NULL
-     AND p_file_quota_table_name IS NOT NULL THEN
-    SELECT * INTO file_quota_result FROM download_check_file_quota(
-      p_ip_hash,
-      p_filepath_hash,
-      deduct_bytes_value,
-      p_now,
-      p_file_quota_window_seconds,
-      p_file_quota_max_bytes,
-      p_file_quota_block_seconds,
-      p_file_quota_table_name
-    );
-
-    IF file_quota_result.bytes_downloaded IS NOT NULL THEN
-      file_quota_bytes_downloaded := file_quota_result.bytes_downloaded;
-      file_quota_blocked_until := file_quota_result.blocked_until;
-      file_quota_exceeded := file_quota_result.quota_exceeded;
-    END IF;
-  END IF;
-
-  -- Step 5: Check global quota when parameters are provided
-  IF p_global_quota_window_seconds IS NOT NULL
-     AND p_global_quota_max_bytes IS NOT NULL
-     AND p_global_quota_block_seconds IS NOT NULL
-     AND p_global_quota_table_name IS NOT NULL THEN
-    SELECT * INTO global_quota_result FROM download_check_global_quota(
-      p_ip_hash,
-      deduct_bytes_value,
-      p_now,
-      p_global_quota_window_seconds,
-      p_global_quota_max_bytes,
-      p_global_quota_block_seconds,
-      p_global_quota_table_name
-    );
-
-    IF global_quota_result.total_bytes_downloaded IS NOT NULL THEN
-      global_quota_bytes_downloaded := global_quota_result.total_bytes_downloaded;
-      global_quota_blocked_until := global_quota_result.blocked_until;
-      global_quota_exceeded := global_quota_result.quota_exceeded;
-    END IF;
   END IF;
 
   RETURN NEXT;

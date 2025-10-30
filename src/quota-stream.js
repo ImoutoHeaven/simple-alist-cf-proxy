@@ -1,15 +1,8 @@
-const DEFAULT_UPDATE_INTERVAL_BASE = 30000;
-const DEFAULT_UPDATE_INTERVAL_RANDOM = 5000;
+import { checkQuotaBalance, deleteQuotaBlock, insertQuotaSettlement } from './quota-service.js';
+
 const LOG_PREFIX = '[Quota Stream]';
-const DEFAULT_FILE_QUOTA_TABLE = 'file_ip_download_quota';
-const DEFAULT_GLOBAL_QUOTA_TABLE = 'global_ip_download_quota';
 const textEncoder = new TextEncoder();
 
-/**
- * Safely determine the byte length of a stream chunk.
- * @param {any} chunk
- * @returns {number}
- */
 const getChunkByteLength = (chunk) => {
   if (chunk === null || chunk === undefined) {
     return 0;
@@ -34,11 +27,6 @@ const getChunkByteLength = (chunk) => {
   return 0;
 };
 
-/**
- * Format cancellation reason for logging.
- * @param {any} reason
- * @returns {string}
- */
 const formatReason = (reason) => {
   if (reason === undefined || reason === null) {
     return 'unknown';
@@ -54,503 +42,171 @@ const formatReason = (reason) => {
 
   try {
     return JSON.stringify(reason);
-  } catch (_err) {
+  } catch (_error) {
     return String(reason);
   }
 };
 
-/**
- * Validate a numeric value is finite and >= 0.
- * @param {any} value
- * @returns {boolean}
- */
-const isNonNegativeNumber = (value) => Number.isFinite(value) && value >= 0;
-
-/**
- * Validate a numeric value is finite and > 0.
- * @param {any} value
- * @returns {boolean}
- */
-const isPositiveNumber = (value) => Number.isFinite(value) && value > 0;
-
-/**
- * Safely schedule background work with optional waitUntil support.
- * @param {Function} promiseFactory
- * @param {string} errorLabel
- * @param {ExecutionContext|undefined} ctx
- * @param {Function|undefined} onMissingWaitUntil
- */
-const scheduleBackgroundTask = (promiseFactory, errorLabel, ctx, onMissingWaitUntil) => {
-  if (typeof promiseFactory !== 'function') {
-    return;
+const toSafeInteger = (value) => {
+  if (!Number.isFinite(value)) {
+    return 0;
   }
-
-  let promise;
-  try {
-    promise = promiseFactory();
-  } catch (error) {
-    console.error(`${LOG_PREFIX} ${errorLabel}: ${error?.message || error}`);
-    return;
+  if (value <= 0) {
+    return 0;
   }
-
-  if (!promise || typeof promise.then !== 'function') {
-    return;
-  }
-
-  const monitoredPromise = promise.catch((error) => {
-    console.error(`${LOG_PREFIX} ${errorLabel}: ${error?.message || error}`);
-  });
-
-  if (ctx && typeof ctx.waitUntil === 'function') {
-    ctx.waitUntil(monitoredPromise);
-  } else {
-    if (typeof onMissingWaitUntil === 'function') {
-      onMissingWaitUntil();
-    } else {
-      console.warn(`${LOG_PREFIX} ctx.waitUntil unavailable; background task runs synchronously`);
-    }
-  }
+  return Math.floor(value);
 };
 
-const getQuotaTableNames = (dbConfig = {}) => ({
-  fileQuotaTableName: dbConfig.fileQuotaTableName || DEFAULT_FILE_QUOTA_TABLE,
-  globalQuotaTableName: dbConfig.globalQuotaTableName || DEFAULT_GLOBAL_QUOTA_TABLE,
-});
-
-const isNoSuchTableError = (error) => {
-  const message = typeof error?.message === 'string' ? error.message.toLowerCase() : '';
-  return message.includes('no such table') || message.includes('does not exist');
-};
-
-const logMissingQuotaTableWarning = (tableName) => {
-  console.error(`${LOG_PREFIX} Table "${tableName}" does not exist. Please run init.sql on your D1 database.`);
-};
-
-const ensureQuotaTables = async (db, fileQuotaTableName, globalQuotaTableName) => {
-  const statements = [
-    db.prepare(`
-      CREATE TABLE IF NOT EXISTS ${fileQuotaTableName} (
-        ip_range_hash TEXT,
-        filepath_hash TEXT,
-        bytes_downloaded BIGINT DEFAULT 0,
-        last_window_time INTEGER NOT NULL,
-        blocked_until INTEGER,
-        PRIMARY KEY (ip_range_hash, filepath_hash)
-      )
-    `),
-    db.prepare(`
-      CREATE TABLE IF NOT EXISTS ${globalQuotaTableName} (
-        ip_range_hash TEXT PRIMARY KEY,
-        total_bytes_downloaded BIGINT DEFAULT 0,
-        last_window_time INTEGER NOT NULL,
-        blocked_until INTEGER
-      )
-    `),
-  ];
-
-  await db.batch(statements);
-};
-
-const executeQuotaRestStatement = async (dbConfig, sql, params, tableName) => {
-  try {
-    await executeD1RestStatement(dbConfig, sql, params);
-  } catch (error) {
-    if (isNoSuchTableError(error)) {
-      logMissingQuotaTableWarning(tableName);
-    }
-    throw error;
+const isWindowActive = (windowSeconds, windowStartTime) => {
+  if (!Number.isFinite(windowSeconds) || windowSeconds <= 0) {
+    return false;
   }
+  if (!Number.isFinite(windowStartTime) || windowStartTime <= 0) {
+    return false;
+  }
+  const elapsed = Date.now() - windowStartTime;
+  return elapsed <= (windowSeconds * 1000);
 };
 
-/**
- * Wraps a ReadableStream to monitor quota consumption
- * @param {ReadableStream} sourceStream - Original response body
- * @param {Object} options - Configuration
- * @param {string} options.ipRange - IP subnet (e.g., "192.168.1.0/24")
- * @param {string} options.ipRangeHash - SHA256 of IP subnet
- * @param {string} options.filepath - File path
- * @param {string} options.filepathHash - SHA256 of filepath
- * @param {number} options.expectedBytes - Pre-deducted bytes (full file or Range)
- * @param {Object} options.config - quotaConfig from worker
- * @param {Object} options.dbConfig - Database configuration
- * @param {Object} options.ctx - Cloudflare Workers context (for waitUntil)
- * @returns {ReadableStream} Wrapped stream
- */
+const buildWindowList = (windowSecondsList, balanceParams = {}) => {
+  if (Array.isArray(windowSecondsList) && windowSecondsList.length > 0) {
+    return windowSecondsList;
+  }
+
+  const windows = [];
+  if (Number.isFinite(balanceParams.fileWindowSeconds)) {
+    windows.push(balanceParams.fileWindowSeconds);
+  }
+  if (Number.isFinite(balanceParams.globalWindowSeconds)) {
+    windows.push(balanceParams.globalWindowSeconds);
+  }
+  return windows;
+};
+
 export function wrapStreamWithQuotaMonitoring(sourceStream, options = {}) {
   if (!sourceStream || typeof sourceStream.pipeThrough !== 'function') {
     return sourceStream;
   }
 
   const {
-    ipRange,
+    requestId,
     ipRangeHash,
-    filepath,
     filepathHash,
     expectedBytes = 0,
-    config = {},
+    windowStartTime = Date.now(),
+    windowSecondsList = [],
+    balanceParams = {},
     dbConfig = {},
+    quotaConfig = {},
     ctx,
   } = options;
 
-  if (!ipRangeHash || !filepathHash) {
-    console.warn(`${LOG_PREFIX} Missing hash identifiers for quota tracking (ipRange: ${ipRange || 'unknown'}, filepath: ${filepath || 'unknown'})`);
+  if (!requestId || !ipRangeHash || !filepathHash) {
+    console.warn(`${LOG_PREFIX} Missing request identifiers, skipping quota settlement`);
     return sourceStream;
   }
 
-  const updateIntervalBase = isPositiveNumber(config.updateIntervalBase) ? config.updateIntervalBase : DEFAULT_UPDATE_INTERVAL_BASE;
-  const updateIntervalRandom = isNonNegativeNumber(config.updateIntervalRandom) ? config.updateIntervalRandom : DEFAULT_UPDATE_INTERVAL_RANDOM;
-  const normalizedExpectedBytes = Number.isFinite(expectedBytes) ? Math.max(0, Math.floor(expectedBytes)) : 0;
-  const expectedBytesDisplay = Number.isFinite(expectedBytes) ? normalizedExpectedBytes : 'unknown';
-
-  const getNextUpdateDelay = () => updateIntervalBase + Math.floor(Math.random() * updateIntervalRandom);
-
   let actualBytes = 0;
-  let lastReportedBytes = 0;
-  let lastUpdateTime = Date.now();
-  let nextUpdateDelay = getNextUpdateDelay();
-  let waitUntilWarned = false;
+  let finalized = false;
 
-  const warnMissingWaitUntil = () => {
-    if (!waitUntilWarned) {
-      console.warn(`${LOG_PREFIX} ctx.waitUntil unavailable; background updates may not complete if execution ends early`);
-      waitUntilWarned = true;
-    }
-  };
+  const windowsToCheck = buildWindowList(windowSecondsList, balanceParams);
 
-  const performProgressUpdate = (label = 'Progress update failed') => {
-    if (actualBytes === lastReportedBytes) {
+  const finalizeQuota = async (contextLabel) => {
+    if (finalized) {
       return;
     }
+    finalized = true;
 
-    if (!dbConfig?.dbMode) {
-      return;
-    }
-    scheduleBackgroundTask(
-      () => updateQuotaProgress(ipRangeHash, filepathHash, actualBytes, dbConfig),
-      label,
-      ctx,
-      warnMissingWaitUntil
-    );
-    lastReportedBytes = actualBytes;
-    lastUpdateTime = Date.now();
-    nextUpdateDelay = getNextUpdateDelay();
-    console.log(`${LOG_PREFIX} Progress updated: ${actualBytes}/${expectedBytesDisplay} bytes`);
-  };
+    const normalizedExpected = toSafeInteger(expectedBytes);
+    const normalizedActual = toSafeInteger(actualBytes);
+    const refundAmount = Math.max(0, normalizedExpected - normalizedActual);
 
-  const performRefund = (contextLabel) => {
-    if (!dbConfig?.dbMode) {
-      return;
-    }
-
-    const refundAmount = Math.max(0, normalizedExpectedBytes - Math.floor(actualBytes));
     if (refundAmount <= 0) {
       return;
     }
 
-    console.log(`${LOG_PREFIX} Refunding ${refundAmount} bytes (${contextLabel})`);
-    scheduleBackgroundTask(
-      () => refundQuota(ipRangeHash, filepathHash, refundAmount, dbConfig),
-      'Refund failed',
-      ctx,
-      warnMissingWaitUntil
-    );
+    const withinWindow = windowsToCheck.some((seconds) => isWindowActive(seconds, windowStartTime));
+    if (!withinWindow) {
+      console.log(`${LOG_PREFIX} Window expired, skip refund for ${contextLabel}`);
+      return;
+    }
+
+    try {
+      const settlement = await insertQuotaSettlement(dbConfig, {
+        requestId,
+        ipRangeHash,
+        filepathHash,
+        actualBytes: normalizedActual,
+        refundAmount,
+        windowStartTime,
+      });
+
+      if (!settlement?.success) {
+        console.warn(`${LOG_PREFIX} Settlement insert failed (${contextLabel})`);
+        return;
+      }
+
+      console.log(`${LOG_PREFIX} Refunded ${refundAmount} bytes (${contextLabel})`);
+
+      if (!ctx || typeof ctx.waitUntil !== 'function') {
+        console.warn(`${LOG_PREFIX} ctx.waitUntil unavailable; skipping async balance reconciliation`);
+        return;
+      }
+
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      ctx.waitUntil((async () => {
+        try {
+          const balance = await checkQuotaBalance(dbConfig, {
+            ipRangeHash,
+            filepathHash,
+            deductBytes: 0,
+            nowSeconds,
+            fileWindowSeconds: balanceParams.fileWindowSeconds,
+            fileMaxBytes: balanceParams.fileMaxBytes,
+            fileBlockSeconds: balanceParams.fileBlockSeconds,
+            globalWindowSeconds: balanceParams.globalWindowSeconds,
+            globalMaxBytes: balanceParams.globalMaxBytes,
+            globalBlockSeconds: balanceParams.globalBlockSeconds,
+          });
+
+          if (!balance.insufficient) {
+            if (quotaConfig.fileQuota?.enabled) {
+              await deleteQuotaBlock(dbConfig, {
+                ipRangeHash,
+                filepathHash,
+                blockType: 'file_quota',
+              });
+            }
+            if (quotaConfig.globalQuota?.enabled) {
+              await deleteQuotaBlock(dbConfig, {
+                ipRangeHash,
+                filepathHash: null,
+                blockType: 'global_quota',
+              });
+            }
+          }
+        } catch (error) {
+          console.error(`${LOG_PREFIX} Async balance check failed: ${error instanceof Error ? error.message : error}`);
+        }
+      })());
+    } catch (error) {
+      console.error(`${LOG_PREFIX} Settlement failed (${contextLabel}): ${error instanceof Error ? error.message : error}`);
+    }
   };
 
-  return sourceStream.pipeThrough(new TransformStream({
+  const wrappedStream = new TransformStream({
     transform(chunk, controller) {
-      const chunkSize = getChunkByteLength(chunk);
-      actualBytes += chunkSize;
-
-      const now = Date.now();
-      const elapsed = now - lastUpdateTime;
-
-      if (elapsed >= nextUpdateDelay) {
-        performProgressUpdate();
-      }
-
+      actualBytes += getChunkByteLength(chunk);
       controller.enqueue(chunk);
     },
-
-    flush() {
-      console.log(`${LOG_PREFIX} Transfer complete: expected=${expectedBytesDisplay}, actual=${actualBytes}`);
-
-      if (dbConfig?.dbMode) {
-        performProgressUpdate('Final progress update failed');
-      }
-
-      if (actualBytes < normalizedExpectedBytes) {
-        performRefund('complete');
-      }
+    async flush() {
+      await finalizeQuota('complete');
     },
-
-    cancel(reason) {
-      console.log(`${LOG_PREFIX} Transfer cancelled: expected=${expectedBytesDisplay}, actual=${actualBytes}, reason=${formatReason(reason)}`);
-
-      if (dbConfig?.dbMode) {
-        performProgressUpdate('Final progress update failed');
-      }
-
-      if (actualBytes < normalizedExpectedBytes) {
-        performRefund('cancelled');
-      }
-    }
-  }));
-}
-
-/**
- * Updates actual bytes transferred in database
- * @param {string} ipRangeHash
- * @param {string} filepathHash
- * @param {number} actualBytes - Current actual bytes transferred
- * @param {Object} dbConfig
- * @returns {Promise<void>}
- */
-async function updateQuotaProgress(ipRangeHash, filepathHash, actualBytes, dbConfig) {
-  const safeBytes = Math.max(0, Math.floor(actualBytes || 0));
-  const now = Math.floor(Date.now() / 1000);
-  const { fileQuotaTableName, globalQuotaTableName } = getQuotaTableNames(dbConfig);
-
-  if (!ipRangeHash || !filepathHash) {
-    console.warn(`${LOG_PREFIX} Skipping quota progress update due to missing identifiers`);
-    return;
-  }
-
-  if (!dbConfig?.dbMode) {
-    console.warn(`${LOG_PREFIX} Skipping quota progress update due to missing dbMode`);
-    return;
-  }
-
-  if (dbConfig.dbMode === 'custom-pg-rest') {
-    if (!dbConfig.postgrestUrl) {
-      console.warn(`${LOG_PREFIX} PostgREST URL missing, cannot update quota progress`);
-      return;
-    }
-
-    const response = await fetch(`${dbConfig.postgrestUrl}/rpc/download_update_quota_progress`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Prefer': 'return=representation'
-      },
-      body: JSON.stringify({
-        p_ip_range_hash: ipRangeHash,
-        p_filepath_hash: filepathHash,
-        p_update_bytes: safeBytes,
-        p_now: now,
-        p_file_table_name: fileQuotaTableName,
-        p_global_table_name: globalQuotaTableName
-      })
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`PostgREST error: ${response.status} ${errorText}`);
-    }
-
-    return;
-  }
-
-  if (dbConfig.dbMode === 'd1') {
-    const bindingName = dbConfig.databaseBinding;
-    const db = bindingName ? dbConfig.env?.[bindingName] : undefined;
-
-    if (!db) {
-      throw new Error('D1 binding not found for quota progress update');
-    }
-
-    await ensureQuotaTables(db, fileQuotaTableName, globalQuotaTableName);
-
-    await db.prepare(`
-      UPDATE ${fileQuotaTableName}
-      SET bytes_downloaded = ?
-      WHERE ip_range_hash = ? AND filepath_hash = ?
-    `).bind(safeBytes, ipRangeHash, filepathHash).run();
-
-    await db.prepare(`
-      UPDATE ${globalQuotaTableName}
-      SET total_bytes_downloaded = total_bytes_downloaded + ?
-      WHERE ip_range_hash = ?
-    `).bind(safeBytes, ipRangeHash).run();
-
-    return;
-  }
-
-  if (dbConfig.dbMode === 'd1-rest') {
-    await executeQuotaRestStatement(
-      dbConfig,
-      `
-        UPDATE ${fileQuotaTableName}
-        SET bytes_downloaded = ?
-        WHERE ip_range_hash = ? AND filepath_hash = ?
-      `,
-      [safeBytes, ipRangeHash, filepathHash],
-      fileQuotaTableName
-    );
-
-    await executeQuotaRestStatement(
-      dbConfig,
-      `
-        UPDATE ${globalQuotaTableName}
-        SET total_bytes_downloaded = total_bytes_downloaded + ?
-        WHERE ip_range_hash = ?
-      `,
-      [safeBytes, ipRangeHash],
-      globalQuotaTableName
-    );
-
-    return;
-  }
-
-  console.warn(`${LOG_PREFIX} Unsupported dbMode (${dbConfig.dbMode}) for quota progress update`);
-}
-
-/**
- * Refunds unused quota (expected - actual)
- * @param {string} ipRangeHash
- * @param {string} filepathHash
- * @param {number} refundAmount - Bytes to refund
- * @param {Object} dbConfig
- * @returns {Promise<void>}
- */
-async function refundQuota(ipRangeHash, filepathHash, refundAmount, dbConfig) {
-  const safeRefund = Math.max(0, Math.floor(refundAmount || 0));
-  const { fileQuotaTableName, globalQuotaTableName } = getQuotaTableNames(dbConfig);
-
-  if (safeRefund <= 0) {
-    return;
-  }
-
-  if (!ipRangeHash || !filepathHash) {
-    console.warn(`${LOG_PREFIX} Skipping quota refund due to missing identifiers`);
-    return;
-  }
-
-  if (!dbConfig?.dbMode) {
-    console.warn(`${LOG_PREFIX} Skipping quota refund due to missing dbMode`);
-    return;
-  }
-
-  if (dbConfig.dbMode === 'custom-pg-rest') {
-    if (!dbConfig.postgrestUrl) {
-      console.warn(`${LOG_PREFIX} PostgREST URL missing, cannot refund quota`);
-      return;
-    }
-
-    const response = await fetch(`${dbConfig.postgrestUrl}/rpc/download_refund_quota`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Prefer': 'return=representation'
-      },
-      body: JSON.stringify({
-        p_ip_range_hash: ipRangeHash,
-        p_filepath_hash: filepathHash,
-        p_refund_bytes: safeRefund,
-        p_file_table_name: fileQuotaTableName,
-        p_global_table_name: globalQuotaTableName
-      })
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`PostgREST error: ${response.status} ${errorText}`);
-    }
-
-    return;
-  }
-
-  if (dbConfig.dbMode === 'd1') {
-    const bindingName = dbConfig.databaseBinding;
-    const db = bindingName ? dbConfig.env?.[bindingName] : undefined;
-
-    if (!db) {
-      throw new Error('D1 binding not found for quota refund');
-    }
-
-    await ensureQuotaTables(db, fileQuotaTableName, globalQuotaTableName);
-
-    await db.prepare(`
-      UPDATE ${fileQuotaTableName}
-      SET bytes_downloaded = MAX(0, bytes_downloaded - ?)
-      WHERE ip_range_hash = ? AND filepath_hash = ?
-    `).bind(safeRefund, ipRangeHash, filepathHash).run();
-
-    await db.prepare(`
-      UPDATE ${globalQuotaTableName}
-      SET total_bytes_downloaded = MAX(0, total_bytes_downloaded - ?)
-      WHERE ip_range_hash = ?
-    `).bind(safeRefund, ipRangeHash).run();
-
-    return;
-  }
-
-  if (dbConfig.dbMode === 'd1-rest') {
-    await executeQuotaRestStatement(
-      dbConfig,
-      `
-        UPDATE ${fileQuotaTableName}
-        SET bytes_downloaded = MAX(0, bytes_downloaded - ?)
-        WHERE ip_range_hash = ? AND filepath_hash = ?
-      `,
-      [safeRefund, ipRangeHash, filepathHash],
-      fileQuotaTableName
-    );
-
-    await executeQuotaRestStatement(
-      dbConfig,
-      `
-        UPDATE ${globalQuotaTableName}
-        SET total_bytes_downloaded = MAX(0, total_bytes_downloaded - ?)
-        WHERE ip_range_hash = ?
-      `,
-      [safeRefund, ipRangeHash],
-      globalQuotaTableName
-    );
-
-    return;
-  }
-
-  console.warn(`${LOG_PREFIX} Unsupported dbMode (${dbConfig.dbMode}) for quota refund`);
-}
-
-/**
- * Execute a single SQL statement via D1 REST API.
- * @param {Object} dbConfig
- * @param {string} sql
- * @param {Array} params
- * @returns {Promise<void>}
- */
-async function executeD1RestStatement(dbConfig, sql, params = []) {
-  const { accountId, databaseId, apiToken } = dbConfig || {};
-
-  if (!accountId || !databaseId || !apiToken) {
-    throw new Error('D1 REST configuration incomplete');
-  }
-
-  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseId}/query`;
-
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiToken}`,
-      'Content-Type': 'application/json'
+    async cancel(reason) {
+      console.log(`${LOG_PREFIX} Transfer cancelled, reason=${formatReason(reason)}`);
+      await finalizeQuota('cancelled');
     },
-    body: JSON.stringify({
-      sql,
-      params
-    })
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`D1 REST error: ${response.status} ${errorText}`);
-  }
-
-  const result = await response.json();
-
-  if (!result.success) {
-    const errors = Array.isArray(result.errors) ? result.errors : [];
-    const message = errors.map(err => err.message).join(', ') || 'Unknown error';
-    throw new Error(`D1 REST query failed: ${message}`);
-  }
+  return sourceStream.pipeThrough(wrappedStream);
 }

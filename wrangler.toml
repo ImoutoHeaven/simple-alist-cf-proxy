@@ -124,6 +124,12 @@ compatibility_date = "2024-01-01"
 # Advanced: Stream monitoring intervals (milliseconds)
 # QUOTA_UPDATE_INTERVAL_BASE = 30000              # Base interval: 30 seconds
 # QUOTA_UPDATE_INTERVAL_RANDOM = 5000             # Random jitter: 0-5 seconds
+# Quota Transaction Log TTL - how long to keep transaction history for audit
+# Format: {number}{unit} where unit is d (day), h (hour), m (minute), s (second)
+# Examples: "7d", "30d", "168h"
+# Default: "7d" (7 days)
+# Cleanup removes transaction records older than this TTL
+# QUOTA_TRANSACTIONS_TTL = "7d"
 
 # ============================================
 # Notes:
