@@ -1,6 +1,8 @@
 const DEFAULT_UPDATE_INTERVAL_BASE = 30000;
 const DEFAULT_UPDATE_INTERVAL_RANDOM = 5000;
 const LOG_PREFIX = '[Quota Stream]';
+const DEFAULT_FILE_QUOTA_TABLE = 'file_ip_download_quota';
+const DEFAULT_GLOBAL_QUOTA_TABLE = 'global_ip_download_quota';
 const textEncoder = new TextEncoder();
 
 /**
@@ -107,6 +109,56 @@ const scheduleBackgroundTask = (promiseFactory, errorLabel, ctx, onMissingWaitUn
     } else {
       console.warn(`${LOG_PREFIX} ctx.waitUntil unavailable; background task runs synchronously`);
     }
+  }
+};
+
+const getQuotaTableNames = (dbConfig = {}) => ({
+  fileQuotaTableName: dbConfig.fileQuotaTableName || DEFAULT_FILE_QUOTA_TABLE,
+  globalQuotaTableName: dbConfig.globalQuotaTableName || DEFAULT_GLOBAL_QUOTA_TABLE,
+});
+
+const isNoSuchTableError = (error) => {
+  const message = typeof error?.message === 'string' ? error.message.toLowerCase() : '';
+  return message.includes('no such table') || message.includes('does not exist');
+};
+
+const logMissingQuotaTableWarning = (tableName) => {
+  console.error(`${LOG_PREFIX} Table "${tableName}" does not exist. Please run init.sql on your D1 database.`);
+};
+
+const ensureQuotaTables = async (db, fileQuotaTableName, globalQuotaTableName) => {
+  const statements = [
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ${fileQuotaTableName} (
+        ip_range_hash TEXT,
+        filepath_hash TEXT,
+        bytes_downloaded BIGINT DEFAULT 0,
+        last_window_time INTEGER NOT NULL,
+        blocked_until INTEGER,
+        PRIMARY KEY (ip_range_hash, filepath_hash)
+      )
+    `),
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ${globalQuotaTableName} (
+        ip_range_hash TEXT PRIMARY KEY,
+        total_bytes_downloaded BIGINT DEFAULT 0,
+        last_window_time INTEGER NOT NULL,
+        blocked_until INTEGER
+      )
+    `),
+  ];
+
+  await db.batch(statements);
+};
+
+const executeQuotaRestStatement = async (dbConfig, sql, params, tableName) => {
+  try {
+    await executeD1RestStatement(dbConfig, sql, params);
+  } catch (error) {
+    if (isNoSuchTableError(error)) {
+      logMissingQuotaTableWarning(tableName);
+    }
+    throw error;
   }
 };
 
@@ -256,6 +308,7 @@ export function wrapStreamWithQuotaMonitoring(sourceStream, options = {}) {
 async function updateQuotaProgress(ipRangeHash, filepathHash, actualBytes, dbConfig) {
   const safeBytes = Math.max(0, Math.floor(actualBytes || 0));
   const now = Math.floor(Date.now() / 1000);
+  const { fileQuotaTableName, globalQuotaTableName } = getQuotaTableNames(dbConfig);
 
   if (!ipRangeHash || !filepathHash) {
     console.warn(`${LOG_PREFIX} Skipping quota progress update due to missing identifiers`);
@@ -284,8 +337,8 @@ async function updateQuotaProgress(ipRangeHash, filepathHash, actualBytes, dbCon
         p_filepath_hash: filepathHash,
         p_update_bytes: safeBytes,
         p_now: now,
-        p_file_table_name: 'file_ip_download_quota',
-        p_global_table_name: 'global_ip_download_quota'
+        p_file_table_name: fileQuotaTableName,
+        p_global_table_name: globalQuotaTableName
       })
     });
 
@@ -305,14 +358,16 @@ async function updateQuotaProgress(ipRangeHash, filepathHash, actualBytes, dbCon
       throw new Error('D1 binding not found for quota progress update');
     }
 
+    await ensureQuotaTables(db, fileQuotaTableName, globalQuotaTableName);
+
     await db.prepare(`
-      UPDATE file_ip_download_quota
+      UPDATE ${fileQuotaTableName}
       SET bytes_downloaded = ?
       WHERE ip_range_hash = ? AND filepath_hash = ?
     `).bind(safeBytes, ipRangeHash, filepathHash).run();
 
     await db.prepare(`
-      UPDATE global_ip_download_quota
+      UPDATE ${globalQuotaTableName}
       SET total_bytes_downloaded = total_bytes_downloaded + ?
       WHERE ip_range_hash = ?
     `).bind(safeBytes, ipRangeHash).run();
@@ -321,17 +376,27 @@ async function updateQuotaProgress(ipRangeHash, filepathHash, actualBytes, dbCon
   }
 
   if (dbConfig.dbMode === 'd1-rest') {
-    await executeD1RestStatement(dbConfig, `
-      UPDATE file_ip_download_quota
-      SET bytes_downloaded = ?
-      WHERE ip_range_hash = ? AND filepath_hash = ?
-    `, [safeBytes, ipRangeHash, filepathHash]);
+    await executeQuotaRestStatement(
+      dbConfig,
+      `
+        UPDATE ${fileQuotaTableName}
+        SET bytes_downloaded = ?
+        WHERE ip_range_hash = ? AND filepath_hash = ?
+      `,
+      [safeBytes, ipRangeHash, filepathHash],
+      fileQuotaTableName
+    );
 
-    await executeD1RestStatement(dbConfig, `
-      UPDATE global_ip_download_quota
-      SET total_bytes_downloaded = total_bytes_downloaded + ?
-      WHERE ip_range_hash = ?
-    `, [safeBytes, ipRangeHash]);
+    await executeQuotaRestStatement(
+      dbConfig,
+      `
+        UPDATE ${globalQuotaTableName}
+        SET total_bytes_downloaded = total_bytes_downloaded + ?
+        WHERE ip_range_hash = ?
+      `,
+      [safeBytes, ipRangeHash],
+      globalQuotaTableName
+    );
 
     return;
   }
@@ -349,6 +414,7 @@ async function updateQuotaProgress(ipRangeHash, filepathHash, actualBytes, dbCon
  */
 async function refundQuota(ipRangeHash, filepathHash, refundAmount, dbConfig) {
   const safeRefund = Math.max(0, Math.floor(refundAmount || 0));
+  const { fileQuotaTableName, globalQuotaTableName } = getQuotaTableNames(dbConfig);
 
   if (safeRefund <= 0) {
     return;
@@ -380,8 +446,8 @@ async function refundQuota(ipRangeHash, filepathHash, refundAmount, dbConfig) {
         p_ip_range_hash: ipRangeHash,
         p_filepath_hash: filepathHash,
         p_refund_bytes: safeRefund,
-        p_file_table_name: 'file_ip_download_quota',
-        p_global_table_name: 'global_ip_download_quota'
+        p_file_table_name: fileQuotaTableName,
+        p_global_table_name: globalQuotaTableName
       })
     });
 
@@ -401,14 +467,16 @@ async function refundQuota(ipRangeHash, filepathHash, refundAmount, dbConfig) {
       throw new Error('D1 binding not found for quota refund');
     }
 
+    await ensureQuotaTables(db, fileQuotaTableName, globalQuotaTableName);
+
     await db.prepare(`
-      UPDATE file_ip_download_quota
+      UPDATE ${fileQuotaTableName}
       SET bytes_downloaded = MAX(0, bytes_downloaded - ?)
       WHERE ip_range_hash = ? AND filepath_hash = ?
     `).bind(safeRefund, ipRangeHash, filepathHash).run();
 
     await db.prepare(`
-      UPDATE global_ip_download_quota
+      UPDATE ${globalQuotaTableName}
       SET total_bytes_downloaded = MAX(0, total_bytes_downloaded - ?)
       WHERE ip_range_hash = ?
     `).bind(safeRefund, ipRangeHash).run();
@@ -417,17 +485,27 @@ async function refundQuota(ipRangeHash, filepathHash, refundAmount, dbConfig) {
   }
 
   if (dbConfig.dbMode === 'd1-rest') {
-    await executeD1RestStatement(dbConfig, `
-      UPDATE file_ip_download_quota
-      SET bytes_downloaded = MAX(0, bytes_downloaded - ?)
-      WHERE ip_range_hash = ? AND filepath_hash = ?
-    `, [safeRefund, ipRangeHash, filepathHash]);
+    await executeQuotaRestStatement(
+      dbConfig,
+      `
+        UPDATE ${fileQuotaTableName}
+        SET bytes_downloaded = MAX(0, bytes_downloaded - ?)
+        WHERE ip_range_hash = ? AND filepath_hash = ?
+      `,
+      [safeRefund, ipRangeHash, filepathHash],
+      fileQuotaTableName
+    );
 
-    await executeD1RestStatement(dbConfig, `
-      UPDATE global_ip_download_quota
-      SET total_bytes_downloaded = MAX(0, total_bytes_downloaded - ?)
-      WHERE ip_range_hash = ?
-    `, [safeRefund, ipRangeHash]);
+    await executeQuotaRestStatement(
+      dbConfig,
+      `
+        UPDATE ${globalQuotaTableName}
+        SET total_bytes_downloaded = MAX(0, total_bytes_downloaded - ?)
+        WHERE ip_range_hash = ?
+      `,
+      [safeRefund, ipRangeHash],
+      globalQuotaTableName
+    );
 
     return;
   }
