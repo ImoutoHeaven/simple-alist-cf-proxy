@@ -295,27 +295,28 @@ RETURNS TABLE(
   quota_exceeded BOOLEAN
 ) AS $$
 DECLARE
-  sql TEXT;
+  v_sql TEXT;
+  v_deduct BIGINT := GREATEST(COALESCE(p_deduct_bytes, 0), 0);
+  v_block_seconds INTEGER := GREATEST(COALESCE(p_block_seconds, 0), 0);
 BEGIN
-  sql := format(
+  v_sql := format(
     'WITH upsert AS (
        INSERT INTO %1$I ("ip_range_hash", "filepath_hash", "bytes_downloaded", "last_window_time", "blocked_until")
        VALUES (
          $1,
          $2,
-         CASE WHEN GREATEST(COALESCE($3, 0), 0) > $6 THEN 0 ELSE GREATEST(COALESCE($3, 0), 0) END,
+         $3,
          $4,
          CASE
-           WHEN GREATEST(COALESCE($3, 0), 0) > $6 THEN $4 + CASE WHEN COALESCE($7, 0) > 0 THEN COALESCE($7, 0) ELSE 1 END
+           WHEN $3 > $6 THEN CASE WHEN $7 > 0 THEN $4 + $7 ELSE $4 END
            ELSE NULL
          END
        )
        ON CONFLICT ("ip_range_hash", "filepath_hash") DO UPDATE SET
          "bytes_downloaded" = CASE
            WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $4 THEN %1$I."bytes_downloaded"
-           WHEN $4 - %1$I."last_window_time" >= $5 THEN CASE WHEN GREATEST(COALESCE($3, 0), 0) > $6 THEN 0 ELSE GREATEST(COALESCE($3, 0), 0) END
-           WHEN %1$I."bytes_downloaded" + GREATEST(COALESCE($3, 0), 0) > $6 THEN %1$I."bytes_downloaded"
-           ELSE %1$I."bytes_downloaded" + GREATEST(COALESCE($3, 0), 0)
+           WHEN $4 - %1$I."last_window_time" >= $5 THEN $3
+           ELSE %1$I."bytes_downloaded" + $3
          END,
          "last_window_time" = CASE
            WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $4 THEN %1$I."last_window_time"
@@ -324,11 +325,12 @@ BEGIN
          END,
          "blocked_until" = CASE
            WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $4 THEN %1$I."blocked_until"
-           WHEN $4 - %1$I."last_window_time" >= $5 THEN CASE
-             WHEN GREATEST(COALESCE($3, 0), 0) > $6 THEN $4 + CASE WHEN COALESCE($7, 0) > 0 THEN COALESCE($7, 0) ELSE 1 END
-             ELSE NULL
-           END
-           WHEN %1$I."bytes_downloaded" + GREATEST(COALESCE($3, 0), 0) > $6 THEN $4 + CASE WHEN COALESCE($7, 0) > 0 THEN COALESCE($7, 0) ELSE 1 END
+           WHEN $4 - %1$I."last_window_time" >= $5 THEN
+             CASE
+               WHEN $3 > $6 THEN CASE WHEN $7 > 0 THEN $4 + $7 ELSE $4 END
+               ELSE NULL
+             END
+           WHEN %1$I."bytes_downloaded" + $3 > $6 THEN CASE WHEN $7 > 0 THEN $4 + $7 ELSE $4 END
            ELSE NULL
          END
        RETURNING
@@ -345,14 +347,14 @@ BEGIN
     p_file_table_name
   );
 
-  RETURN QUERY EXECUTE sql USING
+  RETURN QUERY EXECUTE v_sql USING
     p_ip_range_hash,
     p_filepath_hash,
-    p_deduct_bytes,
+    v_deduct,
     p_now,
     p_window_seconds,
     p_max_quota,
-    p_block_seconds;
+    v_block_seconds;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -376,26 +378,27 @@ RETURNS TABLE(
   quota_exceeded BOOLEAN
 ) AS $$
 DECLARE
-  sql TEXT;
+  v_sql TEXT;
+  v_deduct BIGINT := GREATEST(COALESCE(p_deduct_bytes, 0), 0);
+  v_block_seconds INTEGER := GREATEST(COALESCE(p_block_seconds, 0), 0);
 BEGIN
-  sql := format(
+  v_sql := format(
     'WITH upsert AS (
        INSERT INTO %1$I ("ip_range_hash", "total_bytes_downloaded", "last_window_time", "blocked_until")
        VALUES (
          $1,
-         CASE WHEN GREATEST(COALESCE($2, 0), 0) > $5 THEN 0 ELSE GREATEST(COALESCE($2, 0), 0) END,
+         $2,
          $3,
          CASE
-           WHEN GREATEST(COALESCE($2, 0), 0) > $5 THEN $3 + CASE WHEN COALESCE($6, 0) > 0 THEN COALESCE($6, 0) ELSE 1 END
+           WHEN $2 > $5 THEN CASE WHEN $6 > 0 THEN $3 + $6 ELSE $3 END
            ELSE NULL
          END
        )
        ON CONFLICT ("ip_range_hash") DO UPDATE SET
          "total_bytes_downloaded" = CASE
            WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $3 THEN %1$I."total_bytes_downloaded"
-           WHEN $3 - %1$I."last_window_time" >= $4 THEN CASE WHEN GREATEST(COALESCE($2, 0), 0) > $5 THEN 0 ELSE GREATEST(COALESCE($2, 0), 0) END
-           WHEN %1$I."total_bytes_downloaded" + GREATEST(COALESCE($2, 0), 0) > $5 THEN %1$I."total_bytes_downloaded"
-           ELSE %1$I."total_bytes_downloaded" + GREATEST(COALESCE($2, 0), 0)
+           WHEN $3 - %1$I."last_window_time" >= $4 THEN $2
+           ELSE %1$I."total_bytes_downloaded" + $2
          END,
          "last_window_time" = CASE
            WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $3 THEN %1$I."last_window_time"
@@ -405,10 +408,10 @@ BEGIN
          "blocked_until" = CASE
            WHEN %1$I."blocked_until" IS NOT NULL AND %1$I."blocked_until" > $3 THEN %1$I."blocked_until"
            WHEN $3 - %1$I."last_window_time" >= $4 THEN CASE
-             WHEN GREATEST(COALESCE($2, 0), 0) > $5 THEN $3 + CASE WHEN COALESCE($6, 0) > 0 THEN COALESCE($6, 0) ELSE 1 END
+             WHEN $2 > $5 THEN CASE WHEN $6 > 0 THEN $3 + $6 ELSE $3 END
              ELSE NULL
            END
-           WHEN %1$I."total_bytes_downloaded" + GREATEST(COALESCE($2, 0), 0) > $5 THEN $3 + CASE WHEN COALESCE($6, 0) > 0 THEN COALESCE($6, 0) ELSE 1 END
+           WHEN %1$I."total_bytes_downloaded" + $2 > $5 THEN CASE WHEN $6 > 0 THEN $3 + $6 ELSE $3 END
            ELSE NULL
          END
        RETURNING
@@ -425,209 +428,13 @@ BEGIN
     p_global_table_name
   );
 
-  RETURN QUERY EXECUTE sql USING
+  RETURN QUERY EXECUTE v_sql USING
     p_ip_range_hash,
-    p_deduct_bytes,
+    v_deduct,
     p_now,
     p_window_seconds,
     p_max_quota,
-    p_block_seconds;
-END;
-$$ LANGUAGE plpgsql;
-
-
--- ========================================
--- PostgreSQL Stored Procedure: Update Quota Progress
--- ========================================
-CREATE OR REPLACE FUNCTION download_update_quota_progress(
-  p_ip_range_hash TEXT,
-  p_filepath_hash TEXT,
-  p_update_bytes BIGINT,
-  p_now INTEGER,
-  p_file_table_name TEXT DEFAULT 'file_ip_download_quota',
-  p_global_table_name TEXT DEFAULT 'global_ip_download_quota'
-)
-RETURNS TABLE(
-  success BOOLEAN
-) AS $$
-DECLARE
-  file_select_sql TEXT;
-  file_insert_sql TEXT;
-  file_update_sql TEXT;
-  global_select_sql TEXT;
-  global_insert_sql TEXT;
-  global_update_sql TEXT;
-  file_record RECORD;
-  global_record RECORD;
-  current_file_bytes BIGINT;
-  new_file_bytes BIGINT;
-  delta BIGINT;
-  current_global_bytes BIGINT;
-  new_global_bytes BIGINT;
-  safe_update_bytes BIGINT;
-BEGIN
-  safe_update_bytes := GREATEST(COALESCE(p_update_bytes, 0), 0);
-
-  file_select_sql := format(
-    'SELECT "ip_range_hash", "filepath_hash", "bytes_downloaded"
-       FROM %1$I
-       WHERE "ip_range_hash" = $1 AND "filepath_hash" = $2
-       FOR UPDATE',
-    p_file_table_name
-  );
-
-  EXECUTE file_select_sql INTO file_record USING p_ip_range_hash, p_filepath_hash;
-
-  IF file_record."ip_range_hash" IS NULL THEN
-    file_insert_sql := format(
-      'INSERT INTO %1$I ("ip_range_hash", "filepath_hash", "bytes_downloaded", "last_window_time", "blocked_until")
-         VALUES ($1, $2, $3, $4, NULL)
-         ON CONFLICT ("ip_range_hash", "filepath_hash") DO NOTHING',
-      p_file_table_name
-    );
-
-    EXECUTE file_insert_sql USING p_ip_range_hash, p_filepath_hash, safe_update_bytes, p_now;
-
-    EXECUTE file_select_sql INTO file_record USING p_ip_range_hash, p_filepath_hash;
-  END IF;
-
-  current_file_bytes := COALESCE(file_record."bytes_downloaded", 0);
-  new_file_bytes := safe_update_bytes;
-
-  file_update_sql := format(
-    'UPDATE %1$I
-       SET "bytes_downloaded" = $3
-       WHERE "ip_range_hash" = $1 AND "filepath_hash" = $2',
-    p_file_table_name
-  );
-  EXECUTE file_update_sql USING p_ip_range_hash, p_filepath_hash, new_file_bytes;
-
-  delta := new_file_bytes - current_file_bytes;
-
-  global_select_sql := format(
-    'SELECT "ip_range_hash", "total_bytes_downloaded"
-       FROM %1$I
-       WHERE "ip_range_hash" = $1
-       FOR UPDATE',
-    p_global_table_name
-  );
-  EXECUTE global_select_sql INTO global_record USING p_ip_range_hash;
-
-  IF global_record."ip_range_hash" IS NULL THEN
-    global_insert_sql := format(
-      'INSERT INTO %1$I ("ip_range_hash", "total_bytes_downloaded", "last_window_time", "blocked_until")
-         VALUES ($1, $2, $3, NULL)
-         ON CONFLICT ("ip_range_hash") DO NOTHING',
-      p_global_table_name
-    );
-    EXECUTE global_insert_sql USING p_ip_range_hash, GREATEST(delta, 0), p_now;
-
-    EXECUTE global_select_sql INTO global_record USING p_ip_range_hash;
-  END IF;
-
-  current_global_bytes := COALESCE(global_record."total_bytes_downloaded", 0);
-  new_global_bytes := current_global_bytes + delta;
-
-  IF new_global_bytes < 0 THEN
-    new_global_bytes := 0;
-  END IF;
-
-  global_update_sql := format(
-    'UPDATE %1$I
-       SET "total_bytes_downloaded" = $2
-       WHERE "ip_range_hash" = $1',
-    p_global_table_name
-  );
-  EXECUTE global_update_sql USING p_ip_range_hash, new_global_bytes;
-
-  RETURN QUERY SELECT TRUE;
-END;
-$$ LANGUAGE plpgsql;
-
-
--- ========================================
--- PostgreSQL Stored Procedure: Refund Quota Progress
--- ========================================
-CREATE OR REPLACE FUNCTION download_refund_quota(
-  p_ip_range_hash TEXT,
-  p_filepath_hash TEXT,
-  p_refund_bytes BIGINT,
-  p_file_table_name TEXT DEFAULT 'file_ip_download_quota',
-  p_global_table_name TEXT DEFAULT 'global_ip_download_quota'
-)
-RETURNS TABLE(
-  success BOOLEAN
-) AS $$
-DECLARE
-  file_select_sql TEXT;
-  file_update_sql TEXT;
-  global_select_sql TEXT;
-  global_update_sql TEXT;
-  file_record RECORD;
-  global_record RECORD;
-  refund_amount BIGINT;
-  current_file_bytes BIGINT;
-  new_file_bytes BIGINT;
-  current_global_bytes BIGINT;
-  new_global_bytes BIGINT;
-  adjusted_delta BIGINT;
-BEGIN
-  refund_amount := GREATEST(COALESCE(p_refund_bytes, 0), 0);
-
-  file_select_sql := format(
-    'SELECT "ip_range_hash", "filepath_hash", "bytes_downloaded"
-       FROM %1$I
-       WHERE "ip_range_hash" = $1 AND "filepath_hash" = $2
-       FOR UPDATE',
-    p_file_table_name
-  );
-
-  EXECUTE file_select_sql INTO file_record USING p_ip_range_hash, p_filepath_hash;
-
-  IF file_record."ip_range_hash" IS NOT NULL THEN
-    current_file_bytes := COALESCE(file_record."bytes_downloaded", 0);
-    new_file_bytes := current_file_bytes - refund_amount;
-    IF new_file_bytes < 0 THEN
-      new_file_bytes := 0;
-    END IF;
-
-    file_update_sql := format(
-      'UPDATE %1$I
-         SET "bytes_downloaded" = $3
-         WHERE "ip_range_hash" = $1 AND "filepath_hash" = $2',
-      p_file_table_name
-    );
-    EXECUTE file_update_sql USING p_ip_range_hash, p_filepath_hash, new_file_bytes;
-
-    adjusted_delta := current_file_bytes - new_file_bytes;
-
-    global_select_sql := format(
-      'SELECT "ip_range_hash", "total_bytes_downloaded"
-         FROM %1$I
-         WHERE "ip_range_hash" = $1
-         FOR UPDATE',
-      p_global_table_name
-    );
-    EXECUTE global_select_sql INTO global_record USING p_ip_range_hash;
-
-    IF global_record."ip_range_hash" IS NOT NULL THEN
-      current_global_bytes := COALESCE(global_record."total_bytes_downloaded", 0);
-      new_global_bytes := current_global_bytes - adjusted_delta;
-      IF new_global_bytes < 0 THEN
-        new_global_bytes := 0;
-      END IF;
-
-      global_update_sql := format(
-        'UPDATE %1$I
-           SET "total_bytes_downloaded" = $2
-           WHERE "ip_range_hash" = $1',
-        p_global_table_name
-      );
-      EXECUTE global_update_sql USING p_ip_range_hash, new_global_bytes;
-    END IF;
-  END IF;
-
-  RETURN QUERY SELECT TRUE;
+    v_block_seconds;
 END;
 $$ LANGUAGE plpgsql;
 

@@ -1,5 +1,16 @@
 import { sha256Hash, calculateIPSubnet } from './utils.js';
 
+const toSafeInteger = (value) => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  return Math.max(0, Math.trunc(numeric));
+};
+
 /**
  * Ensure cache, rate limit, and throttle tables exist using a single batch call
  * @param {D1Database} db
@@ -101,6 +112,33 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   const throttleTimeWindow = config.throttleTimeWindow ?? 60;
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
+  const filepathHash = typeof config.filepathHash === 'string' && config.filepathHash.length > 0 ? config.filepathHash : null;
+  const deductBytes = toSafeInteger(config.deductBytes) ?? 0;
+
+  const fileQuotaWindowSeconds = toSafeInteger(config.fileQuotaWindowSeconds);
+  const fileQuotaMaxBytes = toSafeInteger(config.fileQuotaMaxBytes);
+  const fileQuotaBlockSeconds = toSafeInteger(config.fileQuotaBlockSeconds);
+  const fileQuotaEnabled = Boolean(
+    filepathHash &&
+    fileQuotaTableName &&
+    fileQuotaWindowSeconds !== null &&
+    fileQuotaWindowSeconds > 0 &&
+    fileQuotaMaxBytes !== null &&
+    fileQuotaMaxBytes > 0 &&
+    fileQuotaBlockSeconds !== null
+  );
+
+  const globalQuotaWindowSeconds = toSafeInteger(config.globalQuotaWindowSeconds);
+  const globalQuotaMaxBytes = toSafeInteger(config.globalQuotaMaxBytes);
+  const globalQuotaBlockSeconds = toSafeInteger(config.globalQuotaBlockSeconds);
+  const globalQuotaEnabled = Boolean(
+    globalQuotaTableName &&
+    globalQuotaWindowSeconds !== null &&
+    globalQuotaWindowSeconds > 0 &&
+    globalQuotaMaxBytes !== null &&
+    globalQuotaMaxBytes > 0 &&
+    globalQuotaBlockSeconds !== null
+  );
 
   await ensureAllTables(db, {
     cacheTableName,
@@ -130,12 +168,14 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
 
   // Prepare batch queries
   const statements = [];
+  const statementLabels = [];
 
   // 1. Cache SELECT
   const cacheSql = `SELECT LINK_DATA, TIMESTAMP, HOSTNAME_HASH FROM ${cacheTableName} WHERE PATH_HASH = ?`;
   statements.push(db.prepare(cacheSql).bind(pathHash));
+  statementLabels.push('cache');
 
-  // 2. Rate Limit UPSERT (same complex logic as d1.js)
+  // 2. Rate Limit UPSERT
   const rateLimitSql = `
     INSERT INTO ${rateLimitTableName} (IP_HASH, IP_RANGE, ACCESS_COUNT, LAST_WINDOW_TIME, BLOCK_UNTIL)
     VALUES (?, ?, 1, ?, NULL)
@@ -168,12 +208,134 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
       now, windowSeconds, now, limit, blockSeconds, now, blockSeconds
     )
   );
+  statementLabels.push('rate limit');
+
+  // 3. File quota tracking
+  let fileQuotaStatementIndex = null;
+  if (fileQuotaEnabled) {
+    const fileQuotaBlockUntil = fileQuotaBlockSeconds > 0 ? now + fileQuotaBlockSeconds : now;
+    const fileQuotaSql = `
+      INSERT INTO ${fileQuotaTableName} (ip_range_hash, filepath_hash, bytes_downloaded, last_window_time, blocked_until)
+      VALUES (?, ?, ?, ?, CASE WHEN ? > ? THEN ? ELSE NULL END)
+      ON CONFLICT (ip_range_hash, filepath_hash) DO UPDATE SET
+        bytes_downloaded = CASE
+          WHEN ${fileQuotaTableName}.blocked_until IS NOT NULL AND ${fileQuotaTableName}.blocked_until > ? THEN ${fileQuotaTableName}.bytes_downloaded
+          WHEN ? - ${fileQuotaTableName}.last_window_time >= ? THEN excluded.bytes_downloaded
+          ELSE ${fileQuotaTableName}.bytes_downloaded + excluded.bytes_downloaded
+        END,
+        last_window_time = CASE
+          WHEN ${fileQuotaTableName}.blocked_until IS NOT NULL AND ${fileQuotaTableName}.blocked_until > ? THEN ${fileQuotaTableName}.last_window_time
+          WHEN ? - ${fileQuotaTableName}.last_window_time >= ? THEN ?
+          ELSE ${fileQuotaTableName}.last_window_time
+        END,
+        blocked_until = CASE
+          WHEN ${fileQuotaTableName}.blocked_until IS NOT NULL AND ${fileQuotaTableName}.blocked_until > ? THEN ${fileQuotaTableName}.blocked_until
+          WHEN ? - ${fileQuotaTableName}.last_window_time >= ? THEN
+            CASE
+              WHEN excluded.bytes_downloaded > ? THEN ?
+              ELSE NULL
+            END
+          WHEN ${fileQuotaTableName}.bytes_downloaded + excluded.bytes_downloaded > ? THEN ?
+          ELSE NULL
+        END
+      RETURNING
+        bytes_downloaded AS BYTES_DOWNLOADED,
+        last_window_time AS LAST_WINDOW_TIME,
+        blocked_until AS BLOCKED_UNTIL
+    `;
+    const fileQuotaParams = [
+      ipHash,
+      filepathHash,
+      deductBytes,
+      now,
+      deductBytes,
+      fileQuotaMaxBytes,
+      fileQuotaBlockUntil,
+      now,
+      now,
+      fileQuotaWindowSeconds,
+      now,
+      now,
+      fileQuotaWindowSeconds,
+      now,
+      now,
+      now,
+      fileQuotaWindowSeconds,
+      fileQuotaMaxBytes,
+      fileQuotaBlockUntil,
+      fileQuotaMaxBytes,
+      fileQuotaBlockUntil,
+    ];
+    fileQuotaStatementIndex = statements.length;
+    statements.push(db.prepare(fileQuotaSql).bind(...fileQuotaParams));
+    statementLabels.push('file quota');
+  }
+
+  // 4. Global quota tracking
+  let globalQuotaStatementIndex = null;
+  if (globalQuotaEnabled) {
+    const globalQuotaBlockUntil = globalQuotaBlockSeconds > 0 ? now + globalQuotaBlockSeconds : now;
+    const globalQuotaSql = `
+      INSERT INTO ${globalQuotaTableName} (ip_range_hash, total_bytes_downloaded, last_window_time, blocked_until)
+      VALUES (?, ?, ?, CASE WHEN ? > ? THEN ? ELSE NULL END)
+      ON CONFLICT (ip_range_hash) DO UPDATE SET
+        total_bytes_downloaded = CASE
+          WHEN ${globalQuotaTableName}.blocked_until IS NOT NULL AND ${globalQuotaTableName}.blocked_until > ? THEN ${globalQuotaTableName}.total_bytes_downloaded
+          WHEN ? - ${globalQuotaTableName}.last_window_time >= ? THEN excluded.total_bytes_downloaded
+          ELSE ${globalQuotaTableName}.total_bytes_downloaded + excluded.total_bytes_downloaded
+        END,
+        last_window_time = CASE
+          WHEN ${globalQuotaTableName}.blocked_until IS NOT NULL AND ${globalQuotaTableName}.blocked_until > ? THEN ${globalQuotaTableName}.last_window_time
+          WHEN ? - ${globalQuotaTableName}.last_window_time >= ? THEN ?
+          ELSE ${globalQuotaTableName}.last_window_time
+        END,
+        blocked_until = CASE
+          WHEN ${globalQuotaTableName}.blocked_until IS NOT NULL AND ${globalQuotaTableName}.blocked_until > ? THEN ${globalQuotaTableName}.blocked_until
+          WHEN ? - ${globalQuotaTableName}.last_window_time >= ? THEN
+            CASE
+              WHEN excluded.total_bytes_downloaded > ? THEN ?
+              ELSE NULL
+            END
+          WHEN ${globalQuotaTableName}.total_bytes_downloaded + excluded.total_bytes_downloaded > ? THEN ?
+          ELSE NULL
+        END
+      RETURNING
+        total_bytes_downloaded AS TOTAL_BYTES_DOWNLOADED,
+        last_window_time AS LAST_WINDOW_TIME,
+        blocked_until AS BLOCKED_UNTIL
+    `;
+    const globalQuotaParams = [
+      ipHash,
+      deductBytes,
+      now,
+      deductBytes,
+      globalQuotaMaxBytes,
+      globalQuotaBlockUntil,
+      now,
+      now,
+      globalQuotaWindowSeconds,
+      now,
+      now,
+      globalQuotaWindowSeconds,
+      now,
+      now,
+      now,
+      globalQuotaWindowSeconds,
+      globalQuotaMaxBytes,
+      globalQuotaBlockUntil,
+      globalQuotaMaxBytes,
+      globalQuotaBlockUntil,
+    ];
+    globalQuotaStatementIndex = statements.length;
+    statements.push(db.prepare(globalQuotaSql).bind(...globalQuotaParams));
+    statementLabels.push('global quota');
+  }
 
   // Execute batch (single RTT!)
-  console.log('[Unified Check D1] Executing batch (2 queries in 1 RTT: cache + rate limit)');
+  console.log(`[Unified Check D1] Executing batch (${statements.length} queries in 1 RTT: ${statementLabels.join(' + ')})`);
   const results = await db.batch(statements);
 
-  if (!results || results.length < 2) {
+  if (!results || results.length !== statements.length) {
     throw new Error('[Unified Check D1] Batch returned incomplete results');
   }
 
@@ -240,6 +402,52 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
     ipSubnet,
   };
 
+  let fileQuotaSummary = null;
+  if (fileQuotaStatementIndex !== null) {
+    const fileQuotaRow = results[fileQuotaStatementIndex].results?.[0];
+    if (!fileQuotaRow) {
+      console.warn('[Unified Check D1] File quota statement returned no rows');
+    } else {
+      const bytesDownloadedRaw = parseInt(fileQuotaRow.BYTES_DOWNLOADED, 10);
+      const lastWindowRaw = parseInt(fileQuotaRow.LAST_WINDOW_TIME, 10);
+      const blockedRaw = fileQuotaRow.BLOCKED_UNTIL !== null && fileQuotaRow.BLOCKED_UNTIL !== undefined
+        ? parseInt(fileQuotaRow.BLOCKED_UNTIL, 10)
+        : null;
+      const bytesDownloaded = Number.isNaN(bytesDownloadedRaw) ? 0 : bytesDownloadedRaw;
+      const lastWindow = Number.isNaN(lastWindowRaw) ? now : lastWindowRaw;
+      const blockedUntil = blockedRaw !== null && !Number.isNaN(blockedRaw) ? blockedRaw : null;
+      fileQuotaSummary = {
+        bytesDownloaded,
+        lastWindowTime: lastWindow,
+        blockedUntil,
+        exceeded: blockedUntil !== null && blockedUntil > now,
+      };
+    }
+  }
+
+  let globalQuotaSummary = null;
+  if (globalQuotaStatementIndex !== null) {
+    const globalQuotaRow = results[globalQuotaStatementIndex].results?.[0];
+    if (!globalQuotaRow) {
+      console.warn('[Unified Check D1] Global quota statement returned no rows');
+    } else {
+      const totalBytesRaw = parseInt(globalQuotaRow.TOTAL_BYTES_DOWNLOADED, 10);
+      const lastWindowRaw = parseInt(globalQuotaRow.LAST_WINDOW_TIME, 10);
+      const blockedRaw = globalQuotaRow.BLOCKED_UNTIL !== null && globalQuotaRow.BLOCKED_UNTIL !== undefined
+        ? parseInt(globalQuotaRow.BLOCKED_UNTIL, 10)
+        : null;
+      const totalBytesDownloaded = Number.isNaN(totalBytesRaw) ? 0 : totalBytesRaw;
+      const lastWindow = Number.isNaN(lastWindowRaw) ? now : lastWindowRaw;
+      const blockedUntil = blockedRaw !== null && !Number.isNaN(blockedRaw) ? blockedRaw : null;
+      globalQuotaSummary = {
+        bytesDownloaded: totalBytesDownloaded,
+        lastWindowTime: lastWindow,
+        blockedUntil,
+        exceeded: blockedUntil !== null && blockedUntil > now,
+      };
+    }
+  }
+
   // Parse throttle result (only if cache hit with hostname_hash)
   // BREAKING CHANGE: IS_PROTECTED semantics
   //   1 = protected (error detected)
@@ -295,5 +503,7 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
     cache: cacheResult,
     rateLimit: rateLimitResult,
     throttle: throttleResult,
+    fileQuota: fileQuotaSummary,
+    globalQuota: globalQuotaSummary,
   };
 };

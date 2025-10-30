@@ -6,7 +6,6 @@ import { unifiedCheck } from './unified-check.js';
 import { unifiedCheckD1 } from './unified-check-d1.js';
 import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
-import { wrapStreamWithQuotaMonitoring } from './quota-stream.js';
 import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
 
 // Configuration constants
@@ -1584,36 +1583,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   safeHeaders.append("Vary", "Origin");
 
   // 创建带有安全headers的新响应
-  const shouldMonitorQuota = (response.status === 200 || response.status === 206) &&
-    (quotaConfig.fileQuota?.enabled || quotaConfig.globalQuota?.enabled) &&
-    quotaConfig.additionQuotaCheck;
-
-  let finalBody = response.body;
-  if (shouldMonitorQuota && finalBody) {
-    finalBody = wrapStreamWithQuotaMonitoring(
-      response.body,
-      {
-        ipRange: ipSubnet,
-        ipRangeHash: await sha256Hex(ipSubnet || clientIP || ""),
-        filepath: path,
-        filepathHash: pathHash,
-        expectedBytes: quotaConfig._runtimeDeductBytes || 0,
-        config: quotaConfig,
-        dbConfig: {
-          dbMode: config.dbMode,
-          postgrestUrl: config.rateLimitConfig?.postgrestUrl || config.cacheConfig?.postgrestUrl || config.postgrestUrl || "",
-          databaseBinding: config.cacheConfig?.databaseBinding || config.rateLimitConfig?.databaseBinding || config.databaseBinding || "",
-          accountId: config.rateLimitConfig?.accountId || config.cacheConfig?.accountId || config.accountId || "",
-          databaseId: config.rateLimitConfig?.databaseId || config.cacheConfig?.databaseId || config.databaseId || "",
-          apiToken: config.rateLimitConfig?.apiToken || config.cacheConfig?.apiToken || config.apiToken || "",
-          fileQuotaTableName: quotaConfig.fileQuota?.tableName || 'file_ip_download_quota',
-          globalQuotaTableName: quotaConfig.globalQuota?.tableName || 'global_ip_download_quota',
-          env,
-        },
-        ctx,
-      }
-    );
-  }
+  // Quota is fully deducted during the unified check, so we can stream the original body directly.
+  const finalBody = response.body;
 
   const safeResponse = new Response(finalBody, {
     status: response.status,
