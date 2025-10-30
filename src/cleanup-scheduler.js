@@ -2,6 +2,51 @@ import { applyVerifyHeaders } from './utils.js';
 
 const DEFAULT_CLEANUP_PROBABILITY = 0.01;
 
+const parseDurationToMilliseconds = (value) => {
+  if (value === undefined || value === null) {
+    return 0;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value < 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+  if (typeof value !== 'string') {
+    return 0;
+  }
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed === '') {
+    return 0;
+  }
+
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/);
+  if (!match) {
+    return 0;
+  }
+
+  const amount = Number.parseFloat(match[1]);
+  if (!Number.isFinite(amount) || amount < 0) {
+    return 0;
+  }
+
+  const unit = match[2];
+  const multipliers = {
+    ms: 1,
+    s: 1000,
+    m: 60 * 1000,
+    h: 60 * 60 * 1000,
+    d: 24 * 60 * 60 * 1000,
+  };
+
+  const multiplier = multipliers[unit];
+  if (!multiplier) {
+    return 0;
+  }
+
+  return Math.round(amount * multiplier);
+};
+
 const formatPercentageLabel = (probability) => {
   const percentage = probability * 100;
   return percentage % 1 === 0 ? `${percentage}` : percentage.toFixed(2);
@@ -176,6 +221,14 @@ const executePostgrestRpc = async (postgrestUrl, verifyHeader, verifySecret, fun
 
 const buildD1RestCleanupTasks = (config) => {
   const tasks = [];
+  const quotaConfig = config.quotaConfig || {};
+  const quotaRestConfig = config.rateLimitConfig?.accountId
+    ? config.rateLimitConfig
+    : config.cacheConfig?.accountId
+      ? config.cacheConfig
+      : config.throttleConfig?.accountId
+        ? config.throttleConfig
+        : null;
 
   if (config.cacheEnabled && config.cacheConfig) {
     const cacheConfig = config.cacheConfig;
@@ -227,11 +280,65 @@ const buildD1RestCleanupTasks = (config) => {
     });
   }
 
+  if (quotaRestConfig) {
+    tasks.push({
+      name: 'file_quota_cleanup',
+      fn: async () => {
+        const now = Math.floor(Date.now() / 1000);
+        const fileQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.fileQuota?.window || '1h'));
+        const expirySeconds = Math.floor((fileQuotaTTL * 2) / 1000);
+        const fileQuotaExpiry = Math.max(0, now - expirySeconds);
+        const sql = `
+          DELETE FROM file_ip_download_quota
+          WHERE blocked_until IS NULL
+            AND last_window_time < ?
+        `;
+        return executeD1RestStatement(
+          quotaRestConfig.accountId,
+          quotaRestConfig.databaseId,
+          quotaRestConfig.apiToken,
+          sql,
+          [fileQuotaExpiry]
+        );
+      },
+    });
+
+    tasks.push({
+      name: 'global_quota_cleanup',
+      fn: async () => {
+        const now = Math.floor(Date.now() / 1000);
+        const globalQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.globalQuota?.window || '1h'));
+        const expirySeconds = Math.floor((globalQuotaTTL * 2) / 1000);
+        const globalQuotaExpiry = Math.max(0, now - expirySeconds);
+        const sql = `
+          DELETE FROM global_ip_download_quota
+          WHERE blocked_until IS NULL
+            AND last_window_time < ?
+        `;
+        return executeD1RestStatement(
+          quotaRestConfig.accountId,
+          quotaRestConfig.databaseId,
+          quotaRestConfig.apiToken,
+          sql,
+          [globalQuotaExpiry]
+        );
+      },
+    });
+  }
+
   return tasks;
 };
 
 const buildD1CleanupTasks = (config, env) => {
   const tasks = [];
+  const quotaConfig = config.quotaConfig || {};
+  const quotaModuleConfig = config.rateLimitConfig?.databaseBinding
+    ? config.rateLimitConfig
+    : config.cacheConfig?.databaseBinding
+      ? config.cacheConfig
+      : config.throttleConfig?.databaseBinding
+        ? config.throttleConfig
+        : null;
 
   const resolveBinding = (moduleConfig) => {
     const bindingName = moduleConfig?.databaseBinding;
@@ -299,11 +406,55 @@ const buildD1CleanupTasks = (config, env) => {
     });
   }
 
+  if (quotaModuleConfig) {
+    tasks.push({
+      name: 'file_quota_cleanup',
+      fn: async () => {
+        const db = resolveBinding(quotaModuleConfig);
+        const now = Math.floor(Date.now() / 1000);
+        const fileQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.fileQuota?.window || '1h'));
+        const expirySeconds = Math.floor((fileQuotaTTL * 2) / 1000);
+        const fileQuotaExpiry = Math.max(0, now - expirySeconds);
+        const sql = `
+          DELETE FROM file_ip_download_quota
+          WHERE blocked_until IS NULL
+            AND last_window_time < ?
+        `;
+        return executeD1BindingStatement(db, sql, [fileQuotaExpiry]);
+      },
+    });
+
+    tasks.push({
+      name: 'global_quota_cleanup',
+      fn: async () => {
+        const db = resolveBinding(quotaModuleConfig);
+        const now = Math.floor(Date.now() / 1000);
+        const globalQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.globalQuota?.window || '1h'));
+        const expirySeconds = Math.floor((globalQuotaTTL * 2) / 1000);
+        const globalQuotaExpiry = Math.max(0, now - expirySeconds);
+        const sql = `
+          DELETE FROM global_ip_download_quota
+          WHERE blocked_until IS NULL
+            AND last_window_time < ?
+        `;
+        return executeD1BindingStatement(db, sql, [globalQuotaExpiry]);
+      },
+    });
+  }
+
   return tasks;
 };
 
 const buildCustomPgRestCleanupTasks = (config) => {
   const tasks = [];
+  const quotaConfig = config.quotaConfig || {};
+  const quotaPostgrestConfig = config.rateLimitConfig?.postgrestUrl
+    ? config.rateLimitConfig
+    : config.cacheConfig?.postgrestUrl
+      ? config.cacheConfig
+      : config.throttleConfig?.postgrestUrl
+        ? config.throttleConfig
+        : null;
 
   if (config.cacheEnabled && config.cacheConfig) {
     const cacheConfig = config.cacheConfig;
@@ -363,6 +514,46 @@ const buildCustomPgRestCleanupTasks = (config) => {
             p_ttl_seconds: ttlSeconds,
             p_table_name: table,
           }
+        );
+      },
+    });
+  }
+
+  if (quotaPostgrestConfig?.postgrestUrl) {
+    tasks.push({
+      name: 'file_quota_cleanup',
+      fn: async () => {
+        const now = Math.floor(Date.now() / 1000);
+        const fileQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.fileQuota?.window || '1h'));
+        const expirySeconds = Math.floor((fileQuotaTTL * 2) / 1000);
+        const fileQuotaExpiry = Math.max(0, now - expirySeconds);
+        const filters = `blocked_until=is.null&last_window_time=lt.${fileQuotaExpiry}`;
+        return executePostgrestDelete(
+          quotaPostgrestConfig.postgrestUrl,
+          quotaPostgrestConfig.verifyHeader,
+          quotaPostgrestConfig.verifySecret,
+          'file_ip_download_quota',
+          filters,
+          { Prefer: 'return=representation' }
+        );
+      },
+    });
+
+    tasks.push({
+      name: 'global_quota_cleanup',
+      fn: async () => {
+        const now = Math.floor(Date.now() / 1000);
+        const globalQuotaTTL = Math.max(0, parseDurationToMilliseconds(quotaConfig?.globalQuota?.window || '1h'));
+        const expirySeconds = Math.floor((globalQuotaTTL * 2) / 1000);
+        const globalQuotaExpiry = Math.max(0, now - expirySeconds);
+        const filters = `blocked_until=is.null&last_window_time=lt.${globalQuotaExpiry}`;
+        return executePostgrestDelete(
+          quotaPostgrestConfig.postgrestUrl,
+          quotaPostgrestConfig.verifyHeader,
+          quotaPostgrestConfig.verifySecret,
+          'global_ip_download_quota',
+          filters,
+          { Prefer: 'return=representation' }
         );
       },
     });

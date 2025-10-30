@@ -6,6 +6,7 @@ import { unifiedCheck } from './unified-check.js';
 import { unifiedCheckD1 } from './unified-check-d1.js';
 import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
+import { wrapStreamWithQuotaMonitoring } from './quota-stream.js';
 import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
 
 // Configuration constants
@@ -168,6 +169,23 @@ const resolveConfig = (env = {}) => {
   const throttleHostnamePatterns = throttleProtectHostname
     ? throttleProtectHostname.split(',').map((p) => p.trim()).filter((p) => p.length > 0)
     : [];
+
+  // Download quota configuration
+  const additionQuotaCheck = parseBoolean(env.ADDITION_QUOTA_CHECK, false);
+
+  const quotaPerFilepathEnabled = parseBoolean(env.QUOTA_PER_FILEPATH_ENABLED, false);
+  const iprangeWindowPerFilepath = normalizeString(env.IPRANGE_WINDOW_PER_FILEPATH, '1h');
+  const maxQuotaPerFilepath = normalizeString(env.MAX_QUOTA_PER_FILEPATH, '2x');
+  const minAvailableQuotaPerFilepath = normalizeString(env.MIN_AVAILABLE_QUOTA_PER_FILEPATH, '1GB');
+  const quotaPerFilepathBlockTime = normalizeString(env.QUOTA_PER_FILEPATH_BLOCK_TIME, '1h');
+
+  const quotaTotalEnabled = parseBoolean(env.QUOTA_TOTAL_ENABLED, false);
+  const iprangeWindowTotal = normalizeString(env.IPRANGE_WINDOW_TOTAL, '1h');
+  const maxQuotaTotal = normalizeString(env.MAX_QUOTA_TOTAL, '10GB');
+  const quotaTotalBlockTime = normalizeString(env.QUOTA_TOTAL_BLOCK_TIME, '1h');
+
+  const quotaUpdateIntervalBase = parseInteger(env.QUOTA_UPDATE_INTERVAL_BASE, 30000);
+  const quotaUpdateIntervalRandom = parseInteger(env.QUOTA_UPDATE_INTERVAL_RANDOM, 5000);
 
   const parseVerifyValues = (value) => {
     if (!value || typeof value !== 'string') {
@@ -384,6 +402,24 @@ const resolveConfig = (env = {}) => {
     cfRatelimiterBinding,
     ipv4Suffix,
     ipv6Suffix,
+    quotaConfig: {
+      additionQuotaCheck,
+      fileQuota: {
+        enabled: quotaPerFilepathEnabled,
+        window: iprangeWindowPerFilepath,
+        maxQuota: maxQuotaPerFilepath,
+        minAvailable: minAvailableQuotaPerFilepath,
+        blockTime: quotaPerFilepathBlockTime,
+      },
+      globalQuota: {
+        enabled: quotaTotalEnabled,
+        window: iprangeWindowTotal,
+        maxQuota: maxQuotaTotal,
+        blockTime: quotaTotalBlockTime,
+      },
+      updateIntervalBase: quotaUpdateIntervalBase,
+      updateIntervalRandom: quotaUpdateIntervalRandom,
+    },
   };
 };
 
@@ -590,6 +626,123 @@ function createRateLimitResponse(origin, ipSubnet, limit, windowLabel, retryAfte
   });
 }
 
+function createQuotaLimitResponse(origin, statusCode, message, retryAfter) {
+  const safeHeaders = new Headers();
+  safeHeaders.set("content-type", "application/json;charset=UTF-8");
+  safeHeaders.set("Access-Control-Allow-Origin", origin);
+  safeHeaders.append("Vary", "Origin");
+
+  const sanitizedRetryAfter = retryAfter && retryAfter > 0
+    ? Math.max(1, Math.ceil(retryAfter))
+    : 0;
+  if (sanitizedRetryAfter) {
+    safeHeaders.set("Retry-After", String(sanitizedRetryAfter));
+  }
+
+  const payload = {
+    code: statusCode,
+    message
+  };
+  if (sanitizedRetryAfter) {
+    payload['retry-after'] = sanitizedRetryAfter;
+  }
+
+  return new Response(JSON.stringify(payload), {
+    status: statusCode,
+    headers: safeHeaders
+  });
+}
+
+function parseDurationToMilliseconds(value) {
+  if (value === undefined || value === null) {
+    return 0;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+  if (typeof value !== "string") {
+    return 0;
+  }
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed === "") {
+    return 0;
+  }
+
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/);
+  if (!match) {
+    return 0;
+  }
+
+  const amount = Number.parseFloat(match[1]);
+  if (!Number.isFinite(amount) || amount < 0) {
+    return 0;
+  }
+
+  const unit = match[2];
+  const multipliers = {
+    ms: 1,
+    s: 1000,
+    m: 60 * 1000,
+    h: 60 * 60 * 1000,
+    d: 24 * 60 * 60 * 1000,
+  };
+
+  const multiplier = multipliers[unit];
+  if (!multiplier) {
+    return 0;
+  }
+
+  return Math.round(amount * multiplier);
+}
+
+function parseSizeToBytes(value) {
+  if (value === undefined || value === null) {
+    return 0;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+  if (typeof value !== "string") {
+    return 0;
+  }
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed === "") {
+    return 0;
+  }
+
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)(b|kb|mb|gb|tb)$/);
+  if (!match) {
+    return 0;
+  }
+
+  const amount = Number.parseFloat(match[1]);
+  if (!Number.isFinite(amount) || amount < 0) {
+    return 0;
+  }
+
+  const unit = match[2];
+  const multipliers = {
+    b: 1,
+    kb: 1024,
+    mb: 1024 * 1024,
+    gb: 1024 * 1024 * 1024,
+    tb: 1024 * 1024 * 1024 * 1024,
+  };
+
+  const multiplier = multipliers[unit];
+  if (!multiplier) {
+    return 0;
+  }
+
+  return Math.round(amount * multiplier);
+}
+
 function safeDecodePathname(pathname) {
   try {
     return decodeURIComponent(pathname);
@@ -615,6 +768,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   }
 
   const clientIP = request.headers.get("CF-Connecting-IP") || "";
+  const ipSubnet = clientIP ? calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix) : "";
+  let quotaConfig = config.quotaConfig || {};
+  if (!config.quotaConfig) {
+    config.quotaConfig = quotaConfig;
+  } else {
+    quotaConfig = config.quotaConfig;
+  }
+  quotaConfig._runtimeFileMaxQuota = 0;
+  quotaConfig._runtimeDeductBytes = 0;
 
   // CF Rate Limiter检查（第一道防线）
   if (config.enableCfRatelimiter) {
@@ -714,6 +876,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const additionalInfo = url.searchParams.get("additionalInfo") ?? "";
   const additionalInfoSign = url.searchParams.get("additionalInfoSign") ?? "";
+  const pathHash = await sha256Hex(path);
+  let additionalPayload = null;
   if (config.additionCheck) {
     if (!additionalInfo) {
       return createUnauthorizedResponse(origin, "additionalInfo missing");
@@ -732,15 +896,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return createUnauthorizedResponse(origin, "additionalInfo decode failed");
     }
 
-    let additionalPayload;
     try {
       additionalPayload = JSON.parse(decodedAdditional);
     } catch (_error) {
       return createUnauthorizedResponse(origin, "additionalInfo invalid");
     }
 
-    const expectedPathHash = await sha256Hex(path);
-    if (typeof additionalPayload.pathHash !== "string" || additionalPayload.pathHash !== expectedPathHash) {
+    if (typeof additionalPayload.pathHash !== "string" || additionalPayload.pathHash !== pathHash) {
       return createUnauthorizedResponse(origin, "additionalInfo path mismatch");
     }
 
@@ -763,6 +925,83 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
+  let filesize = null;
+  if (quotaConfig.additionQuotaCheck) {
+    if (!additionalPayload || additionalPayload.filesize === undefined || additionalPayload.filesize === null) {
+      return createErrorResponse(origin, 400, "ADDITION_QUOTA_CHECK enabled but filesize missing in additionalInfo");
+    }
+    filesize = Number.parseInt(additionalPayload.filesize, 10);
+    if (!Number.isFinite(filesize) || filesize <= 0) {
+      return createErrorResponse(origin, 400, "ADDITION_QUOTA_CHECK enabled but filesize invalid in additionalInfo");
+    }
+  }
+
+  let deductBytes = 0;
+  let actualFileMaxQuota = 0;
+
+  if ((quotaConfig.fileQuota?.enabled || quotaConfig.globalQuota?.enabled) && filesize !== null) {
+    const rangeHeader = request.headers.get("Range");
+    if (rangeHeader) {
+      const match = rangeHeader.match(/bytes=(\d+)-(\d*)/i);
+      if (match) {
+        const start = Number.parseInt(match[1], 10);
+        let end = match[2] ? Number.parseInt(match[2], 10) : (filesize > 0 ? filesize - 1 : 0);
+        if (!Number.isFinite(start) || start < 0) {
+          deductBytes = filesize;
+        } else {
+          if (!Number.isFinite(end) || end < start) {
+            end = filesize > 0 ? filesize - 1 : start;
+          }
+          deductBytes = Math.min(filesize, Math.max(0, (end - start) + 1));
+        }
+      } else {
+        deductBytes = filesize;
+      }
+    } else {
+      deductBytes = filesize;
+    }
+
+    if (!Number.isFinite(deductBytes) || deductBytes < 0) {
+      deductBytes = 0;
+    }
+
+    if (quotaConfig.fileQuota?.enabled) {
+      let maxQuotaMultiplier = 1;
+      const maxQuotaRaw = quotaConfig.fileQuota.maxQuota || "";
+      if (typeof maxQuotaRaw === "string" && maxQuotaRaw.trim() !== "") {
+        const normalized = maxQuotaRaw.trim().toLowerCase();
+        const multiplierString = normalized.endsWith('x') ? normalized.slice(0, -1) : normalized;
+        const parsedMultiplier = Number.parseFloat(multiplierString);
+        if (Number.isFinite(parsedMultiplier) && parsedMultiplier > 0) {
+          maxQuotaMultiplier = parsedMultiplier;
+        }
+      }
+
+      const calculatedMaxQuota = Math.ceil(filesize * maxQuotaMultiplier);
+      const minAvailableBytes = parseSizeToBytes(quotaConfig.fileQuota.minAvailable || "0");
+      actualFileMaxQuota = Math.max(calculatedMaxQuota, minAvailableBytes);
+    }
+  }
+
+  quotaConfig._runtimeFileMaxQuota = actualFileMaxQuota;
+  quotaConfig._runtimeDeductBytes = deductBytes;
+
+  const fileQuotaWindowSeconds = quotaConfig.fileQuota?.enabled
+    ? Math.max(0, Math.round(parseDurationToMilliseconds(quotaConfig.fileQuota.window || "0") / 1000))
+    : 0;
+  const fileQuotaBlockSeconds = quotaConfig.fileQuota?.enabled
+    ? Math.max(0, Math.round(parseDurationToMilliseconds(quotaConfig.fileQuota.blockTime || "0") / 1000))
+    : 0;
+  const globalQuotaWindowSeconds = quotaConfig.globalQuota?.enabled
+    ? Math.max(0, Math.round(parseDurationToMilliseconds(quotaConfig.globalQuota.window || "0") / 1000))
+    : 0;
+  const globalQuotaBlockSeconds = quotaConfig.globalQuota?.enabled
+    ? Math.max(0, Math.round(parseDurationToMilliseconds(quotaConfig.globalQuota.blockTime || "0") / 1000))
+    : 0;
+  const globalQuotaMaxBytes = quotaConfig.globalQuota?.enabled
+    ? parseSizeToBytes(quotaConfig.globalQuota.maxQuota || "0")
+    : 0;
+
   // ========================================
   // UNIFIED CHECK (RTT 3→1 OPTIMIZATION)
   // ========================================
@@ -784,9 +1023,21 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const cacheConfig = config.cacheConfig || {};
       const throttleConfig = config.throttleConfig || {};
       const limitConfigValue = rateLimitConfig.limit ?? config.ipSubnetLimit;
+      const quotaParams = {
+        filepathHash: pathHash,
+        deductBytes: quotaConfig._runtimeDeductBytes || 0,
+        fileQuotaWindowSeconds,
+        fileQuotaMaxBytes: quotaConfig._runtimeFileMaxQuota || 0,
+        fileQuotaBlockSeconds,
+        globalQuotaWindowSeconds,
+        globalQuotaMaxBytes,
+        globalQuotaBlockSeconds,
+        fileQuotaTableName: "file_ip_download_quota",
+        globalQuotaTableName: "global_ip_download_quota",
+      };
 
       if (config.dbMode === 'custom-pg-rest') {
-        unifiedResult = await unifiedCheck(path, clientIP, {
+        const unifiedOptions = {
           postgrestUrl: rateLimitConfig.postgrestUrl,
           verifyHeader: rateLimitConfig.verifyHeader,
           verifySecret: rateLimitConfig.verifySecret,
@@ -800,9 +1051,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
-        });
+          ...quotaParams,
+        };
+        unifiedResult = await unifiedCheck(path, clientIP, unifiedOptions);
       } else if (config.dbMode === 'd1') {
-        unifiedResult = await unifiedCheckD1(path, clientIP, {
+        const unifiedOptions = {
           env: cacheConfig.env || rateLimitConfig.env,
           databaseBinding: cacheConfig.databaseBinding || rateLimitConfig.databaseBinding || 'DB',
           linkTTL: cacheConfig.linkTTL ?? 1800,
@@ -815,9 +1068,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
-        });
+          ...quotaParams,
+        };
+        unifiedResult = await unifiedCheckD1(path, clientIP, unifiedOptions);
       } else if (config.dbMode === 'd1-rest') {
-        unifiedResult = await unifiedCheckD1Rest(path, clientIP, {
+        const unifiedOptions = {
           accountId: rateLimitConfig.accountId || throttleConfig.accountId || cacheConfig.accountId,
           databaseId: rateLimitConfig.databaseId || throttleConfig.databaseId || cacheConfig.databaseId,
           apiToken: rateLimitConfig.apiToken || throttleConfig.apiToken || cacheConfig.apiToken,
@@ -831,7 +1086,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
-        });
+          ...quotaParams,
+        };
+        unifiedResult = await unifiedCheckD1Rest(path, clientIP, unifiedOptions);
       } else {
         throw new Error(`Unsupported database mode for unified check: ${config.dbMode}`);
       }
@@ -889,6 +1146,46 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         );
       }
       
+      if (quotaConfig.fileQuota?.enabled && unifiedResult.fileQuota) {
+        if (unifiedResult.fileQuota.exceeded) {
+          const nowSeconds = Math.floor(Date.now() / 1000);
+          let retryAfter = 0;
+          if (typeof unifiedResult.fileQuota.blockedUntil === "number") {
+            retryAfter = Math.max(0, Math.ceil(unifiedResult.fileQuota.blockedUntil - nowSeconds));
+          }
+          if (!retryAfter && fileQuotaBlockSeconds) {
+            retryAfter = fileQuotaBlockSeconds;
+          }
+
+          return createQuotaLimitResponse(
+            origin,
+            429,
+            `File-level quota exceeded for ${path}. IP range ${ipSubnet || clientIP} downloaded ${unifiedResult.fileQuota.bytesDownloaded} bytes (limit: ${quotaConfig._runtimeFileMaxQuota} bytes in ${quotaConfig.fileQuota?.window || 'configured window'})`,
+            retryAfter
+          );
+        }
+      }
+
+      if (quotaConfig.globalQuota?.enabled && unifiedResult.globalQuota) {
+        if (unifiedResult.globalQuota.exceeded) {
+          const nowSeconds = Math.floor(Date.now() / 1000);
+          let retryAfter = 0;
+          if (typeof unifiedResult.globalQuota.blockedUntil === "number") {
+            retryAfter = Math.max(0, Math.ceil(unifiedResult.globalQuota.blockedUntil - nowSeconds));
+          }
+          if (!retryAfter && globalQuotaBlockSeconds) {
+            retryAfter = globalQuotaBlockSeconds;
+          }
+
+          return createQuotaLimitResponse(
+            origin,
+            429,
+            `Global quota exceeded for IP range ${ipSubnet || clientIP}. Total downloaded ${unifiedResult.globalQuota.bytesDownloaded} bytes (limit: ${globalQuotaMaxBytes} bytes in ${quotaConfig.globalQuota?.window || 'configured window'})`,
+            retryAfter
+          );
+        }
+      }
+
       // Trigger probabilistic cleanup for rate limit
       if (rateLimiter && config.rateLimitConfig) {
         const probability = config.rateLimitConfig.cleanupProbability || 0.01;
@@ -1287,7 +1584,33 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   safeHeaders.append("Vary", "Origin");
 
   // 创建带有安全headers的新响应
-  const safeResponse = new Response(response.body, {
+  const shouldMonitorQuota = (response.status === 200 || response.status === 206) &&
+    (quotaConfig.fileQuota?.enabled || quotaConfig.globalQuota?.enabled) &&
+    quotaConfig.additionQuotaCheck;
+
+  let finalBody = response.body;
+  if (shouldMonitorQuota && finalBody) {
+    finalBody = wrapStreamWithQuotaMonitoring(
+      response.body,
+      {
+        ipRange: ipSubnet,
+        ipRangeHash: await sha256Hex(ipSubnet || clientIP || ""),
+        filepath: path,
+        filepathHash: pathHash,
+        expectedBytes: quotaConfig._runtimeDeductBytes || 0,
+        config: quotaConfig,
+        dbConfig: {
+          dbMode: config.dbMode,
+          postgrestUrl: config.rateLimitConfig?.postgrestUrl || config.cacheConfig?.postgrestUrl || config.postgrestUrl || "",
+          databaseBinding: config.cacheConfig?.databaseBinding || config.rateLimitConfig?.databaseBinding || config.databaseBinding || "",
+          env,
+        },
+        ctx,
+      }
+    );
+  }
+
+  const safeResponse = new Response(finalBody, {
     status: response.status,
     statusText: response.statusText,
     headers: safeHeaders

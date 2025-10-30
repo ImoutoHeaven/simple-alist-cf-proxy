@@ -101,6 +101,39 @@ compatibility_date = "2024-01-01"
 # #          /api,/system → default behavior
 
 #
+# ============================================
+# Download Quota Configuration
+# ============================================
+
+# Master switch for quota checking (requires additionalInfo.filesize from landing worker)
+# ADDITION_QUOTA_CHECK = false
+
+# File-level quota (per IP range × filepath)
+# QUOTA_PER_FILEPATH_ENABLED = false
+# IPRANGE_WINDOW_PER_FILEPATH = "1h"              # Window duration (supports h/m/s)
+# MAX_QUOTA_PER_FILEPATH = "2x"                   # Multiplier of filesize (e.g., 2x = 200% of file size)
+# MIN_AVAILABLE_QUOTA_PER_FILEPATH = "1GB"        # Minimum quota (protects small files, uses KB/MB/GB/TB)
+# QUOTA_PER_FILEPATH_BLOCK_TIME = "1h"            # Block duration when quota exceeded
+
+# Global quota (per IP range, all files combined)
+# QUOTA_TOTAL_ENABLED = false
+# IPRANGE_WINDOW_TOTAL = "1h"                     # Window duration
+# MAX_QUOTA_TOTAL = "10GB"                        # Maximum total bytes (KB/MB/GB/TB)
+# QUOTA_TOTAL_BLOCK_TIME = "1h"                   # Block duration when quota exceeded
+
+# Advanced: Stream monitoring intervals (milliseconds)
+# QUOTA_UPDATE_INTERVAL_BASE = 30000              # Base interval: 30 seconds
+# QUOTA_UPDATE_INTERVAL_RANDOM = 5000             # Random jitter: 0-5 seconds
+
+# ============================================
+# Notes:
+# - File quota applies per (IP range, filepath) pair
+# - Global quota applies per IP range across all files
+# - Both quotas use fixed window (resets after window expires)
+# - IP ranges respect IPV4_SUFFIX and IPV6_SUFFIX settings
+# - Blocked clients receive 429 status with Retry-After header
+# ============================================
+#
 # # Database Mode for Download Link Cache
 # # Options: "d1" (Cloudflare D1 Binding), "d1-rest" (Cloudflare D1 REST API), "custom-pg-rest" (Custom PostgreSQL + PostgREST)
 # # If not set, caching is completely disabled (always call AList API)
