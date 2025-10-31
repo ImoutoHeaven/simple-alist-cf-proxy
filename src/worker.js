@@ -141,93 +141,93 @@ function calculateFilepathQuota(config, filesize) {
 }
 
 /**
- * Wrap a ReadableStream and track downstream byte usage.
- * Ensures finalize callback executes exactly once with transfer stats.
+ * Create a WritableStream sink that only counts bytes and triggers finalize once.
+ * @param {(payload: {status: 'complete'|'canceled'|'errored', bytes: number}) => void} finalizeOnce
  */
-function wrapReadableWithAccounting(input, finalize) {
-  if (!input || typeof input.getReader !== 'function') {
-    const finalizePromise = Promise.resolve();
+function createByteCountingSink(finalizeOnce) {
+  let bytes = 0;
+  return new WritableStream({
+    write(chunk) {
+      bytes += chunk?.byteLength ?? 0;
+    },
+    close() {
+      finalizeOnce({ status: 'complete', bytes });
+    },
+    abort() {
+      finalizeOnce({ status: 'canceled', bytes });
+    },
+  });
+}
+
+/**
+ * Wrap response body with byte accounting without touching the client stream.
+ * @param {Request} req
+ * @param {Response} upstreamRes
+ * @param {(payload: {status: 'complete'|'canceled'|'errored', bytes: number}) => Promise<void>|void} onFinalize
+ * @param {ExecutionContext} [ctx]
+ * @returns {{ body: ReadableStream|null, finalizePromise: Promise<void> }}
+ */
+function withBodyByteAccounting(req, upstreamRes, onFinalize, ctx) {
+  const method = req?.method || 'GET';
+  const status = upstreamRes?.status;
+  const body = upstreamRes?.body;
+
+  const eligible = (
+    method === 'GET' &&
+    (status === 200 || status === 206) &&
+    body
+  );
+
+  if (!eligible) {
     return {
-      stream: input,
-      finalizeOnce: async () => {
-        try {
-          await finalize({ status: 'complete', bytes: 0 });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          console.error('[Bandwidth Accounting] Finalize failed:', message);
-        }
-      },
-      finalizePromise,
+      body,
+      finalizePromise: Promise.resolve(),
     };
   }
 
-  let bytes = 0;
   let finalized = false;
-  let reader = null;
-  let finalizeResolver;
+  let resolveFinalize;
   const finalizePromise = new Promise((resolve) => {
-    finalizeResolver = resolve;
+    resolveFinalize = resolve;
   });
 
-  const finalizeOnce = async (status) => {
+  const finalizeOnce = (payload) => {
     if (finalized) {
       return;
     }
     finalized = true;
+
+    const safePayload = payload ?? { status: 'complete', bytes: 0 };
+    const runner = (async () => {
+      try {
+        await onFinalize?.(safePayload);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[Bandwidth Accounting] Finalize failed:', message);
+      } finally {
+        resolveFinalize?.();
+      }
+    })();
+
     try {
-      await finalize({ status, bytes });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error('[Bandwidth Accounting] Finalize failed:', message);
+      ctx?.waitUntil?.(runner);
+    } catch {
+      // If waitUntil is unavailable or throws, ensure promise settles quietly.
+      runner.catch(() => {});
     }
-    finalizeResolver?.();
   };
 
-  const stream = new ReadableStream({
-    start() {
-      reader = input.getReader();
-    },
-    async pull(controller) {
-      if (!reader) {
-        controller.close();
-        await finalizeOnce('complete');
-        return;
-      }
+  const [clientStream, countStream] = body.tee();
+  const sink = createByteCountingSink(finalizeOnce);
 
-      try {
-        const { done, value } = await reader.read();
-        if (done) {
-          controller.close();
-          await finalizeOnce('complete');
-          return;
-        }
-
-        if (value) {
-          bytes += value.byteLength ?? 0;
-          controller.enqueue(value);
-        } else {
-          controller.enqueue(value);
-        }
-      } catch (error) {
-        try {
-          controller.error(error);
-        } catch {
-          // controller may already be closed
-        }
-        await finalizeOnce('errored');
-      }
-    },
-    async cancel(reason) {
-      try {
-        await reader?.cancel(reason);
-      } catch {
-        // ignore cancel errors
-      }
-      await finalizeOnce('canceled');
-    }
+  countStream.pipeTo(sink).catch(() => {
+    finalizeOnce({ status: 'errored', bytes: 0 });
   });
 
-  return { stream, finalizeOnce, finalizePromise };
+  return {
+    body: clientStream,
+    finalizePromise,
+  };
 }
 
 function createBandwidthQuotaExceededResponse(origin, bandwidthResult) {
@@ -1601,7 +1601,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   }
 
   let responseBody = response.body;
-  let bandwidthFinalizePromise = null;
 
   const shouldAccountBandwidth =
     config.bandwidthQuotaEnabled &&
@@ -1620,29 +1619,30 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       );
 
       if (subnet) {
-        const { stream, finalizePromise } = wrapReadableWithAccounting(response.body, async ({ bytes }) => {
-          if (!Number.isFinite(bytes) || bytes <= 0) {
-            return;
-          }
+        const { body: countedBody } = withBodyByteAccounting(
+          request,
+          response,
+          async ({ bytes }) => {
+            if (!Number.isFinite(bytes) || bytes <= 0) {
+              return;
+            }
 
-          if (!bandwidthManager || typeof bandwidthManager.upsertBandwidthQuota !== 'function') {
-            console.warn('[Bandwidth Quota] No quota manager available for accounting');
-            return;
-          }
+            if (!bandwidthManager || typeof bandwidthManager.upsertBandwidthQuota !== 'function') {
+              console.warn('[Bandwidth Quota] No quota manager available for accounting');
+              return;
+            }
 
-          try {
-            await bandwidthManager.upsertBandwidthQuota(bandwidthConfig, subnet, path, bytes, filesize);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            console.error('[Bandwidth Quota] Failed to record usage:', message);
-          }
-        });
+            try {
+              await bandwidthManager.upsertBandwidthQuota(bandwidthConfig, subnet, path, bytes, filesize);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              console.error('[Bandwidth Quota] Failed to record usage:', message);
+            }
+          },
+          ctx
+        );
 
-        responseBody = stream;
-        bandwidthFinalizePromise = finalizePromise.catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          console.error('[Bandwidth Accounting] Finalize error:', message);
-        });
+        responseBody = countedBody;
       } else {
         console.warn('[Bandwidth Quota] Unable to determine subnet, skipping accounting');
       }
@@ -1650,10 +1650,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const message = error instanceof Error ? error.message : String(error);
       console.error('[Bandwidth Quota] Accounting setup failed:', message);
     }
-  }
-
-  if (bandwidthFinalizePromise && ctx && ctx.waitUntil) {
-    ctx.waitUntil(bandwidthFinalizePromise);
   }
 
   // 创建仅包含安全必要headers的响应
