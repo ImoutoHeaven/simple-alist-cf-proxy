@@ -1205,6 +1205,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
             : ''
         );
         return createBandwidthQuotaExceededResponse(origin, unifiedResult.bandwidth);
+      } else if (config.bandwidthQuotaEnabled && unifiedResult.bandwidth) {
+        console.log(
+          '[Bandwidth Quota] Unified check allow:',
+          `iprangeAllowed=${unifiedResult.bandwidth.iprangeAllowed}`,
+          `iprangeBytes=${unifiedResult.bandwidth.iprangeBytesUsed}`,
+          `filepathAllowed=${unifiedResult.bandwidth.filepathAllowed}`,
+          `filepathBytes=${unifiedResult.bandwidth.filepathBytesUsed}`
+        );
       }
       
       if (unifiedResult.cache.hit) {
@@ -1611,6 +1619,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     (response.status === 200 || response.status === 206);
 
   if (shouldAccountBandwidth) {
+    console.log(
+      '[Bandwidth Quota] Stream accounting enabled:',
+      `status=${response.status}`,
+      `method=${request.method}`,
+      `path=${path}`
+    );
     try {
       const subnet = calculateIPSubnet(
         clientIP,
@@ -1623,7 +1637,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           request,
           response,
           async ({ bytes }) => {
+            console.log('[Bandwidth Quota] Finalize callback fired:', `bytes=${bytes}`, `subnet=${subnet}`);
+
             if (!Number.isFinite(bytes) || bytes <= 0) {
+              console.log('[Bandwidth Quota] Finalize skipped: non-positive byte count');
               return;
             }
 
@@ -1633,7 +1650,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
             }
 
             try {
+              console.log(
+                '[Bandwidth Quota] Persisting usage:',
+                `subnet=${subnet}`,
+                `filepath=${path}`,
+                `bytes=${bytes}`,
+                `filesize=${filesize}`
+              );
               await bandwidthManager.upsertBandwidthQuota(bandwidthConfig, subnet, path, bytes, filesize);
+              console.log('[Bandwidth Quota] Persist success');
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
               console.error('[Bandwidth Quota] Failed to record usage:', message);
@@ -1650,6 +1675,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const message = error instanceof Error ? error.message : String(error);
       console.error('[Bandwidth Quota] Accounting setup failed:', message);
     }
+  } else {
+    console.log(
+      '[Bandwidth Quota] Accounting skipped:',
+      `enabled=${config.bandwidthQuotaEnabled}`,
+      `managerReady=${Boolean(bandwidthManager)}`,
+      `configReady=${Boolean(bandwidthConfig)}`,
+      `hasBody=${Boolean(responseBody)}`,
+      `method=${request.method}`,
+      `status=${response.status}`
+    );
   }
 
   // 创建仅包含安全必要headers的响应

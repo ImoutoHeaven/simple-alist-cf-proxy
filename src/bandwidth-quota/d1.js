@@ -53,13 +53,64 @@ const calculateFilepathQuota = (config, filesize) => {
   return config.value;
 };
 
+const parseInteger = (value, fallback = 0) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const logQuotaUpdate = ({
+  scope,
+  key,
+  bytesAdded,
+  limit,
+  windowSeconds,
+  row,
+  now,
+}) => {
+  if (!row) {
+    console.log(`[Bandwidth Quota D1] ${scope} quota write: key=${key} bytesAdded=${bytesAdded} (no row returned)`);
+    return;
+  }
+
+  const bytesUsed = parseInteger(row.BYTES_USED ?? row.bytes_used ?? row.bytesUsed, 0);
+  const windowStart = parseInteger(row.WINDOW_START ?? row.window_start ?? row.windowStart, 0);
+  const blockUntilRaw = row.BLOCK_UNTIL ?? row.block_until ?? row.blockUntil;
+  const blockUntil = Number.isFinite(blockUntilRaw) ? blockUntilRaw : parseInteger(blockUntilRaw, null);
+  const blockActive = Number.isFinite(blockUntil) && blockUntil > now;
+  const shouldBlock = limit > 0 && windowSeconds > 0 && bytesUsed >= limit;
+  const segments = [
+    `[Bandwidth Quota D1] ${scope} quota write`,
+    `key=${key}`,
+    `bytesAdded=${bytesAdded}`,
+    `windowUsed=${limit > 0 ? `${bytesUsed}/${limit}` : `${bytesUsed}`}`,
+    `windowStart=${windowStart}`,
+    `blockActive=${blockActive}`,
+    `shouldBlock=${shouldBlock}`,
+  ];
+
+  if (Number.isFinite(blockUntil)) {
+    segments.push(`blockUntil=${blockUntil}`);
+  }
+
+  console.log(segments.join(' | '));
+};
+
 export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, filesize = 0) => {
   if (!config || !config.env || !config.databaseBinding) {
     console.warn('[Bandwidth Quota D1] Missing configuration, skipping quota update');
     return { success: false };
   }
 
+  const normalizedBytes = Number.isFinite(bytes) ? Math.trunc(bytes) : bytes;
+  console.log(
+    '[Bandwidth Quota D1] Upsert request:',
+    `ipRange=${ipRange || 'N/A'}`,
+    `filepath=${filepath || 'N/A'}`,
+    `bytes=${normalizedBytes}`
+  );
+
   if (!ipRange || !Number.isFinite(bytes) || bytes <= 0) {
+    console.log('[Bandwidth Quota D1] Upsert skipped: invalid ipRange or bytes');
     return { success: true };
   }
 
@@ -70,7 +121,7 @@ export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, fil
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const updates = [];
+    const byteCount = Math.max(0, Math.trunc(bytes));
     const totalQuotaActive = Boolean(config.totalEnabled) && config.iprangeLimit > 0 && config.windowTimeTotalSeconds > 0;
     const filepathQuotaLimit = config.filepathEnabled
       ? calculateFilepathQuota(config.filepathLimitConfig, filesize)
@@ -80,6 +131,11 @@ export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, fil
       filepath &&
       config.windowTimeFilepathSeconds > 0 &&
       filepathQuotaLimit > 0;
+
+    if (!totalQuotaActive && !filepathQuotaActive) {
+      console.log('[Bandwidth Quota D1] Upsert skipped: no active quota scopes');
+      return { success: true };
+    }
 
     if (totalQuotaActive) {
       await ensureIprangeTable(db, config.iprangeTableName || DEFAULT_IPRANGE_TABLE);
@@ -111,21 +167,31 @@ export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, fil
               WHEN ${tableName}.BYTES_USED + ?3 > ?6 AND ?7 > 0 THEN ?4 + ?7
               ELSE ${tableName}.BLOCK_UNTIL
             END
+          RETURNING BYTES_USED, WINDOW_START, BLOCK_UNTIL
         `);
 
-        updates.push(
-          stmt
-            .bind(
-              ipHash,
-              ipRange,
-              Math.max(0, Math.trunc(bytes)),
-              now,
-              config.windowTimeTotalSeconds,
-              config.iprangeLimit,
-              blockTimeSeconds
-            )
-            .run()
-        );
+        const result = await stmt
+          .bind(
+            ipHash,
+            ipRange,
+            byteCount,
+            now,
+            config.windowTimeTotalSeconds,
+            config.iprangeLimit,
+            blockTimeSeconds
+          )
+          .all();
+
+        const row = result?.results?.[0] || null;
+        logQuotaUpdate({
+          scope: 'iprange',
+          key: ipRange,
+          bytesAdded: byteCount,
+          limit: config.iprangeLimit,
+          windowSeconds: config.windowTimeTotalSeconds,
+          row,
+          now,
+        });
       }
     }
 
@@ -159,27 +225,33 @@ export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, fil
               WHEN ${tableName}.BYTES_USED + ?4 > ?7 AND ?8 > 0 THEN ?5 + ?8
               ELSE ${tableName}.BLOCK_UNTIL
             END
+          RETURNING BYTES_USED, WINDOW_START, BLOCK_UNTIL
         `);
 
-        updates.push(
-          stmt
-            .bind(
-              compositeHash,
-              ipRange,
-              filepath,
-              Math.max(0, Math.trunc(bytes)),
-              now,
-              config.windowTimeFilepathSeconds,
-              filepathQuotaLimit,
-              blockTimeSeconds
-            )
-            .run()
-        );
-      }
-    }
+        const result = await stmt
+          .bind(
+            compositeHash,
+            ipRange,
+            filepath,
+            byteCount,
+            now,
+            config.windowTimeFilepathSeconds,
+            filepathQuotaLimit,
+            blockTimeSeconds
+          )
+          .all();
 
-    if (updates.length > 0) {
-      await Promise.all(updates);
+        const row = result?.results?.[0] || null;
+        logQuotaUpdate({
+          scope: 'filepath',
+          key: filepath,
+          bytesAdded: byteCount,
+          limit: filepathQuotaLimit,
+          windowSeconds: config.windowTimeFilepathSeconds,
+          row,
+          now,
+        });
+      }
     }
 
     return { success: true };

@@ -15,7 +15,12 @@ const callRpc = async (url, headers, body) => {
     throw new Error(`Bandwidth quota RPC failed (${response.status}): ${errorText}`);
   }
 
-  return response;
+  try {
+    return await response.json();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Bandwidth quota RPC returned invalid JSON: ${message}`);
+  }
 };
 
 const calculateFilepathQuota = (config, filesize) => {
@@ -37,13 +42,68 @@ const calculateFilepathQuota = (config, filesize) => {
   return config.value;
 };
 
+const parseInteger = (value, fallback = 0) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const logQuotaUpdate = ({
+  scope,
+  key,
+  bytesAdded,
+  limit,
+  windowSeconds,
+  row,
+  now,
+}) => {
+  if (!row) {
+    console.log(`[Bandwidth Quota] ${scope} quota write: key=${key} bytesAdded=${bytesAdded} (no row returned)`);
+    return;
+  }
+
+  const bytesUsed = parseInteger(row.BYTES_USED ?? row.bytes_used ?? row.bytesUsed, 0);
+  const windowStart = parseInteger(row.WINDOW_START ?? row.window_start ?? row.windowStart, 0);
+  const blockUntilRaw = row.BLOCK_UNTIL ?? row.block_until ?? row.blockUntil;
+  const blockUntil = Number.isFinite(blockUntilRaw) ? blockUntilRaw : parseInteger(blockUntilRaw, null);
+  const blockActive = Number.isFinite(blockUntil) && blockUntil > now;
+  const limitInfo = limit > 0 ? `${bytesUsed}/${limit}` : `${bytesUsed}`;
+  const shouldBlock = limit > 0 && windowSeconds > 0 && bytesUsed >= limit;
+
+  const segments = [
+    `[Bandwidth Quota] ${scope} quota write`,
+    `key=${key}`,
+    `bytesAdded=${bytesAdded}`,
+    `windowUsed=${limitInfo}`,
+    `windowStart=${windowStart}`,
+    `blockActive=${blockActive}`,
+    `shouldBlock=${shouldBlock}`,
+  ];
+
+  if (blockActive) {
+    segments.push(`blockUntil=${blockUntil}`);
+  } else if (Number.isFinite(blockUntil)) {
+    segments.push(`blockUntil=${blockUntil}`);
+  }
+
+  console.log(segments.join(' | '));
+};
+
 export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, filesize = 0) => {
   if (!config || !config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
     console.warn('[Bandwidth Quota] Missing PostgREST configuration, skipping quota update');
     return { success: false };
   }
 
+  const normalizedBytes = Number.isFinite(bytes) ? Math.trunc(bytes) : bytes;
+  console.log(
+    '[Bandwidth Quota] Upsert request (custom-pg-rest):',
+    `ipRange=${ipRange || 'N/A'}`,
+    `filepath=${filepath || 'N/A'}`,
+    `bytes=${normalizedBytes}`
+  );
+
   if (!ipRange || !Number.isFinite(bytes) || bytes <= 0) {
+    console.log('[Bandwidth Quota] Upsert skipped (custom-pg-rest): invalid ipRange or bytes');
     return { success: true };
   }
 
@@ -58,12 +118,11 @@ export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, fil
     filepath &&
     config.windowTimeFilepathSeconds > 0 &&
     filepathQuotaLimit > 0;
+  const byteCount = Math.max(0, Math.trunc(bytes));
 
   try {
     const headers = { 'Content-Type': 'application/json' };
     applyVerifyHeaders(headers, config.verifyHeader, config.verifySecret);
-
-    const requests = [];
 
     if (totalQuotaActive) {
       const ipHash = await sha256Hash(ipRange);
@@ -74,7 +133,7 @@ export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, fil
         const rpcBody = {
           p_ip_hash: ipHash,
           p_ip_range: ipRange,
-          p_bytes_to_add: Math.max(0, Math.trunc(bytes)),
+          p_bytes_to_add: byteCount,
           p_now: now,
           p_window_seconds: config.windowTimeTotalSeconds,
           p_quota_bytes: config.iprangeLimit,
@@ -82,7 +141,17 @@ export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, fil
           p_table_name: config.iprangeTableName || DEFAULT_IPRANGE_TABLE,
         };
 
-        requests.push(callRpc(rpcUrl, headers, rpcBody));
+        const result = await callRpc(rpcUrl, headers, rpcBody);
+        const row = Array.isArray(result) ? result[0] : null;
+        logQuotaUpdate({
+          scope: 'iprange',
+          key: ipRange,
+          bytesAdded: byteCount,
+          limit: config.iprangeLimit,
+          windowSeconds: config.windowTimeTotalSeconds,
+          row,
+          now,
+        });
       }
     }
 
@@ -96,7 +165,7 @@ export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, fil
           p_composite_hash: compositeHash,
           p_ip_range: ipRange,
           p_filepath: filepath,
-          p_bytes_to_add: Math.max(0, Math.trunc(bytes)),
+          p_bytes_to_add: byteCount,
           p_now: now,
           p_window_seconds: config.windowTimeFilepathSeconds,
           p_quota_bytes: filepathQuotaLimit,
@@ -104,15 +173,25 @@ export const upsertBandwidthQuota = async (config, ipRange, filepath, bytes, fil
           p_table_name: config.filepathTableName || DEFAULT_FILEPATH_TABLE,
         };
 
-        requests.push(callRpc(rpcUrl, headers, rpcBody));
+        const result = await callRpc(rpcUrl, headers, rpcBody);
+        const row = Array.isArray(result) ? result[0] : null;
+        logQuotaUpdate({
+          scope: 'filepath',
+          key: filepath,
+          bytesAdded: byteCount,
+          limit: filepathQuotaLimit,
+          windowSeconds: config.windowTimeFilepathSeconds,
+          row,
+          now,
+        });
       }
     }
 
-    if (requests.length === 0) {
+    if (!totalQuotaActive && !filepathQuotaActive) {
+      console.log('[Bandwidth Quota] Upsert skipped (custom-pg-rest): no active quota scopes');
       return { success: true };
     }
 
-    await Promise.all(requests);
     return { success: true };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
