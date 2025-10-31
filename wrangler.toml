@@ -186,6 +186,61 @@ compatibility_date = "2024-01-01"
 # # PG_ERROR_HANDLE = "fail-closed"      # Use "fail-open" to bypass DB errors gracefully
 
 # # ═══════════════════════════════════════════════════════════════
+# # Bandwidth Quota (Enhanced)
+# # ═══════════════════════════════════════════════════════════════
+# #
+# # Purpose: Limit download bandwidth per IP range and per file
+# # Tracks real download bytes (not just request counts)
+# #
+# # Requirements: Requires DB_MODE to be set (d1, d1-rest, or custom-pg-rest)
+# #
+# # Configuration:
+# QUOTA_LIMIT_TOTAL_ENABLED = "false"                # Enable total bandwidth quota (default: false)
+# QUOTA_LIMIT_FILEPATH_ENABLED = "false"             # Enable per-file bandwidth quota (default: false)
+#
+# # Total Bandwidth Limit (per IP range)
+# IPSUBNET_BANDWIDTH_LIMIT = "10GB"                  # Supports KB/MB/GB/TB units (default: "10GB")
+#                                                     # Examples: "500MB", "1.5TB", "100GB"
+#
+# # Per-File Bandwidth Limit (per IP range + filepath)
+# IPSUBNET_FILEPATH_BANDWIDTH_LIMIT = "2.2x"         # Dynamic quota: filesize * multiplier (default: "2.2x")
+#                                                     # Examples: "2x", "1.5x", "3x"
+#                                                     # Or static: "1GB", "500MB"
+#                                                     # Dynamic requires filesize in additionalInfo
+#
+# # Time Windows
+# BANDWIDTH_WINDOW_TIME_TOTAL = "4h"                 # Total quota window (default: "4h")
+#                                                     # Supports: d (days), h (hours), m (minutes), s (seconds)
+# BANDWIDTH_WINDOW_TIME_FILEPATH = "4h"              # Per-file quota window (default: "4h")
+#
+# # Block Duration
+# BANDWIDTH_BLOCK_TIME = "10m"                       # Block duration after exceeding quota (default: "10m")
+#
+# # Table Names (optional)
+# BANDWIDTH_IPRANGE_TABLE = "IPRANGE_BANDWIDTH_QUOTA_TABLE"           # IP range quota table
+# BANDWIDTH_FILEPATH_TABLE = "IPRANGE_FILEPATH_BANDWIDTH_QUOTA_TABLE" # Filepath quota table
+#
+# # Example Use Cases:
+# #
+# # 1. Prevent bandwidth abuse (10GB per IP per day):
+# #    QUOTA_LIMIT_TOTAL_ENABLED = "true"
+# #    IPSUBNET_BANDWIDTH_LIMIT = "10GB"
+# #    BANDWIDTH_WINDOW_TIME_TOTAL = "1d"
+# #
+# # 2. Per-file limits (allow 2x filesize download):
+# #    QUOTA_LIMIT_FILEPATH_ENABLED = "true"
+# #    IPSUBNET_FILEPATH_BANDWIDTH_LIMIT = "2x"
+# #    BANDWIDTH_WINDOW_TIME_FILEPATH = "4h"
+# #
+# # 3. Combined limits:
+# #    QUOTA_LIMIT_TOTAL_ENABLED = "true"
+# #    QUOTA_LIMIT_FILEPATH_ENABLED = "true"
+# #    IPSUBNET_BANDWIDTH_LIMIT = "50GB"
+# #    IPSUBNET_FILEPATH_BANDWIDTH_LIMIT = "2.5x"
+# #    BANDWIDTH_WINDOW_TIME_TOTAL = "1d"
+# #    BANDWIDTH_WINDOW_TIME_FILEPATH = "6h"
+
+# # ═══════════════════════════════════════════════════════════════
 # # ⚠️ NEW: Cloudflare Rate Limiter (Binding-based, Stateless/Stateful)
 # # ═══════════════════════════════════════════════════════════════
 # #

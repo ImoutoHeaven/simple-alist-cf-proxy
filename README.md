@@ -200,6 +200,95 @@ WHITELIST_PREFIX=/public
 WHITELIST_ACTION=skip-ip
 ```
 
+## IP Subnet Rate Limiting
+
+### Purpose
+
+- Protect upstream services from request floods originating from the same subnet.
+- Complement signature checks by throttling abusive clients before heavy work happens.
+
+### Configuration
+
+- `IPSUBNET_WINDOWTIME_LIMIT` – Maximum requests allowed per subnet inside the window.
+- `WINDOW_TIME` – Sliding window length (e.g., `24h`, `1h`).
+- Requires `DB_MODE` to be set to `d1`, `d1-rest`, or `custom-pg-rest`.
+
+### How It Works
+
+- Each successful request increments counters per subnet using the unified database check.
+- When the limit is exceeded, subsequent requests return HTTP 429 until the window expires.
+- Runs in the same single round trip as cache/throttle/bandwidth checks, minimizing latency.
+
+## Bandwidth Quota
+
+Bandwidth quotas stop high-volume downloads that slip past request-based rate limits. The worker measures **actual bytes streamed** via ReadableStream accounting, updates usage after the transfer completes, and enforces limits on the next request within the same unified database round trip.
+
+### Feature Highlights
+
+- Real byte accounting; ignores misleading `Content-Length` headers.
+- Independent toggles for total (`QUOTA_LIMIT_TOTAL_ENABLED`) and per-file (`QUOTA_LIMIT_FILEPATH_ENABLED`) quotas.
+- Human-readable limits (`500MB`, `1.5TB`) and dynamic per-file budgets (`2x`, `3.5x` of the advertised file size).
+- Separate sliding windows for total vs per-file quotas, plus configurable block duration.
+- Fail-open defaults: both toggles are `false`, so existing deployments are unaffected until explicitly enabled.
+
+### Configuration Flags
+
+- `QUOTA_LIMIT_TOTAL_ENABLED` – Enable per-IP-range quota (default `false`).
+- `QUOTA_LIMIT_FILEPATH_ENABLED` – Enable per-file quota (default `false`).
+- `IPSUBNET_BANDWIDTH_LIMIT` – Total budget per IP range. Supports `KB`, `MB`, `GB`, `TB` (case-insensitive). Example: `50GB`.
+- `IPSUBNET_FILEPATH_BANDWIDTH_LIMIT` – Per-file budget. Accepts human-readable bytes *or* multipliers like `2x` (`filesize * 2`). Dynamic mode requires `additionalInfo.filesize`.
+- `BANDWIDTH_WINDOW_TIME_TOTAL` / `BANDWIDTH_WINDOW_TIME_FILEPATH` – Sliding windows for the respective quotas. Supports `d`, `h`, `m`, `s` (e.g., `1d`, `6h`, `45m`).
+- `BANDWIDTH_BLOCK_TIME` – Cooldown applied after exceeding a quota (default `10m`).
+- `BANDWIDTH_IPRANGE_TABLE` / `BANDWIDTH_FILEPATH_TABLE` – Override quota table names if your schema differs.
+
+> Size helpers: `1GB = 1024MB`, `1TB = 1024GB`. Multipliers run against the file size extracted from `additionalInfo`.
+
+### Requirements
+
+- `DB_MODE` must be `d1`, `d1-rest`, or `custom-pg-rest`.
+- D1 REST mode also needs `D1_ACCOUNT_ID`, `D1_DATABASE_ID`, `D1_API_TOKEN`.
+- Custom PG REST mode needs `POSTGREST_URL` plus matching `VERIFY_HEADER` / `VERIFY_SECRET`.
+- The upstream (landing worker) should pass `additionalInfo.filesize` when using dynamic per-file quotas; missing sizes cause dynamic quotas to skip enforcement (fail-open).
+
+### Example Configurations
+
+**Daily 10 GB per IP range + 2x per-file budget (D1):**
+```env
+DB_MODE=d1
+QUOTA_LIMIT_TOTAL_ENABLED=true
+QUOTA_LIMIT_FILEPATH_ENABLED=true
+IPSUBNET_BANDWIDTH_LIMIT=10GB
+IPSUBNET_FILEPATH_BANDWIDTH_LIMIT=2x
+BANDWIDTH_WINDOW_TIME_TOTAL=1d
+BANDWIDTH_WINDOW_TIME_FILEPATH=6h
+BANDWIDTH_BLOCK_TIME=15m
+```
+
+**Six-hour 5 GB subnet cap (D1-REST) without per-file tracking:**
+```env
+DB_MODE=d1-rest
+D1_ACCOUNT_ID=your-account-id
+D1_DATABASE_ID=your-database-id
+D1_API_TOKEN=your-d1-token
+QUOTA_LIMIT_TOTAL_ENABLED=true
+QUOTA_LIMIT_FILEPATH_ENABLED=false
+IPSUBNET_BANDWIDTH_LIMIT=5GB
+BANDWIDTH_WINDOW_TIME_TOTAL=6h
+BANDWIDTH_BLOCK_TIME=30m
+```
+
+**Hot file protection only with static 200 MB limit (Custom PG REST):**
+```env
+DB_MODE=custom-pg-rest
+POSTGREST_URL=https://pg.example.com
+VERIFY_HEADER=X-AUTH
+VERIFY_SECRET=shared-hmac-secret
+QUOTA_LIMIT_TOTAL_ENABLED=false
+QUOTA_LIMIT_FILEPATH_ENABLED=true
+IPSUBNET_FILEPATH_BANDWIDTH_LIMIT=200MB
+BANDWIDTH_WINDOW_TIME_FILEPATH=1h
+```
+
 ## Integration with alist-landing-worker
 
 ### Landing Worker Configuration

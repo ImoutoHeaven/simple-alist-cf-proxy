@@ -86,7 +86,20 @@ const executeBatchQueries = async (accountId, databaseId, apiToken, statements) 
  * @param {string} tableNames.throttleTableName
  * @returns {Promise<void>}
  */
-const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName, rateLimitTableName, throttleTableName }) => {
+const ensureAllTables = async (
+  accountId,
+  databaseId,
+  apiToken,
+  {
+    cacheTableName,
+    rateLimitTableName,
+    throttleTableName,
+    bandwidthIprangeTableName,
+    bandwidthFilepathTableName,
+    ensureBandwidthIprange,
+    ensureBandwidthFilepath,
+  }
+) => {
   await executeQuery(accountId, databaseId, apiToken, `
     CREATE TABLE IF NOT EXISTS ${cacheTableName} (
       PATH_HASH TEXT PRIMARY KEY,
@@ -120,6 +133,35 @@ const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName
     )
   `);
   await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${throttleTableName}(ERROR_TIMESTAMP)`);
+
+  if (ensureBandwidthIprange && bandwidthIprangeTableName) {
+    await executeQuery(accountId, databaseId, apiToken, `
+      CREATE TABLE IF NOT EXISTS ${bandwidthIprangeTableName} (
+        IP_HASH TEXT PRIMARY KEY,
+        IP_RANGE TEXT NOT NULL,
+        BYTES_USED INTEGER NOT NULL DEFAULT 0,
+        WINDOW_START INTEGER NOT NULL,
+        BLOCK_UNTIL INTEGER
+      )
+    `);
+    await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_${bandwidthIprangeTableName.toLowerCase()}_window ON ${bandwidthIprangeTableName}(WINDOW_START)`);
+    await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_${bandwidthIprangeTableName.toLowerCase()}_block ON ${bandwidthIprangeTableName}(BLOCK_UNTIL) WHERE BLOCK_UNTIL IS NOT NULL`);
+  }
+
+  if (ensureBandwidthFilepath && bandwidthFilepathTableName) {
+    await executeQuery(accountId, databaseId, apiToken, `
+      CREATE TABLE IF NOT EXISTS ${bandwidthFilepathTableName} (
+        COMPOSITE_HASH TEXT PRIMARY KEY,
+        IP_RANGE TEXT NOT NULL,
+        FILEPATH TEXT NOT NULL,
+        BYTES_USED INTEGER NOT NULL DEFAULT 0,
+        WINDOW_START INTEGER NOT NULL,
+        BLOCK_UNTIL INTEGER
+      )
+    `);
+    await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_${bandwidthFilepathTableName.toLowerCase()}_window ON ${bandwidthFilepathTableName}(WINDOW_START)`);
+    await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_${bandwidthFilepathTableName.toLowerCase()}_block ON ${bandwidthFilepathTableName}(BLOCK_UNTIL) WHERE BLOCK_UNTIL IS NOT NULL`);
+  }
 };
 
 /**
@@ -147,8 +189,25 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
   const throttleTimeWindow = config.throttleTimeWindow ?? 60;
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
+  const bandwidthIprangeQuota = config.bandwidthIprangeQuota ?? 0;
+  const bandwidthFilepathQuota = config.bandwidthFilepathQuota ?? 0;
+  const bandwidthWindowTotalSeconds = config.bandwidthWindowTotalSeconds ?? 0;
+  const bandwidthWindowFilepathSeconds = config.bandwidthWindowFilepathSeconds ?? 0;
+  const bandwidthBlockSeconds = config.bandwidthBlockSeconds ?? 0;
+  const bandwidthIprangeTableName = config.bandwidthIprangeTableName || 'IPRANGE_BANDWIDTH_QUOTA_TABLE';
+  const bandwidthFilepathTableName = config.bandwidthFilepathTableName || 'IPRANGE_FILEPATH_BANDWIDTH_QUOTA_TABLE';
+  const shouldCheckBandwidthIprange = bandwidthIprangeQuota > 0 && bandwidthWindowTotalSeconds > 0;
+  const shouldCheckBandwidthFilepath = bandwidthFilepathQuota > 0 && bandwidthWindowFilepathSeconds > 0;
 
-  await ensureAllTables(accountId, databaseId, apiToken, { cacheTableName, rateLimitTableName, throttleTableName });
+  await ensureAllTables(accountId, databaseId, apiToken, {
+    cacheTableName,
+    rateLimitTableName,
+    throttleTableName,
+    bandwidthIprangeTableName,
+    bandwidthFilepathTableName,
+    ensureBandwidthIprange: shouldCheckBandwidthIprange,
+    ensureBandwidthFilepath: shouldCheckBandwidthFilepath,
+  });
 
   console.log('[Unified Check D1-REST] Starting unified check for path:', path);
 
@@ -166,6 +225,11 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
   const ipHash = await sha256Hash(ipSubnet);
   if (!ipHash) {
     throw new Error('[Unified Check D1-REST] Failed to calculate IP hash');
+  }
+
+  let compositeHash = null;
+  if (shouldCheckBandwidthFilepath) {
+    compositeHash = await sha256Hash(`${ipSubnet}${path}`);
   }
 
   const cacheSql = `SELECT LINK_DATA, TIMESTAMP, HOSTNAME_HASH FROM ${cacheTableName} WHERE PATH_HASH = ?`;
@@ -212,16 +276,34 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
       AND throttle.HOSTNAME_HASH IS NOT NULL
   `;
 
-  const statements = [
-    { sql: cacheSql, params: [pathHash] },
-    { sql: rateLimitSql, params: rateLimitParams },
-    { sql: throttleSql, params: [pathHash] },
-  ];
+  const statements = [];
+  const statementIndexes = {};
 
-  console.log('[Unified Check D1-REST] Executing batch (3 queries in 1 RTT: cache + ratelimit + throttle)');
+  statementIndexes.cache = statements.length;
+  statements.push({ sql: cacheSql, params: [pathHash] });
+
+  statementIndexes.rateLimit = statements.length;
+  statements.push({ sql: rateLimitSql, params: rateLimitParams });
+
+  statementIndexes.throttle = statements.length;
+  statements.push({ sql: throttleSql, params: [pathHash] });
+
+  if (shouldCheckBandwidthIprange) {
+    const iprangeSql = `SELECT BYTES_USED, WINDOW_START, BLOCK_UNTIL FROM ${bandwidthIprangeTableName} WHERE IP_HASH = ?`;
+    statementIndexes.bandwidthIprange = statements.length;
+    statements.push({ sql: iprangeSql, params: [ipHash] });
+  }
+
+  if (shouldCheckBandwidthFilepath && compositeHash) {
+    const filepathSql = `SELECT BYTES_USED, WINDOW_START, BLOCK_UNTIL FROM ${bandwidthFilepathTableName} WHERE COMPOSITE_HASH = ?`;
+    statementIndexes.bandwidthFilepath = statements.length;
+    statements.push({ sql: filepathSql, params: [compositeHash] });
+  }
+
+  console.log('[Unified Check D1-REST] Executing batch (cache + ratelimit + throttle + optional bandwidth checks)');
   const batchResults = await executeBatchQueries(accountId, databaseId, apiToken, statements);
 
-  const [cacheResult, rateLimitResult, throttleResult] = batchResults.map((statementResult, index) => {
+  const validatedResults = batchResults.map((statementResult, index) => {
     if (!statementResult) {
       throw new Error(`[Unified Check D1-REST] Batch result missing for statement #${index + 1}`);
     }
@@ -230,6 +312,10 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
     }
     return statementResult;
   });
+
+  const cacheResult = validatedResults[statementIndexes.cache];
+  const rateLimitResult = validatedResults[statementIndexes.rateLimit];
+  const throttleResult = validatedResults[statementIndexes.throttle];
 
   // Parse cache
   let cacheData = {
@@ -338,11 +424,77 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
     console.log('[Unified Check D1-REST] Skipping throttle check (no hostname_hash from cache)');
   }
 
+  const bandwidthData = {
+    iprangeAllowed: true,
+    iprangeBytesUsed: 0,
+    iprangeBlockUntil: null,
+    iprangeRetryAfter: 0,
+    filepathAllowed: true,
+    filepathBytesUsed: 0,
+    filepathBlockUntil: null,
+    filepathRetryAfter: 0,
+  };
+
+  if (shouldCheckBandwidthIprange && typeof statementIndexes.bandwidthIprange !== 'undefined') {
+    const iprangeResult = validatedResults[statementIndexes.bandwidthIprange];
+    const iprangeRow = iprangeResult?.results?.[0];
+    if (iprangeRow) {
+      const bytesUsed = parseInt(iprangeRow.BYTES_USED, 10);
+      const windowStart = parseInt(iprangeRow.WINDOW_START, 10);
+      const blockValue = iprangeRow.BLOCK_UNTIL ? parseInt(iprangeRow.BLOCK_UNTIL, 10) : null;
+
+      bandwidthData.iprangeBytesUsed = Number.isNaN(bytesUsed) ? 0 : bytesUsed;
+
+      if (blockValue && blockValue > now) {
+        bandwidthData.iprangeAllowed = false;
+        bandwidthData.iprangeBlockUntil = blockValue;
+        bandwidthData.iprangeRetryAfter = blockValue - now;
+      } else if (!Number.isNaN(windowStart)
+        && (now - windowStart) < bandwidthWindowTotalSeconds
+        && bandwidthData.iprangeBytesUsed >= bandwidthIprangeQuota) {
+        bandwidthData.iprangeAllowed = false;
+        const retryUntil = windowStart + bandwidthWindowTotalSeconds;
+        bandwidthData.iprangeBlockUntil = retryUntil;
+        if (retryUntil > now) {
+          bandwidthData.iprangeRetryAfter = retryUntil - now;
+        }
+      }
+    }
+  }
+
+  if (shouldCheckBandwidthFilepath && compositeHash && typeof statementIndexes.bandwidthFilepath !== 'undefined') {
+    const filepathResult = validatedResults[statementIndexes.bandwidthFilepath];
+    const filepathRow = filepathResult?.results?.[0];
+    if (filepathRow) {
+      const bytesUsed = parseInt(filepathRow.BYTES_USED, 10);
+      const windowStart = parseInt(filepathRow.WINDOW_START, 10);
+      const blockValue = filepathRow.BLOCK_UNTIL ? parseInt(filepathRow.BLOCK_UNTIL, 10) : null;
+
+      bandwidthData.filepathBytesUsed = Number.isNaN(bytesUsed) ? 0 : bytesUsed;
+
+      if (blockValue && blockValue > now) {
+        bandwidthData.filepathAllowed = false;
+        bandwidthData.filepathBlockUntil = blockValue;
+        bandwidthData.filepathRetryAfter = blockValue - now;
+      } else if (!Number.isNaN(windowStart)
+        && (now - windowStart) < bandwidthWindowFilepathSeconds
+        && bandwidthData.filepathBytesUsed >= bandwidthFilepathQuota) {
+        bandwidthData.filepathAllowed = false;
+        const retryUntil = windowStart + bandwidthWindowFilepathSeconds;
+        bandwidthData.filepathBlockUntil = retryUntil;
+        if (retryUntil > now) {
+          bandwidthData.filepathRetryAfter = retryUntil - now;
+        }
+      }
+    }
+  }
+
   console.log('[Unified Check D1-REST] Completed');
 
   return {
     cache: cacheData,
     rateLimit: rateLimitData,
     throttle: throttleData,
+    bandwidth: bandwidthData,
   };
 };

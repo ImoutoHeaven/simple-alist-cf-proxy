@@ -46,11 +46,12 @@ export const parseNumber = (value, defaultValue) => {
 export const parseWindowTime = (value) => {
   if (!value || typeof value !== 'string') return 0;
   const trimmed = value.trim();
-  const match = trimmed.match(/^(\d+)(h|m|s)$/);
+  const match = trimmed.match(/^(\d+)(d|h|m|s)$/);
   if (!match) return 0;
   const num = Number.parseInt(match[1], 10);
   if (Number.isNaN(num) || num <= 0) return 0;
   const unit = match[2];
+  if (unit === 'd') return num * 86400;
   if (unit === 'h') return num * 3600;
   if (unit === 'm') return num * 60;
   if (unit === 's') return num;
@@ -254,4 +255,78 @@ export const matchHostnamePattern = (hostname, pattern) => {
   }
 
   return false;
+};
+
+/**
+ * Parse bandwidth size with human-readable units (KB/MB/GB/TB)
+ * @param {string} value - e.g., "10GB", "1.5TB", "500MB"
+ * @returns {number} - bytes, or 0 if invalid
+ *
+ * Examples:
+ *   parseBandwidthSize("10GB") => 10737418240
+ *   parseBandwidthSize("1.5TB") => 1649267441664
+ *   parseBandwidthSize("500MB") => 524288000
+ */
+export const parseBandwidthSize = (value) => {
+  if (!value || typeof value !== 'string') {
+    return 0;
+  }
+
+  const trimmed = value.trim().toUpperCase();
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*(KB|MB|GB|TB|K|M|G|T)?$/);
+
+  if (!match) {
+    return 0;
+  }
+
+  const num = parseFloat(match[1]);
+  if (Number.isNaN(num) || num <= 0) {
+    return 0;
+  }
+
+  const unit = match[2] || '';
+  const multipliers = {
+    KB: 1024,
+    K: 1024,
+    MB: 1024 * 1024,
+    M: 1024 * 1024,
+    GB: 1024 * 1024 * 1024,
+    G: 1024 * 1024 * 1024,
+    TB: 1024 * 1024 * 1024 * 1024,
+    T: 1024 * 1024 * 1024 * 1024,
+  };
+
+  const multiplier = multipliers[unit] || 1;
+  return Math.floor(num * multiplier);
+};
+
+/**
+ * Parse dynamic quota configuration (supports "2x" format for filesize multiplier)
+ * @param {string} value - e.g., "2x", "2.5x", "10GB"
+ * @returns {{ type: 'static'|'dynamic', value: number }}
+ *
+ * Examples:
+ *   parseDynamicQuota("2x") => { type: 'dynamic', value: 2 }
+ *   parseDynamicQuota("2.5x") => { type: 'dynamic', value: 2.5 }
+ *   parseDynamicQuota("10GB") => { type: 'static', value: 10737418240 }
+ *   parseDynamicQuota("") => { type: 'dynamic', value: 2.2 } (default)
+ */
+export const parseDynamicQuota = (value) => {
+  if (!value || typeof value !== 'string') {
+    return { type: 'dynamic', value: 2.2 };
+  }
+
+  const trimmed = value.trim();
+  const dynamicMatch = trimmed.match(/^(\d+(?:\.\d+)?)\s*x$/i);
+
+  if (dynamicMatch) {
+    const multiplier = parseFloat(dynamicMatch[1]);
+    return {
+      type: 'dynamic',
+      value: Number.isNaN(multiplier) || multiplier <= 0 ? 2.2 : multiplier,
+    };
+  }
+
+  const bytes = parseBandwidthSize(trimmed);
+  return { type: 'static', value: bytes };
 };

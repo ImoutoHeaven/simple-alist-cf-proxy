@@ -2,11 +2,24 @@
 import { createCacheManager } from './cache/factory.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
+import { createBandwidthQuotaManager } from './bandwidth-quota/factory.js';
 import { unifiedCheck } from './unified-check.js';
 import { unifiedCheckD1 } from './unified-check-d1.js';
 import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
-import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
+import {
+  parseBoolean,
+  parseInteger,
+  parseNumber,
+  parseWindowTime,
+  extractHostname,
+  matchHostnamePattern,
+  applyVerifyHeaders,
+  calculateIPSubnet,
+  sha256Hash,
+  parseBandwidthSize,
+  parseDynamicQuota,
+} from './utils.js';
 
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
@@ -102,6 +115,150 @@ const ensureRequiredEnv = (env) => {
   });
 };
 
+/**
+ * Calculate filepath quota limit based on configuration and filesize.
+ * @param {{type: 'static'|'dynamic', value: number}} config
+ * @param {number} filesize
+ * @returns {number}
+ */
+function calculateFilepathQuota(config, filesize) {
+  if (!config || config.value <= 0) {
+    return 0;
+  }
+
+  if (config.type === 'dynamic') {
+    if (!filesize || filesize <= 0) {
+      console.warn('[Bandwidth Quota] Dynamic quota requires filesize, returning 0');
+      return 0;
+    }
+    const quota = Math.floor(filesize * config.value);
+    console.log(`[Bandwidth Quota] Dynamic filepath quota: ${filesize} bytes * ${config.value} = ${quota} bytes (${(quota / (1024 * 1024 * 1024)).toFixed(2)}GB)`);
+    return quota;
+  }
+
+  console.log(`[Bandwidth Quota] Static filepath quota: ${config.value} bytes (${(config.value / (1024 * 1024 * 1024)).toFixed(2)}GB)`);
+  return config.value;
+}
+
+/**
+ * Wrap a ReadableStream and track downstream byte usage.
+ * Ensures finalize callback executes exactly once with transfer stats.
+ */
+function wrapReadableWithAccounting(input, finalize) {
+  if (!input || typeof input.getReader !== 'function') {
+    const finalizePromise = Promise.resolve();
+    return {
+      stream: input,
+      finalizeOnce: async () => {
+        try {
+          await finalize({ status: 'complete', bytes: 0 });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[Bandwidth Accounting] Finalize failed:', message);
+        }
+      },
+      finalizePromise,
+    };
+  }
+
+  let bytes = 0;
+  let finalized = false;
+  let reader = null;
+  let finalizeResolver;
+  const finalizePromise = new Promise((resolve) => {
+    finalizeResolver = resolve;
+  });
+
+  const finalizeOnce = async (status) => {
+    if (finalized) {
+      return;
+    }
+    finalized = true;
+    try {
+      await finalize({ status, bytes });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[Bandwidth Accounting] Finalize failed:', message);
+    }
+    finalizeResolver?.();
+  };
+
+  const stream = new ReadableStream({
+    start() {
+      reader = input.getReader();
+    },
+    async pull(controller) {
+      if (!reader) {
+        controller.close();
+        await finalizeOnce('complete');
+        return;
+      }
+
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          await finalizeOnce('complete');
+          return;
+        }
+
+        if (value) {
+          bytes += value.byteLength ?? 0;
+          controller.enqueue(value);
+        } else {
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        try {
+          controller.error(error);
+        } catch {
+          // controller may already be closed
+        }
+        await finalizeOnce('errored');
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader?.cancel(reason);
+      } catch {
+        // ignore cancel errors
+      }
+      await finalizeOnce('canceled');
+    }
+  });
+
+  return { stream, finalizeOnce, finalizePromise };
+}
+
+function createBandwidthQuotaExceededResponse(origin, bandwidthResult) {
+  const safeHeaders = new Headers();
+  safeHeaders.set('content-type', 'application/json;charset=UTF-8');
+  safeHeaders.set('Access-Control-Allow-Origin', origin);
+  safeHeaders.append('Vary', 'Origin');
+
+  let message = 'Bandwidth quota exceeded';
+  let retryAfter = 0;
+
+  if (bandwidthResult && bandwidthResult.iprangeAllowed === false) {
+    const bytesUsedGB = ((bandwidthResult.iprangeBytesUsed || 0) / (1024 * 1024 * 1024)).toFixed(2);
+    message = `IP range bandwidth quota exceeded (used: ${bytesUsedGB}GB)`;
+    retryAfter = bandwidthResult.iprangeRetryAfter || 0;
+  } else if (bandwidthResult && bandwidthResult.filepathAllowed === false) {
+    const bytesUsedGB = ((bandwidthResult.filepathBytesUsed || 0) / (1024 * 1024 * 1024)).toFixed(2);
+    message = `File bandwidth quota exceeded (used: ${bytesUsedGB}GB)`;
+    retryAfter = bandwidthResult.filepathRetryAfter || 0;
+  }
+
+  if (retryAfter > 0) {
+    safeHeaders.set('Retry-After', String(Math.max(1, Math.ceil(retryAfter))));
+  }
+
+  return new Response(
+    JSON.stringify({ code: 429, message, 'retry-after': retryAfter }),
+    { status: 429, headers: safeHeaders }
+  );
+}
+
 // Resolve configuration from environment variables
 const resolveConfig = (env = {}) => {
   ensureRequiredEnv(env);
@@ -191,6 +348,40 @@ const resolveConfig = (env = {}) => {
   const d1DatabaseId = normalizeString(env.D1_DATABASE_ID);
   const d1ApiToken = normalizeString(env.D1_API_TOKEN);
   const postgrestUrl = normalizeString(env.POSTGREST_URL);
+
+  const quotaLimitTotalEnabled = parseBoolean(env.QUOTA_LIMIT_TOTAL_ENABLED, false);
+  const quotaLimitFilepathEnabled = parseBoolean(env.QUOTA_LIMIT_FILEPATH_ENABLED, false);
+
+  const bandwidthIprangeLimitRaw = normalizeString(env.IPSUBNET_BANDWIDTH_LIMIT, '10GB');
+  const bandwidthIprangeLimit = parseBandwidthSize(bandwidthIprangeLimitRaw);
+
+  const bandwidthFilepathLimitRaw = normalizeString(env.IPSUBNET_FILEPATH_BANDWIDTH_LIMIT, '2.2x');
+  const bandwidthFilepathLimitParsed = parseDynamicQuota(bandwidthFilepathLimitRaw);
+
+  const bandwidthWindowTimeTotal = normalizeString(env.BANDWIDTH_WINDOW_TIME_TOTAL, '4h');
+  const bandwidthWindowTimeTotalSeconds = parseWindowTime(bandwidthWindowTimeTotal);
+
+  const bandwidthWindowTimeFilepath = normalizeString(env.BANDWIDTH_WINDOW_TIME_FILEPATH, '4h');
+  const bandwidthWindowTimeFilepathSeconds = parseWindowTime(bandwidthWindowTimeFilepath);
+
+  const bandwidthBlockTime = normalizeString(env.BANDWIDTH_BLOCK_TIME, '10m');
+  const bandwidthBlockTimeSeconds = parseWindowTime(bandwidthBlockTime);
+
+  const bandwidthIprangeTableName = normalizeString(env.BANDWIDTH_IPRANGE_TABLE, 'IPRANGE_BANDWIDTH_QUOTA_TABLE');
+  const bandwidthFilepathTableName = normalizeString(env.BANDWIDTH_FILEPATH_TABLE, 'IPRANGE_FILEPATH_BANDWIDTH_QUOTA_TABLE');
+  const bandwidthParamsProvided = [
+    env.QUOTA_LIMIT_TOTAL_ENABLED,
+    env.QUOTA_LIMIT_FILEPATH_ENABLED,
+    env.IPSUBNET_BANDWIDTH_LIMIT,
+    env.IPSUBNET_FILEPATH_BANDWIDTH_LIMIT,
+    env.BANDWIDTH_WINDOW_TIME_TOTAL,
+    env.BANDWIDTH_WINDOW_TIME_FILEPATH,
+    env.BANDWIDTH_BLOCK_TIME,
+    env.BANDWIDTH_IPRANGE_TABLE,
+    env.BANDWIDTH_FILEPATH_TABLE,
+  ].some((value) => value !== undefined);
+  let bandwidthQuotaEnabled = false;
+  let bandwidthQuotaConfig = null;
 
   let cacheEnabled = false;
   let cacheConfig = {};
@@ -342,6 +533,82 @@ const resolveConfig = (env = {}) => {
     throw new Error('Rate limiting configuration is incomplete. Ensure WINDOW_TIME and IPSUBNET_WINDOWTIME_LIMIT are valid positive values.');
   }
 
+  if (dbMode && (quotaLimitTotalEnabled || quotaLimitFilepathEnabled)) {
+    if (normalizedDbMode === 'd1') {
+      bandwidthQuotaEnabled = true;
+      bandwidthQuotaConfig = {
+        env,
+        databaseBinding: d1DatabaseBinding,
+        totalEnabled: quotaLimitTotalEnabled,
+        filepathEnabled: quotaLimitFilepathEnabled,
+        iprangeLimit: bandwidthIprangeLimit,
+        filepathLimitConfig: bandwidthFilepathLimitParsed,
+        windowTimeTotalSeconds: bandwidthWindowTimeTotalSeconds,
+        windowTimeFilepathSeconds: bandwidthWindowTimeFilepathSeconds,
+        blockTimeSeconds: bandwidthBlockTimeSeconds,
+        iprangeTableName: bandwidthIprangeTableName,
+        filepathTableName: bandwidthFilepathTableName,
+        ipv4Suffix,
+        ipv6Suffix,
+        pgErrorHandle,
+        cleanupProbability,
+      };
+    } else if (normalizedDbMode === 'd1-rest') {
+      if (!d1AccountId || !d1DatabaseId || !d1ApiToken) {
+        throw new Error('Bandwidth quota requires D1 account configuration when DB_MODE is "d1-rest"');
+      }
+      bandwidthQuotaEnabled = true;
+      bandwidthQuotaConfig = {
+        accountId: d1AccountId,
+        databaseId: d1DatabaseId,
+        apiToken: d1ApiToken,
+        totalEnabled: quotaLimitTotalEnabled,
+        filepathEnabled: quotaLimitFilepathEnabled,
+        iprangeLimit: bandwidthIprangeLimit,
+        filepathLimitConfig: bandwidthFilepathLimitParsed,
+        windowTimeTotalSeconds: bandwidthWindowTimeTotalSeconds,
+        windowTimeFilepathSeconds: bandwidthWindowTimeFilepathSeconds,
+        blockTimeSeconds: bandwidthBlockTimeSeconds,
+        iprangeTableName: bandwidthIprangeTableName,
+        filepathTableName: bandwidthFilepathTableName,
+        ipv4Suffix,
+        ipv6Suffix,
+        pgErrorHandle,
+        cleanupProbability,
+      };
+    } else if (normalizedDbMode === 'custom-pg-rest') {
+      if (!postgrestUrl || verifyHeaders.length === 0 || verifySecrets.length === 0) {
+        throw new Error('Bandwidth quota requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
+      }
+      bandwidthQuotaEnabled = true;
+      bandwidthQuotaConfig = {
+        postgrestUrl,
+        verifyHeader: verifyHeaders,
+        verifySecret: verifySecrets,
+        totalEnabled: quotaLimitTotalEnabled,
+        filepathEnabled: quotaLimitFilepathEnabled,
+        iprangeLimit: bandwidthIprangeLimit,
+        filepathLimitConfig: bandwidthFilepathLimitParsed,
+        windowTimeTotalSeconds: bandwidthWindowTimeTotalSeconds,
+        windowTimeFilepathSeconds: bandwidthWindowTimeFilepathSeconds,
+        blockTimeSeconds: bandwidthBlockTimeSeconds,
+        iprangeTableName: bandwidthIprangeTableName,
+        filepathTableName: bandwidthFilepathTableName,
+        ipv4Suffix,
+        ipv6Suffix,
+        pgErrorHandle,
+        cleanupProbability,
+      };
+    }
+  } else if (
+    dbMode &&
+    bandwidthParamsProvided &&
+    !quotaLimitTotalEnabled &&
+    !quotaLimitFilepathEnabled
+  ) {
+    console.warn('[Bandwidth Quota] Configuration provided but both QUOTA_LIMIT_TOTAL_ENABLED and QUOTA_LIMIT_FILEPATH_ENABLED are false');
+  }
+
   if (enableCfRatelimiter) {
     const ratelimiter = env[cfRatelimiterBinding];
     if (!ratelimiter || typeof ratelimiter.limit !== 'function') {
@@ -378,6 +645,8 @@ const resolveConfig = (env = {}) => {
     throttleConfig,
     rateLimitEnabled,
     rateLimitConfig,
+    bandwidthQuotaEnabled,
+    bandwidthQuotaConfig,
     windowTime,
     ipSubnetLimit,
     enableCfRatelimiter,
@@ -616,6 +885,19 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const clientIP = request.headers.get("CF-Connecting-IP") || "";
 
+  const bandwidthConfig = config.bandwidthQuotaConfig || null;
+  let bandwidthManager = null;
+  if (config.bandwidthQuotaEnabled) {
+    try {
+      bandwidthManager = createBandwidthQuotaManager(config.dbMode);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[Bandwidth Quota] Manager initialization failed:', message);
+    }
+  }
+
+  let filesize = 0;
+
   // CF Rate Limiter检查（第一道防线）
   if (config.enableCfRatelimiter) {
     try {
@@ -744,6 +1026,20 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return createUnauthorizedResponse(origin, "additionalInfo path mismatch");
     }
 
+    filesize = 0;
+    if (typeof additionalPayload.filesize === 'number') {
+      filesize = Math.max(0, Math.trunc(additionalPayload.filesize));
+    } else if (typeof additionalPayload.filesize === 'string') {
+      const parsed = Number.parseInt(additionalPayload.filesize, 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        filesize = parsed;
+      }
+    }
+
+    if (filesize > 0) {
+      console.log(`[Additional Info] Extracted filesize: ${filesize} bytes (${(filesize / (1024 * 1024 * 1024)).toFixed(2)}GB)`);
+    }
+
     if (config.additionExpireTimeCheck) {
       let expireTimestamp = 0;
       if (typeof additionalPayload.expireTime === "number") {
@@ -777,6 +1073,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     config.dbMode === 'd1-rest'
   );
 
+  const bandwidthWindowTotalSeconds = bandwidthConfig?.windowTimeTotalSeconds ?? 0;
+  const bandwidthWindowFilepathSeconds = bandwidthConfig?.windowTimeFilepathSeconds ?? 0;
+  const bandwidthBlockSeconds = bandwidthConfig?.blockTimeSeconds ?? 0;
+  const bandwidthIprangeTableName = bandwidthConfig?.iprangeTableName || 'IPRANGE_BANDWIDTH_QUOTA_TABLE';
+  const bandwidthFilepathTableName = bandwidthConfig?.filepathTableName || 'IPRANGE_FILEPATH_BANDWIDTH_QUOTA_TABLE';
+  const bandwidthIprangeQuotaLimit = config.bandwidthQuotaEnabled && bandwidthConfig?.totalEnabled
+    ? bandwidthConfig.iprangeLimit
+    : 0;
+  const bandwidthFilepathQuotaLimit = config.bandwidthQuotaEnabled && bandwidthConfig?.filepathEnabled
+    ? calculateFilepathQuota(bandwidthConfig.filepathLimitConfig, filesize)
+    : 0;
+
   if (supportsUnifiedCheck) {
     try {
 
@@ -800,6 +1108,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+          bandwidthIprangeQuota: bandwidthIprangeQuotaLimit,
+          bandwidthFilepathQuota: bandwidthFilepathQuotaLimit,
+          bandwidthWindowTotalSeconds,
+          bandwidthWindowFilepathSeconds,
+          bandwidthBlockSeconds,
+          bandwidthIprangeTableName,
+          bandwidthFilepathTableName,
         });
       } else if (config.dbMode === 'd1') {
         unifiedResult = await unifiedCheckD1(path, clientIP, {
@@ -815,6 +1130,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+          bandwidthIprangeQuota: bandwidthIprangeQuotaLimit,
+          bandwidthFilepathQuota: bandwidthFilepathQuotaLimit,
+          bandwidthWindowTotalSeconds,
+          bandwidthWindowFilepathSeconds,
+          bandwidthBlockSeconds,
+          bandwidthIprangeTableName,
+          bandwidthFilepathTableName,
         });
       } else if (config.dbMode === 'd1-rest') {
         unifiedResult = await unifiedCheckD1Rest(path, clientIP, {
@@ -831,6 +1153,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+          bandwidthIprangeQuota: bandwidthIprangeQuotaLimit,
+          bandwidthFilepathQuota: bandwidthFilepathQuotaLimit,
+          bandwidthWindowTotalSeconds,
+          bandwidthWindowFilepathSeconds,
+          bandwidthBlockSeconds,
+          bandwidthIprangeTableName,
+          bandwidthFilepathTableName,
         });
       } else {
         throw new Error(`Unsupported database mode for unified check: ${config.dbMode}`);
@@ -861,6 +1190,23 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       }
       
       // Check cache result
+      if (
+        config.bandwidthQuotaEnabled &&
+        unifiedResult.bandwidth &&
+        (unifiedResult.bandwidth.iprangeAllowed === false || unifiedResult.bandwidth.filepathAllowed === false)
+      ) {
+        console.warn(
+          '[Bandwidth Quota] Exceeded:',
+          unifiedResult.bandwidth.iprangeAllowed === false
+            ? `IP range bytes=${unifiedResult.bandwidth.iprangeBytesUsed}`
+            : '',
+          unifiedResult.bandwidth.filepathAllowed === false
+            ? `filepath bytes=${unifiedResult.bandwidth.filepathBytesUsed}`
+            : ''
+        );
+        return createBandwidthQuotaExceededResponse(origin, unifiedResult.bandwidth);
+      }
+      
       if (unifiedResult.cache.hit) {
         cacheHit = true;
         linkData = unifiedResult.cache.linkData;
@@ -1254,6 +1600,62 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
+  let responseBody = response.body;
+  let bandwidthFinalizePromise = null;
+
+  const shouldAccountBandwidth =
+    config.bandwidthQuotaEnabled &&
+    bandwidthManager &&
+    bandwidthConfig &&
+    responseBody &&
+    request.method === 'GET' &&
+    (response.status === 200 || response.status === 206);
+
+  if (shouldAccountBandwidth) {
+    try {
+      const subnet = calculateIPSubnet(
+        clientIP,
+        bandwidthConfig.ipv4Suffix || config.ipv4Suffix || '/32',
+        bandwidthConfig.ipv6Suffix || config.ipv6Suffix || '/60'
+      );
+
+      if (subnet) {
+        const { stream, finalizePromise } = wrapReadableWithAccounting(response.body, async ({ bytes }) => {
+          if (!Number.isFinite(bytes) || bytes <= 0) {
+            return;
+          }
+
+          if (!bandwidthManager || typeof bandwidthManager.upsertBandwidthQuota !== 'function') {
+            console.warn('[Bandwidth Quota] No quota manager available for accounting');
+            return;
+          }
+
+          try {
+            await bandwidthManager.upsertBandwidthQuota(bandwidthConfig, subnet, path, bytes, filesize);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error('[Bandwidth Quota] Failed to record usage:', message);
+          }
+        });
+
+        responseBody = stream;
+        bandwidthFinalizePromise = finalizePromise.catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[Bandwidth Accounting] Finalize error:', message);
+        });
+      } else {
+        console.warn('[Bandwidth Quota] Unable to determine subnet, skipping accounting');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[Bandwidth Quota] Accounting setup failed:', message);
+    }
+  }
+
+  if (bandwidthFinalizePromise && ctx && ctx.waitUntil) {
+    ctx.waitUntil(bandwidthFinalizePromise);
+  }
+
   // 创建仅包含安全必要headers的响应
   const safeHeaders = new Headers();
 
@@ -1287,7 +1689,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   safeHeaders.append("Vary", "Origin");
 
   // 创建带有安全headers的新响应
-  const safeResponse = new Response(response.body, {
+  const safeResponse = new Response(responseBody, {
     status: response.status,
     statusText: response.statusText,
     headers: safeHeaders

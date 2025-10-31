@@ -23,6 +23,15 @@ export const unifiedCheck = async (path, clientIP, config) => {
   const throttleTableName = config.throttleTableName || 'THROTTLE_PROTECTION';
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
+  const bandwidthIprangeQuota = config.bandwidthIprangeQuota ?? 0;
+  const bandwidthFilepathQuota = config.bandwidthFilepathQuota ?? 0;
+  const bandwidthWindowTotalSeconds = config.bandwidthWindowTotalSeconds ?? 0;
+  const bandwidthWindowFilepathSeconds = config.bandwidthWindowFilepathSeconds ?? 0;
+  const bandwidthBlockSeconds = config.bandwidthBlockSeconds ?? 0;
+  const bandwidthIprangeTable = config.bandwidthIprangeTableName || 'IPRANGE_BANDWIDTH_QUOTA_TABLE';
+  const bandwidthFilepathTable = config.bandwidthFilepathTableName || 'IPRANGE_FILEPATH_BANDWIDTH_QUOTA_TABLE';
+  const shouldProcessIprange = bandwidthIprangeQuota > 0 && bandwidthWindowTotalSeconds > 0;
+  const shouldProcessFilepath = bandwidthFilepathQuota > 0 && bandwidthWindowFilepathSeconds > 0;
   
   console.log('[Unified Check] Starting unified check for path:', path);
   
@@ -41,6 +50,11 @@ export const unifiedCheck = async (path, clientIP, config) => {
   if (!ipHash) {
     throw new Error('[Unified Check] Failed to calculate IP hash');
   }
+
+  let compositeHash = null;
+  if (shouldProcessFilepath) {
+    compositeHash = await sha256Hash(`${ipSubnet}${path}`);
+  }
   
   // Call unified RPC
   const rpcUrl = `${config.postgrestUrl}/rpc/download_unified_check`;
@@ -57,6 +71,14 @@ export const unifiedCheck = async (path, clientIP, config) => {
     p_ratelimit_table_name: rateLimitTableName,
     p_throttle_time_window: throttleWindow,
     p_throttle_table_name: throttleTableName,
+    p_bandwidth_iprange_quota: bandwidthIprangeQuota,
+    p_bandwidth_filepath_quota: bandwidthFilepathQuota,
+    p_bandwidth_window_total_seconds: bandwidthWindowTotalSeconds,
+    p_bandwidth_window_filepath_seconds: bandwidthWindowFilepathSeconds,
+    p_bandwidth_block_seconds: bandwidthBlockSeconds,
+    p_bandwidth_iprange_table: bandwidthIprangeTable,
+    p_bandwidth_filepath_table: bandwidthFilepathTable,
+    p_bandwidth_composite_hash: compositeHash,
   };
   
   console.log('[Unified Check] Calling RPC with params:', JSON.stringify(rpcBody, null, 2));
@@ -178,11 +200,64 @@ export const unifiedCheck = async (path, clientIP, config) => {
     console.log('[Unified Check] Throttle normal_operation (no record)');
   }
   
+  // Parse bandwidth quota result
+  const bandwidthResult = {
+    iprangeAllowed: true,
+    iprangeBytesUsed: 0,
+    iprangeBlockUntil: null,
+    iprangeRetryAfter: 0,
+    filepathAllowed: true,
+    filepathBytesUsed: 0,
+    filepathBlockUntil: null,
+    filepathRetryAfter: 0,
+  };
+
+  if (shouldProcessIprange || shouldProcessFilepath) {
+    if (shouldProcessIprange) {
+      if (typeof row.bandwidth_iprange_allowed !== 'undefined') {
+        bandwidthResult.iprangeAllowed = row.bandwidth_iprange_allowed !== false;
+      }
+      if (typeof row.bandwidth_iprange_bytes_used !== 'undefined' && row.bandwidth_iprange_bytes_used !== null) {
+        const parsed = parseInt(row.bandwidth_iprange_bytes_used, 10);
+        bandwidthResult.iprangeBytesUsed = Number.isNaN(parsed) ? 0 : parsed;
+      }
+      if (row.bandwidth_iprange_block_until !== null && row.bandwidth_iprange_block_until !== undefined) {
+        const blockValue = parseInt(row.bandwidth_iprange_block_until, 10);
+        if (!Number.isNaN(blockValue)) {
+          bandwidthResult.iprangeBlockUntil = blockValue;
+          if (blockValue > now) {
+            bandwidthResult.iprangeRetryAfter = blockValue - now;
+          }
+        }
+      }
+    }
+
+    if (shouldProcessFilepath) {
+      if (typeof row.bandwidth_filepath_allowed !== 'undefined') {
+        bandwidthResult.filepathAllowed = row.bandwidth_filepath_allowed !== false;
+      }
+      if (typeof row.bandwidth_filepath_bytes_used !== 'undefined' && row.bandwidth_filepath_bytes_used !== null) {
+        const parsed = parseInt(row.bandwidth_filepath_bytes_used, 10);
+        bandwidthResult.filepathBytesUsed = Number.isNaN(parsed) ? 0 : parsed;
+      }
+      if (row.bandwidth_filepath_block_until !== null && row.bandwidth_filepath_block_until !== undefined) {
+        const blockValue = parseInt(row.bandwidth_filepath_block_until, 10);
+        if (!Number.isNaN(blockValue)) {
+          bandwidthResult.filepathBlockUntil = blockValue;
+          if (blockValue > now) {
+            bandwidthResult.filepathRetryAfter = blockValue - now;
+          }
+        }
+      }
+    }
+  }
+
   console.log('[Unified Check] Completed successfully');
   
   return {
     cache: cacheResult,
     rateLimit: rateLimitResult,
     throttle: throttleResult,
+    bandwidth: bandwidthResult,
   };
 };

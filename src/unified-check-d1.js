@@ -9,7 +9,15 @@ import { sha256Hash, calculateIPSubnet } from './utils.js';
  * @param {string} tableNames.throttleTableName
  * @returns {Promise<void>}
  */
-const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttleTableName }) => {
+const ensureAllTables = async (db, {
+  cacheTableName,
+  rateLimitTableName,
+  throttleTableName,
+  bandwidthIprangeTableName,
+  bandwidthFilepathTableName,
+  ensureBandwidthIprange,
+  ensureBandwidthFilepath,
+}) => {
   const statements = [
     db.prepare(`
       CREATE TABLE IF NOT EXISTS ${cacheTableName} (
@@ -44,6 +52,39 @@ const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttl
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${throttleTableName}(ERROR_TIMESTAMP)`),
   ];
 
+  if (ensureBandwidthIprange && bandwidthIprangeTableName) {
+    statements.push(
+      db.prepare(`
+        CREATE TABLE IF NOT EXISTS ${bandwidthIprangeTableName} (
+          IP_HASH TEXT PRIMARY KEY,
+          IP_RANGE TEXT NOT NULL,
+          BYTES_USED INTEGER NOT NULL DEFAULT 0,
+          WINDOW_START INTEGER NOT NULL,
+          BLOCK_UNTIL INTEGER
+        )
+      `),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_${bandwidthIprangeTableName.toLowerCase()}_window ON ${bandwidthIprangeTableName}(WINDOW_START)`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_${bandwidthIprangeTableName.toLowerCase()}_block ON ${bandwidthIprangeTableName}(BLOCK_UNTIL) WHERE BLOCK_UNTIL IS NOT NULL`),
+    );
+  }
+
+  if (ensureBandwidthFilepath && bandwidthFilepathTableName) {
+    statements.push(
+      db.prepare(`
+        CREATE TABLE IF NOT EXISTS ${bandwidthFilepathTableName} (
+          COMPOSITE_HASH TEXT PRIMARY KEY,
+          IP_RANGE TEXT NOT NULL,
+          FILEPATH TEXT NOT NULL,
+          BYTES_USED INTEGER NOT NULL DEFAULT 0,
+          WINDOW_START INTEGER NOT NULL,
+          BLOCK_UNTIL INTEGER
+        )
+      `),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_${bandwidthFilepathTableName.toLowerCase()}_window ON ${bandwidthFilepathTableName}(WINDOW_START)`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_${bandwidthFilepathTableName.toLowerCase()}_block ON ${bandwidthFilepathTableName}(BLOCK_UNTIL) WHERE BLOCK_UNTIL IS NOT NULL`),
+    );
+  }
+
   await db.batch(statements);
 };
 
@@ -76,8 +117,25 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   const throttleTimeWindow = config.throttleTimeWindow ?? 60;
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
+  const bandwidthIprangeQuota = config.bandwidthIprangeQuota ?? 0;
+  const bandwidthFilepathQuota = config.bandwidthFilepathQuota ?? 0;
+  const bandwidthWindowTotalSeconds = config.bandwidthWindowTotalSeconds ?? 0;
+  const bandwidthWindowFilepathSeconds = config.bandwidthWindowFilepathSeconds ?? 0;
+  const bandwidthBlockSeconds = config.bandwidthBlockSeconds ?? 0;
+  const bandwidthIprangeTableName = config.bandwidthIprangeTableName || 'IPRANGE_BANDWIDTH_QUOTA_TABLE';
+  const bandwidthFilepathTableName = config.bandwidthFilepathTableName || 'IPRANGE_FILEPATH_BANDWIDTH_QUOTA_TABLE';
+  const shouldCheckBandwidthIprange = bandwidthIprangeQuota > 0 && bandwidthWindowTotalSeconds > 0;
+  const shouldCheckBandwidthFilepath = bandwidthFilepathQuota > 0 && bandwidthWindowFilepathSeconds > 0;
 
-  await ensureAllTables(db, { cacheTableName, rateLimitTableName, throttleTableName });
+  await ensureAllTables(db, {
+    cacheTableName,
+    rateLimitTableName,
+    throttleTableName,
+    bandwidthIprangeTableName,
+    bandwidthFilepathTableName,
+    ensureBandwidthIprange: shouldCheckBandwidthIprange,
+    ensureBandwidthFilepath: shouldCheckBandwidthFilepath,
+  });
 
   console.log('[Unified Check D1] Starting unified check for path:', path);
 
@@ -97,11 +155,18 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
     throw new Error('[Unified Check D1] Failed to calculate IP hash');
   }
 
+  let compositeHash = null;
+  if (shouldCheckBandwidthFilepath) {
+    compositeHash = await sha256Hash(`${ipSubnet}${path}`);
+  }
+
   // Prepare batch queries
   const statements = [];
+  const statementIndexes = {};
 
   // 1. Cache SELECT
   const cacheSql = `SELECT LINK_DATA, TIMESTAMP, HOSTNAME_HASH FROM ${cacheTableName} WHERE PATH_HASH = ?`;
+  statementIndexes.cache = statements.length;
   statements.push(db.prepare(cacheSql).bind(pathHash));
 
   // 2. Rate Limit UPSERT (same complex logic as d1.js)
@@ -129,6 +194,7 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
     RETURNING ACCESS_COUNT, LAST_WINDOW_TIME, BLOCK_UNTIL
   `;
 
+  statementIndexes.rateLimit = statements.length;
   statements.push(
     db.prepare(rateLimitSql).bind(
       ipHash, ipSubnet, now,
@@ -138,8 +204,20 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
     )
   );
 
+  if (shouldCheckBandwidthIprange) {
+    const iprangeSql = `SELECT BYTES_USED, WINDOW_START, BLOCK_UNTIL FROM ${bandwidthIprangeTableName} WHERE IP_HASH = ?`;
+    statementIndexes.bandwidthIprange = statements.length;
+    statements.push(db.prepare(iprangeSql).bind(ipHash));
+  }
+
+  if (shouldCheckBandwidthFilepath && compositeHash) {
+    const filepathSql = `SELECT BYTES_USED, WINDOW_START, BLOCK_UNTIL FROM ${bandwidthFilepathTableName} WHERE COMPOSITE_HASH = ?`;
+    statementIndexes.bandwidthFilepath = statements.length;
+    statements.push(db.prepare(filepathSql).bind(compositeHash));
+  }
+
   // Execute batch (single RTT!)
-  console.log('[Unified Check D1] Executing batch (2 queries in 1 RTT: cache + rate limit)');
+  console.log('[Unified Check D1] Executing batch (cache + rate limit + optional bandwidth checks)');
   const results = await db.batch(statements);
 
   if (!results || results.length < 2) {
@@ -154,7 +232,7 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
     hostnameHash: null,
   };
 
-  const cacheRow = results[0].results?.[0];
+  const cacheRow = results[statementIndexes.cache]?.results?.[0];
   if (cacheRow) {
     const age = now - parseInt(cacheRow.TIMESTAMP, 10);
     if (age <= cacheTTL) {
@@ -175,7 +253,7 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   }
 
   // Parse rate limit result
-  const rateLimitRow = results[1].results?.[0];
+  const rateLimitRow = results[statementIndexes.rateLimit]?.results?.[0];
   if (!rateLimitRow) {
     throw new Error('[Unified Check D1] Rate limit UPSERT returned no rows');
   }
@@ -258,11 +336,75 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
     console.log('[Unified Check D1] Skipping throttle check (no hostname_hash from cache)');
   }
 
+  const bandwidthResult = {
+    iprangeAllowed: true,
+    iprangeBytesUsed: 0,
+    iprangeBlockUntil: null,
+    iprangeRetryAfter: 0,
+    filepathAllowed: true,
+    filepathBytesUsed: 0,
+    filepathBlockUntil: null,
+    filepathRetryAfter: 0,
+  };
+
+  if (shouldCheckBandwidthIprange && typeof statementIndexes.bandwidthIprange !== 'undefined') {
+    const iprangeRow = results[statementIndexes.bandwidthIprange]?.results?.[0];
+    if (iprangeRow) {
+      const bytesUsed = parseInt(iprangeRow.BYTES_USED, 10);
+      const windowStart = parseInt(iprangeRow.WINDOW_START, 10);
+      const blockValue = iprangeRow.BLOCK_UNTIL ? parseInt(iprangeRow.BLOCK_UNTIL, 10) : null;
+
+      bandwidthResult.iprangeBytesUsed = Number.isNaN(bytesUsed) ? 0 : bytesUsed;
+
+      if (blockValue && blockValue > now) {
+        bandwidthResult.iprangeAllowed = false;
+        bandwidthResult.iprangeBlockUntil = blockValue;
+        bandwidthResult.iprangeRetryAfter = blockValue - now;
+      } else if (!Number.isNaN(windowStart)
+        && (now - windowStart) < bandwidthWindowTotalSeconds
+        && bandwidthResult.iprangeBytesUsed >= bandwidthIprangeQuota) {
+        bandwidthResult.iprangeAllowed = false;
+        const retryUntil = windowStart + bandwidthWindowTotalSeconds;
+        bandwidthResult.iprangeBlockUntil = retryUntil;
+        if (retryUntil > now) {
+          bandwidthResult.iprangeRetryAfter = retryUntil - now;
+        }
+      }
+    }
+  }
+
+  if (shouldCheckBandwidthFilepath && compositeHash && typeof statementIndexes.bandwidthFilepath !== 'undefined') {
+    const filepathRow = results[statementIndexes.bandwidthFilepath]?.results?.[0];
+    if (filepathRow) {
+      const bytesUsed = parseInt(filepathRow.BYTES_USED, 10);
+      const windowStart = parseInt(filepathRow.WINDOW_START, 10);
+      const blockValue = filepathRow.BLOCK_UNTIL ? parseInt(filepathRow.BLOCK_UNTIL, 10) : null;
+
+      bandwidthResult.filepathBytesUsed = Number.isNaN(bytesUsed) ? 0 : bytesUsed;
+
+      if (blockValue && blockValue > now) {
+        bandwidthResult.filepathAllowed = false;
+        bandwidthResult.filepathBlockUntil = blockValue;
+        bandwidthResult.filepathRetryAfter = blockValue - now;
+      } else if (!Number.isNaN(windowStart)
+        && (now - windowStart) < bandwidthWindowFilepathSeconds
+        && bandwidthResult.filepathBytesUsed >= bandwidthFilepathQuota) {
+        bandwidthResult.filepathAllowed = false;
+        const retryUntil = windowStart + bandwidthWindowFilepathSeconds;
+        bandwidthResult.filepathBlockUntil = retryUntil;
+        if (retryUntil > now) {
+          bandwidthResult.filepathRetryAfter = retryUntil - now;
+        }
+      }
+    }
+  }
+
   console.log('[Unified Check D1] Completed successfully');
 
   return {
     cache: cacheResult,
     rateLimit: rateLimitResult,
     throttle: throttleResult,
+    bandwidth: bandwidthResult,
   };
 };

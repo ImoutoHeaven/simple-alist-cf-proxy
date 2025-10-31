@@ -227,6 +227,55 @@ const buildD1RestCleanupTasks = (config) => {
     });
   }
 
+  if (config.bandwidthQuotaEnabled && config.bandwidthQuotaConfig) {
+    const bwConfig = config.bandwidthQuotaConfig;
+    if (bwConfig.totalEnabled && bwConfig.windowTimeTotalSeconds > 0) {
+      tasks.push({
+        name: 'BandwidthQuotaIPRange',
+        fn: async () => {
+          const now = Math.floor(Date.now() / 1000);
+          const cutoffTime = now - (bwConfig.windowTimeTotalSeconds * 2);
+          const table = bwConfig.iprangeTableName || 'IPRANGE_BANDWIDTH_QUOTA_TABLE';
+          const sql = `
+            DELETE FROM ${table}
+            WHERE WINDOW_START < ?
+              AND (BLOCK_UNTIL IS NULL OR BLOCK_UNTIL < ?)
+          `;
+          return executeD1RestStatement(
+            bwConfig.accountId,
+            bwConfig.databaseId,
+            bwConfig.apiToken,
+            sql,
+            [cutoffTime, now]
+          );
+        },
+      });
+    }
+
+    if (bwConfig.filepathEnabled && bwConfig.windowTimeFilepathSeconds > 0) {
+      tasks.push({
+        name: 'BandwidthQuotaFilepath',
+        fn: async () => {
+          const now = Math.floor(Date.now() / 1000);
+          const cutoffTime = now - (bwConfig.windowTimeFilepathSeconds * 2);
+          const table = bwConfig.filepathTableName || 'IPRANGE_FILEPATH_BANDWIDTH_QUOTA_TABLE';
+          const sql = `
+            DELETE FROM ${table}
+            WHERE WINDOW_START < ?
+              AND (BLOCK_UNTIL IS NULL OR BLOCK_UNTIL < ?)
+          `;
+          return executeD1RestStatement(
+            bwConfig.accountId,
+            bwConfig.databaseId,
+            bwConfig.apiToken,
+            sql,
+            [cutoffTime, now]
+          );
+        },
+      });
+    }
+  }
+
   return tasks;
 };
 
@@ -299,6 +348,46 @@ const buildD1CleanupTasks = (config, env) => {
     });
   }
 
+  if (config.bandwidthQuotaEnabled && config.bandwidthQuotaConfig) {
+    const bwConfig = config.bandwidthQuotaConfig;
+
+    if (bwConfig.totalEnabled && bwConfig.windowTimeTotalSeconds > 0) {
+      tasks.push({
+        name: 'BandwidthQuotaIPRange',
+        fn: async () => {
+          const db = resolveBinding(bwConfig);
+          const now = Math.floor(Date.now() / 1000);
+          const cutoffTime = now - (bwConfig.windowTimeTotalSeconds * 2);
+          const table = bwConfig.iprangeTableName || 'IPRANGE_BANDWIDTH_QUOTA_TABLE';
+          const sql = `
+            DELETE FROM ${table}
+            WHERE WINDOW_START < ?
+              AND (BLOCK_UNTIL IS NULL OR BLOCK_UNTIL < ?)
+          `;
+          return executeD1BindingStatement(db, sql, [cutoffTime, now]);
+        },
+      });
+    }
+
+    if (bwConfig.filepathEnabled && bwConfig.windowTimeFilepathSeconds > 0) {
+      tasks.push({
+        name: 'BandwidthQuotaFilepath',
+        fn: async () => {
+          const db = resolveBinding(bwConfig);
+          const now = Math.floor(Date.now() / 1000);
+          const cutoffTime = now - (bwConfig.windowTimeFilepathSeconds * 2);
+          const table = bwConfig.filepathTableName || 'IPRANGE_FILEPATH_BANDWIDTH_QUOTA_TABLE';
+          const sql = `
+            DELETE FROM ${table}
+            WHERE WINDOW_START < ?
+              AND (BLOCK_UNTIL IS NULL OR BLOCK_UNTIL < ?)
+          `;
+          return executeD1BindingStatement(db, sql, [cutoffTime, now]);
+        },
+      });
+    }
+  }
+
   return tasks;
 };
 
@@ -366,6 +455,50 @@ const buildCustomPgRestCleanupTasks = (config) => {
         );
       },
     });
+  }
+
+  if (config.bandwidthQuotaEnabled && config.bandwidthQuotaConfig) {
+    const bwConfig = config.bandwidthQuotaConfig;
+
+    if (bwConfig.totalEnabled && bwConfig.windowTimeTotalSeconds > 0) {
+      tasks.push({
+        name: 'BandwidthQuotaIPRange',
+        fn: async () => {
+          const now = Math.floor(Date.now() / 1000);
+          const cutoffTime = now - (bwConfig.windowTimeTotalSeconds * 2);
+          const table = bwConfig.iprangeTableName || 'IPRANGE_BANDWIDTH_QUOTA_TABLE';
+          const filters = `WINDOW_START=lt.${cutoffTime}&and=(BLOCK_UNTIL.is.null,BLOCK_UNTIL.lt.${now})`;
+          return executePostgrestDelete(
+            bwConfig.postgrestUrl,
+            bwConfig.verifyHeader,
+            bwConfig.verifySecret,
+            table,
+            filters,
+            { Prefer: 'return=representation' }
+          );
+        },
+      });
+    }
+
+    if (bwConfig.filepathEnabled && bwConfig.windowTimeFilepathSeconds > 0) {
+      tasks.push({
+        name: 'BandwidthQuotaFilepath',
+        fn: async () => {
+          const now = Math.floor(Date.now() / 1000);
+          const cutoffTime = now - (bwConfig.windowTimeFilepathSeconds * 2);
+          const table = bwConfig.filepathTableName || 'IPRANGE_FILEPATH_BANDWIDTH_QUOTA_TABLE';
+          const filters = `WINDOW_START=lt.${cutoffTime}&and=(BLOCK_UNTIL.is.null,BLOCK_UNTIL.lt.${now})`;
+          return executePostgrestDelete(
+            bwConfig.postgrestUrl,
+            bwConfig.verifyHeader,
+            bwConfig.verifySecret,
+            table,
+            filters,
+            { Prefer: 'return=representation' }
+          );
+        },
+      });
+    }
   }
 
   return tasks;
