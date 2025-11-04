@@ -10,8 +10,8 @@ import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostna
 
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
-const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-ip', 'asis']);
-const VALID_EXCEPT_ACTIONS = new Set(['block-except', 'skip-sign-except', 'skip-hash-except', 'skip-worker-except', 'skip-ip-except', 'asis-except']);
+const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-ip', 'skip-addition', 'skip-addition-expiretime', 'asis']);
+const VALID_EXCEPT_ACTIONS = new Set(['block-except', 'skip-sign-except', 'skip-hash-except', 'skip-worker-except', 'skip-ip-except', 'skip-addition-except', 'skip-addition-expiretime-except', 'asis-except']);
 
 // Utility: Parse comma-separated prefix list
 const parsePrefixList = (value) => {
@@ -757,6 +757,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let shouldCheckHash = config.hashCheck;
   let shouldCheckWorker = config.workerCheck;
   let shouldCheckIP = config.ipCheck;
+  let shouldCheckAddition = config.additionCheck;
+  let shouldCheckAdditionExpireTime = config.additionExpireTimeCheck;
 
   // Apply action overrides (unless 'asis' is specified)
   // Each skip-* only affects its own check, completely decoupled
@@ -772,6 +774,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
     if (actions.includes('skip-ip')) {
       shouldCheckIP = false;
+    }
+    if (actions.includes('skip-addition')) {
+      shouldCheckAddition = false;
+    }
+    if (actions.includes('skip-addition-expiretime')) {
+      shouldCheckAdditionExpireTime = false;
     }
   }
 
@@ -822,7 +830,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const additionalInfo = url.searchParams.get("additionalInfo") ?? "";
   const additionalInfoSign = url.searchParams.get("additionalInfoSign") ?? "";
-  if (config.additionCheck) {
+  if (shouldCheckAddition) {
     if (!additionalInfo) {
       return createUnauthorizedResponse(origin, "additionalInfo missing");
     }
@@ -852,7 +860,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return createUnauthorizedResponse(origin, "additionalInfo path mismatch");
     }
 
-    if (config.additionExpireTimeCheck) {
+    if (shouldCheckAdditionExpireTime) {
       let expireTimestamp = 0;
       if (typeof additionalPayload.expireTime === "number") {
         expireTimestamp = Math.trunc(additionalPayload.expireTime);
