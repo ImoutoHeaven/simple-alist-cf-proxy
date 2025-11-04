@@ -34,6 +34,47 @@ compatibility_date = "2024-01-01"
 # EXCEPT_PREFIX = "/api,/system"
 # EXCEPT_ACTION = "block-except"
 #
+# # ⚠️ NEW: Path INCLUDES Matching (Match keywords anywhere in path)
+# # In addition to PREFIX (startsWith) matching, you can now use INCLUDES (contains) matching
+# # Path is split into: dirPath (folder) + fileName (file name) + fullPath (complete path)
+# # Example: "/folder1/folder2/file.txt"
+# #   - dirPath: "/folder1/folder2"
+# #   - fileName: "file.txt"
+# #   - fullPath: "/folder1/folder2/file.txt"
+# #
+# # INCLUDES matching modes (comma-separated keywords, no spaces):
+# BLACKLIST_DIR_INCLUDES = "private,confidential,secret"     # Match folder path containing keywords
+# BLACKLIST_NAME_INCLUDES = "backup,bak,.tmp"                # Match file name containing keywords
+# BLACKLIST_PATH_INCLUDES = "temp,cache"                     # Match full path containing keywords
+# WHITELIST_DIR_INCLUDES = "public,shared"                   # Match folder path containing keywords
+# WHITELIST_NAME_INCLUDES = "readme,license"                 # Match file name containing keywords
+# WHITELIST_PATH_INCLUDES = "docs,assets"                    # Match full path containing keywords
+# EXCEPT_DIR_INCLUDES = "test,debug"                         # Match folder path containing keywords
+# EXCEPT_NAME_INCLUDES = "log,tmp"                           # Match file name containing keywords
+# EXCEPT_PATH_INCLUDES = "staging,dev"                       # Match full path containing keywords
+# #
+# # Union Logic (OR):
+# # - PREFIX and INCLUDES are evaluated together (any match triggers action)
+# # - Multiple keywords in INCLUDES are OR-ed (any keyword match triggers)
+# # Example: BLACKLIST_PREFIX="/admin" + BLACKLIST_DIR_INCLUDES="private,secret"
+# #   → Matches: /admin/file.txt (prefix) OR /test/private/file.txt (dir includes) OR /test/secret/file.txt (dir includes)
+# #
+# # Matching Examples:
+# # 1. BLACKLIST_DIR_INCLUDES = "private"
+# #    → Blocks: /test/private/file.txt (dirPath "/test/private" contains "private")
+# #
+# # 2. BLACKLIST_NAME_INCLUDES = "backup"
+# #    → Blocks: /test/backup.zip (fileName "backup.zip" contains "backup")
+# #
+# # 3. BLACKLIST_PATH_INCLUDES = "temp"
+# #    → Blocks: /test/temp/file.txt (fullPath contains "temp")
+# #    → Blocks: /test/file_temp.txt (fullPath contains "temp")
+# #
+# # 4. BLACKLIST_PREFIX = "/admin" + BLACKLIST_DIR_INCLUDES = "secret"
+# #    → Blocks: /admin/file.txt (prefix match)
+# #    → Blocks: /test/secret/file.txt (dir includes match)
+# #    → Union logic: either match is sufficient
+#
 # # ═══════════════════════════════════════════════════════════════
 # # Path Filtering System - Priority & Action Reference
 # # ═══════════════════════════════════════════════════════════════
@@ -67,6 +108,28 @@ compatibility_date = "2024-01-01"
 # # │ skip-ip-except  │ Skip IP check for paths NOT in EXCEPT_PREFIX         │
 # # │ asis-except     │ Use original behavior for paths NOT in EXCEPT_PREFIX │
 # # └─────────────────┴──────────────────────────────────────────────────────┘
+# #
+# #
+# # Matching Modes (PREFIX vs INCLUDES):
+# # ┌─────────────────┬──────────────────────────────────────────────────────┐
+# # │ Mode            │ Description                                          │
+# # ├─────────────────┼──────────────────────────────────────────────────────┤
+# # │ PREFIX          │ Matches path start (e.g., "/admin" matches           │
+# # │                 │ "/admin/file.txt" but NOT "/test/admin/file.txt")    │
+# # │ DIR_INCLUDES    │ Matches folder path containing keyword              │
+# # │                 │ (e.g., "private" matches "/test/private/file.txt")   │
+# # │ NAME_INCLUDES   │ Matches file name containing keyword                 │
+# # │                 │ (e.g., "backup" matches "/test/backup.zip")          │
+# # │ PATH_INCLUDES   │ Matches full path containing keyword                 │
+# # │                 │ (e.g., "temp" matches both "/temp/file.txt" and      │
+# # │                 │ "/test/file_temp.txt")                               │
+# # └─────────────────┴──────────────────────────────────────────────────────┘
+# #
+# # Evaluation Logic:
+# # - PREFIX and INCLUDES are evaluated together (union/OR logic)
+# # - Any match (PREFIX OR DIR_INCLUDES OR NAME_INCLUDES OR PATH_INCLUDES) triggers action
+# # - Multiple keywords within INCLUDES are OR-ed (e.g., "key1,key2" matches either)
+# # - Priority order remains: BLACKLIST > WHITELIST > EXCEPT
 # #
 # # Examples:
 # #

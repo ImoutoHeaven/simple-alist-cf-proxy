@@ -116,6 +116,15 @@ const resolveConfig = (env = {}) => {
   const blacklistPrefixes = parsePrefixList(env.BLACKLIST_PREFIX);
   const whitelistPrefixes = parsePrefixList(env.WHITELIST_PREFIX);
   const exceptPrefixes = parsePrefixList(env.EXCEPT_PREFIX);
+  const blacklistDirIncludes = parsePrefixList(env.BLACKLIST_DIR_INCLUDES);
+  const blacklistNameIncludes = parsePrefixList(env.BLACKLIST_NAME_INCLUDES);
+  const blacklistPathIncludes = parsePrefixList(env.BLACKLIST_PATH_INCLUDES);
+  const whitelistDirIncludes = parsePrefixList(env.WHITELIST_DIR_INCLUDES);
+  const whitelistNameIncludes = parsePrefixList(env.WHITELIST_NAME_INCLUDES);
+  const whitelistPathIncludes = parsePrefixList(env.WHITELIST_PATH_INCLUDES);
+  const exceptDirIncludes = parsePrefixList(env.EXCEPT_DIR_INCLUDES);
+  const exceptNameIncludes = parsePrefixList(env.EXCEPT_NAME_INCLUDES);
+  const exceptPathIncludes = parsePrefixList(env.EXCEPT_PATH_INCLUDES);
   const blacklistActions = validateActions(env.BLACKLIST_ACTION, 'BLACKLIST_ACTION');
   const whitelistActions = validateActions(env.WHITELIST_ACTION, 'WHITELIST_ACTION');
   const exceptActions = validateExceptActions(env.EXCEPT_ACTION, 'EXCEPT_ACTION');
@@ -367,6 +376,15 @@ const resolveConfig = (env = {}) => {
     blacklistPrefixes,
     whitelistPrefixes,
     exceptPrefixes,
+    blacklistDirIncludes,
+    blacklistNameIncludes,
+    blacklistPathIncludes,
+    whitelistDirIncludes,
+    whitelistNameIncludes,
+    whitelistPathIncludes,
+    exceptDirIncludes,
+    exceptNameIncludes,
+    exceptPathIncludes,
     blacklistActions,
     whitelistActions,
     exceptActions,
@@ -444,11 +462,41 @@ const checkPathListAction = (path, config) => {
     decodedPath = path;
   }
 
+  const lastSlashIndex = decodedPath.lastIndexOf('/');
+  const dirPath = lastSlashIndex > 0 ? decodedPath.substring(0, lastSlashIndex) : '';
+  const fileName = lastSlashIndex >= 0 ? decodedPath.substring(lastSlashIndex + 1) : decodedPath;
+
   // Check blacklist first (highest priority)
   if (config.blacklistPrefixes.length > 0 && config.blacklistActions.length > 0) {
     for (const prefix of config.blacklistPrefixes) {
       if (decodedPath.startsWith(prefix)) {
         return config.blacklistActions;
+      }
+    }
+  }
+
+  if (config.blacklistActions.length > 0) {
+    if (config.blacklistDirIncludes.length > 0) {
+      for (const keyword of config.blacklistDirIncludes) {
+        if (dirPath.includes(keyword)) {
+          return config.blacklistActions;
+        }
+      }
+    }
+
+    if (config.blacklistNameIncludes.length > 0) {
+      for (const keyword of config.blacklistNameIncludes) {
+        if (fileName.includes(keyword)) {
+          return config.blacklistActions;
+        }
+      }
+    }
+
+    if (config.blacklistPathIncludes.length > 0) {
+      for (const keyword of config.blacklistPathIncludes) {
+        if (decodedPath.includes(keyword)) {
+          return config.blacklistActions;
+        }
       }
     }
   }
@@ -462,19 +510,79 @@ const checkPathListAction = (path, config) => {
     }
   }
 
-  // Check exception list third (third priority) - inverse matching logic
-  if (config.exceptPrefixes.length > 0 && config.exceptActions.length > 0) {
-    // Check if path matches any except prefix
-    let matchesExceptPrefix = false;
-    for (const prefix of config.exceptPrefixes) {
-      if (decodedPath.startsWith(prefix)) {
-        matchesExceptPrefix = true;
-        break;
+  if (config.whitelistActions.length > 0) {
+    if (config.whitelistDirIncludes.length > 0) {
+      for (const keyword of config.whitelistDirIncludes) {
+        if (dirPath.includes(keyword)) {
+          return config.whitelistActions;
+        }
       }
     }
 
-    // If path does NOT match except prefix, apply the actions (remove -except suffix)
-    if (!matchesExceptPrefix) {
+    if (config.whitelistNameIncludes.length > 0) {
+      for (const keyword of config.whitelistNameIncludes) {
+        if (fileName.includes(keyword)) {
+          return config.whitelistActions;
+        }
+      }
+    }
+
+    if (config.whitelistPathIncludes.length > 0) {
+      for (const keyword of config.whitelistPathIncludes) {
+        if (decodedPath.includes(keyword)) {
+          return config.whitelistActions;
+        }
+      }
+    }
+  }
+
+  // Check exception list third (third priority) - inverse matching logic
+  const hasExceptRules =
+    config.exceptPrefixes.length > 0 ||
+    config.exceptDirIncludes.length > 0 ||
+    config.exceptNameIncludes.length > 0 ||
+    config.exceptPathIncludes.length > 0;
+
+  if (config.exceptActions.length > 0 && hasExceptRules) {
+    let matchesExceptRule = false;
+
+    if (config.exceptPrefixes.length > 0) {
+      for (const prefix of config.exceptPrefixes) {
+        if (decodedPath.startsWith(prefix)) {
+          matchesExceptRule = true;
+          break;
+        }
+      }
+    }
+
+    if (!matchesExceptRule && config.exceptDirIncludes.length > 0) {
+      for (const keyword of config.exceptDirIncludes) {
+        if (dirPath.includes(keyword)) {
+          matchesExceptRule = true;
+          break;
+        }
+      }
+    }
+
+    if (!matchesExceptRule && config.exceptNameIncludes.length > 0) {
+      for (const keyword of config.exceptNameIncludes) {
+        if (fileName.includes(keyword)) {
+          matchesExceptRule = true;
+          break;
+        }
+      }
+    }
+
+    if (!matchesExceptRule && config.exceptPathIncludes.length > 0) {
+      for (const keyword of config.exceptPathIncludes) {
+        if (decodedPath.includes(keyword)) {
+          matchesExceptRule = true;
+          break;
+        }
+      }
+    }
+
+    if (!matchesExceptRule) {
       return config.exceptActions.map(action => action.replace('-except', ''));
     }
     // If path matches except prefix, use default behavior (return empty array)
