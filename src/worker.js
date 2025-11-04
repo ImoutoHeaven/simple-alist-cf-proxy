@@ -2,6 +2,7 @@
 import { createCacheManager } from './cache/factory.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
+import { createSessionDBManager } from './session-db/factory.js';
 import { unifiedCheck } from './unified-check.js';
 import { unifiedCheckD1 } from './unified-check-d1.js';
 import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
@@ -360,6 +361,87 @@ const resolveConfig = (env = {}) => {
     }
   }
 
+  const sessionEnabled = parseBoolean(env.SESSION_ENABLED, false);
+  const onlySessionMode = parseBoolean(env.ONLY_SESSION_MODE, false);
+  if (onlySessionMode && !sessionEnabled) {
+    throw new Error('ONLY_SESSION_MODE is true but SESSION_ENABLED is false');
+  }
+  const rawSessionDbMode = normalizeString(env.SESSION_DB_MODE);
+  const sessionDbMode = rawSessionDbMode || dbMode || '';
+  const sessionTableNameRaw = normalizeString(env.SESSION_D1_TABLE_NAME);
+  const sessionDefaultTable = sessionTableNameRaw || 'SESSION_MAPPING_TABLE';
+  const sessionPostgrestTableRaw = normalizeString(env.SESSION_POSTGREST_TABLE_NAME);
+  const sessionPostgrestTableName = sessionPostgrestTableRaw || sessionDefaultTable;
+
+  let sessionDbConfig = null;
+  const normalizedSessionDbMode = sessionDbMode ? sessionDbMode.toLowerCase() : '';
+
+  if (sessionEnabled) {
+    if (!normalizedSessionDbMode) {
+      throw new Error('SESSION_ENABLED is true but SESSION_DB_MODE (or DB_MODE fallback) is missing');
+    }
+
+    if (normalizedSessionDbMode === 'd1') {
+      const explicitBinding = normalizeString(env.SESSION_D1_DATABASE_BINDING);
+      const fallbackBinding =
+        normalizeString(cacheConfig?.databaseBinding) ||
+        normalizeString(rateLimitConfig?.databaseBinding) ||
+        'SESSIONDB';
+      const databaseBinding = explicitBinding || fallbackBinding;
+      sessionDbConfig = {
+        env,
+        databaseBinding,
+        tableName: sessionDefaultTable,
+      };
+    } else if (normalizedSessionDbMode === 'd1-rest') {
+      const accountId =
+        normalizeString(env.SESSION_D1_ACCOUNT_ID) ||
+        normalizeString(rateLimitConfig?.accountId) ||
+        normalizeString(cacheConfig?.accountId);
+      const databaseId =
+        normalizeString(env.SESSION_D1_DATABASE_ID) ||
+        normalizeString(rateLimitConfig?.databaseId) ||
+        normalizeString(cacheConfig?.databaseId);
+      const apiToken =
+        normalizeString(env.SESSION_D1_API_TOKEN) ||
+        normalizeString(rateLimitConfig?.apiToken) ||
+        normalizeString(cacheConfig?.apiToken);
+
+      if (!accountId || !databaseId || !apiToken) {
+        throw new Error(
+          'SESSION_DB_MODE is "d1-rest" but SESSION_D1_ACCOUNT_ID, SESSION_D1_DATABASE_ID, or SESSION_D1_API_TOKEN is missing'
+        );
+      }
+
+      sessionDbConfig = {
+        accountId,
+        databaseId,
+        apiToken,
+        tableName: sessionDefaultTable,
+      };
+    } else if (normalizedSessionDbMode === 'custom-pg-rest') {
+      const postgrestUrl =
+        normalizeString(env.SESSION_POSTGREST_URL) ||
+        normalizeString(rateLimitConfig?.postgrestUrl) ||
+        normalizeString(cacheConfig?.postgrestUrl);
+
+      if (!postgrestUrl) {
+        throw new Error('SESSION_DB_MODE is "custom-pg-rest" but SESSION_POSTGREST_URL is missing');
+      }
+
+      sessionDbConfig = {
+        postgrestUrl,
+        tableName: sessionPostgrestTableName,
+        verifyHeader: verifyHeaders,
+        verifySecret: verifySecrets,
+      };
+    } else {
+      throw new Error(
+        `Invalid SESSION_DB_MODE: "${sessionDbMode}". Valid options are: "d1", "d1-rest", "custom-pg-rest".`
+      );
+    }
+  }
+
   return {
     address: String(env.ADDRESS).trim(),
     token: String(env.TOKEN).trim(),
@@ -402,6 +484,10 @@ const resolveConfig = (env = {}) => {
     cfRatelimiterBinding,
     ipv4Suffix,
     ipv6Suffix,
+    sessionEnabled,
+    onlySessionMode,
+    sessionDbMode: normalizedSessionDbMode,
+    sessionDbConfig,
   };
 };
 
@@ -453,7 +539,25 @@ async function sha256Hex(text) {
 }
 
 // Check if a path matches blacklist or whitelist and return the actions array
-const checkPathListAction = (path, config) => {
+const checkPathListAction = (path, config, options = {}) => {
+  const isSessionMode = options.isSessionMode === true;
+  const allowedSessionActions = new Set([
+    'block',
+    'asis',
+    'skip-worker',
+    'skip-ip',
+    'block-except',
+    'asis-except',
+    'skip-worker-except',
+    'skip-ip-except',
+  ]);
+  const filterActions = (actions) => {
+    if (!isSessionMode || !Array.isArray(actions)) {
+      return actions;
+    }
+    return actions.filter((action) => allowedSessionActions.has(action));
+  };
+
   let decodedPath;
   try {
     decodedPath = decodeURIComponent(path);
@@ -470,7 +574,7 @@ const checkPathListAction = (path, config) => {
   if (config.blacklistPrefixes.length > 0 && config.blacklistActions.length > 0) {
     for (const prefix of config.blacklistPrefixes) {
       if (decodedPath.startsWith(prefix)) {
-        return config.blacklistActions;
+        return filterActions(config.blacklistActions);
       }
     }
   }
@@ -479,7 +583,7 @@ const checkPathListAction = (path, config) => {
     if (config.blacklistDirIncludes.length > 0) {
       for (const keyword of config.blacklistDirIncludes) {
         if (dirPath.includes(keyword)) {
-          return config.blacklistActions;
+          return filterActions(config.blacklistActions);
         }
       }
     }
@@ -487,7 +591,7 @@ const checkPathListAction = (path, config) => {
     if (config.blacklistNameIncludes.length > 0) {
       for (const keyword of config.blacklistNameIncludes) {
         if (fileName.includes(keyword)) {
-          return config.blacklistActions;
+          return filterActions(config.blacklistActions);
         }
       }
     }
@@ -495,7 +599,7 @@ const checkPathListAction = (path, config) => {
     if (config.blacklistPathIncludes.length > 0) {
       for (const keyword of config.blacklistPathIncludes) {
         if (decodedPath.includes(keyword)) {
-          return config.blacklistActions;
+          return filterActions(config.blacklistActions);
         }
       }
     }
@@ -505,7 +609,7 @@ const checkPathListAction = (path, config) => {
   if (config.whitelistPrefixes.length > 0 && config.whitelistActions.length > 0) {
     for (const prefix of config.whitelistPrefixes) {
       if (decodedPath.startsWith(prefix)) {
-        return config.whitelistActions;
+        return filterActions(config.whitelistActions);
       }
     }
   }
@@ -514,7 +618,7 @@ const checkPathListAction = (path, config) => {
     if (config.whitelistDirIncludes.length > 0) {
       for (const keyword of config.whitelistDirIncludes) {
         if (dirPath.includes(keyword)) {
-          return config.whitelistActions;
+          return filterActions(config.whitelistActions);
         }
       }
     }
@@ -522,7 +626,7 @@ const checkPathListAction = (path, config) => {
     if (config.whitelistNameIncludes.length > 0) {
       for (const keyword of config.whitelistNameIncludes) {
         if (fileName.includes(keyword)) {
-          return config.whitelistActions;
+          return filterActions(config.whitelistActions);
         }
       }
     }
@@ -530,7 +634,7 @@ const checkPathListAction = (path, config) => {
     if (config.whitelistPathIncludes.length > 0) {
       for (const keyword of config.whitelistPathIncludes) {
         if (decodedPath.includes(keyword)) {
-          return config.whitelistActions;
+          return filterActions(config.whitelistActions);
         }
       }
     }
@@ -583,7 +687,8 @@ const checkPathListAction = (path, config) => {
     }
 
     if (!matchesExceptRule) {
-      return config.exceptActions.map(action => action.replace('-except', ''));
+      const filteredExceptActions = filterActions(config.exceptActions);
+      return filteredExceptActions.map(action => action.replace('-except', ''));
     }
     // If path matches except prefix, use default behavior (return empty array)
   }
@@ -706,16 +811,27 @@ function safeDecodePathname(pathname) {
   }
 }
 // src/handleDownload.ts
-async function handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
+async function handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx, options = {}) {
   const origin = request.headers.get("origin") ?? "*";
   const url = new URL(request.url);
-  const path = safeDecodePathname(url.pathname);
-  if (path === null) {
+  const isSessionMode = options?.isSessionMode === true;
+  const sessionInfo = options?.sessionInfo || null;
+  const requestedPath = safeDecodePathname(url.pathname);
+  let path = requestedPath;
+
+  if (isSessionMode) {
+    path = typeof sessionInfo?.filePath === "string" ? sessionInfo.filePath : null;
+    if (path && typeof path === "string" && !path.startsWith("/")) {
+      path = `/${path}`;
+    }
+  }
+
+  if (path === null || typeof path !== "string") {
     return createErrorResponse(origin, 400, "invalid path encoding");
   }
 
   // Check blacklist/whitelist
-  const actions = checkPathListAction(path, config);
+  const actions = checkPathListAction(path, config, { isSessionMode });
 
   // Handle block action
   if (actions.includes('block')) {
@@ -760,6 +876,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let shouldCheckAddition = config.additionCheck;
   let shouldCheckAdditionExpireTime = config.additionExpireTimeCheck;
 
+  if (isSessionMode) {
+    shouldCheckSign = false;
+    shouldCheckHash = false;
+    shouldCheckAddition = false;
+    shouldCheckAdditionExpireTime = false;
+  }
+
   // Apply action overrides (unless 'asis' is specified)
   // Each skip-* only affects its own check, completely decoupled
   if (!actions.includes('asis')) {
@@ -783,98 +906,123 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  // Sign verification
-  const sign = url.searchParams.get("sign") ?? "";
-  if (shouldCheckSign) {
-    const verifyResult = await verify("sign", path, sign, config.token);
-    if (verifyResult !== "") {
-      return createUnauthorizedResponse(origin, verifyResult);
-    }
-  }
+  if (isSessionMode) {
+    const sessionWorkerAddress = typeof sessionInfo?.workerAddress === "string" ? sessionInfo.workerAddress.trim() : "";
+    const sessionIpSubnet = typeof sessionInfo?.ipSubnet === "string" ? sessionInfo.ipSubnet.trim() : "";
 
-  // HashSign verification
-  const hashSign = url.searchParams.get("hashSign") ?? "";
-  if (shouldCheckHash) {
-    const base64Path = base64Encode(path);
-    const hashVerifyResult = await verify("hashSign", base64Path, hashSign, config.token);
-    if (hashVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, hashVerifyResult);
-    }
-  }
-
-  // WorkerSign verification
-  const workerSign = url.searchParams.get("workerSign") ?? "";
-  if (shouldCheckWorker) {
-    const workerVerifyData = JSON.stringify({ path: path, worker_addr: config.workerAddress });
-    const workerVerifyResult = await verify("workerSign", workerVerifyData, workerSign, config.token);
-    if (workerVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, workerVerifyResult);
-    }
-  }
-
-  // IpSign verification
-  const ipSign = url.searchParams.get("ipSign") ?? "";
-  if (shouldCheckIP) {
-    if (!ipSign) {
-      return createUnauthorizedResponse(origin, "ipSign missing");
-    }
-    if (!clientIP) {
-      return createUnauthorizedResponse(origin, "client ip missing");
-    }
-    const ipVerifyData = JSON.stringify({ path: path, ip: clientIP });
-    const ipVerifyResult = await verify("ipSign", ipVerifyData, ipSign, config.token);
-    if (ipVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, ipVerifyResult);
-    }
-  }
-
-  const additionalInfo = url.searchParams.get("additionalInfo") ?? "";
-  const additionalInfoSign = url.searchParams.get("additionalInfoSign") ?? "";
-  if (shouldCheckAddition) {
-    if (!additionalInfo) {
-      return createUnauthorizedResponse(origin, "additionalInfo missing");
-    }
-    if (!additionalInfoSign) {
-      return createUnauthorizedResponse(origin, "additionalInfoSign missing");
+    if (shouldCheckWorker) {
+      const expectedWorker = (config.workerAddress || "").replace(/\/$/, "");
+      const storedWorker = sessionWorkerAddress.replace(/\/$/, "");
+      if (!expectedWorker || !storedWorker || expectedWorker !== storedWorker) {
+        return createUnauthorizedResponse(origin, "worker mismatch");
+      }
     }
 
-    const additionalVerifyResult = await verify("additionalInfoSign", additionalInfo, additionalInfoSign, config.token);
-    if (additionalVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, additionalVerifyResult);
+    if (shouldCheckIP) {
+      if (!sessionIpSubnet) {
+        return createUnauthorizedResponse(origin, "session ip missing");
+      }
+      const calculatedSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
+      if (!calculatedSubnet || calculatedSubnet !== sessionIpSubnet) {
+        return createUnauthorizedResponse(origin, "session ip mismatch");
+      }
+    } else if (clientIP) {
+      calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
+    }
+  } else {
+    // Sign verification
+    const sign = url.searchParams.get("sign") ?? "";
+    if (shouldCheckSign) {
+      const verifyResult = await verify("sign", path, sign, config.token);
+      if (verifyResult !== "") {
+        return createUnauthorizedResponse(origin, verifyResult);
+      }
     }
 
-    const decodedAdditional = base64DecodeToString(additionalInfo);
-    if (!decodedAdditional) {
-      return createUnauthorizedResponse(origin, "additionalInfo decode failed");
+    // HashSign verification
+    const hashSign = url.searchParams.get("hashSign") ?? "";
+    if (shouldCheckHash) {
+      const base64Path = base64Encode(path);
+      const hashVerifyResult = await verify("hashSign", base64Path, hashSign, config.token);
+      if (hashVerifyResult !== "") {
+        return createUnauthorizedResponse(origin, hashVerifyResult);
+      }
     }
 
-    let additionalPayload;
-    try {
-      additionalPayload = JSON.parse(decodedAdditional);
-    } catch (_error) {
-      return createUnauthorizedResponse(origin, "additionalInfo invalid");
+    // WorkerSign verification
+    const workerSign = url.searchParams.get("workerSign") ?? "";
+    if (shouldCheckWorker) {
+      const workerVerifyData = JSON.stringify({ path: path, worker_addr: config.workerAddress });
+      const workerVerifyResult = await verify("workerSign", workerVerifyData, workerSign, config.token);
+      if (workerVerifyResult !== "") {
+        return createUnauthorizedResponse(origin, workerVerifyResult);
+      }
     }
 
-    const expectedPathHash = await sha256Hex(path);
-    if (typeof additionalPayload.pathHash !== "string" || additionalPayload.pathHash !== expectedPathHash) {
-      return createUnauthorizedResponse(origin, "additionalInfo path mismatch");
+    // IpSign verification
+    const ipSign = url.searchParams.get("ipSign") ?? "";
+    if (shouldCheckIP) {
+      if (!ipSign) {
+        return createUnauthorizedResponse(origin, "ipSign missing");
+      }
+      if (!clientIP) {
+        return createUnauthorizedResponse(origin, "client ip missing");
+      }
+      const ipVerifyData = JSON.stringify({ path: path, ip: clientIP });
+      const ipVerifyResult = await verify("ipSign", ipVerifyData, ipSign, config.token);
+      if (ipVerifyResult !== "") {
+        return createUnauthorizedResponse(origin, ipVerifyResult);
+      }
     }
 
-    if (shouldCheckAdditionExpireTime) {
-      let expireTimestamp = 0;
-      if (typeof additionalPayload.expireTime === "number") {
-        expireTimestamp = Math.trunc(additionalPayload.expireTime);
-      } else if (typeof additionalPayload.expireTime === "string") {
-        expireTimestamp = Number.parseInt(additionalPayload.expireTime, 10);
+    const additionalInfo = url.searchParams.get("additionalInfo") ?? "";
+    const additionalInfoSign = url.searchParams.get("additionalInfoSign") ?? "";
+    if (shouldCheckAddition) {
+      if (!additionalInfo) {
+        return createUnauthorizedResponse(origin, "additionalInfo missing");
+      }
+      if (!additionalInfoSign) {
+        return createUnauthorizedResponse(origin, "additionalInfoSign missing");
       }
 
-      if (!Number.isFinite(expireTimestamp) || expireTimestamp <= 0) {
-        return createUnauthorizedResponse(origin, "additionalInfo expire invalid");
+      const additionalVerifyResult = await verify("additionalInfoSign", additionalInfo, additionalInfoSign, config.token);
+      if (additionalVerifyResult !== "") {
+        return createUnauthorizedResponse(origin, additionalVerifyResult);
       }
 
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      if (nowSeconds > expireTimestamp) {
-        return createUnauthorizedResponse(origin, "link expired");
+      const decodedAdditional = base64DecodeToString(additionalInfo);
+      if (!decodedAdditional) {
+        return createUnauthorizedResponse(origin, "additionalInfo decode failed");
+      }
+
+      let additionalPayload;
+      try {
+        additionalPayload = JSON.parse(decodedAdditional);
+      } catch (_error) {
+        return createUnauthorizedResponse(origin, "additionalInfo invalid");
+      }
+
+      const expectedPathHash = await sha256Hex(path);
+      if (typeof additionalPayload.pathHash !== "string" || additionalPayload.pathHash !== expectedPathHash) {
+        return createUnauthorizedResponse(origin, "additionalInfo path mismatch");
+      }
+
+      if (shouldCheckAdditionExpireTime) {
+        let expireTimestamp = 0;
+        if (typeof additionalPayload.expireTime === "number") {
+          expireTimestamp = Math.trunc(additionalPayload.expireTime);
+        } else if (typeof additionalPayload.expireTime === "string") {
+          expireTimestamp = Number.parseInt(additionalPayload.expireTime, 10);
+        }
+
+        if (!Number.isFinite(expireTimestamp) || expireTimestamp <= 0) {
+          return createUnauthorizedResponse(origin, "additionalInfo expire invalid");
+        }
+
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        if (nowSeconds > expireTimestamp) {
+          return createUnauthorizedResponse(origin, "link expired");
+        }
       }
     }
   }
@@ -1411,6 +1559,71 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   return safeResponse;
 }
+
+async function handleSessionDownload(request, env, config, cacheManager, throttleManager, rateLimiter, sessionDBManager, ctx) {
+  const origin = request.headers.get("origin") ?? "*";
+
+  if (!config.sessionEnabled) {
+    return createErrorResponse(origin, 404, "session mode disabled");
+  }
+
+  if (!sessionDBManager) {
+    return createErrorResponse(origin, 500, "session storage unavailable");
+  }
+
+  const url = new URL(request.url);
+  const sessionTicket = (url.searchParams.get("q") || "").trim();
+  if (!sessionTicket) {
+    return createErrorResponse(origin, 400, "session ticket missing");
+  }
+
+  let sessionRecord;
+  try {
+    sessionRecord = await sessionDBManager.get(sessionTicket);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('[Session] lookup failed:', message);
+    return createErrorResponse(origin, 500, "session lookup failed");
+  }
+
+  if (!sessionRecord || sessionRecord.found !== true) {
+    return createUnauthorizedResponse(origin, "session invalid");
+  }
+
+  const rawFilePath = typeof sessionRecord.file_path === "string" ? sessionRecord.file_path : "";
+  if (!rawFilePath) {
+    return createUnauthorizedResponse(origin, "session path missing");
+  }
+
+  const normalizedFilePath = rawFilePath.startsWith("/") ? rawFilePath : `/${rawFilePath}`;
+  const expireAt = Number.isFinite(Number(sessionRecord.expire_at)) ? Number(sessionRecord.expire_at) : 0;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (!expireAt || expireAt <= nowSeconds) {
+    return createUnauthorizedResponse(origin, "session expired");
+  }
+
+  const sessionInfo = {
+    filePath: normalizedFilePath,
+    ipSubnet: typeof sessionRecord.ip_subnet === "string" ? sessionRecord.ip_subnet : "",
+    workerAddress: typeof sessionRecord.worker_address === "string" ? sessionRecord.worker_address : "",
+    expireAt,
+  };
+
+  return handleDownload(
+    request,
+    env,
+    config,
+    cacheManager,
+    throttleManager,
+    rateLimiter,
+    ctx,
+    {
+      isSessionMode: true,
+      sessionInfo,
+    }
+  );
+}
+
 // src/handleOptions.ts
 function handleOptions(request) {
   const corsHeaders = {
@@ -1465,14 +1678,15 @@ async function checkCfRatelimit(env, clientIP, ipv4Suffix, ipv6Suffix, bindingNa
 }
 
 // src/handleRequest.ts - Modified to check IPv6 addresses
-async function handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
+async function handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, sessionDBManager, ctx) {
+  const origin = request.headers.get("origin") ?? "*";
   // Check for IPv6 access if IPv4_ONLY is enabled
   if (config.ipv4Only) {
     const clientIP = request.headers.get("CF-Connecting-IP") || "";
     if (isIPv6(clientIP)) {
       const safeHeaders = new Headers();
       safeHeaders.set("content-type", "application/json;charset=UTF-8");
-      safeHeaders.set("Access-Control-Allow-Origin", request.headers.get("origin") ?? "*");
+      safeHeaders.set("Access-Control-Allow-Origin", origin);
       safeHeaders.append("Vary", "Origin");
 
       return new Response(
@@ -1492,6 +1706,18 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
   if (request.method === "OPTIONS") {
     return handleOptions(request);
   }
+
+  const url = new URL(request.url);
+  const isSessionRequest = url.pathname === "/session" && url.searchParams.has("q");
+
+  if (config.onlySessionMode && !isSessionRequest) {
+    return createErrorResponse(origin, 403, "Only session-based downloads are allowed");
+  }
+
+  if (isSessionRequest) {
+    return handleSessionDownload(request, env, config, cacheManager, throttleManager, rateLimiter, sessionDBManager, ctx);
+  }
+
   return await handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 }
 // src/index.ts
@@ -1504,7 +1730,8 @@ export default {
       // Create throttle manager instance based on DB_MODE (if throttle enabled)
       const throttleManager = config.throttleEnabled ? createThrottleManager(config.dbMode) : null;
       const rateLimiter = config.rateLimitEnabled ? createRateLimiter(config.dbMode) : null;
-      const response = await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
+      const sessionDBManager = config.sessionEnabled ? createSessionDBManager(config) : null;
+      const response = await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, sessionDBManager, ctx);
 
       scheduleAllCleanups(config, env, ctx).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
