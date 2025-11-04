@@ -84,9 +84,10 @@ const executeBatchQueries = async (accountId, databaseId, apiToken, statements) 
  * @param {string} tableNames.cacheTableName
  * @param {string} tableNames.rateLimitTableName
  * @param {string} tableNames.throttleTableName
+ * @param {string} [tableNames.sessionTableName]
  * @returns {Promise<void>}
- */
-const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName, rateLimitTableName, throttleTableName }) => {
+*/
+const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName, rateLimitTableName, throttleTableName, sessionTableName }) => {
   await executeQuery(accountId, databaseId, apiToken, `
     CREATE TABLE IF NOT EXISTS ${cacheTableName} (
       PATH_HASH TEXT PRIMARY KEY,
@@ -120,6 +121,26 @@ const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName
     )
   `);
   await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${throttleTableName}(ERROR_TIMESTAMP)`);
+
+  if (sessionTableName) {
+    await executeBatchQueries(accountId, databaseId, apiToken, [
+      {
+        sql: `
+          CREATE TABLE IF NOT EXISTS ${sessionTableName} (
+            SESSION_TICKET TEXT PRIMARY KEY,
+            FILE_PATH TEXT NOT NULL,
+            IP_SUBNET TEXT NOT NULL,
+            WORKER_ADDRESS TEXT NOT NULL,
+            EXPIRE_AT INTEGER NOT NULL,
+            CREATED_AT INTEGER NOT NULL
+          )
+        `,
+      },
+      {
+        sql: `CREATE INDEX IF NOT EXISTS idx_session_expire ON ${sessionTableName}(EXPIRE_AT)`,
+      },
+    ]);
+  }
 };
 
 /**
@@ -148,7 +169,22 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
 
-  await ensureAllTables(accountId, databaseId, apiToken, { cacheTableName, rateLimitTableName, throttleTableName });
+  let sessionTableName = null;
+  if (config.sessionEnabled === true && config.sessionDbMode === 'd1-rest') {
+    const sessionConfig = config.sessionDbConfig || {};
+    const accountMatches = !sessionConfig.accountId || sessionConfig.accountId === accountId;
+    const databaseMatches = !sessionConfig.databaseId || sessionConfig.databaseId === databaseId;
+    if (accountMatches && databaseMatches) {
+      sessionTableName = sessionConfig.tableName || 'SESSION_MAPPING_TABLE';
+    }
+  }
+
+  await ensureAllTables(accountId, databaseId, apiToken, {
+    cacheTableName,
+    rateLimitTableName,
+    throttleTableName,
+    sessionTableName,
+  });
 
   console.log('[Unified Check D1-REST] Starting unified check for path:', path);
 

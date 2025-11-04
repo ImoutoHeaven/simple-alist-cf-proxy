@@ -1079,6 +1079,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+          sessionEnabled: config.sessionEnabled,
+          sessionDbMode: config.sessionDbMode,
+          sessionDbConfig: config.sessionDbConfig,
         });
       } else if (config.dbMode === 'd1-rest') {
         unifiedResult = await unifiedCheckD1Rest(path, clientIP, {
@@ -1095,6 +1098,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+          sessionEnabled: config.sessionEnabled,
+          sessionDbMode: config.sessionDbMode,
+          sessionDbConfig: config.sessionDbConfig,
         });
       } else {
         throw new Error(`Unsupported database mode for unified check: ${config.dbMode}`);

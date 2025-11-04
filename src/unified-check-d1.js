@@ -9,7 +9,7 @@ import { sha256Hash, calculateIPSubnet } from './utils.js';
  * @param {string} tableNames.throttleTableName
  * @returns {Promise<void>}
  */
-const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttleTableName }) => {
+const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttleTableName, sessionTableName }) => {
   const statements = [
     db.prepare(`
       CREATE TABLE IF NOT EXISTS ${cacheTableName} (
@@ -44,6 +44,22 @@ const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttl
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${throttleTableName}(ERROR_TIMESTAMP)`),
   ];
 
+  if (sessionTableName) {
+    statements.push(
+      db.prepare(`
+        CREATE TABLE IF NOT EXISTS ${sessionTableName} (
+          SESSION_TICKET TEXT PRIMARY KEY,
+          FILE_PATH TEXT NOT NULL,
+          IP_SUBNET TEXT NOT NULL,
+          WORKER_ADDRESS TEXT NOT NULL,
+          EXPIRE_AT INTEGER NOT NULL,
+          CREATED_AT INTEGER NOT NULL
+        )
+      `),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_session_expire ON ${sessionTableName}(EXPIRE_AT)`)
+    );
+  }
+
   await db.batch(statements);
 };
 
@@ -77,7 +93,21 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
 
-  await ensureAllTables(db, { cacheTableName, rateLimitTableName, throttleTableName });
+  let sessionTableName = null;
+  if (config.sessionEnabled === true && config.sessionDbMode === 'd1') {
+    const sessionBinding = config.sessionDbConfig?.databaseBinding;
+    const bindingMatches = !sessionBinding || sessionBinding === config.databaseBinding;
+    if (bindingMatches) {
+      sessionTableName = config.sessionDbConfig?.tableName || 'SESSION_MAPPING_TABLE';
+    }
+  }
+
+  await ensureAllTables(db, {
+    cacheTableName,
+    rateLimitTableName,
+    throttleTableName,
+    sessionTableName,
+  });
 
   console.log('[Unified Check D1] Starting unified check for path:', path);
 
