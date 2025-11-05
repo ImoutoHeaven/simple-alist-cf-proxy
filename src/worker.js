@@ -1579,8 +1579,18 @@ async function handleSessionDownload(request, env, config, cacheManager, throttl
 
   const url = new URL(request.url);
   const sessionTicket = (url.searchParams.get("q") || "").trim();
+  const ticketSignature = (url.searchParams.get("qs") || "").trim();
   if (!sessionTicket) {
     return createErrorResponse(origin, 400, "session ticket missing");
+  }
+  if (!ticketSignature) {
+    return createErrorResponse(origin, 400, "session signature missing");
+  }
+
+  const signatureError = await verifySignature(config.signSecret, sessionTicket, ticketSignature);
+  if (signatureError) {
+    console.warn('[Session] signature verification failed:', signatureError);
+    return createUnauthorizedResponse(origin, "session signature invalid");
   }
 
   let sessionRecord;
