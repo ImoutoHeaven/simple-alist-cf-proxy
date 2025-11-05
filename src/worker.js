@@ -1569,7 +1569,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // Session模式下：如果上游没有Content-Disposition，从path提取文件名并设置
   if (isSessionMode && !safeHeaders.has('content-disposition') && (response.status === 200 || response.status === 206)) {
     const filename = path.split('/').filter(Boolean).pop() || 'download';
-    safeHeaders.set('content-disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+    safeHeaders.set(
+      'content-disposition',
+      `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+    );
   }
 
   // 设置CORS headers
@@ -1744,7 +1747,8 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
   }
 
   const url = new URL(request.url);
-  const isSessionRequest = url.pathname === "/session" && url.searchParams.has("q");
+  const isSessionRequest =
+    url.pathname.startsWith("/session/") && url.searchParams.has("q") && url.searchParams.has("qs");
 
   if (config.onlySessionMode && !isSessionRequest) {
     return createErrorResponse(origin, 403, "Only session-based downloads are allowed");
