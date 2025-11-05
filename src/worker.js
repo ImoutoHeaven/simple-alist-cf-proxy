@@ -448,6 +448,7 @@ const resolveConfig = (env = {}) => {
     workerAddress: String(env.WORKER_ADDRESS).trim(),
     verifyHeader: verifyHeaders,
     verifySecret: verifySecrets,
+    signSecret: env.SIGN_SECRET && env.SIGN_SECRET.trim() !== '' ? env.SIGN_SECRET : env.TOKEN,
     signCheck: parseBoolean(env.SIGN_CHECK, true),
     hashCheck: parseBoolean(env.HASH_CHECK, true),
     workerCheck: parseBoolean(env.WORKER_CHECK, true),
