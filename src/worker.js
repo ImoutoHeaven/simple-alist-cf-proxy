@@ -1567,7 +1567,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   });
 
   // Session模式下：如果上游没有Content-Disposition，从path提取文件名并设置
-  if (isSessionMode && !safeHeaders.has('content-disposition')) {
+  if (isSessionMode && !safeHeaders.has('content-disposition') && (response.status === 200 || response.status === 206)) {
     const filename = path.split('/').filter(Boolean).pop() || 'download';
     safeHeaders.set('content-disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
   }
