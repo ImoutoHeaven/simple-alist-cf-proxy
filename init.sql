@@ -5,9 +5,126 @@
 --   DOWNLOAD_CACHE_TABLE           (env: DOWNLOAD_CACHE_TABLE)
 --   THROTTLE_PROTECTION            (env: THROTTLE_PROTECTION_TABLE)
 --   DOWNLOAD_IP_RATELIMIT_TABLE    (env: DOWNLOAD_IP_RATELIMIT_TABLE)
+--   SESSION_MAPPING_TABLE          (env: SESSION_TABLE_NAME)
 --
 -- If you override the environment variables, adjust the CREATE TABLE
 -- statements accordingly before applying this script.
+
+
+-- ========================================
+-- Session Mapping Table Schema
+-- ========================================
+-- Purpose: Stores landing-worker issued session tickets
+-- Compatible with: PostgreSQL
+
+CREATE TABLE IF NOT EXISTS "SESSION_MAPPING_TABLE" (
+  "SESSION_TICKET" TEXT PRIMARY KEY,
+  "FILE_PATH" TEXT NOT NULL,
+  "IP_SUBNET" TEXT NOT NULL,
+  "WORKER_ADDRESS" TEXT NOT NULL,
+  "EXPIRE_AT" BIGINT NOT NULL,
+  "CREATED_AT" BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_expire
+  ON "SESSION_MAPPING_TABLE"("EXPIRE_AT");
+
+
+-- ========================================
+-- Stored Procedure: Insert Session Mapping
+-- ========================================
+CREATE OR REPLACE FUNCTION session_insert(
+  p_session_ticket TEXT,
+  p_file_path TEXT,
+  p_ip_subnet TEXT,
+  p_worker_address TEXT,
+  p_expire_at BIGINT,
+  p_created_at BIGINT,
+  p_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE'
+)
+RETURNS JSON AS $$
+DECLARE
+  v_sql TEXT;
+BEGIN
+  v_sql := format(
+    'INSERT INTO %1$I ("SESSION_TICKET", "FILE_PATH", "IP_SUBNET", "WORKER_ADDRESS", "EXPIRE_AT", "CREATED_AT")
+     VALUES ($1, $2, $3, $4, $5, $6)',
+    p_table_name
+  );
+
+  EXECUTE v_sql USING p_session_ticket, p_file_path, p_ip_subnet, p_worker_address, p_expire_at, p_created_at;
+
+  RETURN json_build_object('success', true);
+EXCEPTION
+  WHEN others THEN
+    RETURN json_build_object('success', false, 'error', SQLERRM);
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
+-- Stored Procedure: Retrieve Session Mapping (Compatibility)
+-- ========================================
+CREATE OR REPLACE FUNCTION session_get(
+  p_session_ticket TEXT,
+  p_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE'
+)
+RETURNS JSON AS $$
+DECLARE
+  v_sql TEXT;
+  v_record RECORD;
+BEGIN
+  v_sql := format(
+    'SELECT "SESSION_TICKET", "FILE_PATH", "IP_SUBNET", "WORKER_ADDRESS", "EXPIRE_AT", "CREATED_AT"
+     FROM %1$I WHERE "SESSION_TICKET" = $1 LIMIT 1',
+    p_table_name
+  );
+
+  EXECUTE v_sql INTO v_record USING p_session_ticket;
+
+  IF v_record IS NULL OR v_record."SESSION_TICKET" IS NULL THEN
+    RETURN json_build_object('found', false);
+  END IF;
+
+  RETURN json_build_object(
+    'found', true,
+    'file_path', v_record."FILE_PATH",
+    'ip_subnet', v_record."IP_SUBNET",
+    'worker_address', v_record."WORKER_ADDRESS",
+    'expire_at', v_record."EXPIRE_AT"
+  );
+EXCEPTION
+  WHEN others THEN
+    RETURN json_build_object('found', false, 'error', SQLERRM);
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
+-- Stored Procedure: Cleanup Expired Sessions
+-- ========================================
+CREATE OR REPLACE FUNCTION session_cleanup_expired(
+  p_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE',
+  p_now BIGINT DEFAULT NULL
+)
+RETURNS JSON AS $$
+DECLARE
+  v_now BIGINT;
+  v_sql TEXT;
+  v_deleted BIGINT := 0;
+BEGIN
+  v_now := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::BIGINT);
+
+  v_sql := format('DELETE FROM %1$I WHERE "EXPIRE_AT" < $1', p_table_name);
+  EXECUTE v_sql USING v_now;
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+
+  RETURN json_build_object('deleted', v_deleted);
+EXCEPTION
+  WHEN others THEN
+    RETURN json_build_object('deleted', 0, 'error', SQLERRM);
+END;
+$$ LANGUAGE plpgsql;
 
 
 -- ========================================
@@ -280,126 +397,214 @@ $$ LANGUAGE plpgsql;
 
 
 -- ========================================
--- Unified Check Function (RTT Optimization: 3→1)
+-- Unified Check Function (Session + Rate Limit + Cache + Throttle)
 -- ========================================
--- Purpose: Combines Rate Limit + Cache + Throttle checks in a single database round-trip
--- Used by: Worker unified check (src/unified-check.js)
---
--- Performance: Reduces 3 separate queries to 1 RTT
--- - Cache hit scenario: 3 RTT → 1 RTT (66% reduction)
--- - Cache miss scenario: 3 RTT → 2 RTT (33% reduction)
+-- Purpose: Combines Session validation + Rate Limit + Cache + Throttle checks in a single database round-trip
 
 CREATE OR REPLACE FUNCTION download_unified_check(
-  -- Cache params
+  -- Session parameters
+  p_session_ticket TEXT DEFAULT NULL,
+  p_session_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE',
+  p_now BIGINT DEFAULT NULL,
+
+  -- Cache parameters
   p_path_hash TEXT,
   p_cache_ttl INTEGER,
   p_cache_table_name TEXT,
 
-  -- Rate limit params
+  -- Rate limit parameters
   p_ip_hash TEXT,
   p_ip_range TEXT,
-  p_now INTEGER,
   p_window_seconds INTEGER,
   p_limit INTEGER,
   p_block_seconds INTEGER,
   p_ratelimit_table_name TEXT,
 
-  -- Throttle params
+  -- Throttle parameters
   p_throttle_time_window INTEGER,
   p_throttle_table_name TEXT
 )
 RETURNS TABLE(
-  -- Cache result (nullable if not found or expired)
+  -- Session result
+  session_found BOOLEAN,
+  session_file_path TEXT,
+  session_ip_subnet TEXT,
+  session_worker_address TEXT,
+  session_expire_at BIGINT,
+  session_error TEXT,
+
+  -- Cache result
   cache_link_data TEXT,
   cache_timestamp INTEGER,
   cache_hostname_hash TEXT,
 
-  -- Rate limit result (always returns)
+  -- Rate limit result
   rate_access_count INTEGER,
   rate_last_window_time INTEGER,
   rate_block_until INTEGER,
 
-  -- Throttle result (nullable if not found)
+  -- Throttle result
   throttle_record_exists BOOLEAN,
   throttle_is_protected INTEGER,
   throttle_error_timestamp INTEGER,
   throttle_error_code INTEGER
 ) AS $$
 DECLARE
-  cache_sql TEXT;
-  rate_result RECORD;
-  throttle_sql TEXT;
-  cache_rec RECORD;
-  throttle_rec RECORD;
-  cache_hostname_hash_var TEXT;
-BEGIN
-  -- Step 1: Check cache
-  cache_sql := format(
-    'SELECT "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH" FROM %1$I WHERE "PATH_HASH" = $1',
-    p_cache_table_name
-  );
-  EXECUTE cache_sql INTO cache_rec USING p_path_hash;
+  v_now BIGINT;
+  v_session_record RECORD;
+  v_cache_record RECORD;
+  v_rate_record RECORD;
+  v_throttle_record RECORD;
+  v_cache_hostname_hash TEXT;
 
-  -- Check if cache exists and is not expired
-  -- Note: EXECUTE INTO RECORD does not set FOUND correctly, check field instead
-  IF cache_rec."TIMESTAMP" IS NOT NULL AND (p_now - cache_rec."TIMESTAMP") <= p_cache_ttl THEN
-    cache_link_data := cache_rec."LINK_DATA";
-    cache_timestamp := cache_rec."TIMESTAMP";
-    cache_hostname_hash_var := cache_rec."HOSTNAME_HASH";
-  ELSE
-    cache_link_data := NULL;
-    cache_timestamp := NULL;
-    cache_hostname_hash_var := NULL;
+  v_session_found BOOLEAN := NULL;
+  v_session_file_path TEXT := NULL;
+  v_session_ip_subnet TEXT := NULL;
+  v_session_worker_address TEXT := NULL;
+  v_session_expire_at BIGINT := NULL;
+  v_session_error TEXT := NULL;
+
+  v_cache_link_data TEXT := NULL;
+  v_cache_timestamp INTEGER := NULL;
+
+  v_rate_access_count INTEGER := NULL;
+  v_rate_last_window_time INTEGER := NULL;
+  v_rate_block_until INTEGER := NULL;
+
+  v_throttle_record_exists BOOLEAN := FALSE;
+  v_throttle_is_protected INTEGER := NULL;
+  v_throttle_error_timestamp INTEGER := NULL;
+  v_throttle_error_code INTEGER := NULL;
+BEGIN
+  v_now := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::BIGINT);
+
+  -- Step 1: Session validation (if ticket provided)
+  IF p_session_ticket IS NOT NULL AND btrim(p_session_ticket) <> '' THEN
+    EXECUTE format('SELECT * FROM %1$I WHERE "SESSION_TICKET" = $1 LIMIT 1', p_session_table_name)
+      INTO v_session_record
+      USING p_session_ticket;
+
+    IF v_session_record IS NULL OR v_session_record."SESSION_TICKET" IS NULL THEN
+      RETURN QUERY SELECT
+        FALSE,
+        NULL::TEXT,
+        NULL::TEXT,
+        NULL::TEXT,
+        NULL::BIGINT,
+        'session not found'::TEXT,
+        NULL::TEXT,
+        NULL::INTEGER,
+        NULL::TEXT,
+        NULL::INTEGER,
+        NULL::INTEGER,
+        NULL::INTEGER,
+        NULL::BOOLEAN,
+        NULL::INTEGER,
+        NULL::INTEGER,
+        NULL::INTEGER;
+      RETURN;
+    END IF;
+
+    IF v_session_record."EXPIRE_AT" IS NOT NULL AND v_session_record."EXPIRE_AT" < v_now THEN
+      RETURN QUERY SELECT
+        FALSE,
+        NULL::TEXT,
+        NULL::TEXT,
+        NULL::TEXT,
+        v_session_record."EXPIRE_AT",
+        'session expired'::TEXT,
+        NULL::TEXT,
+        NULL::INTEGER,
+        NULL::TEXT,
+        NULL::INTEGER,
+        NULL::INTEGER,
+        NULL::INTEGER,
+        NULL::BOOLEAN,
+        NULL::INTEGER,
+        NULL::INTEGER,
+        NULL::INTEGER;
+      RETURN;
+    END IF;
+
+    v_session_found := TRUE;
+    v_session_file_path := v_session_record."FILE_PATH";
+    v_session_ip_subnet := v_session_record."IP_SUBNET";
+    v_session_worker_address := v_session_record."WORKER_ADDRESS";
+    v_session_expire_at := v_session_record."EXPIRE_AT";
   END IF;
 
-  cache_hostname_hash := cache_hostname_hash_var;
+  -- Step 2: Cache lookup
+  EXECUTE format('SELECT "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH" FROM %1$I WHERE "PATH_HASH" = $1', p_cache_table_name)
+    INTO v_cache_record
+    USING p_path_hash;
 
-  -- Step 2: Upsert rate limit (reuse existing function)
-  SELECT * INTO rate_result FROM download_upsert_rate_limit(
+  IF v_cache_record."TIMESTAMP" IS NOT NULL AND (v_now - v_cache_record."TIMESTAMP") <= p_cache_ttl THEN
+    v_cache_link_data := v_cache_record."LINK_DATA";
+    v_cache_timestamp := v_cache_record."TIMESTAMP";
+    v_cache_hostname_hash := v_cache_record."HOSTNAME_HASH";
+  ELSE
+    v_cache_link_data := NULL;
+    v_cache_timestamp := NULL;
+    v_cache_hostname_hash := NULL;
+  END IF;
+
+  -- Step 3: Rate limit upsert
+  SELECT *
+    INTO v_rate_record
+  FROM download_upsert_rate_limit(
     p_ip_hash,
     p_ip_range,
-    p_now,
+    v_now::INTEGER,
     p_window_seconds,
     p_limit,
     p_block_seconds,
     p_ratelimit_table_name
   );
 
-  rate_access_count := rate_result."ACCESS_COUNT";
-  rate_last_window_time := rate_result."LAST_WINDOW_TIME";
-  rate_block_until := rate_result."BLOCK_UNTIL";
+  v_rate_access_count := v_rate_record."ACCESS_COUNT";
+  v_rate_last_window_time := v_rate_record."LAST_WINDOW_TIME";
+  v_rate_block_until := v_rate_record."BLOCK_UNTIL";
 
-  -- Step 3: Check throttle (only if we have hostname_hash from cache)
-  IF cache_hostname_hash_var IS NOT NULL THEN
-    throttle_sql := format(
-      'SELECT "IS_PROTECTED", "ERROR_TIMESTAMP", "LAST_ERROR_CODE"
-       FROM %1$I WHERE "HOSTNAME_HASH" = $1',
-      p_throttle_table_name
-    );
-    EXECUTE throttle_sql INTO throttle_rec USING cache_hostname_hash_var;
+  -- Step 4: Throttle lookup (only when cache provided hostname)
+  IF v_cache_hostname_hash IS NOT NULL THEN
+    EXECUTE format('SELECT "IS_PROTECTED", "ERROR_TIMESTAMP", "LAST_ERROR_CODE" FROM %1$I WHERE "HOSTNAME_HASH" = $1', p_throttle_table_name)
+      INTO v_throttle_record
+      USING v_cache_hostname_hash;
 
-    -- Note: EXECUTE INTO RECORD does not set FOUND correctly, check field instead
-    IF throttle_rec."IS_PROTECTED" IS NOT NULL THEN
-      -- Record exists in database
-      throttle_record_exists := TRUE;
-      throttle_is_protected := throttle_rec."IS_PROTECTED";
-      throttle_error_timestamp := throttle_rec."ERROR_TIMESTAMP";
-      throttle_error_code := throttle_rec."LAST_ERROR_CODE";
+    IF v_throttle_record."IS_PROTECTED" IS NOT NULL THEN
+      v_throttle_record_exists := TRUE;
+      v_throttle_is_protected := v_throttle_record."IS_PROTECTED";
+      v_throttle_error_timestamp := v_throttle_record."ERROR_TIMESTAMP";
+      v_throttle_error_code := v_throttle_record."LAST_ERROR_CODE";
     ELSE
-      -- Record does not exist in database
-      throttle_record_exists := FALSE;
-      throttle_is_protected := NULL;
-      throttle_error_timestamp := NULL;
-      throttle_error_code := NULL;
+      v_throttle_record_exists := FALSE;
+      v_throttle_is_protected := NULL;
+      v_throttle_error_timestamp := NULL;
+      v_throttle_error_code := NULL;
     END IF;
   ELSE
-    -- No cache or no hostname_hash - skip throttle check
-    throttle_record_exists := FALSE;
-    throttle_is_protected := NULL;
-    throttle_error_timestamp := NULL;
-    throttle_error_code := NULL;
+    v_throttle_record_exists := FALSE;
+    v_throttle_is_protected := NULL;
+    v_throttle_error_timestamp := NULL;
+    v_throttle_error_code := NULL;
   END IF;
 
-  RETURN NEXT;
+  RETURN QUERY SELECT
+    v_session_found,
+    v_session_file_path,
+    v_session_ip_subnet,
+    v_session_worker_address,
+    v_session_expire_at,
+    v_session_error,
+    v_cache_link_data,
+    v_cache_timestamp,
+    v_cache_hostname_hash,
+    v_rate_access_count,
+    v_rate_last_window_time,
+    v_rate_block_until,
+    v_throttle_record_exists,
+    v_throttle_is_protected,
+    v_throttle_error_timestamp,
+    v_throttle_error_code;
 END;
 $$ LANGUAGE plpgsql;

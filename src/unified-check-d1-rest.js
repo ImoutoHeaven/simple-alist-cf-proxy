@@ -145,13 +145,14 @@ const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName
 
 /**
  * Unified check for D1-REST (RTT 3→1-2 optimization)
- * Uses D1 REST API to execute multiple queries
+ * Uses D1 REST API to execute Session (optional) + Rate Limit + Cache in a single batch
  * @param {string} path - File path
  * @param {string} clientIP - Client IP address
  * @param {Object} config - Configuration object
- * @returns {Promise<{cache, rateLimit, throttle}>}
+ * @param {string|null} sessionTicket - Optional session ticket
+ * @returns {Promise<{session, cache, rateLimit, throttle}>}
  */
-export const unifiedCheckD1Rest = async (path, clientIP, config) => {
+export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket = null) => {
   if (!config.accountId || !config.databaseId || !config.apiToken) {
     throw new Error('[Unified Check D1-REST] Missing D1-REST configuration');
   }
@@ -169,15 +170,9 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
 
-  let sessionTableName = null;
-  if (config.sessionEnabled === true && config.sessionDbMode === 'd1-rest') {
-    const sessionConfig = config.sessionDbConfig || {};
-    const accountMatches = !sessionConfig.accountId || sessionConfig.accountId === accountId;
-    const databaseMatches = !sessionConfig.databaseId || sessionConfig.databaseId === databaseId;
-    if (accountMatches && databaseMatches) {
-      sessionTableName = sessionConfig.tableName || 'SESSION_MAPPING_TABLE';
-    }
-  }
+  const sessionEnabled = config.sessionEnabled === true;
+  const sessionTableName = sessionEnabled ? (config.sessionTableName || 'SESSION_MAPPING_TABLE') : null;
+  const shouldCheckSession = sessionEnabled && typeof sessionTicket === 'string' && sessionTicket.trim() !== '';
 
   await ensureAllTables(accountId, databaseId, apiToken, {
     cacheTableName,
@@ -248,16 +243,25 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
       AND throttle.HOSTNAME_HASH IS NOT NULL
   `;
 
-  const statements = [
+  const statements = [];
+
+  if (shouldCheckSession) {
+    statements.push({
+      sql: `SELECT SESSION_TICKET, FILE_PATH, IP_SUBNET, WORKER_ADDRESS, EXPIRE_AT FROM ${sessionTableName} WHERE SESSION_TICKET = ? LIMIT 1`,
+      params: [sessionTicket],
+    });
+  }
+
+  statements.push(
     { sql: cacheSql, params: [pathHash] },
     { sql: rateLimitSql, params: rateLimitParams },
     { sql: throttleSql, params: [pathHash] },
-  ];
+  );
 
-  console.log('[Unified Check D1-REST] Executing batch (3 queries in 1 RTT: cache + ratelimit + throttle)');
+  console.log(`[Unified Check D1-REST] Executing batch (${statements.length} queries in 1 RTT${shouldCheckSession ? ': session + cache + ratelimit + throttle' : ': cache + ratelimit + throttle'})`);
   const batchResults = await executeBatchQueries(accountId, databaseId, apiToken, statements);
 
-  const [cacheResult, rateLimitResult, throttleResult] = batchResults.map((statementResult, index) => {
+  const normalizedResults = batchResults.map((statementResult, index) => {
     if (!statementResult) {
       throw new Error(`[Unified Check D1-REST] Batch result missing for statement #${index + 1}`);
     }
@@ -266,6 +270,60 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
     }
     return statementResult;
   });
+
+  let resultIndex = 0;
+  let sessionResult = {
+    found: shouldCheckSession ? false : null,
+    filePath: null,
+    ipSubnet: null,
+    workerAddress: null,
+    expireAt: null,
+    error: null,
+  };
+
+  if (shouldCheckSession) {
+    const sessionStatement = normalizedResults[resultIndex];
+    const sessionRow = sessionStatement?.results?.[0];
+    if (sessionRow) {
+      const expireAtRaw = Number(sessionRow.EXPIRE_AT);
+      if (Number.isFinite(expireAtRaw) && expireAtRaw < now) {
+        sessionResult = {
+          found: false,
+          filePath: null,
+          ipSubnet: null,
+          workerAddress: null,
+          expireAt: expireAtRaw,
+          error: 'session expired',
+        };
+      } else {
+        sessionResult = {
+          found: true,
+          filePath: sessionRow.FILE_PATH,
+          ipSubnet: sessionRow.IP_SUBNET,
+          workerAddress: sessionRow.WORKER_ADDRESS,
+          expireAt: Number.isFinite(expireAtRaw) ? expireAtRaw : null,
+          error: null,
+        };
+      }
+    } else {
+      sessionResult = {
+        found: false,
+        filePath: null,
+        ipSubnet: null,
+        workerAddress: null,
+        expireAt: null,
+        error: 'session not found',
+      };
+    }
+
+    resultIndex += 1;
+  }
+
+  const cacheResult = normalizedResults[resultIndex];
+  resultIndex += 1;
+  const rateLimitResult = normalizedResults[resultIndex];
+  resultIndex += 1;
+  const throttleResult = normalizedResults[resultIndex];
 
   // Parse cache
   let cacheData = {
@@ -377,6 +435,7 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
   console.log('[Unified Check D1-REST] Completed');
 
   return {
+    session: sessionResult,
     cache: cacheData,
     rateLimit: rateLimitData,
     throttle: throttleData,

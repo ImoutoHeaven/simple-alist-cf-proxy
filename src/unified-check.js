@@ -1,13 +1,14 @@
 import { sha256Hash, calculateIPSubnet, applyVerifyHeaders, hasVerifyCredentials } from './utils.js';
 
 /**
- * Unified check that performs Rate Limit + Cache + Throttle in a single database RTT
+ * Unified check that performs Session validation + Rate Limit + Cache + Throttle in a single database RTT
  * @param {string} path - File path
  * @param {string} clientIP - Client IP address
  * @param {Object} config - Configuration object
- * @returns {Promise<{cache, rateLimit, throttle}>}
+ * @param {string|null} sessionTicket - Optional session ticket
+ * @returns {Promise<{session, cache, rateLimit, throttle}>}
  */
-export const unifiedCheck = async (path, clientIP, config) => {
+export const unifiedCheck = async (path, clientIP, config, sessionTicket = null) => {
   if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
     throw new Error('[Unified Check] Missing PostgREST configuration');
   }
@@ -21,6 +22,7 @@ export const unifiedCheck = async (path, clientIP, config) => {
   const cacheTableName = config.cacheTableName || 'DOWNLOAD_CACHE_TABLE';
   const rateLimitTableName = config.rateLimitTableName || 'DOWNLOAD_IP_RATELIMIT_TABLE';
   const throttleTableName = config.throttleTableName || 'THROTTLE_PROTECTION';
+  const sessionTableName = config.sessionTableName || 'SESSION_MAPPING_TABLE';
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
   
@@ -45,12 +47,14 @@ export const unifiedCheck = async (path, clientIP, config) => {
   // Call unified RPC
   const rpcUrl = `${config.postgrestUrl}/rpc/download_unified_check`;
   const rpcBody = {
+    p_session_ticket: sessionTicket || null,
+    p_session_table_name: sessionTableName,
+    p_now: now,
     p_path_hash: pathHash,
     p_cache_ttl: cacheTTL,
     p_cache_table_name: cacheTableName,
     p_ip_hash: ipHash,
     p_ip_range: ipSubnet,
-    p_now: now,
     p_window_seconds: windowSeconds,
     p_limit: limit,
     p_block_seconds: blockSeconds,
@@ -84,6 +88,18 @@ export const unifiedCheck = async (path, clientIP, config) => {
   
   const row = result[0];
   console.log('[Unified Check] RPC result:', JSON.stringify(row, null, 2));
+
+  const sessionResult = {
+    found: row.session_found === true,
+    filePath: row.session_file_path || null,
+    ipSubnet: row.session_ip_subnet || null,
+    workerAddress: row.session_worker_address || null,
+    expireAt:
+      row.session_expire_at !== null && row.session_expire_at !== undefined
+        ? Number(row.session_expire_at)
+        : null,
+    error: row.session_error || null,
+  };
   
   // Parse cache result
   let cacheResult = {
@@ -181,6 +197,7 @@ export const unifiedCheck = async (path, clientIP, config) => {
   console.log('[Unified Check] Completed successfully');
   
   return {
+    session: sessionResult,
     cache: cacheResult,
     rateLimit: rateLimitResult,
     throttle: throttleResult,

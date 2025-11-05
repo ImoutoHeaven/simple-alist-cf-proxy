@@ -204,14 +204,7 @@ compatibility_date = "2024-01-01"
 # # Session-Based Download Tickets (optional)
 # SESSION_ENABLED = "false"                       # Enable UUID session tickets; default disabled
 # ONLY_SESSION_MODE = "false"                     # When "true", reject non-/session requests and require session tickets
-# SESSION_DB_MODE = ""                            # Optional override ("d1", "d1-rest", "custom-pg-rest"); falls back to DB_MODE
-# SESSION_D1_DATABASE_BINDING = "SESSIONDB"       # D1 binding for session storage (when SESSION_DB_MODE="d1")
-# SESSION_D1_TABLE_NAME = "SESSION_MAPPING_TABLE" # Session table name for D1 / D1-REST
-# SESSION_D1_ACCOUNT_ID = ""                      # Required when SESSION_DB_MODE="d1-rest"
-# SESSION_D1_DATABASE_ID = ""
-# SESSION_D1_API_TOKEN = ""
-# SESSION_POSTGREST_URL = "https://your-domain.com/postgrest"  # Required when SESSION_DB_MODE="custom-pg-rest"
-# SESSION_POSTGREST_TABLE_NAME = "SESSION_MAPPING_TABLE"
+# SESSION table uses the same database configuration defined by DB_MODE
 #
 #
 # # ═══════════════════════════════════════════════════════════════

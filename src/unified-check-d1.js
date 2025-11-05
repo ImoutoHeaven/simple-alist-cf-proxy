@@ -1,12 +1,13 @@
 import { sha256Hash, calculateIPSubnet } from './utils.js';
 
 /**
- * Ensure cache, rate limit, and throttle tables exist using a single batch call
+ * Ensure cache, rate limit, throttle, and session tables exist using a single batch call
  * @param {D1Database} db
  * @param {Object} tableNames
  * @param {string} tableNames.cacheTableName
  * @param {string} tableNames.rateLimitTableName
  * @param {string} tableNames.throttleTableName
+ * @param {string} [tableNames.sessionTableName]
  * @returns {Promise<void>}
  */
 const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttleTableName, sessionTableName }) => {
@@ -65,13 +66,14 @@ const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttl
 
 /**
  * Unified check for D1 binding (RTT 3→1 optimization)
- * Uses db.batch() to execute Rate Limit + Cache + Throttle in a single transaction
+ * Uses db.batch() to execute Session (optional) + Rate Limit + Cache in a single transaction
  * @param {string} path - File path
  * @param {string} clientIP - Client IP address
  * @param {Object} config - Configuration object
- * @returns {Promise<{cache, rateLimit, throttle}>}
+ * @param {string|null} sessionTicket - Optional session ticket
+ * @returns {Promise<{session, cache, rateLimit, throttle}>}
  */
-export const unifiedCheckD1 = async (path, clientIP, config) => {
+export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = null) => {
   if (!config.env || !config.databaseBinding) {
     throw new Error('[Unified Check D1] Missing D1 configuration');
   }
@@ -93,14 +95,9 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
 
-  let sessionTableName = null;
-  if (config.sessionEnabled === true && config.sessionDbMode === 'd1') {
-    const sessionBinding = config.sessionDbConfig?.databaseBinding;
-    const bindingMatches = !sessionBinding || sessionBinding === config.databaseBinding;
-    if (bindingMatches) {
-      sessionTableName = config.sessionDbConfig?.tableName || 'SESSION_MAPPING_TABLE';
-    }
-  }
+  const sessionEnabled = config.sessionEnabled === true;
+  const sessionTableName = sessionEnabled ? (config.sessionTableName || 'SESSION_MAPPING_TABLE') : null;
+  const shouldCheckSession = sessionEnabled && typeof sessionTicket === 'string' && sessionTicket.trim() !== '';
 
   await ensureAllTables(db, {
     cacheTableName,
@@ -129,6 +126,12 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
 
   // Prepare batch queries
   const statements = [];
+
+  if (shouldCheckSession) {
+    statements.push(
+      db.prepare(`SELECT SESSION_TICKET, FILE_PATH, IP_SUBNET, WORKER_ADDRESS, EXPIRE_AT FROM ${sessionTableName} WHERE SESSION_TICKET = ? LIMIT 1`).bind(sessionTicket)
+    );
+  }
 
   // 1. Cache SELECT
   const cacheSql = `SELECT LINK_DATA, TIMESTAMP, HOSTNAME_HASH FROM ${cacheTableName} WHERE PATH_HASH = ?`;
@@ -169,11 +172,61 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   );
 
   // Execute batch (single RTT!)
-  console.log('[Unified Check D1] Executing batch (2 queries in 1 RTT: cache + rate limit)');
+  console.log(`[Unified Check D1] Executing batch (${statements.length} queries in 1 RTT${shouldCheckSession ? ': session + cache + rate limit' : ': cache + rate limit'})`);
   const results = await db.batch(statements);
 
-  if (!results || results.length < 2) {
+  if (!results || results.length !== statements.length) {
     throw new Error('[Unified Check D1] Batch returned incomplete results');
+  }
+
+  // Parse session result (if requested)
+  let sessionResult = {
+    found: shouldCheckSession ? false : null,
+    filePath: null,
+    ipSubnet: null,
+    workerAddress: null,
+    expireAt: null,
+    error: null,
+  };
+
+  let resultIndex = 0;
+
+  if (shouldCheckSession) {
+    const sessionStatement = results[resultIndex];
+    const sessionRow = sessionStatement?.results?.[0];
+    if (sessionRow) {
+      const expireAtRaw = Number(sessionRow.EXPIRE_AT);
+      if (Number.isFinite(expireAtRaw) && expireAtRaw < now) {
+        sessionResult = {
+          found: false,
+          filePath: null,
+          ipSubnet: null,
+          workerAddress: null,
+          expireAt: expireAtRaw,
+          error: 'session expired',
+        };
+      } else {
+        sessionResult = {
+          found: true,
+          filePath: sessionRow.FILE_PATH,
+          ipSubnet: sessionRow.IP_SUBNET,
+          workerAddress: sessionRow.WORKER_ADDRESS,
+          expireAt: Number.isFinite(expireAtRaw) ? expireAtRaw : null,
+          error: null,
+        };
+      }
+    } else {
+      sessionResult = {
+        found: false,
+        filePath: null,
+        ipSubnet: null,
+        workerAddress: null,
+        expireAt: null,
+        error: 'session not found',
+      };
+    }
+
+    resultIndex += 1;
   }
 
   // Parse cache result
@@ -184,7 +237,8 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
     hostnameHash: null,
   };
 
-  const cacheRow = results[0].results?.[0];
+  const cacheStatement = results[resultIndex];
+  const cacheRow = cacheStatement.results?.[0];
   if (cacheRow) {
     const age = now - parseInt(cacheRow.TIMESTAMP, 10);
     if (age <= cacheTTL) {
@@ -205,7 +259,9 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   }
 
   // Parse rate limit result
-  const rateLimitRow = results[1].results?.[0];
+  resultIndex += 1;
+  const rateLimitStatement = results[resultIndex];
+  const rateLimitRow = rateLimitStatement.results?.[0];
   if (!rateLimitRow) {
     throw new Error('[Unified Check D1] Rate limit UPSERT returned no rows');
   }
@@ -291,6 +347,7 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   console.log('[Unified Check D1] Completed successfully');
 
   return {
+    session: sessionResult,
     cache: cacheResult,
     rateLimit: rateLimitResult,
     throttle: throttleResult,

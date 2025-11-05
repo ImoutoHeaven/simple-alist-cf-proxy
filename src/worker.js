@@ -2,7 +2,6 @@
 import { createCacheManager } from './cache/factory.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
-import { createSessionDBManager } from './session-db/factory.js';
 import { unifiedCheck } from './unified-check.js';
 import { unifiedCheckD1 } from './unified-check-d1.js';
 import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
@@ -366,81 +365,7 @@ const resolveConfig = (env = {}) => {
   if (onlySessionMode && !sessionEnabled) {
     throw new Error('ONLY_SESSION_MODE is true but SESSION_ENABLED is false');
   }
-  const rawSessionDbMode = normalizeString(env.SESSION_DB_MODE);
-  const sessionDbMode = rawSessionDbMode || dbMode || '';
-  const sessionTableNameRaw = normalizeString(env.SESSION_D1_TABLE_NAME);
-  const sessionDefaultTable = sessionTableNameRaw || 'SESSION_MAPPING_TABLE';
-  const sessionPostgrestTableRaw = normalizeString(env.SESSION_POSTGREST_TABLE_NAME);
-  const sessionPostgrestTableName = sessionPostgrestTableRaw || sessionDefaultTable;
-
-  let sessionDbConfig = null;
-  const normalizedSessionDbMode = sessionDbMode ? sessionDbMode.toLowerCase() : '';
-
-  if (sessionEnabled) {
-    if (!normalizedSessionDbMode) {
-      throw new Error('SESSION_ENABLED is true but SESSION_DB_MODE (or DB_MODE fallback) is missing');
-    }
-
-    if (normalizedSessionDbMode === 'd1') {
-      const explicitBinding = normalizeString(env.SESSION_D1_DATABASE_BINDING);
-      const fallbackBinding =
-        normalizeString(cacheConfig?.databaseBinding) ||
-        normalizeString(rateLimitConfig?.databaseBinding) ||
-        'SESSIONDB';
-      const databaseBinding = explicitBinding || fallbackBinding;
-      sessionDbConfig = {
-        env,
-        databaseBinding,
-        tableName: sessionDefaultTable,
-      };
-    } else if (normalizedSessionDbMode === 'd1-rest') {
-      const accountId =
-        normalizeString(env.SESSION_D1_ACCOUNT_ID) ||
-        normalizeString(rateLimitConfig?.accountId) ||
-        normalizeString(cacheConfig?.accountId);
-      const databaseId =
-        normalizeString(env.SESSION_D1_DATABASE_ID) ||
-        normalizeString(rateLimitConfig?.databaseId) ||
-        normalizeString(cacheConfig?.databaseId);
-      const apiToken =
-        normalizeString(env.SESSION_D1_API_TOKEN) ||
-        normalizeString(rateLimitConfig?.apiToken) ||
-        normalizeString(cacheConfig?.apiToken);
-
-      if (!accountId || !databaseId || !apiToken) {
-        throw new Error(
-          'SESSION_DB_MODE is "d1-rest" but SESSION_D1_ACCOUNT_ID, SESSION_D1_DATABASE_ID, or SESSION_D1_API_TOKEN is missing'
-        );
-      }
-
-      sessionDbConfig = {
-        accountId,
-        databaseId,
-        apiToken,
-        tableName: sessionDefaultTable,
-      };
-    } else if (normalizedSessionDbMode === 'custom-pg-rest') {
-      const postgrestUrl =
-        normalizeString(env.SESSION_POSTGREST_URL) ||
-        normalizeString(rateLimitConfig?.postgrestUrl) ||
-        normalizeString(cacheConfig?.postgrestUrl);
-
-      if (!postgrestUrl) {
-        throw new Error('SESSION_DB_MODE is "custom-pg-rest" but SESSION_POSTGREST_URL is missing');
-      }
-
-      sessionDbConfig = {
-        postgrestUrl,
-        tableName: sessionPostgrestTableName,
-        verifyHeader: verifyHeaders,
-        verifySecret: verifySecrets,
-      };
-    } else {
-      throw new Error(
-        `Invalid SESSION_DB_MODE: "${sessionDbMode}". Valid options are: "d1", "d1-rest", "custom-pg-rest".`
-      );
-    }
-  }
+  const sessionTableName = normalizeString(env.SESSION_TABLE_NAME) || 'SESSION_MAPPING_TABLE';
 
   return {
     address: String(env.ADDRESS).trim(),
@@ -487,8 +412,7 @@ const resolveConfig = (env = {}) => {
     ipv6Suffix,
     sessionEnabled,
     onlySessionMode,
-    sessionDbMode: normalizedSessionDbMode,
-    sessionDbConfig,
+    sessionTableName,
   };
 };
 
@@ -832,6 +756,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   const sessionInfo = options?.sessionInfo || null;
   const requestedPath = safeDecodePathname(url.pathname);
   let path = requestedPath;
+  const preCheckedUnifiedResult = options?.preCheckedUnifiedResult || null;
 
   if (isSessionMode) {
     path = typeof sessionInfo?.filePath === "string" ? sessionInfo.filePath : null;
@@ -1044,7 +969,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // ========================================
   // UNIFIED CHECK (RTT 3→1 OPTIMIZATION)
   // ========================================
-  let unifiedResult = null;
+  let unifiedResult = preCheckedUnifiedResult;
   let cacheHit = false;
   let linkData = null;
   
@@ -1056,12 +981,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   );
 
   if (supportsUnifiedCheck) {
-    try {
+    if (!unifiedResult) {
+      try {
 
       const rateLimitConfig = config.rateLimitConfig || {};
       const cacheConfig = config.cacheConfig || {};
       const throttleConfig = config.throttleConfig || {};
       const limitConfigValue = rateLimitConfig.limit ?? config.ipSubnetLimit;
+      const sessionTableName = config.sessionTableName || 'SESSION_MAPPING_TABLE';
 
       if (config.dbMode === 'custom-pg-rest') {
         unifiedResult = await unifiedCheck(path, clientIP, {
@@ -1078,6 +1005,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+          sessionTableName,
         });
       } else if (config.dbMode === 'd1') {
         unifiedResult = await unifiedCheckD1(path, clientIP, {
@@ -1094,8 +1022,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
           sessionEnabled: config.sessionEnabled,
-          sessionDbMode: config.sessionDbMode,
-          sessionDbConfig: config.sessionDbConfig,
+          sessionTableName,
         });
       } else if (config.dbMode === 'd1-rest') {
         unifiedResult = await unifiedCheckD1Rest(path, clientIP, {
@@ -1113,101 +1040,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
           sessionEnabled: config.sessionEnabled,
-          sessionDbMode: config.sessionDbMode,
-          sessionDbConfig: config.sessionDbConfig,
+          sessionTableName,
         });
       } else {
         throw new Error(`Unsupported database mode for unified check: ${config.dbMode}`);
       }
-      
-      // Check rate limit result
-      if (!unifiedResult.rateLimit.allowed) {
-        if (unifiedResult.rateLimit.error) {
-          console.error('[Rate Limit] fail-closed error:', unifiedResult.rateLimit.error);
-          return createErrorResponse(origin, 500, unifiedResult.rateLimit.error);
-        }
-        
-        const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
-        console.warn(
-          '[Rate Limit] Subnet blocked:',
-          unifiedResult.rateLimit.ipSubnet || clientIP,
-          `limit=${config.ipSubnetLimit}`,
-          `window=${windowLabel}`,
-          `retryAfter=${unifiedResult.rateLimit.retryAfter || 0}s`
-        );
-        return createRateLimitResponse(
-          origin,
-          unifiedResult.rateLimit.ipSubnet || clientIP,
-          config.ipSubnetLimit,
-          windowLabel,
-          unifiedResult.rateLimit.retryAfter
-        );
-      }
-      
-      // Check cache result
-      if (unifiedResult.cache.hit) {
-        cacheHit = true;
-        linkData = unifiedResult.cache.linkData;
-      }
-      
-      // Check throttle result (if we have cache hit with hostname_hash)
-      if (config.throttleEnabled && unifiedResult.throttle.status === 'protected') {
-        console.log(`[Throttle] Protected from unified check, returning error ${unifiedResult.throttle.errorCode}, retry after ${unifiedResult.throttle.retryAfter}s`);
-        
-        const safeHeaders = new Headers();
-        safeHeaders.set("content-type", "application/json;charset=UTF-8");
-        safeHeaders.set("Access-Control-Allow-Origin", origin);
-        safeHeaders.append("Vary", "Origin");
-        safeHeaders.set("X-Throttle-Protected", "true");
-        safeHeaders.set("X-Throttle-Retry-After", String(unifiedResult.throttle.retryAfter));
-        
-        return new Response(
-          JSON.stringify({
-            code: unifiedResult.throttle.errorCode || 503,
-            message: `Service temporarily unavailable (throttle protected, retry after ${unifiedResult.throttle.retryAfter}s)`
-          }),
-          {
-            status: unifiedResult.throttle.errorCode || 503,
-            headers: safeHeaders
-          }
-        );
-      }
-      
-      // Trigger probabilistic cleanup for rate limit
-      if (rateLimiter && config.rateLimitConfig) {
-        const probability = config.rateLimitConfig.cleanupProbability || 0.01;
-        if (Math.random() < probability) {
-          console.log(`[Rate Limit Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
-          
-          let cleanupPromise;
-          
-          if (config.dbMode === 'custom-pg-rest') {
-            const { cleanupExpiredRecords } = await import('./ratelimit/custom-pg-rest.js');
-            cleanupPromise = cleanupExpiredRecords(
-              config.rateLimitConfig.postgrestUrl,
-              config.rateLimitConfig.verifyHeader,
-              config.rateLimitConfig.verifySecret,
-              config.rateLimitConfig.tableName,
-              config.rateLimitConfig.windowTimeSeconds
-            ).catch((error) => {
-              console.error('[Rate Limit Cleanup] Failed:', error instanceof Error ? error.message : String(error));
-            });
-          } else if (config.dbMode === 'd1') {
-            // D1 cleanup is already triggered inside checkRateLimit's triggerCleanup
-            // No need to trigger here
-            console.log('[Rate Limit Cleanup] Skipped (D1 cleanup handled internally)');
-          } else if (config.dbMode === 'd1-rest') {
-            // D1-REST cleanup is already triggered inside checkRateLimit's triggerCleanup
-            // No need to trigger here
-            console.log('[Rate Limit Cleanup] Skipped (D1-REST cleanup handled internally)');
-          }
-          
-          if (cleanupPromise && ctx && ctx.waitUntil) {
-            ctx.waitUntil(cleanupPromise);
-          }
-        }
-      }
-      
+
   } catch (error) {
     console.error('[Unified Check] Failed:', error instanceof Error ? error.message : String(error));
     console.error('[Unified Check] Stack:', error.stack);
@@ -1225,6 +1063,89 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     } else {
       console.error('[Unified Check] Fail-closed mode: blocking request');
       return createErrorResponse(origin, 500, `Unified check failed: ${error.message}`);
+    }
+    }
+    if (unifiedResult) {
+      if (!unifiedResult.rateLimit.allowed) {
+        if (unifiedResult.rateLimit.error) {
+          console.error('[Rate Limit] fail-closed error:', unifiedResult.rateLimit.error);
+          return createErrorResponse(origin, 500, unifiedResult.rateLimit.error);
+        }
+
+        const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
+        console.warn(
+          '[Rate Limit] Subnet blocked:',
+          unifiedResult.rateLimit.ipSubnet || clientIP,
+          `limit=${config.ipSubnetLimit}`,
+          `window=${windowLabel}`,
+          `retryAfter=${unifiedResult.rateLimit.retryAfter || 0}s`
+        );
+        return createRateLimitResponse(
+          origin,
+          unifiedResult.rateLimit.ipSubnet || clientIP,
+          config.ipSubnetLimit,
+          windowLabel,
+          unifiedResult.rateLimit.retryAfter
+        );
+      }
+
+      if (unifiedResult.cache.hit) {
+        cacheHit = true;
+        linkData = unifiedResult.cache.linkData;
+      }
+
+      if (config.throttleEnabled && unifiedResult.throttle.status === 'protected') {
+        console.log(`[Throttle] Protected from unified check, returning error ${unifiedResult.throttle.errorCode}, retry after ${unifiedResult.throttle.retryAfter}s`);
+
+        const safeHeaders = new Headers();
+        safeHeaders.set("content-type", "application/json;charset=UTF-8");
+        safeHeaders.set("Access-Control-Allow-Origin", origin);
+        safeHeaders.append("Vary", "Origin");
+        safeHeaders.set("X-Throttle-Protected", "true");
+        safeHeaders.set("X-Throttle-Retry-After", String(unifiedResult.throttle.retryAfter));
+
+        return new Response(
+          JSON.stringify({
+            code: unifiedResult.throttle.errorCode || 503,
+            message: `Service temporarily unavailable (throttle protected, retry after ${unifiedResult.throttle.retryAfter}s)`
+          }),
+          {
+            status: unifiedResult.throttle.errorCode || 503,
+            headers: safeHeaders
+          }
+        );
+      }
+
+      if (rateLimiter && config.rateLimitConfig) {
+        const probability = config.rateLimitConfig.cleanupProbability || 0.01;
+        if (Math.random() < probability) {
+          console.log(`[Rate Limit Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
+
+          let cleanupPromise;
+
+          if (config.dbMode === 'custom-pg-rest') {
+            const { cleanupExpiredRecords } = await import('./ratelimit/custom-pg-rest.js');
+            cleanupPromise = cleanupExpiredRecords(
+              config.rateLimitConfig.postgrestUrl,
+              config.rateLimitConfig.verifyHeader,
+              config.rateLimitConfig.verifySecret,
+              config.rateLimitConfig.tableName,
+              config.rateLimitConfig.windowTimeSeconds
+            ).catch((cleanupError) => {
+              console.error('[Rate Limit Cleanup] Failed:', cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
+            });
+          } else if (config.dbMode === 'd1') {
+            console.log('[Rate Limit Cleanup] Skipped (D1 cleanup handled internally)');
+          } else if (config.dbMode === 'd1-rest') {
+            console.log('[Rate Limit Cleanup] Skipped (D1-REST cleanup handled internally)');
+          }
+
+          if (cleanupPromise && ctx && ctx.waitUntil) {
+            ctx.waitUntil(cleanupPromise);
+          }
+        }
+      }
+    }
     }
   }
 } else {
@@ -1589,15 +1510,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   return safeResponse;
 }
 
-async function handleSessionDownload(request, env, config, cacheManager, throttleManager, rateLimiter, sessionDBManager, ctx) {
+async function handleSessionDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
   const origin = request.headers.get("origin") ?? "*";
 
   if (!config.sessionEnabled) {
     return createErrorResponse(origin, 404, "session mode disabled");
-  }
-
-  if (!sessionDBManager) {
-    return createErrorResponse(origin, 500, "session storage unavailable");
   }
 
   const url = new URL(request.url);
@@ -1616,26 +1533,91 @@ async function handleSessionDownload(request, env, config, cacheManager, throttl
     return createUnauthorizedResponse(origin, "session signature invalid");
   }
 
-  let sessionRecord;
+  const clientIP = request.headers.get("CF-Connecting-IP") || "";
+  const placeholderPath = safeDecodePathname(url.pathname) || url.pathname || '/session';
+
+  let unifiedResult;
   try {
-    sessionRecord = await sessionDBManager.get(sessionTicket);
+    const rateLimitConfig = config.rateLimitConfig || {};
+    const cacheConfig = config.cacheConfig || {};
+    const throttleConfig = config.throttleConfig || {};
+    const limitConfigValue = rateLimitConfig.limit ?? config.ipSubnetLimit;
+    const sessionTableName = config.sessionTableName || 'SESSION_MAPPING_TABLE';
+
+    if (config.dbMode === 'custom-pg-rest') {
+      unifiedResult = await unifiedCheck(placeholderPath, clientIP, {
+        postgrestUrl: rateLimitConfig.postgrestUrl,
+        verifyHeader: rateLimitConfig.verifyHeader,
+        verifySecret: rateLimitConfig.verifySecret,
+        linkTTL: cacheConfig.linkTTL ?? 1800,
+        cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
+        windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
+        limit: limitConfigValue ?? 100,
+        blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
+        ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
+        ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
+        rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
+        throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
+        throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+        sessionTableName,
+      }, sessionTicket);
+    } else if (config.dbMode === 'd1') {
+      unifiedResult = await unifiedCheckD1(placeholderPath, clientIP, {
+        env: cacheConfig.env || rateLimitConfig.env,
+        databaseBinding: cacheConfig.databaseBinding || rateLimitConfig.databaseBinding || 'DB',
+        linkTTL: cacheConfig.linkTTL ?? 1800,
+        cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
+        windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
+        limit: limitConfigValue ?? 100,
+        blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
+        ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
+        ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
+        rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
+        throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
+        throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+        sessionEnabled: config.sessionEnabled,
+        sessionTableName,
+      }, sessionTicket);
+    } else if (config.dbMode === 'd1-rest') {
+      unifiedResult = await unifiedCheckD1Rest(placeholderPath, clientIP, {
+        accountId: rateLimitConfig.accountId || throttleConfig.accountId || cacheConfig.accountId,
+        databaseId: rateLimitConfig.databaseId || throttleConfig.databaseId || cacheConfig.databaseId,
+        apiToken: rateLimitConfig.apiToken || throttleConfig.apiToken || cacheConfig.apiToken,
+        linkTTL: cacheConfig.linkTTL ?? 1800,
+        cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
+        windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
+        limit: limitConfigValue ?? 100,
+        blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
+        ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
+        ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
+        rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
+        throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
+        throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+        sessionEnabled: config.sessionEnabled,
+        sessionTableName,
+      }, sessionTicket);
+    } else {
+      throw new Error(`Unsupported database mode for unified session check: ${config.dbMode}`);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error('[Session] lookup failed:', message);
+    console.error('[Session] unified check failed:', message);
     return createErrorResponse(origin, 500, "session lookup failed");
   }
 
-  if (!sessionRecord || sessionRecord.found !== true) {
-    return createUnauthorizedResponse(origin, "session invalid");
+  const sessionDetails = unifiedResult?.session;
+  if (!sessionDetails || sessionDetails.found !== true) {
+    const errorMessage = sessionDetails?.error || 'session invalid';
+    return createErrorResponse(origin, 401, errorMessage);
   }
 
-  const rawFilePath = typeof sessionRecord.file_path === "string" ? sessionRecord.file_path : "";
+  const rawFilePath = typeof sessionDetails.filePath === "string" ? sessionDetails.filePath : "";
   if (!rawFilePath) {
     return createUnauthorizedResponse(origin, "session path missing");
   }
 
   const normalizedFilePath = rawFilePath.startsWith("/") ? rawFilePath : `/${rawFilePath}`;
-  const expireAt = Number.isFinite(Number(sessionRecord.expire_at)) ? Number(sessionRecord.expire_at) : 0;
+  const expireAt = Number.isFinite(Number(sessionDetails.expireAt)) ? Number(sessionDetails.expireAt) : 0;
   const nowSeconds = Math.floor(Date.now() / 1000);
   if (!expireAt || expireAt <= nowSeconds) {
     return createUnauthorizedResponse(origin, "session expired");
@@ -1643,8 +1625,8 @@ async function handleSessionDownload(request, env, config, cacheManager, throttl
 
   const sessionInfo = {
     filePath: normalizedFilePath,
-    ipSubnet: typeof sessionRecord.ip_subnet === "string" ? sessionRecord.ip_subnet : "",
-    workerAddress: typeof sessionRecord.worker_address === "string" ? sessionRecord.worker_address : "",
+    ipSubnet: typeof sessionDetails.ipSubnet === "string" ? sessionDetails.ipSubnet : "",
+    workerAddress: typeof sessionDetails.workerAddress === "string" ? sessionDetails.workerAddress : "",
     expireAt,
   };
 
@@ -1659,6 +1641,7 @@ async function handleSessionDownload(request, env, config, cacheManager, throttl
     {
       isSessionMode: true,
       sessionInfo,
+      preCheckedUnifiedResult: unifiedResult,
     }
   );
 }
@@ -1689,7 +1672,7 @@ function handleOptions(request) {
     return new Response(null, {
       headers: safeHeaders
     });
-  }
+    }
 }
 
 // src/handleRequest.ts - Modified to check IPv6 addresses
@@ -1717,7 +1700,7 @@ async function checkCfRatelimit(env, clientIP, ipv4Suffix, ipv6Suffix, bindingNa
 }
 
 // src/handleRequest.ts - Modified to check IPv6 addresses
-async function handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, sessionDBManager, ctx) {
+async function handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
   const origin = request.headers.get("origin") ?? "*";
   // Check for IPv6 access if IPv4_ONLY is enabled
   if (config.ipv4Only) {
@@ -1754,8 +1737,12 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
     return createErrorResponse(origin, 403, "Only session-based downloads are allowed");
   }
 
+  if (isSessionRequest && (!config.dbMode || config.dbMode.trim() === '')) {
+    return new Response('Session mode requires database configuration', { status: 403 });
+  }
+
   if (isSessionRequest) {
-    return handleSessionDownload(request, env, config, cacheManager, throttleManager, rateLimiter, sessionDBManager, ctx);
+    return handleSessionDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
   }
 
   return await handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
@@ -1770,8 +1757,7 @@ export default {
       // Create throttle manager instance based on DB_MODE (if throttle enabled)
       const throttleManager = config.throttleEnabled ? createThrottleManager(config.dbMode) : null;
       const rateLimiter = config.rateLimitEnabled ? createRateLimiter(config.dbMode) : null;
-      const sessionDBManager = config.sessionEnabled ? createSessionDBManager(config) : null;
-      const response = await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, sessionDBManager, ctx);
+      const response = await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 
       scheduleAllCleanups(config, env, ctx).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
