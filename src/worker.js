@@ -738,6 +738,19 @@ const hmacSha256Sign = async (data, expire, token) => {
   return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_") + ":" + expire;
 };
 
+const verifySignature = async (secret, data, signature) => {
+  if (!signature) return 'sign missing';
+  const parts = signature.split(':');
+  const expirePart = parts[parts.length - 1];
+  if (!expirePart) return 'expire missing';
+  const expire = Number.parseInt(expirePart, 10);
+  if (Number.isNaN(expire)) return 'expire invalid';
+  if (expire < Date.now() / 1e3 && expire > 0) return 'expire expired';
+  const expected = await hmacSha256Sign(data, expire, secret);
+  if (expected !== signature) return 'sign mismatch';
+  return '';
+};
+
 function createErrorResponse(origin, status, message) {
   const safeHeaders = new Headers();
   safeHeaders.set("content-type", "application/json;charset=UTF-8");
