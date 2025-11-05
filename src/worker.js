@@ -1147,8 +1147,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       }
     }
     }
-  }
-} else {
+  } else {
     // Fallback to original logic when unified check is not supported
     
     if (rateLimiter && config.rateLimitEnabled && clientIP) {
