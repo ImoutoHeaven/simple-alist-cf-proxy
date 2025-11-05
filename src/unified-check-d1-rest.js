@@ -323,12 +323,14 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
   const configuredSessionTable = config.sessionTableName || 'SESSION_MAPPING_TABLE';
   const shouldCheckSession = sessionEnabled && typeof sessionTicket === 'string' && sessionTicket.trim() !== '';
 
-  await ensureAllTables(accountId, databaseId, apiToken, {
-    cacheTableName,
-    rateLimitTableName,
-    throttleTableName,
-    sessionTableName: sessionEnabled ? configuredSessionTable : null,
-  });
+  if (config.initTables === true) {
+    await ensureAllTables(accountId, databaseId, apiToken, {
+      cacheTableName,
+      rateLimitTableName,
+      throttleTableName,
+      sessionTableName: sessionEnabled ? configuredSessionTable : null,
+    });
+  }
 
   console.log('[Unified Check D1-REST] Starting unified check for path:', path);
 

@@ -366,6 +366,7 @@ const resolveConfig = (env = {}) => {
     throw new Error('ONLY_SESSION_MODE is true but SESSION_ENABLED is false');
   }
   const sessionTableName = normalizeString(env.SESSION_TABLE_NAME) || 'SESSION_MAPPING_TABLE';
+  const initTables = parseBoolean(env.INIT_TABLES, false);
 
   return {
     address: String(env.ADDRESS).trim(),
@@ -413,6 +414,7 @@ const resolveConfig = (env = {}) => {
     sessionEnabled,
     onlySessionMode,
     sessionTableName,
+    initTables,
   };
 };
 

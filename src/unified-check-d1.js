@@ -100,12 +100,14 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
   const sessionTableName = sessionEnabled ? (config.sessionTableName || 'SESSION_MAPPING_TABLE') : null;
   const shouldCheckSession = sessionEnabled && typeof sessionTicket === 'string' && sessionTicket.trim() !== '';
 
-  await ensureAllTables(db, {
-    cacheTableName,
-    rateLimitTableName,
-    throttleTableName,
-    sessionTableName,
-  });
+  if (config.initTables === true) {
+    await ensureAllTables(db, {
+      cacheTableName,
+      rateLimitTableName,
+      throttleTableName,
+      sessionTableName,
+    });
+  }
 
   console.log('[Unified Check D1] Starting unified check for path:', path);
 
