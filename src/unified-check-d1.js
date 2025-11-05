@@ -51,6 +51,7 @@ const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttl
         CREATE TABLE IF NOT EXISTS ${sessionTableName} (
           SESSION_TICKET TEXT PRIMARY KEY,
           FILE_PATH TEXT NOT NULL,
+          FILE_PATH_HASH TEXT NOT NULL,
           IP_SUBNET TEXT NOT NULL,
           WORKER_ADDRESS TEXT NOT NULL,
           EXPIRE_AT INTEGER NOT NULL,
@@ -124,20 +125,32 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
     throw new Error('[Unified Check D1] Failed to calculate IP hash');
   }
 
-  // Prepare batch queries
-  const statements = [];
+  const defaultSessionResult = {
+    found: shouldCheckSession ? false : null,
+    filePath: null,
+    filePathHash: null,
+    ipSubnet: null,
+    workerAddress: null,
+    expireAt: null,
+    error: null,
+  };
 
-  if (shouldCheckSession) {
-    statements.push(
-      db.prepare(`SELECT SESSION_TICKET, FILE_PATH, IP_SUBNET, WORKER_ADDRESS, EXPIRE_AT FROM ${sessionTableName} WHERE SESSION_TICKET = ? LIMIT 1`).bind(sessionTicket)
-    );
-  }
+  const defaultCacheResult = {
+    hit: false,
+    linkData: null,
+    timestamp: null,
+    hostnameHash: null,
+  };
 
-  // 1. Cache SELECT
-  const cacheSql = `SELECT LINK_DATA, TIMESTAMP, HOSTNAME_HASH FROM ${cacheTableName} WHERE PATH_HASH = ?`;
-  statements.push(db.prepare(cacheSql).bind(pathHash));
+  const defaultThrottleResult = {
+    status: 'normal_operation',
+    recordExists: false,
+    isProtected: null,
+    errorTimestamp: null,
+    errorCode: null,
+    retryAfter: 0,
+  };
 
-  // 2. Rate Limit UPSERT (same complex logic as d1.js)
   const rateLimitSql = `
     INSERT INTO ${rateLimitTableName} (IP_HASH, IP_RANGE, ACCESS_COUNT, LAST_WINDOW_TIME, BLOCK_UNTIL)
     VALUES (?, ?, 1, ?, NULL)
@@ -162,189 +175,245 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
     RETURNING ACCESS_COUNT, LAST_WINDOW_TIME, BLOCK_UNTIL
   `;
 
-  statements.push(
+  const createRateLimitStatement = () =>
     db.prepare(rateLimitSql).bind(
       ipHash, ipSubnet, now,
       now, windowSeconds, now, limit,
       now, windowSeconds, now, now, now,
       now, windowSeconds, now, limit, blockSeconds, now, blockSeconds
-    )
-  );
+    );
 
-  // Execute batch (single RTT!)
-  console.log(`[Unified Check D1] Executing batch (${statements.length} queries in 1 RTT${shouldCheckSession ? ': session + cache + rate limit' : ': cache + rate limit'})`);
-  const results = await db.batch(statements);
-
-  if (!results || results.length !== statements.length) {
-    throw new Error('[Unified Check D1] Batch returned incomplete results');
-  }
-
-  // Parse session result (if requested)
-  let sessionResult = {
-    found: shouldCheckSession ? false : null,
-    filePath: null,
-    ipSubnet: null,
-    workerAddress: null,
-    expireAt: null,
-    error: null,
-  };
-
-  let resultIndex = 0;
-
-  if (shouldCheckSession) {
-    const sessionStatement = results[resultIndex];
-    const sessionRow = sessionStatement?.results?.[0];
-    if (sessionRow) {
-      const expireAtRaw = Number(sessionRow.EXPIRE_AT);
-      if (Number.isFinite(expireAtRaw) && expireAtRaw < now) {
-        sessionResult = {
-          found: false,
-          filePath: null,
-          ipSubnet: null,
-          workerAddress: null,
-          expireAt: expireAtRaw,
-          error: 'session expired',
-        };
-      } else {
-        sessionResult = {
-          found: true,
-          filePath: sessionRow.FILE_PATH,
-          ipSubnet: sessionRow.IP_SUBNET,
-          workerAddress: sessionRow.WORKER_ADDRESS,
-          expireAt: Number.isFinite(expireAtRaw) ? expireAtRaw : null,
-          error: null,
-        };
-      }
-    } else {
-      sessionResult = {
-        found: false,
-        filePath: null,
-        ipSubnet: null,
-        workerAddress: null,
-        expireAt: null,
-        error: 'session not found',
-      };
+  const parseRateLimitResult = (rateLimitRow) => {
+    if (!rateLimitRow) {
+      throw new Error('[Unified Check D1] Rate limit UPSERT returned no rows');
     }
 
-    resultIndex += 1;
-  }
+    const accessCount = parseInt(rateLimitRow.ACCESS_COUNT, 10);
+    const lastWindowTime = parseInt(rateLimitRow.LAST_WINDOW_TIME, 10);
+    const blockUntil = rateLimitRow.BLOCK_UNTIL ? parseInt(rateLimitRow.BLOCK_UNTIL, 10) : null;
 
-  // Parse cache result
-  let cacheResult = {
-    hit: false,
-    linkData: null,
-    timestamp: null,
-    hostnameHash: null,
+    let allowed = true;
+    let retryAfter = 0;
+
+    if (blockUntil && blockUntil > now) {
+      allowed = false;
+      retryAfter = blockUntil - now;
+      console.log('[Unified Check D1] Rate limit BLOCKED until:', new Date(blockUntil * 1000).toISOString());
+    } else if (accessCount >= limit) {
+      const diff = now - lastWindowTime;
+      retryAfter = Math.max(windowSeconds - diff, 0);
+      allowed = false;
+      console.log('[Unified Check D1] Rate limit EXCEEDED:', accessCount, '>=', limit);
+    } else {
+      console.log('[Unified Check D1] Rate limit OK:', accessCount, '/', limit);
+    }
+
+    return {
+      allowed,
+      accessCount,
+      lastWindowTime,
+      blockUntil,
+      retryAfter,
+      ipSubnet,
+      limit,
+      error: null,
+    };
   };
 
-  const cacheStatement = results[resultIndex];
-  const cacheRow = cacheStatement.results?.[0];
-  if (cacheRow) {
-    const age = now - parseInt(cacheRow.TIMESTAMP, 10);
-    if (age <= cacheTTL) {
+  const parseCacheRow = (cacheRow, context) => {
+    const cacheResult = { ...defaultCacheResult };
+
+    if (!cacheRow) {
+      console.log('[Unified Check D1] Cache MISS for', context);
+      return cacheResult;
+    }
+
+    const timestamp = parseInt(cacheRow.TIMESTAMP, 10);
+    const age = now - timestamp;
+    if (Number.isFinite(age) && age <= cacheTTL) {
       try {
         cacheResult.hit = true;
         cacheResult.linkData = JSON.parse(cacheRow.LINK_DATA);
         cacheResult.timestamp = cacheRow.TIMESTAMP;
         cacheResult.hostnameHash = cacheRow.HOSTNAME_HASH || null;
-        console.log('[Unified Check D1] Cache HIT for path:', path);
+        console.log('[Unified Check D1] Cache HIT for', context);
       } catch (error) {
         console.error('[Unified Check D1] Failed to parse cache link data:', error.message);
       }
     } else {
-      console.log('[Unified Check D1] Cache expired (age:', age, 's)');
+      console.log('[Unified Check D1] Cache expired (age:', age, 's) for', context);
     }
-  } else {
-    console.log('[Unified Check D1] Cache MISS for path:', path);
-  }
 
-  // Parse rate limit result
-  resultIndex += 1;
-  const rateLimitStatement = results[resultIndex];
-  const rateLimitRow = rateLimitStatement.results?.[0];
-  if (!rateLimitRow) {
-    throw new Error('[Unified Check D1] Rate limit UPSERT returned no rows');
-  }
-
-  const accessCount = parseInt(rateLimitRow.ACCESS_COUNT, 10);
-  const lastWindowTime = parseInt(rateLimitRow.LAST_WINDOW_TIME, 10);
-  const blockUntil = rateLimitRow.BLOCK_UNTIL ? parseInt(rateLimitRow.BLOCK_UNTIL, 10) : null;
-
-  let rateLimitAllowed = true;
-  let rateLimitRetryAfter = 0;
-
-  if (blockUntil && blockUntil > now) {
-    rateLimitAllowed = false;
-    rateLimitRetryAfter = blockUntil - now;
-    console.log('[Unified Check D1] Rate limit BLOCKED until:', new Date(blockUntil * 1000).toISOString());
-  } else if (accessCount >= limit) {
-    const diff = now - lastWindowTime;
-    rateLimitRetryAfter = windowSeconds - diff;
-    rateLimitAllowed = false;
-    console.log('[Unified Check D1] Rate limit EXCEEDED:', accessCount, '>=', limit);
-  } else {
-    console.log('[Unified Check D1] Rate limit OK:', accessCount, '/', limit);
-  }
-
-  const rateLimitResult = {
-    allowed: rateLimitAllowed,
-    accessCount,
-    lastWindowTime,
-    blockUntil,
-    retryAfter: rateLimitRetryAfter,
-    ipSubnet,
+    return cacheResult;
   };
 
-  // Parse throttle result (only if cache hit with hostname_hash)
-  // BREAKING CHANGE: IS_PROTECTED semantics
-  //   1 = protected (error detected)
-  //   0 = normal operation (initialized or recovered)
-  //   NULL = record does not exist
-  let throttleResult = {
-    status: 'normal_operation',
-    recordExists: false,
-    isProtected: null,
-    errorTimestamp: null,
-    errorCode: null,
-    retryAfter: 0,
-  };
+  const parseThrottleRow = (throttleRow, cacheResult) => {
+    const throttleResult = { ...defaultThrottleResult };
 
-  if (cacheResult.hostnameHash) {
-    // Throttle query (conditional - only when cache hit)
-    const throttleSql = `SELECT IS_PROTECTED, ERROR_TIMESTAMP, LAST_ERROR_CODE FROM ${throttleTableName} WHERE HOSTNAME_HASH = ?`;
-    const throttleQueryResult = await db.prepare(throttleSql).bind(cacheResult.hostnameHash).first();
+    if (!cacheResult.hit || !cacheResult.hostnameHash) {
+      console.log('[Unified Check D1] Skipping throttle check (no hostname_hash from cache)');
+      return throttleResult;
+    }
 
-    if (throttleQueryResult) {
-      throttleResult.recordExists = true;
-      throttleResult.isProtected = throttleQueryResult.IS_PROTECTED;
-      throttleResult.errorTimestamp = throttleQueryResult.ERROR_TIMESTAMP;
-      throttleResult.errorCode = throttleQueryResult.LAST_ERROR_CODE;
-
-      if (throttleQueryResult.IS_PROTECTED === 1) {
-        const errorTimestamp = parseInt(throttleQueryResult.ERROR_TIMESTAMP, 10);
-        const timeSinceError = now - errorTimestamp;
-
-        if (timeSinceError < throttleTimeWindow) {
-          throttleResult.status = 'protected';
-          throttleResult.retryAfter = throttleTimeWindow - timeSinceError;
-          console.log('[Unified Check D1] Throttle PROTECTED, retry after:', throttleResult.retryAfter);
-        } else {
-          throttleResult.status = 'resume_operation';
-          console.log('[Unified Check D1] Throttle resume_operation (time window expired)');
-        }
-      } else if (throttleQueryResult.IS_PROTECTED === 0) {
-        console.log('[Unified Check D1] Throttle normal_operation (IS_PROTECTED = 0)');
-      } else {
-        console.log('[Unified Check D1] Throttle normal_operation (IS_PROTECTED = NULL, invalid state)');
-      }
-    } else {
+    if (!throttleRow) {
       console.log('[Unified Check D1] Throttle normal_operation (no record found)');
+      return throttleResult;
     }
-  } else {
-    console.log('[Unified Check D1] Skipping throttle check (no hostname_hash from cache)');
+
+    throttleResult.recordExists = true;
+    throttleResult.isProtected = throttleRow.IS_PROTECTED;
+    throttleResult.errorTimestamp = throttleRow.ERROR_TIMESTAMP;
+    throttleResult.errorCode = throttleRow.LAST_ERROR_CODE ?? null;
+
+    if (throttleRow.IS_PROTECTED === 1) {
+      const errorTimestamp = parseInt(throttleRow.ERROR_TIMESTAMP, 10);
+      const timeSinceError = now - errorTimestamp;
+
+      if (timeSinceError < throttleTimeWindow) {
+        throttleResult.status = 'protected';
+        throttleResult.retryAfter = throttleTimeWindow - timeSinceError;
+        console.log('[Unified Check D1] Throttle PROTECTED, retry after:', throttleResult.retryAfter);
+      } else {
+        throttleResult.status = 'resume_operation';
+        throttleResult.retryAfter = 0;
+        console.log('[Unified Check D1] Throttle resume_operation (time window expired)');
+      }
+    } else if (throttleRow.IS_PROTECTED === 0) {
+      throttleResult.status = 'normal_operation';
+      console.log('[Unified Check D1] Throttle normal_operation (IS_PROTECTED = 0)');
+    } else {
+      throttleResult.status = 'normal_operation';
+      console.log('[Unified Check D1] Throttle normal_operation (IS_PROTECTED = NULL, invalid state)');
+    }
+
+    return throttleResult;
+  };
+
+  const sessionTicketParam = shouldCheckSession ? sessionTicket : null;
+
+  const sessionJoinClause = sessionTableName
+    ? `
+    LEFT JOIN ${sessionTableName} s 
+      ON s.SESSION_TICKET = params.session_ticket_param 
+      AND params.session_ticket_param IS NOT NULL 
+      AND params.session_ticket_param != ''
+  `
+    : `
+    LEFT JOIN (
+      SELECT 
+        NULL AS SESSION_TICKET,
+        NULL AS FILE_PATH,
+        NULL AS FILE_PATH_HASH,
+        NULL AS IP_SUBNET,
+        NULL AS WORKER_ADDRESS,
+        NULL AS EXPIRE_AT
+    ) s ON 1=0
+  `;
+
+  const unifiedSql = `
+    SELECT 
+      s.SESSION_TICKET,
+      s.FILE_PATH,
+      s.FILE_PATH_HASH,
+      s.IP_SUBNET,
+      s.WORKER_ADDRESS,
+      s.EXPIRE_AT,
+      c.LINK_DATA,
+      c.TIMESTAMP,
+      c.HOSTNAME_HASH,
+      t.IS_PROTECTED,
+      t.ERROR_TIMESTAMP,
+      t.LAST_ERROR_CODE
+    FROM 
+      (SELECT ? AS provided_path_hash, ? AS session_ticket_param) params
+    ${sessionJoinClause}
+    LEFT JOIN ${cacheTableName} c 
+      ON c.PATH_HASH = COALESCE(s.FILE_PATH_HASH, params.provided_path_hash)
+    LEFT JOIN ${throttleTableName} t 
+      ON t.HOSTNAME_HASH = c.HOSTNAME_HASH
+    LIMIT 1
+  `;
+
+  const batchStatements = [
+    db.prepare(unifiedSql).bind(pathHash, sessionTicketParam || null),
+    createRateLimitStatement(),
+  ];
+
+  console.log('[Unified Check D1] Executing batch (unified query + rate limit in 1 RTT)');
+  const batchResults = await db.batch(batchStatements);
+
+  if (!batchResults || batchResults.length !== batchStatements.length) {
+    throw new Error('[Unified Check D1] Unified batch returned incomplete results');
   }
 
-  console.log('[Unified Check D1] Completed successfully');
+  const unifiedRow = batchResults[0]?.results?.[0] || null;
+  const rateLimitStatementResult = batchResults[1]?.results?.[0] || null;
+
+  let sessionResult = { ...defaultSessionResult };
+
+  if (shouldCheckSession) {
+    const sessionFound = Boolean(unifiedRow?.SESSION_TICKET);
+    const expireAtRaw = unifiedRow?.EXPIRE_AT != null ? Number(unifiedRow.EXPIRE_AT) : null;
+
+    sessionResult = {
+      found: sessionFound,
+      filePath: unifiedRow?.FILE_PATH || null,
+      filePathHash: unifiedRow?.FILE_PATH_HASH || null,
+      ipSubnet: unifiedRow?.IP_SUBNET || null,
+      workerAddress: unifiedRow?.WORKER_ADDRESS || null,
+      expireAt: Number.isFinite(expireAtRaw) ? expireAtRaw : null,
+      error: null,
+    };
+
+    if (!sessionFound) {
+      sessionResult.error = 'session not found';
+    } else if (sessionResult.expireAt !== null && sessionResult.expireAt < now) {
+      sessionResult.found = false;
+      sessionResult.error = 'session expired';
+      console.log('[Unified Check D1] Session has expired');
+    } else if (sessionResult.expireAt === null && unifiedRow?.EXPIRE_AT != null) {
+      sessionResult.found = false;
+      sessionResult.error = 'session expired';
+      console.warn('[Unified Check D1] Session record missing valid EXPIRE_AT, treating as expired');
+    }
+
+    console.log('[Unified Check D1] Session found:', sessionResult.found);
+  } else {
+    console.log('[Unified Check D1] Session check skipped');
+  }
+
+  const cacheContextHash = sessionResult?.filePathHash || null;
+  const cacheContext = cacheContextHash ? `session FILE_PATH_HASH ${cacheContextHash}` : `path ${path}`;
+
+  const hasCacheData = unifiedRow && unifiedRow.TIMESTAMP != null && unifiedRow.LINK_DATA != null;
+  const cacheRow = hasCacheData
+    ? {
+        LINK_DATA: unifiedRow.LINK_DATA,
+        TIMESTAMP: unifiedRow.TIMESTAMP,
+        HOSTNAME_HASH: unifiedRow.HOSTNAME_HASH,
+      }
+    : null;
+
+  const cacheResult = parseCacheRow(cacheRow, cacheContext);
+
+  const hasThrottleData = unifiedRow && (
+    unifiedRow.IS_PROTECTED != null ||
+    unifiedRow.ERROR_TIMESTAMP != null ||
+    unifiedRow.LAST_ERROR_CODE != null
+  );
+
+  const throttleRow = hasThrottleData
+    ? {
+        IS_PROTECTED: unifiedRow.IS_PROTECTED,
+        ERROR_TIMESTAMP: unifiedRow.ERROR_TIMESTAMP,
+        LAST_ERROR_CODE: unifiedRow.LAST_ERROR_CODE,
+      }
+    : null;
+
+  const throttleResult = parseThrottleRow(throttleRow, cacheResult);
+  const rateLimitResult = parseRateLimitResult(rateLimitStatementResult);
+
+  console.log('[Unified Check D1] Completed successfully (1 RTT)');
 
   return {
     session: sessionResult,

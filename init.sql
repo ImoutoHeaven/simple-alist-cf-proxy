@@ -20,6 +20,7 @@
 CREATE TABLE IF NOT EXISTS "SESSION_MAPPING_TABLE" (
   "SESSION_TICKET" TEXT PRIMARY KEY,
   "FILE_PATH" TEXT NOT NULL,
+  "FILE_PATH_HASH" TEXT NOT NULL,
   "IP_SUBNET" TEXT NOT NULL,
   "WORKER_ADDRESS" TEXT NOT NULL,
   "EXPIRE_AT" BIGINT NOT NULL,
@@ -28,6 +29,8 @@ CREATE TABLE IF NOT EXISTS "SESSION_MAPPING_TABLE" (
 
 CREATE INDEX IF NOT EXISTS idx_session_expire
   ON "SESSION_MAPPING_TABLE"("EXPIRE_AT");
+CREATE INDEX IF NOT EXISTS idx_session_file_path_hash
+  ON "SESSION_MAPPING_TABLE"("FILE_PATH_HASH");
 
 
 -- ========================================
@@ -36,6 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_session_expire
 CREATE OR REPLACE FUNCTION session_insert(
   p_session_ticket TEXT,
   p_file_path TEXT,
+  p_file_path_hash TEXT,
   p_ip_subnet TEXT,
   p_worker_address TEXT,
   p_expire_at BIGINT,
@@ -47,12 +51,12 @@ DECLARE
   v_sql TEXT;
 BEGIN
   v_sql := format(
-    'INSERT INTO %1$I ("SESSION_TICKET", "FILE_PATH", "IP_SUBNET", "WORKER_ADDRESS", "EXPIRE_AT", "CREATED_AT")
-     VALUES ($1, $2, $3, $4, $5, $6)',
+    'INSERT INTO %1$I ("SESSION_TICKET", "FILE_PATH", "FILE_PATH_HASH", "IP_SUBNET", "WORKER_ADDRESS", "EXPIRE_AT", "CREATED_AT")
+     VALUES ($1, $2, $3, $4, $5, $6, $7)',
     p_table_name
   );
 
-  EXECUTE v_sql USING p_session_ticket, p_file_path, p_ip_subnet, p_worker_address, p_expire_at, p_created_at;
+  EXECUTE v_sql USING p_session_ticket, p_file_path, p_file_path_hash, p_ip_subnet, p_worker_address, p_expire_at, p_created_at;
 
   RETURN json_build_object('success', true);
 EXCEPTION
@@ -75,7 +79,7 @@ DECLARE
   v_record RECORD;
 BEGIN
   v_sql := format(
-    'SELECT "SESSION_TICKET", "FILE_PATH", "IP_SUBNET", "WORKER_ADDRESS", "EXPIRE_AT", "CREATED_AT"
+    'SELECT "SESSION_TICKET", "FILE_PATH", "FILE_PATH_HASH", "IP_SUBNET", "WORKER_ADDRESS", "EXPIRE_AT", "CREATED_AT"
      FROM %1$I WHERE "SESSION_TICKET" = $1 LIMIT 1',
     p_table_name
   );
@@ -89,6 +93,7 @@ BEGIN
   RETURN json_build_object(
     'found', true,
     'file_path', v_record."FILE_PATH",
+    'file_path_hash', v_record."FILE_PATH_HASH",
     'ip_subnet', v_record."IP_SUBNET",
     'worker_address', v_record."WORKER_ADDRESS",
     'expire_at', v_record."EXPIRE_AT"
@@ -459,6 +464,7 @@ DECLARE
 
   v_session_found BOOLEAN := NULL;
   v_session_file_path TEXT := NULL;
+  v_session_file_path_hash TEXT := NULL;
   v_session_ip_subnet TEXT := NULL;
   v_session_worker_address TEXT := NULL;
   v_session_expire_at BIGINT := NULL;
@@ -475,6 +481,8 @@ DECLARE
   v_throttle_is_protected INTEGER := NULL;
   v_throttle_error_timestamp INTEGER := NULL;
   v_throttle_error_code INTEGER := NULL;
+
+  v_actual_path_hash TEXT := NULL;
 BEGIN
   v_now := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::BIGINT);
 
@@ -528,15 +536,25 @@ BEGIN
 
     v_session_found := TRUE;
     v_session_file_path := v_session_record."FILE_PATH";
+    v_session_file_path_hash := v_session_record."FILE_PATH_HASH";
     v_session_ip_subnet := v_session_record."IP_SUBNET";
     v_session_worker_address := v_session_record."WORKER_ADDRESS";
     v_session_expire_at := v_session_record."EXPIRE_AT";
   END IF;
 
   -- Step 2: Cache lookup
+  -- IMPORTANT: If session mode, use pre-stored FILE_PATH_HASH (not the /session/* URL path)
+  IF v_session_found IS TRUE AND v_session_file_path_hash IS NOT NULL THEN
+    -- Session mode: use FILE_PATH_HASH from session table
+    v_actual_path_hash := v_session_file_path_hash;
+  ELSE
+    -- Non-session mode: use provided path_hash
+    v_actual_path_hash := p_path_hash;
+  END IF;
+
   EXECUTE format('SELECT "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH" FROM %1$I WHERE "PATH_HASH" = $1', p_cache_table_name)
     INTO v_cache_record
-    USING p_path_hash;
+    USING v_actual_path_hash;
 
   IF v_cache_record."TIMESTAMP" IS NOT NULL AND (v_now - v_cache_record."TIMESTAMP") <= p_cache_ttl THEN
     v_cache_link_data := v_cache_record."LINK_DATA";
