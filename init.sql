@@ -407,11 +407,6 @@ $$ LANGUAGE plpgsql;
 -- Purpose: Combines Session validation + Rate Limit + Cache + Throttle checks in a single database round-trip
 
 CREATE OR REPLACE FUNCTION download_unified_check(
-  -- Session parameters
-  p_session_ticket TEXT DEFAULT NULL,
-  p_session_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE',
-  p_now BIGINT DEFAULT NULL,
-
   -- Cache parameters
   p_path_hash TEXT,
   p_cache_ttl INTEGER,
@@ -427,7 +422,12 @@ CREATE OR REPLACE FUNCTION download_unified_check(
 
   -- Throttle parameters
   p_throttle_time_window INTEGER,
-  p_throttle_table_name TEXT
+  p_throttle_table_name TEXT,
+
+  -- Session parameters
+  p_session_ticket TEXT DEFAULT NULL,
+  p_session_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE',
+  p_now BIGINT DEFAULT NULL
 )
 RETURNS TABLE(
   -- Session result
