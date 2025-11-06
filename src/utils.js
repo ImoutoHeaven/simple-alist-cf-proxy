@@ -46,11 +46,12 @@ export const parseNumber = (value, defaultValue) => {
 export const parseWindowTime = (value) => {
   if (!value || typeof value !== 'string') return 0;
   const trimmed = value.trim();
-  const match = trimmed.match(/^(\d+)(h|m|s)$/);
+  const match = trimmed.match(/^(\d+)(d|h|m|s)$/);
   if (!match) return 0;
   const num = Number.parseInt(match[1], 10);
   if (Number.isNaN(num) || num <= 0) return 0;
   const unit = match[2];
+  if (unit === 'd') return num * 86400;
   if (unit === 'h') return num * 3600;
   if (unit === 'm') return num * 60;
   if (unit === 's') return num;

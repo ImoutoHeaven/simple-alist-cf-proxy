@@ -153,6 +153,55 @@ CREATE INDEX IF NOT EXISTS idx_download_cache_hostname
 
 
 -- ========================================
+-- Download Last Active Table Schema
+-- ========================================
+-- Purpose: Track last access time and usage count per IP/path pair
+-- Compatible with: PostgreSQL
+
+CREATE TABLE IF NOT EXISTS "DOWNLOAD_LAST_ACTIVE_TABLE" (
+  "IP_HASH" TEXT NOT NULL,
+  "PATH_HASH" TEXT NOT NULL,
+  "LAST_ACCESS_TIME" BIGINT NOT NULL,
+  "TOTAL_ACCESS_COUNT" INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY ("IP_HASH", "PATH_HASH")
+);
+
+CREATE INDEX IF NOT EXISTS idx_download_last_active_time
+  ON "DOWNLOAD_LAST_ACTIVE_TABLE"("LAST_ACCESS_TIME");
+
+
+-- ========================================
+-- Stored Procedure: Upsert Download Last Active
+-- ========================================
+CREATE OR REPLACE FUNCTION download_update_last_active(
+  p_ip_hash TEXT,
+  p_path_hash TEXT,
+  p_last_access_time BIGINT,
+  p_table_name TEXT DEFAULT 'DOWNLOAD_LAST_ACTIVE_TABLE'
+)
+RETURNS JSON AS $$
+DECLARE
+  sql TEXT;
+BEGIN
+  sql := format(
+    'INSERT INTO %1$I ("IP_HASH", "PATH_HASH", "LAST_ACCESS_TIME", "TOTAL_ACCESS_COUNT")
+     VALUES ($1, $2, $3, 1)
+     ON CONFLICT ("IP_HASH", "PATH_HASH") DO UPDATE SET
+       "LAST_ACCESS_TIME" = EXCLUDED."LAST_ACCESS_TIME",
+       "TOTAL_ACCESS_COUNT" = %1$I."TOTAL_ACCESS_COUNT" + 1',
+    p_table_name
+  );
+
+  EXECUTE sql USING p_ip_hash, p_path_hash, p_last_access_time;
+  RETURN json_build_object('success', true);
+EXCEPTION
+  WHEN others THEN
+    RETURN json_build_object('success', false, 'error', SQLERRM);
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
 -- PostgreSQL Stored Procedure: Atomic UPSERT (Download Cache)
 -- ========================================
 CREATE OR REPLACE FUNCTION download_upsert_download_cache(
@@ -427,7 +476,11 @@ CREATE OR REPLACE FUNCTION download_unified_check(
   -- Session parameters
   p_session_ticket TEXT DEFAULT NULL,
   p_session_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE',
-  p_now BIGINT DEFAULT NULL
+  p_now BIGINT DEFAULT NULL,
+
+  -- Last active parameters
+  p_idle_timeout INTEGER DEFAULT 0,
+  p_last_active_table_name TEXT DEFAULT 'DOWNLOAD_LAST_ACTIVE_TABLE'
 )
 RETURNS TABLE(
   -- Session result
@@ -452,7 +505,11 @@ RETURNS TABLE(
   throttle_record_exists BOOLEAN,
   throttle_is_protected INTEGER,
   throttle_error_timestamp INTEGER,
-  throttle_error_code INTEGER
+  throttle_error_code INTEGER,
+
+  -- Last active result
+  active_last_access_time INTEGER,
+  active_total_access_count INTEGER
 ) AS $$
 DECLARE
   v_now BIGINT;
@@ -461,6 +518,7 @@ DECLARE
   v_rate_record RECORD;
   v_throttle_record RECORD;
   v_cache_hostname_hash TEXT;
+  v_active_record RECORD;
 
   v_session_found BOOLEAN := NULL;
   v_session_file_path TEXT := NULL;
@@ -482,6 +540,8 @@ DECLARE
   v_throttle_error_timestamp INTEGER := NULL;
   v_throttle_error_code INTEGER := NULL;
 
+  v_active_last_access_time INTEGER := NULL;
+  v_active_total_access_count INTEGER := NULL;
   v_actual_path_hash TEXT := NULL;
 BEGIN
   v_now := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::BIGINT);
@@ -509,6 +569,8 @@ BEGIN
         NULL::BOOLEAN,
         NULL::INTEGER,
         NULL::INTEGER,
+        NULL::INTEGER,
+        NULL::INTEGER,
         NULL::INTEGER;
       RETURN;
     END IF;
@@ -528,6 +590,8 @@ BEGIN
         NULL::INTEGER,
         NULL::INTEGER,
         NULL::BOOLEAN,
+        NULL::INTEGER,
+        NULL::INTEGER,
         NULL::INTEGER,
         NULL::INTEGER,
         NULL::INTEGER;
@@ -607,6 +671,17 @@ BEGIN
     v_throttle_error_code := NULL;
   END IF;
 
+  -- Step 5: Last active lookup
+  -- IMPORTANT: Use v_actual_path_hash (respects session mode path hash)
+  EXECUTE format('SELECT "LAST_ACCESS_TIME", "TOTAL_ACCESS_COUNT" FROM %1$I WHERE "IP_HASH" = $1 AND "PATH_HASH" = $2 LIMIT 1', p_last_active_table_name)
+    INTO v_active_record
+    USING p_ip_hash, v_actual_path_hash;
+
+  IF v_active_record."LAST_ACCESS_TIME" IS NOT NULL THEN
+    v_active_last_access_time := v_active_record."LAST_ACCESS_TIME";
+    v_active_total_access_count := v_active_record."TOTAL_ACCESS_COUNT";
+  END IF;
+
   RETURN QUERY SELECT
     v_session_found,
     v_session_file_path,
@@ -623,6 +698,8 @@ BEGIN
     v_throttle_record_exists,
     v_throttle_is_protected,
     v_throttle_error_timestamp,
-    v_throttle_error_code;
+    v_throttle_error_code,
+    v_active_last_access_time,
+    v_active_total_access_count;
 END;
 $$ LANGUAGE plpgsql;

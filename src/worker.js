@@ -19,6 +19,24 @@ const parsePrefixList = (value) => {
   return value.split(',').map(p => p.trim()).filter(p => p.length > 0);
 };
 
+const parseTimeString = (value, label) => {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+
+  const trimmed = value.trim();
+  const parsed = parseWindowTime(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${label} is invalid: ${value}`);
+  }
+
+  if (parsed === 0 && trimmed !== '0') {
+    throw new Error(`${label} is invalid: ${value}`);
+  }
+
+  return parsed;
+};
+
 // Utility: Validate action values (supports comma-separated list)
 const validateActions = (actions, paramName) => {
   if (!actions) return [];
@@ -138,6 +156,13 @@ const resolveConfig = (env = {}) => {
   const linkTTLSeconds = parseWindowTime(linkTTL);
   const cleanupPercentage = parseNumber(env.CLEANUP_PERCENTAGE, 1);
   const cleanupProbability = Math.max(0, Math.min(100, cleanupPercentage)) / 100;
+  const idleTimeoutRaw = normalizeString(env.IDLE_TIMEOUT);
+  const idleTimeoutSeconds = idleTimeoutRaw
+    ? parseTimeString(idleTimeoutRaw, 'IDLE_TIMEOUT')
+    : 0;
+  const lastActiveTableName =
+    normalizeString(env.DOWNLOAD_LAST_ACTIVE_TABLE, 'DOWNLOAD_LAST_ACTIVE_TABLE') ||
+    'DOWNLOAD_LAST_ACTIVE_TABLE';
 
   const downloadCacheTableName = (() => {
     const explicit = normalizeString(env.DOWNLOAD_CACHE_TABLE);
@@ -200,6 +225,7 @@ const resolveConfig = (env = {}) => {
   const d1DatabaseId = normalizeString(env.D1_DATABASE_ID);
   const d1ApiToken = normalizeString(env.D1_API_TOKEN);
   const postgrestUrl = normalizeString(env.POSTGREST_URL);
+  const initTables = parseBoolean(env.INIT_TABLES, false);
 
   let cacheEnabled = false;
   let cacheConfig = {};
@@ -213,7 +239,10 @@ const resolveConfig = (env = {}) => {
           databaseBinding: d1DatabaseBinding,
           tableName: downloadCacheTableName,
           linkTTL: linkTTLSeconds,
+          idleTimeout: idleTimeoutSeconds,
+          lastActiveTableName,
           cleanupProbability,
+          initTables,
         };
       } else {
         throw new Error('DB_MODE is set to "d1" but LINK_TTL is missing or invalid');
@@ -227,7 +256,10 @@ const resolveConfig = (env = {}) => {
           apiToken: d1ApiToken,
           tableName: downloadCacheTableName,
           linkTTL: linkTTLSeconds,
+          idleTimeout: idleTimeoutSeconds,
+          lastActiveTableName,
           cleanupProbability,
+          initTables,
         };
       } else {
         throw new Error('DB_MODE is set to "d1-rest" but required environment variables are missing: D1_ACCOUNT_ID, D1_DATABASE_ID, D1_API_TOKEN, LINK_TTL');
@@ -241,7 +273,10 @@ const resolveConfig = (env = {}) => {
           verifySecret: verifySecrets,
           tableName: downloadCacheTableName,
           linkTTL: linkTTLSeconds,
+          idleTimeout: idleTimeoutSeconds,
+          lastActiveTableName,
           cleanupProbability,
+          initTables,
         };
       } else {
         throw new Error('DB_MODE is set to "custom-pg-rest" but required environment variables are missing: POSTGREST_URL, VERIFY_HEADER, VERIFY_SECRET, LINK_TTL');
@@ -366,7 +401,6 @@ const resolveConfig = (env = {}) => {
     throw new Error('ONLY_SESSION_MODE is true but SESSION_ENABLED is false');
   }
   const sessionTableName = normalizeString(env.SESSION_TABLE_NAME) || 'SESSION_MAPPING_TABLE';
-  const initTables = parseBoolean(env.INIT_TABLES, false);
 
   return {
     address: String(env.ADDRESS).trim(),
@@ -415,6 +449,8 @@ const resolveConfig = (env = {}) => {
     onlySessionMode,
     sessionTableName,
     initTables,
+    idleTimeout: idleTimeoutSeconds,
+    lastActiveTableName,
   };
 };
 
@@ -998,6 +1034,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           verifyHeader: rateLimitConfig.verifyHeader,
           verifySecret: rateLimitConfig.verifySecret,
           linkTTL: cacheConfig.linkTTL ?? 1800,
+          idleTimeout: cacheConfig.idleTimeout ?? config.idleTimeout ?? 0,
           cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
           windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
           limit: limitConfigValue ?? 100,
@@ -1008,12 +1045,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
           sessionTableName,
+          lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
         });
       } else if (config.dbMode === 'd1') {
         unifiedResult = await unifiedCheckD1(path, clientIP, {
           env: cacheConfig.env || rateLimitConfig.env,
           databaseBinding: cacheConfig.databaseBinding || rateLimitConfig.databaseBinding || 'DB',
           linkTTL: cacheConfig.linkTTL ?? 1800,
+          idleTimeout: cacheConfig.idleTimeout ?? config.idleTimeout ?? 0,
           cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
           windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
           limit: limitConfigValue ?? 100,
@@ -1025,6 +1064,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
           sessionEnabled: config.sessionEnabled,
           sessionTableName,
+          lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
+          initTables: cacheConfig.initTables,
         });
       } else if (config.dbMode === 'd1-rest') {
         unifiedResult = await unifiedCheckD1Rest(path, clientIP, {
@@ -1032,6 +1073,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           databaseId: rateLimitConfig.databaseId || throttleConfig.databaseId || cacheConfig.databaseId,
           apiToken: rateLimitConfig.apiToken || throttleConfig.apiToken || cacheConfig.apiToken,
           linkTTL: cacheConfig.linkTTL ?? 1800,
+          idleTimeout: cacheConfig.idleTimeout ?? config.idleTimeout ?? 0,
           cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
           windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
           limit: limitConfigValue ?? 100,
@@ -1043,6 +1085,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
           sessionEnabled: config.sessionEnabled,
           sessionTableName,
+          lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
+          initTables: cacheConfig.initTables,
         });
       } else {
         throw new Error(`Unsupported database mode for unified check: ${config.dbMode}`);
@@ -1089,6 +1133,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           windowLabel,
           unifiedResult.rateLimit.retryAfter
         );
+      }
+
+      if (unifiedResult.idle && unifiedResult.idle.expired) {
+        const idleReason = unifiedResult.idle.reason || 'Link expired due to inactivity';
+        const idleDuration = unifiedResult.idle.idleDuration ?? 'unknown';
+        const idleTimeout = unifiedResult.idle.timeout ?? 'unknown';
+        console.warn(
+          `[Idle Timeout] Link expired (idle ${idleDuration}s, timeout ${idleTimeout}s)`
+        );
+        return createErrorResponse(origin, 410, idleReason);
       }
 
       if (unifiedResult.cache.hit) {
@@ -1508,6 +1562,57 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     headers: safeHeaders
   });
 
+  const shouldUpdateLastActive =
+    config.cacheConfig &&
+    typeof config.cacheConfig.idleTimeout === 'number' &&
+    config.cacheConfig.idleTimeout > 0 &&
+    config.cacheConfig.lastActiveTableName;
+
+  if (shouldUpdateLastActive && config.dbMode && clientIP && typeof path === 'string') {
+    const updatePromise = (async () => {
+      try {
+        const ipSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
+        if (!ipSubnet) {
+          return;
+        }
+
+        const [ipHash, pathHash] = await Promise.all([sha256Hash(ipSubnet), sha256Hash(path)]);
+        if (!ipHash || !pathHash) {
+          return;
+        }
+
+        if (config.dbMode === 'd1') {
+          const { updateLastActive } = await import('./unified-check-d1.js');
+          const dbBinding = config.cacheConfig.databaseBinding;
+          const dbInstance = env[dbBinding];
+          if (!dbInstance) {
+            console.error(`[LastActive] D1 binding '${dbBinding}' not found`);
+            return;
+          }
+          await updateLastActive(
+            dbInstance,
+            ipHash,
+            pathHash,
+            config.cacheConfig.lastActiveTableName
+          );
+        } else if (config.dbMode === 'd1-rest') {
+          const { updateLastActive } = await import('./unified-check-d1-rest.js');
+          await updateLastActive(config.cacheConfig, ipHash, pathHash);
+        } else if (config.dbMode === 'custom-pg-rest') {
+          const { updateLastActive } = await import('./unified-check.js');
+          await updateLastActive(config.cacheConfig, ipHash, pathHash);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[LastActive] Update failed:', message);
+      }
+    })();
+
+    if (ctx && ctx.waitUntil) {
+      ctx.waitUntil(updatePromise);
+    }
+  }
+
   return safeResponse;
 }
 
@@ -1551,6 +1656,7 @@ async function handleSessionDownload(request, env, config, cacheManager, throttl
         verifyHeader: rateLimitConfig.verifyHeader,
         verifySecret: rateLimitConfig.verifySecret,
         linkTTL: cacheConfig.linkTTL ?? 1800,
+        idleTimeout: cacheConfig.idleTimeout ?? config.idleTimeout ?? 0,
         cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
         windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
         limit: limitConfigValue ?? 100,
@@ -1561,12 +1667,14 @@ async function handleSessionDownload(request, env, config, cacheManager, throttl
         throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
         throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
         sessionTableName,
+        lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
       }, sessionTicket);
     } else if (config.dbMode === 'd1') {
       unifiedResult = await unifiedCheckD1(placeholderPath, clientIP, {
         env: cacheConfig.env || rateLimitConfig.env,
         databaseBinding: cacheConfig.databaseBinding || rateLimitConfig.databaseBinding || 'DB',
         linkTTL: cacheConfig.linkTTL ?? 1800,
+        idleTimeout: cacheConfig.idleTimeout ?? config.idleTimeout ?? 0,
         cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
         windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
         limit: limitConfigValue ?? 100,
@@ -1578,6 +1686,7 @@ async function handleSessionDownload(request, env, config, cacheManager, throttl
         throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
         sessionEnabled: config.sessionEnabled,
         sessionTableName,
+        lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
       }, sessionTicket);
     } else if (config.dbMode === 'd1-rest') {
       unifiedResult = await unifiedCheckD1Rest(placeholderPath, clientIP, {
@@ -1585,6 +1694,7 @@ async function handleSessionDownload(request, env, config, cacheManager, throttl
         databaseId: rateLimitConfig.databaseId || throttleConfig.databaseId || cacheConfig.databaseId,
         apiToken: rateLimitConfig.apiToken || throttleConfig.apiToken || cacheConfig.apiToken,
         linkTTL: cacheConfig.linkTTL ?? 1800,
+        idleTimeout: cacheConfig.idleTimeout ?? config.idleTimeout ?? 0,
         cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
         windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
         limit: limitConfigValue ?? 100,
@@ -1596,6 +1706,7 @@ async function handleSessionDownload(request, env, config, cacheManager, throttl
         throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
         sessionEnabled: config.sessionEnabled,
         sessionTableName,
+        lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
       }, sessionTicket);
     } else {
       throw new Error(`Unsupported database mode for unified session check: ${config.dbMode}`);
@@ -1609,6 +1720,9 @@ async function handleSessionDownload(request, env, config, cacheManager, throttl
   const sessionDetails = unifiedResult?.session;
   if (!sessionDetails || sessionDetails.found !== true) {
     const errorMessage = sessionDetails?.error || 'session invalid';
+    if (errorMessage === 'Link expired due to inactivity') {
+      return createErrorResponse(origin, 410, errorMessage);
+    }
     return createErrorResponse(origin, 401, errorMessage);
   }
 

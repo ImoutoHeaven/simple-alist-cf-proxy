@@ -10,7 +10,8 @@ import { sha256Hash, calculateIPSubnet } from './utils.js';
  * @param {string} [tableNames.sessionTableName]
  * @returns {Promise<void>}
  */
-const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttleTableName, sessionTableName }) => {
+const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttleTableName, sessionTableName, lastActiveTableName }) => {
+  const activeTableName = lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
   const statements = [
     db.prepare(`
       CREATE TABLE IF NOT EXISTS ${cacheTableName} (
@@ -43,6 +44,16 @@ const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttl
       )
     `),
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${throttleTableName}(ERROR_TIMESTAMP)`),
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ${activeTableName} (
+        IP_HASH TEXT NOT NULL,
+        PATH_HASH TEXT NOT NULL,
+        LAST_ACCESS_TIME INTEGER NOT NULL,
+        TOTAL_ACCESS_COUNT INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (IP_HASH, PATH_HASH)
+      )
+    `),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_download_last_active_time ON ${activeTableName}(LAST_ACCESS_TIME)`),
   ];
 
   if (sessionTableName) {
@@ -92,6 +103,7 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
   const cacheTableName = config.cacheTableName || 'DOWNLOAD_CACHE_TABLE';
   const rateLimitTableName = config.rateLimitTableName || 'DOWNLOAD_IP_RATELIMIT_TABLE';
   const throttleTableName = config.throttleTableName || 'THROTTLE_PROTECTION';
+  const lastActiveTableName = config.lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
   const throttleTimeWindow = config.throttleTimeWindow ?? 60;
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
@@ -106,6 +118,7 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
       rateLimitTableName,
       throttleTableName,
       sessionTableName,
+      lastActiveTableName,
     });
   }
 
@@ -325,19 +338,23 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
       c.HOSTNAME_HASH,
       t.IS_PROTECTED,
       t.ERROR_TIMESTAMP,
-      t.LAST_ERROR_CODE
+      t.LAST_ERROR_CODE,
+      active.LAST_ACCESS_TIME AS ACTIVE_LAST_ACCESS_TIME
     FROM 
-      (SELECT ? AS provided_path_hash, ? AS session_ticket_param) params
+      (SELECT ? AS provided_path_hash, ? AS session_ticket_param, ? AS ip_hash_param) params
     ${sessionJoinClause}
     LEFT JOIN ${cacheTableName} c 
       ON c.PATH_HASH = COALESCE(s.FILE_PATH_HASH, params.provided_path_hash)
     LEFT JOIN ${throttleTableName} t 
       ON t.HOSTNAME_HASH = c.HOSTNAME_HASH
+    LEFT JOIN ${lastActiveTableName} active
+      ON active.PATH_HASH = COALESCE(s.FILE_PATH_HASH, params.provided_path_hash)
+      AND active.IP_HASH = params.ip_hash_param
     LIMIT 1
   `;
 
   const batchStatements = [
-    db.prepare(unifiedSql).bind(pathHash, sessionTicketParam || null),
+    db.prepare(unifiedSql).bind(pathHash, sessionTicketParam || null, ipHash),
     createRateLimitStatement(),
   ];
 
@@ -350,6 +367,14 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
 
   const unifiedRow = batchResults[0]?.results?.[0] || null;
   const rateLimitStatementResult = batchResults[1]?.results?.[0] || null;
+
+  const activeLastAccessTime = (() => {
+    if (!unifiedRow || unifiedRow.ACTIVE_LAST_ACCESS_TIME == null) {
+      return null;
+    }
+    const parsed = Number(unifiedRow.ACTIVE_LAST_ACCESS_TIME);
+    return Number.isFinite(parsed) ? parsed : null;
+  })();
 
   let sessionResult = { ...defaultSessionResult };
 
@@ -396,7 +421,7 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
       }
     : null;
 
-  const cacheResult = parseCacheRow(cacheRow, cacheContext);
+  let cacheResult = parseCacheRow(cacheRow, cacheContext);
 
   const hasThrottleData = unifiedRow && (
     unifiedRow.IS_PROTECTED != null ||
@@ -412,8 +437,42 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
       }
     : null;
 
-  const throttleResult = parseThrottleRow(throttleRow, cacheResult);
+  let throttleResult = parseThrottleRow(throttleRow, cacheResult);
   const rateLimitResult = parseRateLimitResult(rateLimitStatementResult);
+
+  const idleTimeout = Number.isFinite(Number(config.idleTimeout))
+    ? Number(config.idleTimeout)
+    : 0;
+
+  const idleInfo = {
+    expired: false,
+    timeout: idleTimeout,
+    lastAccessTime: activeLastAccessTime,
+    idleDuration: activeLastAccessTime != null ? now - activeLastAccessTime : null,
+  };
+
+  const idleErrorMessage = 'Link expired due to inactivity';
+
+  if (idleTimeout > 0 && activeLastAccessTime != null) {
+    const idleDuration = idleInfo.idleDuration ?? 0;
+    if (idleDuration > idleTimeout) {
+      idleInfo.expired = true;
+      idleInfo.reason = idleErrorMessage;
+      console.log(
+        `[Unified Check D1] Idle timeout exceeded (idle ${idleDuration}s > ${idleTimeout}s)`
+      );
+
+      const fallbackSessionResult = {
+        ...defaultSessionResult,
+        found: shouldCheckSession ? false : defaultSessionResult.found,
+        error: idleErrorMessage,
+      };
+
+      sessionResult = fallbackSessionResult;
+      cacheResult = { ...defaultCacheResult };
+      throttleResult = { ...defaultThrottleResult };
+    }
+  }
 
   console.log('[Unified Check D1] Completed successfully (1 RTT)');
 
@@ -422,5 +481,27 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
     cache: cacheResult,
     rateLimit: rateLimitResult,
     throttle: throttleResult,
+    idle: idleInfo,
   };
 };
+
+const updateLastActive = async (db, ipHash, pathHash, tableName = 'DOWNLOAD_LAST_ACTIVE_TABLE') => {
+  if (!db || typeof db.prepare !== 'function') {
+    throw new Error('[LastActive] Invalid D1 database binding');
+  }
+
+  const resolvedTable = tableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
+  const now = Math.floor(Date.now() / 1000);
+
+  const sql = `
+    INSERT INTO ${resolvedTable} (IP_HASH, PATH_HASH, LAST_ACCESS_TIME, TOTAL_ACCESS_COUNT)
+    VALUES (?, ?, ?, 1)
+    ON CONFLICT(IP_HASH, PATH_HASH) DO UPDATE SET
+      LAST_ACCESS_TIME = excluded.LAST_ACCESS_TIME,
+      TOTAL_ACCESS_COUNT = ${resolvedTable}.TOTAL_ACCESS_COUNT + 1
+  `;
+
+  return db.prepare(sql).bind(ipHash, pathHash, now).run();
+};
+
+export { ensureAllTables, updateLastActive };

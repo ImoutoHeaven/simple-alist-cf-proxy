@@ -171,6 +171,14 @@ compatibility_date = "2024-01-01"
 # DOWNLOAD_CACHE_TABLE = "DOWNLOAD_CACHE_TABLE"
 # THROTTLE_PROTECTION_TABLE = "THROTTLE_PROTECTION"
 # DOWNLOAD_IP_RATELIMIT_TABLE = "DOWNLOAD_IP_RATELIMIT_TABLE"
+# IDLE_TIMEOUT = "0"
+# DOWNLOAD_LAST_ACTIVE_TABLE = "DOWNLOAD_LAST_ACTIVE_TABLE"
+#
+# IDLE_TIMEOUT: 如果链接在此时间内未被访问，视为过期
+#   - 格式: 数字+单位 (s=秒, m=分钟, h=小时, d=天)
+#   - 例如: "30m" (30分钟), "1h" (1小时)
+#   - 设置为 "0" 或空字符串关闭此功能
+# DOWNLOAD_LAST_ACTIVE_TABLE: 自定义空闲追踪表名，默认 DOWNLOAD_LAST_ACTIVE_TABLE
 #
 # # ═══════════════════════════════════════════════════════════════
 # # ⚠️ Database Table Initialization Control (Performance Optimization)

@@ -371,6 +371,62 @@ const buildCustomPgRestCleanupTasks = (config) => {
   return tasks;
 };
 
+const cleanupLastActiveTable = async (config, env) => {
+  const { dbMode, cacheConfig } = config || {};
+
+  if (!dbMode || !cacheConfig || typeof cacheConfig.linkTTL !== 'number' || cacheConfig.linkTTL <= 0) {
+    return { cleaned: 0 };
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const threshold = now - cacheConfig.linkTTL;
+  const tableName = cacheConfig.lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
+
+  try {
+    if (dbMode === 'd1') {
+      const bindingName = cacheConfig.databaseBinding;
+      const sourceEnv = cacheConfig.env || env;
+      const db = sourceEnv?.[bindingName];
+      if (!db) {
+        throw new Error(`D1 database binding '${bindingName}' not found`);
+      }
+
+      const result = await db.prepare(
+        `DELETE FROM ${tableName} WHERE LAST_ACCESS_TIME < ?`
+      ).bind(threshold).run();
+
+      return { cleaned: result?.meta?.changes || 0 };
+    }
+
+    if (dbMode === 'd1-rest') {
+      const { accountId, databaseId, apiToken } = cacheConfig;
+      const sql = `DELETE FROM ${tableName} WHERE LAST_ACCESS_TIME < ?`;
+      const changes = await executeD1RestStatement(accountId, databaseId, apiToken, sql, [threshold]);
+      return { cleaned: changes };
+    }
+
+    if (dbMode === 'custom-pg-rest') {
+      const { postgrestUrl, verifyHeader, verifySecret } = cacheConfig;
+      const filters = `LAST_ACCESS_TIME=lt.${threshold}`;
+      const cleaned = await executePostgrestDelete(
+        postgrestUrl,
+        verifyHeader,
+        verifySecret,
+        tableName,
+        filters,
+        { Prefer: 'return=representation' }
+      );
+      return { cleaned };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('[Cleanup] LastActive cleanup failed:', message);
+    return { cleaned: 0, error: message };
+  }
+
+  return { cleaned: 0 };
+};
+
 export async function scheduleAllCleanups(config, env, ctx) {
   if (!config || !config.dbMode) {
     return;
@@ -403,6 +459,21 @@ export async function scheduleAllCleanups(config, env, ctx) {
     return;
   }
 
+  if (
+    config.cacheConfig &&
+    typeof config.cacheConfig.linkTTL === 'number' &&
+    config.cacheConfig.linkTTL > 0 &&
+    config.cacheConfig.lastActiveTableName
+  ) {
+    cleanupTasks.push({
+      name: 'LastActive',
+      fn: async () => {
+        const result = await cleanupLastActiveTable(config, env);
+        return result.cleaned || 0;
+      },
+    });
+  }
+
   if (cleanupTasks.length === 0) {
     console.warn('[Cleanup Scheduler] No cleanup tasks scheduled (features disabled or misconfigured)');
     return;
@@ -431,3 +502,4 @@ export async function scheduleAllCleanups(config, env, ctx) {
   }
 }
 
+export { cleanupLastActiveTable };

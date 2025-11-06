@@ -23,8 +23,11 @@ export const unifiedCheck = async (path, clientIP, config, sessionTicket = null)
   const rateLimitTableName = config.rateLimitTableName || 'DOWNLOAD_IP_RATELIMIT_TABLE';
   const throttleTableName = config.throttleTableName || 'THROTTLE_PROTECTION';
   const sessionTableName = config.sessionTableName || 'SESSION_MAPPING_TABLE';
+  const lastActiveTableName = config.lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
+  const idleTimeoutValue = Number(config.idleTimeout);
+  const idleTimeout = Number.isFinite(idleTimeoutValue) && idleTimeoutValue > 0 ? idleTimeoutValue : 0;
   
   console.log('[Unified Check] Starting unified check for path:', path);
   
@@ -47,20 +50,27 @@ export const unifiedCheck = async (path, clientIP, config, sessionTicket = null)
   // Call unified RPC
   const rpcUrl = `${config.postgrestUrl}/rpc/download_unified_check`;
   const rpcBody = {
-    p_session_ticket: sessionTicket || null,
-    p_session_table_name: sessionTableName,
-    p_now: now,
     p_path_hash: pathHash,
     p_cache_ttl: cacheTTL,
     p_cache_table_name: cacheTableName,
+
     p_ip_hash: ipHash,
     p_ip_range: ipSubnet,
     p_window_seconds: windowSeconds,
     p_limit: limit,
     p_block_seconds: blockSeconds,
     p_ratelimit_table_name: rateLimitTableName,
+
     p_throttle_time_window: throttleWindow,
     p_throttle_table_name: throttleTableName,
+
+    p_session_ticket: sessionTicket || null,
+    p_session_table_name: sessionTableName,
+    p_now: now,
+
+    // NEW: Last active parameters
+    p_idle_timeout: idleTimeout,
+    p_last_active_table_name: lastActiveTableName,
   };
   
   console.log('[Unified Check] Calling RPC with params:', JSON.stringify(rpcBody, null, 2));
@@ -89,7 +99,7 @@ export const unifiedCheck = async (path, clientIP, config, sessionTicket = null)
   const row = result[0];
   console.log('[Unified Check] RPC result:', JSON.stringify(row, null, 2));
 
-  const sessionResult = {
+  let sessionResult = {
     found: row.session_found === true,
     filePath: row.session_file_path || null,
     ipSubnet: row.session_ip_subnet || null,
@@ -193,7 +203,70 @@ export const unifiedCheck = async (path, clientIP, config, sessionTicket = null)
   } else {
     console.log('[Unified Check] Throttle normal_operation (no record)');
   }
-  
+
+  let activeLastAccessTime = null;
+  let totalAccessCount = null;
+
+  if (row.active_last_access_time !== null && row.active_last_access_time !== undefined) {
+    const parsedActiveLastAccessTime = Number(row.active_last_access_time);
+    if (Number.isFinite(parsedActiveLastAccessTime)) {
+      activeLastAccessTime = parsedActiveLastAccessTime;
+    }
+  }
+
+  if (row.active_total_access_count !== null && row.active_total_access_count !== undefined) {
+    const parsedTotalAccessCount = Number(row.active_total_access_count);
+    if (Number.isFinite(parsedTotalAccessCount)) {
+      totalAccessCount = parsedTotalAccessCount;
+    }
+  }
+
+  const idleInfo = {
+    expired: false,
+    timeout: idleTimeout,
+    lastAccessTime: activeLastAccessTime,
+    totalAccessCount,
+    idleDuration: activeLastAccessTime != null ? now - activeLastAccessTime : null,
+  };
+
+  const idleErrorMessage = 'Link expired due to inactivity';
+
+  if (idleTimeout > 0 && activeLastAccessTime != null) {
+    const idleDuration = idleInfo.idleDuration ?? 0;
+    if (idleDuration > idleTimeout) {
+      idleInfo.expired = true;
+      idleInfo.reason = idleErrorMessage;
+      console.log(
+        `[Unified Check] Idle timeout exceeded (idle ${idleDuration}s > ${idleTimeout}s)`
+      );
+
+      sessionResult = {
+        found: false,
+        filePath: null,
+        ipSubnet: null,
+        workerAddress: null,
+        expireAt: null,
+        error: idleErrorMessage,
+      };
+
+      cacheResult = {
+        hit: false,
+        linkData: null,
+        timestamp: null,
+        hostnameHash: null,
+      };
+
+      throttleResult = {
+        status: 'normal_operation',
+        recordExists: false,
+        isProtected: null,
+        errorTimestamp: null,
+        errorCode: null,
+        retryAfter: 0,
+      };
+    }
+  }
+
   console.log('[Unified Check] Completed successfully');
   
   return {
@@ -201,5 +274,63 @@ export const unifiedCheck = async (path, clientIP, config, sessionTicket = null)
     cache: cacheResult,
     rateLimit: rateLimitResult,
     throttle: throttleResult,
+    idle: idleInfo,
   };
 };
+
+const normalizePostgrestUrl = (url) => {
+  if (!url) {
+    return '';
+  }
+  return url.endsWith('/') ? url.slice(0, -1) : url;
+};
+
+const updateLastActive = async (config, ipHash, pathHash) => {
+  if (
+    !config ||
+    !config.postgrestUrl ||
+    !hasVerifyCredentials(config.verifyHeader, config.verifySecret)
+  ) {
+    throw new Error('[LastActive] Missing PostgREST configuration');
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const tableName = config.lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
+  const targetUrl = `${normalizePostgrestUrl(config.postgrestUrl)}/rpc/download_update_last_active`;
+
+  const headers = {
+    'Content-Type': 'application/json',
+  };
+  applyVerifyHeaders(headers, config.verifyHeader, config.verifySecret);
+
+  const body = {
+    p_ip_hash: ipHash,
+    p_path_hash: pathHash,
+    p_last_access_time: now,
+    p_table_name: tableName,
+  };
+
+  const response = await fetch(targetUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`[LastActive] PostgREST update failed (${response.status}): ${errorText}`);
+  }
+
+  const contentType = response.headers.get('content-type');
+  if (contentType && contentType.includes('application/json')) {
+    try {
+      return await response.json();
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  return null;
+};
+
+export { updateLastActive };

@@ -78,40 +78,62 @@ const executeBatchQueries = async (accountId, databaseId, apiToken, statements) 
 /**
  * Ensure cache, rate limit, throttle, and session tables exist before issuing queries.
  */
-const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName, rateLimitTableName, throttleTableName, sessionTableName }) => {
-  await executeQuery(accountId, databaseId, apiToken, `
-    CREATE TABLE IF NOT EXISTS ${cacheTableName} (
-      PATH_HASH TEXT PRIMARY KEY,
-      PATH TEXT NOT NULL,
-      LINK_DATA TEXT NOT NULL,
-      TIMESTAMP INTEGER NOT NULL,
-      HOSTNAME_HASH TEXT
-    )
-  `);
-  await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_cache_hostname ON ${cacheTableName}(HOSTNAME_HASH)`);
+const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName, rateLimitTableName, throttleTableName, sessionTableName, lastActiveTableName }) => {
+  const activeTableName = lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
 
-  await executeQuery(accountId, databaseId, apiToken, `
-    CREATE TABLE IF NOT EXISTS ${rateLimitTableName} (
-      IP_HASH TEXT PRIMARY KEY,
-      IP_RANGE TEXT NOT NULL,
-      ACCESS_COUNT INTEGER NOT NULL,
-      LAST_WINDOW_TIME INTEGER NOT NULL,
-      BLOCK_UNTIL INTEGER
-    )
-  `);
-  await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_rate_limit_window ON ${rateLimitTableName}(LAST_WINDOW_TIME)`);
-  await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_rate_limit_block ON ${rateLimitTableName}(BLOCK_UNTIL) WHERE BLOCK_UNTIL IS NOT NULL`);
+  const baseStatements = [
+    {
+      sql: `
+        CREATE TABLE IF NOT EXISTS ${cacheTableName} (
+          PATH_HASH TEXT PRIMARY KEY,
+          PATH TEXT NOT NULL,
+          LINK_DATA TEXT NOT NULL,
+          TIMESTAMP INTEGER NOT NULL,
+          HOSTNAME_HASH TEXT
+        )
+      `,
+    },
+    { sql: `CREATE INDEX IF NOT EXISTS idx_cache_hostname ON ${cacheTableName}(HOSTNAME_HASH)` },
+    {
+      sql: `
+        CREATE TABLE IF NOT EXISTS ${rateLimitTableName} (
+          IP_HASH TEXT PRIMARY KEY,
+          IP_RANGE TEXT NOT NULL,
+          ACCESS_COUNT INTEGER NOT NULL,
+          LAST_WINDOW_TIME INTEGER NOT NULL,
+          BLOCK_UNTIL INTEGER
+        )
+      `,
+    },
+    { sql: `CREATE INDEX IF NOT EXISTS idx_rate_limit_window ON ${rateLimitTableName}(LAST_WINDOW_TIME)` },
+    { sql: `CREATE INDEX IF NOT EXISTS idx_rate_limit_block ON ${rateLimitTableName}(BLOCK_UNTIL) WHERE BLOCK_UNTIL IS NOT NULL` },
+    {
+      sql: `
+        CREATE TABLE IF NOT EXISTS ${throttleTableName} (
+          HOSTNAME_HASH TEXT PRIMARY KEY,
+          HOSTNAME TEXT NOT NULL,
+          ERROR_TIMESTAMP INTEGER,
+          IS_PROTECTED INTEGER,
+          LAST_ERROR_CODE INTEGER
+        )
+      `,
+    },
+    { sql: `CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${throttleTableName}(ERROR_TIMESTAMP)` },
+    {
+      sql: `
+        CREATE TABLE IF NOT EXISTS ${activeTableName} (
+          IP_HASH TEXT NOT NULL,
+          PATH_HASH TEXT NOT NULL,
+          LAST_ACCESS_TIME INTEGER NOT NULL,
+          TOTAL_ACCESS_COUNT INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (IP_HASH, PATH_HASH)
+        )
+      `,
+    },
+    { sql: `CREATE INDEX IF NOT EXISTS idx_download_last_active_time ON ${activeTableName}(LAST_ACCESS_TIME)` },
+  ];
 
-  await executeQuery(accountId, databaseId, apiToken, `
-    CREATE TABLE IF NOT EXISTS ${throttleTableName} (
-      HOSTNAME_HASH TEXT PRIMARY KEY,
-      HOSTNAME TEXT NOT NULL,
-      ERROR_TIMESTAMP INTEGER,
-      IS_PROTECTED INTEGER,
-      LAST_ERROR_CODE INTEGER
-    )
-  `);
-  await executeQuery(accountId, databaseId, apiToken, `CREATE INDEX IF NOT EXISTS idx_throttle_timestamp ON ${throttleTableName}(ERROR_TIMESTAMP)`);
+  await executeBatchQueries(accountId, databaseId, apiToken, baseStatements);
 
   if (sessionTableName) {
     await executeBatchQueries(accountId, databaseId, apiToken, [
@@ -315,6 +337,7 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
   const cacheTableName = config.cacheTableName || 'DOWNLOAD_CACHE_TABLE';
   const rateLimitTableName = config.rateLimitTableName || 'DOWNLOAD_IP_RATELIMIT_TABLE';
   const throttleTableName = config.throttleTableName || 'THROTTLE_PROTECTION';
+  const lastActiveTableName = config.lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
   const throttleTimeWindow = config.throttleTimeWindow ?? 60;
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
@@ -329,6 +352,7 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
       rateLimitTableName,
       throttleTableName,
       sessionTableName: sessionEnabled ? configuredSessionTable : null,
+      lastActiveTableName,
     });
   }
 
@@ -383,14 +407,18 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
       c.HOSTNAME_HASH,
       t.IS_PROTECTED,
       t.ERROR_TIMESTAMP,
-      t.LAST_ERROR_CODE
+      t.LAST_ERROR_CODE,
+      active.LAST_ACCESS_TIME AS ACTIVE_LAST_ACCESS_TIME
     FROM 
-      (SELECT ? AS provided_path_hash, ? AS session_ticket_param) params
+      (SELECT ? AS provided_path_hash, ? AS session_ticket_param, ? AS ip_hash_param) params
     ${sessionJoinClause}
     LEFT JOIN ${cacheTableName} c 
       ON c.PATH_HASH = COALESCE(s.FILE_PATH_HASH, params.provided_path_hash)
     LEFT JOIN ${throttleTableName} t 
       ON t.HOSTNAME_HASH = c.HOSTNAME_HASH
+    LEFT JOIN ${lastActiveTableName} active
+      ON active.PATH_HASH = COALESCE(s.FILE_PATH_HASH, params.provided_path_hash)
+      AND active.IP_HASH = params.ip_hash_param
     LIMIT 1
   `;
 
@@ -426,7 +454,7 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
   ];
 
   const batchQueries = [
-    { sql: unifiedSql, params: [pathHash, sessionTicketParam || null] },
+    { sql: unifiedSql, params: [pathHash, sessionTicketParam || null, ipHash] },
     { sql: rateLimitSql, params: rateLimitParams },
   ];
 
@@ -449,6 +477,14 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
   const unifiedRow = batchResults[0]?.results?.[0] || null;
   const rateLimitRow = batchResults[1]?.results?.[0] || null;
 
+  const activeLastAccessTime = (() => {
+    if (!unifiedRow || unifiedRow.ACTIVE_LAST_ACCESS_TIME == null) {
+      return null;
+    }
+    const parsed = Number(unifiedRow.ACTIVE_LAST_ACCESS_TIME);
+    return Number.isFinite(parsed) ? parsed : null;
+  })();
+
   let sessionResult = createDefaultSessionResult(shouldCheckSession);
   if (shouldCheckSession) {
     sessionResult = parseSessionFromRow(unifiedRow, sessionTicket, now);
@@ -464,7 +500,7 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
       }
     : null;
 
-  const cacheResult = parseCacheFromRow(cacheRow, now, cacheTTL);
+  let cacheResult = parseCacheFromRow(cacheRow, now, cacheTTL);
 
   const throttleRow = unifiedRow && (
     unifiedRow.IS_PROTECTED != null ||
@@ -478,8 +514,40 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
       }
     : null;
 
-  const throttleResult = parseThrottleFromRow(throttleRow, cacheResult, now, throttleTimeWindow);
+  let throttleResult = parseThrottleFromRow(throttleRow, cacheResult, now, throttleTimeWindow);
   const rateLimitResult = parseRateLimitResult(rateLimitRow, now, limit, windowSeconds, ipSubnet);
+
+  const idleTimeout = Number.isFinite(Number(config.idleTimeout))
+    ? Number(config.idleTimeout)
+    : 0;
+
+  const idleInfo = {
+    expired: false,
+    timeout: idleTimeout,
+    lastAccessTime: activeLastAccessTime,
+    idleDuration: activeLastAccessTime != null ? now - activeLastAccessTime : null,
+  };
+
+  const idleErrorMessage = 'Link expired due to inactivity';
+
+  if (idleTimeout > 0 && activeLastAccessTime != null) {
+    const idleDuration = idleInfo.idleDuration ?? 0;
+    if (idleDuration > idleTimeout) {
+      idleInfo.expired = true;
+      idleInfo.reason = idleErrorMessage;
+      console.log(
+        `[Unified Check D1-REST] Idle timeout exceeded (idle ${idleDuration}s > ${idleTimeout}s)`
+      );
+
+      sessionResult = {
+        ...createDefaultSessionResult(shouldCheckSession),
+        error: idleErrorMessage,
+      };
+
+      cacheResult = { ...createDefaultCacheResult() };
+      throttleResult = { ...createDefaultThrottleResult() };
+    }
+  }
 
   console.log('[Unified Check D1-REST] Completed successfully (1 RTT)');
 
@@ -488,5 +556,32 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
     cache: cacheResult,
     rateLimit: rateLimitResult,
     throttle: throttleResult,
+    idle: idleInfo,
   };
 };
+
+const updateLastActive = async (config, ipHash, pathHash) => {
+  if (!config || !config.accountId || !config.databaseId || !config.apiToken) {
+    throw new Error('[LastActive] Missing D1 REST configuration');
+  }
+
+  const tableName = config.lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
+  const now = Math.floor(Date.now() / 1000);
+
+  const statements = [
+    {
+      sql: `
+        INSERT INTO ${tableName} (IP_HASH, PATH_HASH, LAST_ACCESS_TIME, TOTAL_ACCESS_COUNT)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(IP_HASH, PATH_HASH) DO UPDATE SET
+          LAST_ACCESS_TIME = excluded.LAST_ACCESS_TIME,
+          TOTAL_ACCESS_COUNT = ${tableName}.TOTAL_ACCESS_COUNT + 1
+      `,
+      params: [ipHash, pathHash, now],
+    },
+  ];
+
+  return executeBatchQueries(config.accountId, config.databaseId, config.apiToken, statements);
+};
+
+export { ensureAllTables, updateLastActive };
