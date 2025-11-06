@@ -852,6 +852,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let shouldCheckIP = config.ipCheck;
   let shouldCheckAddition = config.additionCheck;
   let shouldCheckAdditionExpireTime = config.additionExpireTimeCheck;
+  let dynamicIdleTimeout = null;
 
   if (isSessionMode) {
     shouldCheckSign = false;
@@ -979,6 +980,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         return createUnauthorizedResponse(origin, "additionalInfo invalid");
       }
 
+      // Extract idle_timeout from additionalInfo (priority: additionalInfo > env)
+      if (additionalPayload && typeof additionalPayload === "object") {
+        const { idle_timeout: idleTimeoutOverride } = additionalPayload;
+
+        if (typeof idleTimeoutOverride === "number" && Number.isFinite(idleTimeoutOverride) && idleTimeoutOverride >= 0) {
+          dynamicIdleTimeout = Math.trunc(idleTimeoutOverride);
+          console.log("[IDLE] Using idle_timeout from additionalInfo:", dynamicIdleTimeout);
+        }
+      }
+
       const expectedPathHash = await sha256Hex(path);
       if (typeof additionalPayload.pathHash !== "string" || additionalPayload.pathHash !== expectedPathHash) {
         return createUnauthorizedResponse(origin, "additionalInfo path mismatch");
@@ -1027,6 +1038,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const throttleConfig = config.throttleConfig || {};
       const limitConfigValue = rateLimitConfig.limit ?? config.ipSubnetLimit;
       const sessionTableName = config.sessionTableName || 'SESSION_MAPPING_TABLE';
+      const effectiveIdleTimeout =
+        dynamicIdleTimeout ?? cacheConfig.idleTimeout ?? config.idleTimeout ?? 0;
 
       if (config.dbMode === 'custom-pg-rest') {
         unifiedResult = await unifiedCheck(path, clientIP, {
@@ -1034,7 +1047,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           verifyHeader: rateLimitConfig.verifyHeader,
           verifySecret: rateLimitConfig.verifySecret,
           linkTTL: cacheConfig.linkTTL ?? 1800,
-          idleTimeout: cacheConfig.idleTimeout ?? config.idleTimeout ?? 0,
+          idleTimeout: effectiveIdleTimeout,
           cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
           windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
           limit: limitConfigValue ?? 100,
@@ -1052,7 +1065,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           env: cacheConfig.env || rateLimitConfig.env,
           databaseBinding: cacheConfig.databaseBinding || rateLimitConfig.databaseBinding || 'DB',
           linkTTL: cacheConfig.linkTTL ?? 1800,
-          idleTimeout: cacheConfig.idleTimeout ?? config.idleTimeout ?? 0,
+          idleTimeout: effectiveIdleTimeout,
           cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
           windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
           limit: limitConfigValue ?? 100,
@@ -1073,7 +1086,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           databaseId: rateLimitConfig.databaseId || throttleConfig.databaseId || cacheConfig.databaseId,
           apiToken: rateLimitConfig.apiToken || throttleConfig.apiToken || cacheConfig.apiToken,
           linkTTL: cacheConfig.linkTTL ?? 1800,
-          idleTimeout: cacheConfig.idleTimeout ?? config.idleTimeout ?? 0,
+          idleTimeout: effectiveIdleTimeout,
           cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
           windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
           limit: limitConfigValue ?? 100,
