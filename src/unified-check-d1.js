@@ -468,27 +468,20 @@ const ensureSlotPool = async (db, hostname, globalLimit, tableName) => {
 
 const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
   const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+  const zombieCutoff = `-${config.zombieTimeoutSeconds} seconds`;
 
   try {
     await ensureSlotPool(db, hostname, config.globalLimit, tableName);
 
-    await db
-      .prepare(
-        `UPDATE ${tableName}
-         SET status = 'available', ip_hash = NULL, locked_at = NULL
-         WHERE hostname_pattern = ?
-           AND status = 'locked'
-           AND locked_at < datetime('now', ?)`
-      )
-      .bind(hostname, `-${config.zombieTimeoutSeconds} seconds`)
-      .run();
-
     const ipRow = await db
       .prepare(
         `SELECT COUNT(*) AS c FROM ${tableName}
-         WHERE hostname_pattern = ? AND status = 'locked' AND ip_hash = ?`
+         WHERE hostname_pattern = ?
+           AND status = 'locked'
+           AND ip_hash = ?
+           AND (locked_at IS NULL OR locked_at >= datetime('now', ?))`
       )
-      .bind(hostname, ipHash)
+      .bind(hostname, ipHash, zombieCutoff)
       .first();
 
     if ((ipRow?.c ?? 0) >= config.perIpLimit) {
@@ -498,11 +491,19 @@ const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
     const candidate = await db
       .prepare(
         `SELECT id FROM ${tableName}
-         WHERE hostname_pattern = ? AND status = 'available'
+         WHERE hostname_pattern = ?
            AND slot_index <= ?
+           AND (
+             status = 'available'
+             OR (
+               status = 'locked'
+               AND locked_at IS NOT NULL
+               AND locked_at < datetime('now', ?)
+             )
+           )
          ORDER BY slot_index LIMIT 1`
       )
-      .bind(hostname, config.globalLimit)
+      .bind(hostname, config.globalLimit, zombieCutoff)
       .first();
 
     if (!candidate) {
@@ -513,9 +514,16 @@ const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
         `UPDATE ${tableName}
          SET status = 'locked', ip_hash = ?, locked_at = datetime('now')
          WHERE id = ?
-           AND status = 'available'`
+           AND (
+             status = 'available'
+             OR (
+               status = 'locked'
+               AND locked_at IS NOT NULL
+               AND locked_at < datetime('now', ?)
+             )
+           )`
       )
-      .bind(ipHash, candidate.id)
+      .bind(ipHash, candidate.id, zombieCutoff)
       .run();
     const changes = updateResult.meta?.changes ?? 0;
     if (changes === 0) {
@@ -605,18 +613,20 @@ const cleanupZombieSlots = async (config) => {
 
   const result = await db
     .prepare(
-      `DELETE FROM ${tableName}
+      `UPDATE ${tableName}
+       SET status = 'available', ip_hash = NULL, locked_at = NULL
        WHERE status = 'locked'
+         AND locked_at IS NOT NULL
          AND locked_at < datetime('now', ?)`
     )
     .bind(`-${config.zombieTimeoutSeconds} seconds`)
     .run();
 
-  const deleted = result.meta?.changes ?? 0;
-  if (deleted > 0) {
-    console.log(`[Fair Queue D1] Cleaned up ${deleted} zombie slots`);
+  const recovered = result.meta?.changes ?? 0;
+  if (recovered > 0) {
+    console.log(`[Fair Queue D1] Recovered ${recovered} zombie slots`);
   }
-  return deleted;
+  return recovered;
 };
 
 export {

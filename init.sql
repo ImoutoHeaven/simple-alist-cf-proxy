@@ -530,49 +530,62 @@ DECLARE
   v_zombie_timeout       INTERVAL := (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL;
   v_slot_id              INT;
   v_current_ip_slots     INT;
+  v_now                  TIMESTAMP WITH TIME ZONE;
 BEGIN
+  -- 确保当前 hostname_pattern 下有 1..p_global_limit 的槽位
   INSERT INTO "upstream_slot_pool" ("hostname_pattern", "slot_index", "status")
   SELECT p_hostname_pattern, gs.slot_index, 'available'
   FROM generate_series(1, p_global_limit) AS gs(slot_index)
   ON CONFLICT ("hostname_pattern", "slot_index") DO NOTHING;
 
   LOOP
-    UPDATE "upstream_slot_pool"
-    SET "status" = 'available', "ip_hash" = NULL, "locked_at" = NULL
-    WHERE "hostname_pattern" = p_hostname_pattern
-      AND "status" = 'locked'
-      AND "locked_at" < (clock_timestamp() - v_zombie_timeout);
+    v_now := clock_timestamp();
 
+    -- 只统计“非僵尸”的锁作为该 IP 的占用
     SELECT COUNT(*) INTO v_current_ip_slots
     FROM "upstream_slot_pool"
     WHERE "hostname_pattern" = p_hostname_pattern
       AND "status" = 'locked'
-      AND "ip_hash" = p_ip_hash;
+      AND "ip_hash" = p_ip_hash
+      AND "locked_at" IS NOT NULL
+      AND "locked_at" >= (v_now - v_zombie_timeout);
 
     IF v_current_ip_slots >= p_per_ip_limit THEN
+      -- 该 IP 已经占满自己的并发上限
       RETURN 0;
     END IF;
 
+    -- 抢一个可用槽：包括可用行和超时的僵尸锁
     SELECT "id" INTO v_slot_id
     FROM "upstream_slot_pool"
     WHERE "hostname_pattern" = p_hostname_pattern
-      AND "status" = 'available'
       AND "slot_index" <= p_global_limit
+      AND (
+        "status" = 'available'
+        OR ("status" = 'locked'
+            AND "locked_at" IS NOT NULL
+            AND "locked_at" < (v_now - v_zombie_timeout))
+      )
     ORDER BY "slot_index"
     FOR UPDATE SKIP LOCKED
     LIMIT 1;
 
     IF v_slot_id IS NOT NULL THEN
       UPDATE "upstream_slot_pool"
-      SET "status" = 'locked', "ip_hash" = p_ip_hash, "locked_at" = clock_timestamp()
+      SET "status" = 'locked',
+          "ip_hash" = p_ip_hash,
+          "locked_at" = v_now
       WHERE "id" = v_slot_id;
+
       RETURN v_slot_id;
     END IF;
 
-    IF (clock_timestamp() - v_start_time) > v_queue_timeout THEN
+    -- 排队超时
+    IF (v_now - v_start_time) > v_queue_timeout THEN
       RETURN -1;
     END IF;
 
+    -- 等待再尝试
     PERFORM pg_sleep(v_poll_interval);
   END LOOP;
 END;
@@ -589,28 +602,36 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
   UPDATE "upstream_slot_pool"
-  SET "status" = 'available', "ip_hash" = NULL, "locked_at" = NULL
+  SET "status" = 'available',
+      "ip_hash" = NULL,
+      "locked_at" = NULL
   WHERE "id" = p_slot_id;
 END;
 $$;
 
 -- ========================================
 -- Cleanup Zombie Slots RPC
+-- （可选：手动把久未释放的锁位重置为 available）
 -- ========================================
 CREATE OR REPLACE FUNCTION func_cleanup_zombie_slots(
   p_zombie_timeout_seconds INT
 )
 RETURNS INTEGER
+LANGUAGE plpgsql
 AS $$
 DECLARE
-  deleted_count INTEGER;
+  recovered_count INTEGER;
   v_zombie_timeout INTERVAL := (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL;
 BEGIN
-  DELETE FROM "upstream_slot_pool"
+  UPDATE "upstream_slot_pool"
+  SET "status" = 'available',
+      "ip_hash" = NULL,
+      "locked_at" = NULL
   WHERE "status" = 'locked'
+    AND "locked_at" IS NOT NULL
     AND "locked_at" < (clock_timestamp() - v_zombie_timeout);
-  
-  GET DIAGNOSTICS deleted_count = ROW_COUNT;
-  RETURN deleted_count;
+
+  GET DIAGNOSTICS recovered_count = ROW_COUNT;
+  RETURN recovered_count;
 END;
-$$ LANGUAGE plpgsql;
+$$;

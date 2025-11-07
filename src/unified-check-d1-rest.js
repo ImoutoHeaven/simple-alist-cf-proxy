@@ -561,28 +561,20 @@ const tryAcquireFairSlotOnceRest = async (
   config
 ) => {
   const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+  const zombieCutoff = `-${config.zombieTimeoutSeconds} seconds`;
 
   try {
-    await executeQuery(
-      accountId,
-      databaseId,
-      apiToken,
-      `UPDATE ${tableName}
-       SET status = 'available', ip_hash = NULL, locked_at = NULL
-       WHERE hostname_pattern = ?
-         AND status = 'locked'
-         AND locked_at < datetime('now', ?)`,
-      [hostname, `-${config.zombieTimeoutSeconds} seconds`]
-    );
-
     const ipCountRow = (
       await executeQuery(
         accountId,
         databaseId,
         apiToken,
         `SELECT COUNT(*) AS c FROM ${tableName}
-         WHERE hostname_pattern = ? AND status = 'locked' AND ip_hash = ?`,
-        [hostname, ipHash]
+         WHERE hostname_pattern = ?
+           AND status = 'locked'
+           AND ip_hash = ?
+           AND (locked_at IS NULL OR locked_at >= datetime('now', ?))`,
+        [hostname, ipHash, zombieCutoff]
       )
     ).results?.[0] || null;
     const ipCount = Number(ipCountRow?.c ?? ipCountRow?.C ?? 0);
@@ -597,11 +589,18 @@ const tryAcquireFairSlotOnceRest = async (
       apiToken,
       `SELECT id FROM ${tableName}
        WHERE hostname_pattern = ?
-         AND status = 'available'
          AND slot_index <= ?
+         AND (
+           status = 'available'
+           OR (
+             status = 'locked'
+             AND locked_at IS NOT NULL
+             AND locked_at < datetime('now', ?)
+           )
+         )
        ORDER BY slot_index
        LIMIT 1`,
-      [hostname, config.globalLimit]
+      [hostname, config.globalLimit, zombieCutoff]
     );
 
     const slotId = candidate.results?.[0]?.id ?? candidate.results?.[0]?.ID ?? null;
@@ -616,8 +615,15 @@ const tryAcquireFairSlotOnceRest = async (
       `UPDATE ${tableName}
        SET status = 'locked', ip_hash = ?, locked_at = datetime('now')
        WHERE id = ?
-         AND status = 'available'`,
-      [ipHash, slotId]
+         AND (
+           status = 'available'
+           OR (
+             status = 'locked'
+             AND locked_at IS NOT NULL
+             AND locked_at < datetime('now', ?)
+           )
+         )`,
+      [ipHash, slotId, zombieCutoff]
     );
     const changes = updateResult.meta?.changes ?? 0;
     if (changes === 0) {
@@ -706,17 +712,19 @@ const cleanupZombieSlots = async (config) => {
     accountId,
     databaseId,
     apiToken,
-    `DELETE FROM ${tableName}
+    `UPDATE ${tableName}
+     SET status = 'available', ip_hash = NULL, locked_at = NULL
      WHERE status = 'locked'
+       AND locked_at IS NOT NULL
        AND locked_at < datetime('now', ?)`,
     [`-${config.zombieTimeoutSeconds} seconds`]
   );
 
-  const deleted = result.meta?.changes ?? 0;
-  if (deleted > 0) {
-    console.log(`[Fair Queue D1-REST] Cleaned up ${deleted} zombie slots`);
+  const recovered = result.meta?.changes ?? 0;
+  if (recovered > 0) {
+    console.log(`[Fair Queue D1-REST] Recovered ${recovered} zombie slots`);
   }
-  return deleted;
+  return recovered;
 };
 
 export {
