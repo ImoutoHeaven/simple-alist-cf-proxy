@@ -704,3 +704,127 @@ BEGIN
     v_active_total_access_count;
 END;
 $$ LANGUAGE plpgsql;
+-- ========================================
+-- Fair Upstream Queue Table Schema (PostgreSQL)
+-- ========================================
+CREATE TABLE IF NOT EXISTS "upstream_slot_pool" (
+  "id" SERIAL PRIMARY KEY,
+  "hostname_pattern" TEXT NOT NULL,
+  "slot_index" INTEGER NOT NULL,
+  "status" TEXT NOT NULL DEFAULT 'available',
+  "ip_hash" TEXT,
+  "locked_at" TIMESTAMP WITH TIME ZONE,
+  "created_at" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_upstream_slot_pool_unique
+  ON "upstream_slot_pool" ("hostname_pattern", "slot_index");
+
+CREATE INDEX IF NOT EXISTS idx_upstream_slot_pool_host_status
+  ON "upstream_slot_pool" ("hostname_pattern", "status");
+
+-- ========================================
+-- Acquire Fair Slot RPC
+-- ========================================
+CREATE OR REPLACE FUNCTION func_acquire_fair_slot(
+  p_hostname_pattern           TEXT,
+  p_ip_hash                    TEXT,
+  p_global_limit               INT,
+  p_per_ip_limit               INT,
+  p_queue_wait_timeout_ms      INT,
+  p_zombie_timeout_seconds     INT,
+  p_poll_interval_ms           INT
+)
+RETURNS INT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_start_time           TIMESTAMP WITH TIME ZONE := clock_timestamp();
+  v_poll_interval        INTERVAL := (p_poll_interval_ms::TEXT || ' milliseconds')::INTERVAL;
+  v_queue_timeout        INTERVAL := (p_queue_wait_timeout_ms::TEXT || ' milliseconds')::INTERVAL;
+  v_zombie_timeout       INTERVAL := (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL;
+  v_slot_id              INT;
+  v_current_ip_slots     INT;
+BEGIN
+  INSERT INTO "upstream_slot_pool" ("hostname_pattern", "slot_index", "status")
+  SELECT p_hostname_pattern, gs.slot_index, 'available'
+  FROM generate_series(1, p_global_limit) AS gs(slot_index)
+  ON CONFLICT ("hostname_pattern", "slot_index") DO NOTHING;
+
+  LOOP
+    UPDATE "upstream_slot_pool"
+    SET "status" = 'available', "ip_hash" = NULL, "locked_at" = NULL
+    WHERE "hostname_pattern" = p_hostname_pattern
+      AND "status" = 'locked'
+      AND "locked_at" < (clock_timestamp() - v_zombie_timeout);
+
+    SELECT COUNT(*) INTO v_current_ip_slots
+    FROM "upstream_slot_pool"
+    WHERE "hostname_pattern" = p_hostname_pattern
+      AND "status" = 'locked'
+      AND "ip_hash" = p_ip_hash;
+
+    IF v_current_ip_slots >= p_per_ip_limit THEN
+      RETURN 0;
+    END IF;
+
+    SELECT "id" INTO v_slot_id
+    FROM "upstream_slot_pool"
+    WHERE "hostname_pattern" = p_hostname_pattern
+      AND "status" = 'available'
+    ORDER BY "slot_index"
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1;
+
+    IF v_slot_id IS NOT NULL THEN
+      UPDATE "upstream_slot_pool"
+      SET "status" = 'locked', "ip_hash" = p_ip_hash, "locked_at" = clock_timestamp()
+      WHERE "id" = v_slot_id;
+      RETURN v_slot_id;
+    END IF;
+
+    IF (clock_timestamp() - v_start_time) > v_queue_timeout THEN
+      RETURN -1;
+    END IF;
+
+    PERFORM pg_sleep(v_poll_interval);
+  END LOOP;
+END;
+$$;
+
+-- ========================================
+-- Release Fair Slot RPC
+-- ========================================
+CREATE OR REPLACE FUNCTION func_release_fair_slot(
+  p_slot_id INT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  UPDATE "upstream_slot_pool"
+  SET "status" = 'available', "ip_hash" = NULL, "locked_at" = NULL
+  WHERE "id" = p_slot_id;
+END;
+$$;
+
+-- ========================================
+-- Cleanup Zombie Slots RPC
+-- ========================================
+CREATE OR REPLACE FUNCTION func_cleanup_zombie_slots(
+  p_zombie_timeout_seconds INT
+)
+RETURNS INTEGER
+AS $$
+DECLARE
+  deleted_count INTEGER;
+  v_zombie_timeout INTERVAL := (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL;
+BEGIN
+  DELETE FROM "upstream_slot_pool"
+  WHERE "status" = 'locked'
+    AND "locked_at" < (clock_timestamp() - v_zombie_timeout);
+  
+  GET DIAGNOSTICS deleted_count = ROW_COUNT;
+  RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;

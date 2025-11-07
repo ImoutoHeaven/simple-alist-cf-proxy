@@ -78,7 +78,19 @@ const executeBatchQueries = async (accountId, databaseId, apiToken, statements) 
 /**
  * Ensure cache, rate limit, throttle, and session tables exist before issuing queries.
  */
-const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName, rateLimitTableName, throttleTableName, sessionTableName, lastActiveTableName }) => {
+const ensureAllTables = async (
+  accountId,
+  databaseId,
+  apiToken,
+  {
+    cacheTableName,
+    rateLimitTableName,
+    throttleTableName,
+    sessionTableName,
+    lastActiveTableName,
+    fairQueueTableName = 'upstream_slot_pool',
+  }
+) => {
   const activeTableName = lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
 
   const baseStatements = [
@@ -131,6 +143,30 @@ const ensureAllTables = async (accountId, databaseId, apiToken, { cacheTableName
       `,
     },
     { sql: `CREATE INDEX IF NOT EXISTS idx_download_last_active_time ON ${activeTableName}(LAST_ACCESS_TIME)` },
+    {
+      sql: `
+        CREATE TABLE IF NOT EXISTS ${fairQueueTableName} (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          hostname_pattern TEXT NOT NULL,
+          slot_index INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'available',
+          ip_hash TEXT,
+          locked_at TEXT,
+          created_at TEXT DEFAULT (datetime('now'))
+        )
+      `,
+      params: [],
+    },
+    {
+      sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_fair_queue_unique
+            ON ${fairQueueTableName} (hostname_pattern, slot_index)`,
+      params: [],
+    },
+    {
+      sql: `CREATE INDEX IF NOT EXISTS idx_fair_queue_host_status
+            ON ${fairQueueTableName} (hostname_pattern, status)`,
+      params: [],
+    },
   ];
 
   await executeBatchQueries(accountId, databaseId, apiToken, baseStatements);
@@ -585,4 +621,222 @@ const updateLastActive = async (config, ipHash, pathHash) => {
   return executeBatchQueries(config.accountId, config.databaseId, config.apiToken, statements);
 };
 
-export { ensureAllTables, updateLastActive };
+// ========================================
+// Fair Queue Functions (D1-REST Mode)
+// ========================================
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const ensureSlotPoolRest = async (
+  accountId,
+  databaseId,
+  apiToken,
+  hostname,
+  globalLimit,
+  tableName
+) => {
+  const countResult = await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `SELECT COUNT(*) AS c FROM ${tableName} WHERE hostname_pattern = ?`,
+    [hostname]
+  );
+
+  const row = countResult.results?.[0] || null;
+  const current = Number(row?.c ?? row?.C ?? 0);
+  if (current >= globalLimit) {
+    return;
+  }
+
+  const statements = [];
+  for (let i = current + 1; i <= globalLimit; i++) {
+    statements.push({
+      sql: `INSERT OR IGNORE INTO ${tableName} (hostname_pattern, slot_index, status)
+            VALUES (?, ?, 'available')`,
+      params: [hostname, i],
+    });
+  }
+
+  if (statements.length > 0) {
+    await executeBatchQueries(accountId, databaseId, apiToken, statements);
+  }
+};
+
+const tryAcquireFairSlotOnceRest = async (
+  accountId,
+  databaseId,
+  apiToken,
+  hostname,
+  ipHash,
+  config
+) => {
+  const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+
+  try {
+    await executeQuery(
+      accountId,
+      databaseId,
+      apiToken,
+      `UPDATE ${tableName}
+       SET status = 'available', ip_hash = NULL, locked_at = NULL
+       WHERE hostname_pattern = ?
+         AND status = 'locked'
+         AND locked_at < datetime('now', ?)`,
+      [hostname, `-${config.zombieTimeoutSeconds} seconds`]
+    );
+
+    const ipCountRow = (
+      await executeQuery(
+        accountId,
+        databaseId,
+        apiToken,
+        `SELECT COUNT(*) AS c FROM ${tableName}
+         WHERE hostname_pattern = ? AND status = 'locked' AND ip_hash = ?`,
+        [hostname, ipHash]
+      )
+    ).results?.[0] || null;
+    const ipCount = Number(ipCountRow?.c ?? ipCountRow?.C ?? 0);
+
+    if (ipCount >= config.perIpLimit) {
+      return 0;
+    }
+
+    const candidate = await executeQuery(
+      accountId,
+      databaseId,
+      apiToken,
+      `SELECT id FROM ${tableName}
+       WHERE hostname_pattern = ?
+         AND status = 'available'
+       ORDER BY slot_index
+       LIMIT 1`,
+      [hostname]
+    );
+
+    const slotId = candidate.results?.[0]?.id ?? candidate.results?.[0]?.ID ?? null;
+    if (!slotId) {
+      return -2;
+    }
+
+    const updateResult = await executeQuery(
+      accountId,
+      databaseId,
+      apiToken,
+      `UPDATE ${tableName}
+       SET status = 'locked', ip_hash = ?, locked_at = datetime('now')
+       WHERE id = ?
+         AND status = 'available'`,
+      [ipHash, slotId]
+    );
+    const changes = updateResult.meta?.changes ?? 0;
+    if (changes === 0) {
+      console.warn('[Fair Queue D1-REST][tryAcquire] slot already taken, retrying', {
+        hostname,
+        slotId,
+      });
+      return -2;
+    }
+    return slotId;
+  } catch (error) {
+    throw error;
+  }
+};
+
+const acquireFairSlot = async (hostname, ipHash, config) => {
+  if (!config?.accountId || !config.databaseId || !config.apiToken) {
+    throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration');
+  }
+
+  const { accountId, databaseId, apiToken } = config;
+  const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+  const deadline = Date.now() + config.queueWaitTimeoutMs;
+
+  await ensureSlotPoolRest(accountId, databaseId, apiToken, hostname, config.globalLimit, tableName);
+
+  while (true) {
+    const result = await tryAcquireFairSlotOnceRest(
+      accountId,
+      databaseId,
+      apiToken,
+      hostname,
+      ipHash,
+      config
+    );
+
+    if (result > 0) {
+      console.log(`[Fair Queue D1-REST] Acquired slot ${result} for ${hostname}`);
+      return result;
+    }
+
+    if (result === 0) {
+      console.warn(`[Fair Queue D1-REST] Per-IP limit reached: ${ipHash}`);
+      const error = new Error(`Per-IP limit ${config.perIpLimit} reached`);
+      error.name = 'PerIpLimitError';
+      throw error;
+    }
+
+    if (Date.now() > deadline) {
+      console.warn(`[Fair Queue D1-REST] Queue timeout for ${hostname}`);
+      const error = new Error(`Queue timeout after ${config.queueWaitTimeoutMs}ms`);
+      error.name = 'QueueTimeoutError';
+      throw error;
+    }
+
+    await sleep(config.pollIntervalMs);
+  }
+};
+
+const releaseFairSlot = async (slotId, config) => {
+  if (!config?.accountId || !config.databaseId || !config.apiToken) {
+    throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration');
+  }
+
+  const { accountId, databaseId, apiToken } = config;
+  const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+
+  await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `UPDATE ${tableName}
+     SET status = 'available', ip_hash = NULL, locked_at = NULL
+     WHERE id = ?`,
+    [slotId]
+  );
+
+  console.log(`[Fair Queue D1-REST] Released slot ${slotId}`);
+};
+
+const cleanupZombieSlots = async (config) => {
+  if (!config?.accountId || !config.databaseId || !config.apiToken) {
+    throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration');
+  }
+
+  const { accountId, databaseId, apiToken } = config;
+  const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+
+  const result = await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `DELETE FROM ${tableName}
+     WHERE status = 'locked'
+       AND locked_at < datetime('now', ?)`,
+    [`-${config.zombieTimeoutSeconds} seconds`]
+  );
+
+  const deleted = result.meta?.changes ?? 0;
+  if (deleted > 0) {
+    console.log(`[Fair Queue D1-REST] Cleaned up ${deleted} zombie slots`);
+  }
+  return deleted;
+};
+
+export {
+  ensureAllTables,
+  updateLastActive,
+  acquireFairSlot,
+  releaseFairSlot,
+  cleanupZombieSlots,
+};

@@ -412,6 +412,30 @@ const resolveConfig = (env = {}) => {
   }
   const sessionTableName = normalizeString(env.SESSION_TABLE_NAME) || 'SESSION_MAPPING_TABLE';
 
+  // Fair Upstream Queue Configuration
+  const fairQueueEnabled = parseBoolean(env.FAIR_QUEUE_ENABLED, false);
+  const fairQueueHostPatternsRaw = normalizeString(env.FAIR_QUEUE_HOST_PATTERNS, '');
+  const fairQueueHostnamePatterns = fairQueueHostPatternsRaw
+    ? fairQueueHostPatternsRaw.split(',').map((p) => p.trim()).filter((p) => p.length > 0)
+    : [];
+
+  const fairQueueGlobalLimit = parseInteger(env.FAIR_QUEUE_GLOBAL_LIMIT, 5);
+  const fairQueuePerIpLimit = parseInteger(env.FAIR_QUEUE_PER_IP_LIMIT, 1);
+  const fairQueueWaitTimeoutMs = parseInteger(env.FAIR_QUEUE_WAIT_TIMEOUT_MS, 15000);
+  const fairQueueZombieTimeoutSeconds = parseInteger(env.FAIR_QUEUE_ZOMBIE_TIMEOUT_SECONDS, 30);
+  const fairQueuePollIntervalMs = parseInteger(env.FAIR_QUEUE_POLL_INTERVAL_MS, 200);
+  const fairQueueTableName = normalizeString(env.FAIR_QUEUE_TABLE_NAME, 'upstream_slot_pool');
+
+  // Validate Fair Queue configuration
+  const actualFairQueueEnabled =
+    fairQueueEnabled &&
+    fairQueueHostnamePatterns.length > 0 &&
+    Boolean(dbMode);
+
+  if (fairQueueEnabled && !actualFairQueueEnabled) {
+    console.warn('[Fair Queue] Disabled: HOST_PATTERNS empty or dbMode not configured');
+  }
+
   return {
     address: String(env.ADDRESS).trim(),
     token: String(env.TOKEN).trim(),
@@ -461,6 +485,24 @@ const resolveConfig = (env = {}) => {
     initTables,
     idleTimeout: idleTimeoutSeconds,
     lastActiveTableName,
+    fairQueueEnabled: actualFairQueueEnabled,
+    fairQueueHostnamePatterns,
+    fairQueueConfig: {
+      env,
+      databaseBinding: d1DatabaseBinding,
+      accountId: d1AccountId,
+      databaseId: d1DatabaseId,
+      apiToken: d1ApiToken,
+      postgrestUrl,
+      verifyHeader: verifyHeaders,
+      verifySecret: verifySecrets,
+      globalLimit: fairQueueGlobalLimit,
+      perIpLimit: fairQueuePerIpLimit,
+      queueWaitTimeoutMs: fairQueueWaitTimeoutMs,
+      zombieTimeoutSeconds: fairQueueZombieTimeoutSeconds,
+      pollIntervalMs: fairQueuePollIntervalMs,
+      fairQueueTableName,
+    },
   };
 };
 
@@ -1136,6 +1178,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
     }
     if (unifiedResult) {
+      console.log('[Idle Debug] Unified check idle payload:', unifiedResult.idle ?? null);
       if (!unifiedResult.rateLimit.allowed) {
         if (unifiedResult.rateLimit.error) {
           console.error('[Rate Limit] fail-closed error:', unifiedResult.rateLimit.error);
@@ -1357,6 +1400,125 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // Use linkData from cache or API response
   const downloadUrl = res.data.url;
 
+  // ========================================
+  // Fair Upstream Queue Integration
+  // ========================================
+  const upstreamHostname = extractHostname(downloadUrl);
+  const normalizedDbMode = (config.dbMode || '').trim().toLowerCase();
+  const needFairQueue =
+    config.fairQueueEnabled &&
+    upstreamHostname &&
+    config.fairQueueHostnamePatterns.some((pattern) => matchHostnamePattern(upstreamHostname, pattern));
+
+  if (config.fairQueueEnabled) {
+    const fairQueueConfig = config.fairQueueConfig || {};
+    console.log('[Fair Queue Debug] Decision snapshot:', {
+      upstreamHostname,
+      hostnamePatterns: config.fairQueueHostnamePatterns,
+      needFairQueue,
+      dbMode: normalizedDbMode,
+      configSummary: {
+        tableName: fairQueueConfig.fairQueueTableName,
+        globalLimit: fairQueueConfig.globalLimit,
+        perIpLimit: fairQueueConfig.perIpLimit,
+        queueWaitTimeoutMs: fairQueueConfig.queueWaitTimeoutMs,
+        pollIntervalMs: fairQueueConfig.pollIntervalMs,
+        zombieTimeoutSeconds: fairQueueConfig.zombieTimeoutSeconds,
+        hasPostgrest: Boolean(fairQueueConfig.postgrestUrl),
+        hasD1Binding: Boolean(fairQueueConfig.databaseBinding),
+        hasRestConfig: Boolean(fairQueueConfig.accountId && fairQueueConfig.databaseId),
+      },
+    });
+  }
+
+  let slotId = null;
+  let fairQueueModule = null;
+
+  if (needFairQueue) {
+    console.log('[Fair Queue Debug] Entering enforcement block for:', upstreamHostname);
+    const clientIpSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
+    console.log('[Fair Queue Debug] Derived subnet info:', {
+      clientIP,
+      clientIpSubnet,
+      ipv4Suffix: config.ipv4Suffix,
+      ipv6Suffix: config.ipv6Suffix,
+    });
+
+    if (clientIpSubnet) {
+      const clientIpSubnetHash = await sha256Hash(clientIpSubnet);
+      console.log('[Fair Queue Debug] Subnet hash info:', {
+        clientIpSubnetHash,
+        normalizedDbMode,
+      });
+
+      if (normalizedDbMode === 'custom-pg-rest') {
+        fairQueueModule = await import('./fairqueue/custom-pg-rest.js');
+      } else if (normalizedDbMode === 'd1') {
+        fairQueueModule = await import('./unified-check-d1.js');
+      } else if (normalizedDbMode === 'd1-rest') {
+        fairQueueModule = await import('./unified-check-d1-rest.js');
+      }
+
+      if (fairQueueModule && typeof fairQueueModule.acquireFairSlot === 'function') {
+        try {
+          console.log('[Fair Queue Debug] Attempting to acquire slot with config:', {
+            hostname: upstreamHostname,
+            perIpLimit: config.fairQueueConfig?.perIpLimit,
+            queueWaitTimeoutMs: config.fairQueueConfig?.queueWaitTimeoutMs,
+            pollIntervalMs: config.fairQueueConfig?.pollIntervalMs,
+          });
+          slotId = await fairQueueModule.acquireFairSlot(
+            upstreamHostname,
+            clientIpSubnetHash,
+            config.fairQueueConfig
+          );
+          console.log('[Fair Queue Debug] Slot acquired:', { slotId, hostname: upstreamHostname });
+        } catch (error) {
+          console.error('[Fair Queue Debug] acquireFairSlot failed:', {
+            name: error?.name,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          if (error && error.name === 'PerIpLimitError') {
+            const windowLabel = 'concurrent upstream requests';
+            return createRateLimitResponse(
+              origin,
+              clientIpSubnet,
+              config.fairQueueConfig.perIpLimit,
+              windowLabel,
+              60
+            );
+          }
+
+          if (error && error.name === 'QueueTimeoutError') {
+            const safeHeaders = new Headers();
+            safeHeaders.set("content-type", "application/json;charset=UTF-8");
+            safeHeaders.set("Access-Control-Allow-Origin", origin);
+            safeHeaders.append("Vary", "Origin");
+            safeHeaders.set("Retry-After", "60");
+
+            return new Response(
+              JSON.stringify({
+                code: 503,
+                message: 'Upstream queue timeout, please retry later'
+              }),
+              {
+                status: 503,
+                headers: safeHeaders
+              }
+            );
+          }
+
+          // Other errors propagate
+          throw error;
+        }
+      } else {
+        console.warn('[Fair Queue] Module missing acquireFairSlot implementation');
+      }
+    } else {
+      console.warn('[Fair Queue] Skipped: unable to derive client subnet for queue enforcement');
+    }
+  }
+
   // Throttle protection logic
   let throttleStatus = null;
   let throttleHostname = null;
@@ -1435,209 +1597,229 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   }
 
   // Proceed with fetch
-  request = new Request(downloadUrl, request);
-  if (res.data.header) {
-    for (const k in res.data.header) {
-      for (const v of res.data.header[k]) {
-        request.headers.set(k, v);
+  try {
+    request = new Request(downloadUrl, request);
+    if (res.data.header) {
+      for (const k in res.data.header) {
+        for (const v of res.data.header[k]) {
+          request.headers.set(k, v);
+        }
       }
     }
-  }
 
-  let response = await fetch(request);
-  while (response.status >= 300 && response.status < 400) {
-    const location = response.headers.get("Location");
-    if (location) {
-      if (location.startsWith(`${config.workerAddress}/`)) {
-        request = new Request(location, request);
-        return await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
+    let response = await fetch(request);
+    while (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("Location");
+      if (location) {
+        if (location.startsWith(`${config.workerAddress}/`)) {
+          request = new Request(location, request);
+          return await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
+        } else {
+          request = new Request(location, request);
+          response = await fetch(request);
+        }
       } else {
-        request = new Request(location, request);
-        response = await fetch(request);
+        break;
       }
-    } else {
-      break;
     }
-  }
-  
-  // Update throttle protection status based on fetch result
-  if (config.throttleEnabled && throttleManager && throttleHostname) {
-    try {
-      const statusCode = response.status;
-      const protectedHttpCodes = Array.isArray(config.throttleConfig?.protectedHttpCodes)
-        ? config.throttleConfig.protectedHttpCodes
-        : [];
-
-      if (protectedHttpCodes.includes(statusCode)) {
-        // 4xx or 5xx error - set protection
-        console.log(`[Throttle] Error ${statusCode} from ${throttleHostname}, setting protection`);
-
-        const now = Math.floor(Date.now() / 1000);
-        // Don't await - async update (non-blocking)
-        const updatePromise = throttleManager.updateThrottle(
-          throttleHostname,
-          {
-            errorTimestamp: now,
-            isProtected: 1,
-            errorCode: statusCode,
-          },
-          { ...config.throttleConfig, ctx }
-        );
-
-        if (ctx && ctx.waitUntil) {
-          ctx.waitUntil(updatePromise);
-        }
-      } else if (statusCode >= 200 && statusCode < 400) {
-        // Success - check operation mode and record existence
-        // BREAKING CHANGE: IS_PROTECTED semantics
-        //   1 = protected (error detected)
-        //   0 = normal operation (initialized or recovered)
-        //   NULL = record does not exist
-        if (operationMode === 'resume_operation') {
-          // Clear protection status (was protected, now recovered)
-          console.log(`[Throttle] Success from ${throttleHostname}, clearing protection (resume operation)`);
-
-          // Don't await - async update (non-blocking)
-          const updatePromise = throttleManager.updateThrottle(
-            throttleHostname,
-            {
-              errorTimestamp: null,
-              isProtected: 0,  // Changed from null to 0
-              errorCode: null,
-            },
-            { ...config.throttleConfig, ctx }
-          );
-
-          if (ctx && ctx.waitUntil) {
-            ctx.waitUntil(updatePromise);
-          }
-        } else if (operationMode === 'normal_operation' && throttleStatus && !throttleStatus.recordExists) {
-          // First time accessing this hostname - create record with IS_PROTECTED = 0 (normal operation)
-          console.log(`[Throttle] Success from ${throttleHostname}, creating initial record (first time)`);
-
-          // Don't await - async update (non-blocking)
-          const updatePromise = throttleManager.updateThrottle(
-            throttleHostname,
-            {
-              errorTimestamp: null,
-              isProtected: 0,  // Changed from null to 0
-              errorCode: null,
-            },
-            { ...config.throttleConfig, ctx }
-          );
-
-          if (ctx && ctx.waitUntil) {
-            ctx.waitUntil(updatePromise);
-          }
-        }
-        // else: normal_operation with existing record (recordExists=true) - skip write
-      }
-    } catch (error) {
-      // Throttle update failure should not block downloads
-      console.error('[Throttle] Update failed:', error instanceof Error ? error.message : String(error));
-    }
-  }
-
-  // 创建仅包含安全必要headers的响应
-  const safeHeaders = new Headers();
-
-  // 保留重要的内容相关headers
-  const preserveHeaders = [
-  'content-type',
-  'content-disposition',
-  'content-length',
-  'cache-control',
-  'content-encoding',
-  'accept-ranges',
-  'content-range',    // Added for partial downloads
-  'transfer-encoding', // Added for chunked transfers
-  'content-language',  // Added for internationalization
-  'expires',           // Added for cache control
-  'pragma',            // Added for cache control
-  'etag',
-  'last-modified'
-  ];
-
-  // 仅复制必要的headers
-  preserveHeaders.forEach(header => {
-    const value = response.headers.get(header);
-    if (value) {
-      safeHeaders.set(header, value);
-    }
-  });
-
-  // Session模式下：如果上游没有Content-Disposition，从path提取文件名并设置
-  if (isSessionMode && !safeHeaders.has('content-disposition') && (response.status === 200 || response.status === 206)) {
-    const filename = path.split('/').filter(Boolean).pop() || 'download';
-    safeHeaders.set(
-      'content-disposition',
-      `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`
-    );
-  }
-
-  // 设置CORS headers
-  safeHeaders.set("Access-Control-Allow-Origin", origin);
-  safeHeaders.append("Vary", "Origin");
-
-  // 创建带有安全headers的新响应
-  const safeResponse = new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: safeHeaders
-  });
-
-  const shouldUpdateLastActive =
-    config.cacheConfig &&
-    typeof config.cacheConfig.idleTimeout === 'number' &&
-    config.cacheConfig.idleTimeout > 0 &&
-    config.cacheConfig.lastActiveTableName;
-
-  if (shouldUpdateLastActive && config.dbMode && clientIP && typeof path === 'string') {
-    const updatePromise = (async () => {
+    
+    // Update throttle protection status based on fetch result
+    if (config.throttleEnabled && throttleManager && throttleHostname) {
       try {
-        const ipSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
-        if (!ipSubnet) {
-          return;
-        }
+        const statusCode = response.status;
+        const protectedHttpCodes = Array.isArray(config.throttleConfig?.protectedHttpCodes)
+          ? config.throttleConfig.protectedHttpCodes
+          : [];
 
-        const [ipHash, pathHash] = await Promise.all([sha256Hash(ipSubnet), sha256Hash(path)]);
-        if (!ipHash || !pathHash) {
-          return;
-        }
+        if (protectedHttpCodes.includes(statusCode)) {
+          // 4xx or 5xx error - set protection
+          console.log(`[Throttle] Error ${statusCode} from ${throttleHostname}, setting protection`);
 
-        if (config.dbMode === 'd1') {
-          const { updateLastActive } = await import('./unified-check-d1.js');
-          const dbBinding = config.cacheConfig.databaseBinding;
-          const dbInstance = env[dbBinding];
-          if (!dbInstance) {
-            console.error(`[LastActive] D1 binding '${dbBinding}' not found`);
-            return;
-          }
-          await updateLastActive(
-            dbInstance,
-            ipHash,
-            pathHash,
-            config.cacheConfig.lastActiveTableName
+          const now = Math.floor(Date.now() / 1000);
+          // Don't await - async update (non-blocking)
+          const updatePromise = throttleManager.updateThrottle(
+            throttleHostname,
+            {
+              errorTimestamp: now,
+              isProtected: 1,
+              errorCode: statusCode,
+            },
+            { ...config.throttleConfig, ctx }
           );
-        } else if (config.dbMode === 'd1-rest') {
-          const { updateLastActive } = await import('./unified-check-d1-rest.js');
-          await updateLastActive(config.cacheConfig, ipHash, pathHash);
-        } else if (config.dbMode === 'custom-pg-rest') {
-          const { updateLastActive } = await import('./unified-check.js');
-          await updateLastActive(config.cacheConfig, ipHash, pathHash);
+
+          if (ctx && ctx.waitUntil) {
+            ctx.waitUntil(updatePromise);
+          }
+        } else if (statusCode >= 200 && statusCode < 400) {
+          // Success - check operation mode and record existence
+          // BREAKING CHANGE: IS_PROTECTED semantics
+          //   1 = protected (error detected)
+          //   0 = normal operation (initialized or recovered)
+          //   NULL = record does not exist
+          if (operationMode === 'resume_operation') {
+            // Clear protection status (was protected, now recovered)
+            console.log(`[Throttle] Success from ${throttleHostname}, clearing protection (resume operation)`);
+
+            // Don't await - async update (non-blocking)
+            const updatePromise = throttleManager.updateThrottle(
+              throttleHostname,
+              {
+                errorTimestamp: null,
+                isProtected: 0,  // Changed from null to 0
+                errorCode: null,
+              },
+              { ...config.throttleConfig, ctx }
+            );
+
+            if (ctx && ctx.waitUntil) {
+              ctx.waitUntil(updatePromise);
+            }
+          } else if (operationMode === 'normal_operation' && throttleStatus && !throttleStatus.recordExists) {
+            // First time accessing this hostname - create record with IS_PROTECTED = 0 (normal operation)
+            console.log(`[Throttle] Success from ${throttleHostname}, creating initial record (first time)`);
+
+            // Don't await - async update (non-blocking)
+            const updatePromise = throttleManager.updateThrottle(
+              throttleHostname,
+              {
+                errorTimestamp: null,
+                isProtected: 0,  // Changed from null to 0
+                errorCode: null,
+              },
+              { ...config.throttleConfig, ctx }
+            );
+
+            if (ctx && ctx.waitUntil) {
+              ctx.waitUntil(updatePromise);
+            }
+          }
+          // else: normal_operation with existing record (recordExists=true) - skip write
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error('[LastActive] Update failed:', message);
+        // Throttle update failure should not block downloads
+        console.error('[Throttle] Update failed:', error instanceof Error ? error.message : String(error));
       }
-    })();
+    }
 
-    if (ctx && ctx.waitUntil) {
-      ctx.waitUntil(updatePromise);
+    // 创建仅包含安全必要headers的响应
+    const safeHeaders = new Headers();
+
+    // 保留重要的内容相关headers
+    const preserveHeaders = [
+    'content-type',
+    'content-disposition',
+    'content-length',
+    'cache-control',
+    'content-encoding',
+    'accept-ranges',
+    'content-range',    // Added for partial downloads
+    'transfer-encoding', // Added for chunked transfers
+    'content-language',  // Added for internationalization
+    'expires',           // Added for cache control
+    'pragma',            // Added for cache control
+    'etag',
+    'last-modified'
+    ];
+
+    // 仅复制必要的headers
+    preserveHeaders.forEach(header => {
+      const value = response.headers.get(header);
+      if (value) {
+        safeHeaders.set(header, value);
+      }
+    });
+
+    // Session模式下：如果上游没有Content-Disposition，从path提取文件名并设置
+    if (isSessionMode && !safeHeaders.has('content-disposition') && (response.status === 200 || response.status === 206)) {
+      const filename = path.split('/').filter(Boolean).pop() || 'download';
+      safeHeaders.set(
+        'content-disposition',
+        `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+      );
+    }
+
+    // 设置CORS headers
+    safeHeaders.set("Access-Control-Allow-Origin", origin);
+    safeHeaders.append("Vary", "Origin");
+
+    // 创建带有安全headers的新响应
+    const safeResponse = new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: safeHeaders
+    });
+
+    const shouldUpdateLastActive =
+      config.cacheConfig &&
+      typeof config.cacheConfig.idleTimeout === 'number' &&
+      config.cacheConfig.idleTimeout > 0 &&
+      config.cacheConfig.lastActiveTableName;
+
+    if (shouldUpdateLastActive && config.dbMode && clientIP && typeof path === 'string') {
+      const updatePromise = (async () => {
+        try {
+          const ipSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
+          if (!ipSubnet) {
+            return;
+          }
+
+          const [ipHash, pathHash] = await Promise.all([sha256Hash(ipSubnet), sha256Hash(path)]);
+          if (!ipHash || !pathHash) {
+            return;
+          }
+
+          if (config.dbMode === 'd1') {
+            const { updateLastActive } = await import('./unified-check-d1.js');
+            const dbBinding = config.cacheConfig.databaseBinding;
+            const dbInstance = env[dbBinding];
+            if (!dbInstance) {
+              console.error(`[LastActive] D1 binding '${dbBinding}' not found`);
+              return;
+            }
+            await updateLastActive(
+              dbInstance,
+              ipHash,
+              pathHash,
+              config.cacheConfig.lastActiveTableName
+            );
+          } else if (config.dbMode === 'd1-rest') {
+            const { updateLastActive } = await import('./unified-check-d1-rest.js');
+            await updateLastActive(config.cacheConfig, ipHash, pathHash);
+          } else if (config.dbMode === 'custom-pg-rest') {
+            const { updateLastActive } = await import('./unified-check.js');
+            await updateLastActive(config.cacheConfig, ipHash, pathHash);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[LastActive] Update failed:', message);
+        }
+      })();
+
+      if (ctx && ctx.waitUntil) {
+        ctx.waitUntil(updatePromise);
+      }
+    }
+
+    return safeResponse;
+  } finally {
+    // Release Fair Queue slot
+    if (slotId && slotId > 0 && fairQueueModule && typeof fairQueueModule.releaseFairSlot === 'function') {
+      const releasePromise = (async () => {
+        try {
+          await fairQueueModule.releaseFairSlot(slotId, config.fairQueueConfig);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[Fair Queue] Release failed:', message);
+        }
+      })();
+
+      if (ctx && typeof ctx.waitUntil === 'function') {
+        ctx.waitUntil(releasePromise);
+      } else {
+        await releasePromise;
+      }
     }
   }
-
-  return safeResponse;
 }
 
 async function handleSessionDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {

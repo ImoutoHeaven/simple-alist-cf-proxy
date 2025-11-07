@@ -10,7 +10,17 @@ import { sha256Hash, calculateIPSubnet } from './utils.js';
  * @param {string} [tableNames.sessionTableName]
  * @returns {Promise<void>}
  */
-const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttleTableName, sessionTableName, lastActiveTableName }) => {
+const ensureAllTables = async (
+  db,
+  {
+    cacheTableName,
+    rateLimitTableName,
+    throttleTableName,
+    sessionTableName,
+    lastActiveTableName,
+    fairQueueTableName = 'upstream_slot_pool',
+  }
+) => {
   const activeTableName = lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
   const statements = [
     db.prepare(`
@@ -72,6 +82,28 @@ const ensureAllTables = async (db, { cacheTableName, rateLimitTableName, throttl
       db.prepare(`CREATE INDEX IF NOT EXISTS idx_session_expire ON ${sessionTableName}(EXPIRE_AT)`)
     );
   }
+
+  statements.push(
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ${fairQueueTableName} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hostname_pattern TEXT NOT NULL,
+        slot_index INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'available',
+        ip_hash TEXT,
+        locked_at TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `),
+    db.prepare(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_fair_queue_unique
+        ON ${fairQueueTableName} (hostname_pattern, slot_index)
+    `),
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_fair_queue_host_status
+        ON ${fairQueueTableName} (hostname_pattern, status)
+    `)
+  );
 
   await db.batch(statements);
 };
@@ -505,4 +537,261 @@ const updateLastActive = async (db, ipHash, pathHash, tableName = 'DOWNLOAD_LAST
   return db.prepare(sql).bind(ipHash, pathHash, now).run();
 };
 
-export { ensureAllTables, updateLastActive };
+// ========================================
+// Fair Queue Functions (D1 Mode)
+// ========================================
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const ensureSlotPool = async (db, hostname, globalLimit, tableName) => {
+  console.log('[Fair Queue D1][ensureSlotPool] checking slots', {
+    hostname,
+    globalLimit,
+    tableName,
+  });
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS c FROM ${tableName} WHERE hostname_pattern = ?`)
+    .bind(hostname)
+    .first();
+
+  const current = row?.c ?? 0;
+  if (current >= globalLimit) {
+    return;
+  }
+
+  const statements = [];
+  for (let i = current + 1; i <= globalLimit; i++) {
+    statements.push(
+      db
+        .prepare(
+          `INSERT OR IGNORE INTO ${tableName} (hostname_pattern, slot_index, status)
+           VALUES (?, ?, 'available')`
+        )
+        .bind(hostname, i)
+    );
+  }
+
+  if (statements.length > 0) {
+    console.log('[Fair Queue D1][ensureSlotPool] inserting missing slots', {
+      hostname,
+      statements: statements.length,
+    });
+    await db.batch(statements);
+  } else {
+    console.log('[Fair Queue D1][ensureSlotPool] slot pool already satisfied', {
+      hostname,
+      current,
+    });
+  }
+};
+
+const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
+  const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+
+  console.log('[Fair Queue D1][tryAcquire] attempt start', {
+    hostname,
+    tableName,
+    ipHash,
+    perIpLimit: config.perIpLimit,
+    globalLimit: config.globalLimit,
+    zombieTimeoutSeconds: config.zombieTimeoutSeconds,
+  });
+
+  try {
+    await ensureSlotPool(db, hostname, config.globalLimit, tableName);
+
+    await db
+      .prepare(
+        `UPDATE ${tableName}
+         SET status = 'available', ip_hash = NULL, locked_at = NULL
+         WHERE hostname_pattern = ?
+           AND status = 'locked'
+           AND locked_at < datetime('now', ?)`
+      )
+      .bind(hostname, `-${config.zombieTimeoutSeconds} seconds`)
+      .run();
+
+    console.log('[Fair Queue D1][tryAcquire] cleaned zombies', {
+      hostname,
+      tableName,
+    });
+
+    const ipRow = await db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM ${tableName}
+         WHERE hostname_pattern = ? AND status = 'locked' AND ip_hash = ?`
+      )
+      .bind(hostname, ipHash)
+      .first();
+
+    console.log('[Fair Queue D1][tryAcquire] locked slots for IP', {
+      hostname,
+      lockedCount: ipRow?.c ?? null,
+      perIpLimit: config.perIpLimit,
+    });
+
+    if ((ipRow?.c ?? 0) >= config.perIpLimit) {
+      console.warn('[Fair Queue D1][tryAcquire] per-IP limit hit', {
+        hostname,
+        ipHash,
+      });
+      return 0;
+    }
+
+    const candidate = await db
+      .prepare(
+        `SELECT id FROM ${tableName}
+         WHERE hostname_pattern = ? AND status = 'available'
+         ORDER BY slot_index LIMIT 1`
+      )
+      .bind(hostname)
+      .first();
+
+    console.log('[Fair Queue D1][tryAcquire] candidate slot', {
+      hostname,
+      candidateId: candidate?.id ?? null,
+    });
+
+    if (!candidate) {
+      console.warn('[Fair Queue D1][tryAcquire] no available slot', { hostname });
+      return -2;
+    }
+    const updateResult = await db
+      .prepare(
+        `UPDATE ${tableName}
+         SET status = 'locked', ip_hash = ?, locked_at = datetime('now')
+         WHERE id = ?
+           AND status = 'available'`
+      )
+      .bind(ipHash, candidate.id)
+      .run();
+    const changes = updateResult.meta?.changes ?? 0;
+    if (changes === 0) {
+      console.warn('[Fair Queue D1][tryAcquire] slot already taken, retrying', {
+        hostname,
+        slotId: candidate.id,
+      });
+      return -2;
+    }
+    console.log('[Fair Queue D1][tryAcquire] slot locked', {
+      hostname,
+      slotId: candidate.id,
+    });
+    return candidate.id;
+  } catch (error) {
+    console.error('[Fair Queue D1][tryAcquire] error', {
+      hostname,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : null,
+    });
+    throw error;
+  }
+};
+
+const acquireFairSlot = async (hostname, ipHash, config) => {
+  if (!config?.env || !config.databaseBinding) {
+    throw new Error('[Fair Queue D1] Missing D1 configuration');
+  }
+
+  const db = config.env[config.databaseBinding];
+  if (!db) {
+    throw new Error(`[Fair Queue D1] D1 binding '${config.databaseBinding}' not found`);
+  }
+
+  const deadline = Date.now() + config.queueWaitTimeoutMs;
+  let attempts = 0;
+
+  while (true) {
+    attempts += 1;
+    console.log('[Fair Queue D1][acquire] loop', {
+      hostname,
+      ipHash,
+      attempt: attempts,
+      deadline,
+      now: Date.now(),
+      pollIntervalMs: config.pollIntervalMs,
+    });
+    const result = await tryAcquireFairSlotOnce(db, hostname, ipHash, config);
+
+    if (result > 0) {
+      console.log(`[Fair Queue D1] Acquired slot ${result} for ${hostname}`);
+      return result;
+    }
+
+    if (result === 0) {
+      console.warn(`[Fair Queue D1] Per-IP limit reached: ${ipHash}`);
+      const error = new Error(`Per-IP limit ${config.perIpLimit} reached`);
+      error.name = 'PerIpLimitError';
+      throw error;
+    }
+
+    if (Date.now() > deadline) {
+      console.warn(`[Fair Queue D1] Queue timeout for ${hostname}`);
+      const error = new Error(`Queue timeout after ${config.queueWaitTimeoutMs}ms`);
+      error.name = 'QueueTimeoutError';
+      throw error;
+    }
+
+    await sleep(config.pollIntervalMs);
+  }
+};
+
+const releaseFairSlot = async (slotId, config) => {
+  if (!config?.env || !config.databaseBinding) {
+    throw new Error('[Fair Queue D1] Missing D1 configuration');
+  }
+
+  const db = config.env[config.databaseBinding];
+  if (!db) {
+    throw new Error(`[Fair Queue D1] D1 binding '${config.databaseBinding}' not found`);
+  }
+
+  const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+
+  await db
+    .prepare(
+      `UPDATE ${tableName}
+       SET status = 'available', ip_hash = NULL, locked_at = NULL
+       WHERE id = ?`
+    )
+    .bind(slotId)
+    .run();
+
+  console.log(`[Fair Queue D1] Released slot ${slotId}`);
+};
+
+const cleanupZombieSlots = async (config) => {
+  if (!config?.env || !config.databaseBinding) {
+    throw new Error('[Fair Queue D1] Missing D1 configuration');
+  }
+
+  const db = config.env[config.databaseBinding];
+  if (!db) {
+    throw new Error(`[Fair Queue D1] D1 binding '${config.databaseBinding}' not found`);
+  }
+
+  const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+
+  const result = await db
+    .prepare(
+      `DELETE FROM ${tableName}
+       WHERE status = 'locked'
+         AND locked_at < datetime('now', ?)`
+    )
+    .bind(`-${config.zombieTimeoutSeconds} seconds`)
+    .run();
+
+  const deleted = result.meta?.changes ?? 0;
+  if (deleted > 0) {
+    console.log(`[Fair Queue D1] Cleaned up ${deleted} zombie slots`);
+  }
+  return deleted;
+};
+
+export {
+  ensureAllTables,
+  updateLastActive,
+  acquireFairSlot,
+  releaseFairSlot,
+  cleanupZombieSlots,
+};

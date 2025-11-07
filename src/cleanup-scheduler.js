@@ -500,6 +500,38 @@ export async function scheduleAllCleanups(config, env, ctx) {
   } else {
     await cleanupPromise;
   }
+
+  // Fair Queue zombie slot cleanup
+  if (config.fairQueueEnabled) {
+    const fairQueueCleanupProbability = 0.01; // 1%
+    if (Math.random() < fairQueueCleanupProbability) {
+      console.log('[Fair Queue Cleanup] Triggered cleanup');
+
+      const cleanupPromise = (async () => {
+        let fairQueueModule;
+        if (normalizedMode === 'custom-pg-rest') {
+          fairQueueModule = await import('./fairqueue/custom-pg-rest.js');
+        } else if (normalizedMode === 'd1') {
+          fairQueueModule = await import('./unified-check-d1.js');
+        } else if (normalizedMode === 'd1-rest') {
+          fairQueueModule = await import('./unified-check-d1-rest.js');
+        }
+
+        if (fairQueueModule && typeof fairQueueModule.cleanupZombieSlots === 'function') {
+          await fairQueueModule.cleanupZombieSlots(config.fairQueueConfig);
+        }
+      })().catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[Fair Queue Cleanup] Failed:', message);
+      });
+
+      if (ctx && typeof ctx.waitUntil === 'function') {
+        ctx.waitUntil(cleanupPromise);
+      } else {
+        await cleanupPromise;
+      }
+    }
+  }
 }
 
 export { cleanupLastActiveTable };
