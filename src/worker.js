@@ -956,7 +956,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       if (!clientIP) {
         return createUnauthorizedResponse(origin, "client ip missing");
       }
-      const ipVerifyData = JSON.stringify({ path: path, ip: clientIP });
+      const ipRange = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix) || clientIP || "";
+      const ipVerifyData = JSON.stringify({ path: path, ip: ipRange });
       const ipVerifyResult = await verify("ipSign", ipVerifyData, ipSign, config.token);
       if (ipVerifyResult !== "") {
         return createUnauthorizedResponse(origin, ipVerifyResult);
