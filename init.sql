@@ -772,6 +772,7 @@ BEGIN
     FROM "upstream_slot_pool"
     WHERE "hostname_pattern" = p_hostname_pattern
       AND "status" = 'available'
+      AND "slot_index" <= p_global_limit
     ORDER BY "slot_index"
     FOR UPDATE SKIP LOCKED
     LIMIT 1;

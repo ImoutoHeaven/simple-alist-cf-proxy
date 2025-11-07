@@ -709,9 +709,10 @@ const tryAcquireFairSlotOnceRest = async (
       `SELECT id FROM ${tableName}
        WHERE hostname_pattern = ?
          AND status = 'available'
+         AND slot_index <= ?
        ORDER BY slot_index
        LIMIT 1`,
-      [hostname]
+      [hostname, config.globalLimit]
     );
 
     const slotId = candidate.results?.[0]?.id ?? candidate.results?.[0]?.ID ?? null;
@@ -731,10 +732,6 @@ const tryAcquireFairSlotOnceRest = async (
     );
     const changes = updateResult.meta?.changes ?? 0;
     if (changes === 0) {
-      console.warn('[Fair Queue D1-REST][tryAcquire] slot already taken, retrying', {
-        hostname,
-        slotId,
-      });
       return -2;
     }
     return slotId;

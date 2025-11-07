@@ -544,11 +544,6 @@ const updateLastActive = async (db, ipHash, pathHash, tableName = 'DOWNLOAD_LAST
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const ensureSlotPool = async (db, hostname, globalLimit, tableName) => {
-  console.log('[Fair Queue D1][ensureSlotPool] checking slots', {
-    hostname,
-    globalLimit,
-    tableName,
-  });
   const row = await db
     .prepare(`SELECT COUNT(*) AS c FROM ${tableName} WHERE hostname_pattern = ?`)
     .bind(hostname)
@@ -572,30 +567,12 @@ const ensureSlotPool = async (db, hostname, globalLimit, tableName) => {
   }
 
   if (statements.length > 0) {
-    console.log('[Fair Queue D1][ensureSlotPool] inserting missing slots', {
-      hostname,
-      statements: statements.length,
-    });
     await db.batch(statements);
-  } else {
-    console.log('[Fair Queue D1][ensureSlotPool] slot pool already satisfied', {
-      hostname,
-      current,
-    });
   }
 };
 
 const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
   const tableName = config.fairQueueTableName || 'upstream_slot_pool';
-
-  console.log('[Fair Queue D1][tryAcquire] attempt start', {
-    hostname,
-    tableName,
-    ipHash,
-    perIpLimit: config.perIpLimit,
-    globalLimit: config.globalLimit,
-    zombieTimeoutSeconds: config.zombieTimeoutSeconds,
-  });
 
   try {
     await ensureSlotPool(db, hostname, config.globalLimit, tableName);
@@ -611,11 +588,6 @@ const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
       .bind(hostname, `-${config.zombieTimeoutSeconds} seconds`)
       .run();
 
-    console.log('[Fair Queue D1][tryAcquire] cleaned zombies', {
-      hostname,
-      tableName,
-    });
-
     const ipRow = await db
       .prepare(
         `SELECT COUNT(*) AS c FROM ${tableName}
@@ -624,17 +596,7 @@ const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
       .bind(hostname, ipHash)
       .first();
 
-    console.log('[Fair Queue D1][tryAcquire] locked slots for IP', {
-      hostname,
-      lockedCount: ipRow?.c ?? null,
-      perIpLimit: config.perIpLimit,
-    });
-
     if ((ipRow?.c ?? 0) >= config.perIpLimit) {
-      console.warn('[Fair Queue D1][tryAcquire] per-IP limit hit', {
-        hostname,
-        ipHash,
-      });
       return 0;
     }
 
@@ -642,18 +604,13 @@ const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
       .prepare(
         `SELECT id FROM ${tableName}
          WHERE hostname_pattern = ? AND status = 'available'
+           AND slot_index <= ?
          ORDER BY slot_index LIMIT 1`
       )
-      .bind(hostname)
+      .bind(hostname, config.globalLimit)
       .first();
 
-    console.log('[Fair Queue D1][tryAcquire] candidate slot', {
-      hostname,
-      candidateId: candidate?.id ?? null,
-    });
-
     if (!candidate) {
-      console.warn('[Fair Queue D1][tryAcquire] no available slot', { hostname });
       return -2;
     }
     const updateResult = await db
@@ -667,23 +624,10 @@ const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
       .run();
     const changes = updateResult.meta?.changes ?? 0;
     if (changes === 0) {
-      console.warn('[Fair Queue D1][tryAcquire] slot already taken, retrying', {
-        hostname,
-        slotId: candidate.id,
-      });
       return -2;
     }
-    console.log('[Fair Queue D1][tryAcquire] slot locked', {
-      hostname,
-      slotId: candidate.id,
-    });
     return candidate.id;
   } catch (error) {
-    console.error('[Fair Queue D1][tryAcquire] error', {
-      hostname,
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : null,
-    });
     throw error;
   }
 };
@@ -703,14 +647,6 @@ const acquireFairSlot = async (hostname, ipHash, config) => {
 
   while (true) {
     attempts += 1;
-    console.log('[Fair Queue D1][acquire] loop', {
-      hostname,
-      ipHash,
-      attempt: attempts,
-      deadline,
-      now: Date.now(),
-      pollIntervalMs: config.pollIntervalMs,
-    });
     const result = await tryAcquireFairSlotOnce(db, hostname, ipHash, config);
 
     if (result > 0) {

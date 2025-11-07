@@ -1410,46 +1410,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     upstreamHostname &&
     config.fairQueueHostnamePatterns.some((pattern) => matchHostnamePattern(upstreamHostname, pattern));
 
-  if (config.fairQueueEnabled) {
-    const fairQueueConfig = config.fairQueueConfig || {};
-    console.log('[Fair Queue Debug] Decision snapshot:', {
-      upstreamHostname,
-      hostnamePatterns: config.fairQueueHostnamePatterns,
-      needFairQueue,
-      dbMode: normalizedDbMode,
-      configSummary: {
-        tableName: fairQueueConfig.fairQueueTableName,
-        globalLimit: fairQueueConfig.globalLimit,
-        perIpLimit: fairQueueConfig.perIpLimit,
-        queueWaitTimeoutMs: fairQueueConfig.queueWaitTimeoutMs,
-        pollIntervalMs: fairQueueConfig.pollIntervalMs,
-        zombieTimeoutSeconds: fairQueueConfig.zombieTimeoutSeconds,
-        hasPostgrest: Boolean(fairQueueConfig.postgrestUrl),
-        hasD1Binding: Boolean(fairQueueConfig.databaseBinding),
-        hasRestConfig: Boolean(fairQueueConfig.accountId && fairQueueConfig.databaseId),
-      },
-    });
-  }
-
   let slotId = null;
   let fairQueueModule = null;
 
   if (needFairQueue) {
-    console.log('[Fair Queue Debug] Entering enforcement block for:', upstreamHostname);
     const clientIpSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
-    console.log('[Fair Queue Debug] Derived subnet info:', {
-      clientIP,
-      clientIpSubnet,
-      ipv4Suffix: config.ipv4Suffix,
-      ipv6Suffix: config.ipv6Suffix,
-    });
 
     if (clientIpSubnet) {
       const clientIpSubnetHash = await sha256Hash(clientIpSubnet);
-      console.log('[Fair Queue Debug] Subnet hash info:', {
-        clientIpSubnetHash,
-        normalizedDbMode,
-      });
 
       if (normalizedDbMode === 'custom-pg-rest') {
         fairQueueModule = await import('./fairqueue/custom-pg-rest.js');
@@ -1461,23 +1429,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
       if (fairQueueModule && typeof fairQueueModule.acquireFairSlot === 'function') {
         try {
-          console.log('[Fair Queue Debug] Attempting to acquire slot with config:', {
-            hostname: upstreamHostname,
-            perIpLimit: config.fairQueueConfig?.perIpLimit,
-            queueWaitTimeoutMs: config.fairQueueConfig?.queueWaitTimeoutMs,
-            pollIntervalMs: config.fairQueueConfig?.pollIntervalMs,
-          });
           slotId = await fairQueueModule.acquireFairSlot(
             upstreamHostname,
             clientIpSubnetHash,
             config.fairQueueConfig
           );
-          console.log('[Fair Queue Debug] Slot acquired:', { slotId, hostname: upstreamHostname });
         } catch (error) {
-          console.error('[Fair Queue Debug] acquireFairSlot failed:', {
-            name: error?.name,
-            message: error instanceof Error ? error.message : String(error),
-          });
           if (error && error.name === 'PerIpLimitError') {
             const windowLabel = 'concurrent upstream requests';
             return createRateLimitResponse(
