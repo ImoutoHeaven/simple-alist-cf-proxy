@@ -220,7 +220,6 @@ compatibility_date = "2024-01-01"
 # # - DOWNLOAD_CACHE_TABLE (download link cache)
 # # - DOWNLOAD_IP_RATELIMIT_TABLE (IP rate limiting)
 # # - THROTTLE_PROTECTION (throttle protection)
-# # - SESSION_MAPPING_TABLE (optional, if SESSION_ENABLED="true")
 # #
 # # Note: For custom-pg-rest mode, you should still run init.sql manually for stored procedures
 # #       INIT_TABLES only creates tables, not functions/procedures
@@ -255,12 +254,6 @@ compatibility_date = "2024-01-01"
 # #   - Creates required tables & stored procedures (see init.sql)
 # POSTGREST_URL = "https://your-domain.com/postgrest"  # PostgREST API endpoint (without table name)
 # # Note: VERIFY_HEADER and VERIFY_SECRET (already defined above) are used for PostgREST authentication
-#
-# # Session-Based Download Tickets (optional)
-# SESSION_ENABLED = "false"                       # Enable UUID session tickets; default disabled
-# ONLY_SESSION_MODE = "false"                     # When "true", reject non-/session requests and require session tickets
-# SESSION table uses the same database configuration defined by DB_MODE
-#
 #
 # # ═══════════════════════════════════════════════════════════════
 # # Throttle Protection System - Prevent Repeated Requests to Failing Hostnames

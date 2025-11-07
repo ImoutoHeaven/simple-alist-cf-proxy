@@ -76,7 +76,7 @@ const executeBatchQueries = async (accountId, databaseId, apiToken, statements) 
 };
 
 /**
- * Ensure cache, rate limit, throttle, and session tables exist before issuing queries.
+ * Ensure cache, rate limit, and throttle tables exist before issuing queries.
  */
 const ensureAllTables = async (
   accountId,
@@ -86,7 +86,6 @@ const ensureAllTables = async (
     cacheTableName,
     rateLimitTableName,
     throttleTableName,
-    sessionTableName,
     lastActiveTableName,
     fairQueueTableName = 'upstream_slot_pool',
   }
@@ -170,38 +169,7 @@ const ensureAllTables = async (
   ];
 
   await executeBatchQueries(accountId, databaseId, apiToken, baseStatements);
-
-  if (sessionTableName) {
-    await executeBatchQueries(accountId, databaseId, apiToken, [
-      {
-        sql: `
-          CREATE TABLE IF NOT EXISTS ${sessionTableName} (
-            SESSION_TICKET TEXT PRIMARY KEY,
-            FILE_PATH TEXT NOT NULL,
-            FILE_PATH_HASH TEXT NOT NULL,
-            IP_SUBNET TEXT NOT NULL,
-            WORKER_ADDRESS TEXT NOT NULL,
-            EXPIRE_AT INTEGER NOT NULL,
-            CREATED_AT INTEGER NOT NULL
-          )
-        `,
-      },
-      {
-        sql: `CREATE INDEX IF NOT EXISTS idx_session_expire ON ${sessionTableName}(EXPIRE_AT)`,
-      },
-    ]);
-  }
 };
-
-const createDefaultSessionResult = (shouldCheckSession) => ({
-  found: shouldCheckSession ? false : null,
-  filePath: null,
-  filePathHash: null,
-  ipSubnet: null,
-  workerAddress: null,
-  expireAt: null,
-  error: null,
-});
 
 const createDefaultCacheResult = () => ({
   hit: false,
@@ -218,39 +186,6 @@ const createDefaultThrottleResult = () => ({
   errorCode: null,
   retryAfter: 0,
 });
-
-const parseSessionFromRow = (row, sessionTicket, now) => {
-  const sessionResult = createDefaultSessionResult(true);
-
-  if (!row || row.SESSION_TICKET == null) {
-    sessionResult.error = 'session not found';
-    console.log('[Unified Check D1-REST] Session found: false');
-    return sessionResult;
-  }
-
-  const expireAtRaw = row.EXPIRE_AT != null ? Number(row.EXPIRE_AT) : null;
-
-  sessionResult.found = true;
-  sessionResult.filePath = row.FILE_PATH || null;
-  sessionResult.filePathHash = row.FILE_PATH_HASH || null;
-  sessionResult.ipSubnet = row.IP_SUBNET || null;
-  sessionResult.workerAddress = row.WORKER_ADDRESS || null;
-  sessionResult.expireAt = Number.isFinite(expireAtRaw) ? expireAtRaw : null;
-  sessionResult.error = null;
-
-  if (sessionResult.expireAt !== null && sessionResult.expireAt < now) {
-    sessionResult.found = false;
-    sessionResult.error = 'session expired';
-    console.log('[Unified Check D1-REST] Session expired for ticket:', sessionTicket);
-  } else if (sessionResult.expireAt === null && row.EXPIRE_AT != null) {
-    sessionResult.found = false;
-    sessionResult.error = 'session expired';
-    console.warn('[Unified Check D1-REST] Session record missing valid EXPIRE_AT, treating as expired');
-  }
-
-  console.log('[Unified Check D1-REST] Session found:', sessionResult.found);
-  return sessionResult;
-};
 
 const parseCacheFromRow = (row, now, cacheTTL) => {
   const cacheResult = createDefaultCacheResult();
@@ -357,9 +292,9 @@ const parseThrottleFromRow = (row, cacheResult, now, throttleTimeWindow) => {
 
 /**
  * Unified check for D1-REST (RTT 3→1 optimization).
- * Executes a unified SELECT (session/cache/throttle) and rate limit upsert in a single batch.
+ * Executes a unified SELECT (cache/throttle) and rate limit upsert in a single batch.
  */
-export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket = null) => {
+export const unifiedCheckD1Rest = async (path, clientIP, config) => {
   if (!config.accountId || !config.databaseId || !config.apiToken) {
     throw new Error('[Unified Check D1-REST] Missing D1-REST configuration');
   }
@@ -378,16 +313,11 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
 
-  const sessionEnabled = config.sessionEnabled === true;
-  const configuredSessionTable = config.sessionTableName || 'SESSION_MAPPING_TABLE';
-  const shouldCheckSession = sessionEnabled && typeof sessionTicket === 'string' && sessionTicket.trim() !== '';
-
   if (config.initTables === true) {
     await ensureAllTables(accountId, databaseId, apiToken, {
       cacheTableName,
       rateLimitTableName,
       throttleTableName,
-      sessionTableName: sessionEnabled ? configuredSessionTable : null,
       lastActiveTableName,
     });
   }
@@ -409,35 +339,8 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
     throw new Error('[Unified Check D1-REST] Failed to calculate IP hash');
   }
 
-  const sessionTicketParam = shouldCheckSession ? sessionTicket : null;
-
-  const sessionJoinClause = shouldCheckSession
-    ? `
-    LEFT JOIN ${configuredSessionTable} s 
-      ON s.SESSION_TICKET = params.session_ticket_param 
-      AND params.session_ticket_param IS NOT NULL 
-      AND params.session_ticket_param != ''
-  `
-    : `
-    LEFT JOIN (
-      SELECT 
-        NULL AS SESSION_TICKET,
-        NULL AS FILE_PATH,
-        NULL AS FILE_PATH_HASH,
-        NULL AS IP_SUBNET,
-        NULL AS WORKER_ADDRESS,
-        NULL AS EXPIRE_AT
-    ) s ON 1=0
-  `;
-
   const unifiedSql = `
     SELECT 
-      s.SESSION_TICKET,
-      s.FILE_PATH,
-      s.FILE_PATH_HASH,
-      s.IP_SUBNET,
-      s.WORKER_ADDRESS,
-      s.EXPIRE_AT,
       c.LINK_DATA,
       c.TIMESTAMP,
       c.HOSTNAME_HASH,
@@ -446,14 +349,13 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
       t.LAST_ERROR_CODE,
       active.LAST_ACCESS_TIME AS ACTIVE_LAST_ACCESS_TIME
     FROM 
-      (SELECT ? AS provided_path_hash, ? AS session_ticket_param, ? AS ip_hash_param) params
-    ${sessionJoinClause}
+      (SELECT ? AS provided_path_hash, ? AS ip_hash_param) params
     LEFT JOIN ${cacheTableName} c 
-      ON c.PATH_HASH = COALESCE(s.FILE_PATH_HASH, params.provided_path_hash)
+      ON c.PATH_HASH = params.provided_path_hash
     LEFT JOIN ${throttleTableName} t 
       ON t.HOSTNAME_HASH = c.HOSTNAME_HASH
     LEFT JOIN ${lastActiveTableName} active
-      ON active.PATH_HASH = COALESCE(s.FILE_PATH_HASH, params.provided_path_hash)
+      ON active.PATH_HASH = params.provided_path_hash
       AND active.IP_HASH = params.ip_hash_param
     LIMIT 1
   `;
@@ -491,7 +393,7 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
   ];
 
   const batchQueries = [
-    { sql: unifiedSql, params: [pathHash, sessionTicketParam || null, ipHash] },
+    { sql: unifiedSql, params: [pathHash, ipHash] },
     { sql: rateLimitSql, params: rateLimitParams },
   ];
 
@@ -521,13 +423,6 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
     const parsed = Number(unifiedRow.ACTIVE_LAST_ACCESS_TIME);
     return Number.isFinite(parsed) ? parsed : null;
   })();
-
-  let sessionResult = createDefaultSessionResult(shouldCheckSession);
-  if (shouldCheckSession) {
-    sessionResult = parseSessionFromRow(unifiedRow, sessionTicket, now);
-  } else {
-    console.log('[Unified Check D1-REST] Session check skipped');
-  }
 
   const cacheRow = unifiedRow && unifiedRow.LINK_DATA != null && unifiedRow.TIMESTAMP != null
     ? {
@@ -576,11 +471,6 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
         `[Unified Check D1-REST] Idle timeout exceeded (idle ${idleDuration}s > ${idleTimeout}s)`
       );
 
-      sessionResult = {
-        ...createDefaultSessionResult(shouldCheckSession),
-        error: idleErrorMessage,
-      };
-
       cacheResult = { ...createDefaultCacheResult() };
       throttleResult = { ...createDefaultThrottleResult() };
     }
@@ -589,7 +479,6 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
   console.log('[Unified Check D1-REST] Completed successfully (1 RTT)');
 
   return {
-    session: sessionResult,
     cache: cacheResult,
     rateLimit: rateLimitResult,
     throttle: throttleResult,

@@ -1,13 +1,12 @@
 import { sha256Hash, calculateIPSubnet } from './utils.js';
 
 /**
- * Ensure cache, rate limit, throttle, and session tables exist using a single batch call
+ * Ensure cache, rate limit, and throttle tables exist using a single batch call
  * @param {D1Database} db
  * @param {Object} tableNames
  * @param {string} tableNames.cacheTableName
  * @param {string} tableNames.rateLimitTableName
  * @param {string} tableNames.throttleTableName
- * @param {string} [tableNames.sessionTableName]
  * @returns {Promise<void>}
  */
 const ensureAllTables = async (
@@ -16,7 +15,6 @@ const ensureAllTables = async (
     cacheTableName,
     rateLimitTableName,
     throttleTableName,
-    sessionTableName,
     lastActiveTableName,
     fairQueueTableName = 'upstream_slot_pool',
   }
@@ -66,23 +64,6 @@ const ensureAllTables = async (
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_download_last_active_time ON ${activeTableName}(LAST_ACCESS_TIME)`),
   ];
 
-  if (sessionTableName) {
-    statements.push(
-      db.prepare(`
-        CREATE TABLE IF NOT EXISTS ${sessionTableName} (
-          SESSION_TICKET TEXT PRIMARY KEY,
-          FILE_PATH TEXT NOT NULL,
-          FILE_PATH_HASH TEXT NOT NULL,
-          IP_SUBNET TEXT NOT NULL,
-          WORKER_ADDRESS TEXT NOT NULL,
-          EXPIRE_AT INTEGER NOT NULL,
-          CREATED_AT INTEGER NOT NULL
-        )
-      `),
-      db.prepare(`CREATE INDEX IF NOT EXISTS idx_session_expire ON ${sessionTableName}(EXPIRE_AT)`)
-    );
-  }
-
   statements.push(
     db.prepare(`
       CREATE TABLE IF NOT EXISTS ${fairQueueTableName} (
@@ -110,14 +91,13 @@ const ensureAllTables = async (
 
 /**
  * Unified check for D1 binding (RTT 3→1 optimization)
- * Uses db.batch() to execute Session (optional) + Rate Limit + Cache in a single transaction
+ * Uses db.batch() to execute rate limit + cache logic in a single transaction
  * @param {string} path - File path
  * @param {string} clientIP - Client IP address
  * @param {Object} config - Configuration object
- * @param {string|null} sessionTicket - Optional session ticket
- * @returns {Promise<{session, cache, rateLimit, throttle}>}
+ * @returns {Promise<{cache, rateLimit, throttle, idle}>}
  */
-export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = null) => {
+export const unifiedCheckD1 = async (path, clientIP, config) => {
   if (!config.env || !config.databaseBinding) {
     throw new Error('[Unified Check D1] Missing D1 configuration');
   }
@@ -140,16 +120,11 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
 
-  const sessionEnabled = config.sessionEnabled === true;
-  const sessionTableName = sessionEnabled ? (config.sessionTableName || 'SESSION_MAPPING_TABLE') : null;
-  const shouldCheckSession = sessionEnabled && typeof sessionTicket === 'string' && sessionTicket.trim() !== '';
-
   if (config.initTables === true) {
     await ensureAllTables(db, {
       cacheTableName,
       rateLimitTableName,
       throttleTableName,
-      sessionTableName,
       lastActiveTableName,
     });
   }
@@ -171,16 +146,6 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
   if (!ipHash) {
     throw new Error('[Unified Check D1] Failed to calculate IP hash');
   }
-
-  const defaultSessionResult = {
-    found: shouldCheckSession ? false : null,
-    filePath: null,
-    filePathHash: null,
-    ipSubnet: null,
-    workerAddress: null,
-    expireAt: null,
-    error: null,
-  };
 
   const defaultCacheResult = {
     hit: false,
@@ -337,35 +302,8 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
     return throttleResult;
   };
 
-  const sessionTicketParam = shouldCheckSession ? sessionTicket : null;
-
-  const sessionJoinClause = sessionTableName
-    ? `
-    LEFT JOIN ${sessionTableName} s 
-      ON s.SESSION_TICKET = params.session_ticket_param 
-      AND params.session_ticket_param IS NOT NULL 
-      AND params.session_ticket_param != ''
-  `
-    : `
-    LEFT JOIN (
-      SELECT 
-        NULL AS SESSION_TICKET,
-        NULL AS FILE_PATH,
-        NULL AS FILE_PATH_HASH,
-        NULL AS IP_SUBNET,
-        NULL AS WORKER_ADDRESS,
-        NULL AS EXPIRE_AT
-    ) s ON 1=0
-  `;
-
   const unifiedSql = `
     SELECT 
-      s.SESSION_TICKET,
-      s.FILE_PATH,
-      s.FILE_PATH_HASH,
-      s.IP_SUBNET,
-      s.WORKER_ADDRESS,
-      s.EXPIRE_AT,
       c.LINK_DATA,
       c.TIMESTAMP,
       c.HOSTNAME_HASH,
@@ -374,20 +312,19 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
       t.LAST_ERROR_CODE,
       active.LAST_ACCESS_TIME AS ACTIVE_LAST_ACCESS_TIME
     FROM 
-      (SELECT ? AS provided_path_hash, ? AS session_ticket_param, ? AS ip_hash_param) params
-    ${sessionJoinClause}
+      (SELECT ? AS provided_path_hash, ? AS ip_hash_param) params
     LEFT JOIN ${cacheTableName} c 
-      ON c.PATH_HASH = COALESCE(s.FILE_PATH_HASH, params.provided_path_hash)
+      ON c.PATH_HASH = params.provided_path_hash
     LEFT JOIN ${throttleTableName} t 
       ON t.HOSTNAME_HASH = c.HOSTNAME_HASH
     LEFT JOIN ${lastActiveTableName} active
-      ON active.PATH_HASH = COALESCE(s.FILE_PATH_HASH, params.provided_path_hash)
+      ON active.PATH_HASH = params.provided_path_hash
       AND active.IP_HASH = params.ip_hash_param
     LIMIT 1
   `;
 
   const batchStatements = [
-    db.prepare(unifiedSql).bind(pathHash, sessionTicketParam || null, ipHash),
+    db.prepare(unifiedSql).bind(pathHash, ipHash),
     createRateLimitStatement(),
   ];
 
@@ -409,41 +346,7 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
     return Number.isFinite(parsed) ? parsed : null;
   })();
 
-  let sessionResult = { ...defaultSessionResult };
-
-  if (shouldCheckSession) {
-    const sessionFound = Boolean(unifiedRow?.SESSION_TICKET);
-    const expireAtRaw = unifiedRow?.EXPIRE_AT != null ? Number(unifiedRow.EXPIRE_AT) : null;
-
-    sessionResult = {
-      found: sessionFound,
-      filePath: unifiedRow?.FILE_PATH || null,
-      filePathHash: unifiedRow?.FILE_PATH_HASH || null,
-      ipSubnet: unifiedRow?.IP_SUBNET || null,
-      workerAddress: unifiedRow?.WORKER_ADDRESS || null,
-      expireAt: Number.isFinite(expireAtRaw) ? expireAtRaw : null,
-      error: null,
-    };
-
-    if (!sessionFound) {
-      sessionResult.error = 'session not found';
-    } else if (sessionResult.expireAt !== null && sessionResult.expireAt < now) {
-      sessionResult.found = false;
-      sessionResult.error = 'session expired';
-      console.log('[Unified Check D1] Session has expired');
-    } else if (sessionResult.expireAt === null && unifiedRow?.EXPIRE_AT != null) {
-      sessionResult.found = false;
-      sessionResult.error = 'session expired';
-      console.warn('[Unified Check D1] Session record missing valid EXPIRE_AT, treating as expired');
-    }
-
-    console.log('[Unified Check D1] Session found:', sessionResult.found);
-  } else {
-    console.log('[Unified Check D1] Session check skipped');
-  }
-
-  const cacheContextHash = sessionResult?.filePathHash || null;
-  const cacheContext = cacheContextHash ? `session FILE_PATH_HASH ${cacheContextHash}` : `path ${path}`;
+  const cacheContext = `path ${path}`;
 
   const hasCacheData = unifiedRow && unifiedRow.TIMESTAMP != null && unifiedRow.LINK_DATA != null;
   const cacheRow = hasCacheData
@@ -495,13 +398,6 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
         `[Unified Check D1] Idle timeout exceeded (idle ${idleDuration}s > ${idleTimeout}s)`
       );
 
-      const fallbackSessionResult = {
-        ...defaultSessionResult,
-        found: shouldCheckSession ? false : defaultSessionResult.found,
-        error: idleErrorMessage,
-      };
-
-      sessionResult = fallbackSessionResult;
       cacheResult = { ...defaultCacheResult };
       throttleResult = { ...defaultThrottleResult };
     }
@@ -510,7 +406,6 @@ export const unifiedCheckD1 = async (path, clientIP, config, sessionTicket = nul
   console.log('[Unified Check D1] Completed successfully (1 RTT)');
 
   return {
-    session: sessionResult,
     cache: cacheResult,
     rateLimit: rateLimitResult,
     throttle: throttleResult,

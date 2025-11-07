@@ -5,131 +5,9 @@
 --   DOWNLOAD_CACHE_TABLE           (env: DOWNLOAD_CACHE_TABLE)
 --   THROTTLE_PROTECTION            (env: THROTTLE_PROTECTION_TABLE)
 --   DOWNLOAD_IP_RATELIMIT_TABLE    (env: DOWNLOAD_IP_RATELIMIT_TABLE)
---   SESSION_MAPPING_TABLE          (env: SESSION_TABLE_NAME)
 --
 -- If you override the environment variables, adjust the CREATE TABLE
 -- statements accordingly before applying this script.
-
-
--- ========================================
--- Session Mapping Table Schema
--- ========================================
--- Purpose: Stores landing-worker issued session tickets
--- Compatible with: PostgreSQL
-
-CREATE TABLE IF NOT EXISTS "SESSION_MAPPING_TABLE" (
-  "SESSION_TICKET" TEXT PRIMARY KEY,
-  "FILE_PATH" TEXT NOT NULL,
-  "FILE_PATH_HASH" TEXT NOT NULL,
-  "IP_SUBNET" TEXT NOT NULL,
-  "WORKER_ADDRESS" TEXT NOT NULL,
-  "EXPIRE_AT" BIGINT NOT NULL,
-  "CREATED_AT" BIGINT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_session_expire
-  ON "SESSION_MAPPING_TABLE"("EXPIRE_AT");
-CREATE INDEX IF NOT EXISTS idx_session_file_path_hash
-  ON "SESSION_MAPPING_TABLE"("FILE_PATH_HASH");
-
-
--- ========================================
--- Stored Procedure: Insert Session Mapping
--- ========================================
-CREATE OR REPLACE FUNCTION session_insert(
-  p_session_ticket TEXT,
-  p_file_path TEXT,
-  p_file_path_hash TEXT,
-  p_ip_subnet TEXT,
-  p_worker_address TEXT,
-  p_expire_at BIGINT,
-  p_created_at BIGINT,
-  p_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE'
-)
-RETURNS JSON AS $$
-DECLARE
-  v_sql TEXT;
-BEGIN
-  v_sql := format(
-    'INSERT INTO %1$I ("SESSION_TICKET", "FILE_PATH", "FILE_PATH_HASH", "IP_SUBNET", "WORKER_ADDRESS", "EXPIRE_AT", "CREATED_AT")
-     VALUES ($1, $2, $3, $4, $5, $6, $7)',
-    p_table_name
-  );
-
-  EXECUTE v_sql USING p_session_ticket, p_file_path, p_file_path_hash, p_ip_subnet, p_worker_address, p_expire_at, p_created_at;
-
-  RETURN json_build_object('success', true);
-EXCEPTION
-  WHEN others THEN
-    RETURN json_build_object('success', false, 'error', SQLERRM);
-END;
-$$ LANGUAGE plpgsql;
-
-
--- ========================================
--- Stored Procedure: Retrieve Session Mapping (Compatibility)
--- ========================================
-CREATE OR REPLACE FUNCTION session_get(
-  p_session_ticket TEXT,
-  p_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE'
-)
-RETURNS JSON AS $$
-DECLARE
-  v_sql TEXT;
-  v_record RECORD;
-BEGIN
-  v_sql := format(
-    'SELECT "SESSION_TICKET", "FILE_PATH", "FILE_PATH_HASH", "IP_SUBNET", "WORKER_ADDRESS", "EXPIRE_AT", "CREATED_AT"
-     FROM %1$I WHERE "SESSION_TICKET" = $1 LIMIT 1',
-    p_table_name
-  );
-
-  EXECUTE v_sql INTO v_record USING p_session_ticket;
-
-  IF v_record IS NULL OR v_record."SESSION_TICKET" IS NULL THEN
-    RETURN json_build_object('found', false);
-  END IF;
-
-  RETURN json_build_object(
-    'found', true,
-    'file_path', v_record."FILE_PATH",
-    'file_path_hash', v_record."FILE_PATH_HASH",
-    'ip_subnet', v_record."IP_SUBNET",
-    'worker_address', v_record."WORKER_ADDRESS",
-    'expire_at', v_record."EXPIRE_AT"
-  );
-EXCEPTION
-  WHEN others THEN
-    RETURN json_build_object('found', false, 'error', SQLERRM);
-END;
-$$ LANGUAGE plpgsql;
-
-
--- ========================================
--- Stored Procedure: Cleanup Expired Sessions
--- ========================================
-CREATE OR REPLACE FUNCTION session_cleanup_expired(
-  p_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE',
-  p_now BIGINT DEFAULT NULL
-)
-RETURNS JSON AS $$
-DECLARE
-  v_now BIGINT;
-  v_sql TEXT;
-  v_deleted BIGINT := 0;
-BEGIN
-  v_now := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::BIGINT);
-
-  v_sql := format('DELETE FROM %1$I WHERE "EXPIRE_AT" < $1', p_table_name);
-  EXECUTE v_sql USING v_now;
-  GET DIAGNOSTICS v_deleted = ROW_COUNT;
-
-  RETURN json_build_object('deleted', v_deleted);
-EXCEPTION
-  WHEN others THEN
-    RETURN json_build_object('deleted', 0, 'error', SQLERRM);
-END;
-$$ LANGUAGE plpgsql;
 
 
 -- ========================================
@@ -452,9 +330,9 @@ $$ LANGUAGE plpgsql;
 
 
 -- ========================================
--- Unified Check Function (Session + Rate Limit + Cache + Throttle)
+-- Unified Check Function (Rate Limit + Cache + Throttle)
 -- ========================================
--- Purpose: Combines Session validation + Rate Limit + Cache + Throttle checks in a single database round-trip
+-- Purpose: Combines Rate Limit + Cache + Throttle checks in a single database round-trip
 
 CREATE OR REPLACE FUNCTION download_unified_check(
   -- Cache parameters
@@ -474,9 +352,7 @@ CREATE OR REPLACE FUNCTION download_unified_check(
   p_throttle_time_window INTEGER,
   p_throttle_table_name TEXT,
 
-  -- Session parameters
-  p_session_ticket TEXT DEFAULT NULL,
-  p_session_table_name TEXT DEFAULT 'SESSION_MAPPING_TABLE',
+  -- General parameters
   p_now BIGINT DEFAULT NULL,
 
   -- Last active parameters
@@ -484,14 +360,6 @@ CREATE OR REPLACE FUNCTION download_unified_check(
   p_last_active_table_name TEXT DEFAULT 'DOWNLOAD_LAST_ACTIVE_TABLE'
 )
 RETURNS TABLE(
-  -- Session result
-  session_found BOOLEAN,
-  session_file_path TEXT,
-  session_ip_subnet TEXT,
-  session_worker_address TEXT,
-  session_expire_at BIGINT,
-  session_error TEXT,
-
   -- Cache result
   cache_link_data TEXT,
   cache_timestamp INTEGER,
@@ -514,20 +382,11 @@ RETURNS TABLE(
 ) AS $$
 DECLARE
   v_now BIGINT;
-  v_session_record RECORD;
   v_cache_record RECORD;
   v_rate_record RECORD;
   v_throttle_record RECORD;
   v_cache_hostname_hash TEXT;
   v_active_record RECORD;
-
-  v_session_found BOOLEAN := NULL;
-  v_session_file_path TEXT := NULL;
-  v_session_file_path_hash TEXT := NULL;
-  v_session_ip_subnet TEXT := NULL;
-  v_session_worker_address TEXT := NULL;
-  v_session_expire_at BIGINT := NULL;
-  v_session_error TEXT := NULL;
 
   v_cache_link_data TEXT := NULL;
   v_cache_timestamp INTEGER := NULL;
@@ -547,75 +406,8 @@ DECLARE
 BEGIN
   v_now := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::BIGINT);
 
-  -- Step 1: Session validation (if ticket provided)
-  IF p_session_ticket IS NOT NULL AND btrim(p_session_ticket) <> '' THEN
-    EXECUTE format('SELECT * FROM %1$I WHERE "SESSION_TICKET" = $1 LIMIT 1', p_session_table_name)
-      INTO v_session_record
-      USING p_session_ticket;
-
-    IF v_session_record IS NULL OR v_session_record."SESSION_TICKET" IS NULL THEN
-      RETURN QUERY SELECT
-        FALSE,
-        NULL::TEXT,
-        NULL::TEXT,
-        NULL::TEXT,
-        NULL::BIGINT,
-        'session not found'::TEXT,
-        NULL::TEXT,
-        NULL::INTEGER,
-        NULL::TEXT,
-        NULL::INTEGER,
-        NULL::INTEGER,
-        NULL::INTEGER,
-        NULL::BOOLEAN,
-        NULL::INTEGER,
-        NULL::INTEGER,
-        NULL::INTEGER,
-        NULL::INTEGER,
-        NULL::INTEGER;
-      RETURN;
-    END IF;
-
-    IF v_session_record."EXPIRE_AT" IS NOT NULL AND v_session_record."EXPIRE_AT" < v_now THEN
-      RETURN QUERY SELECT
-        FALSE,
-        NULL::TEXT,
-        NULL::TEXT,
-        NULL::TEXT,
-        v_session_record."EXPIRE_AT",
-        'session expired'::TEXT,
-        NULL::TEXT,
-        NULL::INTEGER,
-        NULL::TEXT,
-        NULL::INTEGER,
-        NULL::INTEGER,
-        NULL::INTEGER,
-        NULL::BOOLEAN,
-        NULL::INTEGER,
-        NULL::INTEGER,
-        NULL::INTEGER,
-        NULL::INTEGER,
-        NULL::INTEGER;
-      RETURN;
-    END IF;
-
-    v_session_found := TRUE;
-    v_session_file_path := v_session_record."FILE_PATH";
-    v_session_file_path_hash := v_session_record."FILE_PATH_HASH";
-    v_session_ip_subnet := v_session_record."IP_SUBNET";
-    v_session_worker_address := v_session_record."WORKER_ADDRESS";
-    v_session_expire_at := v_session_record."EXPIRE_AT";
-  END IF;
-
-  -- Step 2: Cache lookup
-  -- IMPORTANT: If session mode, use pre-stored FILE_PATH_HASH (not the /session/* URL path)
-  IF v_session_found IS TRUE AND v_session_file_path_hash IS NOT NULL THEN
-    -- Session mode: use FILE_PATH_HASH from session table
-    v_actual_path_hash := v_session_file_path_hash;
-  ELSE
-    -- Non-session mode: use provided path_hash
-    v_actual_path_hash := p_path_hash;
-  END IF;
+  -- Step 1: Cache lookup
+  v_actual_path_hash := p_path_hash;
 
   EXECUTE format('SELECT "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH" FROM %1$I WHERE "PATH_HASH" = $1', p_cache_table_name)
     INTO v_cache_record
@@ -631,7 +423,7 @@ BEGIN
     v_cache_hostname_hash := NULL;
   END IF;
 
-  -- Step 3: Rate limit upsert
+  -- Step 2: Rate limit upsert
   SELECT *
     INTO v_rate_record
   FROM download_upsert_rate_limit(
@@ -648,7 +440,7 @@ BEGIN
   v_rate_last_window_time := v_rate_record."LAST_WINDOW_TIME";
   v_rate_block_until := v_rate_record."BLOCK_UNTIL";
 
-  -- Step 4: Throttle lookup (only when cache provided hostname)
+  -- Step 3: Throttle lookup (only when cache provided hostname)
   IF v_cache_hostname_hash IS NOT NULL THEN
     EXECUTE format('SELECT "IS_PROTECTED", "ERROR_TIMESTAMP", "LAST_ERROR_CODE" FROM %1$I WHERE "HOSTNAME_HASH" = $1', p_throttle_table_name)
       INTO v_throttle_record
@@ -672,8 +464,7 @@ BEGIN
     v_throttle_error_code := NULL;
   END IF;
 
-  -- Step 5: Last active lookup
-  -- IMPORTANT: Use v_actual_path_hash (respects session mode path hash)
+  -- Step 4: Last active lookup
   EXECUTE format('SELECT "LAST_ACCESS_TIME", "TOTAL_ACCESS_COUNT" FROM %1$I WHERE "IP_HASH" = $1 AND "PATH_HASH" = $2 LIMIT 1', p_last_active_table_name)
     INTO v_active_record
     USING p_ip_hash, v_actual_path_hash;
@@ -684,12 +475,6 @@ BEGIN
   END IF;
 
   RETURN QUERY SELECT
-    v_session_found,
-    v_session_file_path,
-    v_session_ip_subnet,
-    v_session_worker_address,
-    v_session_expire_at,
-    v_session_error,
     v_cache_link_data,
     v_cache_timestamp,
     v_cache_hostname_hash,
