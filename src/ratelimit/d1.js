@@ -92,7 +92,8 @@ export const checkRateLimit = async (ip, config) => {
         BLOCK_UNTIL = CASE
           WHEN ? - ${tableName}.LAST_WINDOW_TIME >= ? THEN NULL
           WHEN ${tableName}.BLOCK_UNTIL IS NOT NULL AND ${tableName}.BLOCK_UNTIL <= ? THEN NULL
-          WHEN ${tableName}.ACCESS_COUNT >= ? AND ? > 0 THEN ? + ?
+          WHEN ${tableName}.BLOCK_UNTIL IS NOT NULL AND ${tableName}.BLOCK_UNTIL > ? THEN ${tableName}.BLOCK_UNTIL
+          WHEN (${tableName}.BLOCK_UNTIL IS NULL OR ${tableName}.BLOCK_UNTIL <= ?) AND ${tableName}.ACCESS_COUNT >= ? AND ? > 0 THEN ? + ?
           ELSE ${tableName}.BLOCK_UNTIL
         END
       RETURNING ACCESS_COUNT, LAST_WINDOW_TIME, BLOCK_UNTIL
@@ -103,7 +104,7 @@ export const checkRateLimit = async (ip, config) => {
       ipHash, ipSubnet, now,
       now, config.windowTimeSeconds, now, config.limit,
       now, config.windowTimeSeconds, now, now, now,
-      now, config.windowTimeSeconds, now, config.limit, blockTimeSeconds, now, blockTimeSeconds
+      now, config.windowTimeSeconds, now, now, now, config.limit, blockTimeSeconds, now, blockTimeSeconds
     ).first();
 
     if (!result) {

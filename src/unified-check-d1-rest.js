@@ -440,7 +440,8 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
       BLOCK_UNTIL = CASE
         WHEN ? - ${rateLimitTableName}.LAST_WINDOW_TIME >= ? THEN NULL
         WHEN ${rateLimitTableName}.BLOCK_UNTIL IS NOT NULL AND ${rateLimitTableName}.BLOCK_UNTIL <= ? THEN NULL
-        WHEN ${rateLimitTableName}.ACCESS_COUNT >= ? AND ? > 0 THEN ? + ?
+        WHEN ${rateLimitTableName}.BLOCK_UNTIL IS NOT NULL AND ${rateLimitTableName}.BLOCK_UNTIL > ? THEN ${rateLimitTableName}.BLOCK_UNTIL
+        WHEN (${rateLimitTableName}.BLOCK_UNTIL IS NULL OR ${rateLimitTableName}.BLOCK_UNTIL <= ?) AND ${rateLimitTableName}.ACCESS_COUNT >= ? AND ? > 0 THEN ? + ?
         ELSE ${rateLimitTableName}.BLOCK_UNTIL
       END
     RETURNING ACCESS_COUNT, LAST_WINDOW_TIME, BLOCK_UNTIL
@@ -450,7 +451,7 @@ export const unifiedCheckD1Rest = async (path, clientIP, config, sessionTicket =
     ipHash, ipSubnet, now,
     now, windowSeconds, now, limit,
     now, windowSeconds, now, now, now,
-    now, windowSeconds, now, limit, blockSeconds, now, blockSeconds,
+    now, windowSeconds, now, now, now, limit, blockSeconds, now, blockSeconds,
   ];
 
   const batchQueries = [
