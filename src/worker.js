@@ -13,6 +13,8 @@ const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
 const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-ip', 'skip-addition', 'skip-addition-expiretime', 'asis']);
 const VALID_EXCEPT_ACTIONS = new Set(['block-except', 'skip-sign-except', 'skip-hash-except', 'skip-worker-except', 'skip-ip-except', 'skip-addition-except', 'skip-addition-expiretime-except', 'asis-except']);
 
+let ipRateLimitDisabledLogged = false;
+
 // Utility: Parse comma-separated prefix list
 const parsePrefixList = (value) => {
   if (!value || typeof value !== 'string') return [];
@@ -327,10 +329,20 @@ const resolveConfig = (env = {}) => {
     }
   }
 
-  const rateLimitParamsProvided = windowTime !== '' || env.IPSUBNET_WINDOWTIME_LIMIT !== undefined;
+  const ipRateLimitActive = Boolean(dbMode && windowTimeSeconds > 0 && ipSubnetLimit > 0);
   let rateLimitEnabled = false;
   let rateLimitConfig = {};
-  if (dbMode && windowTimeSeconds > 0 && ipSubnetLimit > 0) {
+
+  if (dbMode && ipSubnetLimit === 0 && !ipRateLimitDisabledLogged) {
+    console.log('IP rate limiting disabled (limit=0)');
+    ipRateLimitDisabledLogged = true;
+  }
+
+  if (dbMode && ipSubnetLimit > 0 && windowTimeSeconds <= 0) {
+    throw new Error('WINDOW_TIME must be greater than zero when IPSUBNET_WINDOWTIME_LIMIT > 0');
+  }
+
+  if (ipRateLimitActive) {
     if (normalizedDbMode === 'd1') {
       rateLimitEnabled = true;
       rateLimitConfig = {
@@ -382,8 +394,6 @@ const resolveConfig = (env = {}) => {
         blockTimeSeconds,
       };
     }
-  } else if (dbMode && rateLimitParamsProvided && (!windowTimeSeconds || !ipSubnetLimit)) {
-    throw new Error('Rate limiting configuration is incomplete. Ensure WINDOW_TIME and IPSUBNET_WINDOWTIME_LIMIT are valid positive values.');
   }
 
   if (enableCfRatelimiter) {
