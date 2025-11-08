@@ -4,6 +4,9 @@ compatibility_date = "2024-01-01"
 
 # Environment variables (configure these in Cloudflare Dashboard or use secrets)
 # [vars]
+# # Origin Encrypt Binding (NEW):
+# #   Landing worker now encrypts client origin snapshot (IP / geo / ASN) into additionalInfo.encrypt.
+# #   Configure CHECK_ORIGIN below to enforce binding on the download worker, and use skip-origin path actions when needed.
 # ADDRESS = "https://your-alist-server.com"
 # TOKEN = "your-hmac-token"
 # WORKER_ADDRESS = "https://your-worker.workers.dev"
@@ -23,6 +26,9 @@ compatibility_date = "2024-01-01"
 # SIGN_CHECK = "true"
 # HASH_CHECK = "true"
 # WORKER_CHECK = "true"
+# CHECK_ORIGIN = ""              # Comma-separated origin fields: ip, iprange, country, continent, region, city, asn.
+#                                # Leave empty to disable binding globally, or use values like "asn" / "country,iprange".
+#                                # Pair with the new skip-origin path action for granular overrides.
 # ADDITION_CHECK = "true"             # Require additionalInfo and additionalInfoSign, validate signature/path binding
 # ADDITION_EXPIRETIME_CHECK = "true"  # Validate expireTime field (only when ADDITION_CHECK is true)
 # IPV4_ONLY = "true"
@@ -144,11 +150,11 @@ compatibility_date = "2024-01-01"
 # #   # Paths matching /allowed or /safe → normal checks
 # #   # All other paths → blocked (403)
 # #
-# # Example 3: Skip IP check for all except sensitive paths
+# # Example 3: Skip origin binding for all except sensitive paths
 # #   EXCEPT_PREFIX = "/sensitive,/private"
 # #   EXCEPT_ACTION = "skip-origin-except"
-# #   # Paths matching /sensitive or /private → IP check enabled
-# #   # All other paths → IP check skipped
+# #   # Paths matching /sensitive or /private → origin binding enforced
+# #   # All other paths → origin binding skipped (even when CHECK_ORIGIN is set)
 # #
 # # Example 4: Complex multi-level filtering
 # #   BLACKLIST_PREFIX = "/blocked"
