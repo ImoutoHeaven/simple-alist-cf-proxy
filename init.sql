@@ -508,29 +508,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_upstream_slot_pool_unique
 CREATE INDEX IF NOT EXISTS idx_upstream_slot_pool_host_status
   ON "upstream_slot_pool" ("hostname_pattern", "status");
 
--- ========================================
--- Acquire Fair Slot RPC
--- ========================================
-CREATE OR REPLACE FUNCTION func_acquire_fair_slot(
+-- Try Acquire Fair Slot RPC (single attempt, non-blocking)
+-- Returns:
+--   > 0  → slot id acquired
+--   = 0  → per-IP concurrent limit reached
+--   = -1 → no available slot (global limit reached)
+CREATE OR REPLACE FUNCTION func_try_acquire_slot(
   p_hostname_pattern           TEXT,
   p_ip_hash                    TEXT,
   p_global_limit               INT,
   p_per_ip_limit               INT,
-  p_queue_wait_timeout_ms      INT,
-  p_zombie_timeout_seconds     INT,
-  p_poll_interval_ms           INT
+  p_zombie_timeout_seconds     INT
 )
 RETURNS INT
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  v_start_time           TIMESTAMP WITH TIME ZONE := clock_timestamp();
-  v_poll_interval        INTERVAL := (p_poll_interval_ms::TEXT || ' milliseconds')::INTERVAL;
-  v_queue_timeout        INTERVAL := (p_queue_wait_timeout_ms::TEXT || ' milliseconds')::INTERVAL;
-  v_zombie_timeout       INTERVAL := (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL;
-  v_slot_id              INT;
-  v_current_ip_slots     INT;
-  v_now                  TIMESTAMP WITH TIME ZONE;
+  v_zombie_timeout   INTERVAL := (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL;
+  v_slot_id          INT;
+  v_current_ip_slots INT;
 BEGIN
   -- 确保当前 hostname_pattern 下有 1..p_global_limit 的槽位
   INSERT INTO "upstream_slot_pool" ("hostname_pattern", "slot_index", "status")
@@ -538,56 +534,47 @@ BEGIN
   FROM generate_series(1, p_global_limit) AS gs(slot_index)
   ON CONFLICT ("hostname_pattern", "slot_index") DO NOTHING;
 
-  LOOP
-    v_now := clock_timestamp();
+  -- 1) 统计该 IP 当前持有的非僵尸锁数量
+  SELECT COUNT(*) INTO v_current_ip_slots
+  FROM "upstream_slot_pool"
+  WHERE "hostname_pattern" = p_hostname_pattern
+    AND "status" = 'locked'
+    AND "ip_hash" = p_ip_hash
+    AND "locked_at" IS NOT NULL
+    AND "locked_at" >= (clock_timestamp() - v_zombie_timeout);
 
-    -- 只统计“非僵尸”的锁作为该 IP 的占用
-    SELECT COUNT(*) INTO v_current_ip_slots
-    FROM "upstream_slot_pool"
-    WHERE "hostname_pattern" = p_hostname_pattern
-      AND "status" = 'locked'
-      AND "ip_hash" = p_ip_hash
-      AND "locked_at" IS NOT NULL
-      AND "locked_at" >= (v_now - v_zombie_timeout);
+  IF v_current_ip_slots >= p_per_ip_limit THEN
+    RETURN 0;
+  END IF;
 
-    IF v_current_ip_slots >= p_per_ip_limit THEN
-      -- 该 IP 已经占满自己的并发上限
-      RETURN 0;
-    END IF;
-
-    -- 抢一个可用槽：包括可用行和超时的僵尸锁
-    SELECT "id" INTO v_slot_id
-    FROM "upstream_slot_pool"
-    WHERE "hostname_pattern" = p_hostname_pattern
-      AND "slot_index" <= p_global_limit
-      AND (
-        "status" = 'available'
-        OR ("status" = 'locked'
-            AND "locked_at" IS NOT NULL
-            AND "locked_at" < (v_now - v_zombie_timeout))
+  -- 2) 抢占可用或僵尸槽位（单次尝试）
+  SELECT "id" INTO v_slot_id
+  FROM "upstream_slot_pool"
+  WHERE "hostname_pattern" = p_hostname_pattern
+    AND "slot_index" <= p_global_limit
+    AND (
+      "status" = 'available'
+      OR (
+        "status" = 'locked'
+        AND "locked_at" IS NOT NULL
+        AND "locked_at" < (clock_timestamp() - v_zombie_timeout)
       )
-    ORDER BY "slot_index"
-    FOR UPDATE SKIP LOCKED
-    LIMIT 1;
+    )
+  ORDER BY "slot_index"
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1;
 
-    IF v_slot_id IS NOT NULL THEN
-      UPDATE "upstream_slot_pool"
-      SET "status" = 'locked',
-          "ip_hash" = p_ip_hash,
-          "locked_at" = v_now
-      WHERE "id" = v_slot_id;
+  IF v_slot_id IS NOT NULL THEN
+    UPDATE "upstream_slot_pool"
+    SET "status" = 'locked',
+        "ip_hash" = p_ip_hash,
+        "locked_at" = clock_timestamp()
+    WHERE "id" = v_slot_id;
 
-      RETURN v_slot_id;
-    END IF;
+    RETURN v_slot_id;
+  END IF;
 
-    -- 排队超时
-    IF (v_now - v_start_time) > v_queue_timeout THEN
-      RETURN -1;
-    END IF;
-
-    -- 等待再尝试
-    PERFORM pg_sleep(v_poll_interval);
-  END LOOP;
+  RETURN -1;
 END;
 $$;
 

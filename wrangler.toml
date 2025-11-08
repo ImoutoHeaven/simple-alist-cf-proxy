@@ -439,15 +439,15 @@ compatibility_date = "2024-01-01"
 # ┌──────────────────┬─────────────────────┬────────────────────────────────┐
 # │ DB Mode          │ Table Creation      │ Queue Implementation           │
 # ├──────────────────┼─────────────────────┼────────────────────────────────┤
-# │ PostgreSQL       │ Manual (init.sql)   │ Stored Procedure (pg_sleep)    │
-# │ D1               │ Auto (INIT_TABLES)  │ Worker-side (setTimeout)       │
-# │ D1-REST          │ Auto (INIT_TABLES)  │ Worker-side (setTimeout)       │
+# │ PostgreSQL       │ Manual (init.sql)   │ Single-attempt RPC + Worker wait │
+# │ D1               │ Auto (INIT_TABLES)  │ Single-attempt SQL + Worker wait │
+# │ D1-REST          │ Auto (INIT_TABLES)  │ Single-attempt SQL + Worker wait │
 # └──────────────────┴─────────────────────┴────────────────────────────────┘
 #
 # PostgreSQL Setup:
 #   1. Run init.sql to create:
 #      - Table: upstream_slot_pool
-#      - Functions: func_acquire_fair_slot, func_release_fair_slot, func_cleanup_zombie_slots
+#      - Functions: func_try_acquire_slot, func_release_fair_slot, func_cleanup_zombie_slots
 #   2. INIT_TABLES has no effect (PostgREST doesn't support auto-table creation)
 #
 # D1/D1-REST Setup:
@@ -500,9 +500,8 @@ compatibility_date = "2024-01-01"
 #                                            # Slots stuck in "locked" state > this duration are released
 #                                            # Prevents leaks from Worker crashes/exceptions
 #
-# FAIR_QUEUE_POLL_INTERVAL_MS = "200"  # Polling interval for D1/D1-REST modes (milliseconds)
+# FAIR_QUEUE_POLL_INTERVAL_MS = "200"  # Worker-side polling interval between slot attempts (milliseconds)
 #                                       # Default: 200ms
-#                                       # PostgreSQL uses pg_sleep (this param ignored)
 #                                       # Tradeoff: Lower = more responsive, Higher = less DB pressure
 #
 # FAIR_QUEUE_TABLE_NAME = "upstream_slot_pool"  # Fair queue table name

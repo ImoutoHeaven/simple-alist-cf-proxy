@@ -8,7 +8,49 @@ const buildHeaders = (verifyHeader, verifySecret) => {
   return headers;
 };
 
-const acquireFairSlot = async (hostname, ipHash, config) => {
+const parseSlotId = (payload) => {
+  if (payload === null || payload === undefined) {
+    return NaN;
+  }
+
+  if (typeof payload === 'number') {
+    return Number.isFinite(payload) ? payload : NaN;
+  }
+
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const parsed = parseSlotId(item);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return NaN;
+  }
+
+  if (payload && typeof payload === 'object') {
+    for (const value of Object.values(payload)) {
+      const parsed = parseSlotId(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return NaN;
+  }
+
+  if (typeof payload === 'string') {
+    const trimmed = payload.trim();
+    if (trimmed === '') {
+      return NaN;
+    }
+    const coerced = Number(trimmed);
+    return Number.isFinite(coerced) ? coerced : NaN;
+  }
+
+  const coerced = Number(payload);
+  return Number.isFinite(coerced) ? coerced : NaN;
+};
+
+const tryAcquireFairSlot = async (hostname, ipHash, config) => {
   if (!config?.postgrestUrl) {
     throw new Error('[Fair Queue PG] Missing PostgREST URL');
   }
@@ -19,12 +61,10 @@ const acquireFairSlot = async (hostname, ipHash, config) => {
     p_ip_hash: ipHash,
     p_global_limit: config.globalLimit,
     p_per_ip_limit: config.perIpLimit,
-    p_queue_wait_timeout_ms: config.queueWaitTimeoutMs,
     p_zombie_timeout_seconds: config.zombieTimeoutSeconds,
-    p_poll_interval_ms: config.pollIntervalMs,
   };
 
-  const response = await fetch(`${config.postgrestUrl}/rpc/func_acquire_fair_slot`, {
+  const response = await fetch(`${config.postgrestUrl}/rpc/func_try_acquire_slot`, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -34,23 +74,12 @@ const acquireFairSlot = async (hostname, ipHash, config) => {
     throw new Error(`PostgREST RPC failed: ${response.status}`);
   }
 
-  const slotId = await response.json();
-
-  if (slotId === 0) {
-    console.warn(`[Fair Queue PG] Per-IP limit reached: ${ipHash}`);
-    const error = new Error(`Per-IP limit ${config.perIpLimit} reached`);
-    error.name = 'PerIpLimitError';
-    throw error;
+  const payload = await response.json();
+  const slotId = parseSlotId(payload);
+  if (!Number.isFinite(slotId)) {
+    throw new Error('[Fair Queue PG] Invalid slot id returned from PostgREST');
   }
 
-  if (slotId < 0) {
-    console.warn(`[Fair Queue PG] Queue timeout for ${hostname}`);
-    const error = new Error(`Queue timeout after ${config.queueWaitTimeoutMs}ms`);
-    error.name = 'QueueTimeoutError';
-    throw error;
-  }
-
-  console.log(`[Fair Queue PG] Acquired slot ${slotId} for ${hostname}`);
   return slotId;
 };
 
@@ -98,4 +127,4 @@ const cleanupZombieSlots = async (config) => {
   return deleted;
 };
 
-export { acquireFairSlot, releaseFairSlot, cleanupZombieSlots };
+export { tryAcquireFairSlot, releaseFairSlot, cleanupZombieSlots };

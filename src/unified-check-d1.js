@@ -436,8 +436,6 @@ const updateLastActive = async (db, ipHash, pathHash, tableName = 'DOWNLOAD_LAST
 // Fair Queue Functions (D1 Mode)
 // ========================================
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const ensureSlotPool = async (db, hostname, globalLimit, tableName) => {
   const row = await db
     .prepare(`SELECT COUNT(*) AS c FROM ${tableName} WHERE hostname_pattern = ?`)
@@ -507,7 +505,7 @@ const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
       .first();
 
     if (!candidate) {
-      return -2;
+      return -1;
     }
     const updateResult = await db
       .prepare(
@@ -527,15 +525,19 @@ const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
       .run();
     const changes = updateResult.meta?.changes ?? 0;
     if (changes === 0) {
-      return -2;
+      return -1;
     }
     return candidate.id;
   } catch (error) {
-    throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    const wrapped = new Error(`[Fair Queue D1] Database error: ${message}`);
+    wrapped.name = 'FairQueueDbError';
+    wrapped.originalError = error;
+    throw wrapped;
   }
 };
 
-const acquireFairSlot = async (hostname, ipHash, config) => {
+const tryAcquireFairSlot = async (hostname, ipHash, config) => {
   if (!config?.env || !config.databaseBinding) {
     throw new Error('[Fair Queue D1] Missing D1 configuration');
   }
@@ -545,34 +547,7 @@ const acquireFairSlot = async (hostname, ipHash, config) => {
     throw new Error(`[Fair Queue D1] D1 binding '${config.databaseBinding}' not found`);
   }
 
-  const deadline = Date.now() + config.queueWaitTimeoutMs;
-  let attempts = 0;
-
-  while (true) {
-    attempts += 1;
-    const result = await tryAcquireFairSlotOnce(db, hostname, ipHash, config);
-
-    if (result > 0) {
-      console.log(`[Fair Queue D1] Acquired slot ${result} for ${hostname}`);
-      return result;
-    }
-
-    if (result === 0) {
-      console.warn(`[Fair Queue D1] Per-IP limit reached: ${ipHash}`);
-      const error = new Error(`Per-IP limit ${config.perIpLimit} reached`);
-      error.name = 'PerIpLimitError';
-      throw error;
-    }
-
-    if (Date.now() > deadline) {
-      console.warn(`[Fair Queue D1] Queue timeout for ${hostname}`);
-      const error = new Error(`Queue timeout after ${config.queueWaitTimeoutMs}ms`);
-      error.name = 'QueueTimeoutError';
-      throw error;
-    }
-
-    await sleep(config.pollIntervalMs);
-  }
+  return tryAcquireFairSlotOnce(db, hostname, ipHash, config);
 };
 
 const releaseFairSlot = async (slotId, config) => {
@@ -632,7 +607,7 @@ const cleanupZombieSlots = async (config) => {
 export {
   ensureAllTables,
   updateLastActive,
-  acquireFairSlot,
+  tryAcquireFairSlot,
   releaseFairSlot,
   cleanupZombieSlots,
 };

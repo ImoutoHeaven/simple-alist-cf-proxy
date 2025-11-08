@@ -514,8 +514,6 @@ const updateLastActive = async (config, ipHash, pathHash) => {
 // Fair Queue Functions (D1-REST Mode)
 // ========================================
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const ensureSlotPoolRest = async (
   accountId,
   databaseId,
@@ -605,7 +603,7 @@ const tryAcquireFairSlotOnceRest = async (
 
     const slotId = candidate.results?.[0]?.id ?? candidate.results?.[0]?.ID ?? null;
     if (!slotId) {
-      return -2;
+      return -1;
     }
 
     const updateResult = await executeQuery(
@@ -627,56 +625,36 @@ const tryAcquireFairSlotOnceRest = async (
     );
     const changes = updateResult.meta?.changes ?? 0;
     if (changes === 0) {
-      return -2;
+      return -1;
     }
     return slotId;
   } catch (error) {
-    throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    const wrapped = new Error(`[Fair Queue D1-REST] Database error: ${message}`);
+    wrapped.name = 'FairQueueDbError';
+    wrapped.originalError = error;
+    throw wrapped;
   }
 };
 
-const acquireFairSlot = async (hostname, ipHash, config) => {
+const tryAcquireFairSlot = async (hostname, ipHash, config) => {
   if (!config?.accountId || !config.databaseId || !config.apiToken) {
     throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration');
   }
 
   const { accountId, databaseId, apiToken } = config;
   const tableName = config.fairQueueTableName || 'upstream_slot_pool';
-  const deadline = Date.now() + config.queueWaitTimeoutMs;
 
   await ensureSlotPoolRest(accountId, databaseId, apiToken, hostname, config.globalLimit, tableName);
 
-  while (true) {
-    const result = await tryAcquireFairSlotOnceRest(
-      accountId,
-      databaseId,
-      apiToken,
-      hostname,
-      ipHash,
-      config
-    );
-
-    if (result > 0) {
-      console.log(`[Fair Queue D1-REST] Acquired slot ${result} for ${hostname}`);
-      return result;
-    }
-
-    if (result === 0) {
-      console.warn(`[Fair Queue D1-REST] Per-IP limit reached: ${ipHash}`);
-      const error = new Error(`Per-IP limit ${config.perIpLimit} reached`);
-      error.name = 'PerIpLimitError';
-      throw error;
-    }
-
-    if (Date.now() > deadline) {
-      console.warn(`[Fair Queue D1-REST] Queue timeout for ${hostname}`);
-      const error = new Error(`Queue timeout after ${config.queueWaitTimeoutMs}ms`);
-      error.name = 'QueueTimeoutError';
-      throw error;
-    }
-
-    await sleep(config.pollIntervalMs);
-  }
+  return tryAcquireFairSlotOnceRest(
+    accountId,
+    databaseId,
+    apiToken,
+    hostname,
+    ipHash,
+    config
+  );
 };
 
 const releaseFairSlot = async (slotId, config) => {
@@ -730,7 +708,7 @@ const cleanupZombieSlots = async (config) => {
 export {
   ensureAllTables,
   updateLastActive,
-  acquireFairSlot,
+  tryAcquireFairSlot,
   releaseFairSlot,
   cleanupZombieSlots,
 };
