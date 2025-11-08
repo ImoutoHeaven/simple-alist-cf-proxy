@@ -4,7 +4,7 @@ A Cloudflare Worker that acts as a download proxy for AList, with signature veri
 
 ## Features
 
-- **Four-Layer Signature Verification**: Verifies sign, hashSign, workerSign, and ipSign parameters
+- **Origin-Bound Verification**: Verifies sign, hashSign, workerSign, and an AES-GCM encrypted origin snapshot
 - **Path-based Access Control**: Blacklist/whitelist with flexible actions
 - **IPv4-only Mode**: Option to block IPv6 access
 - **Environment-based Configuration**: No hardcoded values, fully configurable via environment variables
@@ -15,8 +15,8 @@ A Cloudflare Worker that acts as a download proxy for AList, with signature veri
 This worker is designed to work with `alist-landing-worker`:
 
 1. User requests file from `alist-landing-worker`
-2. Landing worker generates four signatures and redirects to this proxy worker
-3. Proxy worker verifies all signatures
+2. Landing worker generates multiple signatures and encrypts the origin snapshot before redirecting to this proxy worker
+3. Proxy worker verifies all signatures, decrypts the snapshot, and enforces `CHECK_ORIGIN`
 4. Proxy worker fetches download URL from AList API
 5. Proxy worker streams the file to user
 
@@ -67,7 +67,7 @@ wrangler deploy
 | `SIGN_CHECK` | Plain | ❌ No | `true` | Enable ?sign= verification |
 | `HASH_CHECK` | Plain | ❌ No | `true` | Enable ?hashSign= verification |
 | `WORKER_CHECK` | Plain | ❌ No | `true` | Enable ?workerSign= verification |
-| `IP_CHECK` | Plain | ❌ No | `true` | Enable ipSign verification |
+| `CHECK_ORIGIN` | Plain | ❌ No | `""` | Comma-separated origin fields to enforce (`ip`, `iprange`, `country`, `continent`, `region`, `city`, `asn`) |
 | `IPV4_ONLY` | Plain | ❌ No | `true` | Block IPv6 access |
 | `BLACKLIST_PREFIX` | Plain | ❌ No | - | Comma-separated blacklist path prefixes |
 | `BLACKLIST_ACTION` | Plain | ❌ No | - | Action for blacklisted paths |
@@ -76,27 +76,31 @@ wrangler deploy
 | `EXCEPT_PREFIX` | Plain | ❌ No | - | Comma-separated exception path prefixes |
 | `EXCEPT_ACTION` | Plain | ❌ No | - | Exception action (must use -except suffix) |
 
-## Signature Verification
+## Signature & Origin Verification
 
-This worker verifies four signatures in order:
+This worker validates three HMAC signatures in order:
 
-1. **sign**: `HMAC-SHA256(path, expire)`
-   - Verifies the path hasn't been tampered with
+1. **sign**: `HMAC-SHA256(path, expire)` ensures the requested path was not altered.
+2. **hashSign**: `HMAC-SHA256(base64(path), expire)` adds a second integrity layer.
+3. **workerSign**: `HMAC-SHA256(JSON.stringify({path, worker_addr}), expire)` binds the ticket to a specific download worker.
 
-2. **hashSign**: `HMAC-SHA256(base64(path), expire)`
-   - Additional path integrity check
+After the HMAC chain succeeds, `additionalInfo` is verified (path hash + expiry) and, when `CHECK_ORIGIN` is non-empty, the worker decrypts `additionalInfo.encrypt` via AES-256-GCM to obtain the origin snapshot issued by the landing worker:
 
-3. **workerSign**: `HMAC-SHA256(JSON.stringify({path, worker_addr}), expire)`
-   - Binds download to specific worker address and path
-   - Prevents signature reuse across different workers
+```jsonc
+{
+  "ip_addr": "1.2.3.4",
+  "country": "US",
+  "continent": "NA",
+  "region": "California",
+  "city": "Los Angeles",
+  "asn": "12345",
+  "ver": 1
+}
+```
 
-4. **ipSign**: `HMAC-SHA256(JSON.stringify({path, ip}), expire)`
-   - Binds download to specific IP and path
-   - Prevents signature reuse across different files
+Use `CHECK_ORIGIN="asn"`, `CHECK_ORIGIN="country,iprange"`, etc. to decide which fields must match the current request. Set `CHECK_ORIGIN=""` (default) to disable origin binding globally. Specific paths can bypass the binding via the new `skip-origin` action.
 
-Signature check order: **sign → hashSign → workerSign → ipSign**
-
-Each check is independent and controlled by its corresponding CHECK flag (SIGN_CHECK, HASH_CHECK, WORKER_CHECK, IP_CHECK).
+`SIGN_CHECK`, `HASH_CHECK`, and `WORKER_CHECK` toggle the HMAC steps, while origin binding is governed exclusively by `CHECK_ORIGIN` + path actions.
 
 ## Path-based Access Control
 
@@ -110,8 +114,8 @@ Control access to specific paths using blacklist and whitelist:
 | `skip-sign` | Skip sign verification only |
 | `skip-hash` | Skip hashSign verification only |
 | `skip-worker` | Skip workerSign verification only |
-| `skip-ip` | Skip ipSign verification only |
-| `asis` | Respect SIGN_CHECK, HASH_CHECK, WORKER_CHECK, IP_CHECK settings |
+| `skip-origin` | Skip origin binding (even if `CHECK_ORIGIN` is enabled) |
+| `asis` | Respect SIGN_CHECK, HASH_CHECK, WORKER_CHECK, and `CHECK_ORIGIN` settings |
 
 ### Priority Rules
 
@@ -143,7 +147,7 @@ All exception actions must use `-except` suffix:
 | `skip-sign-except` | Skip sign check for all paths EXCEPT those matching EXCEPT_PREFIX |
 | `skip-hash-except` | Skip hashSign check for all paths EXCEPT those matching EXCEPT_PREFIX |
 | `skip-worker-except` | Skip workerSign check for all paths EXCEPT those matching EXCEPT_PREFIX |
-| `skip-ip-except` | Skip ipSign check for all paths EXCEPT those matching EXCEPT_PREFIX |
+| `skip-origin-except` | Skip origin binding for all paths EXCEPT those matching EXCEPT_PREFIX |
 | `asis-except` | Use default settings for all paths EXCEPT those matching EXCEPT_PREFIX |
 
 #### Exception List Examples
@@ -162,11 +166,11 @@ EXCEPT_ACTION=block-except
 # Result: Return 403 for all paths EXCEPT /public and /shared
 ```
 
-**Require IP verification only for sensitive paths:**
+**Require origin binding only for sensitive paths:**
 ```env
 EXCEPT_PREFIX=/admin,/private
-EXCEPT_ACTION=skip-ip-except
-# Result: All paths skip IP check EXCEPT /admin and /private
+EXCEPT_ACTION=skip-origin-except
+# Result: All paths skip origin binding EXCEPT /admin and /private
 ```
 
 ### Configuration Examples
@@ -177,10 +181,10 @@ BLACKLIST_PREFIX=/admin,/api/internal,/private
 BLACKLIST_ACTION=block
 ```
 
-**Skip IP check for public content:**
+**Skip origin binding for public content:**
 ```env
 WHITELIST_PREFIX=/public,/shared
-WHITELIST_ACTION=skip-ip
+WHITELIST_ACTION=skip-origin
 ```
 
 **Allow unsigned access to specific paths:**
@@ -197,7 +201,7 @@ BLACKLIST_ACTION=block
 
 # Allow public paths with reduced checks
 WHITELIST_PREFIX=/public
-WHITELIST_ACTION=skip-ip
+WHITELIST_ACTION=skip-origin
 ```
 
 ## Integration with alist-landing-worker
@@ -218,21 +222,21 @@ The landing worker generates:
 - `sign` - Original path signature
 - `hashSign` - Base64-encoded path signature
 - `workerSign` - JSON.stringify({path, worker_addr}) signature
-- `ipSign` - JSON.stringify({path, ip}) signature
+- `additionalInfo` / `additionalInfoSign` - HMAC-protected payload that now includes `pathHash`, `filesize`, `expireTime`, `idle_timeout`, and the AES-GCM encrypted origin snapshot (`encrypt`)
 
-All four signatures must use the same `TOKEN` and `expire` value.
+All signatures and `additionalInfoSign` must use the same `TOKEN` and `expire` value. The download worker relies on `additionalInfo.encrypt` plus `CHECK_ORIGIN` to ensure the current visitor matches the snapshot issued by the landing worker.
 
 ### URL Format
 
 Download URL generated by landing worker:
 ```
-https://proxy-worker.workers.dev/path/to/file?sign=xxx&hashSign=yyy&workerSign=www&ipSign=zzz
+https://proxy-worker.workers.dev/path/to/file?sign=xxx&hashSign=yyy&workerSign=www&additionalInfo=aaa&additionalInfoSign=bbb
 ```
 
 ## Security Best Practices
 
 1. **Use strong TOKEN**: Generate a cryptographically secure random string
-2. **Enable all checks**: Keep SIGN_CHECK, HASH_CHECK, IP_CHECK all `true` by default
+2. **Enable all checks**: Keep SIGN_CHECK, HASH_CHECK, WORKER_CHECK enabled and set `CHECK_ORIGIN` (e.g., `asn`) whenever possible
 3. **Limit whitelist scope**: Only whitelist paths that truly need reduced security
 4. **Review blacklist regularly**: Ensure sensitive paths are properly blocked
 5. **Use HTTPS only**: Never use HTTP for worker URLs
@@ -249,10 +253,10 @@ https://proxy-worker.workers.dev/path/to/file?sign=xxx&hashSign=yyy&workerSign=w
 - Check that signatures haven't expired
 - Ensure path encoding is consistent
 
-### Error: "ipSign mismatch"
-- Verify client IP hasn't changed between landing and download
-- Check that ipSign format matches: `JSON.stringify({path, ip})`
-- Ensure both workers use the same TOKEN
+### Error: "origin mismatch" / "origin decrypt failed"
+- Confirm `additionalInfo` has not been stripped or modified by intermediate services
+- Make sure landing and download workers share the same `TOKEN` so AES keys match
+- Review `CHECK_ORIGIN` value and consider adding `skip-origin` for paths where geo/IP may legitimately change
 
 ### IPv6 users can't download
 - Set `IPV4_ONLY=false` if you want to support IPv6

@@ -23,14 +23,13 @@ compatibility_date = "2024-01-01"
 # SIGN_CHECK = "true"
 # HASH_CHECK = "true"
 # WORKER_CHECK = "true"
-# IP_CHECK = "true"
 # ADDITION_CHECK = "true"             # Require additionalInfo and additionalInfoSign, validate signature/path binding
 # ADDITION_EXPIRETIME_CHECK = "true"  # Validate expireTime field (only when ADDITION_CHECK is true)
 # IPV4_ONLY = "true"
 # BLACKLIST_PREFIX = "/private,/admin"
 # BLACKLIST_ACTION = "block"
 # WHITELIST_PREFIX = "/public"
-# WHITELIST_ACTION = "skip-ip"
+# WHITELIST_ACTION = "skip-origin"
 # EXCEPT_PREFIX = "/api,/system"
 # EXCEPT_ACTION = "block-except"
 #
@@ -93,7 +92,7 @@ compatibility_date = "2024-01-01"
 # # │ skip-sign       │ Skip sign parameter verification                     │
 # # │ skip-hash       │ Skip hashSign parameter verification                 │
 # # │ skip-worker     │ Skip workerSign parameter verification               │
-# # │ skip-ip         │ Skip ipSign parameter verification                   │
+# # │ skip-origin     │ Skip origin binding verification                     │
 # # │ asis            │ Keep original behavior. Cannot combine with others   │
 # # └─────────────────┴──────────────────────────────────────────────────────┘
 # #
@@ -105,7 +104,7 @@ compatibility_date = "2024-01-01"
 # # │ skip-sign-except│ Skip sign check for paths NOT in EXCEPT_PREFIX       │
 # # │ skip-hash-except│ Skip hash check for paths NOT in EXCEPT_PREFIX       │
 # # │ skip-worker-except│ Skip worker check for paths NOT in EXCEPT_PREFIX   │
-# # │ skip-ip-except  │ Skip IP check for paths NOT in EXCEPT_PREFIX         │
+# # │ skip-origin-except│ Skip origin binding for paths NOT in EXCEPT_PREFIX │
 # # │ asis-except     │ Use original behavior for paths NOT in EXCEPT_PREFIX │
 # # └─────────────────┴──────────────────────────────────────────────────────┘
 # #
@@ -137,7 +136,7 @@ compatibility_date = "2024-01-01"
 # #   BLACKLIST_PREFIX = "/private,/admin"
 # #   BLACKLIST_ACTION = "block"
 # #   WHITELIST_PREFIX = "/public"
-# #   WHITELIST_ACTION = "skip-ip,skip-worker"
+# #   WHITELIST_ACTION = "skip-origin,skip-worker"
 # #
 # # Example 2: Only allow specific paths, block everything else
 # #   EXCEPT_PREFIX = "/allowed,/safe"
@@ -147,7 +146,7 @@ compatibility_date = "2024-01-01"
 # #
 # # Example 3: Skip IP check for all except sensitive paths
 # #   EXCEPT_PREFIX = "/sensitive,/private"
-# #   EXCEPT_ACTION = "skip-ip-except"
+# #   EXCEPT_ACTION = "skip-origin-except"
 # #   # Paths matching /sensitive or /private → IP check enabled
 # #   # All other paths → IP check skipped
 # #

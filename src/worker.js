@@ -7,11 +7,12 @@ import { unifiedCheckD1 } from './unified-check-d1.js';
 import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
 import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
+import { checkOriginMatch, decryptOriginSnapshot, getClientIp, parseCheckOriginEnv } from './origin-binding.js';
 
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
-const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-ip', 'skip-addition', 'skip-addition-expiretime', 'asis']);
-const VALID_EXCEPT_ACTIONS = new Set(['block-except', 'skip-sign-except', 'skip-hash-except', 'skip-worker-except', 'skip-ip-except', 'skip-addition-except', 'skip-addition-expiretime-except', 'asis-except']);
+const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-addition', 'skip-addition-expiretime', 'skip-origin', 'asis']);
+const VALID_EXCEPT_ACTIONS = new Set(['block-except', 'skip-sign-except', 'skip-hash-except', 'skip-worker-except', 'skip-addition-except', 'skip-addition-expiretime-except', 'skip-origin-except', 'asis-except']);
 
 let ipRateLimitDisabledLogged = false;
 
@@ -460,6 +461,8 @@ const resolveConfig = (env = {}) => {
     console.warn('[Fair Queue] Disabled: HOST_PATTERNS empty or dbMode not configured');
   }
 
+  const originCheckModes = parseCheckOriginEnv(env.CHECK_ORIGIN);
+
   return {
     address: String(env.ADDRESS).trim(),
     token: String(env.TOKEN).trim(),
@@ -470,7 +473,6 @@ const resolveConfig = (env = {}) => {
     signCheck: parseBoolean(env.SIGN_CHECK, true),
     hashCheck: parseBoolean(env.HASH_CHECK, true),
     workerCheck: parseBoolean(env.WORKER_CHECK, true),
-    ipCheck: parseBoolean(env.IP_CHECK, true),
     additionCheck: parseBoolean(env.ADDITION_CHECK, true),
     additionExpireTimeCheck: parseBoolean(env.ADDITION_EXPIRETIME_CHECK, true),
     ipv4Only: parseBoolean(env.IPV4_ONLY, true),
@@ -506,6 +508,7 @@ const resolveConfig = (env = {}) => {
     initTables,
     idleTimeout: idleTimeoutSeconds,
     lastActiveTableName,
+    originCheckModes,
     fairQueueEnabled: actualFairQueueEnabled,
     fairQueueHostnamePatterns,
     fairQueueConfig: {
@@ -917,7 +920,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return createErrorResponse(origin, 403, "access denied");
   }
 
-  const clientIP = request.headers.get("CF-Connecting-IP") || "";
+  const skipOriginByAction = actions.includes('skip-origin');
+  const needOriginCheck = !skipOriginByAction && config.originCheckModes.length > 0;
+
+  const clientIpValue = getClientIp(request);
+  const clientIP = clientIpValue || "";
 
   // CF Rate Limiter检查（第一道防线）
   if (config.enableCfRatelimiter) {
@@ -951,9 +958,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let shouldCheckSign = config.signCheck;
   let shouldCheckHash = config.hashCheck;
   let shouldCheckWorker = config.workerCheck;
-  let shouldCheckIP = config.ipCheck;
-  let shouldCheckAddition = config.additionCheck;
-  let shouldCheckAdditionExpireTime = config.additionExpireTimeCheck;
+  let shouldCheckAddition = config.additionCheck || needOriginCheck;
+  let shouldCheckAdditionExpireTime = config.additionExpireTimeCheck || needOriginCheck;
   let dynamicIdleTimeout = null;
 
   // Apply action overrides (unless 'asis' is specified)
@@ -968,13 +974,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (actions.includes('skip-worker')) {
       shouldCheckWorker = false;
     }
-    if (actions.includes('skip-ip')) {
-      shouldCheckIP = false;
-    }
-    if (actions.includes('skip-addition')) {
+    if (actions.includes('skip-addition') && !needOriginCheck) {
       shouldCheckAddition = false;
     }
-    if (actions.includes('skip-addition-expiretime')) {
+    if (actions.includes('skip-addition-expiretime') && !needOriginCheck) {
       shouldCheckAdditionExpireTime = false;
     }
   }
@@ -1008,25 +1011,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  // IpSign verification
-  const ipSign = url.searchParams.get("ipSign") ?? "";
-  if (shouldCheckIP) {
-    if (!ipSign) {
-      return createUnauthorizedResponse(origin, "ipSign missing");
-    }
-    if (!clientIP) {
-      return createUnauthorizedResponse(origin, "client ip missing");
-    }
-    const ipRange = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix) || clientIP || "";
-    const ipVerifyData = JSON.stringify({ path: path, ip: ipRange });
-    const ipVerifyResult = await verify("ipSign", ipVerifyData, ipSign, config.token);
-    if (ipVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, ipVerifyResult);
-    }
-  }
-
   const additionalInfo = url.searchParams.get("additionalInfo") ?? "";
   const additionalInfoSign = url.searchParams.get("additionalInfoSign") ?? "";
+  let additionalPayload = null;
   if (shouldCheckAddition) {
     if (!additionalInfo) {
       return createUnauthorizedResponse(origin, "additionalInfo missing");
@@ -1045,7 +1032,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return createUnauthorizedResponse(origin, "additionalInfo decode failed");
     }
 
-    let additionalPayload;
     try {
       additionalPayload = JSON.parse(decodedAdditional);
     } catch (_error) {
@@ -1083,6 +1069,38 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       if (nowSeconds > expireTimestamp) {
         return createUnauthorizedResponse(origin, "link expired");
       }
+    }
+  }
+
+  if (needOriginCheck) {
+    if (!additionalPayload || typeof additionalPayload !== 'object') {
+      return createUnauthorizedResponse(origin, "origin payload missing");
+    }
+    const encryptedSnapshot = typeof additionalPayload.encrypt === 'string' ? additionalPayload.encrypt : '';
+    if (!encryptedSnapshot) {
+      return createUnauthorizedResponse(origin, "origin encrypt missing");
+    }
+    const snapshot = await decryptOriginSnapshot(encryptedSnapshot, config.token);
+    if (!snapshot) {
+      console.warn('[Origin Binding] Failed to decrypt snapshot');
+      return createUnauthorizedResponse(origin, "origin decrypt failed");
+    }
+    const cf = request.cf || {};
+    const currentOrigin = {
+      ip_addr: clientIpValue || null,
+      country: cf.country,
+      continent: cf.continent,
+      region: cf.region,
+      city: cf.city,
+      asn: typeof cf.asn === 'undefined' || cf.asn === null ? undefined : String(cf.asn),
+    };
+    const originResult = checkOriginMatch(snapshot, currentOrigin, config.originCheckModes, {
+      ipv4Suffix: config.ipv4Suffix,
+      ipv6Suffix: config.ipv6Suffix,
+    });
+    if (!originResult.ok) {
+      console.warn('[Origin Binding] Mismatch:', originResult.failedFields);
+      return createUnauthorizedResponse(origin, "origin mismatch");
     }
   }
 
@@ -1815,7 +1833,7 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
   const origin = request.headers.get("origin") ?? "*";
   // Check for IPv6 access if IPv4_ONLY is enabled
   if (config.ipv4Only) {
-    const clientIP = request.headers.get("CF-Connecting-IP") || "";
+    const clientIP = getClientIp(request) || "";
     if (isIPv6(clientIP)) {
       const safeHeaders = new Headers();
       safeHeaders.set("content-type", "application/json;charset=UTF-8");
