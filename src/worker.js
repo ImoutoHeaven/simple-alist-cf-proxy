@@ -901,12 +901,27 @@ function safeDecodePathname(pathname) {
     return null;
   }
 }
+
+// Normalizes the request path the same way Landing uses it for hashing.
+function normalizePath(pathname) {
+  if (typeof pathname !== 'string') {
+    return null;
+  }
+  const decoded = safeDecodePathname(pathname);
+  if (decoded === null) {
+    return null;
+  }
+  if (decoded.length === 0) {
+    return '/';
+  }
+  return decoded.startsWith('/') ? decoded : `/${decoded}`;
+}
 // src/handleDownload.ts
 async function handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
   const origin = request.headers.get("origin") ?? "*";
   const url = new URL(request.url);
-  const requestedPath = safeDecodePathname(url.pathname);
-  let path = requestedPath;
+  const normalizedPath = normalizePath(url.pathname);
+  let path = normalizedPath;
 
   if (path === null || typeof path !== "string") {
     return createErrorResponse(origin, 400, "invalid path encoding");
@@ -1048,8 +1063,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       }
     }
 
-    const expectedPathHash = await sha256Hex(path);
-    if (typeof additionalPayload.pathHash !== "string" || additionalPayload.pathHash !== expectedPathHash) {
+    const normalizedPathForHash = normalizedPath ?? normalizePath(url.pathname);
+    if (typeof normalizedPathForHash !== "string" || normalizedPathForHash.length === 0) {
+      return createErrorResponse(origin, 400, "invalid path encoding");
+    }
+    const currentPathHash = await sha256Hex(normalizedPathForHash);
+    if (typeof additionalPayload.pathHash !== "string" || additionalPayload.pathHash !== currentPathHash) {
       return createUnauthorizedResponse(origin, "additionalInfo path mismatch");
     }
 
