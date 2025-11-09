@@ -271,21 +271,31 @@ BEGIN
      VALUES ($1, $2, 1, $3, NULL)
      ON CONFLICT ("IP_HASH") DO UPDATE SET
        "ACCESS_COUNT" = CASE
+         WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" > $3 THEN %1$I."ACCESS_COUNT"
          WHEN $3 - %1$I."LAST_WINDOW_TIME" >= $4 THEN 1
          WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" <= $3 THEN 1
          WHEN %1$I."ACCESS_COUNT" >= $5 THEN %1$I."ACCESS_COUNT"
          ELSE %1$I."ACCESS_COUNT" + 1
        END,
        "LAST_WINDOW_TIME" = CASE
+         WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" > $3 THEN %1$I."LAST_WINDOW_TIME"
          WHEN $3 - %1$I."LAST_WINDOW_TIME" >= $4 THEN $3
          WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" <= $3 THEN $3
          ELSE %1$I."LAST_WINDOW_TIME"
        END,
        "BLOCK_UNTIL" = CASE
-         WHEN $3 - %1$I."LAST_WINDOW_TIME" >= $4 THEN NULL
-         WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" <= $3 THEN NULL
          WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" > $3 THEN %1$I."BLOCK_UNTIL"
-         WHEN (%1$I."BLOCK_UNTIL" IS NULL OR %1$I."BLOCK_UNTIL" <= $3) AND %1$I."ACCESS_COUNT" >= $5 AND $6 > 0 THEN $3 + $6
+         WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" <= $3 THEN NULL
+         WHEN (%1$I."BLOCK_UNTIL" IS NULL OR %1$I."BLOCK_UNTIL" <= $3)
+              AND (
+                CASE
+                  WHEN $3 - %1$I."LAST_WINDOW_TIME" >= $4 THEN 1
+                  WHEN %1$I."BLOCK_UNTIL" IS NOT NULL AND %1$I."BLOCK_UNTIL" <= $3 THEN 1
+                  WHEN %1$I."ACCESS_COUNT" >= $5 THEN %1$I."ACCESS_COUNT"
+                  ELSE %1$I."ACCESS_COUNT" + 1
+                END
+              ) >= $5
+              AND $6 > 0 THEN $3 + $6
          ELSE %1$I."BLOCK_UNTIL"
        END
      RETURNING "ACCESS_COUNT", "LAST_WINDOW_TIME", "BLOCK_UNTIL"',

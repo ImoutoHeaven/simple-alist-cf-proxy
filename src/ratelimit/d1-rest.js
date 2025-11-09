@@ -107,21 +107,31 @@ export const checkRateLimit = async (ip, config) => {
       VALUES (?, ?, 1, ?, NULL)
       ON CONFLICT (IP_HASH) DO UPDATE SET
         ACCESS_COUNT = CASE
+          WHEN ${tableName}.BLOCK_UNTIL IS NOT NULL AND ${tableName}.BLOCK_UNTIL > ? THEN ${tableName}.ACCESS_COUNT
           WHEN ? - ${tableName}.LAST_WINDOW_TIME >= ? THEN 1
           WHEN ${tableName}.BLOCK_UNTIL IS NOT NULL AND ${tableName}.BLOCK_UNTIL <= ? THEN 1
           WHEN ${tableName}.ACCESS_COUNT >= ? THEN ${tableName}.ACCESS_COUNT
           ELSE ${tableName}.ACCESS_COUNT + 1
         END,
         LAST_WINDOW_TIME = CASE
+          WHEN ${tableName}.BLOCK_UNTIL IS NOT NULL AND ${tableName}.BLOCK_UNTIL > ? THEN ${tableName}.LAST_WINDOW_TIME
           WHEN ? - ${tableName}.LAST_WINDOW_TIME >= ? THEN ?
           WHEN ${tableName}.BLOCK_UNTIL IS NOT NULL AND ${tableName}.BLOCK_UNTIL <= ? THEN ?
           ELSE ${tableName}.LAST_WINDOW_TIME
         END,
         BLOCK_UNTIL = CASE
-          WHEN ? - ${tableName}.LAST_WINDOW_TIME >= ? THEN NULL
-          WHEN ${tableName}.BLOCK_UNTIL IS NOT NULL AND ${tableName}.BLOCK_UNTIL <= ? THEN NULL
           WHEN ${tableName}.BLOCK_UNTIL IS NOT NULL AND ${tableName}.BLOCK_UNTIL > ? THEN ${tableName}.BLOCK_UNTIL
-          WHEN (${tableName}.BLOCK_UNTIL IS NULL OR ${tableName}.BLOCK_UNTIL <= ?) AND ${tableName}.ACCESS_COUNT >= ? AND ? > 0 THEN ? + ?
+          WHEN ${tableName}.BLOCK_UNTIL IS NOT NULL AND ${tableName}.BLOCK_UNTIL <= ? THEN NULL
+          WHEN (${tableName}.BLOCK_UNTIL IS NULL OR ${tableName}.BLOCK_UNTIL <= ?)
+            AND (
+              CASE
+                WHEN ? - ${tableName}.LAST_WINDOW_TIME >= ? THEN 1
+                WHEN ${tableName}.BLOCK_UNTIL IS NOT NULL AND ${tableName}.BLOCK_UNTIL <= ? THEN 1
+                WHEN ${tableName}.ACCESS_COUNT >= ? THEN ${tableName}.ACCESS_COUNT
+                ELSE ${tableName}.ACCESS_COUNT + 1
+              END
+            ) >= ?
+            AND ? > 0 THEN ? + ?
           ELSE ${tableName}.BLOCK_UNTIL
         END
       RETURNING ACCESS_COUNT, LAST_WINDOW_TIME, BLOCK_UNTIL
@@ -129,9 +139,10 @@ export const checkRateLimit = async (ip, config) => {
 
     const upsertParams = [
       ipHash, ipSubnet, now,
-      now, config.windowTimeSeconds, now, config.limit,
-      now, config.windowTimeSeconds, now, now, now,
-      now, config.windowTimeSeconds, now, now, now, config.limit, blockTimeSeconds, now, blockTimeSeconds,
+      now, now, config.windowTimeSeconds, now, config.limit,
+      now, now, config.windowTimeSeconds, now, now, now,
+      now, now, now,
+      now, config.windowTimeSeconds, now, config.limit, config.limit, blockTimeSeconds, now, blockTimeSeconds,
     ];
 
     const queryResult = await executeQuery(accountId, databaseId, apiToken, upsertSql, upsertParams);

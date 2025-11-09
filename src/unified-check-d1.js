@@ -168,21 +168,31 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
     VALUES (?, ?, 1, ?, NULL)
     ON CONFLICT (IP_HASH) DO UPDATE SET
       ACCESS_COUNT = CASE
+        WHEN ${rateLimitTableName}.BLOCK_UNTIL IS NOT NULL AND ${rateLimitTableName}.BLOCK_UNTIL > ? THEN ${rateLimitTableName}.ACCESS_COUNT
         WHEN ? - ${rateLimitTableName}.LAST_WINDOW_TIME >= ? THEN 1
         WHEN ${rateLimitTableName}.BLOCK_UNTIL IS NOT NULL AND ${rateLimitTableName}.BLOCK_UNTIL <= ? THEN 1
         WHEN ${rateLimitTableName}.ACCESS_COUNT >= ? THEN ${rateLimitTableName}.ACCESS_COUNT
         ELSE ${rateLimitTableName}.ACCESS_COUNT + 1
       END,
       LAST_WINDOW_TIME = CASE
+        WHEN ${rateLimitTableName}.BLOCK_UNTIL IS NOT NULL AND ${rateLimitTableName}.BLOCK_UNTIL > ? THEN ${rateLimitTableName}.LAST_WINDOW_TIME
         WHEN ? - ${rateLimitTableName}.LAST_WINDOW_TIME >= ? THEN ?
         WHEN ${rateLimitTableName}.BLOCK_UNTIL IS NOT NULL AND ${rateLimitTableName}.BLOCK_UNTIL <= ? THEN ?
         ELSE ${rateLimitTableName}.LAST_WINDOW_TIME
       END,
       BLOCK_UNTIL = CASE
-        WHEN ? - ${rateLimitTableName}.LAST_WINDOW_TIME >= ? THEN NULL
-        WHEN ${rateLimitTableName}.BLOCK_UNTIL IS NOT NULL AND ${rateLimitTableName}.BLOCK_UNTIL <= ? THEN NULL
         WHEN ${rateLimitTableName}.BLOCK_UNTIL IS NOT NULL AND ${rateLimitTableName}.BLOCK_UNTIL > ? THEN ${rateLimitTableName}.BLOCK_UNTIL
-        WHEN (${rateLimitTableName}.BLOCK_UNTIL IS NULL OR ${rateLimitTableName}.BLOCK_UNTIL <= ?) AND ${rateLimitTableName}.ACCESS_COUNT >= ? AND ? > 0 THEN ? + ?
+        WHEN ${rateLimitTableName}.BLOCK_UNTIL IS NOT NULL AND ${rateLimitTableName}.BLOCK_UNTIL <= ? THEN NULL
+        WHEN (${rateLimitTableName}.BLOCK_UNTIL IS NULL OR ${rateLimitTableName}.BLOCK_UNTIL <= ?)
+             AND (
+               CASE
+                 WHEN ? - ${rateLimitTableName}.LAST_WINDOW_TIME >= ? THEN 1
+                 WHEN ${rateLimitTableName}.BLOCK_UNTIL IS NOT NULL AND ${rateLimitTableName}.BLOCK_UNTIL <= ? THEN 1
+                 WHEN ${rateLimitTableName}.ACCESS_COUNT >= ? THEN ${rateLimitTableName}.ACCESS_COUNT
+                 ELSE ${rateLimitTableName}.ACCESS_COUNT + 1
+               END
+             ) >= ?
+             AND ? > 0 THEN ? + ?
         ELSE ${rateLimitTableName}.BLOCK_UNTIL
       END
     RETURNING ACCESS_COUNT, LAST_WINDOW_TIME, BLOCK_UNTIL
@@ -191,9 +201,10 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   const createRateLimitStatement = () =>
     db.prepare(rateLimitSql).bind(
       ipHash, ipSubnet, now,
-      now, windowSeconds, now, limit,
-      now, windowSeconds, now, now, now,
-      now, windowSeconds, now, now, now, limit, blockSeconds, now, blockSeconds
+      now, now, windowSeconds, now, limit,
+      now, now, windowSeconds, now, now, now,
+      now, now, now,
+      now, windowSeconds, now, limit, limit, blockSeconds, now, blockSeconds
     );
 
   const parseRateLimitResult = (rateLimitRow) => {
