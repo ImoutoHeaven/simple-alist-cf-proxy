@@ -517,8 +517,27 @@ export async function scheduleAllCleanups(config, env, ctx) {
           fairQueueModule = await import('./unified-check-d1-rest.js');
         }
 
-        if (fairQueueModule && typeof fairQueueModule.cleanupZombieSlots === 'function') {
-          await fairQueueModule.cleanupZombieSlots(config.fairQueueConfig);
+        if (fairQueueModule) {
+          const fairQueueCleanupTasks = [];
+
+          if (typeof fairQueueModule.cleanupZombieSlots === 'function') {
+            fairQueueCleanupTasks.push(
+              fairQueueModule.cleanupZombieSlots(config.fairQueueConfig)
+            );
+          }
+
+          if (
+            config.fairQueueConfig?.ipCooldownEnabled &&
+            typeof fairQueueModule.cleanupIpCooldown === 'function'
+          ) {
+            fairQueueCleanupTasks.push(
+              fairQueueModule.cleanupIpCooldown(config.fairQueueConfig)
+            );
+          }
+
+          if (fairQueueCleanupTasks.length > 0) {
+            await Promise.all(fairQueueCleanupTasks);
+          }
         }
       })().catch((error) => {
         const message = error instanceof Error ? error.message : String(error);

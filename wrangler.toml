@@ -513,6 +513,9 @@ compatibility_date = "2024-01-01"
 #                                                # Default: upstream_slot_pool
 #                                                # Only change if table name conflicts exist
 #
+# FAIR_QUEUE_IP_COOLDOWN_SECONDS = "3"  # Cooldown before same IP can re-acquire slot
+#                                       # Default: 3 seconds (set to 0 to disable cooldown logic)
+#
 # Error Responses:
 # ┌─────────────────────────┬──────────┬─────────────┬───────────────────────────────┐
 # │ Condition               │ Status   │ Retry-After │ Meaning                       │

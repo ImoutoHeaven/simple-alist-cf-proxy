@@ -88,6 +88,7 @@ const ensureAllTables = async (
     throttleTableName,
     lastActiveTableName,
     fairQueueTableName = 'upstream_slot_pool',
+    fairQueueCooldownTableName = 'upstream_ip_cooldown',
   }
 ) => {
   const activeTableName = lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
@@ -165,6 +166,19 @@ const ensureAllTables = async (
       sql: `CREATE INDEX IF NOT EXISTS idx_fair_queue_host_status
             ON ${fairQueueTableName} (hostname_pattern, status)`,
       params: [],
+    },
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${fairQueueCooldownTableName} (
+        hostname_pattern TEXT NOT NULL,
+        ip_hash TEXT NOT NULL,
+        last_release_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (hostname_pattern, ip_hash)
+      )`,
+    },
+    {
+      sql: `CREATE INDEX IF NOT EXISTS idx_ip_cooldown_ts
+            ON ${fairQueueCooldownTableName} (last_release_at)`,
     },
   ];
 
@@ -531,8 +545,30 @@ const ensureSlotPoolRest = async (
   apiToken,
   hostname,
   globalLimit,
-  tableName
+  tableName,
+  cooldownTableName = 'upstream_ip_cooldown'
 ) => {
+  await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `CREATE TABLE IF NOT EXISTS ${cooldownTableName} (
+      hostname_pattern TEXT NOT NULL,
+      ip_hash TEXT NOT NULL,
+      last_release_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (hostname_pattern, ip_hash)
+    )`
+  );
+
+  await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `CREATE INDEX IF NOT EXISTS idx_ip_cooldown_ts
+     ON ${cooldownTableName} (last_release_at)`
+  );
+
   const countResult = await executeQuery(
     accountId,
     databaseId,
@@ -570,7 +606,10 @@ const tryAcquireFairSlotOnceRest = async (
   config
 ) => {
   const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+  const cooldownTableName = config.fairQueueCooldownTableName || 'upstream_ip_cooldown';
   const zombieCutoff = `-${config.zombieTimeoutSeconds} seconds`;
+  const cooldownSeconds =
+    config && config.ipCooldownEnabled ? Math.max(0, config.ipCooldownSeconds || 0) : 0;
 
   try {
     const ipCountRow = (
@@ -590,6 +629,29 @@ const tryAcquireFairSlotOnceRest = async (
 
     if (ipCount >= config.perIpLimit) {
       return 0;
+    }
+
+    if (
+      cooldownSeconds > 0 &&
+      ipCount > 0 &&
+      ipCount < config.perIpLimit &&
+      ipHash
+    ) {
+      const cooldownResult = await executeQuery(
+        accountId,
+        databaseId,
+        apiToken,
+        `SELECT 1 AS active FROM ${cooldownTableName}
+         WHERE hostname_pattern = ?
+           AND ip_hash = ?
+           AND last_release_at > datetime('now', ?)`,
+        [hostname, ipHash, `-${cooldownSeconds} seconds`]
+      );
+
+      const cooldownRow = cooldownResult.results?.[0] || null;
+      if (cooldownRow) {
+        return 0;
+      }
     }
 
     const candidate = await executeQuery(
@@ -655,8 +717,17 @@ const tryAcquireFairSlot = async (hostname, ipHash, config) => {
 
   const { accountId, databaseId, apiToken } = config;
   const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+  const cooldownTableName = config.fairQueueCooldownTableName || 'upstream_ip_cooldown';
 
-  await ensureSlotPoolRest(accountId, databaseId, apiToken, hostname, config.globalLimit, tableName);
+  await ensureSlotPoolRest(
+    accountId,
+    databaseId,
+    apiToken,
+    hostname,
+    config.globalLimit,
+    tableName,
+    cooldownTableName
+  );
 
   return tryAcquireFairSlotOnceRest(
     accountId,
@@ -675,6 +746,36 @@ const releaseFairSlot = async (slotId, config) => {
 
   const { accountId, databaseId, apiToken } = config;
   const tableName = config.fairQueueTableName || 'upstream_slot_pool';
+  const cooldownTableName = config.fairQueueCooldownTableName || 'upstream_ip_cooldown';
+
+  const slotRowResult = await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `SELECT hostname_pattern, ip_hash FROM ${tableName} WHERE id = ?`,
+    [slotId]
+  );
+
+  const slotRow = slotRowResult.results?.[0] || null;
+  if (!slotRow) {
+    return;
+  }
+
+  const slotHostname = slotRow.hostname_pattern ?? slotRow.HOSTNAME_PATTERN ?? null;
+  const slotIpHash = slotRow.ip_hash ?? slotRow.IP_HASH ?? null;
+
+  if (config.ipCooldownEnabled && slotHostname && slotIpHash) {
+    await executeQuery(
+      accountId,
+      databaseId,
+      apiToken,
+      `INSERT INTO ${cooldownTableName} (hostname_pattern, ip_hash, last_release_at, created_at)
+       VALUES (?, ?, datetime('now'), datetime('now'))
+       ON CONFLICT(hostname_pattern, ip_hash)
+       DO UPDATE SET last_release_at = excluded.last_release_at`,
+      [slotHostname, slotIpHash]
+    );
+  }
 
   await executeQuery(
     accountId,
@@ -716,10 +817,47 @@ const cleanupZombieSlots = async (config) => {
   return recovered;
 };
 
+const cleanupIpCooldown = async (config) => {
+  if (!config?.accountId || !config.databaseId || !config.apiToken) {
+    throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration');
+  }
+
+  if (!config?.ipCooldownEnabled) {
+    return 0;
+  }
+
+  const ttlSeconds = Number.isFinite(config?.ipCooldownCleanupTtlSeconds)
+    ? config.ipCooldownCleanupTtlSeconds
+    : Math.max((config?.ipCooldownSeconds || 0) * 10, 60);
+
+  if (ttlSeconds <= 0) {
+    return 0;
+  }
+
+  const { accountId, databaseId, apiToken } = config;
+  const tableName = config.fairQueueCooldownTableName || 'upstream_ip_cooldown';
+
+  const result = await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `DELETE FROM ${tableName}
+     WHERE last_release_at < datetime('now', ?)`,
+    [`-${ttlSeconds} seconds`]
+  );
+
+  const deleted = result.meta?.changes ?? 0;
+  if (deleted > 0) {
+    console.log(`[Fair Queue D1-REST] Cleaned up ${deleted} cooldown records`);
+  }
+  return deleted;
+};
+
 export {
   ensureAllTables,
   updateLastActive,
   tryAcquireFairSlot,
   releaseFairSlot,
   cleanupZombieSlots,
+  cleanupIpCooldown,
 };

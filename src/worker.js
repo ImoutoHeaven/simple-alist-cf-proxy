@@ -432,6 +432,12 @@ const resolveConfig = (env = {}) => {
 
   const fairQueueGlobalLimit = parseInteger(env.FAIR_QUEUE_GLOBAL_LIMIT, 5);
   const fairQueuePerIpLimit = parseInteger(env.FAIR_QUEUE_PER_IP_LIMIT, 1);
+  const fairQueueIpCooldownSecondsRaw = parseInteger(env.FAIR_QUEUE_IP_COOLDOWN_SECONDS, 3);
+  const fairQueueIpCooldownSeconds = Math.max(0, fairQueueIpCooldownSecondsRaw);
+  const fairQueueIpCooldownEnabled = fairQueueIpCooldownSeconds > 0;
+  const fairQueueIpCooldownCleanupTtlSeconds = fairQueueIpCooldownEnabled
+    ? Math.max(fairQueueIpCooldownSeconds * 10, 60)
+    : 0;
   const fairQueueWaitTimeoutMs = parseIntegerStrict(
     env.FAIR_QUEUE_WAIT_TIMEOUT_MS,
     15000,
@@ -524,6 +530,9 @@ const resolveConfig = (env = {}) => {
       perIpLimit: fairQueuePerIpLimit,
       queueWaitTimeoutMs: fairQueueWaitTimeoutMs,
       zombieTimeoutSeconds: fairQueueZombieTimeoutSeconds,
+      ipCooldownSeconds: fairQueueIpCooldownEnabled ? fairQueueIpCooldownSeconds : 0,
+      ipCooldownEnabled: fairQueueIpCooldownEnabled,
+      ipCooldownCleanupTtlSeconds: fairQueueIpCooldownCleanupTtlSeconds,
       pollIntervalMs: fairQueuePollIntervalMs,
       fairQueueTableName,
     },

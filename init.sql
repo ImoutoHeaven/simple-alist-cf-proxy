@@ -518,6 +518,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_upstream_slot_pool_unique
 CREATE INDEX IF NOT EXISTS idx_upstream_slot_pool_host_status
   ON "upstream_slot_pool" ("hostname_pattern", "status");
 
+-- Tracks per-IP slot release timestamps to enforce cooldowns
+CREATE TABLE IF NOT EXISTS "upstream_ip_cooldown" (
+  "hostname_pattern" TEXT NOT NULL,
+  "ip_hash" TEXT NOT NULL,
+  "last_release_at" TIMESTAMP WITH TIME ZONE NOT NULL,
+  "created_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  PRIMARY KEY ("hostname_pattern", "ip_hash")
+);
+
+CREATE INDEX IF NOT EXISTS idx_upstream_ip_cooldown_ts
+  ON "upstream_ip_cooldown" ("last_release_at");
+
 -- Try Acquire Fair Slot RPC (single attempt, non-blocking)
 -- Returns:
 --   > 0  → slot id acquired
@@ -528,15 +540,22 @@ CREATE OR REPLACE FUNCTION func_try_acquire_slot(
   p_ip_hash                    TEXT,
   p_global_limit               INT,
   p_per_ip_limit               INT,
-  p_zombie_timeout_seconds     INT
+  p_zombie_timeout_seconds     INT,
+  p_cooldown_seconds           INT
 )
 RETURNS INT
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  v_zombie_timeout   INTERVAL := (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL;
-  v_slot_id          INT;
-  v_current_ip_slots INT;
+  v_now               TIMESTAMP WITH TIME ZONE := clock_timestamp();
+  v_zombie_timeout    INTERVAL := (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL;
+  v_cooldown_interval INTERVAL := CASE
+    WHEN p_cooldown_seconds > 0 THEN (p_cooldown_seconds::TEXT || ' seconds')::INTERVAL
+    ELSE NULL
+  END;
+  v_slot_id           INT;
+  v_current_ip_slots  INT;
+  v_last_release_at   TIMESTAMP WITH TIME ZONE;
 BEGIN
   -- 确保当前 hostname_pattern 下有 1..p_global_limit 的槽位
   INSERT INTO "upstream_slot_pool" ("hostname_pattern", "slot_index", "status")
@@ -551,13 +570,30 @@ BEGIN
     AND "status" = 'locked'
     AND "ip_hash" = p_ip_hash
     AND "locked_at" IS NOT NULL
-    AND "locked_at" >= (clock_timestamp() - v_zombie_timeout);
+    AND "locked_at" >= (v_now - v_zombie_timeout);
 
   IF v_current_ip_slots >= p_per_ip_limit THEN
     RETURN 0;
   END IF;
 
-  -- 2) 抢占可用或僵尸槽位（单次尝试）
+  -- 2) 冷却判断：只针对仍有空位的 IP 且启用了冷却
+  IF v_cooldown_interval IS NOT NULL
+     AND p_ip_hash IS NOT NULL
+     AND v_current_ip_slots > 0
+     AND v_current_ip_slots < p_per_ip_limit THEN
+    SELECT "last_release_at"
+      INTO v_last_release_at
+    FROM "upstream_ip_cooldown"
+    WHERE "hostname_pattern" = p_hostname_pattern
+      AND "ip_hash" = p_ip_hash;
+
+    IF v_last_release_at IS NOT NULL
+       AND v_last_release_at > (v_now - v_cooldown_interval) THEN
+      RETURN 0;
+    END IF;
+  END IF;
+
+  -- 3) 抢占可用或僵尸槽位（单次尝试）
   SELECT "id" INTO v_slot_id
   FROM "upstream_slot_pool"
   WHERE "hostname_pattern" = p_hostname_pattern
@@ -567,7 +603,7 @@ BEGIN
       OR (
         "status" = 'locked'
         AND "locked_at" IS NOT NULL
-        AND "locked_at" < (clock_timestamp() - v_zombie_timeout)
+        AND "locked_at" < (v_now - v_zombie_timeout)
       )
     )
   ORDER BY "slot_index"
@@ -578,7 +614,7 @@ BEGIN
     UPDATE "upstream_slot_pool"
     SET "status" = 'locked',
         "ip_hash" = p_ip_hash,
-        "locked_at" = clock_timestamp()
+        "locked_at" = v_now
     WHERE "id" = v_slot_id;
 
     RETURN v_slot_id;
@@ -592,12 +628,35 @@ $$;
 -- Release Fair Slot RPC
 -- ========================================
 CREATE OR REPLACE FUNCTION func_release_fair_slot(
-  p_slot_id INT
+  p_slot_id INT,
+  p_enable_cooldown BOOLEAN DEFAULT TRUE
 )
 RETURNS VOID
 LANGUAGE plpgsql
 AS $$
+DECLARE
+  v_hostname_pattern TEXT;
+  v_ip_hash          TEXT;
 BEGIN
+  SELECT "hostname_pattern", "ip_hash"
+    INTO v_hostname_pattern, v_ip_hash
+  FROM "upstream_slot_pool"
+  WHERE "id" = p_slot_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF p_enable_cooldown
+     AND v_ip_hash IS NOT NULL THEN
+    INSERT INTO "upstream_ip_cooldown" ("hostname_pattern", "ip_hash", "last_release_at")
+    VALUES (v_hostname_pattern, v_ip_hash, clock_timestamp())
+    ON CONFLICT ("hostname_pattern", "ip_hash")
+    DO UPDATE SET
+      "last_release_at" = EXCLUDED."last_release_at";
+  END IF;
+
   UPDATE "upstream_slot_pool"
   SET "status" = 'available',
       "ip_hash" = NULL,
@@ -630,5 +689,32 @@ BEGIN
 
   GET DIAGNOSTICS recovered_count = ROW_COUNT;
   RETURN recovered_count;
+END;
+$$;
+
+-- ========================================
+-- Cleanup IP Cooldown Records RPC
+-- ========================================
+CREATE OR REPLACE FUNCTION func_cleanup_ip_cooldown(
+  p_ttl_seconds INT
+)
+RETURNS INTEGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_cutoff  TIMESTAMP WITH TIME ZONE;
+  v_deleted INTEGER;
+BEGIN
+  IF p_ttl_seconds <= 0 THEN
+    RETURN 0;
+  END IF;
+
+  v_cutoff := clock_timestamp() - (p_ttl_seconds::TEXT || ' seconds')::INTERVAL;
+
+  DELETE FROM "upstream_ip_cooldown"
+  WHERE "last_release_at" < v_cutoff;
+
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
 END;
 $$;

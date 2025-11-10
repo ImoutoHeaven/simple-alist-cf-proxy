@@ -62,6 +62,7 @@ const tryAcquireFairSlot = async (hostname, ipHash, config) => {
     p_global_limit: config.globalLimit,
     p_per_ip_limit: config.perIpLimit,
     p_zombie_timeout_seconds: config.zombieTimeoutSeconds,
+    p_cooldown_seconds: config.ipCooldownEnabled ? config.ipCooldownSeconds : 0,
   };
 
   const response = await fetch(`${config.postgrestUrl}/rpc/func_try_acquire_slot`, {
@@ -93,7 +94,10 @@ const releaseFairSlot = async (slotId, config) => {
   const response = await fetch(`${config.postgrestUrl}/rpc/func_release_fair_slot`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ p_slot_id: slotId }),
+    body: JSON.stringify({
+      p_slot_id: slotId,
+      p_enable_cooldown: Boolean(config.ipCooldownEnabled),
+    }),
   });
 
   if (!response.ok) {
@@ -127,4 +131,44 @@ const cleanupZombieSlots = async (config) => {
   return deleted;
 };
 
-export { tryAcquireFairSlot, releaseFairSlot, cleanupZombieSlots };
+
+const cleanupIpCooldown = async (config) => {
+  if (!config?.postgrestUrl) {
+    throw new Error('[Fair Queue PG] Missing PostgREST URL');
+  }
+
+  if (!config?.ipCooldownEnabled) {
+    return 0;
+  }
+
+  const ttlSeconds = Number.isFinite(config.ipCooldownCleanupTtlSeconds)
+    ? config.ipCooldownCleanupTtlSeconds
+    : Math.max((config.ipCooldownSeconds || 0) * 10, 60);
+
+  if (ttlSeconds <= 0) {
+    return 0;
+  }
+
+  const headers = buildHeaders(config.verifyHeader, config.verifySecret);
+
+  const response = await fetch(`${config.postgrestUrl}/rpc/func_cleanup_ip_cooldown`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ p_ttl_seconds: ttlSeconds }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`PostgREST cooldown cleanup RPC failed: ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const deleted = typeof payload === 'number' ? payload : Number(payload);
+  if (Number.isFinite(deleted) && deleted > 0) {
+    console.log(`[Fair Queue PG] Cleaned up ${deleted} cooldown records`);
+    return deleted;
+  }
+
+  return 0;
+};
+
+export { tryAcquireFairSlot, releaseFairSlot, cleanupZombieSlots, cleanupIpCooldown };
