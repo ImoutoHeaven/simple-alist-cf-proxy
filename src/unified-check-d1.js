@@ -18,6 +18,7 @@ const ensureAllTables = async (
     lastActiveTableName,
     fairQueueTableName = 'upstream_slot_pool',
     fairQueueCooldownTableName = 'upstream_ip_cooldown',
+    fairQueueQueueDepthTableName = 'upstream_ip_queue_depth',
   }
 ) => {
   const activeTableName = lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
@@ -97,6 +98,19 @@ const ensureAllTables = async (
     db.prepare(`
       CREATE INDEX IF NOT EXISTS idx_ip_cooldown_ts
         ON ${fairQueueCooldownTableName} (last_release_at)
+    `),
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ${fairQueueQueueDepthTableName} (
+        hostname_pattern TEXT NOT NULL,
+        ip_hash TEXT NOT NULL,
+        waiting_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (hostname_pattern, ip_hash)
+      )
+    `),
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_ip_queue_depth_ts
+        ON ${fairQueueQueueDepthTableName} (updated_at)
     `)
   );
 
@@ -514,6 +528,27 @@ const ensureSlotPool = async (
   }
 };
 
+const ensureQueueDepthTable = async (db, tableName = 'upstream_ip_queue_depth') => {
+  await db
+    .prepare(`
+      CREATE TABLE IF NOT EXISTS ${tableName} (
+        hostname_pattern TEXT NOT NULL,
+        ip_hash TEXT NOT NULL,
+        waiting_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (hostname_pattern, ip_hash)
+      )
+    `)
+    .run();
+
+  await db
+    .prepare(`
+      CREATE INDEX IF NOT EXISTS idx_ip_queue_depth_ts
+        ON ${tableName} (updated_at)
+    `)
+    .run();
+};
+
 const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
   const tableName = config.fairQueueTableName || 'upstream_slot_pool';
   const cooldownTableName = config.fairQueueCooldownTableName || 'upstream_ip_cooldown';
@@ -747,6 +782,137 @@ const cleanupIpCooldown = async (config) => {
   return deleted;
 };
 
+const queueDepthEnforced = (config) =>
+  Number.isFinite(config?.maxWaitersPerIp) && config.maxWaitersPerIp > 0;
+
+const tryRegisterQueueWaiter = async (hostname, ipHash, config) => {
+  if (!config?.env || !config.databaseBinding) {
+    throw new Error('[Fair Queue D1] Missing D1 configuration');
+  }
+
+  if (!queueDepthEnforced(config) || !ipHash) {
+    return true;
+  }
+
+  const db = config.env[config.databaseBinding];
+  if (!db) {
+    throw new Error(`[Fair Queue D1] D1 binding '${config.databaseBinding}' not found`);
+  }
+
+  const tableName = config.fairQueueQueueDepthTableName || 'upstream_ip_queue_depth';
+  await ensureQueueDepthTable(db, tableName);
+
+  const attemptUpdate = async () => {
+    const result = await db
+      .prepare(
+        `UPDATE ${tableName}
+         SET waiting_count = waiting_count + 1,
+             updated_at = datetime('now')
+         WHERE hostname_pattern = ?
+           AND ip_hash = ?
+           AND waiting_count < ?`
+      )
+      .bind(hostname, ipHash, config.maxWaitersPerIp)
+      .run();
+    return result.meta?.changes ?? 0;
+  };
+
+  let changes = await attemptUpdate();
+  if (changes > 0) {
+    return true;
+  }
+
+  try {
+    const insertResult = await db
+      .prepare(
+        `INSERT INTO ${tableName} (hostname_pattern, ip_hash, waiting_count, updated_at)
+         VALUES (?, ?, 1, datetime('now'))`
+      )
+      .bind(hostname, ipHash)
+      .run();
+    changes = insertResult.meta?.changes ?? 0;
+    if (changes > 0) {
+      return true;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/UNIQUE/i.test(message)) {
+      throw error;
+    }
+  }
+
+  changes = await attemptUpdate();
+  return changes > 0;
+};
+
+const releaseQueueWaiter = async (hostname, ipHash, config) => {
+  if (!config?.env || !config.databaseBinding) {
+    throw new Error('[Fair Queue D1] Missing D1 configuration');
+  }
+
+  if (!ipHash) {
+    return;
+  }
+
+  const db = config.env[config.databaseBinding];
+  if (!db) {
+    throw new Error(`[Fair Queue D1] D1 binding '${config.databaseBinding}' not found`);
+  }
+
+  const tableName = config.fairQueueQueueDepthTableName || 'upstream_ip_queue_depth';
+  await ensureQueueDepthTable(db, tableName);
+
+  await db
+    .prepare(
+      `UPDATE ${tableName}
+       SET waiting_count = CASE
+         WHEN waiting_count > 0 THEN waiting_count - 1
+         ELSE 0
+       END,
+       updated_at = datetime('now')
+       WHERE hostname_pattern = ?
+         AND ip_hash = ?`
+    )
+    .bind(hostname, ipHash)
+    .run();
+};
+
+const cleanupQueueDepth = async (config) => {
+  if (!config?.env || !config.databaseBinding) {
+    throw new Error('[Fair Queue D1] Missing D1 configuration');
+  }
+
+  const ttlSeconds = Number.isFinite(config?.queueDepthCleanupTtlSeconds)
+    ? config.queueDepthCleanupTtlSeconds
+    : Math.max((config?.ipCooldownSeconds || 0) * 10, 60);
+
+  if (ttlSeconds <= 0) {
+    return 0;
+  }
+
+  const db = config.env[config.databaseBinding];
+  if (!db) {
+    throw new Error(`[Fair Queue D1] D1 binding '${config.databaseBinding}' not found`);
+  }
+
+  const tableName = config.fairQueueQueueDepthTableName || 'upstream_ip_queue_depth';
+  await ensureQueueDepthTable(db, tableName);
+
+  const result = await db
+    .prepare(
+      `DELETE FROM ${tableName}
+       WHERE updated_at < datetime('now', ?)`
+    )
+    .bind(`-${ttlSeconds} seconds`)
+    .run();
+
+  const deleted = result.meta?.changes ?? 0;
+  if (deleted > 0) {
+    console.log(`[Fair Queue D1] Cleaned up ${deleted} queue depth records`);
+  }
+  return deleted;
+};
+
 export {
   ensureAllTables,
   updateLastActive,
@@ -754,4 +920,7 @@ export {
   releaseFairSlot,
   cleanupZombieSlots,
   cleanupIpCooldown,
+  tryRegisterQueueWaiter,
+  releaseQueueWaiter,
+  cleanupQueueDepth,
 };

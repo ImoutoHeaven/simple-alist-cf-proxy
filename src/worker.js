@@ -432,12 +432,18 @@ const resolveConfig = (env = {}) => {
 
   const fairQueueGlobalLimit = parseInteger(env.FAIR_QUEUE_GLOBAL_LIMIT, 5);
   const fairQueuePerIpLimit = parseInteger(env.FAIR_QUEUE_PER_IP_LIMIT, 1);
+  const fairQueueMaxWaitersRaw = parseInteger(env.FAIR_QUEUE_MAX_WAITERS_PER_IP, 3);
+  const fairQueueMaxWaitersPerIp = Math.max(1, fairQueueMaxWaitersRaw);
   const fairQueueIpCooldownSecondsRaw = parseInteger(env.FAIR_QUEUE_IP_COOLDOWN_SECONDS, 3);
   const fairQueueIpCooldownSeconds = Math.max(0, fairQueueIpCooldownSecondsRaw);
   const fairQueueIpCooldownEnabled = fairQueueIpCooldownSeconds > 0;
   const fairQueueIpCooldownCleanupTtlSeconds = fairQueueIpCooldownEnabled
     ? Math.max(fairQueueIpCooldownSeconds * 10, 60)
     : 0;
+  const fairQueueQueueDepthCleanupTtlSeconds = Math.max(
+    fairQueueIpCooldownSeconds > 0 ? fairQueueIpCooldownSeconds * 10 : 0,
+    60
+  );
   const fairQueueWaitTimeoutMs = parseIntegerStrict(
     env.FAIR_QUEUE_WAIT_TIMEOUT_MS,
     15000,
@@ -456,6 +462,7 @@ const resolveConfig = (env = {}) => {
     throw new Error('FAIR_QUEUE_POLL_INTERVAL_MS must be greater than 0');
   }
   const fairQueueTableName = normalizeString(env.FAIR_QUEUE_TABLE_NAME, 'upstream_slot_pool');
+  const fairQueueQueueDepthTableName = 'upstream_ip_queue_depth';
 
   // Validate Fair Queue configuration
   const actualFairQueueEnabled =
@@ -528,13 +535,17 @@ const resolveConfig = (env = {}) => {
       verifySecret: verifySecrets,
       globalLimit: fairQueueGlobalLimit,
       perIpLimit: fairQueuePerIpLimit,
+      maxWaitersPerIp: fairQueueMaxWaitersPerIp,
       queueWaitTimeoutMs: fairQueueWaitTimeoutMs,
       zombieTimeoutSeconds: fairQueueZombieTimeoutSeconds,
       ipCooldownSeconds: fairQueueIpCooldownEnabled ? fairQueueIpCooldownSeconds : 0,
       ipCooldownEnabled: fairQueueIpCooldownEnabled,
       ipCooldownCleanupTtlSeconds: fairQueueIpCooldownCleanupTtlSeconds,
+      queueDepthCleanupTtlSeconds: fairQueueQueueDepthCleanupTtlSeconds,
       pollIntervalMs: fairQueuePollIntervalMs,
       fairQueueTableName,
+      fairQueueCooldownTableName: 'upstream_ip_cooldown',
+      fairQueueQueueDepthTableName,
     },
   };
 };
@@ -780,11 +791,19 @@ const verifySignature = async (secret, data, signature) => {
   return '';
 };
 
-function createErrorResponse(origin, status, message) {
+function createErrorResponse(origin, status, message, extraHeaders) {
   const safeHeaders = new Headers();
   safeHeaders.set("content-type", "application/json;charset=UTF-8");
   safeHeaders.set("Access-Control-Allow-Origin", origin);
   safeHeaders.append("Vary", "Origin");
+  if (extraHeaders && typeof extraHeaders === 'object') {
+    for (const [headerName, headerValue] of Object.entries(extraHeaders)) {
+      if (headerValue === undefined || headerValue === null) {
+        continue;
+      }
+      safeHeaders.set(headerName, String(headerValue));
+    }
+  }
 
   return new Response(
     JSON.stringify({
@@ -849,6 +868,7 @@ const FAIR_QUEUE_RESULT = {
   ACQUIRED: 'acquired',
   PER_IP_LIMIT: 'per_ip_limit',
   TIMEOUT: 'timeout',
+  QUEUE_FULL: 'queue_full',
 };
 
 async function acquireFairSlotWithRetry(fairQueueModule, hostname, ipHash, fairQueueConfig) {
@@ -863,43 +883,77 @@ async function acquireFairSlotWithRetry(fairQueueModule, hostname, ipHash, fairQ
     ? Math.max(0, fairQueueConfig.pollIntervalMs)
     : 200;
 
+  const registerWaiterFn =
+    typeof fairQueueModule.tryRegisterQueueWaiter === 'function'
+      ? fairQueueModule.tryRegisterQueueWaiter
+      : null;
+  const releaseWaiterFn =
+    typeof fairQueueModule.releaseQueueWaiter === 'function'
+      ? fairQueueModule.releaseQueueWaiter
+      : null;
+  const maxWaiters = Number(fairQueueConfig?.maxWaitersPerIp);
+  const enforceQueueDepth =
+    registerWaiterFn &&
+    releaseWaiterFn &&
+    Number.isFinite(maxWaiters) &&
+    maxWaiters > 0;
+
+  let registeredWaiter = false;
+  if (enforceQueueDepth) {
+    registeredWaiter = await registerWaiterFn(hostname, ipHash, fairQueueConfig);
+    if (!registeredWaiter) {
+      return { status: FAIR_QUEUE_RESULT.QUEUE_FULL };
+    }
+  }
+
   const start = Date.now();
 
-  while (true) {
-    const elapsed = Date.now() - start;
-    if (elapsed > queueWaitTimeoutMs) {
-      return { status: FAIR_QUEUE_RESULT.TIMEOUT };
+  try {
+    while (true) {
+      const elapsed = Date.now() - start;
+      if (elapsed > queueWaitTimeoutMs) {
+        return { status: FAIR_QUEUE_RESULT.TIMEOUT };
+      }
+
+      const slotId = await fairQueueModule.tryAcquireFairSlot(
+        hostname,
+        ipHash,
+        fairQueueConfig
+      );
+
+      if (!Number.isFinite(slotId)) {
+        throw new Error('[Fair Queue] tryAcquireFairSlot returned invalid slot id');
+      }
+
+      if (slotId > 0) {
+        return { status: FAIR_QUEUE_RESULT.ACQUIRED, slotId };
+      }
+
+      if (slotId === 0) {
+        return { status: FAIR_QUEUE_RESULT.PER_IP_LIMIT };
+      }
+
+      const remaining = queueWaitTimeoutMs - (Date.now() - start);
+      if (remaining <= 0) {
+        return { status: FAIR_QUEUE_RESULT.TIMEOUT };
+      }
+
+      const waitMs = pollIntervalMs > 0 ? Math.min(pollIntervalMs, remaining) : remaining;
+      if (waitMs <= 0) {
+        return { status: FAIR_QUEUE_RESULT.TIMEOUT };
+      }
+
+      await sleep(waitMs);
     }
-
-    const slotId = await fairQueueModule.tryAcquireFairSlot(
-      hostname,
-      ipHash,
-      fairQueueConfig
-    );
-
-    if (!Number.isFinite(slotId)) {
-      throw new Error('[Fair Queue] tryAcquireFairSlot returned invalid slot id');
+  } finally {
+    if (registeredWaiter && releaseWaiterFn) {
+      try {
+        await releaseWaiterFn(hostname, ipHash, fairQueueConfig);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[Fair Queue] Failed to release queue waiter:', message);
+      }
     }
-
-    if (slotId > 0) {
-      return { status: FAIR_QUEUE_RESULT.ACQUIRED, slotId };
-    }
-
-    if (slotId === 0) {
-      return { status: FAIR_QUEUE_RESULT.PER_IP_LIMIT };
-    }
-
-    const remaining = queueWaitTimeoutMs - (Date.now() - start);
-    if (remaining <= 0) {
-      return { status: FAIR_QUEUE_RESULT.TIMEOUT };
-    }
-
-    const waitMs = pollIntervalMs > 0 ? Math.min(pollIntervalMs, remaining) : remaining;
-    if (waitMs <= 0) {
-      return { status: FAIR_QUEUE_RESULT.TIMEOUT };
-    }
-
-    await sleep(waitMs);
   }
 }
 
@@ -1496,6 +1550,17 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
           if (acquireResult.status === FAIR_QUEUE_RESULT.ACQUIRED) {
             slotId = acquireResult.slotId;
+          } else if (acquireResult.status === FAIR_QUEUE_RESULT.QUEUE_FULL) {
+            console.warn(`[Fair Queue] Queue depth full for ${clientIpSubnet}`);
+            return createErrorResponse(
+              origin,
+              429,
+              'too many pending requests from your IP range',
+              {
+                'Retry-After': '3',
+                'X-Fair-Queue': 'queue-full',
+              }
+            );
           } else if (acquireResult.status === FAIR_QUEUE_RESULT.PER_IP_LIMIT) {
             console.warn(`[Fair Queue] Per-IP limit reached for ${clientIpSubnet}`);
             const windowLabel = 'concurrent upstream requests';

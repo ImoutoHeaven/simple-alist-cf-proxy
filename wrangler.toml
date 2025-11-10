@@ -495,6 +495,11 @@ compatibility_date = "2024-01-01"
 #                                     # Prevents single IP/NAT from monopolizing all slots
 #                                     # Recommendation: Keep at 1 for fairness, increase to 2-3 if needed
 #
+# FAIR_QUEUE_MAX_WAITERS_PER_IP = "3" # Max pending queue waiters per hostname × IP subnet
+#                                     # Default: 3
+#                                     # Requests beyond this depth are rejected immediately with 429
+#                                     # Helps prevent IDM-style burst traffic from overwhelming the queue
+#
 # FAIR_QUEUE_WAIT_TIMEOUT_MS = "15000"  # Max queue wait time in milliseconds
 #                                        # Default: 15000 (15 seconds)
 #                                        # Leaves 15s buffer for 30s Worker wall-time limit
@@ -532,6 +537,8 @@ compatibility_date = "2024-01-01"
 #   FAIR_QUEUE_HOST_PATTERNS = "*.sharepoint.com"
 #   FAIR_QUEUE_GLOBAL_LIMIT = "5"
 #   FAIR_QUEUE_PER_IP_LIMIT = "1"
+#   FAIR_QUEUE_MAX_WAITERS_PER_IP = "3"
+#   FAIR_QUEUE_MAX_WAITERS_PER_IP = "3"
 #   DB_MODE = "custom-pg-rest"
 #   # Result: Max 5 concurrent SharePoint connections, 1 per IP, queues if exceeded
 #
@@ -540,6 +547,7 @@ compatibility_date = "2024-01-01"
 #   FAIR_QUEUE_HOST_PATTERNS = "*.sharepoint.com,*.onedrive.com,*.googleapis.com"
 #   FAIR_QUEUE_GLOBAL_LIMIT = "10"
 #   FAIR_QUEUE_PER_IP_LIMIT = "2"
+#   FAIR_QUEUE_MAX_WAITERS_PER_IP = "4"
 #   DB_MODE = "d1"
 #   INIT_TABLES = "true"  # First deployment only
 #   # Result: 10 concurrent connections per hostname, 2 per IP

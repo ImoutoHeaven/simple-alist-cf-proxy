@@ -530,6 +530,18 @@ CREATE TABLE IF NOT EXISTS "upstream_ip_cooldown" (
 CREATE INDEX IF NOT EXISTS idx_upstream_ip_cooldown_ts
   ON "upstream_ip_cooldown" ("last_release_at");
 
+-- Tracks per hostname/iprange queue depth (pending waiters)
+CREATE TABLE IF NOT EXISTS "upstream_ip_queue_depth" (
+  "hostname_pattern" TEXT NOT NULL,
+  "ip_hash" TEXT NOT NULL,
+  "waiting_count" INTEGER NOT NULL DEFAULT 0,
+  "updated_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  PRIMARY KEY ("hostname_pattern", "ip_hash")
+);
+
+CREATE INDEX IF NOT EXISTS idx_upstream_ip_queue_depth_ts
+  ON "upstream_ip_queue_depth" ("updated_at");
+
 -- Try Acquire Fair Slot RPC (single attempt, non-blocking)
 -- Returns:
 --   > 0  → slot id acquired
@@ -713,6 +725,110 @@ BEGIN
 
   DELETE FROM "upstream_ip_cooldown"
   WHERE "last_release_at" < v_cutoff;
+
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
+END;
+$$;
+
+-- ========================================
+-- Queue depth waiter registration RPC
+-- ========================================
+CREATE OR REPLACE FUNCTION func_try_register_queue_waiter(
+  p_hostname_pattern TEXT,
+  p_ip_hash          TEXT,
+  p_max_waiters      INTEGER
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_now  TIMESTAMP WITH TIME ZONE := clock_timestamp();
+  v_rows INTEGER;
+BEGIN
+  IF p_ip_hash IS NULL OR p_ip_hash = '' THEN
+    RETURN TRUE;
+  END IF;
+
+  IF p_max_waiters IS NULL OR p_max_waiters <= 0 THEN
+    RETURN TRUE;
+  END IF;
+
+  UPDATE "upstream_ip_queue_depth"
+  SET "waiting_count" = "waiting_count" + 1,
+      "updated_at" = v_now
+  WHERE "hostname_pattern" = p_hostname_pattern
+    AND "ip_hash" = p_ip_hash
+    AND "waiting_count" < p_max_waiters;
+
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  IF v_rows > 0 THEN
+    RETURN TRUE;
+  END IF;
+
+  BEGIN
+    INSERT INTO "upstream_ip_queue_depth" (
+      "hostname_pattern", "ip_hash", "waiting_count", "updated_at"
+    )
+    VALUES (p_hostname_pattern, p_ip_hash, 1, v_now);
+    RETURN TRUE;
+  EXCEPTION
+    WHEN unique_violation THEN
+      UPDATE "upstream_ip_queue_depth"
+      SET "waiting_count" = "waiting_count" + 1,
+          "updated_at" = v_now
+      WHERE "hostname_pattern" = p_hostname_pattern
+        AND "ip_hash" = p_ip_hash
+        AND "waiting_count" < p_max_waiters;
+
+      GET DIAGNOSTICS v_rows = ROW_COUNT;
+      RETURN v_rows > 0;
+    WHEN others THEN
+      RETURN FALSE;
+  END;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION func_release_queue_waiter(
+  p_hostname_pattern TEXT,
+  p_ip_hash          TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_now TIMESTAMP WITH TIME ZONE := clock_timestamp();
+BEGIN
+  IF p_ip_hash IS NULL OR p_ip_hash = '' THEN
+    RETURN;
+  END IF;
+
+  UPDATE "upstream_ip_queue_depth"
+  SET "waiting_count" = GREATEST("waiting_count" - 1, 0),
+      "updated_at" = v_now
+  WHERE "hostname_pattern" = p_hostname_pattern
+    AND "ip_hash" = p_ip_hash;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION func_cleanup_queue_depth(
+  p_ttl_seconds INT
+)
+RETURNS INTEGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_cutoff  TIMESTAMP WITH TIME ZONE;
+  v_deleted INTEGER;
+BEGIN
+  IF p_ttl_seconds IS NULL OR p_ttl_seconds <= 0 THEN
+    RETURN 0;
+  END IF;
+
+  v_cutoff := clock_timestamp() - (p_ttl_seconds::TEXT || ' seconds')::INTERVAL;
+
+  DELETE FROM "upstream_ip_queue_depth"
+  WHERE "updated_at" < v_cutoff;
 
   GET DIAGNOSTICS v_deleted = ROW_COUNT;
   RETURN v_deleted;

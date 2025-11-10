@@ -180,6 +180,19 @@ const ensureAllTables = async (
       sql: `CREATE INDEX IF NOT EXISTS idx_ip_cooldown_ts
             ON ${fairQueueCooldownTableName} (last_release_at)`,
     },
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${fairQueueQueueDepthTableName} (
+        hostname_pattern TEXT NOT NULL,
+        ip_hash TEXT NOT NULL,
+        waiting_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (hostname_pattern, ip_hash)
+      )`,
+    },
+    {
+      sql: `CREATE INDEX IF NOT EXISTS idx_ip_queue_depth_ts
+            ON ${fairQueueQueueDepthTableName} (updated_at)`,
+    },
   ];
 
   await executeBatchQueries(accountId, databaseId, apiToken, baseStatements);
@@ -597,6 +610,34 @@ const ensureSlotPoolRest = async (
   }
 };
 
+const ensureQueueDepthTableRest = async (
+  accountId,
+  databaseId,
+  apiToken,
+  tableName = 'upstream_ip_queue_depth'
+) => {
+  await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `CREATE TABLE IF NOT EXISTS ${tableName} (
+      hostname_pattern TEXT NOT NULL,
+      ip_hash TEXT NOT NULL,
+      waiting_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (hostname_pattern, ip_hash)
+    )`
+  );
+
+  await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `CREATE INDEX IF NOT EXISTS idx_ip_queue_depth_ts
+     ON ${tableName} (updated_at)`
+  );
+};
+
 const tryAcquireFairSlotOnceRest = async (
   accountId,
   databaseId,
@@ -853,6 +894,129 @@ const cleanupIpCooldown = async (config) => {
   return deleted;
 };
 
+const queueDepthEnforced = (config) =>
+  Number.isFinite(config?.maxWaitersPerIp) && config.maxWaitersPerIp > 0;
+
+const tryRegisterQueueWaiter = async (hostname, ipHash, config) => {
+  if (!config?.accountId || !config.databaseId || !config.apiToken) {
+    throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration');
+  }
+
+  if (!queueDepthEnforced(config) || !ipHash) {
+    return true;
+  }
+
+  const { accountId, databaseId, apiToken } = config;
+  const tableName = config.fairQueueQueueDepthTableName || 'upstream_ip_queue_depth';
+  await ensureQueueDepthTableRest(accountId, databaseId, apiToken, tableName);
+
+  const attemptUpdate = async () => {
+    const result = await executeQuery(
+      accountId,
+      databaseId,
+      apiToken,
+      `UPDATE ${tableName}
+       SET waiting_count = waiting_count + 1,
+           updated_at = datetime('now')
+       WHERE hostname_pattern = ?
+         AND ip_hash = ?
+         AND waiting_count < ?`,
+      [hostname, ipHash, config.maxWaitersPerIp]
+    );
+    return result.meta?.changes ?? 0;
+  };
+
+  let changes = await attemptUpdate();
+  if (changes > 0) {
+    return true;
+  }
+
+  try {
+    const insertResult = await executeQuery(
+      accountId,
+      databaseId,
+      apiToken,
+      `INSERT INTO ${tableName} (hostname_pattern, ip_hash, waiting_count, updated_at)
+       VALUES (?, ?, 1, datetime('now'))`,
+      [hostname, ipHash]
+    );
+    changes = insertResult.meta?.changes ?? 0;
+    if (changes > 0) {
+      return true;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/UNIQUE/i.test(message)) {
+      throw error;
+    }
+  }
+
+  changes = await attemptUpdate();
+  return changes > 0;
+};
+
+const releaseQueueWaiter = async (hostname, ipHash, config) => {
+  if (!config?.accountId || !config.databaseId || !config.apiToken) {
+    throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration');
+  }
+
+  if (!ipHash) {
+    return;
+  }
+
+  const { accountId, databaseId, apiToken } = config;
+  const tableName = config.fairQueueQueueDepthTableName || 'upstream_ip_queue_depth';
+  await ensureQueueDepthTableRest(accountId, databaseId, apiToken, tableName);
+
+  await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `UPDATE ${tableName}
+     SET waiting_count = CASE
+       WHEN waiting_count > 0 THEN waiting_count - 1
+       ELSE 0
+     END,
+     updated_at = datetime('now')
+     WHERE hostname_pattern = ?
+       AND ip_hash = ?`,
+    [hostname, ipHash]
+  );
+};
+
+const cleanupQueueDepth = async (config) => {
+  if (!config?.accountId || !config.databaseId || !config.apiToken) {
+    throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration');
+  }
+
+  const ttlSeconds = Number.isFinite(config?.queueDepthCleanupTtlSeconds)
+    ? config.queueDepthCleanupTtlSeconds
+    : Math.max((config?.ipCooldownSeconds || 0) * 10, 60);
+
+  if (ttlSeconds <= 0) {
+    return 0;
+  }
+
+  const { accountId, databaseId, apiToken } = config;
+  const tableName = config.fairQueueQueueDepthTableName || 'upstream_ip_queue_depth';
+  await ensureQueueDepthTableRest(accountId, databaseId, apiToken, tableName);
+
+  const result = await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `DELETE FROM ${tableName}
+     WHERE updated_at < datetime('now', ?)`,
+    [`-${ttlSeconds} seconds`]
+  );
+
+  const deleted = result.meta?.changes ?? 0;
+  if (deleted > 0) {
+    console.log(`[Fair Queue D1-REST] Cleaned up ${deleted} queue depth records`);
+  }
+  return deleted;
+};
+
 export {
   ensureAllTables,
   updateLastActive,
@@ -860,4 +1024,7 @@ export {
   releaseFairSlot,
   cleanupZombieSlots,
   cleanupIpCooldown,
+  tryRegisterQueueWaiter,
+  releaseQueueWaiter,
+  cleanupQueueDepth,
 };
