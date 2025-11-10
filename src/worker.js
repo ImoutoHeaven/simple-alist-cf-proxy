@@ -864,6 +864,44 @@ function createRateLimitResponse(origin, ipSubnet, limit, windowLabel, retryAfte
   });
 }
 
+function createThrottleProtectedResponse(origin, throttleStatus) {
+  const retryAfter =
+    throttleStatus && Number.isFinite(throttleStatus.retryAfter) && throttleStatus.retryAfter > 0
+      ? Math.max(1, Math.ceil(throttleStatus.retryAfter))
+      : 0;
+  const statusCode =
+    throttleStatus && Number.isFinite(throttleStatus.errorCode) && throttleStatus.errorCode >= 100
+      ? throttleStatus.errorCode
+      : 503;
+  const message =
+    (throttleStatus && throttleStatus.message) ||
+    (retryAfter
+      ? `Service temporarily unavailable (throttle protected, retry after ${retryAfter}s)`
+      : 'Service temporarily unavailable (throttle protected)');
+
+  const safeHeaders = new Headers();
+  safeHeaders.set("content-type", "application/json;charset=UTF-8");
+  safeHeaders.set("Access-Control-Allow-Origin", origin);
+  safeHeaders.append("Vary", "Origin");
+  safeHeaders.set("X-Throttle-Protected", "true");
+  if (retryAfter) {
+    const retryAfterValue = String(retryAfter);
+    safeHeaders.set("Retry-After", retryAfterValue);
+    safeHeaders.set("X-Throttle-Retry-After", retryAfterValue);
+  }
+
+  return new Response(
+    JSON.stringify({
+      code: statusCode,
+      message
+    }),
+    {
+      status: statusCode,
+      headers: safeHeaders
+    }
+  );
+}
+
 const FAIR_QUEUE_RESULT = {
   ACQUIRED: 'acquired',
   PER_IP_LIMIT: 'per_ip_limit',
@@ -1332,23 +1370,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       if (config.throttleEnabled && unifiedResult.throttle.status === 'protected') {
         console.log(`[Throttle] Protected from unified check, returning error ${unifiedResult.throttle.errorCode}, retry after ${unifiedResult.throttle.retryAfter}s`);
 
-        const safeHeaders = new Headers();
-        safeHeaders.set("content-type", "application/json;charset=UTF-8");
-        safeHeaders.set("Access-Control-Allow-Origin", origin);
-        safeHeaders.append("Vary", "Origin");
-        safeHeaders.set("X-Throttle-Protected", "true");
-        safeHeaders.set("X-Throttle-Retry-After", String(unifiedResult.throttle.retryAfter));
-
-        return new Response(
-          JSON.stringify({
-            code: unifiedResult.throttle.errorCode || 503,
-            message: `Service temporarily unavailable (throttle protected, retry after ${unifiedResult.throttle.retryAfter}s)`
-          }),
-          {
-            status: unifiedResult.throttle.errorCode || 503,
-            headers: safeHeaders
-          }
-        );
+        return createThrottleProtectedResponse(origin, unifiedResult.throttle);
       }
 
       if (rateLimiter && config.rateLimitConfig) {
@@ -1511,6 +1533,57 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   // Use linkData from cache or API response
   const downloadUrl = res.data.url;
+  // ========================================
+  // Throttle protection logic (pre-check)
+  // ========================================
+  let throttleStatus = null;
+  let throttleHostname = null;
+  let operationMode = 'normal_operation'; // 'normal_operation' or 'resume_operation'
+
+  const throttleCheckEnabled = config.throttleEnabled && throttleManager;
+  if (throttleCheckEnabled) {
+    throttleHostname = extractHostname(downloadUrl);
+
+    const unifiedThrottleUsable =
+      unifiedResult &&
+      unifiedResult.cache &&
+      unifiedResult.cache.hit &&
+      unifiedResult.cache.hostnameHash &&
+      unifiedResult.throttle;
+
+    if (unifiedThrottleUsable) {
+      throttleStatus = unifiedResult.throttle;
+    } else if (throttleHostname) {
+      let hostnameMatched = false;
+      for (const pattern of config.throttleHostnamePatterns) {
+        if (matchHostnamePattern(throttleHostname, pattern)) {
+          hostnameMatched = true;
+          break;
+        }
+      }
+
+      if (hostnameMatched) {
+        try {
+          throttleStatus = await throttleManager.checkThrottle(throttleHostname, { ...config.throttleConfig, ctx });
+        } catch (error) {
+          // Throttle check failure should not block downloads
+          console.error('[Throttle] Check failed, proceeding with download:', error instanceof Error ? error.message : String(error));
+        }
+      }
+    }
+
+    if (throttleStatus) {
+      if (throttleStatus.status === 'protected') {
+        console.log(
+          `[Throttle] Protected: ${throttleHostname}, returning error ${throttleStatus.errorCode}, retry after ${throttleStatus.retryAfter}s`
+        );
+        return createThrottleProtectedResponse(origin, throttleStatus);
+      } else if (throttleStatus.status === 'resume_operation') {
+        operationMode = 'resume_operation';
+        console.log(`[Throttle] Resume operation: ${throttleHostname}`);
+      }
+    }
+  }
 
   // ========================================
   // Fair Upstream Queue Integration
@@ -1600,83 +1673,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       }
     } else {
       console.warn('[Fair Queue] Skipped: unable to derive client subnet for queue enforcement');
-    }
-  }
-
-  // Throttle protection logic
-  let throttleStatus = null;
-  let throttleHostname = null;
-  let operationMode = 'normal_operation'; // 'normal_operation' or 'resume_operation'
-
-  const shouldCheckThrottle = config.throttleEnabled && throttleManager && (
-    !unifiedResult ||
-    (unifiedResult && (!unifiedResult.cache.hit || !unifiedResult.cache.hostnameHash))
-  );
-
-  if (shouldCheckThrottle) {
-    try {
-      // Extract hostname from download URL
-      throttleHostname = extractHostname(downloadUrl);
-
-      if (throttleHostname) {
-        // Check if hostname matches any protection pattern
-        let hostnameMatched = false;
-        for (const pattern of config.throttleHostnamePatterns) {
-          if (matchHostnamePattern(throttleHostname, pattern)) {
-            hostnameMatched = true;
-            break;
-          }
-        }
-
-        if (hostnameMatched) {
-          // Check throttle protection status
-          throttleStatus = await throttleManager.checkThrottle(throttleHostname, { ...config.throttleConfig, ctx });
-
-          if (throttleStatus) {
-            if (throttleStatus.status === 'protected') {
-              // Still in protection window - return error without fetching
-              console.log(`[Throttle] Protected: ${throttleHostname}, returning error ${throttleStatus.errorCode}, retry after ${throttleStatus.retryAfter}s`);
-
-              const safeHeaders = new Headers();
-              safeHeaders.set("content-type", "application/json;charset=UTF-8");
-              safeHeaders.set("Access-Control-Allow-Origin", origin);
-              safeHeaders.append("Vary", "Origin");
-              safeHeaders.set("X-Throttle-Protected", "true");
-              safeHeaders.set("X-Throttle-Retry-After", String(throttleStatus.retryAfter));
-
-              return new Response(
-                JSON.stringify({
-                  code: throttleStatus.errorCode,
-                  message: `Service temporarily unavailable (throttle protected, retry after ${throttleStatus.retryAfter}s)`
-                }),
-                {
-                  status: throttleStatus.errorCode,
-                  headers: safeHeaders
-                }
-              );
-            } else if (throttleStatus.status === 'resume_operation') {
-              // Time window expired - resume operation (mark for potential state clear)
-              operationMode = 'resume_operation';
-              console.log(`[Throttle] Resume operation: ${throttleHostname}`);
-            }
-            // else: normal_operation (no protection)
-          }
-        }
-      }
-    } catch (error) {
-      // Throttle check failure should not block downloads
-      console.error('[Throttle] Check failed, proceeding with download:', error instanceof Error ? error.message : String(error));
-    }
-  } else if (
-    unifiedResult &&
-    unifiedResult.cache &&
-    unifiedResult.cache.hit &&
-    unifiedResult.cache.hostnameHash
-  ) {
-    throttleHostname = extractHostname(downloadUrl);
-    throttleStatus = unifiedResult.throttle;
-    if (unifiedResult.throttle.status === 'resume_operation') {
-      operationMode = 'resume_operation';
     }
   }
 
