@@ -509,6 +509,11 @@ compatibility_date = "2024-01-01"
 #                                            # Default: 30 seconds
 #                                            # Slots stuck in "locked" state > this duration are released
 #                                            # Prevents leaks from Worker crashes/exceptions
+
+# FAIR_QUEUE_QUEUE_DEPTH_ZOMBIE_TTL_SECONDS = "20"  # Queue depth zombie timeout
+#                                                    # Default: 20 seconds
+#                                                    # Auto-resets stale waiter counts when Worker cleanup fails
+#                                                    # Increase if users see premature queue resets, decrease to evict faster
 #
 # FAIR_QUEUE_POLL_INTERVAL_MS = "200"  # Worker-side polling interval between slot attempts (milliseconds)
 #                                       # Default: 200ms

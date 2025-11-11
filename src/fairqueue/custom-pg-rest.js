@@ -230,6 +230,9 @@ const tryRegisterQueueWaiter = async (hostname, ipHash, config) => {
   }
 
   const headers = buildHeaders(config.verifyHeader, config.verifySecret);
+  const zombieTtlSeconds = Number.isFinite(config?.queueDepthZombieTtlSeconds)
+    ? config.queueDepthZombieTtlSeconds
+    : 20;
   const response = await fetch(`${config.postgrestUrl}/rpc/func_try_register_queue_waiter`, {
     method: 'POST',
     headers,
@@ -237,6 +240,7 @@ const tryRegisterQueueWaiter = async (hostname, ipHash, config) => {
       p_hostname_pattern: hostname,
       p_ip_hash: ipHash,
       p_max_waiters: config.maxWaitersPerIp,
+      p_zombie_timeout_seconds: Math.max(1, zombieTtlSeconds),
     }),
   });
 

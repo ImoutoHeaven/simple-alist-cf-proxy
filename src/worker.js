@@ -437,6 +437,11 @@ const resolveConfig = (env = {}) => {
   const fairQueueIpCooldownSecondsRaw = parseInteger(env.FAIR_QUEUE_IP_COOLDOWN_SECONDS, 3);
   const fairQueueIpCooldownSeconds = Math.max(0, fairQueueIpCooldownSecondsRaw);
   const fairQueueIpCooldownEnabled = fairQueueIpCooldownSeconds > 0;
+  const fairQueueQueueDepthZombieTtlRaw = parseInteger(
+    env.FAIR_QUEUE_QUEUE_DEPTH_ZOMBIE_TTL_SECONDS,
+    20
+  );
+  const fairQueueQueueDepthZombieTtlSeconds = Math.max(1, fairQueueQueueDepthZombieTtlRaw);
   const fairQueueIpCooldownCleanupTtlSeconds = fairQueueIpCooldownEnabled
     ? Math.max(fairQueueIpCooldownSeconds * 10, 60)
     : 0;
@@ -542,6 +547,7 @@ const resolveConfig = (env = {}) => {
       ipCooldownEnabled: fairQueueIpCooldownEnabled,
       ipCooldownCleanupTtlSeconds: fairQueueIpCooldownCleanupTtlSeconds,
       queueDepthCleanupTtlSeconds: fairQueueQueueDepthCleanupTtlSeconds,
+      queueDepthZombieTtlSeconds: fairQueueQueueDepthZombieTtlSeconds,
       pollIntervalMs: fairQueuePollIntervalMs,
       fairQueueTableName,
       fairQueueCooldownTableName: 'upstream_ip_cooldown',

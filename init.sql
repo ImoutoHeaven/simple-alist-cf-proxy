@@ -735,9 +735,10 @@ $$;
 -- Queue depth waiter registration RPC
 -- ========================================
 CREATE OR REPLACE FUNCTION func_try_register_queue_waiter(
-  p_hostname_pattern TEXT,
-  p_ip_hash          TEXT,
-  p_max_waiters      INTEGER
+  p_hostname_pattern     TEXT,
+  p_ip_hash              TEXT,
+  p_max_waiters          INTEGER,
+  p_zombie_timeout_seconds INTEGER DEFAULT 20
 )
 RETURNS BOOLEAN
 LANGUAGE plpgsql
@@ -745,12 +746,29 @@ AS $$
 DECLARE
   v_now  TIMESTAMP WITH TIME ZONE := clock_timestamp();
   v_rows INTEGER;
+  v_zombie_timeout INTERVAL := CASE
+    WHEN p_zombie_timeout_seconds IS NULL OR p_zombie_timeout_seconds <= 0 THEN INTERVAL '20 seconds'
+    ELSE (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL
+  END;
 BEGIN
   IF p_ip_hash IS NULL OR p_ip_hash = '' THEN
     RETURN TRUE;
   END IF;
 
   IF p_max_waiters IS NULL OR p_max_waiters <= 0 THEN
+    RETURN TRUE;
+  END IF;
+
+  -- First, try to revive zombie queue records that have not been updated within the TTL
+  UPDATE "upstream_ip_queue_depth"
+  SET "waiting_count" = 1,
+      "updated_at" = v_now
+  WHERE "hostname_pattern" = p_hostname_pattern
+    AND "ip_hash" = p_ip_hash
+    AND "updated_at" < (v_now - v_zombie_timeout);
+
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  IF v_rows > 0 THEN
     RETURN TRUE;
   END IF;
 

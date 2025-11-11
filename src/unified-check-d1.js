@@ -801,6 +801,25 @@ const tryRegisterQueueWaiter = async (hostname, ipHash, config) => {
 
   const tableName = config.fairQueueQueueDepthTableName || 'upstream_ip_queue_depth';
   await ensureQueueDepthTable(db, tableName);
+  const zombieTtlSeconds = Number.isFinite(config?.queueDepthZombieTtlSeconds)
+    ? Math.max(1, config.queueDepthZombieTtlSeconds)
+    : 20;
+  const zombieCutoff = `-${zombieTtlSeconds} seconds`;
+
+  const reviveZombieQueue = async () => {
+    const result = await db
+      .prepare(
+        `UPDATE ${tableName}
+         SET waiting_count = 1,
+             updated_at = datetime('now')
+         WHERE hostname_pattern = ?
+           AND ip_hash = ?
+           AND updated_at < datetime('now', ?)`
+      )
+      .bind(hostname, ipHash, zombieCutoff)
+      .run();
+    return result.meta?.changes ?? 0;
+  };
 
   const attemptUpdate = async () => {
     const result = await db
@@ -817,7 +836,12 @@ const tryRegisterQueueWaiter = async (hostname, ipHash, config) => {
     return result.meta?.changes ?? 0;
   };
 
-  let changes = await attemptUpdate();
+  let changes = await reviveZombieQueue();
+  if (changes > 0) {
+    return true;
+  }
+
+  changes = await attemptUpdate();
   if (changes > 0) {
     return true;
   }
