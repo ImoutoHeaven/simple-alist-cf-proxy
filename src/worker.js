@@ -16,6 +16,26 @@ const VALID_EXCEPT_ACTIONS = new Set(['block-except', 'skip-sign-except', 'skip-
 
 let ipRateLimitDisabledLogged = false;
 
+const DOWNLOAD_EXPOSE_HEADERS = 'Content-Length, Content-Range, X-Throttle-Status, X-Throttle-Retry-After, Accept-Ranges';
+const DOWNLOAD_ALLOW_HEADERS = 'Range, Content-Type, X-Requested-With';
+
+const applyDownloadCorsHeaders = (headers) => {
+  if (!headers || typeof headers.set !== 'function') {
+    return;
+  }
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Expose-Headers', DOWNLOAD_EXPOSE_HEADERS);
+};
+
+const handleOptions = () => {
+  const headers = new Headers();
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  headers.set('Access-Control-Allow-Headers', DOWNLOAD_ALLOW_HEADERS);
+  headers.set('Access-Control-Max-Age', '86400');
+  return new Response(null, { status: 204, headers });
+};
+
 // Utility: Parse comma-separated prefix list
 const parsePrefixList = (value) => {
   if (!value || typeof value !== 'string') return [];
@@ -1816,8 +1836,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     });
 
     // 设置CORS headers
-    safeHeaders.set("Access-Control-Allow-Origin", origin);
-    safeHeaders.append("Vary", "Origin");
+    applyDownloadCorsHeaders(safeHeaders);
 
     // 创建带有安全headers的新响应
     const safeResponse = new Response(response.body, {
