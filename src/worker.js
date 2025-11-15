@@ -453,7 +453,7 @@ const resolveConfig = (env = {}) => {
   const fairQueueGlobalLimit = parseInteger(env.FAIR_QUEUE_GLOBAL_LIMIT, 5);
   const fairQueuePerIpLimit = parseInteger(env.FAIR_QUEUE_PER_IP_LIMIT, 1);
   const fairQueueMaxWaitersRaw = parseInteger(env.FAIR_QUEUE_MAX_WAITERS_PER_IP, 3);
-  const fairQueueMaxWaitersPerIp = Math.max(1, fairQueueMaxWaitersRaw);
+  const fairQueueMaxWaitersPerIp = fairQueueMaxWaitersRaw <= 0 ? 0 : fairQueueMaxWaitersRaw;
   const fairQueueIpCooldownSecondsRaw = parseInteger(env.FAIR_QUEUE_IP_COOLDOWN_SECONDS, 3);
   const fairQueueIpCooldownSeconds = Math.max(0, fairQueueIpCooldownSecondsRaw);
   const fairQueueIpCooldownEnabled = fairQueueIpCooldownSeconds > 0;
