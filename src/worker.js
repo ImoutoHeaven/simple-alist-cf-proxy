@@ -962,18 +962,37 @@ async function acquireFairSlotWithRetry(fairQueueModule, hostname, ipHash, fairQ
     Number.isFinite(maxWaiters) &&
     maxWaiters > 0;
 
-  let registeredWaiter = false;
-  if (enforceQueueDepth) {
-    registeredWaiter = await registerWaiterFn(hostname, ipHash, fairQueueConfig);
-    if (!registeredWaiter) {
-      return { status: FAIR_QUEUE_RESULT.QUEUE_FULL };
-    }
-  }
-
   const start = Date.now();
+
+  const waitForNextAttempt = async () => {
+    const elapsed = Date.now() - start;
+    if (elapsed >= queueWaitTimeoutMs) {
+      return false;
+    }
+    const remaining = queueWaitTimeoutMs - elapsed;
+    const waitMs = pollIntervalMs > 0 ? Math.min(pollIntervalMs, remaining) : remaining;
+    if (waitMs <= 0) {
+      return false;
+    }
+    await sleep(waitMs);
+    return true;
+  };
+
+  let registeredWaiter = false;
 
   try {
     while (true) {
+      if (enforceQueueDepth && !registeredWaiter) {
+        registeredWaiter = await registerWaiterFn(hostname, ipHash, fairQueueConfig);
+        if (!registeredWaiter) {
+          const canContinue = await waitForNextAttempt();
+          if (!canContinue) {
+            return { status: FAIR_QUEUE_RESULT.TIMEOUT };
+          }
+          continue;
+        }
+      }
+
       const elapsed = Date.now() - start;
       if (elapsed > queueWaitTimeoutMs) {
         return { status: FAIR_QUEUE_RESULT.TIMEOUT };
@@ -993,21 +1012,10 @@ async function acquireFairSlotWithRetry(fairQueueModule, hostname, ipHash, fairQ
         return { status: FAIR_QUEUE_RESULT.ACQUIRED, slotId };
       }
 
-      if (slotId === 0) {
-        return { status: FAIR_QUEUE_RESULT.PER_IP_LIMIT };
-      }
-
-      const remaining = queueWaitTimeoutMs - (Date.now() - start);
-      if (remaining <= 0) {
+      const canContinue = await waitForNextAttempt();
+      if (!canContinue) {
         return { status: FAIR_QUEUE_RESULT.TIMEOUT };
       }
-
-      const waitMs = pollIntervalMs > 0 ? Math.min(pollIntervalMs, remaining) : remaining;
-      if (waitMs <= 0) {
-        return { status: FAIR_QUEUE_RESULT.TIMEOUT };
-      }
-
-      await sleep(waitMs);
     }
   } finally {
     if (registeredWaiter && releaseWaiterFn) {
@@ -1649,29 +1657,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
           if (acquireResult.status === FAIR_QUEUE_RESULT.ACQUIRED) {
             slotId = acquireResult.slotId;
-          } else if (acquireResult.status === FAIR_QUEUE_RESULT.QUEUE_FULL) {
-            console.warn(`[Fair Queue] Queue depth full for ${clientIpSubnet}`);
-            return createErrorResponse(
-              origin,
-              429,
-              'too many pending requests from your IP range',
-              {
-                'Retry-After': '3',
-                'X-Fair-Queue': 'queue-full',
-              }
-            );
-          } else if (acquireResult.status === FAIR_QUEUE_RESULT.PER_IP_LIMIT) {
-            console.warn(`[Fair Queue] Per-IP limit reached for ${clientIpSubnet}`);
-            const windowLabel = 'concurrent upstream requests';
-            return createRateLimitResponse(
-              origin,
-              clientIpSubnet,
-              config.fairQueueConfig.perIpLimit,
-              windowLabel,
-              60
-            );
-          } else if (acquireResult.status === FAIR_QUEUE_RESULT.TIMEOUT) {
-            console.warn(`[Fair Queue] Queue wait timeout for ${upstreamHostname}`);
+          } else if (
+            acquireResult.status === FAIR_QUEUE_RESULT.TIMEOUT ||
+            acquireResult.status === FAIR_QUEUE_RESULT.QUEUE_FULL ||
+            acquireResult.status === FAIR_QUEUE_RESULT.PER_IP_LIMIT
+          ) {
+            const reasonLabel =
+              acquireResult.status === FAIR_QUEUE_RESULT.PER_IP_LIMIT
+                ? 'per-IP queue wait timeout'
+                : acquireResult.status === FAIR_QUEUE_RESULT.QUEUE_FULL
+                  ? 'queue depth wait timeout'
+                  : 'queue wait timeout';
+            console.warn(`[Fair Queue] ${reasonLabel} for ${upstreamHostname}`);
 
             const safeHeaders = new Headers();
             safeHeaders.set("content-type", "application/json;charset=UTF-8");

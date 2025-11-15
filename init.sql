@@ -584,14 +584,17 @@ BEGIN
     AND "locked_at" IS NOT NULL
     AND "locked_at" >= (v_now - v_zombie_timeout);
 
-  IF v_current_ip_slots >= p_per_ip_limit THEN
-    RETURN 0;
+  IF p_per_ip_limit > 0 THEN
+    IF v_current_ip_slots >= p_per_ip_limit THEN
+      RETURN 0;
+    END IF;
   END IF;
 
   -- 2) 冷却判断：只针对仍有空位的 IP 且启用了冷却
   IF v_cooldown_interval IS NOT NULL
      AND p_ip_hash IS NOT NULL
      AND v_current_ip_slots > 0
+     AND p_per_ip_limit > 0
      AND v_current_ip_slots < p_per_ip_limit THEN
     SELECT "last_release_at"
       INTO v_last_release_at
