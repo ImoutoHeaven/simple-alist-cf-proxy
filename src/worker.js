@@ -616,6 +616,42 @@ function base64DecodeToString(input) {
   }
 }
 
+const sanitizeDispositionFileName = (value) => {
+  if (!value) return 'download.bin';
+  return value.replace(/["\\\r\n]/g, '_');
+};
+
+const encodeRFC5987Value = (value) =>
+  encodeURIComponent(value)
+    .replace(/['()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`)
+    .replace(/%(7C|60|5E)/g, (match) => match.toUpperCase());
+
+const buildAttachmentContentDisposition = (fileName) => {
+  const normalized = fileName && fileName.length > 0 ? fileName : 'download.bin';
+  const safeName = sanitizeDispositionFileName(normalized);
+  const encoded = encodeRFC5987Value(normalized);
+  return `attachment; filename="${safeName}"; filename*=UTF-8''${encoded}`;
+};
+
+const deriveFileNameFromPath = (inputPath) => {
+  if (typeof inputPath !== 'string' || inputPath.length === 0) {
+    return '';
+  }
+  let decoded = '';
+  try {
+    decoded = decodeURIComponent(inputPath);
+  } catch (_error) {
+    decoded = inputPath;
+  }
+  const segments = decoded.split('/').filter((segment) => segment.length > 0);
+  return segments.length > 0 ? segments[segments.length - 1] : '';
+};
+
+const ensureEncryptedFileName = (fileName) => {
+  const normalized = fileName && fileName.length > 0 ? fileName : 'download.bin';
+  return normalized.toLowerCase().endsWith('.enc') ? normalized : `${normalized}.enc`;
+};
+
 async function sha256Hex(text) {
   const data = new TextEncoder().encode(text);
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
@@ -1806,31 +1842,41 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     // 创建仅包含安全必要headers的响应
     const safeHeaders = new Headers();
+    const isCryptedDownload = additionalPayload?.isCrypted === true;
 
     // 保留重要的内容相关headers
     const preserveHeaders = [
-    'content-type',
-    'content-disposition',
-    'content-length',
-    'cache-control',
-    'content-encoding',
-    'accept-ranges',
-    'content-range',    // Added for partial downloads
-    'transfer-encoding', // Added for chunked transfers
-    'content-language',  // Added for internationalization
-    'expires',           // Added for cache control
-    'pragma',            // Added for cache control
-    'etag',
-    'last-modified'
+      'content-type',
+      'content-disposition',
+      'content-length',
+      'cache-control',
+      'content-encoding',
+      'accept-ranges',
+      'content-range', // Added for partial downloads
+      'transfer-encoding', // Added for chunked transfers
+      'content-language', // Added for internationalization
+      'expires', // Added for cache control
+      'pragma', // Added for cache control
+      'etag',
+      'last-modified'
     ];
 
     // 仅复制必要的headers
     preserveHeaders.forEach(header => {
+      if (header === 'content-disposition' && isCryptedDownload) {
+        return;
+      }
       const value = response.headers.get(header);
       if (value) {
         safeHeaders.set(header, value);
       }
     });
+
+    if (isCryptedDownload) {
+      const derivedName = deriveFileNameFromPath(path);
+      const encryptedFileName = ensureEncryptedFileName(derivedName);
+      safeHeaders.set('content-disposition', buildAttachmentContentDisposition(encryptedFileName));
+    }
 
     // 设置CORS headers
     applyDownloadCorsHeaders(safeHeaders);
