@@ -1761,6 +1761,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         break;
       }
     }
+
+    if (response.status !== 200 && response.status !== 206) {
+      console.warn(
+        `[Upstream] Unexpected status ${response.status} for ${path} (url ${downloadUrl})`
+      );
+    }
     
     // Update throttle protection status based on fetch result
     if (config.throttleEnabled && throttleManager && throttleHostname) {
