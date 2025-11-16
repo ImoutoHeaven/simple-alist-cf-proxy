@@ -1089,6 +1089,7 @@ function normalizePath(pathname) {
 }
 // src/handleDownload.ts
 async function handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
+  const originalRequest = request;
   const origin = request.headers.get("origin") ?? "*";
   const url = new URL(request.url);
   const normalizedPath = normalizePath(url.pathname);
@@ -1510,6 +1511,68 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
+  const fetchLinkDataFromApi = async () => {
+    const headers = {
+      "content-type": "application/json;charset=UTF-8",
+      Authorization: config.token,
+      "CF-Connecting-IP-WORKERS": clientIP,
+    };
+    applyVerifyHeaders(headers, config.verifyHeader, config.verifySecret);
+    const resp = await fetch(`${config.address}/api/fs/link`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ path }),
+    });
+
+    const contentType = resp.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      const originalStatus = resp.status;
+      const safeErrorMessage = JSON.stringify({
+        code: originalStatus,
+        message: `Request failed with status: ${originalStatus}`,
+      });
+      const safeHeaders = new Headers();
+      safeHeaders.set("content-type", "application/json;charset=UTF-8");
+      safeHeaders.set("Access-Control-Allow-Origin", origin);
+      safeHeaders.append("Vary", "Origin");
+
+      return {
+        errorResponse: new Response(safeErrorMessage, {
+          status: originalStatus,
+          statusText: "Error",
+          headers: safeHeaders,
+        }),
+      };
+    }
+
+    const apiResult = await resp.json();
+    if (apiResult.code !== 200) {
+      const httpStatus = apiResult.code >= 100 && apiResult.code < 600 ? apiResult.code : 500;
+      const safeHeaders = new Headers();
+      safeHeaders.set("content-type", "application/json;charset=UTF-8");
+      safeHeaders.set("Access-Control-Allow-Origin", origin);
+      safeHeaders.append("Vary", "Origin");
+      return {
+        errorResponse: new Response(JSON.stringify(apiResult), {
+          status: httpStatus,
+          headers: safeHeaders,
+        }),
+      };
+    }
+
+    if (cacheManager && apiResult.data) {
+      ctx.waitUntil(
+        cacheManager
+          .saveCache(path, apiResult.data, { ...config.cacheConfig, ctx })
+          .catch((error) => {
+            console.error('[Cache] Save failed:', error instanceof Error ? error.message : String(error));
+          })
+      );
+    }
+
+    return { res: apiResult };
+  };
+
   // Check cache (if not already resolved by unified check)
   let res;
   if (cacheHit && linkData) {
@@ -1525,84 +1588,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  // If cache miss or not enabled, call AList API
   if (!res) {
-    // 发送请求到AList服务
-    const headers = {
-      "content-type": "application/json;charset=UTF-8",
-      Authorization: config.token,
-      "CF-Connecting-IP-WORKERS": clientIP, // Forward the client's IP address, since default CF-Connecting-IP will be overwritten by CF, we should include original CF-Connecting-IP and forward it into a new header.
-    };
-    applyVerifyHeaders(headers, config.verifyHeader, config.verifySecret);
-    let resp = await fetch(`${config.address}/api/fs/link`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        path
-      })
-    });
-
-    // 检查响应类型
-    const contentType = resp.headers.get("content-type") || "";
-
-    // 如果不是JSON格式，返回自定义错误响应
-    if (!contentType.includes("application/json")) {
-      // 获取原始响应的状态码
-      const originalStatus = resp.status;
-      // 创建一个简单的错误消息，不包含敏感信息
-      const safeErrorMessage = JSON.stringify({
-        code: originalStatus,
-        message: `Request failed with status: ${originalStatus}`
-      });
-
-      // 创建全新的headers对象，只添加必要的安全headers
-      const safeHeaders = new Headers();
-      safeHeaders.set("content-type", "application/json;charset=UTF-8");
-      safeHeaders.set("Access-Control-Allow-Origin", origin);
-      safeHeaders.append("Vary", "Origin");
-
-      const safeErrorResp = new Response(safeErrorMessage, {
-        status: originalStatus,
-        statusText: "Error",  // 使用通用状态文本
-        headers: safeHeaders  // 使用安全的headers集合
-      });
-
-      return safeErrorResp;
+    const { res: apiResult, errorResponse } = await fetchLinkDataFromApi();
+    if (errorResponse) {
+      return errorResponse;
     }
-
-    // 如果是JSON，按原来的逻辑处理
-    res = await resp.json();
-    if (res.code !== 200) {
-      // 将错误状态码也反映在HTTP响应中
-      const httpStatus = res.code >= 100 && res.code < 600 ? res.code : 500;
-
-      const safeHeaders = new Headers();
-      safeHeaders.set("content-type", "application/json;charset=UTF-8");
-      safeHeaders.set("Access-Control-Allow-Origin", origin);
-      safeHeaders.append("Vary", "Origin");
-
-      const errorResp = new Response(JSON.stringify(res), {
-        status: httpStatus,
-        headers: safeHeaders
-      });
-      return errorResp;
-    }
-
-    // API call successful, save to cache (if enabled)
-    if (cacheManager && res.data) {
-      ctx.waitUntil(
-        cacheManager
-          .saveCache(path, res.data, { ...config.cacheConfig, ctx })
-          .catch((error) => {
-            // Cache save failure should not block downloads
-            console.error('[Cache] Save failed:', error instanceof Error ? error.message : String(error));
-          })
-      );
-    }
+    res = apiResult;
   }
 
   // Use linkData from cache or API response
-  const downloadUrl = res.data.url;
+  let downloadUrl = res.data.url;
   // ========================================
   // Throttle protection logic (pre-check)
   // ========================================
@@ -1735,17 +1730,27 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
+  const buildUpstreamRequest = (urlValue, headerConfig) => {
+    const upstreamRequest = new Request(urlValue, originalRequest);
+    if (headerConfig && typeof headerConfig === 'object') {
+      Object.keys(headerConfig).forEach((key) => {
+        const entries = Array.isArray(headerConfig[key]) ? headerConfig[key] : [headerConfig[key]];
+        entries.forEach((value) => {
+          if (typeof value === 'string') {
+            upstreamRequest.headers.set(key, value);
+          }
+        });
+      });
+    }
+    return upstreamRequest;
+  };
+  const shouldRetryAuthError = (status) => status === 401 || status === 410;
+
+  let retriedWithFreshLink = false;
+
   // Proceed with fetch
   try {
-    request = new Request(downloadUrl, request);
-    if (res.data.header) {
-      for (const k in res.data.header) {
-        for (const v of res.data.header[k]) {
-          request.headers.set(k, v);
-        }
-      }
-    }
-
+    request = buildUpstreamRequest(downloadUrl, res.data.header);
     let response = await fetch(request);
     while (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("Location");
@@ -1759,6 +1764,34 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         }
       } else {
         break;
+      }
+    }
+
+    if (!retriedWithFreshLink && shouldRetryAuthError(response.status)) {
+      retriedWithFreshLink = true;
+      console.warn(`[Upstream] Auth error ${response.status} for ${path}, refreshing link from API`);
+      const { res: refreshedLink, errorResponse } = await fetchLinkDataFromApi();
+      if (errorResponse) {
+        console.warn('[Upstream] Failed to refresh link due to API error, returning original response');
+      } else if (refreshedLink && refreshedLink.data && refreshedLink.data.url) {
+        downloadUrl = refreshedLink.data.url;
+        res = refreshedLink;
+        request = buildUpstreamRequest(downloadUrl, res.data.header);
+        response = await fetch(request);
+        while (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get("Location");
+          if (location) {
+            if (location.startsWith(`${config.workerAddress}/`)) {
+              request = new Request(location, request);
+              return await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
+            } else {
+              request = new Request(location, request);
+              response = await fetch(request);
+            }
+          } else {
+            break;
+          }
+        }
       }
     }
 
