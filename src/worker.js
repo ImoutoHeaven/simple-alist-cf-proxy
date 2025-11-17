@@ -486,6 +486,14 @@ const resolveConfig = (env = {}) => {
   if (fairQueuePollIntervalMs <= 0) {
     throw new Error('FAIR_QUEUE_POLL_INTERVAL_MS must be greater than 0');
   }
+  const fairQueueMinSlotHoldMs = parseIntegerStrict(
+    env.FAIR_QUEUE_MIN_SLOT_HOLD_MS,
+    800,
+    'FAIR_QUEUE_MIN_SLOT_HOLD_MS'
+  );
+  if (fairQueueMinSlotHoldMs < 0) {
+    throw new Error('FAIR_QUEUE_MIN_SLOT_HOLD_MS must be greater than or equal to 0');
+  }
   const fairQueueTableName = normalizeString(env.FAIR_QUEUE_TABLE_NAME, 'upstream_slot_pool');
   const fairQueueQueueDepthTableName = 'upstream_ip_queue_depth';
 
@@ -569,6 +577,7 @@ const resolveConfig = (env = {}) => {
       queueDepthCleanupTtlSeconds: fairQueueQueueDepthCleanupTtlSeconds,
       queueDepthZombieTtlSeconds: fairQueueQueueDepthZombieTtlSeconds,
       pollIntervalMs: fairQueuePollIntervalMs,
+      minSlotHoldMs: fairQueueMinSlotHoldMs,
       fairQueueTableName,
       fairQueueCooldownTableName: 'upstream_ip_cooldown',
       fairQueueQueueDepthTableName,
@@ -1661,6 +1670,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     config.fairQueueHostnamePatterns.some((pattern) => matchHostnamePattern(upstreamHostname, pattern));
 
   let slotId = null;
+  let slotAcquiredAt = null;
   let fairQueueModule = null;
 
   if (needFairQueue) {
@@ -1751,6 +1761,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // Proceed with fetch
   try {
     request = buildUpstreamRequest(downloadUrl, res.data.header);
+    if (slotId && slotAcquiredAt === null) {
+      slotAcquiredAt = Date.now();
+    }
     let response = await fetch(request);
     while (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("Location");
@@ -1984,6 +1997,28 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (slotId && slotId > 0 && fairQueueModule && typeof fairQueueModule.releaseFairSlot === 'function') {
       const releasePromise = (async () => {
         try {
+          const fairCfg = config.fairQueueConfig || {};
+          const minHoldMs = Number.isFinite(fairCfg.minSlotHoldMs) ? Math.max(0, fairCfg.minSlotHoldMs) : 0;
+
+          if (slotAcquiredAt !== null && minHoldMs > 0) {
+            const now = Date.now();
+            const elapsed = now - slotAcquiredAt;
+
+            if (elapsed < 0) {
+              console.warn('[Fair Queue] Negative elapsed slot time, skip hold logic', {
+                slotId,
+                slotAcquiredAt,
+                now,
+              });
+            } else if (elapsed < minHoldMs) {
+              const remaining = minHoldMs - elapsed;
+              console.log(
+                `[Fair Queue] Holding slot ${slotId} for additional ${remaining}ms (elapsed=${elapsed}ms, minHoldMs=${minHoldMs}ms)`
+              );
+              await sleep(remaining);
+            }
+          }
+
           await fairQueueModule.releaseFairSlot(slotId, config.fairQueueConfig);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
