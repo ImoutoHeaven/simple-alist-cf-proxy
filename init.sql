@@ -273,6 +273,8 @@ BEGIN
         v_error_timestamp := NULL;
         v_last_error_code := NULL;
         v_obs_window_start := v_now;
+        v_obs_error_count := 0;
+        v_obs_success_count := 0;
       ELSE
         v_is_protected := 1;
       END IF;

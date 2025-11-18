@@ -74,7 +74,9 @@ const computeNextState = (existing, event, thresholds) => {
       state.isProtected = 0;
       state.errorTimestamp = null;
       state.lastErrorCode = null;
-      state.obsWindowStart = state.obsWindowStart || event.now;
+      state.obsWindowStart = event.now;
+      state.obsErrorCount = 0;
+      state.obsSuccessCount = 0;
     } else {
       state.isProtected = 1;
     }
