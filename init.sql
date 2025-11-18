@@ -210,28 +210,41 @@ DECLARE
   v_ratio_trigger BOOLEAN := FALSE;
   v_consecutive_trigger BOOLEAN := FALSE;
   v_should_protect BOOLEAN := FALSE;
-  v_existing BOOLEAN := FALSE;
+  v_locked BOOLEAN := FALSE;
+  v_locked_row_count INTEGER := 0;
 BEGIN
-  EXECUTE format(
-    'SELECT "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT"
-       FROM %1$I WHERE "HOSTNAME_HASH" = $1 LIMIT 1',
-    v_table_name
-  )
-  INTO v_hostname, v_error_timestamp, v_is_protected, v_last_error_code, v_obs_window_start, v_obs_error_count, v_obs_success_count, v_consecutive_error_count
-  USING p_hostname_hash;
-
-  v_existing := v_hostname IS NOT NULL;
-
-  IF NOT v_existing THEN
-    v_hostname := p_hostname;
-    v_obs_window_start := v_now;
+  -- Lock row to avoid lost updates under concurrency
+  WHILE NOT v_locked LOOP
+    v_hostname := NULL;
+    v_error_timestamp := NULL;
+    v_is_protected := NULL;
+    v_last_error_code := NULL;
+    v_obs_window_start := NULL;
     v_obs_error_count := 0;
     v_obs_success_count := 0;
     v_consecutive_error_count := 0;
-    v_is_protected := 0;
-    v_error_timestamp := NULL;
-    v_last_error_code := NULL;
-  END IF;
+
+    EXECUTE format(
+      'SELECT "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT"
+         FROM %1$I WHERE "HOSTNAME_HASH" = $1
+         FOR UPDATE',
+      v_table_name
+    )
+    INTO v_hostname, v_error_timestamp, v_is_protected, v_last_error_code, v_obs_window_start, v_obs_error_count, v_obs_success_count, v_consecutive_error_count
+    USING p_hostname_hash;
+
+    GET DIAGNOSTICS v_locked_row_count = ROW_COUNT;
+    v_locked := v_locked_row_count > 0;
+
+    IF NOT v_locked THEN
+      EXECUTE format(
+        'INSERT INTO %1$I ("HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT")
+         VALUES ($1, $2, NULL, 0, NULL, $3, 0, 0, 0)
+         ON CONFLICT ("HOSTNAME_HASH") DO NOTHING',
+        v_table_name
+      ) USING p_hostname_hash, COALESCE(p_hostname, p_hostname_hash), v_now;
+    END IF;
+  END LOOP;
 
   v_hostname := COALESCE(p_hostname, v_hostname);
   v_is_protected := COALESCE(v_is_protected, 0);
@@ -287,17 +300,16 @@ BEGIN
   END IF;
 
   sql := format(
-    'INSERT INTO %1$I ("HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT")
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-     ON CONFLICT ("HOSTNAME_HASH") DO UPDATE SET
-       "HOSTNAME" = EXCLUDED."HOSTNAME",
-       "ERROR_TIMESTAMP" = EXCLUDED."ERROR_TIMESTAMP",
-       "IS_PROTECTED" = EXCLUDED."IS_PROTECTED",
-       "LAST_ERROR_CODE" = EXCLUDED."LAST_ERROR_CODE",
-       "OBS_WINDOW_START" = EXCLUDED."OBS_WINDOW_START",
-       "OBS_ERROR_COUNT" = EXCLUDED."OBS_ERROR_COUNT",
-       "OBS_SUCCESS_COUNT" = EXCLUDED."OBS_SUCCESS_COUNT",
-       "CONSECUTIVE_ERROR_COUNT" = EXCLUDED."CONSECUTIVE_ERROR_COUNT"
+    'UPDATE %1$I SET
+       "HOSTNAME" = $2,
+       "ERROR_TIMESTAMP" = $3,
+       "IS_PROTECTED" = $4,
+       "LAST_ERROR_CODE" = $5,
+       "OBS_WINDOW_START" = $6,
+       "OBS_ERROR_COUNT" = $7,
+       "OBS_SUCCESS_COUNT" = $8,
+       "CONSECUTIVE_ERROR_COUNT" = $9
+     WHERE "HOSTNAME_HASH" = $1
      RETURNING "HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT"',
     v_table_name
   );
