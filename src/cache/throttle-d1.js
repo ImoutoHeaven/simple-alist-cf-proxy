@@ -256,13 +256,9 @@ export const updateThrottle = async (hostname, updateData, config) => {
     return;
   }
 
-  let db = null;
-  let transactionStarted = false;
-  let rollbackIfNeeded = async () => {};
-
   try {
     // Get D1 database instance from binding
-    db = config.env[config.databaseBinding];
+    const db = config.env[config.databaseBinding];
     if (!db) {
       console.error(`[Throttle] D1 database binding '${config.databaseBinding}' not found in env`);
       return;
@@ -303,25 +299,6 @@ export const updateThrottle = async (hostname, updateData, config) => {
         } else {
           console.warn(`[Throttle Cleanup] No ctx.waitUntil available, cleanup may be interrupted`);
         }
-      }
-    };
-
-    transactionStarted = await db.prepare('BEGIN IMMEDIATE').run().then(
-      () => true,
-      (error) => {
-        console.warn('[Throttle] BEGIN IMMEDIATE failed, fallback to non-transaction:', error instanceof Error ? error.message : String(error));
-        return false;
-      }
-    );
-
-    rollbackIfNeeded = async () => {
-      if (transactionStarted) {
-        try {
-          await db.prepare('ROLLBACK').run();
-        } catch (rollbackError) {
-          console.error('[Throttle] ROLLBACK failed:', rollbackError instanceof Error ? rollbackError.message : String(rollbackError));
-        }
-        transactionStarted = false;
       }
     };
 
@@ -394,19 +371,8 @@ export const updateThrottle = async (hostname, updateData, config) => {
       .first();
 
     if (!result) {
-      await rollbackIfNeeded();
       console.error('[Throttle] D1 UPSERT returned no rows');
       return;
-    }
-
-    if (transactionStarted) {
-      try {
-        await db.prepare('COMMIT').run();
-        transactionStarted = false;
-      } catch (commitError) {
-        await rollbackIfNeeded();
-        throw commitError;
-      }
     }
 
     console.log(
@@ -416,7 +382,6 @@ export const updateThrottle = async (hostname, updateData, config) => {
     // Trigger cleanup probabilistically
     triggerCleanup();
   } catch (error) {
-    await rollbackIfNeeded();
     console.error('[Throttle] Update failed:', error.message);
     // Don't propagate error - throttle failure should not block downloads
   }
