@@ -220,7 +220,7 @@ BEGIN
   INTO v_hostname, v_error_timestamp, v_is_protected, v_last_error_code, v_obs_window_start, v_obs_error_count, v_obs_success_count, v_consecutive_error_count
   USING p_hostname_hash;
 
-  v_existing := FOUND;
+  v_existing := v_hostname IS NOT NULL;
 
   IF NOT v_existing THEN
     v_hostname := p_hostname;
