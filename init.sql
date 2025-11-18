@@ -151,7 +151,11 @@ CREATE TABLE IF NOT EXISTS "THROTTLE_PROTECTION" (
   "HOSTNAME" TEXT NOT NULL,
   "ERROR_TIMESTAMP" INTEGER,
   "IS_PROTECTED" INTEGER,
-  "LAST_ERROR_CODE" INTEGER
+  "LAST_ERROR_CODE" INTEGER,
+  "OBS_WINDOW_START" INTEGER,
+  "OBS_ERROR_COUNT" INTEGER NOT NULL DEFAULT 0,
+  "OBS_SUCCESS_COUNT" INTEGER NOT NULL DEFAULT 0,
+  "CONSECUTIVE_ERROR_COUNT" INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_throttle_timestamp
@@ -164,9 +168,14 @@ CREATE INDEX IF NOT EXISTS idx_throttle_timestamp
 CREATE OR REPLACE FUNCTION download_upsert_throttle_protection(
   p_hostname_hash TEXT,
   p_hostname TEXT,
-  p_error_timestamp INTEGER,
-  p_is_protected INTEGER,
-  p_last_error_code INTEGER,
+  p_now INTEGER,
+  p_is_error BOOLEAN,
+  p_status_code INTEGER,
+  p_throttle_time_window INTEGER,
+  p_observe_window_seconds INTEGER,
+  p_error_ratio_percent INTEGER,
+  p_consecutive_threshold INTEGER,
+  p_min_sample_count INTEGER,
   p_table_name TEXT DEFAULT 'THROTTLE_PROTECTION'
 )
 RETURNS TABLE(
@@ -174,24 +183,133 @@ RETURNS TABLE(
   "HOSTNAME" TEXT,
   "ERROR_TIMESTAMP" INTEGER,
   "IS_PROTECTED" INTEGER,
-  "LAST_ERROR_CODE" INTEGER
+  "LAST_ERROR_CODE" INTEGER,
+  "OBS_WINDOW_START" INTEGER,
+  "OBS_ERROR_COUNT" INTEGER,
+  "OBS_SUCCESS_COUNT" INTEGER,
+  "CONSECUTIVE_ERROR_COUNT" INTEGER
 ) AS $$
 DECLARE
   sql TEXT;
+  v_now INTEGER := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::INTEGER);
+  v_table_name TEXT := COALESCE(NULLIF(p_table_name, ''), 'THROTTLE_PROTECTION');
+  v_observe_window_seconds INTEGER := GREATEST(1, COALESCE(p_observe_window_seconds, 60));
+  v_error_ratio_percent INTEGER := GREATEST(0, COALESCE(p_error_ratio_percent, 0));
+  v_consecutive_threshold INTEGER := GREATEST(1, COALESCE(p_consecutive_threshold, 1));
+  v_min_sample_count INTEGER := GREATEST(1, COALESCE(p_min_sample_count, 1));
+  v_throttle_time_window INTEGER := GREATEST(1, COALESCE(p_throttle_time_window, 1));
+
+  v_hostname TEXT := p_hostname;
+  v_error_timestamp INTEGER := NULL;
+  v_is_protected INTEGER := 0;
+  v_last_error_code INTEGER := NULL;
+  v_obs_window_start INTEGER := NULL;
+  v_obs_error_count INTEGER := 0;
+  v_obs_success_count INTEGER := 0;
+  v_consecutive_error_count INTEGER := 0;
+  v_ratio_trigger BOOLEAN := FALSE;
+  v_consecutive_trigger BOOLEAN := FALSE;
+  v_should_protect BOOLEAN := FALSE;
+  v_existing BOOLEAN := FALSE;
 BEGIN
+  EXECUTE format(
+    'SELECT "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT"
+       FROM %1$I WHERE "HOSTNAME_HASH" = $1 LIMIT 1',
+    v_table_name
+  )
+  INTO v_hostname, v_error_timestamp, v_is_protected, v_last_error_code, v_obs_window_start, v_obs_error_count, v_obs_success_count, v_consecutive_error_count
+  USING p_hostname_hash;
+
+  v_existing := FOUND;
+
+  IF NOT v_existing THEN
+    v_hostname := p_hostname;
+    v_obs_window_start := v_now;
+    v_obs_error_count := 0;
+    v_obs_success_count := 0;
+    v_consecutive_error_count := 0;
+    v_is_protected := 0;
+    v_error_timestamp := NULL;
+    v_last_error_code := NULL;
+  END IF;
+
+  v_hostname := COALESCE(p_hostname, v_hostname);
+  v_is_protected := COALESCE(v_is_protected, 0);
+  v_obs_error_count := COALESCE(v_obs_error_count, 0);
+  v_obs_success_count := COALESCE(v_obs_success_count, 0);
+  v_consecutive_error_count := COALESCE(v_consecutive_error_count, 0);
+
+  IF v_obs_window_start IS NULL OR (v_now - v_obs_window_start) >= v_observe_window_seconds THEN
+    v_obs_window_start := v_now;
+    v_obs_error_count := 0;
+    v_obs_success_count := 0;
+    -- 连续错误计数在观察窗口重置时不会被重置，只有成功事件清零
+  END IF;
+
+  IF COALESCE(p_is_error, FALSE) THEN
+    v_obs_error_count := v_obs_error_count + 1;
+    v_consecutive_error_count := v_consecutive_error_count + 1;
+  ELSE
+    v_obs_success_count := v_obs_success_count + 1;
+    v_consecutive_error_count := 0;
+  END IF;
+
+  IF COALESCE(p_is_error, FALSE) THEN
+    IF (v_obs_error_count + v_obs_success_count) >= v_min_sample_count THEN
+      v_ratio_trigger := (v_obs_error_count * 100) >= (v_error_ratio_percent * (v_obs_error_count + v_obs_success_count));
+    END IF;
+    v_consecutive_trigger := v_consecutive_error_count >= v_consecutive_threshold;
+    v_should_protect := v_ratio_trigger OR v_consecutive_trigger;
+  END IF;
+
+  IF v_should_protect THEN
+    v_is_protected := 1;
+    v_error_timestamp := v_now;
+    v_last_error_code := p_status_code;
+  ELSE
+    IF v_is_protected = 1 AND v_error_timestamp IS NOT NULL THEN
+      IF (v_now - v_error_timestamp) >= v_throttle_time_window THEN
+        v_is_protected := 0;
+        v_error_timestamp := NULL;
+        v_last_error_code := NULL;
+        v_obs_window_start := v_now;
+      ELSE
+        v_is_protected := 1;
+      END IF;
+    ELSE
+      v_is_protected := 0;
+      IF COALESCE(p_is_error, FALSE) THEN
+        v_last_error_code := p_status_code;
+      END IF;
+    END IF;
+  END IF;
+
   sql := format(
-    'INSERT INTO %1$I ("HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE")
-     VALUES ($1, $2, $3, $4, $5)
+    'INSERT INTO %1$I ("HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT")
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT ("HOSTNAME_HASH") DO UPDATE SET
        "HOSTNAME" = EXCLUDED."HOSTNAME",
        "ERROR_TIMESTAMP" = EXCLUDED."ERROR_TIMESTAMP",
        "IS_PROTECTED" = EXCLUDED."IS_PROTECTED",
-       "LAST_ERROR_CODE" = EXCLUDED."LAST_ERROR_CODE"
-     RETURNING "HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE"',
-    p_table_name
+       "LAST_ERROR_CODE" = EXCLUDED."LAST_ERROR_CODE",
+       "OBS_WINDOW_START" = EXCLUDED."OBS_WINDOW_START",
+       "OBS_ERROR_COUNT" = EXCLUDED."OBS_ERROR_COUNT",
+       "OBS_SUCCESS_COUNT" = EXCLUDED."OBS_SUCCESS_COUNT",
+       "CONSECUTIVE_ERROR_COUNT" = EXCLUDED."CONSECUTIVE_ERROR_COUNT"
+     RETURNING "HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT"',
+    v_table_name
   );
 
-  RETURN QUERY EXECUTE sql USING p_hostname_hash, p_hostname, p_error_timestamp, p_is_protected, p_last_error_code;
+  RETURN QUERY EXECUTE sql USING
+    p_hostname_hash,
+    v_hostname,
+    v_error_timestamp,
+    v_is_protected,
+    v_last_error_code,
+    v_obs_window_start,
+    v_obs_error_count,
+    v_obs_success_count,
+    v_consecutive_error_count;
 END;
 $$ LANGUAGE plpgsql;
 

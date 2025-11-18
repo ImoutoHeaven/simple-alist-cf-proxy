@@ -1,5 +1,20 @@
 import { sha256Hash, applyVerifyHeaders, hasVerifyCredentials } from '../utils.js';
 
+const sanitizeThresholds = (config) => {
+  const toInt = (value, fallback) => {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+
+  return {
+    throttleTimeWindow: Math.max(1, toInt(config.throttleTimeWindow, 60)),
+    observeWindowSeconds: Math.max(1, toInt(config.observeWindowSeconds, 60)),
+    errorRatioPercent: Math.max(0, toInt(config.errorRatioPercent, 20)),
+    consecutiveThreshold: Math.max(1, toInt(config.consecutiveThreshold, 4)),
+    minSampleCount: Math.max(1, toInt(config.minSampleCount, 8)),
+  };
+};
+
 /**
  * Execute query via PostgREST API
  * @param {string} postgrestUrl - PostgREST API base URL
@@ -180,9 +195,8 @@ export const checkThrottle = async (hostname, config) => {
  * Update throttle protection status for a hostname using RPC stored procedure
  * @param {string} hostname - Hostname
  * @param {Object} updateData - Update data
- * @param {number} updateData.errorTimestamp - Unix timestamp of error (or null to clear)
- * @param {number} updateData.isProtected - 1 to protect, null to clear protection
- * @param {number} updateData.errorCode - HTTP error code (or null)
+ * @param {'error'|'success'} updateData.eventType - Event type
+ * @param {number} updateData.statusCode - HTTP status code for this event
  * @param {Object} config - Throttle configuration
  * @returns {Promise<void>}
  */
@@ -195,9 +209,29 @@ export const updateThrottle = async (hostname, updateData, config) => {
     return;
   }
 
+  const eventType = updateData?.eventType;
+  const isError = eventType === 'error';
+  const isSuccess = eventType === 'success';
+
+  if (!isError && !isSuccess) {
+    console.warn('[Throttle] Skipping updateThrottle due to invalid eventType:', eventType);
+    return;
+  }
+
+  const statusCode = Number.isFinite(updateData?.statusCode)
+    ? Number(updateData.statusCode)
+    : Number.parseInt(updateData?.statusCode, 10);
+
+  if (!Number.isFinite(statusCode)) {
+    console.warn('[Throttle] Skip updateThrottle: invalid statusCode:', updateData?.statusCode);
+    return;
+  }
+
   try {
     const { postgrestUrl, verifyHeader, verifySecret } = config;
     const tableName = config.tableName || 'THROTTLE_PROTECTION';
+    const thresholds = sanitizeThresholds(config);
+    const now = Math.floor(Date.now() / 1000);
 
     // Calculate hostname hash
     const hostnameHash = await sha256Hash(hostname);
@@ -212,7 +246,13 @@ export const updateThrottle = async (hostname, updateData, config) => {
       if (Math.random() < probability) {
         console.log(`[Throttle Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
 
-        const cleanupPromise = cleanupExpiredThrottle(postgrestUrl, verifyHeader, verifySecret, tableName, config.throttleTimeWindow)
+        const cleanupPromise = cleanupExpiredThrottle(
+          postgrestUrl,
+          verifyHeader,
+          verifySecret,
+          tableName,
+          thresholds.throttleTimeWindow
+        )
           .then((deletedCount) => {
             console.log(`[Throttle Cleanup] Background cleanup finished: ${deletedCount} records deleted`);
             return deletedCount;
@@ -235,9 +275,14 @@ export const updateThrottle = async (hostname, updateData, config) => {
     const rpcBody = {
       p_hostname_hash: hostnameHash,
       p_hostname: hostname,
-      p_error_timestamp: updateData.errorTimestamp,
-      p_is_protected: updateData.isProtected,
-      p_last_error_code: updateData.errorCode,
+      p_now: now,
+      p_is_error: isError,
+      p_status_code: statusCode,
+      p_throttle_time_window: thresholds.throttleTimeWindow,
+      p_observe_window_seconds: thresholds.observeWindowSeconds,
+      p_error_ratio_percent: thresholds.errorRatioPercent,
+      p_consecutive_threshold: thresholds.consecutiveThreshold,
+      p_min_sample_count: thresholds.minSampleCount,
       p_table_name: tableName,
     };
 
@@ -263,7 +308,10 @@ export const updateThrottle = async (hostname, updateData, config) => {
       return;
     }
 
-    console.log(`[Throttle] Updated protection status for ${hostname}: IS_PROTECTED=${updateData.isProtected}, ERROR_CODE=${updateData.errorCode}`);
+    const row = rpcResult[0];
+    console.log(
+      `[Throttle] Updated protection for ${hostname}: isProtected=${row.IS_PROTECTED}, errorCode=${row.LAST_ERROR_CODE}, ratioObs=${row.OBS_ERROR_COUNT}/${row.OBS_SUCCESS_COUNT} (consecutive=${row.CONSECUTIVE_ERROR_COUNT})`
+    );
 
     // Trigger cleanup probabilistically
     triggerCleanup();

@@ -228,7 +228,14 @@ const resolveConfig = (env = {}) => {
 
   const throttleProtectHostname = normalizeString(env.THROTTLE_PROTECT_HOSTNAME);
   const throttleTimeWindow = normalizeString(env.THROTTLE_TIME_WINDOW, '60s');
-  const throttleTimeWindowSeconds = parseWindowTime(throttleTimeWindow);
+  const throttleTimeWindowSecondsEnv = parseInteger(env.THROTTLE_TIME_WINDOW_SECONDS);
+  const throttleTimeWindowSeconds = Number.isFinite(throttleTimeWindowSecondsEnv) && throttleTimeWindowSecondsEnv > 0
+    ? throttleTimeWindowSecondsEnv
+    : parseWindowTime(throttleTimeWindow);
+  const throttleObserveWindowSeconds = parseInteger(env.THROTTLE_OBSERVE_WINDOW_SECONDS, 60);
+  const throttleErrorRatioPercent = parseInteger(env.THROTTLE_ERROR_RATIO_PERCENT, 20);
+  const throttleConsecutiveThreshold = parseInteger(env.THROTTLE_CONSECUTIVE_THRESHOLD, 4);
+  const throttleMinSampleCount = parseInteger(env.THROTTLE_MIN_SAMPLE_COUNT, 8);
   const throttleProtectHttpCodeRaw = normalizeString(env.THROTTLE_PROTECT_HTTP_CODE, '429,500,503');
   const throttleProtectHttpCodes = throttleProtectHttpCodeRaw
     ? throttleProtectHttpCodeRaw
@@ -335,6 +342,10 @@ const resolveConfig = (env = {}) => {
         databaseBinding: d1DatabaseBinding,
         tableName: throttleTableName,
         throttleTimeWindow: throttleTimeWindowSeconds,
+        observeWindowSeconds: throttleObserveWindowSeconds,
+        errorRatioPercent: throttleErrorRatioPercent,
+        consecutiveThreshold: throttleConsecutiveThreshold,
+        minSampleCount: throttleMinSampleCount,
         cleanupProbability,
         protectedHttpCodes: throttleProtectHttpCodes,
       };
@@ -348,6 +359,10 @@ const resolveConfig = (env = {}) => {
         apiToken: d1ApiToken,
         tableName: throttleTableName,
         throttleTimeWindow: throttleTimeWindowSeconds,
+        observeWindowSeconds: throttleObserveWindowSeconds,
+        errorRatioPercent: throttleErrorRatioPercent,
+        consecutiveThreshold: throttleConsecutiveThreshold,
+        minSampleCount: throttleMinSampleCount,
         cleanupProbability,
         protectedHttpCodes: throttleProtectHttpCodes,
       };
@@ -361,6 +376,10 @@ const resolveConfig = (env = {}) => {
         verifySecret: verifySecrets,
         tableName: throttleTableName,
         throttleTimeWindow: throttleTimeWindowSeconds,
+        observeWindowSeconds: throttleObserveWindowSeconds,
+        errorRatioPercent: throttleErrorRatioPercent,
+        consecutiveThreshold: throttleConsecutiveThreshold,
+        minSampleCount: throttleMinSampleCount,
         cleanupProbability,
         protectedHttpCodes: throttleProtectHttpCodes,
       };
@@ -1612,7 +1631,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // ========================================
   let throttleStatus = null;
   let throttleHostname = null;
-  let operationMode = 'normal_operation'; // 'normal_operation' or 'resume_operation'
 
   const throttleCheckEnabled = config.throttleEnabled && throttleManager;
   if (throttleCheckEnabled) {
@@ -1653,7 +1671,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         );
         return createThrottleProtectedResponse(origin, throttleStatus);
       } else if (throttleStatus.status === 'resume_operation') {
-        operationMode = 'resume_operation';
         console.log(`[Throttle] Resume operation: ${throttleHostname}`);
       }
     }
@@ -1822,18 +1839,20 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           ? config.throttleConfig.protectedHttpCodes
           : [];
 
-        if (protectedHttpCodes.includes(statusCode)) {
-          // 4xx or 5xx error - set protection
-          console.log(`[Throttle] Error ${statusCode} from ${throttleHostname}, setting protection`);
+        const isProtectedError = protectedHttpCodes.includes(statusCode);
+        const isSuccessStatus = statusCode >= 200 && statusCode < 400;
 
-          const now = Math.floor(Date.now() / 1000);
-          // Don't await - async update (non-blocking)
+        if (isProtectedError || isSuccessStatus) {
+          const eventType = isProtectedError ? 'error' : 'success';
+          if (isProtectedError) {
+            console.log(`[Throttle] Error ${statusCode} from ${throttleHostname}, reporting to throttle window`);
+          }
+
           const updatePromise = throttleManager.updateThrottle(
             throttleHostname,
             {
-              errorTimestamp: now,
-              isProtected: 1,
-              errorCode: statusCode,
+              eventType,
+              statusCode,
             },
             { ...config.throttleConfig, ctx }
           );
@@ -1841,50 +1860,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           if (ctx && ctx.waitUntil) {
             ctx.waitUntil(updatePromise);
           }
-        } else if (statusCode >= 200 && statusCode < 400) {
-          // Success - check operation mode and record existence
-          // BREAKING CHANGE: IS_PROTECTED semantics
-          //   1 = protected (error detected)
-          //   0 = normal operation (initialized or recovered)
-          //   NULL = record does not exist
-          if (operationMode === 'resume_operation') {
-            // Clear protection status (was protected, now recovered)
-            console.log(`[Throttle] Success from ${throttleHostname}, clearing protection (resume operation)`);
-
-            // Don't await - async update (non-blocking)
-            const updatePromise = throttleManager.updateThrottle(
-              throttleHostname,
-              {
-                errorTimestamp: null,
-                isProtected: 0,  // Changed from null to 0
-                errorCode: null,
-              },
-              { ...config.throttleConfig, ctx }
-            );
-
-            if (ctx && ctx.waitUntil) {
-              ctx.waitUntil(updatePromise);
-            }
-          } else if (operationMode === 'normal_operation' && throttleStatus && !throttleStatus.recordExists) {
-            // First time accessing this hostname - create record with IS_PROTECTED = 0 (normal operation)
-            console.log(`[Throttle] Success from ${throttleHostname}, creating initial record (first time)`);
-
-            // Don't await - async update (non-blocking)
-            const updatePromise = throttleManager.updateThrottle(
-              throttleHostname,
-              {
-                errorTimestamp: null,
-                isProtected: 0,  // Changed from null to 0
-                errorCode: null,
-              },
-              { ...config.throttleConfig, ctx }
-            );
-
-            if (ctx && ctx.waitUntil) {
-              ctx.waitUntil(updatePromise);
-            }
-          }
-          // else: normal_operation with existing record (recordExists=true) - skip write
         }
       } catch (error) {
         // Throttle update failure should not block downloads

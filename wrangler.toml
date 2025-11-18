@@ -290,6 +290,14 @@ compatibility_date = "2024-01-01"
 #                                  # Default: "60s"
 #                                  # After this time, requests will resume to check if service recovered
 #
+# THROTTLE_TIME_WINDOW_SECONDS = "" # Optional numeric override (seconds) for protection window
+#                                   # If set, this value takes precedence over THROTTLE_TIME_WINDOW
+#
+# THROTTLE_OBSERVE_WINDOW_SECONDS = "60"  # Observation window length for counting successes/errors
+# THROTTLE_ERROR_RATIO_PERCENT = "20"     # Error ratio threshold (requires min sample count)
+# THROTTLE_CONSECUTIVE_THRESHOLD = "4"    # Consecutive protected responses to trigger protection (set to 1 for immediate)
+# THROTTLE_MIN_SAMPLE_COUNT = "8"         # Minimum samples (success + error) before ratio-based protection is evaluated
+#
 # THROTTLE_PROTECT_HTTP_CODE = "429,500,503"  # Status codes that trigger protection (comma-separated)
 #                                             # Provide only the codes that should cause throttle protect writes
 #                                             # Example: "500" or "429,500,503"
@@ -567,6 +575,10 @@ compatibility_date = "2024-01-01"
 #   FAIR_QUEUE_GLOBAL_LIMIT = "5"
 #   THROTTLE_PROTECT_HOSTNAME = "*.sharepoint.com"
 #   THROTTLE_TIME_WINDOW = "60s"
+#   THROTTLE_OBSERVE_WINDOW_SECONDS = "60"
+#   THROTTLE_ERROR_RATIO_PERCENT = "20"
+#   THROTTLE_CONSECUTIVE_THRESHOLD = "4"
+#   THROTTLE_MIN_SAMPLE_COUNT = "8"
 #   # Result: Normal state → Queue limits concurrency
 #   #         Error state → Throttle blocks requests early
 #
