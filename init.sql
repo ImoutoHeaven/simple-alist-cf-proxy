@@ -772,6 +772,7 @@ AS $$
 DECLARE
   v_hostname_pattern TEXT;
   v_ip_hash          TEXT;
+  v_row_count        INTEGER := 0;
 BEGIN
   SELECT "hostname_pattern", "ip_hash"
     INTO v_hostname_pattern, v_ip_hash
@@ -779,7 +780,9 @@ BEGIN
   WHERE "id" = p_slot_id
   FOR UPDATE;
 
-  IF NOT FOUND THEN
+  GET DIAGNOSTICS v_row_count = ROW_COUNT;
+
+  IF v_row_count = 0 THEN
     RETURN;
   END IF;
 
