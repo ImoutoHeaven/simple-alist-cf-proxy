@@ -1539,17 +1539,31 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  const fetchLinkDataFromApi = async () => {
+  const fetchLinkDataFromApi = async (options = {}) => {
+    const { forceRefresh = false, linkType } = options;
     const headers = {
       "content-type": "application/json;charset=UTF-8",
       Authorization: config.token,
       "CF-Connecting-IP-WORKERS": clientIP,
     };
     applyVerifyHeaders(headers, config.verifyHeader, config.verifySecret);
-    const resp = await fetch(`${config.address}/api/fs/link`, {
+    const requestUrl = new URL(`${config.address}/api/fs/link`);
+    if (forceRefresh) {
+      requestUrl.searchParams.set("refresh", "true");
+      const typeVal =
+        linkType ||
+        (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `refresh-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+      requestUrl.searchParams.set("type", typeVal);
+    } else if (linkType) {
+      requestUrl.searchParams.set("type", linkType);
+    }
+    const payload = forceRefresh ? { path, refresh: true } : { path };
+    const resp = await fetch(requestUrl.toString(), {
       method: "POST",
       headers,
-      body: JSON.stringify({ path }),
+      body: JSON.stringify(payload),
     });
 
     const contentType = resp.headers.get("content-type") || "";
@@ -1589,13 +1603,17 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     if (cacheManager && apiResult.data) {
-      ctx.waitUntil(
-        cacheManager
-          .saveCache(path, apiResult.data, { ...config.cacheConfig, ctx })
-          .catch((error) => {
-            console.error('[Cache] Save failed:', error instanceof Error ? error.message : String(error));
-          })
-      );
+      if (forceRefresh && shouldRetryAuthError(apiResult.code || 0)) {
+        console.warn('[Cache] Skip cache save due to auth error during refresh');
+      } else {
+        ctx.waitUntil(
+          cacheManager
+            .saveCache(path, apiResult.data, { ...config.cacheConfig, ctx })
+            .catch((error) => {
+              console.error('[Cache] Save failed:', error instanceof Error ? error.message : String(error));
+            })
+        );
+      }
     }
 
     return { res: apiResult };
@@ -1800,7 +1818,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (!retriedWithFreshLink && shouldRetryAuthError(response.status)) {
       retriedWithFreshLink = true;
       console.warn(`[Upstream] Auth error ${response.status} for ${path}, refreshing link from API`);
-      const { res: refreshedLink, errorResponse } = await fetchLinkDataFromApi();
+      const refreshType =
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `refresh-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const { res: refreshedLink, errorResponse } = await fetchLinkDataFromApi({
+        forceRefresh: true,
+        linkType: refreshType,
+      });
       if (errorResponse) {
         console.warn('[Upstream] Failed to refresh link due to API error, returning original response');
       } else if (refreshedLink && refreshedLink.data && refreshedLink.data.url) {
