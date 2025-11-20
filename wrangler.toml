@@ -297,6 +297,8 @@ compatibility_date = "2024-01-01"
 # THROTTLE_ERROR_RATIO_PERCENT = "20"     # Error ratio threshold (requires min sample count)
 # THROTTLE_CONSECUTIVE_THRESHOLD = "4"    # Consecutive protected responses to trigger protection (set to 1 for immediate)
 # THROTTLE_MIN_SAMPLE_COUNT = "8"         # Minimum samples (success + error) before ratio-based protection is evaluated
+# THROTTLE_FAST_MIN_SAMPLE_COUNT = "4"    # Fast trigger sample threshold (scheme B). Set to "0" to disable fast ratio.
+# THROTTLE_FAST_ERROR_RATIO_PERCENT = "60" # Fast trigger error ratio (scheme B) - enforced to be >= ERROR_RATIO_PERCENT
 #
 # THROTTLE_PROTECT_HTTP_CODE = "429,500,503"  # Status codes that trigger protection (comma-separated)
 #                                             # Provide only the codes that should cause throttle protect writes

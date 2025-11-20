@@ -176,6 +176,8 @@ CREATE OR REPLACE FUNCTION download_upsert_throttle_protection(
   p_error_ratio_percent INTEGER,
   p_consecutive_threshold INTEGER,
   p_min_sample_count INTEGER,
+  p_fast_error_ratio_percent INTEGER DEFAULT NULL,
+  p_fast_min_sample_count INTEGER DEFAULT NULL,
   p_table_name TEXT DEFAULT 'THROTTLE_PROTECTION'
 )
 RETURNS TABLE(
@@ -198,6 +200,8 @@ DECLARE
   v_consecutive_threshold INTEGER := GREATEST(1, COALESCE(p_consecutive_threshold, 1));
   v_min_sample_count INTEGER := GREATEST(1, COALESCE(p_min_sample_count, 1));
   v_throttle_time_window INTEGER := GREATEST(1, COALESCE(p_throttle_time_window, 1));
+  v_fast_error_ratio_percent INTEGER := NULL;
+  v_fast_min_sample_count INTEGER := NULL;
 
   v_hostname TEXT := p_hostname;
   v_error_timestamp INTEGER := NULL;
@@ -208,11 +212,27 @@ DECLARE
   v_obs_success_count INTEGER := 0;
   v_consecutive_error_count INTEGER := 0;
   v_ratio_trigger BOOLEAN := FALSE;
+  v_fast_ratio_trigger BOOLEAN := FALSE;
   v_consecutive_trigger BOOLEAN := FALSE;
   v_should_protect BOOLEAN := FALSE;
   v_locked BOOLEAN := FALSE;
   v_locked_row_count INTEGER := 0;
+  v_total INTEGER := 0;
 BEGIN
+  v_fast_error_ratio_percent := GREATEST(
+    v_error_ratio_percent,
+    COALESCE(p_fast_error_ratio_percent, v_error_ratio_percent)
+  );
+  v_fast_min_sample_count := COALESCE(p_fast_min_sample_count, 4);
+  IF v_fast_min_sample_count <= 0 THEN
+    v_fast_min_sample_count := 0;
+  ELSE
+    v_fast_min_sample_count := LEAST(
+      v_min_sample_count,
+      GREATEST(1, v_fast_min_sample_count)
+    );
+  END IF;
+
   -- Lock row to avoid lost updates under concurrency
   WHILE NOT v_locked LOOP
     v_hostname := NULL;
@@ -268,11 +288,18 @@ BEGIN
   END IF;
 
   IF COALESCE(p_is_error, FALSE) THEN
-    IF (v_obs_error_count + v_obs_success_count) >= v_min_sample_count THEN
-      v_ratio_trigger := (v_obs_error_count * 100) >= (v_error_ratio_percent * (v_obs_error_count + v_obs_success_count));
+    v_total := v_obs_error_count + v_obs_success_count;
+
+    IF v_total >= v_min_sample_count THEN
+      v_ratio_trigger := (v_obs_error_count * 100) >= (v_error_ratio_percent * v_total);
     END IF;
+
+    IF v_fast_min_sample_count > 0 AND v_total >= v_fast_min_sample_count THEN
+      v_fast_ratio_trigger := (v_obs_error_count * 100) >= (v_fast_error_ratio_percent * v_total);
+    END IF;
+
     v_consecutive_trigger := v_consecutive_error_count >= v_consecutive_threshold;
-    v_should_protect := v_ratio_trigger OR v_consecutive_trigger;
+    v_should_protect := v_ratio_trigger OR v_fast_ratio_trigger OR v_consecutive_trigger;
   END IF;
 
   IF v_should_protect THEN

@@ -236,6 +236,8 @@ const resolveConfig = (env = {}) => {
   const throttleErrorRatioPercent = parseInteger(env.THROTTLE_ERROR_RATIO_PERCENT, 20);
   const throttleConsecutiveThreshold = parseInteger(env.THROTTLE_CONSECUTIVE_THRESHOLD, 4);
   const throttleMinSampleCount = parseInteger(env.THROTTLE_MIN_SAMPLE_COUNT, 8);
+  const throttleFastMinSampleCount = parseInteger(env.THROTTLE_FAST_MIN_SAMPLE_COUNT, 4);
+  const throttleFastErrorRatioPercent = parseInteger(env.THROTTLE_FAST_ERROR_RATIO_PERCENT, 60);
   const throttleProtectHttpCodeRaw = normalizeString(env.THROTTLE_PROTECT_HTTP_CODE, '429,500,503');
   const throttleProtectHttpCodes = throttleProtectHttpCodeRaw
     ? throttleProtectHttpCodeRaw
@@ -346,6 +348,8 @@ const resolveConfig = (env = {}) => {
         errorRatioPercent: throttleErrorRatioPercent,
         consecutiveThreshold: throttleConsecutiveThreshold,
         minSampleCount: throttleMinSampleCount,
+        fastErrorRatioPercent: throttleFastErrorRatioPercent,
+        fastMinSampleCount: throttleFastMinSampleCount,
         cleanupProbability,
         protectedHttpCodes: throttleProtectHttpCodes,
       };
@@ -363,6 +367,8 @@ const resolveConfig = (env = {}) => {
         errorRatioPercent: throttleErrorRatioPercent,
         consecutiveThreshold: throttleConsecutiveThreshold,
         minSampleCount: throttleMinSampleCount,
+        fastErrorRatioPercent: throttleFastErrorRatioPercent,
+        fastMinSampleCount: throttleFastMinSampleCount,
         cleanupProbability,
         protectedHttpCodes: throttleProtectHttpCodes,
       };
@@ -380,6 +386,8 @@ const resolveConfig = (env = {}) => {
         errorRatioPercent: throttleErrorRatioPercent,
         consecutiveThreshold: throttleConsecutiveThreshold,
         minSampleCount: throttleMinSampleCount,
+        fastErrorRatioPercent: throttleFastErrorRatioPercent,
+        fastMinSampleCount: throttleFastMinSampleCount,
         cleanupProbability,
         protectedHttpCodes: throttleProtectHttpCodes,
       };

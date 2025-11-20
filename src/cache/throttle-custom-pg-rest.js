@@ -6,12 +6,20 @@ const sanitizeThresholds = (config) => {
     return Number.isFinite(parsed) ? parsed : fallback;
   };
 
+  const baseMinSample = Math.max(1, toInt(config.minSampleCount, 8));
+  const baseErrorRatio = Math.max(0, toInt(config.errorRatioPercent, 20));
+  const fastMinSampleRaw = toInt(config.fastMinSampleCount, 4);
+  const fastMinSample = fastMinSampleRaw <= 0 ? 0 : Math.max(1, fastMinSampleRaw);
+  const fastErrorRatio = Math.max(0, toInt(config.fastErrorRatioPercent, 60));
+
   return {
     throttleTimeWindow: Math.max(1, toInt(config.throttleTimeWindow, 60)),
     observeWindowSeconds: Math.max(1, toInt(config.observeWindowSeconds, 60)),
-    errorRatioPercent: Math.max(0, toInt(config.errorRatioPercent, 20)),
+    errorRatioPercent: baseErrorRatio,
     consecutiveThreshold: Math.max(1, toInt(config.consecutiveThreshold, 4)),
-    minSampleCount: Math.max(1, toInt(config.minSampleCount, 8)),
+    minSampleCount: baseMinSample,
+    fastErrorRatioPercent: Math.max(baseErrorRatio, fastErrorRatio),
+    fastMinSampleCount: fastMinSample === 0 ? 0 : Math.min(baseMinSample, fastMinSample),
   };
 };
 
@@ -283,6 +291,8 @@ export const updateThrottle = async (hostname, updateData, config) => {
       p_error_ratio_percent: thresholds.errorRatioPercent,
       p_consecutive_threshold: thresholds.consecutiveThreshold,
       p_min_sample_count: thresholds.minSampleCount,
+      p_fast_error_ratio_percent: thresholds.fastErrorRatioPercent,
+      p_fast_min_sample_count: thresholds.fastMinSampleCount,
       p_table_name: tableName,
     };
 

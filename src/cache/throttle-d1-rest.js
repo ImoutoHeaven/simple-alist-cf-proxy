@@ -6,12 +6,20 @@ const sanitizeThresholds = (config) => {
     return Number.isFinite(parsed) ? parsed : fallback;
   };
 
+  const baseMinSample = Math.max(1, toInt(config.minSampleCount, 8));
+  const baseErrorRatio = Math.max(0, toInt(config.errorRatioPercent, 20));
+  const fastMinSampleRaw = toInt(config.fastMinSampleCount, 4);
+  const fastMinSample = fastMinSampleRaw <= 0 ? 0 : Math.max(1, fastMinSampleRaw);
+  const fastErrorRatio = Math.max(0, toInt(config.fastErrorRatioPercent, 60));
+
   return {
     throttleTimeWindow: Math.max(1, toInt(config.throttleTimeWindow, 60)),
     observeWindowSeconds: Math.max(1, toInt(config.observeWindowSeconds, 60)),
-    errorRatioPercent: Math.max(0, toInt(config.errorRatioPercent, 20)),
+    errorRatioPercent: baseErrorRatio,
     consecutiveThreshold: Math.max(1, toInt(config.consecutiveThreshold, 4)),
-    minSampleCount: Math.max(1, toInt(config.minSampleCount, 8)),
+    minSampleCount: baseMinSample,
+    fastErrorRatioPercent: Math.max(baseErrorRatio, fastErrorRatio),
+    fastMinSampleCount: fastMinSample === 0 ? 0 : Math.min(baseMinSample, fastMinSample),
   };
 };
 
@@ -53,6 +61,7 @@ const computeNextState = (existing, event, thresholds) => {
   }
 
   let ratioTrigger = false;
+  let fastRatioTrigger = false;
   let consecutiveTrigger = false;
   let shouldProtect = false;
 
@@ -61,8 +70,11 @@ const computeNextState = (existing, event, thresholds) => {
     if (total >= thresholds.minSampleCount) {
       ratioTrigger = (state.obsErrorCount * 100) >= (thresholds.errorRatioPercent * total);
     }
+    if (thresholds.fastMinSampleCount > 0 && total >= thresholds.fastMinSampleCount) {
+      fastRatioTrigger = (state.obsErrorCount * 100) >= (thresholds.fastErrorRatioPercent * total);
+    }
     consecutiveTrigger = state.consecutiveErrorCount >= thresholds.consecutiveThreshold;
-    shouldProtect = ratioTrigger || consecutiveTrigger;
+    shouldProtect = ratioTrigger || fastRatioTrigger || consecutiveTrigger;
   }
 
   if (shouldProtect) {
