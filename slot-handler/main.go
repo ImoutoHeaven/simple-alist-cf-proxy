@@ -432,6 +432,11 @@ func (s *server) acquireSlot(ctx context.Context, req AcquireRequest) (*AcquireR
 				Meta:         meta,
 			}, nil
 		case "ACQUIRED":
+			tokenLog := tryRes.slotToken
+			if len(tokenLog) > 8 {
+				tokenLog = tokenLog[len(tokenLog)-8:]
+			}
+			s.log.Infof("slot granted host=%s ip=%s token=%s", req.Hostname, req.IPBucket, tokenLog)
 			return &AcquireResponse{
 				Result:    "granted",
 				SlotToken: tryRes.slotToken,
@@ -455,6 +460,12 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 
 	if err := s.backend.ReleaseSlot(ctx, req); err != nil {
 		s.log.Errorf("release slot error: %v", err)
+	} else {
+		tokenLog := req.SlotToken
+		if len(tokenLog) > 8 {
+			tokenLog = tokenLog[len(tokenLog)-8:]
+		}
+		s.log.Infof("slot released host=%s ip=%s token=%s", req.Hostname, req.IPBucket, tokenLog)
 	}
 	return nil
 }

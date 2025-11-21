@@ -1105,6 +1105,7 @@ const createSlotHandlerClient = (config, workerClient) => {
           fqContext.slotToken = data.slotToken;
           fqContext.backend = FAIR_QUEUE_BACKEND.SLOT_HANDLER;
           fqContext.slotAcquiredAt = Date.now();
+          console.log(`[FQ] slot granted via slot-handler host=${fqContext.hostname}`);
           return { kind: 'granted' };
         }
         if (data && data.result === 'throttled') {
@@ -1152,6 +1153,7 @@ const createSlotHandlerClient = (config, workerClient) => {
           headers,
           body: JSON.stringify(payload),
         });
+        console.log(`[FQ] slot released via slot-handler host=${fqContext.hostname}`);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error('[FQ] releaseSlot error (slot-handler):', message);
@@ -1409,6 +1411,7 @@ const createWorkerLocalFQClient = (config, env) => {
               fqContext.slotToken = attempt.slotToken;
               fqContext.slotAcquiredAt = Date.now();
               fqContext.backend = FAIR_QUEUE_BACKEND.WORKER;
+              console.log(`[FQ] slot granted via worker host=${fqContext.hostname}`);
               return { kind: 'granted' };
             }
           } catch (error) {
@@ -1440,6 +1443,7 @@ const createWorkerLocalFQClient = (config, env) => {
         return;
       }
       await releaseLocalSlot(fqContext);
+      console.log(`[FQ] slot released via worker host=${fqContext.hostname}`);
     },
   };
 };
