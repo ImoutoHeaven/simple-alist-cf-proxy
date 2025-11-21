@@ -1048,14 +1048,17 @@ const createFairQueueClient = (config, env) => {
 const createSlotHandlerClient = (config, workerClient) => {
   const slotCfg = config.slotHandlerConfig || {};
   const baseUrl = normalizePostgrestBaseUrl(slotCfg.url);
+  const pgErrorHandle = config.pgErrorHandle || 'fail-closed';
   if (!baseUrl) {
-    return workerClient;
+    if (pgErrorHandle === 'fail-open') {
+      return workerClient;
+    }
+    throw new Error('[FQ] slot-handler backend enabled but FAIR_QUEUE_SLOT_HANDLER_URL is missing');
   }
 
   const acquireUrl = `${baseUrl}/api/v0/fairqueue/acquire`;
   const releaseUrl = `${baseUrl}/api/v0/fairqueue/release`;
   const authKey = slotCfg.authKey || '';
-  const pgErrorHandle = config.pgErrorHandle || 'fail-closed';
   const fallbackClient = workerClient || createWorkerLocalFQClient(config);
   const timeoutMs =
     Number(slotCfg.timeoutMs) ||
