@@ -1072,14 +1072,6 @@ const createSlotHandlerClient = (config, workerClient) => {
         hostnameHash: fqContext.hostnameHash,
         ipBucket: fqContext.ipBucket,
         now: fqContext.nowMs,
-        maxWaitMs: fqContext.maxWaitMs,
-        minSlotHoldMs: fqContext.minSlotHoldMs,
-        maxSlotPerHost: fqContext.maxSlotPerHost,
-        maxSlotPerIp: fqContext.maxSlotPerIp,
-        maxWaitersPerIp: fqContext.maxWaitersPerIp,
-        zombieTimeoutSeconds: fqContext.zombieTimeoutSeconds,
-        cooldownSeconds: fqContext.cooldownSeconds,
-        pollIntervalMs: config.fairQueueConfig?.pollIntervalMs,
       };
 
       try {
@@ -1148,7 +1140,6 @@ const createSlotHandlerClient = (config, workerClient) => {
         slotToken: fqContext.slotToken,
         hitUpstreamAtMs: fqContext.hitUpstreamAtMs || fqContext.nowMs,
         now: Date.now(),
-        minSlotHoldMs: fqContext.minSlotHoldMs,
       };
 
       try {

@@ -350,22 +350,16 @@ func (s *server) acquireSlot(ctx context.Context, req AcquireRequest) (*AcquireR
 		req.Now = time.Now().UnixMilli()
 	}
 
-	maxWait := s.cfg.FairQueue.maxWaitDuration(req.MaxWaitMs)
+	maxWait := s.cfg.FairQueue.maxWaitDuration(0)
 	deadline := time.Now().Add(maxWait)
 	pollInterval := s.cfg.FairQueue.pollInterval()
-	if req.PollIntervalMs > 0 {
-		override := time.Duration(req.PollIntervalMs) * time.Millisecond
-		if override < pollInterval {
-			pollInterval = override
-		}
-	}
-	minHoldMs := s.cfg.FairQueue.minHold(req.MinSlotHoldMs)
+	minHoldMs := s.cfg.FairQueue.minHold(0)
 
-	req.MaxSlotPerHost = pickInt(req.MaxSlotPerHost, s.cfg.FairQueue.maxSlotPerHost())
-	req.MaxSlotPerIP = pickInt(req.MaxSlotPerIP, s.cfg.FairQueue.maxSlotPerIP())
-	req.MaxWaitersPerIP = pickInt(req.MaxWaitersPerIP, s.cfg.FairQueue.maxWaitersPerIP())
-	req.ZombieTimeoutSeconds = pickInt(req.ZombieTimeoutSeconds, s.cfg.FairQueue.zombieTimeoutSeconds())
-	req.CooldownSeconds = pickInt(req.CooldownSeconds, s.cfg.FairQueue.cooldownSeconds())
+	req.MaxSlotPerHost = s.cfg.FairQueue.maxSlotPerHost()
+	req.MaxSlotPerIP = s.cfg.FairQueue.maxSlotPerIP()
+	req.MaxWaitersPerIP = s.cfg.FairQueue.maxWaitersPerIP()
+	req.ZombieTimeoutSeconds = s.cfg.FairQueue.zombieTimeoutSeconds()
+	req.CooldownSeconds = s.cfg.FairQueue.cooldownSeconds()
 
 	throttleRes, err := s.backend.CheckThrottle(ctx, req)
 	if err != nil {
@@ -451,7 +445,7 @@ func (s *server) acquireSlot(ctx context.Context, req AcquireRequest) (*AcquireR
 }
 
 func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
-	minHoldMs := s.cfg.FairQueue.minHold(req.MinSlotHoldMs)
+	minHoldMs := s.cfg.FairQueue.minHold(0)
 
 	target := time.UnixMilli(req.HitUpstreamAt).Add(time.Duration(minHoldMs) * time.Millisecond)
 	now := time.Now()
