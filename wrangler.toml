@@ -487,8 +487,8 @@ compatibility_date = "2024-01-01"
 # FAIR_QUEUE_ENABLED = "false"       # Enable fair queue (default: false)
 #                                     # Requires FAIR_QUEUE_HOST_PATTERNS to be non-empty
 #
-# FAIR_QUEUE_BACKEND = "worker"      # "worker" (use local PostgREST/D1) or "slot-handler"
-#                                     # slot-handler mode calls external Go service via FAIR_QUEUE_SLOT_HANDLER_URL
+# FAIR_QUEUE_BACKEND = "worker"      # "worker": Worker 本地轮询+PostgREST/D1；"slot-handler": 交给外部 Go 服务
+#                                     # slot-handler 行为完全由其 config.json 决定，Worker 仅做调用，不传递本地 queue/hold 参数
 #
 # FAIR_QUEUE_HOST_PATTERNS = ""      # Comma-separated hostname patterns to protect
 #                                     # Supports wildcards: "*.sharepoint.com,*.onedrive.com"
@@ -543,7 +543,7 @@ compatibility_date = "2024-01-01"
 # FAIR_QUEUE_IP_COOLDOWN_SECONDS = "3"  # Cooldown before same IP can re-acquire slot
 #                                       # Default: 3 seconds (set to 0 to disable cooldown logic)
 #
-# FAIR_QUEUE_SLOT_HANDLER_URL = ""      # slot-handler base URL (when FAIR_QUEUE_BACKEND=slot-handler)
+# FAIR_QUEUE_SLOT_HANDLER_URL = ""      # slot-handler base URL (FAIR_QUEUE_BACKEND=slot-handler 时必须)
 # FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS = "" # Optional; defaults to MAX_WAIT_MS + 5000
 # FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY = ""  # Optional shared secret header X-FQ-Auth
 #
