@@ -476,6 +476,8 @@ const resolveConfig = (env = {}) => {
   const fairQueueHostnamePatterns = fairQueueHostPatternsRaw
     ? fairQueueHostPatternsRaw.split(',').map((p) => p.trim()).filter((p) => p.length > 0)
     : [];
+  const fairQueueBackend = normalizeString(env.FAIR_QUEUE_BACKEND, 'worker').toLowerCase();
+  const fairQueueSlotHandlerUrl = normalizeString(env.FAIR_QUEUE_SLOT_HANDLER_URL, '');
 
   const fairQueueGlobalLimit = parseInteger(env.FAIR_QUEUE_GLOBAL_LIMIT, 5);
   const fairQueuePerIpLimit = parseInteger(env.FAIR_QUEUE_PER_IP_LIMIT, 1);
@@ -496,14 +498,23 @@ const resolveConfig = (env = {}) => {
     fairQueueIpCooldownSeconds > 0 ? fairQueueIpCooldownSeconds * 10 : 0,
     60
   );
+  const fairQueueWaitTimeoutLabel =
+    env.FAIR_QUEUE_MAX_WAIT_MS !== undefined ? 'FAIR_QUEUE_MAX_WAIT_MS' : 'FAIR_QUEUE_WAIT_TIMEOUT_MS';
+  const fairQueueWaitTimeoutSource =
+    env.FAIR_QUEUE_MAX_WAIT_MS !== undefined ? env.FAIR_QUEUE_MAX_WAIT_MS : env.FAIR_QUEUE_WAIT_TIMEOUT_MS;
   const fairQueueWaitTimeoutMs = parseIntegerStrict(
-    env.FAIR_QUEUE_WAIT_TIMEOUT_MS,
+    fairQueueWaitTimeoutSource,
     15000,
-    'FAIR_QUEUE_WAIT_TIMEOUT_MS'
+    fairQueueWaitTimeoutLabel
   );
   if (fairQueueWaitTimeoutMs <= 0) {
-    throw new Error('FAIR_QUEUE_WAIT_TIMEOUT_MS must be greater than 0');
+    throw new Error(`${fairQueueWaitTimeoutLabel} must be greater than 0`);
   }
+  const fairQueueSlotHandlerTimeoutMs = parseInteger(
+    env.FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS,
+    fairQueueWaitTimeoutMs + 5000
+  );
+  const fairQueueSlotHandlerAuthKey = normalizeString(env.FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY, '');
   const fairQueueZombieTimeoutSeconds = parseInteger(env.FAIR_QUEUE_ZOMBIE_TIMEOUT_SECONDS, 30);
   const fairQueuePollIntervalMs = parseIntegerStrict(
     env.FAIR_QUEUE_POLL_INTERVAL_MS,
@@ -524,14 +535,20 @@ const resolveConfig = (env = {}) => {
   const fairQueueTableName = normalizeString(env.FAIR_QUEUE_TABLE_NAME, 'upstream_slot_pool');
   const fairQueueQueueDepthTableName = 'upstream_ip_queue_depth';
 
+  const fairQueueBackendReady =
+    fairQueueBackend === 'slot-handler'
+      ? fairQueueSlotHandlerUrl !== '' || Boolean(dbMode)
+      : Boolean(dbMode);
   // Validate Fair Queue configuration
   const actualFairQueueEnabled =
     fairQueueEnabled &&
     fairQueueHostnamePatterns.length > 0 &&
-    Boolean(dbMode);
+    fairQueueBackendReady;
 
   if (fairQueueEnabled && !actualFairQueueEnabled) {
-    console.warn('[Fair Queue] Disabled: HOST_PATTERNS empty or dbMode not configured');
+    console.warn('[Fair Queue] Disabled: HOST_PATTERNS empty或公平队列后端配置缺失');
+  } else if (fairQueueEnabled && fairQueueBackend === 'slot-handler' && !fairQueueSlotHandlerUrl) {
+    console.error('[Fair Queue] slot-handler 未配置 URL，已自动降级为 worker 后端');
   }
 
   const originCheckModes = parseCheckOriginEnv(env.CHECK_ORIGIN);
@@ -572,6 +589,12 @@ const resolveConfig = (env = {}) => {
     throttleConfig,
     rateLimitEnabled,
     rateLimitConfig,
+    fairQueueBackend,
+    slotHandlerConfig: {
+      url: fairQueueSlotHandlerUrl,
+      timeoutMs: fairQueueSlotHandlerTimeoutMs,
+      authKey: fairQueueSlotHandlerAuthKey,
+    },
     windowTime,
     ipSubnetLimit,
     enableCfRatelimiter,
@@ -579,6 +602,7 @@ const resolveConfig = (env = {}) => {
     ipv4Suffix,
     ipv6Suffix,
     initTables,
+    pgErrorHandle,
     idleTimeout: idleTimeoutSeconds,
     lastActiveTableName,
     originCheckModes,
@@ -1000,106 +1024,431 @@ function createThrottleProtectedResponse(origin, throttleStatus) {
   );
 }
 
-const FAIR_QUEUE_RESULT = {
-  ACQUIRED: 'acquired',
-  PER_IP_LIMIT: 'per_ip_limit',
-  TIMEOUT: 'timeout',
-  QUEUE_FULL: 'queue_full',
+const FAIR_QUEUE_BACKEND = {
+  WORKER: 'worker',
+  SLOT_HANDLER: 'slot-handler',
 };
 
-async function acquireFairSlotWithRetry(fairQueueModule, hostname, ipHash, fairQueueConfig) {
-  if (!fairQueueModule || typeof fairQueueModule.tryAcquireFairSlot !== 'function') {
-    throw new Error('[Fair Queue] Module missing tryAcquireFairSlot implementation');
+const normalizePostgrestBaseUrl = (url) => {
+  if (!url || typeof url !== 'string') {
+    return '';
+  }
+  return url.endsWith('/') ? url.slice(0, -1) : url;
+};
+
+const createFairQueueClient = (config, env) => {
+  const workerClient = createWorkerLocalFQClient(config, env);
+  const backend = (config.fairQueueBackend || 'worker').toLowerCase();
+  if (backend === FAIR_QUEUE_BACKEND.SLOT_HANDLER) {
+    return createSlotHandlerClient(config, workerClient);
+  }
+  return workerClient;
+};
+
+const createSlotHandlerClient = (config, workerClient) => {
+  const slotCfg = config.slotHandlerConfig || {};
+  const baseUrl = normalizePostgrestBaseUrl(slotCfg.url);
+  if (!baseUrl) {
+    return workerClient;
   }
 
-  const queueWaitTimeoutMs = Number.isFinite(fairQueueConfig.queueWaitTimeoutMs)
-    ? Math.max(0, fairQueueConfig.queueWaitTimeoutMs)
-    : 15000;
-  const pollIntervalMs = Number.isFinite(fairQueueConfig.pollIntervalMs)
-    ? Math.max(0, fairQueueConfig.pollIntervalMs)
-    : 200;
+  const acquireUrl = `${baseUrl}/api/v0/fairqueue/acquire`;
+  const releaseUrl = `${baseUrl}/api/v0/fairqueue/release`;
+  const authKey = slotCfg.authKey || '';
+  const pgErrorHandle = config.pgErrorHandle || 'fail-closed';
+  const fallbackClient = workerClient || createWorkerLocalFQClient(config);
+  const timeoutMs =
+    Number(slotCfg.timeoutMs) ||
+    Number(config.fairQueueConfig?.queueWaitTimeoutMs || 0) + 5000 ||
+    25000;
 
-  const registerWaiterFn =
-    typeof fairQueueModule.tryRegisterQueueWaiter === 'function'
-      ? fairQueueModule.tryRegisterQueueWaiter
-      : null;
-  const releaseWaiterFn =
-    typeof fairQueueModule.releaseQueueWaiter === 'function'
-      ? fairQueueModule.releaseQueueWaiter
-      : null;
-  const maxWaiters = Number(fairQueueConfig?.maxWaitersPerIp);
-  const enforceQueueDepth =
-    registerWaiterFn &&
-    releaseWaiterFn &&
-    Number.isFinite(maxWaiters) &&
-    maxWaiters > 0;
+  return {
+    async waitForSlot(ctx, fqContext) {
+      const payload = {
+        hostname: fqContext.hostname,
+        hostnameHash: fqContext.hostnameHash,
+        ipBucket: fqContext.ipBucket,
+        now: fqContext.nowMs,
+        maxWaitMs: fqContext.maxWaitMs,
+        minSlotHoldMs: fqContext.minSlotHoldMs,
+        maxSlotPerHost: fqContext.maxSlotPerHost,
+        maxSlotPerIp: fqContext.maxSlotPerIp,
+        maxWaitersPerIp: fqContext.maxWaitersPerIp,
+        zombieTimeoutSeconds: fqContext.zombieTimeoutSeconds,
+        cooldownSeconds: fqContext.cooldownSeconds,
+        pollIntervalMs: config.fairQueueConfig?.pollIntervalMs,
+      };
 
-  const start = Date.now();
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const headers = { 'Content-Type': 'application/json' };
+        if (authKey) {
+          headers['X-FQ-Auth'] = authKey;
+        }
 
-  const waitForNextAttempt = async () => {
-    const elapsed = Date.now() - start;
-    if (elapsed >= queueWaitTimeoutMs) {
-      return false;
+        const res = await fetch(acquireUrl, {
+          method: 'POST',
+          body: JSON.stringify(payload),
+          headers,
+          signal: controller.signal,
+        });
+
+        clearTimeout(timer);
+
+        if (!res.ok) {
+          const message = `[FQ] slot-handler acquire failed: status ${res.status}`;
+          console.error(message);
+          if (pgErrorHandle === 'fail-open') {
+            return fallbackClient.waitForSlot(ctx, fqContext);
+          }
+          throw new Error(message);
+        }
+
+        const data = await res.json();
+        if (data && data.result === 'granted') {
+          fqContext.slotToken = data.slotToken;
+          fqContext.backend = FAIR_QUEUE_BACKEND.SLOT_HANDLER;
+          fqContext.slotAcquiredAt = Date.now();
+          return { kind: 'granted' };
+        }
+        if (data && data.result === 'throttled') {
+          return {
+            kind: 'throttled',
+            throttleCode: Number.isFinite(data.throttleCode) ? data.throttleCode : 503,
+          };
+        }
+        return { kind: 'timeout' };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[FQ] slot-handler acquire error:', message);
+        if (pgErrorHandle === 'fail-open') {
+          return fallbackClient.waitForSlot(ctx, fqContext);
+        }
+        throw error;
+      }
+    },
+
+    async releaseSlot(ctx, fqContext) {
+      if (fqContext.backend === FAIR_QUEUE_BACKEND.WORKER) {
+        return fallbackClient.releaseSlot(ctx, fqContext);
+      }
+
+      if (!fqContext.slotToken) {
+        return;
+      }
+
+      const payload = {
+        hostname: fqContext.hostname,
+        hostnameHash: fqContext.hostnameHash,
+        ipBucket: fqContext.ipBucket,
+        slotToken: fqContext.slotToken,
+        hitUpstreamAtMs: fqContext.hitUpstreamAtMs || fqContext.nowMs,
+        now: Date.now(),
+        minSlotHoldMs: fqContext.minSlotHoldMs,
+      };
+
+      try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (authKey) {
+          headers['X-FQ-Auth'] = authKey;
+        }
+        await fetch(releaseUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[FQ] releaseSlot error (slot-handler):', message);
+      }
+    },
+  };
+};
+
+const createWorkerLocalFQClient = (config, env) => {
+  const fairCfg = config.fairQueueConfig || {};
+  const normalizedDbMode = (config.dbMode || '').trim().toLowerCase();
+  const postgrestUrl = normalizePostgrestBaseUrl(fairCfg.postgrestUrl);
+  const maxWaitMs = Number.isFinite(fairCfg.queueWaitTimeoutMs)
+    ? Math.max(0, fairCfg.queueWaitTimeoutMs)
+    : 20000;
+  const pollIntervalMs = Number.isFinite(fairCfg.pollIntervalMs)
+    ? Math.max(0, fairCfg.pollIntervalMs)
+    : 500;
+  const minHoldMs = Number.isFinite(fairCfg.minSlotHoldMs)
+    ? Math.max(0, fairCfg.minSlotHoldMs)
+    : 0;
+
+  let cachedFairQueueModule = null;
+
+  const buildPostgrestHeaders = () => {
+    const headers = { 'Content-Type': 'application/json' };
+    applyVerifyHeaders(headers, fairCfg.verifyHeader, fairCfg.verifySecret);
+    return headers;
+  };
+
+  const callPostgrestRpc = async (fnName, body) => {
+    if (!postgrestUrl) {
+      throw new Error('[Fair Queue] PostgREST URL not configured');
     }
-    const remaining = queueWaitTimeoutMs - elapsed;
-    const waitMs = pollIntervalMs > 0 ? Math.min(pollIntervalMs, remaining) : remaining;
-    if (waitMs <= 0) {
-      return false;
+    const response = await fetch(`${postgrestUrl}/rpc/${fnName}`, {
+      method: 'POST',
+      headers: buildPostgrestHeaders(),
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`[Fair Queue] PostgREST ${fnName} failed: ${response.status} ${text}`);
     }
-    await sleep(waitMs);
+    const data = await response.json().catch(() => ({}));
+    if (Array.isArray(data) && data.length === 1) {
+      return data[0];
+    }
+    return data || {};
+  };
+
+  const loadFairQueueModule = async () => {
+    if (cachedFairQueueModule) {
+      return cachedFairQueueModule;
+    }
+    if (normalizedDbMode === 'd1') {
+      cachedFairQueueModule = await import('./unified-check-d1.js');
+    } else if (normalizedDbMode === 'd1-rest') {
+      cachedFairQueueModule = await import('./unified-check-d1-rest.js');
+    }
+    return cachedFairQueueModule;
+  };
+
+  const registerWaiter = async (fqContext) => {
+    if (!fqContext?.ipBucket || !Number.isFinite(fairCfg.maxWaitersPerIp) || fairCfg.maxWaitersPerIp <= 0) {
+      return true;
+    }
+
+    if (normalizedDbMode === 'custom-pg-rest') {
+      const data = await callPostgrestRpc('download_register_fq_waiter', {
+        p_hostname_hash: fqContext.hostnameHash,
+        p_hostname: fqContext.hostname,
+        p_ip_bucket: fqContext.ipBucket,
+        p_max_waiters_per_ip: fairCfg.maxWaitersPerIp,
+        p_zombie_timeout_seconds: fairCfg.queueDepthZombieTtlSeconds,
+      });
+      const status = (data.status || '').toUpperCase();
+      return status === 'REGISTERED';
+    }
+
+    if (normalizedDbMode === 'd1' || normalizedDbMode === 'd1-rest') {
+      const fairQueueModule = await loadFairQueueModule();
+      if (fairQueueModule && typeof fairQueueModule.tryRegisterQueueWaiter === 'function') {
+        return fairQueueModule.tryRegisterQueueWaiter(
+          fqContext.hostname,
+          fqContext.ipBucket,
+          { ...fairCfg, env }
+        );
+      }
+    }
+
     return true;
   };
 
-  let registeredWaiter = false;
+  const releaseWaiter = async (fqContext) => {
+    if (!fqContext?.ipBucket) {
+      return;
+    }
 
-  try {
-    while (true) {
-      if (enforceQueueDepth && !registeredWaiter) {
-        registeredWaiter = await registerWaiterFn(hostname, ipHash, fairQueueConfig);
-        if (!registeredWaiter) {
-          const canContinue = await waitForNextAttempt();
-          if (!canContinue) {
-            return { status: FAIR_QUEUE_RESULT.TIMEOUT };
-          }
-          continue;
+    if (normalizedDbMode === 'custom-pg-rest') {
+      await callPostgrestRpc('download_release_fq_waiter', {
+        p_hostname: fqContext.hostname,
+        p_ip_bucket: fqContext.ipBucket,
+      });
+      return;
+    }
+
+    if (normalizedDbMode === 'd1' || normalizedDbMode === 'd1-rest') {
+      const fairQueueModule = await loadFairQueueModule();
+      if (fairQueueModule && typeof fairQueueModule.releaseQueueWaiter === 'function') {
+        await fairQueueModule.releaseQueueWaiter(
+          fqContext.hostname,
+          fqContext.ipBucket,
+          { ...fairCfg, env }
+        );
+      }
+    }
+  };
+
+  const tryAcquire = async (fqContext) => {
+    if (normalizedDbMode === 'custom-pg-rest') {
+      const payload = {
+        p_hostname_hash: fqContext.hostnameHash,
+        p_hostname: fqContext.hostname,
+        p_ip_bucket: fqContext.ipBucket,
+        p_now_ms: fqContext.nowMs,
+        p_max_slot_per_host: fqContext.maxSlotPerHost,
+        p_max_slot_per_ip: fqContext.maxSlotPerIp,
+        p_max_waiters_per_ip: fqContext.maxWaitersPerIp,
+        p_zombie_timeout: fqContext.zombieTimeoutSeconds,
+        p_cooldown_seconds: fqContext.cooldownSeconds,
+      };
+      const data = await callPostgrestRpc('download_try_acquire_slot', payload);
+      const status = (data.status || '').toUpperCase();
+      const throttleCode =
+        Number.isFinite(data.throttle_code) && data.throttle_code > 0
+          ? data.throttle_code
+          : Number.isFinite(data.throttleCode) && data.throttleCode > 0
+            ? data.throttleCode
+            : null;
+      if (status === 'THROTTLED') {
+        return {
+          kind: 'throttled',
+          throttleCode: throttleCode || 503,
+        };
+      }
+      if (status === 'ACQUIRED') {
+        const slotToken = data.slot_token || data.slotToken;
+        return { kind: 'granted', slotToken };
+      }
+      return { kind: 'wait' };
+    }
+
+    if (normalizedDbMode === 'd1' || normalizedDbMode === 'd1-rest') {
+      const fairQueueModule = await loadFairQueueModule();
+      if (fairQueueModule && typeof fairQueueModule.tryAcquireFairSlot === 'function') {
+        const slotId = await fairQueueModule.tryAcquireFairSlot(
+          fqContext.hostname,
+          fqContext.ipBucket,
+          { ...fairCfg, env }
+        );
+        if (Number.isFinite(slotId) && slotId > 0) {
+          return { kind: 'granted', slotToken: slotId };
         }
       }
-
-      const elapsed = Date.now() - start;
-      if (elapsed > queueWaitTimeoutMs) {
-        return { status: FAIR_QUEUE_RESULT.TIMEOUT };
-      }
-
-      const slotId = await fairQueueModule.tryAcquireFairSlot(
-        hostname,
-        ipHash,
-        fairQueueConfig
-      );
-
-      if (!Number.isFinite(slotId)) {
-        throw new Error('[Fair Queue] tryAcquireFairSlot returned invalid slot id');
-      }
-
-      if (slotId > 0) {
-        return { status: FAIR_QUEUE_RESULT.ACQUIRED, slotId };
-      }
-
-      const canContinue = await waitForNextAttempt();
-      if (!canContinue) {
-        return { status: FAIR_QUEUE_RESULT.TIMEOUT };
-      }
+      return { kind: 'wait' };
     }
-  } finally {
-    if (registeredWaiter && releaseWaiterFn) {
+
+    return { kind: 'wait' };
+  };
+
+  const releaseLocalSlot = async (fqContext) => {
+    const start =
+      fqContext.hitUpstreamAtMs || fqContext.slotAcquiredAt || fqContext.nowMs || Date.now();
+    const elapsed = Date.now() - start;
+    if (elapsed < minHoldMs) {
+      await sleep(minHoldMs - elapsed);
+    }
+
+    if (normalizedDbMode === 'custom-pg-rest') {
+      const payload = {
+        p_hostname_hash: fqContext.hostnameHash,
+        p_ip_bucket: fqContext.ipBucket,
+        p_slot_token: fqContext.slotToken,
+        p_now_ms: Date.now(),
+      };
       try {
-        await releaseWaiterFn(hostname, ipHash, fairQueueConfig);
+        await callPostgrestRpc('download_release_slot', payload);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        console.error('[Fair Queue] Failed to release queue waiter:', message);
+        console.error('[FQ] releaseSlot error (worker):', message);
+      }
+      return;
+    }
+
+    if (normalizedDbMode === 'd1' || normalizedDbMode === 'd1-rest') {
+      const fairQueueModule = await loadFairQueueModule();
+      if (fairQueueModule && typeof fairQueueModule.releaseFairSlot === 'function') {
+        try {
+          await fairQueueModule.releaseFairSlot(Number(fqContext.slotToken), {
+            ...fairCfg,
+            env,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[FQ] releaseSlot error (worker D1):', message);
+        }
       }
     }
-  }
-}
+  };
+
+  return {
+    async waitForSlot(ctx, fqContext) {
+      const start = Date.now();
+      let registered = false;
+
+      try {
+        while (true) {
+          if (Date.now() - start > maxWaitMs) {
+            return { kind: 'timeout' };
+          }
+
+          if (!registered && Number.isFinite(fairCfg.maxWaitersPerIp) && fairCfg.maxWaitersPerIp > 0) {
+            try {
+              const allowed = await registerWaiter(fqContext);
+              if (allowed) {
+                registered = true;
+              } else {
+                const elapsed = Date.now() - start;
+                const remaining = maxWaitMs - elapsed;
+                const waitMs = pollIntervalMs > 0 ? Math.min(pollIntervalMs, remaining) : remaining;
+                if (waitMs > 0) {
+                  await sleep(waitMs);
+                }
+                continue;
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              console.error('[FQ] register waiter failed:', message);
+              const elapsed = Date.now() - start;
+              const remaining = maxWaitMs - elapsed;
+              const waitMs = pollIntervalMs > 0 ? Math.min(pollIntervalMs, remaining) : remaining;
+              if (waitMs > 0) {
+                await sleep(waitMs);
+              }
+              continue;
+            }
+          }
+
+          try {
+            const attempt = await tryAcquire(fqContext);
+            if (attempt.kind === 'throttled') {
+              return attempt;
+            }
+            if (attempt.kind === 'granted') {
+              fqContext.slotToken = attempt.slotToken;
+              fqContext.slotAcquiredAt = Date.now();
+              fqContext.backend = FAIR_QUEUE_BACKEND.WORKER;
+              return { kind: 'granted' };
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error('[FQ] local acquire error:', message);
+          }
+
+          const elapsed = Date.now() - start;
+          const remaining = maxWaitMs - elapsed;
+          const waitMs = pollIntervalMs > 0 ? Math.min(pollIntervalMs, remaining) : remaining;
+          if (waitMs > 0) {
+            await sleep(waitMs);
+          }
+        }
+      } finally {
+        if (registered) {
+          try {
+            await releaseWaiter(fqContext);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error('[FQ] release waiter failed:', message);
+          }
+        }
+      }
+    },
+
+    async releaseSlot(ctx, fqContext) {
+      if (!fqContext?.slotToken) {
+        return;
+      }
+      await releaseLocalSlot(fqContext);
+    },
+  };
+};
 
 function safeDecodePathname(pathname) {
   try {
@@ -1706,77 +2055,61 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // Fair Upstream Queue Integration
   // ========================================
   const upstreamHostname = extractHostname(downloadUrl);
-  const normalizedDbMode = (config.dbMode || '').trim().toLowerCase();
   const needFairQueue =
     config.fairQueueEnabled &&
     upstreamHostname &&
     config.fairQueueHostnamePatterns.some((pattern) => matchHostnamePattern(upstreamHostname, pattern));
 
-  let slotId = null;
-  let slotAcquiredAt = null;
-  let fairQueueModule = null;
+  let fairQueueClient = null;
+  let fqContext = null;
 
   if (needFairQueue) {
     const clientIpSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
 
     if (clientIpSubnet) {
       const clientIpSubnetHash = await sha256Hash(clientIpSubnet);
+      const hostnameHash = await sha256Hash(upstreamHostname);
+      fairQueueClient = createFairQueueClient(config, env);
+      fqContext = {
+        hostname: upstreamHostname,
+        hostnameHash,
+        ipBucket: clientIpSubnetHash,
+        nowMs: Date.now(),
+        maxWaitMs: config.fairQueueConfig.queueWaitTimeoutMs,
+        minSlotHoldMs: config.fairQueueConfig.minSlotHoldMs,
+        maxSlotPerHost: config.fairQueueConfig.globalLimit,
+        maxSlotPerIp: config.fairQueueConfig.perIpLimit,
+        maxWaitersPerIp: config.fairQueueConfig.maxWaitersPerIp,
+        zombieTimeoutSeconds: config.fairQueueConfig.zombieTimeoutSeconds,
+        cooldownSeconds: config.fairQueueConfig.ipCooldownSeconds,
+        backend: config.fairQueueBackend,
+      };
 
-      if (normalizedDbMode === 'custom-pg-rest') {
-        fairQueueModule = await import('./fairqueue/custom-pg-rest.js');
-      } else if (normalizedDbMode === 'd1') {
-        fairQueueModule = await import('./unified-check-d1.js');
-      } else if (normalizedDbMode === 'd1-rest') {
-        fairQueueModule = await import('./unified-check-d1-rest.js');
+      const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext);
+      if (fqResult.kind === 'throttled') {
+        return createThrottleProtectedResponse(origin, {
+          status: 'protected',
+          errorCode: fqResult.throttleCode || 503,
+        });
       }
 
-      if (fairQueueModule && typeof fairQueueModule.tryAcquireFairSlot === 'function') {
-        try {
-          const acquireResult = await acquireFairSlotWithRetry(
-            fairQueueModule,
-            upstreamHostname,
-            clientIpSubnetHash,
-            config.fairQueueConfig
-          );
+      if (fqResult.kind === 'timeout') {
+        const safeHeaders = new Headers();
+        safeHeaders.set("content-type", "application/json;charset=UTF-8");
+        safeHeaders.set("Access-Control-Allow-Origin", origin);
+        safeHeaders.append("Vary", "Origin");
+        safeHeaders.set("Retry-After", "60");
 
-          if (acquireResult.status === FAIR_QUEUE_RESULT.ACQUIRED) {
-            slotId = acquireResult.slotId;
-          } else if (
-            acquireResult.status === FAIR_QUEUE_RESULT.TIMEOUT ||
-            acquireResult.status === FAIR_QUEUE_RESULT.QUEUE_FULL ||
-            acquireResult.status === FAIR_QUEUE_RESULT.PER_IP_LIMIT
-          ) {
-            const reasonLabel =
-              acquireResult.status === FAIR_QUEUE_RESULT.PER_IP_LIMIT
-                ? 'per-IP queue wait timeout'
-                : acquireResult.status === FAIR_QUEUE_RESULT.QUEUE_FULL
-                  ? 'queue depth wait timeout'
-                  : 'queue wait timeout';
-            console.warn(`[Fair Queue] ${reasonLabel} for ${upstreamHostname}`);
-
-            const safeHeaders = new Headers();
-            safeHeaders.set("content-type", "application/json;charset=UTF-8");
-            safeHeaders.set("Access-Control-Allow-Origin", origin);
-            safeHeaders.append("Vary", "Origin");
-            safeHeaders.set("Retry-After", "60");
-
-            return new Response(
-              JSON.stringify({
-                code: 503,
-                message: 'Upstream queue timeout, please retry later'
-              }),
-              {
-                status: 503,
-                headers: safeHeaders
-              }
-            );
+        return new Response(
+          JSON.stringify({
+            code: 503,
+            message: 'Upstream queue timeout, please retry later'
+          }),
+          {
+            status: 503,
+            headers: safeHeaders
           }
-        } catch (error) {
-          // Other errors propagate
-          throw error;
-        }
-      } else {
-        console.warn('[Fair Queue] Module missing tryAcquireFairSlot implementation');
+        );
       }
     } else {
       console.warn('[Fair Queue] Skipped: unable to derive client subnet for queue enforcement');
@@ -1804,8 +2137,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // Proceed with fetch
   try {
     request = buildUpstreamRequest(downloadUrl, res.data.header);
-    if (slotId && slotAcquiredAt === null) {
-      slotAcquiredAt = Date.now();
+    if (fqContext && !fqContext.hitUpstreamAtMs) {
+      fqContext.hitUpstreamAtMs = Date.now();
     }
     let response = await fetch(request);
     while (response.status >= 300 && response.status < 400) {
@@ -2001,39 +2334,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     return safeResponse;
   } finally {
-    // Release Fair Queue slot
-    if (slotId && slotId > 0 && fairQueueModule && typeof fairQueueModule.releaseFairSlot === 'function') {
-      const releasePromise = (async () => {
-        try {
-          const fairCfg = config.fairQueueConfig || {};
-          const minHoldMs = Number.isFinite(fairCfg.minSlotHoldMs) ? Math.max(0, fairCfg.minSlotHoldMs) : 0;
-
-          if (slotAcquiredAt !== null && minHoldMs > 0) {
-            const now = Date.now();
-            const elapsed = now - slotAcquiredAt;
-
-            if (elapsed < 0) {
-              console.warn('[Fair Queue] Negative elapsed slot time, skip hold logic', {
-                slotId,
-                slotAcquiredAt,
-                now,
-              });
-            } else if (elapsed < minHoldMs) {
-              const remaining = minHoldMs - elapsed;
-              console.log(
-                `[Fair Queue] Holding slot ${slotId} for additional ${remaining}ms (elapsed=${elapsed}ms, minHoldMs=${minHoldMs}ms)`
-              );
-              await sleep(remaining);
-            }
-          }
-
-          await fairQueueModule.releaseFairSlot(slotId, config.fairQueueConfig);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          console.error('[Fair Queue] Release failed:', message);
-        }
-      })();
-
+    if (fairQueueClient && fqContext && fqContext.slotToken) {
+      const releasePromise = fairQueueClient.releaseSlot(ctx, fqContext);
       if (ctx && typeof ctx.waitUntil === 'function') {
         ctx.waitUntil(releasePromise);
       } else {

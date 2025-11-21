@@ -443,7 +443,7 @@ compatibility_date = "2024-01-01"
 # 1. Request arrives → Hostname matches FAIR_QUEUE_HOST_PATTERNS
 # 2. Worker tries to acquire slot from pool (max concurrent = FAIR_QUEUE_GLOBAL_LIMIT)
 # 3. If slot available → Acquire → Fetch upstream → Release immediately
-# 4. If no slot available → Wait in queue (up to FAIR_QUEUE_WAIT_TIMEOUT_MS)
+# 4. If no slot available → Wait in queue (up to FAIR_QUEUE_MAX_WAIT_MS)
 # 5. If per-IP limit reached → Return 429 immediately
 #
 # Slot Occupancy Timeline:
@@ -485,8 +485,10 @@ compatibility_date = "2024-01-01"
 # Configuration:
 #
 # FAIR_QUEUE_ENABLED = "false"       # Enable fair queue (default: false)
-#                                     # Requires DB_MODE to be set
 #                                     # Requires FAIR_QUEUE_HOST_PATTERNS to be non-empty
+#
+# FAIR_QUEUE_BACKEND = "worker"      # "worker" (use local PostgREST/D1) or "slot-handler"
+#                                     # slot-handler mode calls external Go service via FAIR_QUEUE_SLOT_HANDLER_URL
 #
 # FAIR_QUEUE_HOST_PATTERNS = ""      # Comma-separated hostname patterns to protect
 #                                     # Supports wildcards: "*.sharepoint.com,*.onedrive.com"
@@ -510,10 +512,11 @@ compatibility_date = "2024-01-01"
 #                                     # Requests beyond this depth are rejected immediately with 429
 #                                     # Helps prevent IDM-style burst traffic from overwhelming the queue
 #
-# FAIR_QUEUE_WAIT_TIMEOUT_MS = "15000"  # Max queue wait time in milliseconds
-#                                        # Default: 15000 (15 seconds)
-#                                        # Leaves 15s buffer for 30s Worker wall-time limit
-#                                        # If exceeded → Returns 503 Queue Timeout
+# FAIR_QUEUE_MAX_WAIT_MS = "15000"   # Max queue wait time in milliseconds
+#                                     # Default: 15000 (15 seconds)
+#                                     # Leaves 15s buffer for 30s Worker wall-time limit
+#                                     # If exceeded → Returns 503 Queue Timeout
+#                                     # Legacy name FAIR_QUEUE_WAIT_TIMEOUT_MS is still accepted
 #
 # FAIR_QUEUE_ZOMBIE_TIMEOUT_SECONDS = "30"  # Zombie slot auto-reclaim timeout
 #                                            # Default: 30 seconds
@@ -539,6 +542,10 @@ compatibility_date = "2024-01-01"
 #
 # FAIR_QUEUE_IP_COOLDOWN_SECONDS = "3"  # Cooldown before same IP can re-acquire slot
 #                                       # Default: 3 seconds (set to 0 to disable cooldown logic)
+#
+# FAIR_QUEUE_SLOT_HANDLER_URL = ""      # slot-handler base URL (when FAIR_QUEUE_BACKEND=slot-handler)
+# FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS = "" # Optional; defaults to MAX_WAIT_MS + 5000
+# FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY = ""  # Optional shared secret header X-FQ-Auth
 #
 # Error Responses:
 # ┌─────────────────────────┬──────────┬─────────────┬───────────────────────────────┐

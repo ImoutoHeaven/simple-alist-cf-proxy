@@ -1,0 +1,36 @@
+{
+  "listen": ":8080",
+  "logLevel": "info",
+  "auth": {
+    "enabled": true,
+    "header": "X-FQ-Auth",
+    "token": "change-me"
+  },
+  "backend": {
+    "mode": "postgrest",
+    "postgrest": {
+      "baseUrl": "https://your-postgrest-endpoint.example.com",
+      "authHeader": "Bearer your-postgrest-token"
+    },
+    "postgres": {
+      "dsn": "postgres://user:pass@host:5432/dbname?sslmode=disable"
+    }
+  },
+  "fairQueue": {
+    "maxWaitMs": 20000,
+    "pollIntervalMs": 500,
+    "minSlotHoldMs": 800,
+    "maxSlotPerHost": 5,
+    "maxSlotPerIp": 1,
+    "maxWaitersPerIp": 3,
+    "zombieTimeoutSeconds": 30,
+    "ipCooldownSeconds": 0,
+    "rpc": {
+      "throttleCheckFunc": "download_check_throttle_protection",
+      "registerWaiterFunc": "download_register_fq_waiter",
+      "releaseWaiterFunc": "download_release_fq_waiter",
+      "tryAcquireFunc": "download_try_acquire_slot",
+      "releaseFunc": "download_release_slot"
+    }
+  }
+}
