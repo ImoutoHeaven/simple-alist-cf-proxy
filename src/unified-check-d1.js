@@ -549,6 +549,47 @@ const ensureQueueDepthTable = async (db, tableName = 'upstream_ip_queue_depth') 
     .run();
 };
 
+const ensurePacingTable = async (db, tableName = 'worker_host_pacing') => {
+  await db
+    .prepare(`
+      CREATE TABLE IF NOT EXISTS ${tableName} (
+        hostname_pattern TEXT PRIMARY KEY,
+        last_acquired_at TEXT NOT NULL
+      )
+    `)
+    .run();
+};
+
+const tryClaimPacingToken = async (db, hostname, intervalMs, tableName = 'worker_host_pacing') => {
+  if (!intervalMs || intervalMs <= 0) {
+    return true;
+  }
+
+  const seconds = intervalMs / 1000;
+  const modifier = `-${seconds} seconds`;
+
+  try {
+    const result = await db
+      .prepare(
+        `
+        INSERT INTO ${tableName} (hostname_pattern, last_acquired_at)
+        VALUES (?, strftime('%Y-%m-%d %H:%M:%f','now'))
+        ON CONFLICT(hostname_pattern) DO UPDATE
+        SET last_acquired_at = excluded.last_acquired_at
+        WHERE ${tableName}.last_acquired_at <= strftime('%Y-%m-%d %H:%M:%f','now', ?)
+        `
+      )
+      .bind(hostname, modifier)
+      .run();
+
+    const changes = result.meta?.changes ?? 0;
+    return changes > 0;
+  } catch (e) {
+    console.error('[D1 Pacing] Error:', e);
+    return false;
+  }
+};
+
 const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
   const tableName = config.fairQueueTableName || 'upstream_slot_pool';
   const cooldownTableName = config.fairQueueCooldownTableName || 'upstream_ip_cooldown';
@@ -648,7 +689,7 @@ const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
   }
 };
 
-const tryAcquireFairSlot = async (hostname, ipHash, config) => {
+const tryAcquireWorkerSlot = async (hostname, ipHash, config) => {
   if (!config?.env || !config.databaseBinding) {
     throw new Error('[Fair Queue D1] Missing D1 configuration');
   }
@@ -658,7 +699,27 @@ const tryAcquireFairSlot = async (hostname, ipHash, config) => {
     throw new Error(`[Fair Queue D1] D1 binding '${config.databaseBinding}' not found`);
   }
 
+  const hostIntervalMs =
+    Number.isFinite(config.hostIntervalMs) && config.hostIntervalMs > 0
+      ? config.hostIntervalMs
+      : Number.isFinite(config.pacingIntervalMs) && config.pacingIntervalMs > 0
+        ? config.pacingIntervalMs
+        : 0;
+
+  const tableName = config.fairQueueHostPacingTableName || 'worker_host_pacing';
+
+  await ensurePacingTable(db, tableName);
+
+  const allowed = await tryClaimPacingToken(db, hostname, hostIntervalMs, tableName);
+  if (!allowed) {
+    return -1;
+  }
+
   return tryAcquireFairSlotOnce(db, hostname, ipHash, config);
+};
+
+const tryAcquireFairSlot = async (hostname, ipHash, config) => {
+  return tryAcquireWorkerSlot(hostname, ipHash, config);
 };
 
 const releaseFairSlot = async (slotId, config) => {

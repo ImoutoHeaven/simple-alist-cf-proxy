@@ -701,6 +701,16 @@ CREATE TABLE IF NOT EXISTS "upstream_ip_queue_depth" (
 CREATE INDEX IF NOT EXISTS idx_upstream_ip_queue_depth_ts
   ON "upstream_ip_queue_depth" ("updated_at");
 
+-- Worker-specific host pacing table
+CREATE TABLE IF NOT EXISTS "upstream_host_pacing_worker" (
+  "hostname_pattern" TEXT PRIMARY KEY,
+  "next_allowed_at"  TIMESTAMPTZ NOT NULL,
+  "updated_at"       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX IF NOT EXISTS "idx_upstream_host_pacing_worker_ts"
+  ON "upstream_host_pacing_worker" ("updated_at");
+
 -- Try Acquire Fair Slot RPC (single attempt, non-blocking)
 -- Returns:
 --   > 0  → slot id acquired
@@ -795,6 +805,71 @@ BEGIN
   END IF;
 
   RETURN -1;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION func_worker_try_acquire_slot_paced(
+  p_hostname_pattern       TEXT,
+  p_ip_hash                TEXT,
+  p_global_limit           INT,
+  p_per_ip_limit           INT,
+  p_zombie_timeout_seconds INT,
+  p_cooldown_seconds       INT,
+  p_host_interval_ms       INT
+)
+RETURNS INT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_now          TIMESTAMPTZ := clock_timestamp();
+  v_interval     INTERVAL;
+  v_next_allowed TIMESTAMPTZ;
+  v_slot_id      INT;
+BEGIN
+  IF p_host_interval_ms IS NULL OR p_host_interval_ms <= 0 THEN
+    RETURN func_try_acquire_slot(
+      p_hostname_pattern,
+      p_ip_hash,
+      p_global_limit,
+      p_per_ip_limit,
+      p_zombie_timeout_seconds,
+      p_cooldown_seconds
+    );
+  END IF;
+
+  v_interval := make_interval(msecs => p_host_interval_ms);
+
+  INSERT INTO "upstream_host_pacing_worker" ("hostname_pattern", "next_allowed_at")
+  VALUES (p_hostname_pattern, v_now)
+  ON CONFLICT ("hostname_pattern") DO NOTHING;
+
+  SELECT "next_allowed_at"
+    INTO v_next_allowed
+  FROM "upstream_host_pacing_worker"
+  WHERE "hostname_pattern" = p_hostname_pattern
+  FOR UPDATE;
+
+  IF v_now < v_next_allowed THEN
+    RETURN -1;
+  END IF;
+
+  v_slot_id := func_try_acquire_slot(
+    p_hostname_pattern,
+    p_ip_hash,
+    p_global_limit,
+    p_per_ip_limit,
+    p_zombie_timeout_seconds,
+    p_cooldown_seconds
+  );
+
+  IF v_slot_id > 0 THEN
+    UPDATE "upstream_host_pacing_worker"
+    SET "next_allowed_at" = v_now + v_interval,
+        "updated_at"      = v_now
+    WHERE "hostname_pattern" = p_hostname_pattern;
+  END IF;
+
+  RETURN v_slot_id;
 END;
 $$;
 
@@ -1168,6 +1243,93 @@ BEGIN
       COALESCE(p_max_slot_per_ip, 0),
       COALESCE(p_zombie_timeout, 0),
       COALESCE(p_cooldown_seconds, 0)
+    );
+  EXCEPTION
+    WHEN others THEN
+      v_slot_id := NULL;
+  END;
+
+  IF v_slot_id IS NULL THEN
+    RETURN QUERY SELECT 'WAIT', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
+    RETURN;
+  END IF;
+
+  IF v_slot_id > 0 THEN
+    RETURN QUERY SELECT 'ACQUIRED', v_slot_id::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
+    RETURN;
+  ELSIF v_slot_id = 0 THEN
+    RETURN QUERY SELECT 'IP_TOO_MANY', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
+    RETURN;
+  ELSE
+    RETURN QUERY SELECT 'QUEUE_FULL', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
+    RETURN;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION download_worker_try_acquire_slot(
+  p_hostname_hash TEXT,
+  p_hostname TEXT,
+  p_ip_bucket TEXT,
+  p_now_ms BIGINT,
+  p_max_slot_per_host INT,
+  p_max_slot_per_ip INT,
+  p_max_waiters_per_ip INT DEFAULT 0,
+  p_zombie_timeout INT DEFAULT 30,
+  p_cooldown_seconds INT DEFAULT 0,
+  p_host_interval_ms INT DEFAULT 0,
+  p_throttle_time_window INT DEFAULT 60,
+  p_throttle_table_name TEXT DEFAULT 'THROTTLE_PROTECTION',
+  p_queue_depth_table_name TEXT DEFAULT 'upstream_ip_queue_depth'
+)
+RETURNS TABLE(
+  status TEXT,
+  slot_token TEXT,
+  queue_depth INT,
+  ip_queue_depth INT,
+  throttle_code INT,
+  throttle_retry_after INT
+) AS $$
+DECLARE
+  v_slot_id INT;
+  v_throttled BOOLEAN := FALSE;
+  v_throttle_code INTEGER := NULL;
+  v_throttle_retry_after INTEGER := NULL;
+  v_queue_depth INT := 0;
+  v_ip_queue_depth INT := 0;
+  v_queue_table TEXT := COALESCE(NULLIF(p_queue_depth_table_name, ''), 'upstream_ip_queue_depth');
+BEGIN
+  IF p_hostname IS NULL OR p_hostname = '' THEN
+    p_hostname := p_hostname_hash;
+  END IF;
+
+  IF p_hostname_hash IS NOT NULL AND p_hostname_hash <> '' THEN
+    SELECT COALESCE(t.is_protected, FALSE), t.error_code, t.retry_after
+    INTO v_throttled, v_throttle_code, v_throttle_retry_after
+    FROM download_check_throttle_protection(p_hostname_hash, p_hostname, p_throttle_time_window, p_throttle_table_name) AS t;
+  END IF;
+
+  EXECUTE format('SELECT COALESCE(SUM("waiting_count"), 0) FROM %1$I WHERE "hostname_pattern" = $1', v_queue_table)
+    INTO v_queue_depth
+    USING p_hostname;
+  EXECUTE format('SELECT COALESCE("waiting_count", 0) FROM %1$I WHERE "hostname_pattern" = $1 AND "ip_hash" = $2', v_queue_table)
+    INTO v_ip_queue_depth
+    USING p_hostname, p_ip_bucket;
+
+  IF v_throttled THEN
+    RETURN QUERY SELECT 'THROTTLED', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
+    RETURN;
+  END IF;
+
+  BEGIN
+    v_slot_id := func_worker_try_acquire_slot_paced(
+      p_hostname,
+      p_ip_bucket,
+      COALESCE(p_max_slot_per_host, 0),
+      COALESCE(p_max_slot_per_ip, 0),
+      COALESCE(p_zombie_timeout, 0),
+      COALESCE(p_cooldown_seconds, 0),
+      COALESCE(p_host_interval_ms, 0)
     );
   EXCEPTION
     WHEN others THEN

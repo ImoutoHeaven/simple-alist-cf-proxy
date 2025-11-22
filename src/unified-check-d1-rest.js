@@ -638,6 +638,54 @@ const ensureQueueDepthTableRest = async (
   );
 };
 
+const ensurePacingTableRest = async (
+  accountId,
+  databaseId,
+  apiToken,
+  tableName = 'worker_host_pacing'
+) => {
+  await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `CREATE TABLE IF NOT EXISTS ${tableName} (
+      hostname_pattern TEXT PRIMARY KEY,
+      last_acquired_at TEXT NOT NULL
+    )`
+  );
+};
+
+const tryClaimPacingTokenRest = async (
+  accountId,
+  databaseId,
+  apiToken,
+  hostname,
+  intervalMs,
+  tableName = 'worker_host_pacing'
+) => {
+  if (!intervalMs || intervalMs <= 0) {
+    return true;
+  }
+
+  const seconds = intervalMs / 1000;
+  const modifier = `-${seconds} seconds`;
+
+  const result = await executeQuery(
+    accountId,
+    databaseId,
+    apiToken,
+    `INSERT INTO ${tableName} (hostname_pattern, last_acquired_at)
+     VALUES (?, strftime('%Y-%m-%d %H:%M:%f','now'))
+     ON CONFLICT(hostname_pattern) DO UPDATE
+     SET last_acquired_at = excluded.last_acquired_at
+     WHERE ${tableName}.last_acquired_at <= strftime('%Y-%m-%d %H:%M:%f','now', ?)`,
+    [hostname, modifier]
+  );
+
+  const changes = result.meta?.changes ?? 0;
+  return changes > 0;
+};
+
 const tryAcquireFairSlotOnceRest = async (
   accountId,
   databaseId,
@@ -751,6 +799,47 @@ const tryAcquireFairSlotOnceRest = async (
   }
 };
 
+const tryAcquireWorkerSlotRest = async (hostname, ipHash, config) => {
+  if (!config?.accountId || !config.databaseId || !config.apiToken) {
+    throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration');
+  }
+
+  const { accountId, databaseId, apiToken } = config;
+
+  const hostIntervalMs =
+    Number.isFinite(config.hostIntervalMs) && config.hostIntervalMs > 0
+      ? config.hostIntervalMs
+      : Number.isFinite(config.pacingIntervalMs) && config.pacingIntervalMs > 0
+        ? config.pacingIntervalMs
+        : 0;
+
+  const tableName = config.fairQueueHostPacingTableName || 'worker_host_pacing';
+
+  await ensurePacingTableRest(accountId, databaseId, apiToken, tableName);
+
+  const allowed = await tryClaimPacingTokenRest(
+    accountId,
+    databaseId,
+    apiToken,
+    hostname,
+    hostIntervalMs,
+    tableName
+  );
+
+  if (!allowed) {
+    return -1;
+  }
+
+  return tryAcquireFairSlotOnceRest(
+    accountId,
+    databaseId,
+    apiToken,
+    hostname,
+    ipHash,
+    config
+  );
+};
+
 const tryAcquireFairSlot = async (hostname, ipHash, config) => {
   if (!config?.accountId || !config.databaseId || !config.apiToken) {
     throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration');
@@ -770,14 +859,7 @@ const tryAcquireFairSlot = async (hostname, ipHash, config) => {
     cooldownTableName
   );
 
-  return tryAcquireFairSlotOnceRest(
-    accountId,
-    databaseId,
-    apiToken,
-    hostname,
-    ipHash,
-    config
-  );
+  return tryAcquireWorkerSlotRest(hostname, ipHash, config);
 };
 
 const releaseFairSlot = async (slotId, config) => {

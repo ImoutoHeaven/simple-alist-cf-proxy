@@ -52,17 +52,18 @@ type PostgresConfig struct {
 }
 
 type FairQueueConfig struct {
-	MaxWaitMs            int64     `json:"maxWaitMs"`
-	PollIntervalMs       int64     `json:"pollIntervalMs"`
-	PollWindowMs         int64     `json:"pollWindowMs"`
-	MinSlotHoldMs        int64     `json:"minSlotHoldMs"`
-	MaxSlotPerHost       int       `json:"maxSlotPerHost"`
-	MaxSlotPerIP         int       `json:"maxSlotPerIp"`
-	MaxWaitersPerIP      int       `json:"maxWaitersPerIp"`
-	ZombieTimeoutSeconds int       `json:"zombieTimeoutSeconds"`
-	IPCooldownSeconds    int       `json:"ipCooldownSeconds"`
-	SessionIdleSeconds   int       `json:"sessionIdleSeconds"`
-	RPC                  RPCConfig `json:"rpc"`
+	MaxWaitMs               int64     `json:"maxWaitMs"`
+	PollIntervalMs          int64     `json:"pollIntervalMs"`
+	PollWindowMs            int64     `json:"pollWindowMs"`
+	MinSlotHoldMs           int64     `json:"minSlotHoldMs"`
+	SmoothReleaseIntervalMs int64     `json:"smoothReleaseIntervalMs,omitempty"`
+	MaxSlotPerHost          int       `json:"maxSlotPerHost"`
+	MaxSlotPerIP            int       `json:"maxSlotPerIp"`
+	MaxWaitersPerIP         int       `json:"maxWaitersPerIp"`
+	ZombieTimeoutSeconds    int       `json:"zombieTimeoutSeconds"`
+	IPCooldownSeconds       int       `json:"ipCooldownSeconds"`
+	SessionIdleSeconds      int       `json:"sessionIdleSeconds"`
+	RPC                     RPCConfig `json:"rpc"`
 }
 
 type RPCConfig struct {
@@ -223,11 +224,37 @@ func (m *memorySessionStore) Range(fn func(token string, sess *FQSession) bool) 
 	})
 }
 
+type smoothHostReleaser struct {
+	mu            sync.Mutex
+	lastReleaseAt time.Time
+}
+
+func (sr *smoothHostReleaser) nextReleaseAfter(base time.Time, interval time.Duration) time.Time {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
+	if interval <= 0 {
+		sr.lastReleaseAt = base
+		return base
+	}
+
+	if sr.lastReleaseAt.IsZero() || !sr.lastReleaseAt.After(base) {
+		sr.lastReleaseAt = base
+		return base
+	}
+
+	next := sr.lastReleaseAt.Add(interval)
+	sr.lastReleaseAt = next
+	return next
+}
+
 type server struct {
-	cfg          Config
-	backend      queueBackend
-	log          *logger
-	sessionStore sessionStore
+	cfg             Config
+	backend         queueBackend
+	log             *logger
+	sessionStore    sessionStore
+	smoothMu        sync.Mutex
+	smoothReleasers map[string]*smoothHostReleaser
 }
 
 type logger struct {
@@ -328,6 +355,18 @@ func (c FairQueueConfig) maxSlotPerHost() int {
 		return c.MaxSlotPerHost
 	}
 	return 5
+}
+
+func (c FairQueueConfig) smoothInterval() time.Duration {
+	if c.SmoothReleaseIntervalMs > 0 {
+		return time.Duration(c.SmoothReleaseIntervalMs) * time.Millisecond
+	}
+	minHold := c.minHold(0)
+	slots := c.maxSlotPerHost()
+	if minHold <= 0 || slots <= 0 {
+		return 0
+	}
+	return time.Duration(minHold/int64(slots)) * time.Millisecond
 }
 
 func (c FairQueueConfig) maxSlotPerIP() int {
@@ -797,30 +836,70 @@ func (s *server) gcSessions() {
 	})
 }
 
+func (s *server) getSmoothReleaser(hostnameHash, hostname string) *smoothHostReleaser {
+	key := hostnameHash
+	if key == "" {
+		key = hostname
+	}
+
+	s.smoothMu.Lock()
+	defer s.smoothMu.Unlock()
+
+	if s.smoothReleasers == nil {
+		s.smoothReleasers = make(map[string]*smoothHostReleaser)
+	}
+
+	releaser := s.smoothReleasers[key]
+	if releaser == nil {
+		releaser = &smoothHostReleaser{}
+		s.smoothReleasers[key] = releaser
+	}
+	return releaser
+}
+
 func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
-	minHoldMs := s.cfg.FairQueue.minHold(0)
+	minHoldMs := s.cfg.FairQueue.minHold(req.MinSlotHoldMs)
 
 	hitAt := time.UnixMilli(req.HitUpstreamAt)
-	target := hitAt.Add(time.Duration(minHoldMs) * time.Millisecond)
-	now := time.Now()
-	if target.After(now) {
-		time.Sleep(target.Sub(now))
+	if req.HitUpstreamAt == 0 || hitAt.IsZero() {
+		hitAt = time.Now()
 	}
+
+	now := time.Now()
+	minHoldTarget := hitAt.Add(time.Duration(minHoldMs) * time.Millisecond)
+	baseTime := minHoldTarget
+	if baseTime.Before(now) {
+		baseTime = now
+	}
+
+	interval := s.cfg.FairQueue.smoothInterval()
+	releaser := s.getSmoothReleaser(req.HostnameHash, req.Hostname)
+
+	target := baseTime
+	if interval > 0 {
+		target = releaser.nextReleaseAfter(baseTime, interval)
+	}
+
+	if delay := time.Until(target); delay > 0 {
+		time.Sleep(delay)
+	}
+
 	now = time.Now()
 	holdMs := now.Sub(hitAt).Milliseconds()
 
 	if err := s.backend.ReleaseSlot(ctx, req); err != nil {
 		s.log.Errorf("release slot error: %v", err)
-	} else {
-		tokenLog := req.SlotToken
-		if len(tokenLog) > 8 {
-			tokenLog = tokenLog[len(tokenLog)-8:]
-		}
-		s.log.Infof(
-			"slot released host=%s ip=%s token=%s hold_ms=%d min_hold_ms=%d",
-			req.Hostname, req.IPBucket, tokenLog, holdMs, minHoldMs,
-		)
+		return err
 	}
+
+	tokenLog := req.SlotToken
+	if len(tokenLog) > 8 {
+		tokenLog = tokenLog[len(tokenLog)-8:]
+	}
+	s.log.Infof(
+		"slot released host=%s ip=%s token=%s hold_ms=%d min_hold_ms=%d",
+		req.Hostname, req.IPBucket, tokenLog, holdMs, minHoldMs,
+	)
 	return nil
 }
 

@@ -1267,6 +1267,18 @@ const createWorkerLocalFQClient = (config, env) => {
   const minHoldMs = Number.isFinite(fairCfg.minSlotHoldMs)
     ? Math.max(0, fairCfg.minSlotHoldMs)
     : 0;
+  const hostIntervalMs = Number.isFinite(fairCfg.smoothReleaseIntervalMs)
+    ? Math.max(0, fairCfg.smoothReleaseIntervalMs)
+    : (() => {
+        const perHost =
+          Number.isFinite(fairCfg.maxSlotPerHost) && fairCfg.maxSlotPerHost > 0
+            ? fairCfg.maxSlotPerHost
+            : 0;
+        if (minHoldMs > 0 && perHost > 0) {
+          return Math.floor(minHoldMs / perHost);
+        }
+        return 0;
+      })();
 
   let cachedFairQueueModule = null;
 
@@ -1366,6 +1378,8 @@ const createWorkerLocalFQClient = (config, env) => {
 
   const tryAcquire = async (fqContext) => {
     if (normalizedDbMode === 'custom-pg-rest') {
+      const fnName =
+        fairCfg.workerTryAcquireFunc || 'download_worker_try_acquire_slot';
       const payload = {
         p_hostname_hash: fqContext.hostnameHash,
         p_hostname: fqContext.hostname,
@@ -1377,8 +1391,9 @@ const createWorkerLocalFQClient = (config, env) => {
         p_zombie_timeout: fqContext.zombieTimeoutSeconds,
         p_cooldown_seconds: fqContext.cooldownSeconds,
         p_throttle_time_window: Number(config.throttleConfig?.throttleTimeWindow) || 60,
+        p_host_interval_ms: hostIntervalMs,
       };
-      const data = await callPostgrestRpc('download_try_acquire_slot', payload);
+      const data = await callPostgrestRpc(fnName, payload);
       const status = (data.status || '').toUpperCase();
       const throttleRetryAfter =
         Number.isFinite(data.throttle_retry_after) && data.throttle_retry_after > 0
@@ -1412,10 +1427,19 @@ const createWorkerLocalFQClient = (config, env) => {
         const slotId = await fairQueueModule.tryAcquireFairSlot(
           fqContext.hostname,
           fqContext.ipBucket,
-          { ...fairCfg, env }
+          {
+            ...fairCfg,
+            env,
+            hostIntervalMs,
+            fairQueueHostPacingTableName: fairCfg.hostPacingTableName,
+            pacingIntervalMs: hostIntervalMs,
+          }
         );
         if (Number.isFinite(slotId) && slotId > 0) {
           return { kind: 'granted', slotToken: slotId };
+        }
+        if (slotId === -1 || slotId === 0) {
+          return { kind: 'wait' };
         }
       }
       return { kind: 'wait' };
