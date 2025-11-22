@@ -1376,6 +1376,7 @@ const createWorkerLocalFQClient = (config, env) => {
         p_max_waiters_per_ip: fqContext.maxWaitersPerIp,
         p_zombie_timeout: fqContext.zombieTimeoutSeconds,
         p_cooldown_seconds: fqContext.cooldownSeconds,
+        p_throttle_time_window: Number(config.throttleConfig?.throttleTimeWindow) || 60,
       };
       const data = await callPostgrestRpc('download_try_acquire_slot', payload);
       const status = (data.status || '').toUpperCase();
