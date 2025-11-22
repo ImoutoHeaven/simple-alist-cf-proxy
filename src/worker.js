@@ -1081,6 +1081,10 @@ const createSlotHandlerClient = (config, workerClient) => {
   const releaseUrl = `${baseUrl}/api/v0/fairqueue/release`;
   const authKey = slotCfg.authKey || '';
   const fallbackClient = workerClient || createWorkerLocalFQClient(config);
+  const throttleTimeWindowSeconds =
+    Number(config.throttleConfig?.throttleTimeWindow) > 0
+      ? Number(config.throttleConfig.throttleTimeWindow)
+      : 60;
   const perRequestTimeoutMsRaw = Number(slotCfg.perRequestTimeoutMs);
   const perRequestTimeoutMs =
     Number.isFinite(perRequestTimeoutMsRaw) && perRequestTimeoutMsRaw > 0 ? perRequestTimeoutMsRaw : 8000;
@@ -1136,6 +1140,7 @@ const createSlotHandlerClient = (config, workerClient) => {
               hostnameHash: fqContext.hostnameHash,
               ipBucket: fqContext.ipBucket,
               now: fqContext.nowMs,
+              throttleTimeWindowSeconds,
             };
 
         let res;
@@ -1183,9 +1188,20 @@ const createSlotHandlerClient = (config, workerClient) => {
             console.log(`[FQ] slot granted via slot-handler host=${fqContext.hostname}`);
             return { kind: 'granted' };
           case 'throttled':
+            const retryAfter =
+              Number.isFinite(data?.throttleRetryAfter) && data.throttleRetryAfter > 0
+                ? data.throttleRetryAfter
+                : Number.isFinite(data?.throttle_retry_after) && data.throttle_retry_after > 0
+                  ? data.throttle_retry_after
+                  : Number.isFinite(data?.throttleWait) && data.throttleWait > 0
+                    ? data.throttleWait
+                    : Number.isFinite(data?.retryAfter) && data.retryAfter > 0
+                      ? data.retryAfter
+                      : null;
             return {
               kind: 'throttled',
               throttleCode: Number.isFinite(data.throttleCode) ? data.throttleCode : 503,
+              retryAfter: retryAfter ?? undefined,
             };
           case 'timeout':
             return { kind: 'timeout' };
@@ -1363,6 +1379,12 @@ const createWorkerLocalFQClient = (config, env) => {
       };
       const data = await callPostgrestRpc('download_try_acquire_slot', payload);
       const status = (data.status || '').toUpperCase();
+      const throttleRetryAfter =
+        Number.isFinite(data.throttle_retry_after) && data.throttle_retry_after > 0
+          ? data.throttle_retry_after
+          : Number.isFinite(data.throttleRetryAfter) && data.throttleRetryAfter > 0
+            ? data.throttleRetryAfter
+            : null;
       const throttleCode =
         Number.isFinite(data.throttle_code) && data.throttle_code > 0
           ? data.throttle_code
@@ -1373,6 +1395,7 @@ const createWorkerLocalFQClient = (config, env) => {
         return {
           kind: 'throttled',
           throttleCode: throttleCode || 503,
+          retryAfter: throttleRetryAfter || undefined,
         };
       }
       if (status === 'ACQUIRED') {
@@ -2164,6 +2187,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         return createThrottleProtectedResponse(origin, {
           status: 'protected',
           errorCode: fqResult.throttleCode || 503,
+          retryAfter: fqResult.retryAfter,
         });
       }
 

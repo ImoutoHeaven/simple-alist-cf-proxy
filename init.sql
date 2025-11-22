@@ -904,17 +904,25 @@ $$;
 CREATE OR REPLACE FUNCTION download_check_throttle_protection(
   p_hostname_hash TEXT,
   p_hostname TEXT,
+  p_throttle_time_window INTEGER DEFAULT 60,
   p_throttle_table_name TEXT DEFAULT 'THROTTLE_PROTECTION'
 )
 RETURNS TABLE(
   is_protected BOOLEAN,
-  error_code INTEGER
+  error_code INTEGER,
+  retry_after INTEGER
 ) AS $$
 DECLARE
   v_table_name TEXT := COALESCE(NULLIF(p_throttle_table_name, ''), 'THROTTLE_PROTECTION');
+  v_window INTEGER := GREATEST(1, COALESCE(p_throttle_time_window, 60));
+  v_now INTEGER := EXTRACT(EPOCH FROM NOW())::INTEGER;
+  v_error_timestamp INTEGER;
+  v_error_code INTEGER;
+  v_is_protected INTEGER;
+  v_retry_after INTEGER := NULL;
 BEGIN
   IF p_hostname_hash IS NULL OR p_hostname_hash = '' THEN
-    RETURN QUERY SELECT FALSE, NULL::INTEGER;
+    RETURN QUERY SELECT FALSE, NULL::INTEGER, NULL::INTEGER;
     RETURN;
   END IF;
 
@@ -935,12 +943,29 @@ BEGIN
       NULL;
   END;
 
-  RETURN QUERY EXECUTE format(
-    'SELECT COALESCE("IS_PROTECTED" = 1, FALSE), "LAST_ERROR_CODE"
+  EXECUTE format(
+    'SELECT "IS_PROTECTED", "LAST_ERROR_CODE", "ERROR_TIMESTAMP"
      FROM %1$I
      WHERE "HOSTNAME_HASH" = $1',
     v_table_name
-  ) USING p_hostname_hash;
+  )
+  INTO v_is_protected, v_error_code, v_error_timestamp
+  USING p_hostname_hash;
+
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT FALSE, NULL::INTEGER, NULL::INTEGER;
+    RETURN;
+  END IF;
+
+  IF COALESCE(v_is_protected, 0) = 1 AND v_error_timestamp IS NOT NULL THEN
+    IF (v_now - v_error_timestamp) < v_window THEN
+      v_retry_after := GREATEST(v_window - (v_now - v_error_timestamp), 0);
+      RETURN QUERY SELECT TRUE, v_error_code, v_retry_after;
+      RETURN;
+    END IF;
+  END IF;
+
+  RETURN QUERY SELECT FALSE, NULL::INTEGER, NULL::INTEGER;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1092,6 +1117,7 @@ CREATE OR REPLACE FUNCTION download_try_acquire_slot(
   p_max_waiters_per_ip INT DEFAULT 0,
   p_zombie_timeout INT DEFAULT 30,
   p_cooldown_seconds INT DEFAULT 0,
+  p_throttle_time_window INT DEFAULT 60,
   p_throttle_table_name TEXT DEFAULT 'THROTTLE_PROTECTION',
   p_queue_depth_table_name TEXT DEFAULT 'upstream_ip_queue_depth'
 )
@@ -1100,12 +1126,14 @@ RETURNS TABLE(
   slot_token TEXT,
   queue_depth INT,
   ip_queue_depth INT,
-  throttle_code INT
+  throttle_code INT,
+  throttle_retry_after INT
 ) AS $$
 DECLARE
   v_slot_id INT;
   v_throttled BOOLEAN := FALSE;
   v_throttle_code INTEGER := NULL;
+  v_throttle_retry_after INTEGER := NULL;
   v_queue_depth INT := 0;
   v_ip_queue_depth INT := 0;
   v_queue_table TEXT := COALESCE(NULLIF(p_queue_depth_table_name, ''), 'upstream_ip_queue_depth');
@@ -1115,9 +1143,9 @@ BEGIN
   END IF;
 
   IF p_hostname_hash IS NOT NULL AND p_hostname_hash <> '' THEN
-    SELECT COALESCE(t.is_protected, FALSE), t.error_code
-    INTO v_throttled, v_throttle_code
-    FROM download_check_throttle_protection(p_hostname_hash, p_hostname, p_throttle_table_name) AS t;
+    SELECT COALESCE(t.is_protected, FALSE), t.error_code, t.retry_after
+    INTO v_throttled, v_throttle_code, v_throttle_retry_after
+    FROM download_check_throttle_protection(p_hostname_hash, p_hostname, p_throttle_time_window, p_throttle_table_name) AS t;
   END IF;
 
   EXECUTE format('SELECT COALESCE(SUM("waiting_count"), 0) FROM %1$I WHERE "hostname_pattern" = $1', v_queue_table)
@@ -1128,7 +1156,7 @@ BEGIN
     USING p_hostname, p_ip_bucket;
 
   IF v_throttled THEN
-    RETURN QUERY SELECT 'THROTTLED', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code;
+    RETURN QUERY SELECT 'THROTTLED', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
     RETURN;
   END IF;
 
@@ -1147,18 +1175,18 @@ BEGIN
   END;
 
   IF v_slot_id IS NULL THEN
-    RETURN QUERY SELECT 'WAIT', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code;
+    RETURN QUERY SELECT 'WAIT', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
     RETURN;
   END IF;
 
   IF v_slot_id > 0 THEN
-    RETURN QUERY SELECT 'ACQUIRED', v_slot_id::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code;
+    RETURN QUERY SELECT 'ACQUIRED', v_slot_id::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
     RETURN;
   ELSIF v_slot_id = 0 THEN
-    RETURN QUERY SELECT 'IP_TOO_MANY', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code;
+    RETURN QUERY SELECT 'IP_TOO_MANY', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
     RETURN;
   ELSE
-    RETURN QUERY SELECT 'QUEUE_FULL', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code;
+    RETURN QUERY SELECT 'QUEUE_FULL', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
     RETURN;
   END IF;
 END;

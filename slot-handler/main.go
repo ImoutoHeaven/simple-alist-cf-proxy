@@ -78,6 +78,7 @@ type AcquireRequest struct {
 	HostnameHash         string `json:"hostnameHash"`
 	IPBucket             string `json:"ipBucket"`
 	Now                  int64  `json:"now"`
+	ThrottleTimeWindow   int    `json:"throttleTimeWindowSeconds,omitempty"`
 	MaxSlotPerHost       int    `json:"maxSlotPerHost,omitempty"`
 	MaxSlotPerIP         int    `json:"maxSlotPerIp,omitempty"`
 	MaxWaitersPerIP      int    `json:"maxWaitersPerIp,omitempty"`
@@ -93,6 +94,7 @@ type AcquireResponse struct {
 	SlotToken    string                 `json:"slotToken,omitempty"`
 	HoldMs       int64                  `json:"holdMs,omitempty"`
 	ThrottleCode int                    `json:"throttleCode,omitempty"`
+	ThrottleWait int                    `json:"throttleRetryAfter,omitempty"`
 	Reason       string                 `json:"reason,omitempty"`
 	Meta         map[string]interface{} `json:"meta,omitempty"`
 }
@@ -112,8 +114,9 @@ type ReleaseResponse struct {
 }
 
 type throttleResult struct {
-	throttled bool
-	code      int
+	throttled  bool
+	code       int
+	retryAfter int
 }
 
 type registerResult struct {
@@ -124,11 +127,12 @@ type registerResult struct {
 }
 
 type tryAcquireResult struct {
-	status       string
-	slotToken    string
-	queueDepth   int
-	ipQueueDepth int
-	throttleCode int
+	status             string
+	slotToken          string
+	queueDepth         int
+	ipQueueDepth       int
+	throttleCode       int
+	throttleRetryAfter int
 }
 
 type queueBackend interface {
@@ -149,17 +153,19 @@ const (
 )
 
 type FQSession struct {
-	mu               sync.Mutex
-	Token            string
-	Hostname         string
-	HostnameHash     string
-	IPBucket         string
-	CreatedAt        time.Time
-	LastSeenAt       time.Time
-	State            FQSessionState
-	SlotToken        string
-	WaiterRegistered bool
-	ThrottleCode     int
+	mu                 sync.Mutex
+	Token              string
+	Hostname           string
+	HostnameHash       string
+	IPBucket           string
+	CreatedAt          time.Time
+	LastSeenAt         time.Time
+	State              FQSessionState
+	SlotToken          string
+	WaiterRegistered   bool
+	ThrottleCode       int
+	ThrottleRetryAfter int
+	ThrottleTimeWindow int
 }
 
 type sessionStore interface {
@@ -359,6 +365,13 @@ func (c FairQueueConfig) sessionIdleDuration() time.Duration {
 	return time.Duration(c.SessionIdleSeconds) * time.Second
 }
 
+func sanitizeThrottleWindowSeconds(v int) int {
+	if v > 0 {
+		return v
+	}
+	return 60
+}
+
 func loadConfig(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -454,7 +467,8 @@ func (s *server) handleAcquireSlot(ctx context.Context, req AcquireRequest) (*Ac
 
 func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
 	now := time.Now()
-	backendReq := s.buildAcquireRequest(req.Hostname, req.HostnameHash, req.IPBucket, now)
+	throttleWindow := sanitizeThrottleWindowSeconds(req.ThrottleTimeWindow)
+	backendReq := s.buildAcquireRequest(req.Hostname, req.HostnameHash, req.IPBucket, throttleWindow, now)
 
 	throttleRes, err := s.backend.CheckThrottle(ctx, backendReq)
 	if err != nil {
@@ -464,19 +478,23 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 		return &AcquireResponse{
 			Result:       "throttled",
 			ThrottleCode: throttleRes.code,
+			ThrottleWait: throttleRes.retryAfter,
 			Reason:       "throttle_open",
 		}, nil
 	}
 
 	token := uuid.New().String()
 	sess := &FQSession{
-		Token:        token,
-		Hostname:     req.Hostname,
-		HostnameHash: req.HostnameHash,
-		IPBucket:     req.IPBucket,
-		CreatedAt:    now,
-		LastSeenAt:   now,
-		State:        StatePending,
+		Token:              token,
+		Hostname:           req.Hostname,
+		HostnameHash:       req.HostnameHash,
+		IPBucket:           req.IPBucket,
+		CreatedAt:          now,
+		LastSeenAt:         now,
+		State:              StatePending,
+		ThrottleTimeWindow: throttleWindow,
+		ThrottleRetryAfter: 0,
+		ThrottleCode:       0,
 	}
 
 	s.sessionStore.Save(sess)
@@ -527,6 +545,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 		return &AcquireResponse{
 			Result:       "throttled",
 			ThrottleCode: sess.ThrottleCode,
+			ThrottleWait: sess.ThrottleRetryAfter,
 		}, nil
 	case StateTimeout:
 		s.cleanupSession(sess)
@@ -555,6 +574,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 		return &AcquireResponse{
 			Result:       "throttled",
 			ThrottleCode: sess.ThrottleCode,
+			ThrottleWait: sess.ThrottleRetryAfter,
 		}, nil
 	case StateTimeout:
 		s.cleanupSession(sess)
@@ -577,7 +597,7 @@ func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time
 				return nil
 			}
 
-			req := s.buildAcquireRequest(sess.Hostname, sess.HostnameHash, sess.IPBucket, time.Now())
+			req := s.buildAcquireRequest(sess.Hostname, sess.HostnameHash, sess.IPBucket, sess.ThrottleTimeWindow, time.Now())
 			regRes, err := s.backend.RegisterWaiter(ctx, req)
 			if err != nil {
 				s.log.Warnf("register waiter error: %v", err)
@@ -597,7 +617,7 @@ func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time
 			return nil
 		}
 
-		req := s.buildAcquireRequest(sess.Hostname, sess.HostnameHash, sess.IPBucket, time.Now())
+		req := s.buildAcquireRequest(sess.Hostname, sess.HostnameHash, sess.IPBucket, sess.ThrottleTimeWindow, time.Now())
 		tryRes, err := s.backend.TryAcquire(ctx, req)
 		if err != nil {
 			s.log.Warnf("tryAcquire error: %v", err)
@@ -608,10 +628,12 @@ func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time
 			continue
 		}
 
+		sess.ThrottleRetryAfter = 0
 		switch strings.ToUpper(tryRes.status) {
 		case "THROTTLED":
 			sess.State = StateThrottled
 			sess.ThrottleCode = tryRes.throttleCode
+			sess.ThrottleRetryAfter = tryRes.throttleRetryAfter
 			return nil
 		case "ACQUIRED":
 			sess.State = StateGranted
@@ -623,12 +645,13 @@ func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time
 	}
 }
 
-func (s *server) buildAcquireRequest(hostname, hostnameHash, ipBucket string, now time.Time) AcquireRequest {
+func (s *server) buildAcquireRequest(hostname, hostnameHash, ipBucket string, throttleTimeWindow int, now time.Time) AcquireRequest {
 	return AcquireRequest{
 		Hostname:             hostname,
 		HostnameHash:         hostnameHash,
 		IPBucket:             ipBucket,
 		Now:                  now.UnixMilli(),
+		ThrottleTimeWindow:   sanitizeThrottleWindowSeconds(throttleTimeWindow),
 		MaxSlotPerHost:       s.cfg.FairQueue.maxSlotPerHost(),
 		MaxSlotPerIP:         s.cfg.FairQueue.maxSlotPerIP(),
 		MaxWaitersPerIP:      s.cfg.FairQueue.maxWaitersPerIP(),
@@ -649,7 +672,7 @@ func (s *server) cleanupSession(sess *FQSession) {
 
 	if shouldReleaseWaiter {
 		go func() {
-			req := s.buildAcquireRequest(hostname, hostnameHash, ipBucket, time.Now())
+			req := s.buildAcquireRequest(hostname, hostnameHash, ipBucket, sess.ThrottleTimeWindow, time.Now())
 			if err := s.backend.ReleaseWaiter(context.Background(), req); err != nil {
 				s.log.Warnf("release waiter failed: %v", err)
 			}
@@ -809,18 +832,21 @@ func (b *postgrestBackend) CheckThrottle(ctx context.Context, req AcquireRequest
 	if fn == "" {
 		return throttleResult{}, nil
 	}
+	window := pickInt(req.ThrottleTimeWindow, 60)
 	body := map[string]interface{}{
-		"p_hostname_hash": req.HostnameHash,
-		"p_hostname":      req.Hostname,
+		"p_hostname_hash":        req.HostnameHash,
+		"p_hostname":             req.Hostname,
+		"p_throttle_time_window": window,
 	}
 	var resp struct {
 		IsProtected bool `json:"is_protected"`
 		ErrorCode   int  `json:"error_code"`
+		RetryAfter  int  `json:"retry_after"`
 	}
 	if err := b.doRPC(ctx, fn, body, &resp); err != nil {
 		return throttleResult{}, err
 	}
-	return throttleResult{throttled: resp.IsProtected, code: resp.ErrorCode}, nil
+	return throttleResult{throttled: resp.IsProtected, code: resp.ErrorCode, retryAfter: resp.RetryAfter}, nil
 }
 
 func (b *postgrestBackend) RegisterWaiter(ctx context.Context, req AcquireRequest) (*registerResult, error) {
@@ -869,33 +895,37 @@ func (b *postgrestBackend) TryAcquire(ctx context.Context, req AcquireRequest) (
 	if fn == "" {
 		return nil, errors.New("tryAcquire function not configured")
 	}
+	window := pickInt(req.ThrottleTimeWindow, 60)
 	body := map[string]interface{}{
-		"p_hostname_hash":      req.HostnameHash,
-		"p_hostname":           req.Hostname,
-		"p_ip_bucket":          req.IPBucket,
-		"p_now_ms":             req.Now,
-		"p_max_slot_per_host":  req.MaxSlotPerHost,
-		"p_max_slot_per_ip":    req.MaxSlotPerIP,
-		"p_max_waiters_per_ip": req.MaxWaitersPerIP,
-		"p_zombie_timeout":     req.ZombieTimeoutSeconds,
-		"p_cooldown_seconds":   req.CooldownSeconds,
+		"p_hostname_hash":        req.HostnameHash,
+		"p_hostname":             req.Hostname,
+		"p_ip_bucket":            req.IPBucket,
+		"p_now_ms":               req.Now,
+		"p_max_slot_per_host":    req.MaxSlotPerHost,
+		"p_max_slot_per_ip":      req.MaxSlotPerIP,
+		"p_max_waiters_per_ip":   req.MaxWaitersPerIP,
+		"p_zombie_timeout":       req.ZombieTimeoutSeconds,
+		"p_cooldown_seconds":     req.CooldownSeconds,
+		"p_throttle_time_window": window,
 	}
 	var resp struct {
-		Status       string `json:"status"`
-		SlotToken    string `json:"slot_token"`
-		QueueDepth   int    `json:"queue_depth"`
-		IpQueueDepth int    `json:"ip_queue_depth"`
-		ThrottleCode int    `json:"throttle_code"`
+		Status             string `json:"status"`
+		SlotToken          string `json:"slot_token"`
+		QueueDepth         int    `json:"queue_depth"`
+		IpQueueDepth       int    `json:"ip_queue_depth"`
+		ThrottleCode       int    `json:"throttle_code"`
+		ThrottleRetryAfter int    `json:"throttle_retry_after"`
 	}
 	if err := b.doRPC(ctx, fn, body, &resp); err != nil {
 		return nil, err
 	}
 	return &tryAcquireResult{
-		status:       resp.Status,
-		slotToken:    resp.SlotToken,
-		queueDepth:   resp.QueueDepth,
-		ipQueueDepth: resp.IpQueueDepth,
-		throttleCode: resp.ThrottleCode,
+		status:             resp.Status,
+		slotToken:          resp.SlotToken,
+		queueDepth:         resp.QueueDepth,
+		ipQueueDepth:       resp.IpQueueDepth,
+		throttleCode:       resp.ThrottleCode,
+		throttleRetryAfter: resp.ThrottleRetryAfter,
 	}, nil
 }
 
@@ -938,13 +968,15 @@ func (p *postgresBackend) CheckThrottle(ctx context.Context, req AcquireRequest)
 	if fn == "" {
 		return throttleResult{}, nil
 	}
-	row := p.db.QueryRowContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2)", fn), req.HostnameHash, req.Hostname)
+	window := pickInt(req.ThrottleTimeWindow, 60)
+	row := p.db.QueryRowContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3)", fn), req.HostnameHash, req.Hostname, window)
 	var isProtected sql.NullBool
 	var errorCode sql.NullInt64
-	if err := row.Scan(&isProtected, &errorCode); err != nil {
+	var retryAfter sql.NullInt64
+	if err := row.Scan(&isProtected, &errorCode, &retryAfter); err != nil {
 		return throttleResult{}, err
 	}
-	return throttleResult{throttled: isProtected.Bool, code: int(errorCode.Int64)}, nil
+	return throttleResult{throttled: isProtected.Bool, code: int(errorCode.Int64), retryAfter: int(retryAfter.Int64)}, nil
 }
 
 func (p *postgresBackend) RegisterWaiter(ctx context.Context, req AcquireRequest) (*registerResult, error) {
@@ -982,19 +1014,21 @@ func (p *postgresBackend) TryAcquire(ctx context.Context, req AcquireRequest) (*
 	if fn == "" {
 		return nil, errors.New("tryAcquire function not configured")
 	}
-	row := p.db.QueryRowContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7,$8,$9)", fn),
-		req.HostnameHash, req.Hostname, req.IPBucket, req.Now, req.MaxSlotPerHost, req.MaxSlotPerIP, req.MaxWaitersPerIP, req.ZombieTimeoutSeconds, req.CooldownSeconds)
+	window := pickInt(req.ThrottleTimeWindow, 60)
+	row := p.db.QueryRowContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", fn),
+		req.HostnameHash, req.Hostname, req.IPBucket, req.Now, req.MaxSlotPerHost, req.MaxSlotPerIP, req.MaxWaitersPerIP, req.ZombieTimeoutSeconds, req.CooldownSeconds, window)
 	var status, slotToken sql.NullString
-	var queueDepth, ipQueueDepth, throttleCode sql.NullInt64
-	if err := row.Scan(&status, &slotToken, &queueDepth, &ipQueueDepth, &throttleCode); err != nil {
+	var queueDepth, ipQueueDepth, throttleCode, throttleRetryAfter sql.NullInt64
+	if err := row.Scan(&status, &slotToken, &queueDepth, &ipQueueDepth, &throttleCode, &throttleRetryAfter); err != nil {
 		return nil, err
 	}
 	return &tryAcquireResult{
-		status:       status.String,
-		slotToken:    slotToken.String,
-		queueDepth:   int(queueDepth.Int64),
-		ipQueueDepth: int(ipQueueDepth.Int64),
-		throttleCode: int(throttleCode.Int64),
+		status:             status.String,
+		slotToken:          slotToken.String,
+		queueDepth:         int(queueDepth.Int64),
+		ipQueueDepth:       int(ipQueueDepth.Int64),
+		throttleCode:       int(throttleCode.Int64),
+		throttleRetryAfter: int(throttleRetryAfter.Int64),
 	}, nil
 }
 
