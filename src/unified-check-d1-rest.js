@@ -187,7 +187,7 @@ const ensureAllTables = async (
         hostname_pattern TEXT NOT NULL,
         ip_hash TEXT NOT NULL,
         waiting_count INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
         PRIMARY KEY (hostname_pattern, ip_hash)
       )`,
     },
@@ -199,7 +199,7 @@ const ensureAllTables = async (
       sql: `CREATE TABLE IF NOT EXISTS ${fairQueueHostPacingTableName} (
         hostname_pattern TEXT PRIMARY KEY,
         last_acquired_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
       )`,
     },
   ];
@@ -637,7 +637,7 @@ const ensureQueueDepthTableRest = async (
       hostname_pattern TEXT NOT NULL,
       ip_hash TEXT NOT NULL,
       waiting_count INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
       PRIMARY KEY (hostname_pattern, ip_hash)
     )`
   );
