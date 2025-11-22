@@ -30,30 +30,34 @@
   - `backend.postgrest.authHeader`：可选，传入 PostgREST 的 `Authorization` 值。
   - `backend.postgres.dsn`：PostgreSQL DSN，当 `mode=postgres` 时使用。
 - `fairQueue`：公平队列参数。
-  - `maxWaitMs` / `pollIntervalMs` / `minSlotHoldMs`：等待时长、轮询间隔、最小持锁时间。
+  - `maxWaitMs` / `pollIntervalMs` / `pollWindowMs` / `minSlotHoldMs`：总等待时长、内部轮询间隔、本次轮询窗口预算、最小持锁时间。
+  - `sessionIdleSeconds`：会话多久不轮询就判定过期（默认 90 秒）。
   - `maxSlotPerHost` / `maxSlotPerIp`：单 hostname/单 IP 的并发 slot 上限。
   - `maxWaitersPerIp`：每个 IP 允许的排队人数（>0 时才会注册/释放 waiter）。
   - `zombieTimeoutSeconds` / `ipCooldownSeconds`：僵尸锁超时 & 冷却时间。
-  - `rpc`：数据库 RPC 函数名（默认与 `download-init.sql` 中保持一致）。
+- `rpc`：数据库 RPC 函数名（默认与 `download-init.sql` 中保持一致）。
 
 ## HTTP 接口
 
 - `POST /api/v0/fairqueue/acquire`
-  - 请求体：
+  - 首次请求（不带 `queryToken`）：
     ```json
     {
       "hostname": "example.com",
       "hostnameHash": "sha256-of-hostname",
       "ipBucket": "203.0.113.4/32",
-      "now": 1732170000000,
-      "maxWaitMs": 20000,
-      "minSlotHoldMs": 800
+      "now": 1732170000000
     }
     ```
-  - 响应结果只会有三种：
-    - `{"result":"granted","slotToken":"...","holdMs":800}`
-    - `{"result":"throttled","throttleCode":429}`
-    - `{"result":"timeout"}`
+    返回 `{"result":"pending","queryToken":"..."}` 或 `{"result":"throttled",...}`。
+  - 轮询请求（带 `queryToken`）：
+    ```json
+    {
+      "queryToken": "uuid-from-first-call",
+      "now": 1732170008000
+    }
+    ```
+    返回 `pending | granted | throttled | timeout`，`granted` 时附带 `slotToken`。
 
 - `POST /api/v0/fairqueue/release`
   - 负责按 `hitUpstreamAtMs + minSlotHoldMs` 计算最小持锁时间并调用数据库释放 slot。
@@ -61,6 +65,8 @@
 
 ## 运行时行为
 
-- 只有三种终态：`granted`（拿到 slot）、`timeout`（等待超时）、`throttled`（熔断，立即退出）。
-- 所有其他错误/队列状态一律按 `pollIntervalMs` 睡眠后重试，避免客户端重试风暴。
+- 短轮询：每次 HTTP 请求只使用 `pollWindowMs` 预算注册/抢锁，Worker 端默认 8 秒超时，多次轮询在 `maxWaitMs` + `SLOT_HANDLER_MAX_ATTEMPTS_CAP` 限制内完成。
+- 终态只有三种：`granted`（拿到 slot）、`timeout`（等待超时/会话过期）、`throttled`（熔断，立即退出）；终态会立刻删除会话。
+- 会话清理：`sessionIdleSeconds` 内无轮询或累计等待超过 `maxWaitMs` → 直接返回 `timeout` 并清理。
+- 暂时错误/队列已满/IP 过多一律保持 `pending`，内部按 `pollIntervalMs` 自行 sleep 重试，避免客户端重试风暴。
 - release 阶段即使数据库报错也只记录日志，不向调用方新增错误分支。

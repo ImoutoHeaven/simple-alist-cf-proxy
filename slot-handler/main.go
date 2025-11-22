@@ -14,9 +14,11 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -52,12 +54,14 @@ type PostgresConfig struct {
 type FairQueueConfig struct {
 	MaxWaitMs            int64     `json:"maxWaitMs"`
 	PollIntervalMs       int64     `json:"pollIntervalMs"`
+	PollWindowMs         int64     `json:"pollWindowMs"`
 	MinSlotHoldMs        int64     `json:"minSlotHoldMs"`
 	MaxSlotPerHost       int       `json:"maxSlotPerHost"`
 	MaxSlotPerIP         int       `json:"maxSlotPerIp"`
 	MaxWaitersPerIP      int       `json:"maxWaitersPerIp"`
 	ZombieTimeoutSeconds int       `json:"zombieTimeoutSeconds"`
 	IPCooldownSeconds    int       `json:"ipCooldownSeconds"`
+	SessionIdleSeconds   int       `json:"sessionIdleSeconds"`
 	RPC                  RPCConfig `json:"rpc"`
 }
 
@@ -74,18 +78,18 @@ type AcquireRequest struct {
 	HostnameHash         string `json:"hostnameHash"`
 	IPBucket             string `json:"ipBucket"`
 	Now                  int64  `json:"now"`
-	MaxWaitMs            int64  `json:"maxWaitMs,omitempty"`
-	MinSlotHoldMs        int64  `json:"minSlotHoldMs,omitempty"`
 	MaxSlotPerHost       int    `json:"maxSlotPerHost,omitempty"`
 	MaxSlotPerIP         int    `json:"maxSlotPerIp,omitempty"`
 	MaxWaitersPerIP      int    `json:"maxWaitersPerIp,omitempty"`
 	ZombieTimeoutSeconds int    `json:"zombieTimeoutSeconds,omitempty"`
 	CooldownSeconds      int    `json:"cooldownSeconds,omitempty"`
 	PollIntervalMs       int64  `json:"pollIntervalMs,omitempty"`
+	QueryToken           string `json:"queryToken,omitempty"`
 }
 
 type AcquireResponse struct {
 	Result       string                 `json:"result"`
+	QueryToken   string                 `json:"queryToken,omitempty"`
 	SlotToken    string                 `json:"slotToken,omitempty"`
 	HoldMs       int64                  `json:"holdMs,omitempty"`
 	ThrottleCode int                    `json:"throttleCode,omitempty"`
@@ -135,10 +139,89 @@ type queueBackend interface {
 	ReleaseSlot(ctx context.Context, req ReleaseRequest) error
 }
 
+type FQSessionState string
+
+const (
+	StatePending   FQSessionState = "PENDING"
+	StateGranted   FQSessionState = "GRANTED"
+	StateThrottled FQSessionState = "THROTTLED"
+	StateTimeout   FQSessionState = "TIMEOUT"
+)
+
+type FQSession struct {
+	mu               sync.Mutex
+	Token            string
+	Hostname         string
+	HostnameHash     string
+	IPBucket         string
+	CreatedAt        time.Time
+	LastSeenAt       time.Time
+	State            FQSessionState
+	SlotToken        string
+	WaiterRegistered bool
+	ThrottleCode     int
+}
+
+type sessionStore interface {
+	Load(token string) (*FQSession, bool)
+	Save(sess *FQSession)
+	Delete(token string)
+	Range(func(token string, sess *FQSession) bool)
+}
+
+type memorySessionStore struct {
+	data sync.Map
+}
+
+func newMemorySessionStore() *memorySessionStore {
+	return &memorySessionStore{}
+}
+
+func (m *memorySessionStore) Load(token string) (*FQSession, bool) {
+	if token == "" {
+		return nil, false
+	}
+	raw, ok := m.data.Load(token)
+	if !ok {
+		return nil, false
+	}
+	sess, ok := raw.(*FQSession)
+	return sess, ok
+}
+
+func (m *memorySessionStore) Save(sess *FQSession) {
+	if sess == nil {
+		return
+	}
+	m.data.Store(sess.Token, sess)
+}
+
+func (m *memorySessionStore) Delete(token string) {
+	if token == "" {
+		return
+	}
+	m.data.Delete(token)
+}
+
+func (m *memorySessionStore) Range(fn func(token string, sess *FQSession) bool) {
+	m.data.Range(func(key, value interface{}) bool {
+		token, ok := key.(string)
+		if !ok {
+			return true
+		}
+		sess, ok := value.(*FQSession)
+		if !ok {
+			return true
+		}
+		return fn(token, sess)
+	})
+}
+
 type server struct {
-	cfg     Config
-	backend queueBackend
-	log     *logger
+	cfg          Config
+	backend      queueBackend
+	log          *logger
+	sessionStore sessionStore
 }
 
 type logger struct {
@@ -199,11 +282,8 @@ func (l *logger) Errorf(format string, args ...interface{}) {
 	}
 }
 
-func (c FairQueueConfig) maxWaitDuration(override int64) time.Duration {
+func (c FairQueueConfig) maxWaitDuration() time.Duration {
 	value := c.MaxWaitMs
-	if override > 0 {
-		value = override
-	}
 	if value <= 0 {
 		value = 20000
 	}
@@ -214,6 +294,14 @@ func (c FairQueueConfig) pollInterval() time.Duration {
 	value := c.PollIntervalMs
 	if value <= 0 {
 		value = 500
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
+func (c FairQueueConfig) pollWindowDuration() time.Duration {
+	value := c.PollWindowMs
+	if value <= 0 {
+		value = 6000
 	}
 	return time.Duration(value) * time.Millisecond
 }
@@ -262,6 +350,13 @@ func (c FairQueueConfig) cooldownSeconds() int {
 		return c.IPCooldownSeconds
 	}
 	return 0
+}
+
+func (c FairQueueConfig) sessionIdleDuration() time.Duration {
+	if c.SessionIdleSeconds <= 0 {
+		return 90 * time.Second
+	}
+	return time.Duration(c.SessionIdleSeconds) * time.Second
 }
 
 func loadConfig(path string) (Config, error) {
@@ -313,7 +408,7 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.acquireSlot(r.Context(), req)
+	resp, err := s.handleAcquireSlot(r.Context(), req)
 	if err != nil {
 		s.log.Errorf("AcquireSlot failed: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -345,23 +440,23 @@ func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ReleaseResponse{Result: "ok"})
 }
 
-func (s *server) acquireSlot(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
+func (s *server) handleAcquireSlot(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
 	if req.Now == 0 {
 		req.Now = time.Now().UnixMilli()
 	}
 
-	maxWait := s.cfg.FairQueue.maxWaitDuration(0)
-	deadline := time.Now().Add(maxWait)
-	pollInterval := s.cfg.FairQueue.pollInterval()
-	minHoldMs := s.cfg.FairQueue.minHold(0)
+	if strings.TrimSpace(req.QueryToken) == "" {
+		return s.handleFirstAcquire(ctx, req)
+	}
 
-	req.MaxSlotPerHost = s.cfg.FairQueue.maxSlotPerHost()
-	req.MaxSlotPerIP = s.cfg.FairQueue.maxSlotPerIP()
-	req.MaxWaitersPerIP = s.cfg.FairQueue.maxWaitersPerIP()
-	req.ZombieTimeoutSeconds = s.cfg.FairQueue.zombieTimeoutSeconds()
-	req.CooldownSeconds = s.cfg.FairQueue.cooldownSeconds()
+	return s.handlePollAcquire(ctx, req)
+}
 
-	throttleRes, err := s.backend.CheckThrottle(ctx, req)
+func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
+	now := time.Now()
+	backendReq := s.buildAcquireRequest(req.Hostname, req.HostnameHash, req.IPBucket, now)
+
+	throttleRes, err := s.backend.CheckThrottle(ctx, backendReq)
 	if err != nil {
 		return nil, err
 	}
@@ -373,80 +468,226 @@ func (s *server) acquireSlot(ctx context.Context, req AcquireRequest) (*AcquireR
 		}, nil
 	}
 
-	var registered bool
-	defer func() {
-		if registered {
-			if err := s.backend.ReleaseWaiter(context.Background(), req); err != nil {
-				s.log.Warnf("release waiter failed: %v", err)
+	token := uuid.New().String()
+	sess := &FQSession{
+		Token:        token,
+		Hostname:     req.Hostname,
+		HostnameHash: req.HostnameHash,
+		IPBucket:     req.IPBucket,
+		CreatedAt:    now,
+		LastSeenAt:   now,
+		State:        StatePending,
+	}
+
+	s.sessionStore.Save(sess)
+
+	return &AcquireResponse{
+		Result:     "pending",
+		QueryToken: token,
+	}, nil
+}
+
+func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
+	token := strings.TrimSpace(req.QueryToken)
+	sess, ok := s.sessionStore.Load(token)
+	if !ok || sess == nil {
+		return &AcquireResponse{Result: "timeout"}, nil
+	}
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	now := time.Now()
+
+	idleLimit := s.cfg.FairQueue.sessionIdleDuration()
+	if idleLimit > 0 && now.Sub(sess.LastSeenAt) > idleLimit {
+		s.cleanupSession(sess)
+		return &AcquireResponse{Result: "timeout"}, nil
+	}
+
+	maxWait := s.cfg.FairQueue.maxWaitDuration()
+	if now.Sub(sess.CreatedAt) >= maxWait {
+		sess.State = StateTimeout
+		s.cleanupSession(sess)
+		return &AcquireResponse{Result: "timeout"}, nil
+	}
+
+	sess.LastSeenAt = now
+
+	switch sess.State {
+	case StateGranted:
+		s.cleanupSession(sess)
+		return &AcquireResponse{
+			Result:     "granted",
+			SlotToken:  sess.SlotToken,
+			QueryToken: sess.Token,
+		}, nil
+	case StateThrottled:
+		s.cleanupSession(sess)
+		return &AcquireResponse{
+			Result:       "throttled",
+			ThrottleCode: sess.ThrottleCode,
+		}, nil
+	case StateTimeout:
+		s.cleanupSession(sess)
+		return &AcquireResponse{Result: "timeout"}, nil
+	}
+
+	budget := s.cfg.FairQueue.pollWindowDuration()
+	if err := s.runQueueCycle(ctx, sess, budget); err != nil {
+		s.log.Warnf("runQueueCycle error: %v", err)
+		return &AcquireResponse{
+			Result:     "pending",
+			QueryToken: sess.Token,
+		}, nil
+	}
+
+	switch sess.State {
+	case StateGranted:
+		s.cleanupSession(sess)
+		return &AcquireResponse{
+			Result:     "granted",
+			SlotToken:  sess.SlotToken,
+			QueryToken: sess.Token,
+		}, nil
+	case StateThrottled:
+		s.cleanupSession(sess)
+		return &AcquireResponse{
+			Result:       "throttled",
+			ThrottleCode: sess.ThrottleCode,
+		}, nil
+	case StateTimeout:
+		s.cleanupSession(sess)
+		return &AcquireResponse{Result: "timeout"}, nil
+	default:
+		return &AcquireResponse{
+			Result:     "pending",
+			QueryToken: sess.Token,
+		}, nil
+	}
+}
+
+func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time.Duration) error {
+	start := time.Now()
+	pollInterval := s.cfg.FairQueue.pollInterval()
+
+	if sess.IPBucket != "" && s.cfg.FairQueue.maxWaitersPerIP() > 0 && !sess.WaiterRegistered {
+		for {
+			if time.Since(start) >= budget {
+				return nil
 			}
-		}
-	}()
 
-	for {
-		if time.Now().After(deadline) {
-			return &AcquireResponse{Result: "timeout"}, nil
-		}
-
-		if req.IPBucket != "" && req.MaxWaitersPerIP > 0 && !registered {
+			req := s.buildAcquireRequest(sess.Hostname, sess.HostnameHash, sess.IPBucket, time.Now())
 			regRes, err := s.backend.RegisterWaiter(ctx, req)
 			if err != nil {
 				s.log.Warnf("register waiter error: %v", err)
-				time.Sleep(pollInterval)
-				continue
+				return err
 			}
 			if regRes != nil && regRes.allowed {
-				registered = true
-			} else {
-				time.Sleep(pollInterval)
-				continue
+				sess.WaiterRegistered = true
+				break
 			}
+
+			time.Sleep(pollInterval)
+		}
+	}
+
+	for {
+		if time.Since(start) >= budget {
+			return nil
 		}
 
+		req := s.buildAcquireRequest(sess.Hostname, sess.HostnameHash, sess.IPBucket, time.Now())
 		tryRes, err := s.backend.TryAcquire(ctx, req)
 		if err != nil {
 			s.log.Warnf("tryAcquire error: %v", err)
-			time.Sleep(pollInterval)
-			continue
+			return err
 		}
 		if tryRes == nil {
 			time.Sleep(pollInterval)
 			continue
 		}
 
-		meta := map[string]interface{}{}
-		if tryRes != nil {
-			if tryRes.queueDepth > 0 {
-				meta["queueDepth"] = tryRes.queueDepth
-			}
-			if tryRes.ipQueueDepth > 0 {
-				meta["ipQueueDepth"] = tryRes.ipQueueDepth
-			}
-		}
-
 		switch strings.ToUpper(tryRes.status) {
 		case "THROTTLED":
-			return &AcquireResponse{
-				Result:       "throttled",
-				ThrottleCode: tryRes.throttleCode,
-				Reason:       "throttle_by_db",
-				Meta:         meta,
-			}, nil
+			sess.State = StateThrottled
+			sess.ThrottleCode = tryRes.throttleCode
+			return nil
 		case "ACQUIRED":
-			tokenLog := tryRes.slotToken
-			if len(tokenLog) > 8 {
-				tokenLog = tokenLog[len(tokenLog)-8:]
-			}
-			s.log.Infof("slot granted host=%s ip=%s token=%s", req.Hostname, req.IPBucket, tokenLog)
-			return &AcquireResponse{
-				Result:    "granted",
-				SlotToken: tryRes.slotToken,
-				HoldMs:    minHoldMs,
-				Meta:      meta,
-			}, nil
+			sess.State = StateGranted
+			sess.SlotToken = tryRes.slotToken
+			return nil
 		default:
 			time.Sleep(pollInterval)
 		}
 	}
+}
+
+func (s *server) buildAcquireRequest(hostname, hostnameHash, ipBucket string, now time.Time) AcquireRequest {
+	return AcquireRequest{
+		Hostname:             hostname,
+		HostnameHash:         hostnameHash,
+		IPBucket:             ipBucket,
+		Now:                  now.UnixMilli(),
+		MaxSlotPerHost:       s.cfg.FairQueue.maxSlotPerHost(),
+		MaxSlotPerIP:         s.cfg.FairQueue.maxSlotPerIP(),
+		MaxWaitersPerIP:      s.cfg.FairQueue.maxWaitersPerIP(),
+		ZombieTimeoutSeconds: s.cfg.FairQueue.zombieTimeoutSeconds(),
+		CooldownSeconds:      s.cfg.FairQueue.cooldownSeconds(),
+	}
+}
+
+func (s *server) cleanupSession(sess *FQSession) {
+	token := sess.Token
+	shouldReleaseWaiter := sess.WaiterRegistered && sess.IPBucket != "" && s.cfg.FairQueue.maxWaitersPerIP() > 0
+	hostname := sess.Hostname
+	hostnameHash := sess.HostnameHash
+	ipBucket := sess.IPBucket
+
+	sess.WaiterRegistered = false
+	s.sessionStore.Delete(token)
+
+	if shouldReleaseWaiter {
+		go func() {
+			req := s.buildAcquireRequest(hostname, hostnameHash, ipBucket, time.Now())
+			if err := s.backend.ReleaseWaiter(context.Background(), req); err != nil {
+				s.log.Warnf("release waiter failed: %v", err)
+			}
+		}()
+	}
+}
+
+func (s *server) startSessionGC(ctx context.Context) {
+	ticker := time.NewTicker(45 * time.Second)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.gcSessions()
+			}
+		}
+	}()
+}
+
+func (s *server) gcSessions() {
+	now := time.Now()
+	idleLimit := s.cfg.FairQueue.sessionIdleDuration()
+	maxWait := s.cfg.FairQueue.maxWaitDuration()
+
+	s.sessionStore.Range(func(token string, sess *FQSession) bool {
+		sess.mu.Lock()
+		shouldDelete := sess.State != StatePending ||
+			(idleLimit > 0 && now.Sub(sess.LastSeenAt) > idleLimit) ||
+			now.Sub(sess.CreatedAt) >= maxWait
+		if shouldDelete {
+			s.cleanupSession(sess)
+		}
+		sess.mu.Unlock()
+		return true
+	})
 }
 
 func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
@@ -813,11 +1054,16 @@ func main() {
 		log.Fatalf("failed to init backend: %v", err)
 	}
 
+	gcCtx, gcCancel := context.WithCancel(context.Background())
+	defer gcCancel()
+
 	s := &server{
-		cfg:     cfg,
-		backend: backend,
-		log:     l,
+		cfg:          cfg,
+		backend:      backend,
+		log:          l,
+		sessionStore: newMemorySessionStore(),
 	}
+	s.startSessionGC(gcCtx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v0/fairqueue/acquire", s.handleAcquire)
@@ -842,6 +1088,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
+	gcCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(ctx); err != nil {

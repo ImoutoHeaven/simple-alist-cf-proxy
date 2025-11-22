@@ -510,10 +510,29 @@ const resolveConfig = (env = {}) => {
   if (fairQueueWaitTimeoutMs <= 0) {
     throw new Error(`${fairQueueWaitTimeoutLabel} must be greater than 0`);
   }
-  const fairQueueSlotHandlerTimeoutMs = parseInteger(
-    env.FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS,
-    fairQueueWaitTimeoutMs + 5000
+  const slotHandlerMaxWaitLabel =
+    env.SLOT_HANDLER_MAX_WAIT_MS !== undefined ? 'SLOT_HANDLER_MAX_WAIT_MS' : 'FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS';
+  const slotHandlerMaxWaitSource =
+    env.SLOT_HANDLER_MAX_WAIT_MS !== undefined
+      ? env.SLOT_HANDLER_MAX_WAIT_MS
+      : env.FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS;
+  const slotHandlerTotalMaxWaitMs = parseIntegerStrict(
+    slotHandlerMaxWaitSource,
+    20000,
+    slotHandlerMaxWaitLabel
   );
+  if (slotHandlerTotalMaxWaitMs <= 0) {
+    throw new Error(`${slotHandlerMaxWaitLabel} must be greater than 0`);
+  }
+  const slotHandlerPerRequestTimeoutMs = parseInteger(
+    env.SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS,
+    8000
+  );
+  if (slotHandlerPerRequestTimeoutMs <= 0) {
+    throw new Error('SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS must be greater than 0');
+  }
+  const slotHandlerMaxAttemptsCapRaw = parseInteger(env.SLOT_HANDLER_MAX_ATTEMPTS_CAP, 35);
+  const slotHandlerMaxAttemptsCap = slotHandlerMaxAttemptsCapRaw > 0 ? slotHandlerMaxAttemptsCapRaw : 35;
   const fairQueueSlotHandlerAuthKey = normalizeString(env.FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY, '');
   const fairQueueZombieTimeoutSeconds = parseInteger(env.FAIR_QUEUE_ZOMBIE_TIMEOUT_SECONDS, 30);
   const fairQueuePollIntervalMs = parseIntegerStrict(
@@ -592,7 +611,9 @@ const resolveConfig = (env = {}) => {
     fairQueueBackend,
     slotHandlerConfig: {
       url: fairQueueSlotHandlerUrl,
-      timeoutMs: fairQueueSlotHandlerTimeoutMs,
+      totalMaxWaitMs: slotHandlerTotalMaxWaitMs,
+      perRequestTimeoutMs: slotHandlerPerRequestTimeoutMs,
+      maxAttemptsCap: slotHandlerMaxAttemptsCap,
       authKey: fairQueueSlotHandlerAuthKey,
     },
     windowTime,
@@ -1048,7 +1069,7 @@ const createFairQueueClient = (config, env) => {
 const createSlotHandlerClient = (config, workerClient) => {
   const slotCfg = config.slotHandlerConfig || {};
   const baseUrl = normalizePostgrestBaseUrl(slotCfg.url);
-  const pgErrorHandle = config.pgErrorHandle || 'fail-closed';
+  const pgErrorHandle = (config.pgErrorHandle || 'fail-closed').toLowerCase();
   if (!baseUrl) {
     if (pgErrorHandle === 'fail-open') {
       return workerClient;
@@ -1060,36 +1081,74 @@ const createSlotHandlerClient = (config, workerClient) => {
   const releaseUrl = `${baseUrl}/api/v0/fairqueue/release`;
   const authKey = slotCfg.authKey || '';
   const fallbackClient = workerClient || createWorkerLocalFQClient(config);
-  const timeoutMs =
-    Number(slotCfg.timeoutMs) ||
-    Number(config.fairQueueConfig?.queueWaitTimeoutMs || 0) + 5000 ||
-    25000;
+  const perRequestTimeoutMsRaw = Number(slotCfg.perRequestTimeoutMs);
+  const perRequestTimeoutMs =
+    Number.isFinite(perRequestTimeoutMsRaw) && perRequestTimeoutMsRaw > 0 ? perRequestTimeoutMsRaw : 8000;
+  const totalMaxWaitMsRaw =
+    Number(slotCfg.totalMaxWaitMs) ||
+    Number(slotCfg.timeoutMs) || // legacy field
+    Number(config.fairQueueConfig?.queueWaitTimeoutMs);
+  const totalMaxWaitMs =
+    Number.isFinite(totalMaxWaitMsRaw) && totalMaxWaitMsRaw > 0 ? totalMaxWaitMsRaw : 20000;
+  const maxAttemptsCapRaw = Number(slotCfg.maxAttemptsCap);
+  const maxAttemptsCap =
+    Number.isFinite(maxAttemptsCapRaw) && maxAttemptsCapRaw > 0 ? maxAttemptsCapRaw : 35;
+
+  const buildHeaders = () => {
+    const headers = { 'Content-Type': 'application/json' };
+    if (authKey) {
+      headers['X-FQ-Auth'] = authKey;
+    }
+    return headers;
+  };
+
+  const fetchWithTimeout = async (url, payload, timeoutMs) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        headers: buildHeaders(),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const computeMaxAttempts = () => {
+    const attempts = Math.ceil(totalMaxWaitMs / perRequestTimeoutMs);
+    const safeAttempts = Number.isFinite(attempts) && attempts > 0 ? attempts : 1;
+    return Math.max(1, Math.min(maxAttemptsCap, safeAttempts));
+  };
 
   return {
     async waitForSlot(ctx, fqContext) {
-      const payload = {
-        hostname: fqContext.hostname,
-        hostnameHash: fqContext.hostnameHash,
-        ipBucket: fqContext.ipBucket,
-        now: fqContext.nowMs,
-      };
+      const maxAttempts = computeMaxAttempts();
+      let queryToken = null;
 
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-        const headers = { 'Content-Type': 'application/json' };
-        if (authKey) {
-          headers['X-FQ-Auth'] = authKey;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const payload = queryToken
+          ? { queryToken, now: Date.now() }
+          : {
+              hostname: fqContext.hostname,
+              hostnameHash: fqContext.hostnameHash,
+              ipBucket: fqContext.ipBucket,
+              now: fqContext.nowMs,
+            };
+
+        let res;
+        try {
+          res = await fetchWithTimeout(acquireUrl, payload, perRequestTimeoutMs);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[FQ] slot-handler acquire error:', message);
+          if (attempt === maxAttempts) {
+            return { kind: 'timeout', reason: 'slot-handler-unreachable' };
+          }
+          continue;
         }
-
-        const res = await fetch(acquireUrl, {
-          method: 'POST',
-          body: JSON.stringify(payload),
-          headers,
-          signal: controller.signal,
-        });
-
-        clearTimeout(timer);
 
         if (!res.ok) {
           const message = `[FQ] slot-handler acquire failed: status ${res.status}`;
@@ -1100,29 +1159,50 @@ const createSlotHandlerClient = (config, workerClient) => {
           throw new Error(message);
         }
 
-        const data = await res.json();
-        if (data && data.result === 'granted') {
-          fqContext.slotToken = data.slotToken;
-          fqContext.backend = FAIR_QUEUE_BACKEND.SLOT_HANDLER;
-          fqContext.slotAcquiredAt = Date.now();
-          console.log(`[FQ] slot granted via slot-handler host=${fqContext.hostname}`);
-          return { kind: 'granted' };
+        let data;
+        try {
+          data = await res.json();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[FQ] slot-handler response parse error:', message);
+          if (attempt === maxAttempts) {
+            return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
+          }
+          continue;
         }
-        if (data && data.result === 'throttled') {
-          return {
-            kind: 'throttled',
-            throttleCode: Number.isFinite(data.throttleCode) ? data.throttleCode : 503,
-          };
+
+        if (!queryToken && data && data.queryToken) {
+          queryToken = data.queryToken;
         }
-        return { kind: 'timeout' };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error('[FQ] slot-handler acquire error:', message);
-        if (pgErrorHandle === 'fail-open') {
-          return fallbackClient.waitForSlot(ctx, fqContext);
+
+        switch (data?.result) {
+          case 'granted':
+            fqContext.slotToken = data.slotToken;
+            fqContext.backend = FAIR_QUEUE_BACKEND.SLOT_HANDLER;
+            fqContext.slotAcquiredAt = Date.now();
+            console.log(`[FQ] slot granted via slot-handler host=${fqContext.hostname}`);
+            return { kind: 'granted' };
+          case 'throttled':
+            return {
+              kind: 'throttled',
+              throttleCode: Number.isFinite(data.throttleCode) ? data.throttleCode : 503,
+            };
+          case 'timeout':
+            return { kind: 'timeout' };
+          case 'pending':
+            continue;
+          default: {
+            const message = `[FQ] unexpected slot-handler result: ${data?.result}`;
+            console.error(message);
+            if (pgErrorHandle === 'fail-open') {
+              return fallbackClient.waitForSlot(ctx, fqContext);
+            }
+            throw new Error(message);
+          }
         }
-        throw error;
       }
+
+      return { kind: 'timeout', reason: 'slot-handler-loop-exhausted' };
     },
 
     async releaseSlot(ctx, fqContext) {
@@ -1144,13 +1224,9 @@ const createSlotHandlerClient = (config, workerClient) => {
       };
 
       try {
-        const headers = { 'Content-Type': 'application/json' };
-        if (authKey) {
-          headers['X-FQ-Auth'] = authKey;
-        }
         await fetch(releaseUrl, {
           method: 'POST',
-          headers,
+          headers: buildHeaders(),
           body: JSON.stringify(payload),
         });
         console.log(`[FQ] slot released via slot-handler host=${fqContext.hostname}`);

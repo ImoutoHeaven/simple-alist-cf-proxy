@@ -544,7 +544,10 @@ compatibility_date = "2024-01-01"
 #                                       # Default: 3 seconds (set to 0 to disable cooldown logic)
 #
 # FAIR_QUEUE_SLOT_HANDLER_URL = ""      # slot-handler base URL (FAIR_QUEUE_BACKEND=slot-handler 时必须)
-# FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS = "" # Optional; defaults to MAX_WAIT_MS + 5000
+# FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS = "" # slot-handler 总等待时间上限（别名 SLOT_HANDLER_MAX_WAIT_MS），默认 20000
+# SLOT_HANDLER_MAX_WAIT_MS = ""           # 可选，作用同 FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS
+# SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = "8000" # 单次短轮询 HTTP 超时（毫秒），默认 8000
+# SLOT_HANDLER_MAX_ATTEMPTS_CAP = "35"   # 短轮询最大尝试次数上限（自动 clamp），默认 35
 # FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY = ""  # Optional shared secret header X-FQ-Auth
 #
 # Error Responses:
