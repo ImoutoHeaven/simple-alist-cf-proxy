@@ -536,6 +536,10 @@ compatibility_date = "2024-01-01"
 #                                       # Default: 800ms (with 4 slots ≈ 5 QPS to upstream)
 #                                       # Set to 0 to disable hold-and-release behavior
 #
+# FAIR_QUEUE_SMOOTH_RELEASE_INTERVAL_MS = "" # Optional host-level pacing interval (ms)
+#                                            # Unset/empty → auto derived as MIN_SLOT_HOLD_MS / FAIR_QUEUE_GLOBAL_LIMIT
+#                                            # 0 → disable pacing; >0 → fixed interval between slot grants per host
+#
 # FAIR_QUEUE_TABLE_NAME = "upstream_slot_pool"  # Fair queue table name
 #                                                # Default: upstream_slot_pool
 #                                                # Only change if table name conflicts exist

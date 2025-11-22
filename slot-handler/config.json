@@ -21,6 +21,7 @@
     "pollIntervalMs": 500,
     "pollWindowMs": 6000,
     "minSlotHoldMs": 800,
+    "smoothReleaseIntervalMs": null,
     "sessionIdleSeconds": 90,
     "maxSlotPerHost": 5,
     "maxSlotPerIp": 1,
