@@ -56,7 +56,7 @@ type FairQueueConfig struct {
 	PollIntervalMs          int64     `json:"pollIntervalMs"`
 	PollWindowMs            int64     `json:"pollWindowMs"`
 	MinSlotHoldMs           int64     `json:"minSlotHoldMs"`
-	SmoothReleaseIntervalMs int64     `json:"smoothReleaseIntervalMs,omitempty"`
+	SmoothReleaseIntervalMs *int64    `json:"smoothReleaseIntervalMs,omitempty"`
 	MaxSlotPerHost          int       `json:"maxSlotPerHost"`
 	MaxSlotPerIP            int       `json:"maxSlotPerIp"`
 	MaxWaitersPerIP         int       `json:"maxWaitersPerIp"`
@@ -358,8 +358,11 @@ func (c FairQueueConfig) maxSlotPerHost() int {
 }
 
 func (c FairQueueConfig) smoothInterval() time.Duration {
-	if c.SmoothReleaseIntervalMs > 0 {
-		return time.Duration(c.SmoothReleaseIntervalMs) * time.Millisecond
+	if c.SmoothReleaseIntervalMs != nil {
+		if *c.SmoothReleaseIntervalMs <= 0 {
+			return 0
+		}
+		return time.Duration(*c.SmoothReleaseIntervalMs) * time.Millisecond
 	}
 	minHold := c.minHold(0)
 	slots := c.maxSlotPerHost()

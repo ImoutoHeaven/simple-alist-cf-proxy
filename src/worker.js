@@ -551,6 +551,17 @@ const resolveConfig = (env = {}) => {
   if (fairQueueMinSlotHoldMs < 0) {
     throw new Error('FAIR_QUEUE_MIN_SLOT_HOLD_MS must be greater than or equal to 0');
   }
+  const fairQueueSmoothReleaseIntervalMs = (() => {
+    const raw = env.FAIR_QUEUE_SMOOTH_RELEASE_INTERVAL_MS;
+    if (raw === undefined || raw === null || String(raw).trim() === '') {
+      return undefined;
+    }
+    const parsed = parseInteger(raw, 0);
+    if (!Number.isFinite(parsed)) {
+      throw new Error('FAIR_QUEUE_SMOOTH_RELEASE_INTERVAL_MS must be an integer');
+    }
+    return parsed;
+  })();
   const fairQueueTableName = normalizeString(env.FAIR_QUEUE_TABLE_NAME, 'upstream_slot_pool');
   const fairQueueQueueDepthTableName = 'upstream_ip_queue_depth';
 
@@ -650,6 +661,7 @@ const resolveConfig = (env = {}) => {
       queueDepthZombieTtlSeconds: fairQueueQueueDepthZombieTtlSeconds,
       pollIntervalMs: fairQueuePollIntervalMs,
       minSlotHoldMs: fairQueueMinSlotHoldMs,
+      smoothReleaseIntervalMs: fairQueueSmoothReleaseIntervalMs,
       fairQueueTableName,
       fairQueueCooldownTableName: 'upstream_ip_cooldown',
       fairQueueQueueDepthTableName,
