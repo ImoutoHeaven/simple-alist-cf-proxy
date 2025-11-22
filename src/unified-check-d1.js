@@ -119,7 +119,8 @@ const ensureAllTables = async (
     db.prepare(`
       CREATE TABLE IF NOT EXISTS ${fairQueueHostPacingTableName} (
         hostname_pattern TEXT PRIMARY KEY,
-        last_acquired_at TEXT NOT NULL
+        last_acquired_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
       )
     `)
   );
@@ -566,7 +567,8 @@ const ensurePacingTable = async (db, tableName = 'worker_host_pacing') => {
     .prepare(`
       CREATE TABLE IF NOT EXISTS ${tableName} (
         hostname_pattern TEXT PRIMARY KEY,
-        last_acquired_at TEXT NOT NULL
+        last_acquired_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
       )
     `)
     .run();
@@ -587,7 +589,8 @@ const tryClaimPacingToken = async (db, hostname, intervalMs, tableName = 'worker
         INSERT INTO ${tableName} (hostname_pattern, last_acquired_at)
         VALUES (?, strftime('%Y-%m-%d %H:%M:%f','now'))
         ON CONFLICT(hostname_pattern) DO UPDATE
-        SET last_acquired_at = excluded.last_acquired_at
+        SET last_acquired_at = excluded.last_acquired_at,
+            updated_at = excluded.last_acquired_at
         WHERE ${tableName}.last_acquired_at <= strftime('%Y-%m-%d %H:%M:%f','now', ?)
         `
       )
