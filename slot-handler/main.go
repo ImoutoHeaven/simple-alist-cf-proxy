@@ -475,6 +475,10 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 		return nil, err
 	}
 	if throttleRes.throttled {
+		s.log.Infof(
+			"acquire throttled host=%s ip=%s code=%d retryAfter=%d",
+			req.Hostname, req.IPBucket, throttleRes.code, throttleRes.retryAfter,
+		)
 		return &AcquireResponse{
 			Result:       "throttled",
 			ThrottleCode: throttleRes.code,
@@ -484,6 +488,10 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 	}
 
 	token := uuid.New().String()
+	s.log.Infof(
+		"session created host=%s ip=%s token=%s window=%ds",
+		req.Hostname, req.IPBucket, token, throttleWindow,
+	)
 	sess := &FQSession{
 		Token:              token,
 		Hostname:           req.Hostname,
@@ -509,6 +517,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 	token := strings.TrimSpace(req.QueryToken)
 	sess, ok := s.sessionStore.Load(token)
 	if !ok || sess == nil {
+		s.log.Infof("session missing token=%s", token)
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
 
@@ -519,12 +528,22 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 
 	idleLimit := s.cfg.FairQueue.sessionIdleDuration()
 	if idleLimit > 0 && now.Sub(sess.LastSeenAt) > idleLimit {
+		s.log.Infof(
+			"session idle-timeout token=%s host=%s ip=%s idle_ms=%d",
+			sess.Token, sess.Hostname, sess.IPBucket,
+			now.Sub(sess.LastSeenAt).Milliseconds(),
+		)
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
 
 	maxWait := s.cfg.FairQueue.maxWaitDuration()
 	if now.Sub(sess.CreatedAt) >= maxWait {
+		s.log.Infof(
+			"session max-wait-timeout token=%s host=%s ip=%s wait_ms=%d",
+			sess.Token, sess.Hostname, sess.IPBucket,
+			now.Sub(sess.CreatedAt).Milliseconds(),
+		)
 		sess.State = StateTimeout
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
@@ -534,6 +553,10 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 
 	switch sess.State {
 	case StateGranted:
+		s.log.Infof(
+			"session granted token=%s host=%s ip=%s slotToken=%s",
+			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
+		)
 		s.cleanupSession(sess)
 		return &AcquireResponse{
 			Result:     "granted",
@@ -541,6 +564,11 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			QueryToken: sess.Token,
 		}, nil
 	case StateThrottled:
+		s.log.Infof(
+			"session throttled token=%s host=%s ip=%s code=%d retryAfter=%d",
+			sess.Token, sess.Hostname, sess.IPBucket,
+			sess.ThrottleCode, sess.ThrottleRetryAfter,
+		)
 		s.cleanupSession(sess)
 		return &AcquireResponse{
 			Result:       "throttled",
@@ -548,6 +576,10 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			ThrottleWait: sess.ThrottleRetryAfter,
 		}, nil
 	case StateTimeout:
+		s.log.Infof(
+			"session timeout token=%s host=%s ip=%s",
+			sess.Token, sess.Hostname, sess.IPBucket,
+		)
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
@@ -563,6 +595,10 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 
 	switch sess.State {
 	case StateGranted:
+		s.log.Infof(
+			"session granted token=%s host=%s ip=%s slotToken=%s",
+			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
+		)
 		s.cleanupSession(sess)
 		return &AcquireResponse{
 			Result:     "granted",
@@ -570,6 +606,11 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			QueryToken: sess.Token,
 		}, nil
 	case StateThrottled:
+		s.log.Infof(
+			"session throttled token=%s host=%s ip=%s code=%d retryAfter=%d",
+			sess.Token, sess.Hostname, sess.IPBucket,
+			sess.ThrottleCode, sess.ThrottleRetryAfter,
+		)
 		s.cleanupSession(sess)
 		return &AcquireResponse{
 			Result:       "throttled",
@@ -577,6 +618,10 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			ThrottleWait: sess.ThrottleRetryAfter,
 		}, nil
 	case StateTimeout:
+		s.log.Infof(
+			"session timeout token=%s host=%s ip=%s",
+			sess.Token, sess.Hostname, sess.IPBucket,
+		)
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
 	default:
@@ -590,6 +635,11 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time.Duration) error {
 	start := time.Now()
 	pollInterval := s.cfg.FairQueue.pollInterval()
+	s.log.Debugf(
+		"runQueueCycle start token=%s host=%s ip=%s waiterRegistered=%v budget_ms=%d poll_ms=%d",
+		sess.Token, sess.Hostname, sess.IPBucket, sess.WaiterRegistered,
+		budget.Milliseconds(), pollInterval.Milliseconds(),
+	)
 
 	if sess.IPBucket != "" && s.cfg.FairQueue.maxWaitersPerIP() > 0 && !sess.WaiterRegistered {
 		for {
@@ -605,7 +655,20 @@ func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time
 			}
 			if regRes != nil && regRes.allowed {
 				sess.WaiterRegistered = true
+				s.log.Infof(
+					"waiter registered token=%s host=%s ip=%s qDepth=%d ipQDepth=%d status=%s",
+					sess.Token, sess.Hostname, sess.IPBucket,
+					regRes.queueDepth, regRes.ipQueueDepth, regRes.statusMessage,
+				)
 				break
+			}
+
+			if regRes != nil {
+				s.log.Debugf(
+					"waiter not-allowed token=%s host=%s ip=%s qDepth=%d ipQDepth=%d status=%s",
+					sess.Token, sess.Hostname, sess.IPBucket,
+					regRes.queueDepth, regRes.ipQueueDepth, regRes.statusMessage,
+				)
 			}
 
 			time.Sleep(pollInterval)
@@ -634,10 +697,25 @@ func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time
 			sess.State = StateThrottled
 			sess.ThrottleCode = tryRes.throttleCode
 			sess.ThrottleRetryAfter = tryRes.throttleRetryAfter
+			s.log.Infof(
+				"slot throttled token=%s host=%s ip=%s code=%d retryAfter=%d qDepth=%d ipQDepth=%d",
+				sess.Token, sess.Hostname, sess.IPBucket,
+				tryRes.throttleCode, tryRes.throttleRetryAfter,
+				tryRes.queueDepth, tryRes.ipQueueDepth,
+			)
 			return nil
 		case "ACQUIRED":
 			sess.State = StateGranted
 			sess.SlotToken = tryRes.slotToken
+			slotLog := tryRes.slotToken
+			if len(slotLog) > 8 {
+				slotLog = slotLog[len(slotLog)-8:]
+			}
+			s.log.Infof(
+				"slot acquired token=%s host=%s ip=%s slot=%s qDepth=%d ipQDepth=%d",
+				sess.Token, sess.Hostname, sess.IPBucket,
+				slotLog, tryRes.queueDepth, tryRes.ipQueueDepth,
+			)
 			return nil
 		default:
 			time.Sleep(pollInterval)
@@ -675,6 +753,8 @@ func (s *server) cleanupSession(sess *FQSession) {
 			req := s.buildAcquireRequest(hostname, hostnameHash, ipBucket, sess.ThrottleTimeWindow, time.Now())
 			if err := s.backend.ReleaseWaiter(context.Background(), req); err != nil {
 				s.log.Warnf("release waiter failed: %v", err)
+			} else {
+				s.log.Debugf("waiter released host=%s ip=%s token=%s", hostname, ipBucket, token)
 			}
 		}()
 	}
@@ -706,6 +786,10 @@ func (s *server) gcSessions() {
 			(idleLimit > 0 && now.Sub(sess.LastSeenAt) > idleLimit) ||
 			now.Sub(sess.CreatedAt) >= maxWait
 		if shouldDelete {
+			s.log.Debugf(
+				"session gc token=%s host=%s ip=%s state=%s",
+				sess.Token, sess.Hostname, sess.IPBucket, sess.State,
+			)
 			s.cleanupSession(sess)
 		}
 		sess.mu.Unlock()
@@ -716,11 +800,14 @@ func (s *server) gcSessions() {
 func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 	minHoldMs := s.cfg.FairQueue.minHold(0)
 
-	target := time.UnixMilli(req.HitUpstreamAt).Add(time.Duration(minHoldMs) * time.Millisecond)
+	hitAt := time.UnixMilli(req.HitUpstreamAt)
+	target := hitAt.Add(time.Duration(minHoldMs) * time.Millisecond)
 	now := time.Now()
 	if target.After(now) {
 		time.Sleep(target.Sub(now))
 	}
+	now = time.Now()
+	holdMs := now.Sub(hitAt).Milliseconds()
 
 	if err := s.backend.ReleaseSlot(ctx, req); err != nil {
 		s.log.Errorf("release slot error: %v", err)
@@ -729,7 +816,10 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 		if len(tokenLog) > 8 {
 			tokenLog = tokenLog[len(tokenLog)-8:]
 		}
-		s.log.Infof("slot released host=%s ip=%s token=%s", req.Hostname, req.IPBucket, tokenLog)
+		s.log.Infof(
+			"slot released host=%s ip=%s token=%s hold_ms=%d min_hold_ms=%d",
+			req.Hostname, req.IPBucket, tokenLog, holdMs, minHoldMs,
+		)
 	}
 	return nil
 }
