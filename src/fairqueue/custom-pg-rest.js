@@ -315,6 +315,49 @@ const cleanupQueueDepth = async (config) => {
   return 0;
 };
 
+const cleanupHostPacing = async (config) => {
+  if (!config?.postgrestUrl) {
+    throw new Error('[Fair Queue PG] Missing PostgREST URL');
+  }
+
+  const ttlSeconds = Number.isFinite(config?.hostPacingCleanupTtlSeconds)
+    ? config.hostPacingCleanupTtlSeconds
+    : 604800;
+
+  if (ttlSeconds <= 0) {
+    return 0;
+  }
+
+  const tableName = config.fairQueueHostPacingTableName || 'upstream_host_pacing_worker';
+  const cutoffIso = new Date(Date.now() - ttlSeconds * 1000).toISOString();
+
+  const headers = buildHeaders(config.verifyHeader, config.verifySecret);
+  const response = await fetch(
+    `${config.postgrestUrl}/${tableName}?updated_at=lt.${encodeURIComponent(cutoffIso)}`,
+    {
+      method: 'DELETE',
+      headers: { ...headers, Prefer: 'return=representation' },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`PostgREST pacing cleanup failed: ${response.status}`);
+  }
+
+  let deleted = 0;
+  const contentType = response.headers.get('content-type');
+  if (contentType && contentType.includes('application/json')) {
+    const payload = await response.json().catch(() => []);
+    deleted = Array.isArray(payload) ? payload.length : Number(payload) || 0;
+  }
+
+  if (deleted > 0) {
+    console.log(`[Fair Queue PG] Cleaned up ${deleted} pacing records`);
+  }
+
+  return deleted;
+};
+
 export {
   tryAcquireFairSlot,
   releaseFairSlot,
@@ -323,4 +366,5 @@ export {
   tryRegisterQueueWaiter,
   releaseQueueWaiter,
   cleanupQueueDepth,
+  cleanupHostPacing,
 };

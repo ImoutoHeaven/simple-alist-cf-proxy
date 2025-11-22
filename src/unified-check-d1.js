@@ -19,6 +19,7 @@ const ensureAllTables = async (
     fairQueueTableName = 'upstream_slot_pool',
     fairQueueCooldownTableName = 'upstream_ip_cooldown',
     fairQueueQueueDepthTableName = 'upstream_ip_queue_depth',
+    fairQueueHostPacingTableName = 'worker_host_pacing',
   }
 ) => {
   const activeTableName = lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
@@ -114,6 +115,15 @@ const ensureAllTables = async (
     `)
   );
 
+  statements.push(
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ${fairQueueHostPacingTableName} (
+        hostname_pattern TEXT PRIMARY KEY,
+        last_acquired_at TEXT NOT NULL
+      )
+    `)
+  );
+
   await db.batch(statements);
 };
 
@@ -147,6 +157,7 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
   const throttleTimeWindow = config.throttleTimeWindow ?? 60;
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
+  const hostPacingTableName = config.fairQueueHostPacingTableName || 'worker_host_pacing';
 
   if (config.initTables === true) {
     await ensureAllTables(db, {
@@ -154,6 +165,7 @@ export const unifiedCheckD1 = async (path, clientIP, config) => {
       rateLimitTableName,
       throttleTableName,
       lastActiveTableName,
+      fairQueueHostPacingTableName: hostPacingTableName,
     });
   }
 
@@ -590,6 +602,41 @@ const tryClaimPacingToken = async (db, hostname, intervalMs, tableName = 'worker
   }
 };
 
+const cleanupHostPacing = async (config) => {
+  if (!config?.env || !config.databaseBinding) {
+    throw new Error('[Fair Queue D1] Missing D1 configuration for pacing cleanup');
+  }
+
+  const db = config.env[config.databaseBinding];
+  if (!db) {
+    throw new Error(`[Fair Queue D1] D1 binding '${config.databaseBinding}' not found`);
+  }
+
+  const tableName = config.fairQueueHostPacingTableName || 'worker_host_pacing';
+  const ttlSeconds = Number.isFinite(config?.hostPacingCleanupTtlSeconds)
+    ? config.hostPacingCleanupTtlSeconds
+    : 604800;
+
+  if (ttlSeconds <= 0) {
+    return 0;
+  }
+
+  await ensurePacingTable(db, tableName);
+
+  const result = await db
+    .prepare(
+      `DELETE FROM ${tableName}
+       WHERE updated_at < strftime('%Y-%m-%d %H:%M:%f','now', ?)`)
+    .bind(`-${ttlSeconds} seconds`)
+    .run();
+
+  const deleted = result.meta?.changes ?? 0;
+  if (deleted > 0) {
+    console.log(`[Fair Queue D1] Cleaned up ${deleted} pacing records`);
+  }
+  return deleted;
+};
+
 const tryAcquireFairSlotOnce = async (db, hostname, ipHash, config) => {
   const tableName = config.fairQueueTableName || 'upstream_slot_pool';
   const cooldownTableName = config.fairQueueCooldownTableName || 'upstream_ip_cooldown';
@@ -1008,4 +1055,5 @@ export {
   tryRegisterQueueWaiter,
   releaseQueueWaiter,
   cleanupQueueDepth,
+  cleanupHostPacing,
 };

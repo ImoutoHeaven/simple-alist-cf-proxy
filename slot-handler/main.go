@@ -861,7 +861,7 @@ func (s *server) getSmoothReleaser(hostnameHash, hostname string) *smoothHostRel
 }
 
 func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
-	minHoldMs := s.cfg.FairQueue.minHold(req.MinSlotHoldMs)
+	minHoldMs := s.cfg.FairQueue.minHold(0)
 
 	hitAt := time.UnixMilli(req.HitUpstreamAt)
 	if req.HitUpstreamAt == 0 || hitAt.IsZero() {

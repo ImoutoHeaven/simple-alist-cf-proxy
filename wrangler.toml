@@ -539,6 +539,8 @@ compatibility_date = "2024-01-01"
 # FAIR_QUEUE_SMOOTH_RELEASE_INTERVAL_MS = "" # Optional host-level pacing interval (ms)
 #                                            # Unset/empty → auto derived as MIN_SLOT_HOLD_MS / FAIR_QUEUE_GLOBAL_LIMIT
 #                                            # 0 → disable pacing; >0 → fixed interval between slot grants per host
+# FAIR_QUEUE_HOST_PACING_TABLE = ""           # Optional override for host pacing table name
+# FAIR_QUEUE_HOST_PACING_CLEANUP_TTL_SECONDS = "604800" # Cleanup TTL for host pacing records (default 7d). 0 = disable cleanup
 #
 # FAIR_QUEUE_TABLE_NAME = "upstream_slot_pool"  # Fair queue table name
 #                                                # Default: upstream_slot_pool

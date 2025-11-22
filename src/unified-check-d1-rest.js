@@ -89,6 +89,8 @@ const ensureAllTables = async (
     lastActiveTableName,
     fairQueueTableName = 'upstream_slot_pool',
     fairQueueCooldownTableName = 'upstream_ip_cooldown',
+    fairQueueQueueDepthTableName = 'upstream_ip_queue_depth',
+    fairQueueHostPacingTableName = 'worker_host_pacing',
   }
 ) => {
   const activeTableName = lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
@@ -192,6 +194,12 @@ const ensureAllTables = async (
     {
       sql: `CREATE INDEX IF NOT EXISTS idx_ip_queue_depth_ts
             ON ${fairQueueQueueDepthTableName} (updated_at)`,
+    },
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${fairQueueHostPacingTableName} (
+        hostname_pattern TEXT PRIMARY KEY,
+        last_acquired_at TEXT NOT NULL
+      )`,
     },
   ];
 
@@ -336,6 +344,8 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
   const rateLimitTableName = config.rateLimitTableName || 'DOWNLOAD_IP_RATELIMIT_TABLE';
   const throttleTableName = config.throttleTableName || 'THROTTLE_PROTECTION';
   const lastActiveTableName = config.lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
+  const fairQueueQueueDepthTableName = config.fairQueueQueueDepthTableName || 'upstream_ip_queue_depth';
+  const hostPacingTableName = config.fairQueueHostPacingTableName || 'worker_host_pacing';
   const throttleTimeWindow = config.throttleTimeWindow ?? 60;
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
@@ -346,6 +356,8 @@ export const unifiedCheckD1Rest = async (path, clientIP, config) => {
       rateLimitTableName,
       throttleTableName,
       lastActiveTableName,
+      fairQueueQueueDepthTableName,
+      fairQueueHostPacingTableName: hostPacingTableName,
     });
   }
 
@@ -670,20 +682,58 @@ const tryClaimPacingTokenRest = async (
   const seconds = intervalMs / 1000;
   const modifier = `-${seconds} seconds`;
 
-  const result = await executeQuery(
+  try {
+    const result = await executeQuery(
+      accountId,
+      databaseId,
+      apiToken,
+      `INSERT INTO ${tableName} (hostname_pattern, last_acquired_at)
+       VALUES (?, strftime('%Y-%m-%d %H:%M:%f','now'))
+       ON CONFLICT(hostname_pattern) DO UPDATE
+       SET last_acquired_at = excluded.last_acquired_at
+       WHERE ${tableName}.last_acquired_at <= strftime('%Y-%m-%d %H:%M:%f','now', ?)`,
+      [hostname, modifier]
+    );
+
+    const changes = result.meta?.changes ?? 0;
+    return changes > 0;
+  } catch (error) {
+    console.error('[D1-REST Pacing] Error:', error);
+    return false;
+  }
+};
+
+const cleanupHostPacing = async (config) => {
+  if (!config?.accountId || !config.databaseId || !config.apiToken) {
+    throw new Error('[Fair Queue D1-REST] Missing D1 REST configuration for pacing cleanup');
+  }
+
+  const { accountId, databaseId, apiToken } = config;
+  const tableName = config.fairQueueHostPacingTableName || 'worker_host_pacing';
+  const ttlSeconds = Number.isFinite(config?.hostPacingCleanupTtlSeconds)
+    ? config.hostPacingCleanupTtlSeconds
+    : 604800;
+
+  if (ttlSeconds <= 0) {
+    return 0;
+  }
+
+  await ensurePacingTableRest(accountId, databaseId, apiToken, tableName);
+
+  const changes = await executeQuery(
     accountId,
     databaseId,
     apiToken,
-    `INSERT INTO ${tableName} (hostname_pattern, last_acquired_at)
-     VALUES (?, strftime('%Y-%m-%d %H:%M:%f','now'))
-     ON CONFLICT(hostname_pattern) DO UPDATE
-     SET last_acquired_at = excluded.last_acquired_at
-     WHERE ${tableName}.last_acquired_at <= strftime('%Y-%m-%d %H:%M:%f','now', ?)`,
-    [hostname, modifier]
+    `DELETE FROM ${tableName}
+     WHERE updated_at < datetime('now', ?)`,
+    [`-${ttlSeconds} seconds`]
   );
 
-  const changes = result.meta?.changes ?? 0;
-  return changes > 0;
+  const deleted = changes.meta?.changes ?? 0;
+  if (deleted > 0) {
+    console.log(`[Fair Queue D1-REST] Cleaned up ${deleted} pacing records`);
+  }
+  return deleted;
 };
 
 const tryAcquireFairSlotOnceRest = async (
@@ -1134,4 +1184,5 @@ export {
   tryRegisterQueueWaiter,
   releaseQueueWaiter,
   cleanupQueueDepth,
+  cleanupHostPacing,
 };

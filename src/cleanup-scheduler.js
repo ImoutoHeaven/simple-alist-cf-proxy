@@ -541,6 +541,12 @@ export async function scheduleAllCleanups(config, env, ctx) {
             );
           }
 
+          if (typeof fairQueueModule.cleanupHostPacing === 'function') {
+            fairQueueCleanupTasks.push(
+              fairQueueModule.cleanupHostPacing(config.fairQueueConfig)
+            );
+          }
+
           if (fairQueueCleanupTasks.length > 0) {
             await Promise.all(fairQueueCleanupTasks);
           }

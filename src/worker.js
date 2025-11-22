@@ -562,6 +562,12 @@ const resolveConfig = (env = {}) => {
     }
     return parsed;
   })();
+  const fairQueueHostPacingTableName = normalizeString(env.FAIR_QUEUE_HOST_PACING_TABLE, '');
+  const fairQueueHostPacingCleanupTtlSecondsRaw = parseInteger(
+    env.FAIR_QUEUE_HOST_PACING_CLEANUP_TTL_SECONDS,
+    604800
+  );
+  const fairQueueHostPacingCleanupTtlSeconds = Math.max(0, fairQueueHostPacingCleanupTtlSecondsRaw);
   const fairQueueTableName = normalizeString(env.FAIR_QUEUE_TABLE_NAME, 'upstream_slot_pool');
   const fairQueueQueueDepthTableName = 'upstream_ip_queue_depth';
 
@@ -662,6 +668,9 @@ const resolveConfig = (env = {}) => {
       pollIntervalMs: fairQueuePollIntervalMs,
       minSlotHoldMs: fairQueueMinSlotHoldMs,
       smoothReleaseIntervalMs: fairQueueSmoothReleaseIntervalMs,
+      hostPacingTableName: fairQueueHostPacingTableName || undefined,
+      fairQueueHostPacingTableName: fairQueueHostPacingTableName || undefined,
+      hostPacingCleanupTtlSeconds: fairQueueHostPacingCleanupTtlSeconds,
       fairQueueTableName,
       fairQueueCooldownTableName: 'upstream_ip_cooldown',
       fairQueueQueueDepthTableName,
