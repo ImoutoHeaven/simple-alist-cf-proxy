@@ -516,9 +516,11 @@ const resolveConfig = (env = {}) => {
     env.SLOT_HANDLER_MAX_WAIT_MS !== undefined
       ? env.SLOT_HANDLER_MAX_WAIT_MS
       : env.FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS;
+  const slotHandlerDefaultTotalMaxWaitMs =
+    fairQueueWaitTimeoutMs > 0 ? fairQueueWaitTimeoutMs + 5000 : 20000;
   const slotHandlerTotalMaxWaitMs = parseIntegerStrict(
     slotHandlerMaxWaitSource,
-    20000,
+    slotHandlerDefaultTotalMaxWaitMs,
     slotHandlerMaxWaitLabel
   );
   if (slotHandlerTotalMaxWaitMs <= 0) {
