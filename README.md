@@ -1,29 +1,3 @@
-### IPv6 users can't download
-- Set `IPV4_ONLY=false` if you want to support IPv6
-- Note: IPv6 support may have security implications depending on your setup
-
-### Blacklist/Whitelist not working
-- Verify both PREFIX and ACTION are set for the list you want to activate
-- Check path prefixes match exactly (case-sensitive, including leading /)
-- Remember: Blacklist overrides whitelist when both match
-
-## Performance Tips
-
-1. **Use Cloudflare caching**: Configure appropriate cache headers
-2. **Deploy close to users**: Use Cloudflare's global network
-3. **Monitor metrics**: Check Cloudflare Analytics for performance insights
-4. **Optimize AList**: Ensure your AList server responds quickly
-
-## License
-
-MIT
-
-## Support
-
-For issues and questions:
-- Check environment variables are correctly configured
-- Review worker logs in Cloudflare Dashboard
-- Verify integration with alist-landing-worker
 # simple-alist-cf-proxy
 
 simple-alist-cf-proxy 是 AList 下载体系中的「download worker」，通常与 `alist-landing-worker` 搭配使用，负责：
