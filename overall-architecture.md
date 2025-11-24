@@ -186,8 +186,7 @@ Download Worker 接到请求后：
 设计上：
 
 - 所有与限流 / token / cache / fair queue 相关的逻辑都尽量下沉到存储层的函数（init.sql 中），Worker 仅调用简化接口；
-- D1 版本大体复刻这些逻辑，但使用 SQL/JS 而非 plpgsql；
-- 这样既保证部署在 Cloudflare 生态内的一致性，也允许迁移到自建 PG。
+- 历史的 D1/D1-REST 路径已移除；若需新的后端，需新增对应 schema 与实现。
 
 ### 2. Pow-bot-deterrent 扩展
 

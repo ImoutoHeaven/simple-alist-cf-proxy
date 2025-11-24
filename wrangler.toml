@@ -187,52 +187,6 @@ compatibility_date = "2024-01-01"
 # DOWNLOAD_LAST_ACTIVE_TABLE: 自定义空闲追踪表名，默认 DOWNLOAD_LAST_ACTIVE_TABLE
 #   - 仅在 DB_MODE="custom-pg-rest" 时生效
 #
-# # ═══════════════════════════════════════════════════════════════
-# # ⚠️ Database Table Initialization Control (Performance Optimization)
-# # ═══════════════════════════════════════════════════════════════
-# #
-# # INIT_TABLES controls whether to create database tables before each RPC/SQL batch call
-# # Default: "false" (skip table initialization for optimal performance)
-# #
-# # How it works:
-# # - When "true": Worker calls ensureTables() before every unified check
-# #                Creates tables if they don't exist (CREATE TABLE IF NOT EXISTS)
-# #                Ensures tables are always available but adds overhead
-# # - When "false": Worker skips ensureTables() call completely
-# #                 Reduces database round-trips and improves response time
-# #                 Tables must be created manually before first use
-# #
-# # Performance Impact:
-# # - "false" (recommended): ~10-50ms faster per request (no table check overhead)
-# # - "true" (legacy): Safe but slower (adds CREATE TABLE queries to every request)
-# #
-# # When to use "true":
-# # - First deployment (tables don't exist yet)
-# # - Table schema changes (need to update table structure)
-# # - Development/testing environments
-# # - Automatic recovery after database reset
-# #
-# # When to use "false":
-# # - Production environments (tables already exist)
-# # - Performance-critical scenarios
-# # - After initial deployment is successful
-# #
-# # Recommended Workflow:
-# # 1. First deployment: INIT_TABLES="true" → Creates all tables
-# # 2. Verify tables exist: Check database dashboard or run SELECT on tables
-# # 3. Switch to production: INIT_TABLES="false" → Optimal performance
-# # 4. Schema updates: Temporarily set to "true" → Apply changes → Set back to "false"
-# #
-# # Tables Created (when INIT_TABLES="true"):
-# # - DOWNLOAD_CACHE_TABLE (download link cache)
-# # - DOWNLOAD_IP_RATELIMIT_TABLE (IP rate limiting)
-# # - THROTTLE_PROTECTION (throttle protection)
-# #
-# # Note: For custom-pg-rest mode, you should still run init.sql manually for stored procedures
-# #       INIT_TABLES only creates tables, not functions/procedures
-# #
-# INIT_TABLES = "false"
-#
 # # Link Cache TTL - how long to cache download links before re-fetching from AList
 # # Format: {number}{unit} where unit is h (hour), m (minute), s (second)
 # # Examples: "30m", "1h", "120s"
@@ -446,8 +400,7 @@ compatibility_date = "2024-01-01"
 #   1. Run init.sql to create:
 #      - Table: upstream_slot_pool
 #      - Functions: func_try_acquire_slot, func_release_fair_slot, func_cleanup_zombie_slots
-#   2. INIT_TABLES has no effect (PostgREST doesn't support auto-table creation)
-#   2. INIT_TABLES has no effect (PostgREST doesn't support auto-table creation)
+#   2. Fair Queue 仅在已手动创建上述表/函数后可用
 # Relationship with Throttle Protection:
 # ┌────────────────┬────────────────┬──────────────────────────────────┐
 # │ State          │ Fair Queue     │ Throttle Protection              │

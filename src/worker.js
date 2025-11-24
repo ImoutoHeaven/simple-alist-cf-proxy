@@ -271,7 +271,6 @@ const resolveConfig = (env = {}) => {
   }
 
   const postgrestUrl = normalizeString(env.POSTGREST_URL);
-  const initTables = parseBoolean(env.INIT_TABLES, false);
 
   let cacheEnabled = false;
   let cacheConfig = {};
@@ -288,7 +287,6 @@ const resolveConfig = (env = {}) => {
         idleTimeout: idleTimeoutSeconds,
         lastActiveTableName,
         cleanupProbability,
-        initTables,
       };
     } else {
       throw new Error('DB_MODE is set to "custom-pg-rest" but required environment variables are missing: POSTGREST_URL, VERIFY_HEADER, VERIFY_SECRET, LINK_TTL');
@@ -531,7 +529,6 @@ const resolveConfig = (env = {}) => {
     cfRatelimiterBinding,
     ipv4Suffix,
     ipv6Suffix,
-    initTables,
     pgErrorHandle,
     idleTimeout: idleTimeoutSeconds,
     lastActiveTableName,

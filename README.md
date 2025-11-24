@@ -190,7 +190,7 @@ landing worker 端生成与字段含义请参考 `alist-landing-worker-architect
 
 ## 部署与配置文档
 
-更完整的部署指导（含 DB_MODE 三种模式、D1/PostgREST 初始化、Throttle/Fair Queue 场景示例等）请阅读本仓库根目录的：
+更完整的部署指导（仅支持无 DB / PostgREST 模式，以及 Throttle/Fair Queue 场景示例）请阅读本仓库根目录的：
 
 - `DEPLOYMENT.md`
 
