@@ -52,21 +52,22 @@ type PostgresConfig struct {
 }
 
 type FairQueueConfig struct {
-	MaxWaitMs                 int64                  `json:"maxWaitMs"`
-	PollIntervalMs            int64                  `json:"pollIntervalMs"`
-	PollWindowMs              int64                  `json:"pollWindowMs"`
-	MinSlotHoldMs             int64                  `json:"minSlotHoldMs"`
-	SmoothReleaseIntervalMs   *int64                 `json:"smoothReleaseIntervalMs,omitempty"`
-	MaxSlotPerHost            int                    `json:"maxSlotPerHost"`
-	MaxSlotPerIP              int                    `json:"maxSlotPerIp"`
-	MaxWaitersPerIP           int                    `json:"maxWaitersPerIp"`
-	MaxWaitersPerHost         int                    `json:"maxWaitersPerHost"`
-	ZombieTimeoutSeconds      int                    `json:"zombieTimeoutSeconds"`
-	IPCooldownSeconds         int                    `json:"ipCooldownSeconds"`
-	SessionIdleSeconds        int                    `json:"sessionIdleSeconds"`
-	RPC                       RPCConfig              `json:"rpc"`
-	Cleanup                   FairQueueCleanupConfig `json:"cleanup"`
-	maxWaitersPerHostProvided bool
+	MaxWaitMs                  int64                  `json:"maxWaitMs"`
+	PollIntervalMs             int64                  `json:"pollIntervalMs"`
+	PollWindowMs               int64                  `json:"pollWindowMs"`
+	MinSlotHoldMs              int64                  `json:"minSlotHoldMs"`
+	SmoothReleaseIntervalMs    *int64                 `json:"smoothReleaseIntervalMs,omitempty"`
+	MaxSlotPerHost             int                    `json:"maxSlotPerHost"`
+	MaxSlotPerIP               int                    `json:"maxSlotPerIp"`
+	MaxWaitersPerIP            int                    `json:"maxWaitersPerIp"`
+	MaxWaitersPerHost          int                    `json:"maxWaitersPerHost"`
+	ZombieTimeoutSeconds       int                    `json:"zombieTimeoutSeconds"`
+	IPCooldownSeconds          int                    `json:"ipCooldownSeconds"`
+	SessionIdleSeconds         int                    `json:"sessionIdleSeconds"`
+	RPC                        RPCConfig              `json:"rpc"`
+	Cleanup                    FairQueueCleanupConfig `json:"cleanup"`
+	DefaultGrantedCleanupDelay int                    `json:"defaultGrantedCleanupDelay"`
+	maxWaitersPerHostProvided  bool
 }
 
 type RPCConfig struct {
@@ -115,6 +116,14 @@ type ReleaseRequest struct {
 }
 
 type ReleaseResponse struct {
+	Result string `json:"result"`
+}
+
+type CancelRequest struct {
+	QueryToken string `json:"queryToken"`
+}
+
+type CancelResponse struct {
 	Result string `json:"result"`
 }
 
@@ -181,6 +190,7 @@ type FQSession struct {
 	ThrottleCode       int
 	ThrottleRetryAfter int
 	ThrottleTimeWindow int
+	CleanupScheduled   bool
 }
 
 type sessionStore interface {
@@ -431,6 +441,14 @@ func (c FairQueueConfig) sessionIdleDuration() time.Duration {
 	return time.Duration(c.SessionIdleSeconds) * time.Second
 }
 
+func (c FairQueueConfig) grantedCleanupDelay() time.Duration {
+	delay := c.DefaultGrantedCleanupDelay
+	if delay <= 0 {
+		delay = 5
+	}
+	return time.Duration(delay) * time.Second
+}
+
 func (c FairQueueConfig) cleanupInterval() time.Duration {
 	if c.Cleanup.IntervalSeconds <= 0 {
 		return 0
@@ -568,6 +586,53 @@ func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ReleaseResponse{Result: "ok"})
 }
 
+func (s *server) handleCancelSession(w http.ResponseWriter, r *http.Request) {
+	if !s.authPassed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	defer r.Body.Close()
+
+	var req CancelRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		s.log.Warnf("cancel decode error: %v", err)
+		writeJSON(w, http.StatusOK, CancelResponse{Result: "noop"})
+		return
+	}
+
+	token := strings.TrimSpace(req.QueryToken)
+	if token == "" {
+		writeJSON(w, http.StatusOK, CancelResponse{Result: "noop"})
+		return
+	}
+
+	sess, ok := s.sessionStore.Load(token)
+	if !ok || sess == nil {
+		writeJSON(w, http.StatusOK, CancelResponse{Result: "gone"})
+		return
+	}
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	s.log.Infof("session cancel request token=%s host=%s ip=%s state=%s",
+		sess.Token, sess.Hostname, sess.IPBucket, sess.State)
+
+	hostname := sess.Hostname
+	hostnameHash := sess.HostnameHash
+	ipBucket := sess.IPBucket
+	slotToken := sess.SlotToken
+	sessionToken := sess.Token
+
+	if sess.State == StateGranted && sess.SlotToken != "" {
+		go s.releaseSlotForSession(r.Context(), hostname, hostnameHash, ipBucket, slotToken, sessionToken)
+	}
+
+	s.cleanupSession(sess)
+
+	writeJSON(w, http.StatusOK, CancelResponse{Result: "canceled"})
+}
+
 func (s *server) handleAcquireSlot(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
 	if req.Now == 0 {
 		req.Now = time.Now().UnixMilli()
@@ -672,7 +737,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			"session granted token=%s host=%s ip=%s slotToken=%s",
 			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
 		)
-		s.cleanupSession(sess)
+		s.handleGrantedLocked(sess)
 		return &AcquireResponse{
 			Result:     "granted",
 			SlotToken:  sess.SlotToken,
@@ -701,7 +766,11 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 
 	budget := s.cfg.FairQueue.pollWindowDuration()
 	if err := s.runQueueCycle(ctx, sess, budget); err != nil {
-		s.log.Warnf("runQueueCycle error: %v", err)
+		if errors.Is(err, context.Canceled) {
+			s.log.Infof("runQueueCycle canceled token=%s host=%s ip=%s", sess.Token, sess.Hostname, sess.IPBucket)
+		} else {
+			s.log.Warnf("runQueueCycle error: %v", err)
+		}
 		return &AcquireResponse{
 			Result:     "pending",
 			QueryToken: sess.Token,
@@ -714,7 +783,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			"session granted token=%s host=%s ip=%s slotToken=%s",
 			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
 		)
-		s.cleanupSession(sess)
+		s.handleGrantedLocked(sess)
 		return &AcquireResponse{
 			Result:     "granted",
 			SlotToken:  sess.SlotToken,
@@ -878,6 +947,70 @@ func (s *server) cleanupSession(sess *FQSession) {
 				s.log.Debugf("waiter released host=%s ip=%s token=%s", hostname, ipBucket, token)
 			}
 		}()
+	}
+}
+
+func (s *server) deleteSessionLocked(sess *FQSession) {
+	token := sess.Token
+	s.sessionStore.Delete(token)
+	s.log.Debugf(
+		"session removed token=%s host=%s ip=%s state=%s (delayed)",
+		token, sess.Hostname, sess.IPBucket, sess.State,
+	)
+}
+
+func (s *server) handleGrantedLocked(sess *FQSession) {
+	hostCap := s.cfg.FairQueue.maxWaitersPerHost()
+	ipCap := s.cfg.FairQueue.maxWaitersPerIP()
+	shouldReleaseWaiter := sess.WaiterRegistered && sess.IPBucket != "" && (ipCap > 0 || hostCap > 0)
+
+	if shouldReleaseWaiter {
+		sess.WaiterRegistered = false
+		hostname := sess.Hostname
+		hostnameHash := sess.HostnameHash
+		ipBucket := sess.IPBucket
+		token := sess.Token
+		throttleWindow := sess.ThrottleTimeWindow
+
+		go func() {
+			req := s.buildAcquireRequest(hostname, hostnameHash, ipBucket, throttleWindow, time.Now())
+			if err := s.backend.ReleaseWaiter(context.Background(), req); err != nil {
+				s.log.Warnf("release waiter (granted) failed: %v", err)
+			} else {
+				s.log.Debugf("waiter released (granted) host=%s ip=%s token=%s", hostname, ipBucket, token)
+			}
+		}()
+	}
+
+	if !sess.CleanupScheduled {
+		sess.CleanupScheduled = true
+		go func(sess *FQSession) {
+			time.Sleep(s.cfg.FairQueue.grantedCleanupDelay())
+			sess.mu.Lock()
+			defer sess.mu.Unlock()
+			s.deleteSessionLocked(sess)
+		}(sess)
+	}
+}
+
+func (s *server) releaseSlotForSession(ctx context.Context, hostname, hostnameHash, ipBucket, slotToken, token string) {
+	if ctx == nil || ctx.Err() != nil {
+		ctx = context.Background()
+	}
+
+	req := ReleaseRequest{
+		Hostname:     hostname,
+		HostnameHash: hostnameHash,
+		IPBucket:     ipBucket,
+		SlotToken:    slotToken,
+		Now:          time.Now().UnixMilli(),
+	}
+
+	if err := s.backend.ReleaseSlot(ctx, req); err != nil {
+		s.log.Warnf("release slot (cancel) failed token=%s host=%s ip=%s: %v",
+			token, hostname, ipBucket, err)
+	} else {
+		s.log.Infof("slot released (cancel) token=%s host=%s ip=%s", token, hostname, ipBucket)
 	}
 }
 
@@ -1453,6 +1586,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v0/fairqueue/acquire", s.handleAcquire)
 	mux.HandleFunc("/api/v0/fairqueue/release", s.handleRelease)
+	mux.HandleFunc("/api/v0/fairqueue/cancel", s.handleCancelSession)
 
 	httpServer := &http.Server{
 		Addr:         cfg.Listen,

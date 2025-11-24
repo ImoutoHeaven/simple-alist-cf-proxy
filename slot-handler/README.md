@@ -37,6 +37,7 @@
   - `maxWaitersPerHost`：单 hostname 的全局排队上限（默认 50，<=0 关闭 host 级上限，不影响 Worker 返回的枚举，仅在内部 sleep 重试；当 `maxWaitersPerHost>0` 且 `maxWaitersPerIp<=0` 时仅启用 host 级排队）。
   - `zombieTimeoutSeconds` / `ipCooldownSeconds`：僵尸锁超时 & 冷却时间。
   - `cleanup`：后台清理配置（`enabled`、`intervalSeconds` 默认 1800 秒、`queueDepthZombieTtlSeconds` 未指定时默认 20 秒）。
+  - `defaultGrantedCleanupDelay`：GRANTED 会话在释放 waiter 后延迟删除的秒数，默认 5 秒，用于给 client-cancel 遗言留短窗口。
 - `rpc`：数据库 RPC 函数名（默认与 `download-init.sql` 中保持一致）。
 
 ## HTTP 接口

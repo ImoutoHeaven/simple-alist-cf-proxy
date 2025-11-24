@@ -771,6 +771,21 @@ function createUnauthorizedResponse(origin, message) {
   return createErrorResponse(origin, 401, message);
 }
 
+function createClientAbortResponse(origin) {
+  return createErrorResponse(origin, 499, "client aborted request");
+}
+
+function isAbortError(error) {
+  if (!error) {
+    return false;
+  }
+  if (error.name === 'AbortError') {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return typeof message === 'string' && message.toLowerCase().includes('aborted');
+}
+
 const formatRateLimitWindow = (windowLabel, windowSeconds) => {
   if (windowLabel) {
     return windowLabel;
@@ -880,6 +895,7 @@ const createSlotHandlerClient = (config) => {
 
   const acquireUrl = `${baseUrl}/api/v0/fairqueue/acquire`;
   const releaseUrl = `${baseUrl}/api/v0/fairqueue/release`;
+  const cancelUrl = `${baseUrl}/api/v0/fairqueue/cancel`;
   const authKey = slotCfg.authKey || '';
   const throttleTimeWindowSeconds =
     Number(config.throttleConfig?.throttleTimeWindow) > 0
@@ -980,8 +996,9 @@ const createSlotHandlerClient = (config) => {
           continue;
         }
 
-        if (!queryToken && data && data.queryToken) {
+        if (data && data.queryToken) {
           queryToken = data.queryToken;
+          fqContext.queryToken = data.queryToken;
         }
 
         switch (data?.result) {
@@ -1024,6 +1041,28 @@ const createSlotHandlerClient = (config) => {
       return pgErrorHandle === 'fail-open'
         ? { kind: 'granted' }
         : { kind: 'timeout', reason: 'slot-handler-loop-exhausted' };
+    },
+
+    async cancelSession(ctx, fqContext) {
+      const token = fqContext?.queryToken;
+      if (!token) {
+        return;
+      }
+
+      const payload = { queryToken: token };
+
+      try {
+        await fetch(cancelUrl, {
+          method: 'POST',
+          headers: buildHeaders(),
+          body: JSON.stringify(payload),
+          signal: ctx?.signal,
+        });
+        console.log(`[FQ] cancel session via slot-handler host=${fqContext.hostname}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn('[FQ] cancelSession error (slot-handler):', message);
+      }
     },
 
     async releaseSlot(ctx, fqContext) {
@@ -1084,6 +1123,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   const url = new URL(request.url);
   const normalizedPath = normalizePath(url.pathname);
   let path = normalizedPath;
+  let clientAborted = false;
+  const clientSignal = request.signal;
+  if (clientSignal && typeof clientSignal.addEventListener === 'function') {
+    clientSignal.addEventListener('abort', () => {
+      clientAborted = true;
+    });
+  }
 
   if (path === null || typeof path !== "string") {
     return createErrorResponse(origin, 400, "invalid path encoding");
@@ -1610,6 +1656,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   let fairQueueClient = null;
   let fqContext = null;
+  let shouldSendFQCancel = false;
+  let earlyResponse = null;
 
   if (needFairQueue) {
     if (!config.slotHandlerConfig?.url) {
@@ -1636,32 +1684,43 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         nowMs: Date.now(),
       };
 
-      const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext);
-      if (fqResult.kind === 'throttled') {
-        return createThrottleProtectedResponse(origin, {
-          status: 'protected',
-          errorCode: fqResult.throttleCode || 503,
-          retryAfter: fqResult.retryAfter,
-        });
-      }
+      try {
+        const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext);
+        if (fqResult.kind === 'throttled') {
+          return createThrottleProtectedResponse(origin, {
+            status: 'protected',
+            errorCode: fqResult.throttleCode || 503,
+            retryAfter: fqResult.retryAfter,
+          });
+        }
 
-      if (fqResult.kind === 'timeout') {
-        const safeHeaders = new Headers();
-        safeHeaders.set("content-type", "application/json;charset=UTF-8");
-        safeHeaders.set("Access-Control-Allow-Origin", origin);
-        safeHeaders.append("Vary", "Origin");
-        safeHeaders.set("Retry-After", "60");
+        if (fqResult.kind === 'timeout') {
+          const safeHeaders = new Headers();
+          safeHeaders.set("content-type", "application/json;charset=UTF-8");
+          safeHeaders.set("Access-Control-Allow-Origin", origin);
+          safeHeaders.append("Vary", "Origin");
+          safeHeaders.set("Retry-After", "60");
 
-        return new Response(
-          JSON.stringify({
-            code: 503,
-            message: 'Upstream queue timeout, please retry later'
-          }),
-          {
-            status: 503,
-            headers: safeHeaders
-          }
-        );
+          return new Response(
+            JSON.stringify({
+              code: 503,
+              message: 'Upstream queue timeout, please retry later'
+            }),
+            {
+              status: 503,
+              headers: safeHeaders
+            }
+          );
+        }
+      } catch (error) {
+        if (clientAborted && isAbortError(error)) {
+          shouldSendFQCancel = true;
+          earlyResponse = createClientAbortResponse(origin);
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[Fair Queue] waitForSlot error:', message);
+          return createErrorResponse(origin, 503, 'Fair queue unavailable');
+        }
       }
     } else {
       console.warn('[Fair Queue] Skipped: unable to derive client subnet for queue enforcement');
@@ -1688,6 +1747,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   // Proceed with fetch
   try {
+    if (earlyResponse) {
+      return earlyResponse;
+    }
+
     request = buildUpstreamRequest(downloadUrl, res.data.header);
     if (fqContext && !fqContext.hitUpstreamAtMs) {
       fqContext.hitUpstreamAtMs = Date.now();
@@ -1872,6 +1935,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     return safeResponse;
   } finally {
+    if (shouldSendFQCancel && fairQueueClient && fqContext && fqContext.queryToken) {
+      const cancelPromise = fairQueueClient.cancelSession(ctx, fqContext);
+      if (ctx && typeof ctx.waitUntil === 'function') {
+        ctx.waitUntil(cancelPromise);
+      } else {
+        cancelPromise.catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn('[Fair Queue] cancelSession failed:', message);
+        });
+      }
+    }
+
     if (fairQueueClient && fqContext && fqContext.slotToken) {
       const releasePromise = fairQueueClient.releaseSlot(ctx, fqContext);
       if (ctx && typeof ctx.waitUntil === 'function') {
