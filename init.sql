@@ -701,16 +701,6 @@ CREATE TABLE IF NOT EXISTS "upstream_ip_queue_depth" (
 CREATE INDEX IF NOT EXISTS idx_upstream_ip_queue_depth_ts
   ON "upstream_ip_queue_depth" ("updated_at");
 
--- Worker-specific host pacing table
-CREATE TABLE IF NOT EXISTS "upstream_host_pacing_worker" (
-  "hostname_pattern" TEXT PRIMARY KEY,
-  "next_allowed_at"  TIMESTAMPTZ NOT NULL,
-  "updated_at"       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
-);
-
-CREATE INDEX IF NOT EXISTS "idx_upstream_host_pacing_worker_ts"
-  ON "upstream_host_pacing_worker" ("updated_at");
-
 -- Try Acquire Fair Slot RPC (single attempt, non-blocking)
 -- Returns:
 --   > 0  → slot id acquired
@@ -808,71 +798,6 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION func_worker_try_acquire_slot_paced(
-  p_hostname_pattern       TEXT,
-  p_ip_hash                TEXT,
-  p_global_limit           INT,
-  p_per_ip_limit           INT,
-  p_zombie_timeout_seconds INT,
-  p_cooldown_seconds       INT,
-  p_host_interval_ms       INT
-)
-RETURNS INT
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_now          TIMESTAMPTZ := clock_timestamp();
-  v_interval     INTERVAL;
-  v_next_allowed TIMESTAMPTZ;
-  v_slot_id      INT;
-BEGIN
-  IF p_host_interval_ms IS NULL OR p_host_interval_ms <= 0 THEN
-    RETURN func_try_acquire_slot(
-      p_hostname_pattern,
-      p_ip_hash,
-      p_global_limit,
-      p_per_ip_limit,
-      p_zombie_timeout_seconds,
-      p_cooldown_seconds
-    );
-  END IF;
-
-  v_interval := make_interval(msecs => p_host_interval_ms);
-
-  INSERT INTO "upstream_host_pacing_worker" ("hostname_pattern", "next_allowed_at")
-  VALUES (p_hostname_pattern, v_now)
-  ON CONFLICT ("hostname_pattern") DO NOTHING;
-
-  SELECT "next_allowed_at"
-    INTO v_next_allowed
-  FROM "upstream_host_pacing_worker"
-  WHERE "hostname_pattern" = p_hostname_pattern
-  FOR UPDATE;
-
-  IF v_now < v_next_allowed THEN
-    RETURN -1;
-  END IF;
-
-  v_slot_id := func_try_acquire_slot(
-    p_hostname_pattern,
-    p_ip_hash,
-    p_global_limit,
-    p_per_ip_limit,
-    p_zombie_timeout_seconds,
-    p_cooldown_seconds
-  );
-
-  IF v_slot_id > 0 THEN
-    UPDATE "upstream_host_pacing_worker"
-    SET "next_allowed_at" = v_now + v_interval,
-        "updated_at"      = v_now
-    WHERE "hostname_pattern" = p_hostname_pattern;
-  END IF;
-
-  RETURN v_slot_id;
-END;
-$$;
-
 -- ========================================
 -- Release Fair Slot RPC
 -- ========================================
@@ -965,6 +890,33 @@ BEGIN
 
   DELETE FROM "upstream_ip_cooldown"
   WHERE "last_release_at" < v_cutoff;
+
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
+END;
+$$;
+
+-- ========================================
+-- Cleanup Queue Depth Records RPC
+-- ========================================
+CREATE OR REPLACE FUNCTION func_cleanup_queue_depth(
+  p_ttl_seconds INT
+)
+RETURNS INTEGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_cutoff  TIMESTAMP WITH TIME ZONE;
+  v_deleted INTEGER;
+BEGIN
+  IF p_ttl_seconds <= 0 THEN
+    RETURN 0;
+  END IF;
+
+  v_cutoff := clock_timestamp() - (p_ttl_seconds::TEXT || ' seconds')::INTERVAL;
+
+  DELETE FROM "upstream_ip_queue_depth"
+  WHERE "updated_at" < v_cutoff;
 
   GET DIAGNOSTICS v_deleted = ROW_COUNT;
   RETURN v_deleted;
@@ -1267,93 +1219,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION download_worker_try_acquire_slot(
-  p_hostname_hash TEXT,
-  p_hostname TEXT,
-  p_ip_bucket TEXT,
-  p_now_ms BIGINT,
-  p_max_slot_per_host INT,
-  p_max_slot_per_ip INT,
-  p_max_waiters_per_ip INT DEFAULT 0,
-  p_zombie_timeout INT DEFAULT 30,
-  p_cooldown_seconds INT DEFAULT 0,
-  p_host_interval_ms INT DEFAULT 0,
-  p_throttle_time_window INT DEFAULT 60,
-  p_throttle_table_name TEXT DEFAULT 'THROTTLE_PROTECTION',
-  p_queue_depth_table_name TEXT DEFAULT 'upstream_ip_queue_depth'
-)
-RETURNS TABLE(
-  status TEXT,
-  slot_token TEXT,
-  queue_depth INT,
-  ip_queue_depth INT,
-  throttle_code INT,
-  throttle_retry_after INT
-) AS $$
-DECLARE
-  v_slot_id INT;
-  v_throttled BOOLEAN := FALSE;
-  v_throttle_code INTEGER := NULL;
-  v_throttle_retry_after INTEGER := NULL;
-  v_queue_depth INT := 0;
-  v_ip_queue_depth INT := 0;
-  v_queue_table TEXT := COALESCE(NULLIF(p_queue_depth_table_name, ''), 'upstream_ip_queue_depth');
-BEGIN
-  IF p_hostname IS NULL OR p_hostname = '' THEN
-    p_hostname := p_hostname_hash;
-  END IF;
-
-  IF p_hostname_hash IS NOT NULL AND p_hostname_hash <> '' THEN
-    SELECT COALESCE(t.is_protected, FALSE), t.error_code, t.retry_after
-    INTO v_throttled, v_throttle_code, v_throttle_retry_after
-    FROM download_check_throttle_protection(p_hostname_hash, p_hostname, p_throttle_time_window, p_throttle_table_name) AS t;
-  END IF;
-
-  EXECUTE format('SELECT COALESCE(SUM("waiting_count"), 0) FROM %1$I WHERE "hostname_pattern" = $1', v_queue_table)
-    INTO v_queue_depth
-    USING p_hostname;
-  EXECUTE format('SELECT COALESCE("waiting_count", 0) FROM %1$I WHERE "hostname_pattern" = $1 AND "ip_hash" = $2', v_queue_table)
-    INTO v_ip_queue_depth
-    USING p_hostname, p_ip_bucket;
-
-  IF v_throttled THEN
-    RETURN QUERY SELECT 'THROTTLED', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
-    RETURN;
-  END IF;
-
-  BEGIN
-    v_slot_id := func_worker_try_acquire_slot_paced(
-      p_hostname,
-      p_ip_bucket,
-      COALESCE(p_max_slot_per_host, 0),
-      COALESCE(p_max_slot_per_ip, 0),
-      COALESCE(p_zombie_timeout, 0),
-      COALESCE(p_cooldown_seconds, 0),
-      COALESCE(p_host_interval_ms, 0)
-    );
-  EXCEPTION
-    WHEN others THEN
-      v_slot_id := NULL;
-  END;
-
-  IF v_slot_id IS NULL THEN
-    RETURN QUERY SELECT 'WAIT', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
-    RETURN;
-  END IF;
-
-  IF v_slot_id > 0 THEN
-    RETURN QUERY SELECT 'ACQUIRED', v_slot_id::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
-    RETURN;
-  ELSIF v_slot_id = 0 THEN
-    RETURN QUERY SELECT 'IP_TOO_MANY', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
-    RETURN;
-  ELSE
-    RETURN QUERY SELECT 'QUEUE_FULL', NULL::TEXT, v_queue_depth, v_ip_queue_depth, v_throttle_code, v_throttle_retry_after;
-    RETURN;
-  END IF;
-END;
-$$ LANGUAGE plpgsql;
-
 -- 释放 slot 调度
 CREATE OR REPLACE FUNCTION download_release_slot(
   p_hostname_hash TEXT,
@@ -1375,127 +1240,5 @@ BEGIN
   END;
 
   PERFORM func_release_fair_slot(v_slot_id, TRUE);
-END;
-$$;
-
--- ========================================
--- Queue depth waiter registration RPC
--- ========================================
-CREATE OR REPLACE FUNCTION func_try_register_queue_waiter(
-  p_hostname_pattern     TEXT,
-  p_ip_hash              TEXT,
-  p_max_waiters          INTEGER,
-  p_zombie_timeout_seconds INTEGER DEFAULT 20
-)
-RETURNS BOOLEAN
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_now  TIMESTAMP WITH TIME ZONE := clock_timestamp();
-  v_rows INTEGER;
-  v_zombie_timeout INTERVAL := CASE
-    WHEN p_zombie_timeout_seconds IS NULL OR p_zombie_timeout_seconds <= 0 THEN INTERVAL '20 seconds'
-    ELSE (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL
-  END;
-BEGIN
-  IF p_ip_hash IS NULL OR p_ip_hash = '' THEN
-    RETURN TRUE;
-  END IF;
-
-  IF p_max_waiters IS NULL OR p_max_waiters <= 0 THEN
-    RETURN TRUE;
-  END IF;
-
-  -- First, try to revive zombie queue records that have not been updated within the TTL
-  UPDATE "upstream_ip_queue_depth"
-  SET "waiting_count" = 1,
-      "updated_at" = v_now
-  WHERE "hostname_pattern" = p_hostname_pattern
-    AND "ip_hash" = p_ip_hash
-    AND "updated_at" < (v_now - v_zombie_timeout);
-
-  GET DIAGNOSTICS v_rows = ROW_COUNT;
-  IF v_rows > 0 THEN
-    RETURN TRUE;
-  END IF;
-
-  UPDATE "upstream_ip_queue_depth"
-  SET "waiting_count" = "waiting_count" + 1,
-      "updated_at" = v_now
-  WHERE "hostname_pattern" = p_hostname_pattern
-    AND "ip_hash" = p_ip_hash
-    AND "waiting_count" < p_max_waiters;
-
-  GET DIAGNOSTICS v_rows = ROW_COUNT;
-  IF v_rows > 0 THEN
-    RETURN TRUE;
-  END IF;
-
-  BEGIN
-    INSERT INTO "upstream_ip_queue_depth" (
-      "hostname_pattern", "ip_hash", "waiting_count", "updated_at"
-    )
-    VALUES (p_hostname_pattern, p_ip_hash, 1, v_now);
-    RETURN TRUE;
-  EXCEPTION
-    WHEN unique_violation THEN
-      UPDATE "upstream_ip_queue_depth"
-      SET "waiting_count" = "waiting_count" + 1,
-          "updated_at" = v_now
-      WHERE "hostname_pattern" = p_hostname_pattern
-        AND "ip_hash" = p_ip_hash
-        AND "waiting_count" < p_max_waiters;
-
-      GET DIAGNOSTICS v_rows = ROW_COUNT;
-      RETURN v_rows > 0;
-    WHEN others THEN
-      RETURN FALSE;
-  END;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION func_release_queue_waiter(
-  p_hostname_pattern TEXT,
-  p_ip_hash          TEXT
-)
-RETURNS VOID
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_now TIMESTAMP WITH TIME ZONE := clock_timestamp();
-BEGIN
-  IF p_ip_hash IS NULL OR p_ip_hash = '' THEN
-    RETURN;
-  END IF;
-
-  UPDATE "upstream_ip_queue_depth"
-  SET "waiting_count" = GREATEST("waiting_count" - 1, 0),
-      "updated_at" = v_now
-  WHERE "hostname_pattern" = p_hostname_pattern
-    AND "ip_hash" = p_ip_hash;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION func_cleanup_queue_depth(
-  p_ttl_seconds INT
-)
-RETURNS INTEGER
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_cutoff  TIMESTAMP WITH TIME ZONE;
-  v_deleted INTEGER;
-BEGIN
-  IF p_ttl_seconds IS NULL OR p_ttl_seconds <= 0 THEN
-    RETURN 0;
-  END IF;
-
-  v_cutoff := clock_timestamp() - (p_ttl_seconds::TEXT || ' seconds')::INTERVAL;
-
-  DELETE FROM "upstream_ip_queue_depth"
-  WHERE "updated_at" < v_cutoff;
-
-  GET DIAGNOSTICS v_deleted = ROW_COUNT;
-  RETURN v_deleted;
 END;
 $$;

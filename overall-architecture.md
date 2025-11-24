@@ -44,7 +44,7 @@ Landing Worker 本身不提供实际文件下载，仅返回 HTML 页面或 `/in
   - IP 限流
   - Throttle 保护（错误 host 的短路保护）
   - Last Active 跟踪；
-- 可选：通过 Fair Queue（worker/slot-handler）控制公用上游的并发。
+- 可选：通过 Fair Queue（slot-handler）控制公用上游的并发。
 
 Download Worker 不直接管理 PoW/人机验证，而是信任 Landing Worker 提供的结果，通过签名+加密的形式做「不可篡改」传递。
 
@@ -202,9 +202,8 @@ Landing Worker 与 Powdet 之间通过 HMAC + DB 状态保证 challenge 不可�
 
 Fair Queue 抽象了「对某一主机模式的并发 slot 与队列」：
 
-- 在大规模多 Region 部署中，可以：
-  - 所有 Worker 通过 PostgREST/Postgres + 统一 schema 操作相同队列；
-  - 或让 Worker 通过 slot-handler，将复杂队列算法与状态管理移动到自托管进程内。
+- 在大规模多 Region 部署中，所有 download worker 通过 slot-handler 访问同一套 PostgreSQL schema，实现统一的队列视图；
+- slot-handler 内部可选择 PostgREST 或直接 Postgres 作为后端，Worker 不再直接实现「本地队列」逻辑。
 
 队列/Throttle 与 RateLimiter 的结合，使系统在面对「大量用户集中访问某个第三方网盘」时仍能保持可控的延迟和吞吐。
 

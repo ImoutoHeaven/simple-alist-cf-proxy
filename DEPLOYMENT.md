@@ -259,43 +259,30 @@ download worker 端同样支持 IP 子网速率限制：
 
 ---
 
-## 5. Fair Queue & slot-handler
+## 5. Fair Queue（唯一后端：slot-handler）
 
-Fair Queue 用于限制对特定上游 hostname 的并发下载数量，并提供 per-IP 公平性。配置在 `wrangler.toml` 的「Fair Queue」部分。
+Fair Queue 用于限制对特定上游 hostname 的并发下载数量，并提供 per-IP 公平性。当前版本仅支持外部 `slot-handler` 服务实现。
 
-### 5.1 Worker Backend（FAIR_QUEUE_BACKEND="worker"）
-
-由 Worker 自身通过 DB（D1/PostgREST）实现队列：
-
-- 开关：`FAIR_QUEUE_ENABLED=true`  
-- Host 匹配：`FAIR_QUEUE_HOST_PATTERNS="*.sharepoint.com,*.example.com"`  
-- 并发/队列参数：  
-  - `FAIR_QUEUE_GLOBAL_LIMIT`、`FAIR_QUEUE_PER_IP_LIMIT`  
-  - `FAIR_QUEUE_MAX_WAITERS_PER_IP`  
-  - `FAIR_QUEUE_MAX_WAIT_MS` 等  
-
-对应 schema 与函数参见 `init.sql` Fair Queue 部分。  
-
-### 5.2 slot-handler Backend（FAIR_QUEUE_BACKEND="slot-handler"）
-
-外部 Go 服务 `slot-handler` 承担队列逻辑，Worker 通过 HTTP 调用：
-
-1. 在 `slot-handler/` 中配置并运行服务，参考 `slot-handler/README.md`。  
-2. 在 download worker 中设置：
+1. 在 PostgreSQL 上执行 `init.sql`，确保存在：
+   - 表：`upstream_slot_pool`, `upstream_ip_queue_depth`, `upstream_ip_cooldown`
+   - 函数：`download_register_fq_waiter`, `download_release_fq_waiter`, `download_try_acquire_slot`, `download_release_slot`, `func_cleanup_zombie_slots`, `func_cleanup_ip_cooldown`, `func_cleanup_queue_depth` 等  
+2. 在 `slot-handler/` 中配置并运行服务（参数来源：`slot-handler/config.json`）。并发/等待/清理行为由其中的 `fairQueue` 段决定（包含 `cleanup.*`）。  
+3. 在 download worker 中设置（`wrangler.toml` 同步更新）：  
 
    ```env
    FAIR_QUEUE_ENABLED=true
-   FAIR_QUEUE_BACKEND=slot-handler
    FAIR_QUEUE_HOST_PATTERNS=*.sharepoint.com
-
    FAIR_QUEUE_SLOT_HANDLER_URL=https://slot-handler.example.com
-   SLOT_HANDLER_MAX_WAIT_MS=15000
+
+   FAIR_QUEUE_MAX_WAIT_MS=15000            # 队列等待预算
+   FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS=20000 # slot-handler 总等待预算（默认 FAIR_QUEUE_MAX_WAIT_MS+5000）
    SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS=8000
-   SLOT_HANDLER_MAX_ATTEMPTS_CAP=4
+   SLOT_HANDLER_MAX_ATTEMPTS_CAP=35
    FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY=shared-secret
    ```
 
-如架构文档所述，slot-handler 与 Throttle Protection 结合，可在上游开始大量报错时迅速进入保护状态，并提前拒绝请求。
+- `PG_ERROR_HANDLE=fail-open` 语义：slot-handler 不可用时直接放行（跳过排队）；`fail-closed` 返回 503/500。  
+- Worker 不再支持 `FAIR_QUEUE_BACKEND=worker`，也不再读取 `FAIR_QUEUE_GLOBAL_LIMIT` / `FAIR_QUEUE_PER_IP_LIMIT` 等本地限额，真实限额以 slot-handler 配置为准。  
 
 ---
 

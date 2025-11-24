@@ -366,199 +366,29 @@ compatibility_date = "2024-01-01"
 # #   # Edge: 5 req/10s, DB: 100 req/24h (configure in WINDOW_TIME/IPSUBNET_WINDOWTIME_LIMIT)
 
 # ═══════════════════════════════════════════════════════════════
-# ⚠️ NEW: Fair Upstream Queue - Concurrent Request Limiting per Upstream Host
+# Fair Upstream Queue (slot-handler only)
 # ═══════════════════════════════════════════════════════════════
 #
-# Purpose: Limit concurrent upstream fetch requests per hostname pattern to prevent
-#          overloading upstream sources (e.g., SharePoint, OneDrive, Google Drive)
+# Purpose: Limit concurrent upstream fetch requests per hostname pattern and keep fairness between IPs.
+# Implementation:
+# - Worker only matches FAIR_QUEUE_HOST_PATTERNS and calls slot-handler /api/v0/fairqueue/acquire + /release.
+# - All queueing, concurrency limits, and cleanup schedule live in slot-handler/config.json (fairQueue.*, fairQueue.cleanup.*).
+# - PostgreSQL schema required by slot-handler: upstream_slot_pool / upstream_ip_queue_depth / upstream_ip_cooldown +
+#   download_register_fq_waiter / download_release_fq_waiter / download_try_acquire_slot / download_release_slot and cleanup funcs from init.sql.
 #
-# Key Concepts:
-# - **Slot Pool**: Database-driven pool of slots (1..N) per hostname pattern
-# - **Per-IP Fairness**: Single IP subnet cannot monopolize all slots
-# - **Queue Mechanism**: Requests wait for available slot instead of immediate rejection
-# - **Short Occupation**: Slots held ONLY during upstream fetch (TTFB ~1-3s), NOT during file download
-#
-# How it works:
-# 1. Request arrives → Hostname matches FAIR_QUEUE_HOST_PATTERNS
-# 2. Worker tries to acquire slot from pool (max concurrent = FAIR_QUEUE_GLOBAL_LIMIT)
-# 3. If slot available → Acquire → Fetch upstream → Release immediately
-# 4. If no slot available → Wait in queue (up to FAIR_QUEUE_MAX_WAIT_MS)
-# 5. If per-IP limit reached → Return 429 immediately
-#
-# Slot Occupancy Timeline:
-#   [Request] → [Acquire slot] → [await fetch(upstream)] → [Got Response headers] → [Release slot] → [Stream file 2min]
-#                ↑_____________ Slot held ~1-3s (TTFB only) _____________↑
-#
-# Database Mode Requirements (DB_MODE="custom-pg-rest"):
-# ┌──────────────────┬─────────────────────┬────────────────────────────────┐
-# │ DB Mode          │ Table Creation      │ Queue Implementation           │
-# ├──────────────────┼─────────────────────┼────────────────────────────────┤
-# │ custom-pg-rest   │ Manual (init.sql)   │ Single-attempt RPC + Worker wait │
-# └──────────────────┴─────────────────────┴────────────────────────────────┘
-#
-# PostgreSQL Setup:
-#   1. Run init.sql to create:
-#      - Table: upstream_slot_pool
-#      - Functions: func_try_acquire_slot, func_release_fair_slot, func_cleanup_zombie_slots
-#   2. Fair Queue 仅在已手动创建上述表/函数后可用
-# Relationship with Throttle Protection:
-# ┌────────────────┬────────────────┬──────────────────────────────────┐
-# │ State          │ Fair Queue     │ Throttle Protection              │
-# ├────────────────┼────────────────┼──────────────────────────────────┤
-# │ Normal         │ Limits slots   │ Not active                       │
-# │ Upstream Error │ Not triggered  │ Marks host as protected (503)    │
-# │ Protection Win │ Not entered    │ Unified check returns 503 early  │
-# └────────────────┴────────────────┴──────────────────────────────────┘
-# Combined Behavior:
-#   - Normal: Fair Queue limits concurrency proactively
-#   - Error: Throttle Protection circuit-breaks, blocks requests BEFORE queue
-#   - Recovery: Protection window expires → Fair Queue resumes limiting
-#
-# Configuration:
-#
-# FAIR_QUEUE_ENABLED = "false"       # Enable fair queue (default: false)
-#                                     # Requires FAIR_QUEUE_HOST_PATTERNS to be non-empty
-#
-# FAIR_QUEUE_BACKEND = "worker"      # "worker": Worker 本地轮询+PostgREST；"slot-handler": 交给外部 Go 服务
-#                                     # slot-handler 行为完全由其 config.json 决定，Worker 仅做调用，不传递本地 queue/hold 参数
-#
-# FAIR_QUEUE_HOST_PATTERNS = ""      # Comma-separated hostname patterns to protect
-#                                     # Supports wildcards: "*.sharepoint.com,*.onedrive.com"
-#                                     # Examples:
-#                                     #   "*.sharepoint.com" → matches "contoso-my.sharepoint.com"
-#                                     #   "example.com" → matches only "example.com"
-#                                     # Default: "" (disabled)
-#
-# FAIR_QUEUE_GLOBAL_LIMIT = "5"      # Max concurrent slots per hostname pattern
-#                                     # Default: 5
-#                                     # Recommendation: Start with 5, adjust based on upstream limits
-#                                     # Example: SharePoint often limits to 5-10 concurrent connections
-#
-# FAIR_QUEUE_PER_IP_LIMIT = "1"      # Max concurrent slots per IP subnet
-#                                     # Default: 1
-#                                     # Prevents single IP/NAT from monopolizing all slots
-#                                     # Recommendation: Keep at 1 for fairness, increase to 2-3 if needed
-#
-# FAIR_QUEUE_MAX_WAITERS_PER_IP = "3" # Max pending queue waiters per hostname × IP subnet
-#                                     # Default: 3
-#                                     # Requests beyond this depth are rejected immediately with 429
-#                                     # Helps prevent IDM-style burst traffic from overwhelming the queue
-#
-# FAIR_QUEUE_MAX_WAIT_MS = "15000"   # Max queue wait time in milliseconds
-#                                     # Default: 15000 (15 seconds)
-#                                     # Leaves 15s buffer for 30s Worker wall-time limit
-#                                     # If exceeded → Returns 503 Queue Timeout
-#                                     # Legacy name FAIR_QUEUE_WAIT_TIMEOUT_MS is still accepted
-#
-# FAIR_QUEUE_ZOMBIE_TIMEOUT_SECONDS = "30"  # Zombie slot auto-reclaim timeout
-#                                            # Default: 30 seconds
-#                                            # Slots stuck in "locked" state > this duration are released
-#                                            # Prevents leaks from Worker crashes/exceptions
-
-# FAIR_QUEUE_QUEUE_DEPTH_ZOMBIE_TTL_SECONDS = "20"  # Queue depth zombie timeout
-#                                                    # Default: 20 seconds
-#                                                    # Auto-resets stale waiter counts when Worker cleanup fails
-#                                                    # Increase if users see premature queue resets, decrease to evict faster
-#
-# FAIR_QUEUE_POLL_INTERVAL_MS = "200"  # Worker-side polling interval between slot attempts (milliseconds)
-#                                       # Default: 200ms
-#                                       # Tradeoff: Lower = more responsive, Higher = less DB pressure
-#
-# FAIR_QUEUE_MIN_SLOT_HOLD_MS = "800"   # Minimum slot hold time (ms) to approximate QPS
-#                                       # Default: 800ms (with 4 slots ≈ 5 QPS to upstream)
-#                                       # Set to 0 to disable hold-and-release behavior
-#
-# FAIR_QUEUE_SMOOTH_RELEASE_INTERVAL_MS = "" # Optional host-level pacing interval (ms)
-#                                            # Unset/empty → auto derived as MIN_SLOT_HOLD_MS / FAIR_QUEUE_GLOBAL_LIMIT
-#                                            # 0 → disable pacing; >0 → fixed interval between slot grants per host
-# FAIR_QUEUE_HOST_PACING_TABLE = ""           # Optional override for host pacing table name
-# FAIR_QUEUE_HOST_PACING_CLEANUP_TTL_SECONDS = "604800" # Cleanup TTL for host pacing records (default 7d). 0 = disable cleanup
-#
-# FAIR_QUEUE_TABLE_NAME = "upstream_slot_pool"  # Fair queue table name
-#                                                # Default: upstream_slot_pool
-#                                                # Only change if table name conflicts exist
-#
-# FAIR_QUEUE_IP_COOLDOWN_SECONDS = "3"  # Cooldown before same IP can re-acquire slot
-#                                       # Default: 3 seconds (set to 0 to disable cooldown logic)
-#
-# FAIR_QUEUE_SLOT_HANDLER_URL = ""      # slot-handler base URL (FAIR_QUEUE_BACKEND=slot-handler 时必须)
-# FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS = "" # slot-handler 总等待时间上限（别名 SLOT_HANDLER_MAX_WAIT_MS），默认 20000
-# SLOT_HANDLER_MAX_WAIT_MS = ""           # 可选，作用同 FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS
-# SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = "8000" # 单次短轮询 HTTP 超时（毫秒），默认 8000
-# SLOT_HANDLER_MAX_ATTEMPTS_CAP = "35"   # 短轮询最大尝试次数上限（自动 clamp），默认 35
-# FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY = ""  # Optional shared secret header X-FQ-Auth
+# Configuration (Worker side):
+# FAIR_QUEUE_ENABLED = "false"       # Enable fair queue (requires non-empty HOST_PATTERNS)
+# FAIR_QUEUE_HOST_PATTERNS = ""      # Comma-separated hostname patterns (supports wildcards)
+# FAIR_QUEUE_MAX_WAIT_MS = "15000"   # Max wait per request before giving up (feeds slot-handler total wait cap)
+# FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS = "" # Total wait budget for slot-handler polling (defaults to FAIR_QUEUE_MAX_WAIT_MS + 5000ms)
+# SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = "8000" # Per-poll HTTP timeout (ms)
+# SLOT_HANDLER_MAX_ATTEMPTS_CAP = "35"   # Max poll attempts before giving up
+# FAIR_QUEUE_SLOT_HANDLER_URL = ""      # Required slot-handler base URL
+# FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY = "" # Optional shared secret header X-FQ-Auth
 #
 # Error Responses:
-# ┌─────────────────────────┬──────────┬─────────────┬───────────────────────────────┐
-# │ Condition               │ Status   │ Retry-After │ Meaning                       │
-# ├─────────────────────────┼──────────┼─────────────┼───────────────────────────────┤
-# │ Per-IP limit reached    │ 429      │ 60s         │ IP has max concurrent slots   │
-# │ Queue timeout           │ 503      │ 60s         │ Waited 15s, no slot available │
-# │ Upstream throttled      │ 503      │ Varies      │ Throttle Protection active    │
-# └─────────────────────────┴──────────┴─────────────┴───────────────────────────────┘
-#
-# Example Configurations:
-#
-# Example 1: Protect SharePoint with conservative limits
-#   FAIR_QUEUE_ENABLED = "true"
-#   FAIR_QUEUE_HOST_PATTERNS = "*.sharepoint.com"
-#   FAIR_QUEUE_GLOBAL_LIMIT = "5"
-#   FAIR_QUEUE_PER_IP_LIMIT = "1"
-#   FAIR_QUEUE_MAX_WAITERS_PER_IP = "3"
-#   FAIR_QUEUE_MAX_WAITERS_PER_IP = "3"
-#   DB_MODE = "custom-pg-rest"
-#   # Result: Max 5 concurrent SharePoint connections, 1 per IP, queues if exceeded
-#
-# Example 2: Multiple upstream sources with higher limits
-#   FAIR_QUEUE_ENABLED = "true"
-#   FAIR_QUEUE_HOST_PATTERNS = "*.sharepoint.com,*.onedrive.com,*.googleapis.com"
-#   FAIR_QUEUE_GLOBAL_LIMIT = "10"
-#   FAIR_QUEUE_PER_IP_LIMIT = "2"
-#   FAIR_QUEUE_MAX_WAITERS_PER_IP = "4"
-#   DB_MODE = "custom-pg-rest"
-#   # Run init.sql once on PostgreSQL before enabling
-#   # Result: 10 concurrent connections per hostname, 2 per IP
-#
-# Example 3: Combined with Throttle Protection
-#   FAIR_QUEUE_ENABLED = "true"
-#   FAIR_QUEUE_HOST_PATTERNS = "*.sharepoint.com"
-#   FAIR_QUEUE_GLOBAL_LIMIT = "5"
-#   THROTTLE_PROTECT_HOSTNAME = "*.sharepoint.com"
-#   THROTTLE_TIME_WINDOW = "60s"
-#   THROTTLE_OBSERVE_WINDOW_SECONDS = "60"
-#   THROTTLE_ERROR_RATIO_PERCENT = "20"
-#   THROTTLE_CONSECUTIVE_THRESHOLD = "4"
-#   THROTTLE_MIN_SAMPLE_COUNT = "8"
-#   # Result: Normal state → Queue limits concurrency
-#   #         Error state → Throttle blocks requests early
-#
-# Troubleshooting:
-#
-# Problem: All requests get 503 Queue Timeout
-# Diagnosis:
-#   - Check FAIR_QUEUE_GLOBAL_LIMIT (may be too low)
-#   - Check upstream TTFB (if >5s, slots stay locked longer)
-#   - Check zombie cleanup (FAIR_QUEUE_ZOMBIE_TIMEOUT_SECONDS may be too high)
-# Solution:
-#   - Increase FAIR_QUEUE_GLOBAL_LIMIT to 10-20
-#   - Decrease FAIR_QUEUE_ZOMBIE_TIMEOUT_SECONDS to 15-20
-#
-# Problem: Single IP can't download multiple files in parallel
-# Diagnosis:
-#   - FAIR_QUEUE_PER_IP_LIMIT=1 blocks parallel downloads from same IP
-# Solution:
-#   - Increase FAIR_QUEUE_PER_IP_LIMIT to 2-3
-#   - Ensure FAIR_QUEUE_GLOBAL_LIMIT is also increased proportionally
-#
-# Problem: Fair Queue not working
-# Diagnosis:
-#   - Check FAIR_QUEUE_ENABLED="true"
-#   - Check FAIR_QUEUE_HOST_PATTERNS is non-empty
-#   - Check DB_MODE is set to "custom-pg-rest"
-#   - PostgreSQL: Verify init.sql was run
-# Solution:
-#   - Enable all required settings
-#   - Check worker logs for "[Fair Queue]" messages
+# - throttled → 503 + Retry-After from slot-handler throttle result
+# - timeout   → 503 (queue wait exceeded)
 
 # For local development, create a .dev.vars file with:
 # ADDRESS=https://your-alist-server.com

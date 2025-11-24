@@ -34,6 +34,11 @@
       "releaseWaiterFunc": "download_release_fq_waiter",
       "tryAcquireFunc": "download_try_acquire_slot",
       "releaseFunc": "download_release_slot"
+    },
+    "cleanup": {
+      "enabled": true,
+      "intervalSeconds": 1800,
+      "queueDepthZombieTtlSeconds": 20
     }
   }
 }

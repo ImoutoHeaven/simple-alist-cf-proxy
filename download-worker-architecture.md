@@ -26,7 +26,7 @@
     - 签名/Origin 检查配置：`SIGN_CHECK` / `HASH_CHECK` / `WORKER_CHECK` / `CHECK_ORIGIN`
     - Path Based ACL：`BLACKLIST_*`, `WHITELIST_*`, `EXCEPT_*`（含 `*_INCLUDES`）
     - DB_MODE 相关：下载缓存 / Throttle / IP 限流
-    - FairQueue（公平队列）相关：`FAIR_QUEUE_*` / `FAIR_QUEUE_BACKEND`
+    - FairQueue（slot-handler）相关：`FAIR_QUEUE_*`（hostname 匹配 + slot-handler 地址/超时/鉴权）
     - CF Rate Limiter：`ENABLE_CF_RATELIMITER`, `CF_RATELIMITER_BINDING`
   - 创建：
     - `cacheManager`（download link cache）
@@ -123,34 +123,22 @@
 
 若 DB 层判断已超过限流，或 hostname 已保护且在保护窗口内，Worker 直接返回 429/503 或映射正确的错误信息。
 
-6. **Fair Queue（公平队列）与 slot-handler 集成**
+6. **Fair Queue（slot-handler）**
 
-当 `FAIR_QUEUE_ENABLED=true` 且匹配目标 hostname 时，download worker 会在发起上游请求前先申请一个「slot」：
+当 `FAIR_QUEUE_ENABLED=true` 且下载 hostname 匹配 `FAIR_QUEUE_HOST_PATTERNS` 时，Worker 会在发起上游请求前向 slot-handler 申请「slot」：
 
-- 匹配逻辑：
-  - 使用 `FAIR_QUEUE_HOST_PATTERNS` 与 `matchHostnamePattern` 对 download URL hostname 做 pattern 匹配（支持 `*.sharepoint.com` 等）。
-- 后端模式（`FAIR_QUEUE_BACKEND`）：
-  - `worker`：纯 Worker 内实现的公平队列，使用 DB 表：
-    - `upstream_slot_pool`
-    - `upstream_ip_queue_depth`
-    - `upstream_ip_cooldown`
-  - `slot-handler`：委托给外部 `slot-handler` 进程，通过 HTTP 调用其 `/api/v0/fairqueue/acquire` / `/release`。
-    - URL：`FAIR_QUEUE_SLOT_HANDLER_URL`
-    - Auth：`FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY`（X-FQ-Auth）
-- 相关参数（均在 `wrangler.toml` 有详细注释）：
-  - 全局 / per-IP 并发：`FAIR_QUEUE_GLOBAL_LIMIT`, `FAIR_QUEUE_PER_IP_LIMIT`
-  - 等待队列：`FAIR_QUEUE_MAX_WAITERS_PER_IP`, `FAIR_QUEUE_MAX_WAIT_MS`
-  - Zombie 超时、Cooldown 机制
-  - slot 保持最小时长、平滑释放间隔等。
-
-在 `handleDownload` 中：
-
-- 在真正 `fetch(downloadUrl)` 前调用 `fairQueueClient.waitForSlot(ctx, fqContext)`：
-  - 可能返回：
-    - granted：获得 slot，继续向上游发送请求；
-    - throttled：返回 503 + Retry-After，提示上游处于保护状态；
-    - timeout：长时间未获取 slot，返回 503。
-- 响应结束后，使用 `fairQueueClient.releaseSlot(ctx, fqContext)` 释放 slot。
+- 前置要求：`FAIR_QUEUE_SLOT_HANDLER_URL` 必填；缺失时直接返回 503（fail-closed，不再降级到本地实现）。
+- 行为流程：
+  - 计算 `hostnameHash` 与 `ipBucket`（基于客户端 IP 子网），构造 `fqContext`。
+  - 调用 slot-handler `/api/v0/fairqueue/acquire` 轮询，直到返回：
+    - `granted`：获得 slotToken，继续向上游 fetch；
+    - `throttled`：返回 503 + Retry-After；
+    - `timeout`：返回 503。
+  - 请求结束后调用 `/api/v0/fairqueue/release`，携带 `slotToken`、`hostnameHash`、`ipBucket`、`hitUpstreamAtMs`。
+- 配置来源：
+  - Worker 环境变量：`FAIR_QUEUE_ENABLED`, `FAIR_QUEUE_HOST_PATTERNS`, `FAIR_QUEUE_MAX_WAIT_MS`, `FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS`, `SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS`, `SLOT_HANDLER_MAX_ATTEMPTS_CAP`, `FAIR_QUEUE_SLOT_HANDLER_URL`, `FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY`。
+  - 并发/排队/清理参数：仅从 `slot-handler/config.json` 读取（`MaxSlotPerHost` / `MaxSlotPerIp` / `MaxWaitersPerIp` / `cleanup.*` 等），Worker 不再接受 `FAIR_QUEUE_GLOBAL_LIMIT` 等本地配置，也不再触发清理 RPC。
+  - `PG_ERROR_HANDLE=fail-open` 语义：slot-handler 不可用时直接放行（跳过排队）；`fail-closed` 则返回 503/500。
 
 ### 4. 上游请求与响应封装
 
@@ -179,7 +167,7 @@
      - `Access-Control-Expose-Headers: Content-Length, Content-Range, X-Throttle-Status, X-Throttle-Retry-After, Accept-Ranges`
    - 返回 `Response(response.body, safeHeaders)`。
 
-6. Last Active 更新：
+7. Last Active 更新：
    - 若 `IDLE_TIMEOUT > 0` 且配置了 `DOWNLOAD_LAST_ACTIVE_TABLE`：
      - 使用 `calculateIPSubnet(clientIP)` 计算子网，再对 IP 子网 + path 组合做 sha256；
      - 调用不同 unified-check 模块的 `updateLastActive`：
@@ -199,13 +187,13 @@ slot-handler 是一个独立运行于服务器上的 HTTP 服务，它为 Worker
     - `mode` = `"postgrest"`：通过 HTTP 调用 PostgREST RPC 函数；
     - `mode` = `"postgres"`：直接使用 `database/sql` 调 `func_try_*` 等函数。
   - `FairQueue`：
-    - 与 Worker 中 FAIR_QUEUE_* 对应的一组参数（MaxWaitMs、PollIntervalMs、MaxSlotPerHost 等）。
-    - `RPC` 子配置指定调用的函数名：
-      - `ThrottleCheckFunc`（如 `download_check_throttle_protection`）
-      - `RegisterWaiterFunc`
-      - `ReleaseWaiterFunc`
-      - `TryAcquireFunc`
-      - `ReleaseFunc`
+    - 行为与清理参数（MaxSlotPerHost/MaxSlotPerIp/MaxWaitersPerIp/ZombieTimeoutSeconds/IPCooldownSeconds 以及 `cleanup.enabled/intervalSeconds/queueDepthZombieTtlSeconds` 等）。
+    - `RPC` 子配置指定调用的函数名，通常指向 init.sql 中的：
+      - `download_check_throttle_protection`
+      - `download_register_fq_waiter`
+      - `download_release_fq_waiter`
+      - `download_try_acquire_slot`
+      - `download_release_slot`
 
 核心 HTTP API：
 
@@ -226,15 +214,15 @@ slot-handler 是一个独立运行于服务器上的 HTTP 服务，它为 Worker
 - PostgREST 模式：
   - 与 PostgREST 交互，调用 init.sql 中的函数名（由配置指定）：
     - `download_check_throttle_protection`
-    - `func_try_register_queue_waiter`
-    - `func_release_queue_waiter`
-    - `func_try_acquire_fair_slot`
-    - `func_release_fair_slot`
-    - 以及清理 zombie slots / cooldown 记录等函数。
+    - `download_register_fq_waiter`
+    - `download_release_fq_waiter`
+    - `download_try_acquire_slot`
+    - `download_release_slot`
+    - 以及清理 zombie slots / cooldown / queue depth 记录的函数（由内部 cleanup goroutine 定期调用）。
 - PostgreSQL 模式：
   - 通过 `database/sql` 直接执行 `SELECT * FROM func_xxx(...)`。
 
-Cloudflare Worker 端（simple-alist-cf-proxy）在 `FAIR_QUEUE_BACKEND=slot-handler` 时，会通过 `slot-handler` 完成所有队列与 throttle 查询，而自身只负责控制 HTTP 流程。
+Cloudflare Worker 端（simple-alist-cf-proxy）仅支持 `slot-handler` 这一种 Fair Queue 后端，所有排队与释放逻辑都交由该服务处理。
 
 ## 四、数据库 schema 与 init.sql
 
@@ -268,17 +256,20 @@ download worker 依赖的 PostgreSQL schema 定义在 `init.sql` 中，主要包
 6. **Fair Queue**
    - 表：
      - `upstream_slot_pool`（slot 池）
-     - `upstream_ip_queue_depth`（每 IP 队列深度）
      - `upstream_ip_cooldown`（IP 冷却表）
-     - `upstream_host_pacing_worker` 等节奏控制表
+     - `upstream_ip_queue_depth`（每 IP 队列深度，供 slot-handler 记录 waiter）
    - 函数：
-     - `func_try_register_queue_waiter`
-     - `func_release_queue_waiter`
-     - `func_try_acquire_fair_slot`
+     - `download_register_fq_waiter`
+     - `download_release_fq_waiter`
+     - `download_try_acquire_slot`
+     - `download_release_slot`
+     - `func_try_acquire_slot`
      - `func_release_fair_slot`
      - `func_cleanup_zombie_slots`
      - `func_cleanup_ip_cooldown`
+     - `func_cleanup_queue_depth`
      - `download_check_throttle_protection`（上文提过）。
+   - 清理由 slot-handler 内部定时任务调用，download worker 不再直连这些 RPC。
 
 D1 / D1-REST 模式下，Worker 端有对应的 SQL 适配逻辑（不依赖 plpgsql），实现同样的语义。
 
@@ -301,9 +292,10 @@ D1 / D1-REST 模式下，Worker 端有对应的 SQL 适配逻辑（不依赖 plp
 - CF Rate Limiter：
   - `ENABLE_CF_RATELIMITER`, `CF_RATELIMITER_BINDING`, `IPV4_SUFFIX`, `IPV6_SUFFIX`
 - Fair Queue：
-  - `FAIR_QUEUE_ENABLED`, `FAIR_QUEUE_HOST_PATTERNS`, `FAIR_QUEUE_BACKEND`
-  - 并发和等待相关各项 `FAIR_QUEUE_*`
-  - slot-handler 地址与超时：`FAIR_QUEUE_SLOT_HANDLER_URL`, `SLOT_HANDLER_MAX_WAIT_MS`, `SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS`, `SLOT_HANDLER_MAX_ATTEMPTS_CAP`, `FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY`
+  - `FAIR_QUEUE_ENABLED`, `FAIR_QUEUE_HOST_PATTERNS`
+  - slot-handler 连接与轮询：`FAIR_QUEUE_MAX_WAIT_MS`, `FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS`, `SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS`, `SLOT_HANDLER_MAX_ATTEMPTS_CAP`
+  - slot-handler 入口与鉴权：`FAIR_QUEUE_SLOT_HANDLER_URL`, `FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY`
+  - 并发/清理参数由 `slot-handler/config.json` 管理（`MaxSlotPerHost` / `MaxSlotPerIp` / `MaxWaitersPerIp` / `cleanup.*` 等）
 
 ## 六、小结
 

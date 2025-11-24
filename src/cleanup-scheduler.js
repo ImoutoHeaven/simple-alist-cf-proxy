@@ -300,59 +300,6 @@ export async function scheduleAllCleanups(config, env, ctx) {
   } else {
     await cleanupPromise;
   }
-
-  // Fair Queue zombie slot cleanup
-  if (config.fairQueueEnabled) {
-    const fairQueueCleanupProbability = 0.01; // 1%
-    if (Math.random() < fairQueueCleanupProbability) {
-      console.log('[Fair Queue Cleanup] Triggered cleanup');
-
-      const cleanupPromise = (async () => {
-        const fairQueueModule = await import('./fairqueue/custom-pg-rest.js');
-        const fairQueueCleanupTasks = [];
-
-        if (typeof fairQueueModule.cleanupZombieSlots === 'function') {
-          fairQueueCleanupTasks.push(
-            fairQueueModule.cleanupZombieSlots(config.fairQueueConfig)
-          );
-        }
-
-        if (
-          config.fairQueueConfig?.ipCooldownEnabled &&
-          typeof fairQueueModule.cleanupIpCooldown === 'function'
-        ) {
-          fairQueueCleanupTasks.push(
-            fairQueueModule.cleanupIpCooldown(config.fairQueueConfig)
-          );
-        }
-
-        if (typeof fairQueueModule.cleanupQueueDepth === 'function') {
-          fairQueueCleanupTasks.push(
-            fairQueueModule.cleanupQueueDepth(config.fairQueueConfig)
-          );
-        }
-
-        if (typeof fairQueueModule.cleanupHostPacing === 'function') {
-          fairQueueCleanupTasks.push(
-            fairQueueModule.cleanupHostPacing(config.fairQueueConfig)
-          );
-        }
-
-        if (fairQueueCleanupTasks.length > 0) {
-          await Promise.all(fairQueueCleanupTasks);
-        }
-      })().catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error('[Fair Queue Cleanup] Failed:', message);
-      });
-
-      if (ctx && typeof ctx.waitUntil === 'function') {
-        ctx.waitUntil(cleanupPromise);
-      } else {
-        await cleanupPromise;
-      }
-    }
-  }
 }
 
 export { cleanupLastActiveTable };

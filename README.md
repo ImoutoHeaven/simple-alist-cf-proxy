@@ -15,7 +15,7 @@ simple-alist-cf-proxy 是 AList 下载体系中的「download worker」，通常
 - **Origin 绑定**：解密 `additionalInfo.encrypt` 内的 origin snapshot 并按 `CHECK_ORIGIN` 校验 IP / Geo / ASN 等信息。
 - **Path ACL**：基于黑名单/白名单/EXCEPT + `*_INCLUDES` 实现精细路径访问控制和 per-path 校验开关。
 - **下载缓存 & 限流**：可选使用 D1 / D1-REST / PostgREST 进行下载链接缓存、IP 限流与上游 Throttle 保护。
-- **Fair Queue 支持**：通过内置 Worker 实现或外部 `slot-handler` 服务实现公平队列，保护 OneDrive/SharePoint 等上游存储。
+- **Fair Queue 支持**：通过外部 `slot-handler` 服务实现公平队列，保护 OneDrive/SharePoint 等上游存储。
 - **IPv4-only 模式**：可禁止 IPv6 下载（`IPV4_ONLY=true`）。
 
 ## Quick Start
@@ -126,7 +126,7 @@ Path ACL 仅改变校验逻辑与阻断行为，不会改变下载链接本身�
 
 download worker 仅支持两种 DB 模式（`DB_MODE`）：
 
-- `""`：不使用 DB（每次都访问 AList，无下载缓存/限流/Throttle/Fair Queue/Idle 持久化）。  
+- `""`：不使用 DB（每次都访问 AList，无下载缓存/限流/Throttle/Idle 持久化；Fair Queue 仅依赖独立 slot-handler + PostgreSQL）。  
 - `"custom-pg-rest"`：使用自建 PostgreSQL + PostgREST，并配合根目录 `init.sql`。  
 
 关键环境变量（详细含义见 `wrangler.toml`）：
@@ -140,15 +140,14 @@ download worker 仅支持两种 DB 模式（`DB_MODE`）：
 
 ### Fair Queue & slot-handler
 
-当你需要对某些上游 hostname 做公平排队（避免爆上游）时，可以启用 Fair Queue：
+当你需要对某些上游 hostname 做公平排队（避免爆上游）时，可以启用 Fair Queue（唯一实现：Go 版 slot-handler）：
 
-- 开关与模式：  
-  - `FAIR_QUEUE_ENABLED`  
-  - `FAIR_QUEUE_BACKEND`：`worker` 或 `slot-handler`  
-- 保护域名与并发限制：  
-  - `FAIR_QUEUE_HOST_PATTERNS`, `FAIR_QUEUE_GLOBAL_LIMIT`, `FAIR_QUEUE_PER_IP_LIMIT`, `FAIR_QUEUE_MAX_WAITERS_PER_IP`, `FAIR_QUEUE_MAX_WAIT_MS` 等  
-- 使用 `slot-handler` 后端时：  
-  - `FAIR_QUEUE_SLOT_HANDLER_URL`, `SLOT_HANDLER_MAX_WAIT_MS`, `SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS`, `SLOT_HANDLER_MAX_ATTEMPTS_CAP`, `FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY`。  
+- Worker 侧开关与入口：  
+  - `FAIR_QUEUE_ENABLED`，`FAIR_QUEUE_HOST_PATTERNS`  
+- slot-handler 连接与等待策略：  
+  - `FAIR_QUEUE_SLOT_HANDLER_URL`（必填）、`FAIR_QUEUE_MAX_WAIT_MS`、`FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS`、`SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS`、`SLOT_HANDLER_MAX_ATTEMPTS_CAP`、`FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY`  
+- 并发、清理与公平参数来源：  
+  - **仅从 `slot-handler/config.json` 读取**（`MaxSlotPerHost` / `MaxSlotPerIp` / `MaxWaitersPerIp` 以及 `cleanup.*`），Worker 不再触达 Fair Queue 相关的 PostgreSQL schema。  
 
 更多说明可参考：  
 - `download-worker-architecture.md` 的 Fair Queue 部分  

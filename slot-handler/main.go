@@ -52,18 +52,19 @@ type PostgresConfig struct {
 }
 
 type FairQueueConfig struct {
-	MaxWaitMs               int64     `json:"maxWaitMs"`
-	PollIntervalMs          int64     `json:"pollIntervalMs"`
-	PollWindowMs            int64     `json:"pollWindowMs"`
-	MinSlotHoldMs           int64     `json:"minSlotHoldMs"`
-	SmoothReleaseIntervalMs *int64    `json:"smoothReleaseIntervalMs,omitempty"`
-	MaxSlotPerHost          int       `json:"maxSlotPerHost"`
-	MaxSlotPerIP            int       `json:"maxSlotPerIp"`
-	MaxWaitersPerIP         int       `json:"maxWaitersPerIp"`
-	ZombieTimeoutSeconds    int       `json:"zombieTimeoutSeconds"`
-	IPCooldownSeconds       int       `json:"ipCooldownSeconds"`
-	SessionIdleSeconds      int       `json:"sessionIdleSeconds"`
-	RPC                     RPCConfig `json:"rpc"`
+	MaxWaitMs               int64                  `json:"maxWaitMs"`
+	PollIntervalMs          int64                  `json:"pollIntervalMs"`
+	PollWindowMs            int64                  `json:"pollWindowMs"`
+	MinSlotHoldMs           int64                  `json:"minSlotHoldMs"`
+	SmoothReleaseIntervalMs *int64                 `json:"smoothReleaseIntervalMs,omitempty"`
+	MaxSlotPerHost          int                    `json:"maxSlotPerHost"`
+	MaxSlotPerIP            int                    `json:"maxSlotPerIp"`
+	MaxWaitersPerIP         int                    `json:"maxWaitersPerIp"`
+	ZombieTimeoutSeconds    int                    `json:"zombieTimeoutSeconds"`
+	IPCooldownSeconds       int                    `json:"ipCooldownSeconds"`
+	SessionIdleSeconds      int                    `json:"sessionIdleSeconds"`
+	RPC                     RPCConfig              `json:"rpc"`
+	Cleanup                 FairQueueCleanupConfig `json:"cleanup"`
 }
 
 type RPCConfig struct {
@@ -114,6 +115,12 @@ type ReleaseResponse struct {
 	Result string `json:"result"`
 }
 
+type FairQueueCleanupConfig struct {
+	Enabled                 bool `json:"enabled"`
+	IntervalSeconds         int  `json:"intervalSeconds"`
+	QueueDepthZombieSeconds int  `json:"queueDepthZombieTtlSeconds"`
+}
+
 type throttleResult struct {
 	throttled  bool
 	code       int
@@ -142,6 +149,10 @@ type queueBackend interface {
 	ReleaseWaiter(ctx context.Context, req AcquireRequest) error
 	TryAcquire(ctx context.Context, req AcquireRequest) (*tryAcquireResult, error)
 	ReleaseSlot(ctx context.Context, req ReleaseRequest) error
+}
+
+type fairQueueCleanupBackend interface {
+	CleanupFairQueue(ctx context.Context, cfg FairQueueConfig) error
 }
 
 type FQSessionState string
@@ -407,6 +418,21 @@ func (c FairQueueConfig) sessionIdleDuration() time.Duration {
 	return time.Duration(c.SessionIdleSeconds) * time.Second
 }
 
+func (c FairQueueConfig) cleanupInterval() time.Duration {
+	if c.Cleanup.IntervalSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.Cleanup.IntervalSeconds) * time.Second
+}
+
+func (c FairQueueConfig) queueDepthCleanupTTL() int {
+	ttl := c.Cleanup.QueueDepthZombieSeconds
+	if ttl <= 0 {
+		ttl = 20
+	}
+	return ttl
+}
+
 func sanitizeThrottleWindowSeconds(v int) int {
 	if v > 0 {
 		return v
@@ -423,11 +449,40 @@ func loadConfig(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
+
+	var cleanupEnabledProvided bool
+	var cleanupIntervalProvided bool
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err == nil {
+		if fqRaw, ok := raw["fairQueue"]; ok {
+			var fq map[string]json.RawMessage
+			if err := json.Unmarshal(fqRaw, &fq); err == nil {
+				if cleanupRaw, ok := fq["cleanup"]; ok {
+					var cleanup map[string]json.RawMessage
+					if err := json.Unmarshal(cleanupRaw, &cleanup); err == nil {
+						if _, ok := cleanup["enabled"]; ok {
+							cleanupEnabledProvided = true
+						}
+						if _, ok := cleanup["intervalSeconds"]; ok {
+							cleanupIntervalProvided = true
+						}
+					}
+				}
+			}
+		}
+	}
+
 	if strings.TrimSpace(cfg.Listen) == "" {
 		cfg.Listen = ":8080"
 	}
 	if strings.TrimSpace(cfg.Auth.Header) == "" {
 		cfg.Auth.Header = "X-FQ-Auth"
+	}
+	if cfg.FairQueue.Cleanup.IntervalSeconds == 0 && !cleanupIntervalProvided {
+		cfg.FairQueue.Cleanup.IntervalSeconds = 1800
+	}
+	if !cleanupEnabledProvided {
+		cfg.FairQueue.Cleanup.Enabled = true
 	}
 	return cfg, nil
 }
@@ -817,6 +872,43 @@ func (s *server) startSessionGC(ctx context.Context) {
 	}()
 }
 
+func (s *server) startFairQueueCleanup(ctx context.Context) {
+	c := s.cfg.FairQueue.Cleanup
+	if !c.Enabled {
+		s.log.Infof("fairqueue cleanup disabled")
+		return
+	}
+
+	interval := s.cfg.FairQueue.cleanupInterval()
+	if interval <= 0 {
+		s.log.Infof("fairqueue cleanup disabled (interval<=0)")
+		return
+	}
+	s.log.Infof("fairqueue cleanup interval=%s", interval)
+
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := s.runFairQueueCleanup(ctx); err != nil {
+					s.log.Warnf("fairqueue cleanup error: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+func (s *server) runFairQueueCleanup(ctx context.Context) error {
+	if backend, ok := s.backend.(fairQueueCleanupBackend); ok {
+		return backend.CleanupFairQueue(ctx, s.cfg.FairQueue)
+	}
+	return nil
+}
+
 func (s *server) gcSessions() {
 	now := time.Now()
 	idleLimit := s.cfg.FairQueue.sessionIdleDuration()
@@ -1115,6 +1207,37 @@ func (b *postgrestBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) 
 	return b.doRPC(ctx, fn, body, nil)
 }
 
+func (b *postgrestBackend) CleanupFairQueue(ctx context.Context, cfg FairQueueConfig) error {
+	if timeout := cfg.zombieTimeoutSeconds(); timeout > 0 {
+		body := map[string]interface{}{
+			"p_zombie_timeout_seconds": timeout,
+		}
+		if err := b.doRPC(ctx, "func_cleanup_zombie_slots", body, nil); err != nil {
+			return fmt.Errorf("cleanup zombie slots: %w", err)
+		}
+	}
+
+	if cooldown := cfg.cooldownSeconds(); cooldown > 0 {
+		body := map[string]interface{}{
+			"p_ttl_seconds": maxInt(cooldown*10, 60),
+		}
+		if err := b.doRPC(ctx, "func_cleanup_ip_cooldown", body, nil); err != nil {
+			return fmt.Errorf("cleanup ip cooldown: %w", err)
+		}
+	}
+
+	if ttl := cfg.queueDepthCleanupTTL(); ttl > 0 {
+		body := map[string]interface{}{
+			"p_ttl_seconds": ttl,
+		}
+		if err := b.doRPC(ctx, "func_cleanup_queue_depth", body, nil); err != nil {
+			return fmt.Errorf("cleanup queue depth: %w", err)
+		}
+	}
+
+	return nil
+}
+
 type postgresBackend struct {
 	cfg Config
 	db  *sql.DB
@@ -1214,6 +1337,36 @@ func (p *postgresBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) e
 	return err
 }
 
+func (p *postgresBackend) CleanupFairQueue(ctx context.Context, cfg FairQueueConfig) error {
+	if timeout := cfg.zombieTimeoutSeconds(); timeout > 0 {
+		if _, err := p.db.ExecContext(ctx, "SELECT func_cleanup_zombie_slots($1)", timeout); err != nil {
+			return fmt.Errorf("cleanup zombie slots: %w", err)
+		}
+	}
+
+	if cooldown := cfg.cooldownSeconds(); cooldown > 0 {
+		ttl := maxInt(cooldown*10, 60)
+		if _, err := p.db.ExecContext(ctx, "SELECT func_cleanup_ip_cooldown($1)", ttl); err != nil {
+			return fmt.Errorf("cleanup ip cooldown: %w", err)
+		}
+	}
+
+	if ttl := cfg.queueDepthCleanupTTL(); ttl > 0 {
+		if _, err := p.db.ExecContext(ctx, "SELECT func_cleanup_queue_depth($1)", ttl); err != nil {
+			return fmt.Errorf("cleanup queue depth: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func pickInt(input int, fallback int) int {
 	if input > 0 {
 		return input
@@ -1270,6 +1423,7 @@ func main() {
 		sessionStore: newMemorySessionStore(),
 	}
 	s.startSessionGC(gcCtx)
+	s.startFairQueueCleanup(gcCtx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v0/fairqueue/acquire", s.handleAcquire)

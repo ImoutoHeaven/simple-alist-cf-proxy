@@ -35,6 +35,7 @@
   - `maxSlotPerHost` / `maxSlotPerIp`：单 hostname/单 IP 的并发 slot 上限。
   - `maxWaitersPerIp`：每个 IP 允许的排队人数（>0 时才会注册/释放 waiter）。
   - `zombieTimeoutSeconds` / `ipCooldownSeconds`：僵尸锁超时 & 冷却时间。
+  - `cleanup`：后台清理配置（`enabled`、`intervalSeconds` 默认 1800 秒、`queueDepthZombieTtlSeconds` 未指定时默认 20 秒）。
 - `rpc`：数据库 RPC 函数名（默认与 `download-init.sql` 中保持一致）。
 
 ## HTTP 接口
@@ -70,3 +71,4 @@
 - 会话清理：`sessionIdleSeconds` 内无轮询或累计等待超过 `maxWaitMs` → 直接返回 `timeout` 并清理。
 - 暂时错误/队列已满/IP 过多一律保持 `pending`，内部按 `pollIntervalMs` 自行 sleep 重试，避免客户端重试风暴。
 - release 阶段即使数据库报错也只记录日志，不向调用方新增错误分支。
+- Cleanup：`cleanup.enabled=true` 时，每隔 `intervalSeconds` 触发一次后台任务，依次调用 `func_cleanup_zombie_slots` / `func_cleanup_ip_cooldown` / `func_cleanup_queue_depth`。
