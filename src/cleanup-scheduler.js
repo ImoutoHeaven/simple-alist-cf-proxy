@@ -28,47 +28,6 @@ const deriveCleanupProbability = (config) => {
   return DEFAULT_CLEANUP_PROBABILITY;
 };
 
-const executeD1RestStatement = async (accountId, databaseId, apiToken, sql, params = []) => {
-  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseId}/query`;
-  const payload = params && params.length > 0 ? { sql, params } : { sql };
-
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`D1 REST cleanup request failed (${response.status}): ${errorText}`);
-  }
-
-  const result = await response.json();
-  if (!result.success) {
-    throw new Error(`D1 REST cleanup query failed: ${JSON.stringify(result.errors || 'Unknown error')}`);
-  }
-
-  const statementResult = result.result?.[0];
-  return statementResult?.meta?.changes ?? 0;
-};
-
-const executeD1BindingStatement = async (db, sql, params = []) => {
-  if (!db || typeof db.prepare !== 'function') {
-    throw new Error('D1 binding unavailable for cleanup');
-  }
-
-  let statement = db.prepare(sql);
-  if (params.length > 0) {
-    statement = statement.bind(...params);
-  }
-
-  const result = await statement.run();
-  return result?.meta?.changes ?? 0;
-};
-
 const normalizePostgrestUrl = (postgrestUrl) => {
   if (!postgrestUrl) {
     return '';
@@ -174,134 +133,6 @@ const executePostgrestRpc = async (postgrestUrl, verifyHeader, verifySecret, fun
   return 0;
 };
 
-const buildD1RestCleanupTasks = (config) => {
-  const tasks = [];
-
-  if (config.cacheEnabled && config.cacheConfig) {
-    const cacheConfig = config.cacheConfig;
-    tasks.push({
-      name: 'Cache',
-      fn: async () => {
-        const now = Math.floor(Date.now() / 1000);
-        const cutoffTime = now - (cacheConfig.linkTTL * 2);
-        const table = cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE';
-        const sql = `DELETE FROM ${table} WHERE TIMESTAMP < ?`;
-        return executeD1RestStatement(cacheConfig.accountId, cacheConfig.databaseId, cacheConfig.apiToken, sql, [cutoffTime]);
-      },
-    });
-  }
-
-  if (config.rateLimitEnabled && config.rateLimitConfig) {
-    const rateLimitConfig = config.rateLimitConfig;
-    tasks.push({
-      name: 'RateLimit',
-      fn: async () => {
-        const now = Math.floor(Date.now() / 1000);
-        const cutoffTime = now - (rateLimitConfig.windowTimeSeconds * 2);
-        const table = rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE';
-        const sql = `
-          DELETE FROM ${table}
-          WHERE LAST_WINDOW_TIME < ?
-            AND (BLOCK_UNTIL IS NULL OR BLOCK_UNTIL < ?)
-        `;
-        return executeD1RestStatement(rateLimitConfig.accountId, rateLimitConfig.databaseId, rateLimitConfig.apiToken, sql, [cutoffTime, now]);
-      },
-    });
-  }
-
-  if (config.throttleEnabled && config.throttleConfig) {
-    const throttleConfig = config.throttleConfig;
-    tasks.push({
-      name: 'Throttle',
-      fn: async () => {
-        const now = Math.floor(Date.now() / 1000);
-        const cutoffTime = now - (throttleConfig.throttleTimeWindow * 2);
-        const table = throttleConfig.tableName || 'THROTTLE_PROTECTION';
-        const sql = `
-          DELETE FROM ${table}
-          WHERE IS_PROTECTED = 0
-            AND (ERROR_TIMESTAMP IS NULL OR ERROR_TIMESTAMP < ?)
-        `;
-        return executeD1RestStatement(throttleConfig.accountId, throttleConfig.databaseId, throttleConfig.apiToken, sql, [cutoffTime]);
-      },
-    });
-  }
-
-  return tasks;
-};
-
-const buildD1CleanupTasks = (config, env) => {
-  const tasks = [];
-
-  const resolveBinding = (moduleConfig) => {
-    const bindingName = moduleConfig?.databaseBinding;
-    if (!bindingName) {
-      throw new Error('D1 database binding name is missing');
-    }
-    const sourceEnv = moduleConfig.env || env;
-    const db = sourceEnv?.[bindingName];
-    if (!db) {
-      throw new Error(`D1 database binding '${bindingName}' not found`);
-    }
-    return db;
-  };
-
-  if (config.cacheEnabled && config.cacheConfig) {
-    const cacheConfig = config.cacheConfig;
-    tasks.push({
-      name: 'Cache',
-      fn: async () => {
-        const db = resolveBinding(cacheConfig);
-        const now = Math.floor(Date.now() / 1000);
-        const cutoffTime = now - (cacheConfig.linkTTL * 2);
-        const table = cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE';
-        const sql = `DELETE FROM ${table} WHERE TIMESTAMP < ?`;
-        return executeD1BindingStatement(db, sql, [cutoffTime]);
-      },
-    });
-  }
-
-  if (config.rateLimitEnabled && config.rateLimitConfig) {
-    const rateLimitConfig = config.rateLimitConfig;
-    tasks.push({
-      name: 'RateLimit',
-      fn: async () => {
-        const db = resolveBinding(rateLimitConfig);
-        const now = Math.floor(Date.now() / 1000);
-        const cutoffTime = now - (rateLimitConfig.windowTimeSeconds * 2);
-        const table = rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE';
-        const sql = `
-          DELETE FROM ${table}
-          WHERE LAST_WINDOW_TIME < ?
-            AND (BLOCK_UNTIL IS NULL OR BLOCK_UNTIL < ?)
-        `;
-        return executeD1BindingStatement(db, sql, [cutoffTime, now]);
-      },
-    });
-  }
-
-  if (config.throttleEnabled && config.throttleConfig) {
-    const throttleConfig = config.throttleConfig;
-    tasks.push({
-      name: 'Throttle',
-      fn: async () => {
-        const db = resolveBinding(throttleConfig);
-        const now = Math.floor(Date.now() / 1000);
-        const cutoffTime = now - (throttleConfig.throttleTimeWindow * 2);
-        const table = throttleConfig.tableName || 'THROTTLE_PROTECTION';
-        const sql = `
-          DELETE FROM ${table}
-          WHERE IS_PROTECTED = 0
-            AND (ERROR_TIMESTAMP IS NULL OR ERROR_TIMESTAMP < ?)
-        `;
-        return executeD1BindingStatement(db, sql, [cutoffTime]);
-      },
-    });
-  }
-
-  return tasks;
-};
-
 const buildCustomPgRestCleanupTasks = (config) => {
   const tasks = [];
 
@@ -374,7 +205,12 @@ const buildCustomPgRestCleanupTasks = (config) => {
 const cleanupLastActiveTable = async (config, env) => {
   const { dbMode, cacheConfig } = config || {};
 
-  if (!dbMode || !cacheConfig || typeof cacheConfig.linkTTL !== 'number' || cacheConfig.linkTTL <= 0) {
+  if (
+    dbMode !== 'custom-pg-rest' ||
+    !cacheConfig ||
+    typeof cacheConfig.linkTTL !== 'number' ||
+    cacheConfig.linkTTL <= 0
+  ) {
     return { cleaned: 0 };
   }
 
@@ -383,41 +219,17 @@ const cleanupLastActiveTable = async (config, env) => {
   const tableName = cacheConfig.lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
 
   try {
-    if (dbMode === 'd1') {
-      const bindingName = cacheConfig.databaseBinding;
-      const sourceEnv = cacheConfig.env || env;
-      const db = sourceEnv?.[bindingName];
-      if (!db) {
-        throw new Error(`D1 database binding '${bindingName}' not found`);
-      }
-
-      const result = await db.prepare(
-        `DELETE FROM ${tableName} WHERE LAST_ACCESS_TIME < ?`
-      ).bind(threshold).run();
-
-      return { cleaned: result?.meta?.changes || 0 };
-    }
-
-    if (dbMode === 'd1-rest') {
-      const { accountId, databaseId, apiToken } = cacheConfig;
-      const sql = `DELETE FROM ${tableName} WHERE LAST_ACCESS_TIME < ?`;
-      const changes = await executeD1RestStatement(accountId, databaseId, apiToken, sql, [threshold]);
-      return { cleaned: changes };
-    }
-
-    if (dbMode === 'custom-pg-rest') {
-      const { postgrestUrl, verifyHeader, verifySecret } = cacheConfig;
-      const filters = `LAST_ACCESS_TIME=lt.${threshold}`;
-      const cleaned = await executePostgrestDelete(
-        postgrestUrl,
-        verifyHeader,
-        verifySecret,
-        tableName,
-        filters,
-        { Prefer: 'return=representation' }
-      );
-      return { cleaned };
-    }
+    const { postgrestUrl, verifyHeader, verifySecret } = cacheConfig;
+    const filters = `LAST_ACCESS_TIME=lt.${threshold}`;
+    const cleaned = await executePostgrestDelete(
+      postgrestUrl,
+      verifyHeader,
+      verifySecret,
+      tableName,
+      filters,
+      { Prefer: 'return=representation' }
+    );
+    return { cleaned };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error('[Cleanup] LastActive cleanup failed:', message);
@@ -428,7 +240,7 @@ const cleanupLastActiveTable = async (config, env) => {
 };
 
 export async function scheduleAllCleanups(config, env, ctx) {
-  if (!config || !config.dbMode) {
+  if (!config || config.dbMode !== 'custom-pg-rest') {
     return;
   }
 
@@ -445,19 +257,7 @@ export async function scheduleAllCleanups(config, env, ctx) {
     `[Cleanup Scheduler] Triggered (${formatPercentageLabel(cleanupProbability)}% probability)`
   );
 
-  const normalizedMode = String(config.dbMode || '').trim().toLowerCase();
-  let cleanupTasks = [];
-
-  if (normalizedMode === 'd1-rest') {
-    cleanupTasks = buildD1RestCleanupTasks(config);
-  } else if (normalizedMode === 'd1') {
-    cleanupTasks = buildD1CleanupTasks(config, env);
-  } else if (normalizedMode === 'custom-pg-rest') {
-    cleanupTasks = buildCustomPgRestCleanupTasks(config);
-  } else {
-    console.warn(`[Cleanup Scheduler] Unknown dbMode: ${config.dbMode}`);
-    return;
-  }
+  const cleanupTasks = buildCustomPgRestCleanupTasks(config);
 
   if (
     config.cacheConfig &&
@@ -508,48 +308,38 @@ export async function scheduleAllCleanups(config, env, ctx) {
       console.log('[Fair Queue Cleanup] Triggered cleanup');
 
       const cleanupPromise = (async () => {
-        let fairQueueModule;
-        if (normalizedMode === 'custom-pg-rest') {
-          fairQueueModule = await import('./fairqueue/custom-pg-rest.js');
-        } else if (normalizedMode === 'd1') {
-          fairQueueModule = await import('./unified-check-d1.js');
-        } else if (normalizedMode === 'd1-rest') {
-          fairQueueModule = await import('./unified-check-d1-rest.js');
+        const fairQueueModule = await import('./fairqueue/custom-pg-rest.js');
+        const fairQueueCleanupTasks = [];
+
+        if (typeof fairQueueModule.cleanupZombieSlots === 'function') {
+          fairQueueCleanupTasks.push(
+            fairQueueModule.cleanupZombieSlots(config.fairQueueConfig)
+          );
         }
 
-        if (fairQueueModule) {
-          const fairQueueCleanupTasks = [];
+        if (
+          config.fairQueueConfig?.ipCooldownEnabled &&
+          typeof fairQueueModule.cleanupIpCooldown === 'function'
+        ) {
+          fairQueueCleanupTasks.push(
+            fairQueueModule.cleanupIpCooldown(config.fairQueueConfig)
+          );
+        }
 
-          if (typeof fairQueueModule.cleanupZombieSlots === 'function') {
-            fairQueueCleanupTasks.push(
-              fairQueueModule.cleanupZombieSlots(config.fairQueueConfig)
-            );
-          }
+        if (typeof fairQueueModule.cleanupQueueDepth === 'function') {
+          fairQueueCleanupTasks.push(
+            fairQueueModule.cleanupQueueDepth(config.fairQueueConfig)
+          );
+        }
 
-          if (
-            config.fairQueueConfig?.ipCooldownEnabled &&
-            typeof fairQueueModule.cleanupIpCooldown === 'function'
-          ) {
-            fairQueueCleanupTasks.push(
-              fairQueueModule.cleanupIpCooldown(config.fairQueueConfig)
-            );
-          }
+        if (typeof fairQueueModule.cleanupHostPacing === 'function') {
+          fairQueueCleanupTasks.push(
+            fairQueueModule.cleanupHostPacing(config.fairQueueConfig)
+          );
+        }
 
-          if (typeof fairQueueModule.cleanupQueueDepth === 'function') {
-            fairQueueCleanupTasks.push(
-              fairQueueModule.cleanupQueueDepth(config.fairQueueConfig)
-            );
-          }
-
-          if (typeof fairQueueModule.cleanupHostPacing === 'function') {
-            fairQueueCleanupTasks.push(
-              fairQueueModule.cleanupHostPacing(config.fairQueueConfig)
-            );
-          }
-
-          if (fairQueueCleanupTasks.length > 0) {
-            await Promise.all(fairQueueCleanupTasks);
-          }
+        if (fairQueueCleanupTasks.length > 0) {
+          await Promise.all(fairQueueCleanupTasks);
         }
       })().catch((error) => {
         const message = error instanceof Error ? error.message : String(error);

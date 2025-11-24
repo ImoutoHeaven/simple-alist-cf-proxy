@@ -170,7 +170,8 @@ compatibility_date = "2024-01-01"
 
 #
 # # Database Mode for Download Link Cache
-# # Options: "d1" (Cloudflare D1 Binding), "d1-rest" (Cloudflare D1 REST API), "custom-pg-rest" (Custom PostgreSQL + PostgREST)
+# # Options: "" (disable DB) or "custom-pg-rest" (Custom PostgreSQL + PostgREST)
+# # D1 / D1-REST 已废弃，不再支持
 # # If not set, caching is completely disabled (always call AList API)
 # DB_MODE = ""
 # DOWNLOAD_CACHE_TABLE = "DOWNLOAD_CACHE_TABLE"
@@ -184,6 +185,7 @@ compatibility_date = "2024-01-01"
 #   - 例如: "30m" (30分钟), "1h" (1小时)
 #   - 设置为 "0" 或空字符串关闭此功能
 # DOWNLOAD_LAST_ACTIVE_TABLE: 自定义空闲追踪表名，默认 DOWNLOAD_LAST_ACTIVE_TABLE
+#   - 仅在 DB_MODE="custom-pg-rest" 时生效
 #
 # # ═══════════════════════════════════════════════════════════════
 # # ⚠️ Database Table Initialization Control (Performance Optimization)
@@ -217,7 +219,7 @@ compatibility_date = "2024-01-01"
 # #
 # # Recommended Workflow:
 # # 1. First deployment: INIT_TABLES="true" → Creates all tables
-# # 2. Verify tables exist: Check D1 dashboard or run SELECT on tables
+# # 2. Verify tables exist: Check database dashboard or run SELECT on tables
 # # 3. Switch to production: INIT_TABLES="false" → Optimal performance
 # # 4. Schema updates: Temporarily set to "true" → Apply changes → Set back to "false"
 # #
@@ -243,16 +245,6 @@ compatibility_date = "2024-01-01"
 # # Cleanup removes records older than LINK_TTL * 2
 # CLEANUP_PERCENTAGE = "1"
 #
-# # D1 (Cloudflare D1 Binding) Download Cache - requires DB_MODE="d1"
-# # Note: You must also configure d1_databases binding below
-# D1_DATABASE_BINDING = "DB"  # Optional, defaults to "DB"
-#
-# # D1 REST API Download Cache - requires DB_MODE="d1-rest"
-# # Use this mode when you cannot use Workers binding (e.g., external API calls)
-# D1_ACCOUNT_ID = "your-cloudflare-account-id"
-# D1_DATABASE_ID = "your-d1-database-id"
-# D1_API_TOKEN = "your-cloudflare-api-token"
-#
 # # Custom PostgreSQL + PostgREST Download Cache - requires DB_MODE="custom-pg-rest"
 # # Use this mode when you have self-hosted PostgreSQL with PostgREST REST API
 # # ⚠️ IMPORTANT: You MUST run init.sql on your PostgreSQL database first!
@@ -274,7 +266,7 @@ compatibility_date = "2024-01-01"
 # # 4. If successful, protection is cleared automatically
 # #
 # # Requirements:
-# # - DB_MODE must be set (d1, d1-rest, or custom-pg-rest)
+# # - DB_MODE must be set to "custom-pg-rest"
 # # - For custom-pg-rest: Run init.sql to create THROTTLE_PROTECTION table and stored procedures
 # #
 # # Configuration:
@@ -379,13 +371,6 @@ compatibility_date = "2024-01-01"
 # #   IPSUBNET_WINDOWTIME_LIMIT = "100"  # 100 requests per 24h (DB layer)
 # #   # CF Rate Limiter configured in binding: 10 requests per 10s (edge layer)
 
-# D1 Database Binding (for DB_MODE="d1")
-# Uncomment and configure this section if using D1 binding mode
-# [[d1_databases]]
-# binding = "DB"  # Must match D1_DATABASE_BINDING env var (or use default "DB")
-# database_name = "alist-cache-db"
-# database_id = "your-d1-database-id"
-
 # ═══════════════════════════════════════════════════════════════
 # ⚠️ NEW: Cloudflare Rate Limiter Binding (for ENABLE_CF_RATELIMITER="true")
 # ═══════════════════════════════════════════════════════════════
@@ -450,13 +435,11 @@ compatibility_date = "2024-01-01"
 #   [Request] → [Acquire slot] → [await fetch(upstream)] → [Got Response headers] → [Release slot] → [Stream file 2min]
 #                ↑_____________ Slot held ~1-3s (TTFB only) _____________↑
 #
-# Database Mode Requirements:
+# Database Mode Requirements (DB_MODE="custom-pg-rest"):
 # ┌──────────────────┬─────────────────────┬────────────────────────────────┐
 # │ DB Mode          │ Table Creation      │ Queue Implementation           │
 # ├──────────────────┼─────────────────────┼────────────────────────────────┤
-# │ PostgreSQL       │ Manual (init.sql)   │ Single-attempt RPC + Worker wait │
-# │ D1               │ Auto (INIT_TABLES)  │ Single-attempt SQL + Worker wait │
-# │ D1-REST          │ Auto (INIT_TABLES)  │ Single-attempt SQL + Worker wait │
+# │ custom-pg-rest   │ Manual (init.sql)   │ Single-attempt RPC + Worker wait │
 # └──────────────────┴─────────────────────┴────────────────────────────────┘
 #
 # PostgreSQL Setup:
@@ -464,11 +447,7 @@ compatibility_date = "2024-01-01"
 #      - Table: upstream_slot_pool
 #      - Functions: func_try_acquire_slot, func_release_fair_slot, func_cleanup_zombie_slots
 #   2. INIT_TABLES has no effect (PostgREST doesn't support auto-table creation)
-#
-# D1/D1-REST Setup:
-#   1. First deployment: INIT_TABLES="true" → Creates upstream_slot_pool table
-#   2. Subsequent requests: INIT_TABLES="false" → Table persists, queue functions always available
-#
+#   2. INIT_TABLES has no effect (PostgREST doesn't support auto-table creation)
 # Relationship with Throttle Protection:
 # ┌────────────────┬────────────────┬──────────────────────────────────┐
 # │ State          │ Fair Queue     │ Throttle Protection              │
@@ -487,7 +466,7 @@ compatibility_date = "2024-01-01"
 # FAIR_QUEUE_ENABLED = "false"       # Enable fair queue (default: false)
 #                                     # Requires FAIR_QUEUE_HOST_PATTERNS to be non-empty
 #
-# FAIR_QUEUE_BACKEND = "worker"      # "worker": Worker 本地轮询+PostgREST/D1；"slot-handler": 交给外部 Go 服务
+# FAIR_QUEUE_BACKEND = "worker"      # "worker": Worker 本地轮询+PostgREST；"slot-handler": 交给外部 Go 服务
 #                                     # slot-handler 行为完全由其 config.json 决定，Worker 仅做调用，不传递本地 queue/hold 参数
 #
 # FAIR_QUEUE_HOST_PATTERNS = ""      # Comma-separated hostname patterns to protect
@@ -583,8 +562,8 @@ compatibility_date = "2024-01-01"
 #   FAIR_QUEUE_GLOBAL_LIMIT = "10"
 #   FAIR_QUEUE_PER_IP_LIMIT = "2"
 #   FAIR_QUEUE_MAX_WAITERS_PER_IP = "4"
-#   DB_MODE = "d1"
-#   INIT_TABLES = "true"  # First deployment only
+#   DB_MODE = "custom-pg-rest"
+#   # Run init.sql once on PostgreSQL before enabling
 #   # Result: 10 concurrent connections per hostname, 2 per IP
 #
 # Example 3: Combined with Throttle Protection
@@ -622,9 +601,8 @@ compatibility_date = "2024-01-01"
 # Diagnosis:
 #   - Check FAIR_QUEUE_ENABLED="true"
 #   - Check FAIR_QUEUE_HOST_PATTERNS is non-empty
-#   - Check DB_MODE is set (d1/d1-rest/custom-pg-rest)
+#   - Check DB_MODE is set to "custom-pg-rest"
 #   - PostgreSQL: Verify init.sql was run
-#   - D1: Verify INIT_TABLES="true" was used at least once
 # Solution:
 #   - Enable all required settings
 #   - Check worker logs for "[Fair Queue]" messages

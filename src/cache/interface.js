@@ -2,7 +2,7 @@
  * Download link cache interface
  *
  * This file defines the interface that all cache implementations must follow.
- * Actual implementations are in d1.js, d1-rest.js, and custom-pg-rest.js
+ * Current implementation is in custom-pg-rest.js
  *
  * All cache implementations support:
  * - TTL-based expiration
@@ -16,14 +16,9 @@
  *
  * @param {string} path - File path to check
  * @param {Object} config - Cache configuration
- * @param {Object} config.env - Cloudflare Workers env object (for D1 binding)
- * @param {string} config.databaseBinding - D1 database binding name (for D1)
- * @param {string} config.accountId - Cloudflare account ID (for D1-REST)
- * @param {string} config.databaseId - D1 database ID (for D1-REST)
- * @param {string} config.apiToken - Cloudflare API token (for D1-REST)
- * @param {string} config.postgrestUrl - PostgREST API endpoint (for custom-pg-rest)
- * @param {string|string[]} config.verifyHeader - Authentication header name(s) (for custom-pg-rest)
- * @param {string|string[]} config.verifySecret - Authentication header value(s) (for custom-pg-rest)
+ * @param {string} config.postgrestUrl - PostgREST API endpoint
+ * @param {string|string[]} config.verifyHeader - Authentication header name(s)
+ * @param {string|string[]} config.verifySecret - Authentication header value(s)
  * @param {string} config.tableName - Table name (defaults to 'DOWNLOAD_CACHE_TABLE')
  * @param {number} config.linkTTL - Link TTL in seconds
  * @param {Object} config.ctx - ExecutionContext for waitUntil (optional)

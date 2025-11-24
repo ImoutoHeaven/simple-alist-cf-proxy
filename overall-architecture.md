@@ -7,7 +7,7 @@
 从客户端到存储的整体链路可抽象为：
 
 用户浏览器 → Landing Worker → Download Worker → 上游存储（AList/云盘）  
-                                 ↘ 数据库（D1/PostgreSQL/PostgREST）  
+                                 ↘ 数据库（PostgreSQL/PostgREST）  
                    ↘ PoW 服务（pow-bot-deterrent）  
                    ↘ Cloudflare 基础设施（Rate Limiter, Turnstile）
 
@@ -22,7 +22,7 @@
   - pow-bot-deterrent（Powdet，外部 PoW 服务）
 - 聚合多层限流：
   - Cloudflare Rate Limiter Binding（纯边缘）
-  - D1 / PostgreSQL 的 IP/文件限流
+  - PostgreSQL 的 IP/文件限流
   - ALTCHA & Turnstile & Powdet token 的一次性消费控制；
 - 与 AList API（`/api/fs/get`）交互，获得文件元信息；
 - 发放 download worker 的下载票据（URL + 签名 + additionalInfo）。
@@ -40,7 +40,7 @@ Landing Worker 本身不提供实际文件下载，仅返回 HTML 页面或 `/in
   - OPTIONAL：解密 origin snapshot 并执行 `CHECK_ORIGIN`；
 - 再次与 AList API 交互（`/api/fs/link`），获取实际 download URL（可缓存）；
 - 在 Worker 层统一实现：
-  - 下载链接缓存（D1/PG）
+  - 下载链接缓存（PostgreSQL）
   - IP 限流
   - Throttle 保护（错误 host 的短路保护）
   - Last Active 跟踪；
@@ -103,7 +103,7 @@ Landing Worker 的 `/info`：
    - Turnstile：siteverify + Token 表 (可选)；
    - ALTCHA：stateless verifySolution + Token 表；
    - Powdet：HMAC + PoW 服务 Verify + 一次性票据消费；
-2. 通过 Unified Check（D1/PG）执行：
+2. 通过 Unified Check（PostgreSQL）执行：
    - IP/文件限流（`IP_LIMIT_TABLE`/`IP_FILE_LIMIT_TABLE`/`POWDET_DIFFICULTY_STATE`等）；
    - ALTCHA/Turnstile/Powdet token 状态更新；
    - 文件大小缓存；
@@ -138,7 +138,7 @@ Download Worker 接到请求后：
    - 拿到 landing 当时记录的 origin snapshot（IP/Geo/ASN 等）；
    - 对照当前请求环境（IP & Cloudflare header）；
    - 不一致则拒绝（降低「票据转移」「跳 IP 下载」风险）。
-4. 使用 Unified Check（download_unified_check 或 D1 版本）：
+4. 使用 Unified Check（download_unified_check，需 DB_MODE="custom-pg-rest"）：
    - 查看是否已有缓存 download link；
    - 更新 IP 限流状态；
    - 读取 Throttle 保护状态；
@@ -168,7 +168,7 @@ Download Worker 接到请求后：
    - 强制 token/PoW 在短窗口内使用，超过即失效。
 4. **访问频率控制：**
    - CF Rate Limiter 在边缘层快速把高频恶意流量挡在 Worker 之前；
-   - D1/PG 限流则提供更细粒度的长时间窗口控制。
+   - DB（PostgreSQL）限流则提供更细粒度的长时间窗口控制。
 5. **上游存储保护：**
    - 下载缓存减少对 AList 和后端存储的请求次数；
    - Throttle 保护将错误状态缓存在 DB 中，避免持续打在已知故障 hostname 上；
@@ -178,11 +178,10 @@ Download Worker 接到请求后：
 
 ### 1. 数据库模式
 
-两类 Worker（Landing & Download）都支持三种 DB 模式：
+两类 Worker（Landing & Download）目前仅支持：
 
-- `d1`：Cloudflare D1 Binding
-- `d1-rest`：通过 HTTP 访问 Cloudflare D1 REST API
-- `custom-pg-rest`：自建 PostgreSQL + PostgREST
+- `""`：无数据库（仅依赖 CF Rate Limiter / 前端验证）
+- `custom-pg-rest`：自建 PostgreSQL + PostgREST（需先执行 `init.sql`）
 
 设计上：
 
@@ -220,4 +219,3 @@ Fair Queue 抽象了「对某一主机模式的并发 slot 与队列」：
 - 数据库与 Cloudflare 基础设施提供强一致的限流与状态记录。
 
 在不牺牲用户体验（可按需选择 Turnstile/ALTCHA/Powdet）的前提下，该架构可以有效提高「自动化下载」「爬虫」「打码/代理组合攻击」的成本。
-

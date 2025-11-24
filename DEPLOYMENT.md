@@ -166,19 +166,17 @@ EXCEPT_ACTION=asis-except
 
 ## 3. Database & Unified Check（DB_MODE）
 
-download worker 的 DB 功能与 landing worker 类似，同样支持三种模式（见 `wrangler.toml` 中「Database Mode for Download Link Cache」及后续各节）：
+download worker 仅支持两种模式（D1/D1-REST 已移除，需改用 PostgreSQL + PostgREST）：
 
-- `DB_MODE=""`：不启用 DB（无缓存、无 DB 限流、无 Throttle）。  
-- `DB_MODE="d1"`：Cloudflare D1 绑定。  
-- `DB_MODE="d1-rest"`：Cloudflare D1 REST API。  
+- `DB_MODE=""`：不启用 DB（无缓存、无 DB 限流、无 Throttle/Fair Queue/Idle 持久化）。  
 - `DB_MODE="custom-pg-rest"`：自建 PostgreSQL + PostgREST。  
 
 ### 3.1 共享配置
 
-无论哪种 DB 模式，若要启用缓存/限流/Throttle，推荐至少设置：
+启用数据库能力时，推荐至少设置：
 
 ```env
-DB_MODE=d1  # 或 d1-rest / custom-pg-rest
+DB_MODE=custom-pg-rest  # 留空则完全关闭数据库功能
 
 DOWNLOAD_CACHE_TABLE=DOWNLOAD_CACHE_TABLE
 DOWNLOAD_IP_RATELIMIT_TABLE=DOWNLOAD_IP_RATELIMIT_TABLE
@@ -193,49 +191,9 @@ BLOCK_TIME=10m
 PG_ERROR_HANDLE=fail-closed
 ```
 
-### 3.2 D1 Binding（DB_MODE="d1"）
+### 3.2 custom-pg-rest（DB_MODE="custom-pg-rest"）
 
-1. 创建 D1 数据库：
-
-   ```bash
-   wrangler d1 create alist-download-db
-   ```
-
-2. 将输出的 `[[d1_databases]]` 段复制到 `wrangler.toml`。  
-
-3. 设置环境变量（`.dev.vars` 与 Dashboard）：
-
-   ```env
-   DB_MODE=d1
-   D1_DATABASE_BINDING=DB  # 与 wrangler.toml 中 binding 对应
-   ```
-
-4. 首次部署可设定：
-
-   ```env
-   INIT_TABLES=true
-   ```
-
-   待 D1 中创建完 `DOWNLOAD_CACHE_TABLE` / `THROTTLE_PROTECTION` / `DOWNLOAD_IP_RATELIMIT_TABLE` 后，再改为 `false` 以提升性能。  
-
-> D1 / D1-REST 模式下，表结构由 Worker 通过 `ensureTables()` 自动创建，无需手工执行 `init.sql`。
-
-### 3.3 D1 REST（DB_MODE="d1-rest"）
-
-当无法使用 D1 绑定时，通过 REST API 访问 D1：
-
-```env
-DB_MODE=d1-rest
-D1_ACCOUNT_ID=your-account-id
-D1_DATABASE_ID=your-d1-database-id
-D1_API_TOKEN=your-d1-api-token
-```
-
-其他配置与 D1 模式相同，也可以使用 `INIT_TABLES=true` 进行自动建表。
-
-### 3.4 custom-pg-rest（DB_MODE="custom-pg-rest"）
-
-使用自建 PostgreSQL + PostgREST 时：
+使用自建 PostgreSQL + PostgREST 时（Idle/Fair Queue/Throttle/DB 限流均依赖此模式）：
 
 1. 在 PostgreSQL 上执行仓库根目录的 `init.sql`：  
 
@@ -261,6 +219,15 @@ D1_API_TOKEN=your-d1-api-token
 - Last Active 更新  
 
 如果遇到 PostgREST `PGRST205` / 表或函数不存在错误，请确认 `init.sql` 已在正确数据库上执行，且 `POSTGREST_URL` 指向的实例加载了最新 schema。
+
+### 3.3 从 D1 迁移到 custom-pg-rest
+
+新版 download worker 不再支持 `DB_MODE=d1` / `d1-rest`。迁移建议：
+
+1. 部署 PostgreSQL + PostgREST，并执行本仓库 `init.sql`。  
+2. 将原有 D1 环境变量清空/删除，仅保留 `POSTGREST_URL`、`VERIFY_HEADER`、`VERIFY_SECRET`。  
+3. 设置 `DB_MODE=custom-pg-rest`，重新部署 Worker。  
+4. 如需保留历史缓存/限流数据，可先导出 D1 表数据再导入 PostgreSQL（字段兼容参考 `init.sql`）。  
 
 ---
 
@@ -365,4 +332,3 @@ curl "https://your-download-worker.workers.dev/path/to/file?sign=...&hashSign=..
 
 simple-alist-cf-proxy 使用 MIT License（见 `package.json` 中的 `license: "MIT"` 字段）。  
 在部署与二次封装时，可按 MIT 协议自由使用与修改。  
-

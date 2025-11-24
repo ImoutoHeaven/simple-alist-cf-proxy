@@ -3,8 +3,6 @@ import { createCacheManager } from './cache/factory.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
 import { unifiedCheck } from './unified-check.js';
-import { unifiedCheckD1 } from './unified-check-d1.js';
-import { unifiedCheckD1Rest } from './unified-check-d1-rest.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
 import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
 import { checkOriginMatch, decryptOriginSnapshot, getClientIp, parseCheckOriginEnv } from './origin-binding.js';
@@ -187,8 +185,12 @@ const resolveConfig = (env = {}) => {
   const whitelistActions = validateActions(env.WHITELIST_ACTION, 'WHITELIST_ACTION');
   const exceptActions = validateExceptActions(env.EXCEPT_ACTION, 'EXCEPT_ACTION');
 
-  const dbMode = normalizeString(env.DB_MODE);
-  const normalizedDbMode = dbMode ? dbMode.toLowerCase() : '';
+  const dbModeRaw = normalizeString(env.DB_MODE);
+  const normalizedDbMode = dbModeRaw ? dbModeRaw.toLowerCase() : '';
+  const dbMode = normalizedDbMode === 'custom-pg-rest' ? 'custom-pg-rest' : '';
+  if (normalizedDbMode && dbMode !== 'custom-pg-rest') {
+    throw new Error(`Invalid DB_MODE: "${dbModeRaw}". Only "" or "custom-pg-rest" are supported.`);
+  }
   const enableCfRatelimiter = normalizeString(env.ENABLE_CF_RATELIMITER, 'false').toLowerCase() === 'true';
   const cfRatelimiterBinding = normalizeString(env.CF_RATELIMITER_BINDING, 'CF_RATE_LIMITER');
 
@@ -197,9 +199,10 @@ const resolveConfig = (env = {}) => {
   const cleanupPercentage = parseNumber(env.CLEANUP_PERCENTAGE, 1);
   const cleanupProbability = Math.max(0, Math.min(100, cleanupPercentage)) / 100;
   const idleTimeoutRaw = normalizeString(env.IDLE_TIMEOUT);
-  const idleTimeoutSeconds = idleTimeoutRaw
-    ? parseTimeString(idleTimeoutRaw, 'IDLE_TIMEOUT')
-    : 0;
+  const idleTimeoutSeconds =
+    dbMode === 'custom-pg-rest' && idleTimeoutRaw
+      ? parseTimeString(idleTimeoutRaw, 'IDLE_TIMEOUT')
+      : 0;
   const lastActiveTableName =
     normalizeString(env.DOWNLOAD_LAST_ACTIVE_TABLE, 'DOWNLOAD_LAST_ACTIVE_TABLE') ||
     'DOWNLOAD_LAST_ACTIVE_TABLE';
@@ -207,8 +210,6 @@ const resolveConfig = (env = {}) => {
   const downloadCacheTableName = (() => {
     const explicit = normalizeString(env.DOWNLOAD_CACHE_TABLE);
     if (explicit) return explicit;
-    const legacyD1 = normalizeString(env.D1_TABLE_NAME);
-    if (legacyD1) return legacyD1;
     const legacyPg = normalizeString(env.POSTGREST_TABLE_NAME);
     if (legacyPg) return legacyPg;
     return 'DOWNLOAD_CACHE_TABLE';
@@ -269,196 +270,85 @@ const resolveConfig = (env = {}) => {
     throw new Error('VERIFY_HEADER and VERIFY_SECRET must have the same number of comma-separated entries');
   }
 
-  const d1DatabaseBinding = normalizeString(env.D1_DATABASE_BINDING, 'DB');
-  const d1AccountId = normalizeString(env.D1_ACCOUNT_ID);
-  const d1DatabaseId = normalizeString(env.D1_DATABASE_ID);
-  const d1ApiToken = normalizeString(env.D1_API_TOKEN);
   const postgrestUrl = normalizeString(env.POSTGREST_URL);
   const initTables = parseBoolean(env.INIT_TABLES, false);
 
   let cacheEnabled = false;
   let cacheConfig = {};
 
-  if (dbMode) {
-    if (normalizedDbMode === 'd1') {
-      if (d1DatabaseBinding && linkTTLSeconds > 0) {
-        cacheEnabled = true;
-        cacheConfig = {
-          env,
-          databaseBinding: d1DatabaseBinding,
-          tableName: downloadCacheTableName,
-          linkTTL: linkTTLSeconds,
-          idleTimeout: idleTimeoutSeconds,
-          lastActiveTableName,
-          cleanupProbability,
-          initTables,
-        };
-      } else {
-        throw new Error('DB_MODE is set to "d1" but LINK_TTL is missing or invalid');
-      }
-    } else if (normalizedDbMode === 'd1-rest') {
-      if (d1AccountId && d1DatabaseId && d1ApiToken && linkTTLSeconds > 0) {
-        cacheEnabled = true;
-        cacheConfig = {
-          accountId: d1AccountId,
-          databaseId: d1DatabaseId,
-          apiToken: d1ApiToken,
-          tableName: downloadCacheTableName,
-          linkTTL: linkTTLSeconds,
-          idleTimeout: idleTimeoutSeconds,
-          lastActiveTableName,
-          cleanupProbability,
-          initTables,
-        };
-      } else {
-        throw new Error('DB_MODE is set to "d1-rest" but required environment variables are missing: D1_ACCOUNT_ID, D1_DATABASE_ID, D1_API_TOKEN, LINK_TTL');
-      }
-    } else if (normalizedDbMode === 'custom-pg-rest') {
-      if (postgrestUrl && verifyHeaders.length > 0 && verifySecrets.length > 0 && linkTTLSeconds > 0) {
-        cacheEnabled = true;
-        cacheConfig = {
-          postgrestUrl,
-          verifyHeader: verifyHeaders,
-          verifySecret: verifySecrets,
-          tableName: downloadCacheTableName,
-          linkTTL: linkTTLSeconds,
-          idleTimeout: idleTimeoutSeconds,
-          lastActiveTableName,
-          cleanupProbability,
-          initTables,
-        };
-      } else {
-        throw new Error('DB_MODE is set to "custom-pg-rest" but required environment variables are missing: POSTGREST_URL, VERIFY_HEADER, VERIFY_SECRET, LINK_TTL');
-      }
-    } else {
-      throw new Error(`Invalid DB_MODE: "${dbMode}". Valid options are: "d1", "d1-rest", "custom-pg-rest"`);
-    }
-  }
-
-  const throttleEnabled = throttleHostnamePatterns.length > 0 && Boolean(dbMode);
-  let throttleConfig = {};
-  if (throttleEnabled) {
-    if (normalizedDbMode === 'd1') {
-      throttleConfig = {
-        env,
-        databaseBinding: d1DatabaseBinding,
-        tableName: throttleTableName,
-        throttleTimeWindow: throttleTimeWindowSeconds,
-        observeWindowSeconds: throttleObserveWindowSeconds,
-        errorRatioPercent: throttleErrorRatioPercent,
-        consecutiveThreshold: throttleConsecutiveThreshold,
-        minSampleCount: throttleMinSampleCount,
-        fastErrorRatioPercent: throttleFastErrorRatioPercent,
-        fastMinSampleCount: throttleFastMinSampleCount,
-        cleanupProbability,
-        protectedHttpCodes: throttleProtectHttpCodes,
-      };
-    } else if (normalizedDbMode === 'd1-rest') {
-      if (!d1AccountId || !d1DatabaseId || !d1ApiToken) {
-        throw new Error('Throttle protection requires D1 account configuration when DB_MODE is "d1-rest"');
-      }
-      throttleConfig = {
-        accountId: d1AccountId,
-        databaseId: d1DatabaseId,
-        apiToken: d1ApiToken,
-        tableName: throttleTableName,
-        throttleTimeWindow: throttleTimeWindowSeconds,
-        observeWindowSeconds: throttleObserveWindowSeconds,
-        errorRatioPercent: throttleErrorRatioPercent,
-        consecutiveThreshold: throttleConsecutiveThreshold,
-        minSampleCount: throttleMinSampleCount,
-        fastErrorRatioPercent: throttleFastErrorRatioPercent,
-        fastMinSampleCount: throttleFastMinSampleCount,
-        cleanupProbability,
-        protectedHttpCodes: throttleProtectHttpCodes,
-      };
-    } else if (normalizedDbMode === 'custom-pg-rest') {
-      if (!postgrestUrl || verifyHeaders.length === 0 || verifySecrets.length === 0) {
-        throw new Error('Throttle protection requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
-      }
-      throttleConfig = {
+  if (dbMode === 'custom-pg-rest') {
+    if (postgrestUrl && verifyHeaders.length > 0 && verifySecrets.length > 0 && linkTTLSeconds > 0) {
+      cacheEnabled = true;
+      cacheConfig = {
         postgrestUrl,
         verifyHeader: verifyHeaders,
         verifySecret: verifySecrets,
-        tableName: throttleTableName,
-        throttleTimeWindow: throttleTimeWindowSeconds,
-        observeWindowSeconds: throttleObserveWindowSeconds,
-        errorRatioPercent: throttleErrorRatioPercent,
-        consecutiveThreshold: throttleConsecutiveThreshold,
-        minSampleCount: throttleMinSampleCount,
-        fastErrorRatioPercent: throttleFastErrorRatioPercent,
-        fastMinSampleCount: throttleFastMinSampleCount,
+        tableName: downloadCacheTableName,
+        linkTTL: linkTTLSeconds,
+        idleTimeout: idleTimeoutSeconds,
+        lastActiveTableName,
         cleanupProbability,
-        protectedHttpCodes: throttleProtectHttpCodes,
+        initTables,
       };
+    } else {
+      throw new Error('DB_MODE is set to "custom-pg-rest" but required environment variables are missing: POSTGREST_URL, VERIFY_HEADER, VERIFY_SECRET, LINK_TTL');
     }
   }
 
-  const ipRateLimitActive = Boolean(dbMode && windowTimeSeconds > 0 && ipSubnetLimit > 0);
+  const throttleEnabled = throttleHostnamePatterns.length > 0 && dbMode === 'custom-pg-rest';
+  let throttleConfig = {};
+  if (throttleEnabled) {
+    if (!postgrestUrl || verifyHeaders.length === 0 || verifySecrets.length === 0) {
+      throw new Error('Throttle protection requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
+    }
+    throttleConfig = {
+      postgrestUrl,
+      verifyHeader: verifyHeaders,
+      verifySecret: verifySecrets,
+      tableName: throttleTableName,
+      throttleTimeWindow: throttleTimeWindowSeconds,
+      observeWindowSeconds: throttleObserveWindowSeconds,
+      errorRatioPercent: throttleErrorRatioPercent,
+      consecutiveThreshold: throttleConsecutiveThreshold,
+      minSampleCount: throttleMinSampleCount,
+      fastErrorRatioPercent: throttleFastErrorRatioPercent,
+      fastMinSampleCount: throttleFastMinSampleCount,
+      cleanupProbability,
+      protectedHttpCodes: throttleProtectHttpCodes,
+    };
+  }
+
+  const ipRateLimitActive = dbMode === 'custom-pg-rest' && windowTimeSeconds > 0 && ipSubnetLimit > 0;
   let rateLimitEnabled = false;
   let rateLimitConfig = {};
 
-  if (dbMode && ipSubnetLimit === 0 && !ipRateLimitDisabledLogged) {
+  if (dbMode === 'custom-pg-rest' && ipSubnetLimit === 0 && !ipRateLimitDisabledLogged) {
     console.log('IP rate limiting disabled (limit=0)');
     ipRateLimitDisabledLogged = true;
   }
 
-  if (dbMode && ipSubnetLimit > 0 && windowTimeSeconds <= 0) {
+  if (dbMode === 'custom-pg-rest' && ipSubnetLimit > 0 && windowTimeSeconds <= 0) {
     throw new Error('WINDOW_TIME must be greater than zero when IPSUBNET_WINDOWTIME_LIMIT > 0');
   }
 
   if (ipRateLimitActive) {
-    if (normalizedDbMode === 'd1') {
-      rateLimitEnabled = true;
-      rateLimitConfig = {
-        env,
-        databaseBinding: d1DatabaseBinding,
-        tableName: rateLimitTableName,
-        windowTimeSeconds,
-        limit: ipSubnetLimit,
-        ipv4Suffix,
-        ipv6Suffix,
-        pgErrorHandle,
-        cleanupProbability,
-        blockTimeSeconds,
-      };
-    } else if (normalizedDbMode === 'd1-rest') {
-      if (!d1AccountId || !d1DatabaseId || !d1ApiToken) {
-        throw new Error('Rate limiting requires D1 account configuration when DB_MODE is "d1-rest"');
-      }
-      rateLimitEnabled = true;
-      rateLimitConfig = {
-        accountId: d1AccountId,
-        databaseId: d1DatabaseId,
-        apiToken: d1ApiToken,
-        tableName: rateLimitTableName,
-        windowTimeSeconds,
-        limit: ipSubnetLimit,
-        ipv4Suffix,
-        ipv6Suffix,
-        pgErrorHandle,
-        cleanupProbability,
-        blockTimeSeconds,
-      };
-    } else if (normalizedDbMode === 'custom-pg-rest') {
-      if (!postgrestUrl || verifyHeaders.length === 0 || verifySecrets.length === 0) {
-        throw new Error('Rate limiting requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
-      }
-      rateLimitEnabled = true;
-      rateLimitConfig = {
-        postgrestUrl,
-        verifyHeader: verifyHeaders,
-        verifySecret: verifySecrets,
-        tableName: rateLimitTableName,
-        windowTimeSeconds,
-        limit: ipSubnetLimit,
-        ipv4Suffix,
-        ipv6Suffix,
-        pgErrorHandle,
-        cleanupProbability,
-        blockTimeSeconds,
-      };
+    if (!postgrestUrl || verifyHeaders.length === 0 || verifySecrets.length === 0) {
+      throw new Error('Rate limiting requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
     }
+    rateLimitEnabled = true;
+    rateLimitConfig = {
+      postgrestUrl,
+      verifyHeader: verifyHeaders,
+      verifySecret: verifySecrets,
+      tableName: rateLimitTableName,
+      windowTimeSeconds,
+      limit: ipSubnetLimit,
+      ipv4Suffix,
+      ipv6Suffix,
+      pgErrorHandle,
+      cleanupProbability,
+      blockTimeSeconds,
+    };
   }
 
   if (enableCfRatelimiter) {
@@ -575,8 +465,8 @@ const resolveConfig = (env = {}) => {
 
   const fairQueueBackendReady =
     fairQueueBackend === 'slot-handler'
-      ? fairQueueSlotHandlerUrl !== '' || Boolean(dbMode)
-      : Boolean(dbMode);
+      ? fairQueueSlotHandlerUrl !== '' && dbMode === 'custom-pg-rest'
+      : dbMode === 'custom-pg-rest';
   // Validate Fair Queue configuration
   const actualFairQueueEnabled =
     fairQueueEnabled &&
@@ -649,11 +539,6 @@ const resolveConfig = (env = {}) => {
     fairQueueEnabled: actualFairQueueEnabled,
     fairQueueHostnamePatterns,
     fairQueueConfig: {
-      env,
-      databaseBinding: d1DatabaseBinding,
-      accountId: d1AccountId,
-      databaseId: d1DatabaseId,
-      apiToken: d1ApiToken,
       postgrestUrl,
       verifyHeader: verifyHeaders,
       verifySecret: verifySecrets,
@@ -1303,8 +1188,6 @@ const createWorkerLocalFQClient = (config, env) => {
         return 0;
       })();
 
-  let cachedFairQueueModule = null;
-
   const buildPostgrestHeaders = () => {
     const headers = { 'Content-Type': 'application/json' };
     applyVerifyHeaders(headers, fairCfg.verifyHeader, fairCfg.verifySecret);
@@ -1331,18 +1214,6 @@ const createWorkerLocalFQClient = (config, env) => {
     return data || {};
   };
 
-  const loadFairQueueModule = async () => {
-    if (cachedFairQueueModule) {
-      return cachedFairQueueModule;
-    }
-    if (normalizedDbMode === 'd1') {
-      cachedFairQueueModule = await import('./unified-check-d1.js');
-    } else if (normalizedDbMode === 'd1-rest') {
-      cachedFairQueueModule = await import('./unified-check-d1-rest.js');
-    }
-    return cachedFairQueueModule;
-  };
-
   const registerWaiter = async (fqContext) => {
     if (!fqContext?.ipBucket || !Number.isFinite(fairCfg.maxWaitersPerIp) || fairCfg.maxWaitersPerIp <= 0) {
       return true;
@@ -1360,17 +1231,6 @@ const createWorkerLocalFQClient = (config, env) => {
       return status === 'REGISTERED';
     }
 
-    if (normalizedDbMode === 'd1' || normalizedDbMode === 'd1-rest') {
-      const fairQueueModule = await loadFairQueueModule();
-      if (fairQueueModule && typeof fairQueueModule.tryRegisterQueueWaiter === 'function') {
-        return fairQueueModule.tryRegisterQueueWaiter(
-          fqContext.hostname,
-          fqContext.ipBucket,
-          { ...fairCfg, env }
-        );
-      }
-    }
-
     return true;
   };
 
@@ -1386,88 +1246,53 @@ const createWorkerLocalFQClient = (config, env) => {
       });
       return;
     }
-
-    if (normalizedDbMode === 'd1' || normalizedDbMode === 'd1-rest') {
-      const fairQueueModule = await loadFairQueueModule();
-      if (fairQueueModule && typeof fairQueueModule.releaseQueueWaiter === 'function') {
-        await fairQueueModule.releaseQueueWaiter(
-          fqContext.hostname,
-          fqContext.ipBucket,
-          { ...fairCfg, env }
-        );
-      }
-    }
   };
 
   const tryAcquire = async (fqContext) => {
-    if (normalizedDbMode === 'custom-pg-rest') {
-      const fnName =
-        fairCfg.workerTryAcquireFunc || 'download_worker_try_acquire_slot';
-      const payload = {
-        p_hostname_hash: fqContext.hostnameHash,
-        p_hostname: fqContext.hostname,
-        p_ip_bucket: fqContext.ipBucket,
-        p_now_ms: fqContext.nowMs,
-        p_max_slot_per_host: fqContext.maxSlotPerHost,
-        p_max_slot_per_ip: fqContext.maxSlotPerIp,
-        p_max_waiters_per_ip: fqContext.maxWaitersPerIp,
-        p_zombie_timeout: fqContext.zombieTimeoutSeconds,
-        p_cooldown_seconds: fqContext.cooldownSeconds,
-        p_throttle_time_window: Number(config.throttleConfig?.throttleTimeWindow) || 60,
-        p_host_interval_ms: hostIntervalMs,
+    if (normalizedDbMode !== 'custom-pg-rest') {
+      return { kind: 'granted', slotToken: null };
+    }
+
+    const fnName =
+      fairCfg.workerTryAcquireFunc || 'download_worker_try_acquire_slot';
+    const payload = {
+      p_hostname_hash: fqContext.hostnameHash,
+      p_hostname: fqContext.hostname,
+      p_ip_bucket: fqContext.ipBucket,
+      p_now_ms: fqContext.nowMs,
+      p_max_slot_per_host: fqContext.maxSlotPerHost,
+      p_max_slot_per_ip: fqContext.maxSlotPerIp,
+      p_max_waiters_per_ip: fairCfg.maxWaitersPerIp,
+      p_zombie_timeout: fqContext.zombieTimeoutSeconds,
+      p_cooldown_seconds: fqContext.cooldownSeconds,
+      p_throttle_time_window: Number(config.throttleConfig?.throttleTimeWindow) || 60,
+      p_host_interval_ms: hostIntervalMs,
+    };
+    const data = await callPostgrestRpc(fnName, payload);
+    const status = (data.status || '').toUpperCase();
+    const throttleRetryAfter =
+      Number.isFinite(data.throttle_retry_after) && data.throttle_retry_after > 0
+        ? data.throttle_retry_after
+        : Number.isFinite(data.throttleRetryAfter) && data.throttleRetryAfter > 0
+          ? data.throttleRetryAfter
+          : null;
+    const throttleCode =
+      Number.isFinite(data.throttle_code) && data.throttle_code > 0
+        ? data.throttle_code
+        : Number.isFinite(data.throttleCode) && data.throttleCode > 0
+          ? data.throttleCode
+          : null;
+    if (status === 'THROTTLED') {
+      return {
+        kind: 'throttled',
+        throttleCode: throttleCode || 503,
+        retryAfter: throttleRetryAfter || undefined,
       };
-      const data = await callPostgrestRpc(fnName, payload);
-      const status = (data.status || '').toUpperCase();
-      const throttleRetryAfter =
-        Number.isFinite(data.throttle_retry_after) && data.throttle_retry_after > 0
-          ? data.throttle_retry_after
-          : Number.isFinite(data.throttleRetryAfter) && data.throttleRetryAfter > 0
-            ? data.throttleRetryAfter
-            : null;
-      const throttleCode =
-        Number.isFinite(data.throttle_code) && data.throttle_code > 0
-          ? data.throttle_code
-          : Number.isFinite(data.throttleCode) && data.throttleCode > 0
-            ? data.throttleCode
-            : null;
-      if (status === 'THROTTLED') {
-        return {
-          kind: 'throttled',
-          throttleCode: throttleCode || 503,
-          retryAfter: throttleRetryAfter || undefined,
-        };
-      }
-      if (status === 'ACQUIRED') {
-        const slotToken = data.slot_token || data.slotToken;
-        return { kind: 'granted', slotToken };
-      }
-      return { kind: 'wait' };
     }
-
-    if (normalizedDbMode === 'd1' || normalizedDbMode === 'd1-rest') {
-      const fairQueueModule = await loadFairQueueModule();
-      if (fairQueueModule && typeof fairQueueModule.tryAcquireFairSlot === 'function') {
-        const slotId = await fairQueueModule.tryAcquireFairSlot(
-          fqContext.hostname,
-          fqContext.ipBucket,
-          {
-            ...fairCfg,
-            env,
-            hostIntervalMs,
-            fairQueueHostPacingTableName: fairCfg.hostPacingTableName,
-            pacingIntervalMs: hostIntervalMs,
-          }
-        );
-        if (Number.isFinite(slotId) && slotId > 0) {
-          return { kind: 'granted', slotToken: slotId };
-        }
-        if (slotId === -1 || slotId === 0) {
-          return { kind: 'wait' };
-        }
-      }
-      return { kind: 'wait' };
+    if (status === 'ACQUIRED') {
+      const slotToken = data.slot_token || data.slotToken;
+      return { kind: 'granted', slotToken };
     }
-
     return { kind: 'wait' };
   };
 
@@ -1493,21 +1318,6 @@ const createWorkerLocalFQClient = (config, env) => {
         console.error('[FQ] releaseSlot error (worker):', message);
       }
       return;
-    }
-
-    if (normalizedDbMode === 'd1' || normalizedDbMode === 'd1-rest') {
-      const fairQueueModule = await loadFairQueueModule();
-      if (fairQueueModule && typeof fairQueueModule.releaseFairSlot === 'function') {
-        try {
-          await fairQueueModule.releaseFairSlot(Number(fqContext.slotToken), {
-            ...fairCfg,
-            env,
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          console.error('[FQ] releaseSlot error (worker D1):', message);
-        }
-      }
     }
   };
 
@@ -1832,17 +1642,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let cacheHit = false;
   let linkData = null;
   
-  // Use unified check for all database modes when rate limit is enabled
-  const supportsUnifiedCheck = config.rateLimitEnabled && (
-    config.dbMode === 'custom-pg-rest' ||
-    config.dbMode === 'd1' ||
-    config.dbMode === 'd1-rest'
-  );
+  // Use unified check when rate limit is enabled and dbMode is custom-pg-rest
+  const supportsUnifiedCheck = config.rateLimitEnabled && config.dbMode === 'custom-pg-rest';
 
   if (supportsUnifiedCheck) {
-    if (!unifiedResult) {
-      try {
-
+    try {
       const rateLimitConfig = config.rateLimitConfig || {};
       const cacheConfig = config.cacheConfig || {};
       const throttleConfig = config.throttleConfig || {};
@@ -1850,83 +1654,41 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const effectiveIdleTimeout =
         dynamicIdleTimeout ?? cacheConfig.idleTimeout ?? config.idleTimeout ?? 0;
 
-      if (config.dbMode === 'custom-pg-rest') {
-        unifiedResult = await unifiedCheck(path, clientIP, {
-          postgrestUrl: rateLimitConfig.postgrestUrl,
-          verifyHeader: rateLimitConfig.verifyHeader,
-          verifySecret: rateLimitConfig.verifySecret,
-          linkTTL: cacheConfig.linkTTL ?? 1800,
-          idleTimeout: effectiveIdleTimeout,
-          cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
-          windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
-          limit: limitConfigValue ?? 100,
-          blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
-          ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
-          ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
-          rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
-          throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
-          throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
-          lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
-        });
-      } else if (config.dbMode === 'd1') {
-        unifiedResult = await unifiedCheckD1(path, clientIP, {
-          env: cacheConfig.env || rateLimitConfig.env,
-          databaseBinding: cacheConfig.databaseBinding || rateLimitConfig.databaseBinding || 'DB',
-          linkTTL: cacheConfig.linkTTL ?? 1800,
-          idleTimeout: effectiveIdleTimeout,
-          cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
-          windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
-          limit: limitConfigValue ?? 100,
-          blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
-          ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
-          ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
-          rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
-          throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
-          throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
-          lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
-          initTables: cacheConfig.initTables,
-        });
-      } else if (config.dbMode === 'd1-rest') {
-        unifiedResult = await unifiedCheckD1Rest(path, clientIP, {
-          accountId: rateLimitConfig.accountId || throttleConfig.accountId || cacheConfig.accountId,
-          databaseId: rateLimitConfig.databaseId || throttleConfig.databaseId || cacheConfig.databaseId,
-          apiToken: rateLimitConfig.apiToken || throttleConfig.apiToken || cacheConfig.apiToken,
-          linkTTL: cacheConfig.linkTTL ?? 1800,
-          idleTimeout: effectiveIdleTimeout,
-          cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
-          windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
-          limit: limitConfigValue ?? 100,
-          blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
-          ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
-          ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
-          rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
-          throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
-          throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
-          lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
-          initTables: cacheConfig.initTables,
-        });
+      unifiedResult = await unifiedCheck(path, clientIP, {
+        postgrestUrl: rateLimitConfig.postgrestUrl,
+        verifyHeader: rateLimitConfig.verifyHeader,
+        verifySecret: rateLimitConfig.verifySecret,
+        linkTTL: cacheConfig.linkTTL ?? 1800,
+        idleTimeout: effectiveIdleTimeout,
+        cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
+        windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
+        limit: limitConfigValue ?? 100,
+        blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
+        ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
+        ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
+        rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
+        throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
+        throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
+        lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
+      });
+    } catch (error) {
+      console.error('[Unified Check] Failed:', error instanceof Error ? error.message : String(error));
+      console.error('[Unified Check] Stack:', error.stack);
+
+      // Respect PG_ERROR_HANDLE configuration
+      const pgErrorHandle = config.rateLimitConfig?.pgErrorHandle || 'fail-closed';
+
+      if (pgErrorHandle === 'fail-open') {
+        console.warn('[Unified Check] Fail-open mode: allowing request despite error');
+        // Reset unified check outputs so downstream logic can run without them
+        unifiedResult = null;
+        cacheHit = false;
+        linkData = null;
+        // Continue execution without returning
       } else {
-        throw new Error(`Unsupported database mode for unified check: ${config.dbMode}`);
+        console.error('[Unified Check] Fail-closed mode: blocking request');
+        return createErrorResponse(origin, 500, `Unified check failed: ${error.message}`);
       }
-
-  } catch (error) {
-    console.error('[Unified Check] Failed:', error instanceof Error ? error.message : String(error));
-    console.error('[Unified Check] Stack:', error.stack);
-
-    // Respect PG_ERROR_HANDLE configuration
-    const pgErrorHandle = config.rateLimitConfig?.pgErrorHandle || 'fail-closed';
-
-    if (pgErrorHandle === 'fail-open') {
-      console.warn('[Unified Check] Fail-open mode: allowing request despite error');
-      // Reset unified check outputs so downstream logic can run without them
-      unifiedResult = null;
-      cacheHit = false;
-      linkData = null;
-      // Continue execution without returning
-    } else {
-      console.error('[Unified Check] Fail-closed mode: blocking request');
-      return createErrorResponse(origin, 500, `Unified check failed: ${error.message}`);
-    }
     }
     if (unifiedResult) {
       console.log('[Idle Debug] Unified check idle payload:', unifiedResult.idle ?? null);
@@ -1979,31 +1741,22 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         if (Math.random() < probability) {
           console.log(`[Rate Limit Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
 
-          let cleanupPromise;
-
-          if (config.dbMode === 'custom-pg-rest') {
-            const { cleanupExpiredRecords } = await import('./ratelimit/custom-pg-rest.js');
-            cleanupPromise = cleanupExpiredRecords(
-              config.rateLimitConfig.postgrestUrl,
-              config.rateLimitConfig.verifyHeader,
-              config.rateLimitConfig.verifySecret,
-              config.rateLimitConfig.tableName,
-              config.rateLimitConfig.windowTimeSeconds
-            ).catch((cleanupError) => {
-              console.error('[Rate Limit Cleanup] Failed:', cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
-            });
-          } else if (config.dbMode === 'd1') {
-            console.log('[Rate Limit Cleanup] Skipped (D1 cleanup handled internally)');
-          } else if (config.dbMode === 'd1-rest') {
-            console.log('[Rate Limit Cleanup] Skipped (D1-REST cleanup handled internally)');
-          }
+          const { cleanupExpiredRecords } = await import('./ratelimit/custom-pg-rest.js');
+          const cleanupPromise = cleanupExpiredRecords(
+            config.rateLimitConfig.postgrestUrl,
+            config.rateLimitConfig.verifyHeader,
+            config.rateLimitConfig.verifySecret,
+            config.rateLimitConfig.tableName,
+            config.rateLimitConfig.windowTimeSeconds
+          ).catch((cleanupError) => {
+            console.error('[Rate Limit Cleanup] Failed:', cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
+          });
 
           if (cleanupPromise && ctx && ctx.waitUntil) {
             ctx.waitUntil(cleanupPromise);
           }
         }
       }
-    }
     }
   } else {
     // Fallback to original logic when unified check is not supported
@@ -2433,7 +2186,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       config.cacheConfig.idleTimeout > 0 &&
       config.cacheConfig.lastActiveTableName;
 
-    if (shouldUpdateLastActive && config.dbMode && clientIP && typeof path === 'string') {
+    if (
+      shouldUpdateLastActive &&
+      config.dbMode === 'custom-pg-rest' &&
+      clientIP &&
+      typeof path === 'string'
+    ) {
       const updatePromise = (async () => {
         try {
           const ipSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
@@ -2446,27 +2204,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
             return;
           }
 
-          if (config.dbMode === 'd1') {
-            const { updateLastActive } = await import('./unified-check-d1.js');
-            const dbBinding = config.cacheConfig.databaseBinding;
-            const dbInstance = env[dbBinding];
-            if (!dbInstance) {
-              console.error(`[LastActive] D1 binding '${dbBinding}' not found`);
-              return;
-            }
-            await updateLastActive(
-              dbInstance,
-              ipHash,
-              pathHash,
-              config.cacheConfig.lastActiveTableName
-            );
-          } else if (config.dbMode === 'd1-rest') {
-            const { updateLastActive } = await import('./unified-check-d1-rest.js');
-            await updateLastActive(config.cacheConfig, ipHash, pathHash);
-          } else if (config.dbMode === 'custom-pg-rest') {
-            const { updateLastActive } = await import('./unified-check.js');
-            await updateLastActive(config.cacheConfig, ipHash, pathHash);
-          }
+          const { updateLastActive } = await import('./unified-check.js');
+          await updateLastActive(config.cacheConfig, ipHash, pathHash);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           console.error('[LastActive] Update failed:', message);

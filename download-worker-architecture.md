@@ -105,15 +105,11 @@
 
 5. **DB 统一检查：下载缓存 + IP 限流 + Throttle + Last Active**
 
-当配置了 `DB_MODE` 时，download worker 会通过「Unified Check」减少与数据库交互的 RTT：
+当 `DB_MODE="custom-pg-rest"` 时，download worker 会通过「Unified Check」减少与数据库交互的 RTT：
 
-- 支持三种后端：
-  - `d1`：Cloudflare D1 Binding
-  - `d1-rest`：Cloudflare D1 REST API
-  - `custom-pg-rest`：PostgREST + PostgreSQL（需要先执行 `init.sql`）
+- 后端：PostgREST + PostgreSQL（需要先执行 `init.sql`）
 - 调用路径：
   - `unifiedCheck`（PostgREST）→ RPC `download_unified_check(...)`
-  - `unifiedCheckD1` / `unifiedCheckD1Rest` → 通过 D1 SQL 执行同等逻辑
 - 入参包括：
   - `PATH_HASH`, `IP_HASH`, `IP_RANGE`
   - 缓存 TTL、限流窗口和上限
@@ -298,7 +294,7 @@ D1 / D1-REST 模式下，Worker 端有对应的 SQL 适配逻辑（不依赖 plp
 - Path ACL：
   - `BLACKLIST_*`, `WHITELIST_*`, `EXCEPT_*`, 以及 `*_INCLUDES`
 - DB：
-  - `DB_MODE`（空 / d1 / d1-rest / custom-pg-rest）
+  - `DB_MODE`（空 / custom-pg-rest）
   - `DOWNLOAD_CACHE_TABLE`, `THROTTLE_PROTECTION_TABLE`, `DOWNLOAD_IP_RATELIMIT_TABLE`
   - `D1_*` / `POSTGREST_URL`, `INIT_TABLES`, `LINK_TTL`, `CLEANUP_PERCENTAGE`
   - IP 限流：`WINDOW_TIME`, `IPSUBNET_WINDOWTIME_LIMIT`, `BLOCK_TIME`, `PG_ERROR_HANDLE`
@@ -320,4 +316,3 @@ simple-alist-cf-proxy 扮演的是「下载出口 + 安全代理」：
   - 可选 DB 支持的缓存与限流；
   - 可选 Fair Queue + slot-handler + Throttle，保护上游存储；
 - 通过 init.sql 定义的统一检查与 Fair Queue schema，download worker 可以在多种数据库环境下保持一致的行为。
-

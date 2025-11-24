@@ -124,18 +124,16 @@ Path ACL 仅改变校验逻辑与阻断行为，不会改变下载链接本身�
 
 ### Database & Caching
 
-download worker 支持三种 DB 模式（`DB_MODE`）：
+download worker 仅支持两种 DB 模式（`DB_MODE`）：
 
-- `""`：不使用 DB（每次都访问 AList，无下载缓存/限流/Throttle）。  
-- `"d1"` / `"d1-rest"`：使用 Cloudflare D1 或其 REST API。  
+- `""`：不使用 DB（每次都访问 AList，无下载缓存/限流/Throttle/Fair Queue/Idle 持久化）。  
 - `"custom-pg-rest"`：使用自建 PostgreSQL + PostgREST，并配合根目录 `init.sql`。  
 
 关键环境变量（详细含义见 `wrangler.toml`）：
 
 - 缓存与限流：`DOWNLOAD_CACHE_TABLE`, `DOWNLOAD_IP_RATELIMIT_TABLE`, `LINK_TTL`, `WINDOW_TIME`, `IPSUBNET_WINDOWTIME_LIMIT`, `BLOCK_TIME`, `PG_ERROR_HANDLE`, `CLEANUP_PERCENTAGE`。  
 - Throttle：`THROTTLE_PROTECTION_TABLE`, `THROTTLE_PROTECT_HOSTNAME`, `THROTTLE_*` 系列。  
-- Idle：`IDLE_TIMEOUT`, `DOWNLOAD_LAST_ACTIVE_TABLE`。  
-- D1/D1-REST：`D1_DATABASE_BINDING`, `D1_ACCOUNT_ID`, `D1_DATABASE_ID`, `D1_API_TOKEN`。  
+- Idle（仅在 DB_MODE="custom-pg-rest" 时生效）：`IDLE_TIMEOUT`, `DOWNLOAD_LAST_ACTIVE_TABLE`。  
 - custom-pg-rest：`POSTGREST_URL`（配合 `VERIFY_HEADER` / `VERIFY_SECRET` 使用）。  
 
 数据库 schema 与统一检查（`download_unified_check`）的细节请看 `download-worker-architecture.md` 与 `init.sql`。
