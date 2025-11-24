@@ -26,6 +26,7 @@
     "maxSlotPerHost": 5,
     "maxSlotPerIp": 1,
     "maxWaitersPerIp": 3,
+    "maxWaitersPerHost": 50,
     "zombieTimeoutSeconds": 30,
     "ipCooldownSeconds": 0,
     "rpc": {

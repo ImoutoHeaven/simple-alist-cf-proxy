@@ -52,19 +52,21 @@ type PostgresConfig struct {
 }
 
 type FairQueueConfig struct {
-	MaxWaitMs               int64                  `json:"maxWaitMs"`
-	PollIntervalMs          int64                  `json:"pollIntervalMs"`
-	PollWindowMs            int64                  `json:"pollWindowMs"`
-	MinSlotHoldMs           int64                  `json:"minSlotHoldMs"`
-	SmoothReleaseIntervalMs *int64                 `json:"smoothReleaseIntervalMs,omitempty"`
-	MaxSlotPerHost          int                    `json:"maxSlotPerHost"`
-	MaxSlotPerIP            int                    `json:"maxSlotPerIp"`
-	MaxWaitersPerIP         int                    `json:"maxWaitersPerIp"`
-	ZombieTimeoutSeconds    int                    `json:"zombieTimeoutSeconds"`
-	IPCooldownSeconds       int                    `json:"ipCooldownSeconds"`
-	SessionIdleSeconds      int                    `json:"sessionIdleSeconds"`
-	RPC                     RPCConfig              `json:"rpc"`
-	Cleanup                 FairQueueCleanupConfig `json:"cleanup"`
+	MaxWaitMs                 int64                  `json:"maxWaitMs"`
+	PollIntervalMs            int64                  `json:"pollIntervalMs"`
+	PollWindowMs              int64                  `json:"pollWindowMs"`
+	MinSlotHoldMs             int64                  `json:"minSlotHoldMs"`
+	SmoothReleaseIntervalMs   *int64                 `json:"smoothReleaseIntervalMs,omitempty"`
+	MaxSlotPerHost            int                    `json:"maxSlotPerHost"`
+	MaxSlotPerIP              int                    `json:"maxSlotPerIp"`
+	MaxWaitersPerIP           int                    `json:"maxWaitersPerIp"`
+	MaxWaitersPerHost         int                    `json:"maxWaitersPerHost"`
+	ZombieTimeoutSeconds      int                    `json:"zombieTimeoutSeconds"`
+	IPCooldownSeconds         int                    `json:"ipCooldownSeconds"`
+	SessionIdleSeconds        int                    `json:"sessionIdleSeconds"`
+	RPC                       RPCConfig              `json:"rpc"`
+	Cleanup                   FairQueueCleanupConfig `json:"cleanup"`
+	maxWaitersPerHostProvided bool
 }
 
 type RPCConfig struct {
@@ -84,6 +86,7 @@ type AcquireRequest struct {
 	MaxSlotPerHost       int    `json:"maxSlotPerHost,omitempty"`
 	MaxSlotPerIP         int    `json:"maxSlotPerIp,omitempty"`
 	MaxWaitersPerIP      int    `json:"maxWaitersPerIp,omitempty"`
+	MaxWaitersPerHost    int    `json:"maxWaitersPerHost,omitempty"`
 	ZombieTimeoutSeconds int    `json:"zombieTimeoutSeconds,omitempty"`
 	CooldownSeconds      int    `json:"cooldownSeconds,omitempty"`
 	PollIntervalMs       int64  `json:"pollIntervalMs,omitempty"`
@@ -397,6 +400,16 @@ func (c FairQueueConfig) maxWaitersPerIP() int {
 	return 0
 }
 
+func (c FairQueueConfig) maxWaitersPerHost() int {
+	if c.MaxWaitersPerHost > 0 {
+		return c.MaxWaitersPerHost
+	}
+	if c.maxWaitersPerHostProvided {
+		return 0
+	}
+	return 50
+}
+
 func (c FairQueueConfig) zombieTimeoutSeconds() int {
 	if c.ZombieTimeoutSeconds > 0 {
 		return c.ZombieTimeoutSeconds
@@ -452,11 +465,15 @@ func loadConfig(path string) (Config, error) {
 
 	var cleanupEnabledProvided bool
 	var cleanupIntervalProvided bool
+	var maxWaitersPerHostProvided bool
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err == nil {
 		if fqRaw, ok := raw["fairQueue"]; ok {
 			var fq map[string]json.RawMessage
 			if err := json.Unmarshal(fqRaw, &fq); err == nil {
+				if _, ok := fq["maxWaitersPerHost"]; ok {
+					maxWaitersPerHostProvided = true
+				}
 				if cleanupRaw, ok := fq["cleanup"]; ok {
 					var cleanup map[string]json.RawMessage
 					if err := json.Unmarshal(cleanupRaw, &cleanup); err == nil {
@@ -484,6 +501,7 @@ func loadConfig(path string) (Config, error) {
 	if !cleanupEnabledProvided {
 		cfg.FairQueue.Cleanup.Enabled = true
 	}
+	cfg.FairQueue.maxWaitersPerHostProvided = maxWaitersPerHostProvided
 	return cfg, nil
 }
 
@@ -829,6 +847,7 @@ func (s *server) buildAcquireRequest(hostname, hostnameHash, ipBucket string, th
 		ThrottleTimeWindow:   sanitizeThrottleWindowSeconds(throttleTimeWindow),
 		MaxSlotPerHost:       s.cfg.FairQueue.maxSlotPerHost(),
 		MaxSlotPerIP:         s.cfg.FairQueue.maxSlotPerIP(),
+		MaxWaitersPerHost:    s.cfg.FairQueue.maxWaitersPerHost(),
 		MaxWaitersPerIP:      s.cfg.FairQueue.maxWaitersPerIP(),
 		ZombieTimeoutSeconds: s.cfg.FairQueue.zombieTimeoutSeconds(),
 		CooldownSeconds:      s.cfg.FairQueue.cooldownSeconds(),
@@ -1122,6 +1141,7 @@ func (b *postgrestBackend) RegisterWaiter(ctx context.Context, req AcquireReques
 		"p_hostname_hash":          req.HostnameHash,
 		"p_hostname":               req.Hostname,
 		"p_ip_bucket":              req.IPBucket,
+		"p_max_waiters_per_host":   req.MaxWaitersPerHost,
 		"p_max_waiters_per_ip":     req.MaxWaitersPerIP,
 		"p_zombie_timeout_seconds": req.ZombieTimeoutSeconds,
 	}
@@ -1279,8 +1299,8 @@ func (p *postgresBackend) RegisterWaiter(ctx context.Context, req AcquireRequest
 	if fn == "" || req.IPBucket == "" || req.MaxWaitersPerIP <= 0 {
 		return &registerResult{allowed: true}, nil
 	}
-	row := p.db.QueryRowContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5)", fn),
-		req.HostnameHash, req.Hostname, req.IPBucket, req.MaxWaitersPerIP, req.ZombieTimeoutSeconds)
+	row := p.db.QueryRowContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7)", fn),
+		req.HostnameHash, req.Hostname, req.IPBucket, req.MaxWaitersPerIP, req.ZombieTimeoutSeconds, nil, req.MaxWaitersPerHost)
 	var status string
 	var queueDepth, ipQueueDepth sql.NullInt64
 	if err := row.Scan(&status, &queueDepth, &ipQueueDepth); err != nil {

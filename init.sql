@@ -1003,7 +1003,8 @@ CREATE OR REPLACE FUNCTION download_register_fq_waiter(
   p_ip_bucket TEXT,
   p_max_waiters_per_ip INT DEFAULT 0,
   p_zombie_timeout_seconds INT DEFAULT 20,
-  p_queue_depth_table_name TEXT DEFAULT 'upstream_ip_queue_depth'
+  p_queue_depth_table_name TEXT DEFAULT 'upstream_ip_queue_depth',
+  p_max_waiters_per_host INT DEFAULT 0
 )
 RETURNS TABLE(
   status TEXT,
@@ -1018,6 +1019,8 @@ DECLARE
     WHEN p_zombie_timeout_seconds IS NULL OR p_zombie_timeout_seconds <= 0 THEN INTERVAL '20 seconds'
     ELSE (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL
   END;
+  v_max_waiters_per_host INTEGER := COALESCE(p_max_waiters_per_host, 0);
+  v_host_queue_depth INTEGER := 0;
 BEGIN
   IF p_hostname IS NULL OR p_hostname = '' THEN
     p_hostname := p_hostname_hash;
@@ -1029,6 +1032,22 @@ BEGIN
     ip_queue_depth := 0;
     RETURN NEXT;
     RETURN;
+  END IF;
+
+  IF v_max_waiters_per_host > 0 THEN
+    EXECUTE format('SELECT COALESCE(SUM("waiting_count"), 0) FROM %1$I WHERE "hostname_pattern" = $1', v_table_name)
+      INTO v_host_queue_depth
+      USING p_hostname;
+
+    IF v_host_queue_depth >= v_max_waiters_per_host THEN
+      status := 'HOST_QUEUE_FULL';
+      queue_depth := v_host_queue_depth;
+      EXECUTE format('SELECT COALESCE("waiting_count", 0) FROM %1$I WHERE "hostname_pattern" = $1 AND "ip_hash" = $2', v_table_name)
+        INTO ip_queue_depth
+        USING p_hostname, p_ip_bucket;
+      RETURN NEXT;
+      RETURN;
+    END IF;
   END IF;
 
   BEGIN
