@@ -1051,17 +1051,21 @@ const createSlotHandlerClient = (config) => {
 
       const payload = { queryToken: token };
 
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
       try {
         await fetch(cancelUrl, {
           method: 'POST',
           headers: buildHeaders(),
           body: JSON.stringify(payload),
-          signal: ctx?.signal,
+          signal: controller.signal,
         });
         console.log(`[FQ] cancel session via slot-handler host=${fqContext.hostname}`);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.warn('[FQ] cancelSession error (slot-handler):', message);
+      } finally {
+        clearTimeout(timer);
       }
     },
 
