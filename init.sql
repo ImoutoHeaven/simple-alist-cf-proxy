@@ -1019,6 +1019,7 @@ DECLARE
     WHEN p_zombie_timeout_seconds IS NULL OR p_zombie_timeout_seconds <= 0 THEN INTERVAL '20 seconds'
     ELSE (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL
   END;
+  v_max_waiters_per_ip INTEGER := NULL;
   v_max_waiters_per_host INTEGER := COALESCE(p_max_waiters_per_host, 0);
   v_host_queue_depth INTEGER := 0;
 BEGIN
@@ -1026,7 +1027,11 @@ BEGIN
     p_hostname := p_hostname_hash;
   END IF;
 
-  IF p_ip_bucket IS NULL OR p_ip_bucket = '' OR p_max_waiters_per_ip IS NULL OR p_max_waiters_per_ip <= 0 THEN
+  IF p_max_waiters_per_ip IS NOT NULL AND p_max_waiters_per_ip > 0 THEN
+    v_max_waiters_per_ip := p_max_waiters_per_ip;
+  END IF;
+
+  IF p_ip_bucket IS NULL OR p_ip_bucket = '' THEN
     status := 'REGISTERED';
     queue_depth := 0;
     ip_queue_depth := 0;
@@ -1063,15 +1068,26 @@ BEGIN
     GET DIAGNOSTICS v_rows = ROW_COUNT;
 
     IF v_rows = 0 THEN
-      EXECUTE format(
-        'UPDATE %1$I
-            SET "waiting_count" = "waiting_count" + 1,
-                "updated_at" = $1
-          WHERE "hostname_pattern" = $2
-            AND "ip_hash" = $3
-            AND "waiting_count" < $4',
-        v_table_name
-      ) USING v_now, p_hostname, p_ip_bucket, p_max_waiters_per_ip;
+      IF v_max_waiters_per_ip IS NOT NULL THEN
+        EXECUTE format(
+          'UPDATE %1$I
+              SET "waiting_count" = "waiting_count" + 1,
+                  "updated_at" = $1
+            WHERE "hostname_pattern" = $2
+              AND "ip_hash" = $3
+              AND "waiting_count" < $4',
+          v_table_name
+        ) USING v_now, p_hostname, p_ip_bucket, v_max_waiters_per_ip;
+      ELSE
+        EXECUTE format(
+          'UPDATE %1$I
+              SET "waiting_count" = "waiting_count" + 1,
+                  "updated_at" = $1
+            WHERE "hostname_pattern" = $2
+              AND "ip_hash" = $3',
+          v_table_name
+        ) USING v_now, p_hostname, p_ip_bucket;
+      END IF;
       GET DIAGNOSTICS v_rows = ROW_COUNT;
     END IF;
 
@@ -1085,15 +1101,26 @@ BEGIN
         v_rows := 1;
       EXCEPTION
         WHEN unique_violation THEN
-          EXECUTE format(
-            'UPDATE %1$I
-                SET "waiting_count" = "waiting_count" + 1,
-                    "updated_at" = $1
-              WHERE "hostname_pattern" = $2
-                AND "ip_hash" = $3
-                AND "waiting_count" < $4',
-            v_table_name
-          ) USING v_now, p_hostname, p_ip_bucket, p_max_waiters_per_ip;
+          IF v_max_waiters_per_ip IS NOT NULL THEN
+            EXECUTE format(
+              'UPDATE %1$I
+                  SET "waiting_count" = "waiting_count" + 1,
+                      "updated_at" = $1
+                WHERE "hostname_pattern" = $2
+                  AND "ip_hash" = $3
+                  AND "waiting_count" < $4',
+              v_table_name
+            ) USING v_now, p_hostname, p_ip_bucket, v_max_waiters_per_ip;
+          ELSE
+            EXECUTE format(
+              'UPDATE %1$I
+                  SET "waiting_count" = "waiting_count" + 1,
+                      "updated_at" = $1
+                WHERE "hostname_pattern" = $2
+                  AND "ip_hash" = $3',
+              v_table_name
+            ) USING v_now, p_hostname, p_ip_bucket;
+          END IF;
           GET DIAGNOSTICS v_rows = ROW_COUNT;
         WHEN others THEN
           v_rows := 0;
@@ -1114,7 +1141,7 @@ BEGIN
 
   IF v_rows > 0 THEN
     status := 'REGISTERED';
-  ELSIF ip_queue_depth >= p_max_waiters_per_ip THEN
+  ELSIF v_max_waiters_per_ip IS NOT NULL AND ip_queue_depth >= v_max_waiters_per_ip THEN
     status := 'QUEUE_FULL';
   ELSE
     status := 'REGISTER_FAILED';

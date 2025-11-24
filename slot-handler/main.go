@@ -756,7 +756,10 @@ func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time
 		budget.Milliseconds(), pollInterval.Milliseconds(),
 	)
 
-	if sess.IPBucket != "" && s.cfg.FairQueue.maxWaitersPerIP() > 0 && !sess.WaiterRegistered {
+	hostCap := s.cfg.FairQueue.maxWaitersPerHost()
+	ipCap := s.cfg.FairQueue.maxWaitersPerIP()
+
+	if sess.IPBucket != "" && (ipCap > 0 || hostCap > 0) && !sess.WaiterRegistered {
 		for {
 			if time.Since(start) >= budget {
 				return nil
@@ -856,7 +859,9 @@ func (s *server) buildAcquireRequest(hostname, hostnameHash, ipBucket string, th
 
 func (s *server) cleanupSession(sess *FQSession) {
 	token := sess.Token
-	shouldReleaseWaiter := sess.WaiterRegistered && sess.IPBucket != "" && s.cfg.FairQueue.maxWaitersPerIP() > 0
+	hostCap := s.cfg.FairQueue.maxWaitersPerHost()
+	ipCap := s.cfg.FairQueue.maxWaitersPerIP()
+	shouldReleaseWaiter := sess.WaiterRegistered && sess.IPBucket != "" && (ipCap > 0 || hostCap > 0)
 	hostname := sess.Hostname
 	hostnameHash := sess.HostnameHash
 	ipBucket := sess.IPBucket
@@ -1134,7 +1139,7 @@ func (b *postgrestBackend) CheckThrottle(ctx context.Context, req AcquireRequest
 
 func (b *postgrestBackend) RegisterWaiter(ctx context.Context, req AcquireRequest) (*registerResult, error) {
 	fn := b.cfg.FairQueue.RPC.RegisterWaiterFunc
-	if fn == "" || req.IPBucket == "" || req.MaxWaitersPerIP <= 0 {
+	if fn == "" || req.IPBucket == "" || (req.MaxWaitersPerIP <= 0 && req.MaxWaitersPerHost <= 0) {
 		return &registerResult{allowed: true}, nil
 	}
 	body := map[string]interface{}{
@@ -1296,7 +1301,7 @@ func (p *postgresBackend) CheckThrottle(ctx context.Context, req AcquireRequest)
 
 func (p *postgresBackend) RegisterWaiter(ctx context.Context, req AcquireRequest) (*registerResult, error) {
 	fn := p.cfg.FairQueue.RPC.RegisterWaiterFunc
-	if fn == "" || req.IPBucket == "" || req.MaxWaitersPerIP <= 0 {
+	if fn == "" || req.IPBucket == "" || (req.MaxWaitersPerIP <= 0 && req.MaxWaitersPerHost <= 0) {
 		return &registerResult{allowed: true}, nil
 	}
 	row := p.db.QueryRowContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7)", fn),
