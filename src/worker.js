@@ -6,11 +6,15 @@ import { unifiedCheck } from './unified-check.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
 import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
 import { checkOriginMatch, decryptOriginSnapshot, getClientIp, parseCheckOriginEnv } from './origin-binding.js';
+import { handleInternalApiIfAny } from './internal-api.js';
+import { fetchControllerState } from './controller-adapter.js';
+import { BootstrapDO } from './do/bootstrap-do.js';
+import { DecisionDO } from './do/decision-do.js';
+import { MetricsDO } from './do/metrics-do.js';
 
 // Configuration constants
 const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
 const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-addition', 'skip-addition-expiretime', 'skip-origin', 'asis']);
-const VALID_EXCEPT_ACTIONS = new Set(['block-except', 'skip-sign-except', 'skip-hash-except', 'skip-worker-except', 'skip-addition-except', 'skip-addition-expiretime-except', 'skip-origin-except', 'asis-except']);
 
 let ipRateLimitDisabledLogged = false;
 
@@ -32,12 +36,6 @@ const handleOptions = () => {
   headers.set('Access-Control-Allow-Headers', DOWNLOAD_ALLOW_HEADERS);
   headers.set('Access-Control-Max-Age', '86400');
   return new Response(null, { status: 204, headers });
-};
-
-// Utility: Parse comma-separated prefix list
-const parsePrefixList = (value) => {
-  if (!value || typeof value !== 'string') return [];
-  return value.split(',').map(p => p.trim()).filter(p => p.length > 0);
 };
 
 const parseTimeString = (value, label) => {
@@ -73,80 +71,6 @@ const parseIntegerStrict = (value, defaultValue, label) => {
   return parsed;
 };
 
-// Utility: Validate action values (supports comma-separated list)
-const validateActions = (actions, paramName) => {
-  if (!actions) return [];
-
-  const actionList = String(actions)
-    .split(',')
-    .map(a => a.trim().toLowerCase())
-    .filter(a => a.length > 0);
-
-  // Validate each action
-  for (const action of actionList) {
-    if (!VALID_ACTIONS.has(action)) {
-      throw new Error(
-        `${paramName} contains invalid action '${action}'. Must be one of: ${Array.from(VALID_ACTIONS).join(', ')}`
-      );
-    }
-  }
-
-  // Validate combinations
-  const hasBlock = actionList.includes('block');
-  const hasAsis = actionList.includes('asis');
-
-  if (hasBlock && actionList.length > 1) {
-    throw new Error(`${paramName}: 'block' cannot be combined with other actions`);
-  }
-
-  if (hasAsis && actionList.length > 1) {
-    throw new Error(`${paramName}: 'asis' cannot be combined with other actions`);
-  }
-
-  return actionList;
-};
-
-// Utility: Validate except action values (supports comma-separated list)
-const validateExceptActions = (actions, paramName) => {
-  if (!actions) return [];
-
-  const actionList = String(actions)
-    .split(',')
-    .map(a => a.trim().toLowerCase())
-    .filter(a => a.length > 0);
-
-  // Validate each action
-  for (const action of actionList) {
-    // Must end with -except
-    if (!action.endsWith('-except')) {
-      throw new Error(
-        `${paramName} contains invalid action '${action}'. All actions must use -except suffix (e.g., 'block-except', 'skip-sign-except')`
-      );
-    }
-
-    // Check if it's a valid except action
-    if (!VALID_EXCEPT_ACTIONS.has(action)) {
-      throw new Error(
-        `${paramName} contains invalid action '${action}'. Must be one of: ${Array.from(VALID_EXCEPT_ACTIONS).join(', ')}`
-      );
-    }
-  }
-
-  // Validate combinations (same rules as regular actions)
-  const hasBlock = actionList.includes('block-except');
-  const hasAsis = actionList.includes('asis-except');
-
-  if (hasBlock && actionList.length > 1) {
-    throw new Error(`${paramName}: 'block-except' cannot be combined with other actions`);
-  }
-
-  if (hasAsis && actionList.length > 1) {
-    throw new Error(`${paramName}: 'asis-except' cannot be combined with other actions`);
-  }
-
-  return actionList;
-};
-
 // Ensure required environment variables are set
 const ensureRequiredEnv = (env) => {
   REQUIRED_ENV.forEach((key) => {
@@ -166,22 +90,6 @@ const resolveConfig = (env = {}) => {
     const trimmed = value.trim();
     return trimmed === '' ? defaultValue : trimmed;
   };
-
-  const blacklistPrefixes = parsePrefixList(env.BLACKLIST_PREFIX);
-  const whitelistPrefixes = parsePrefixList(env.WHITELIST_PREFIX);
-  const exceptPrefixes = parsePrefixList(env.EXCEPT_PREFIX);
-  const blacklistDirIncludes = parsePrefixList(env.BLACKLIST_DIR_INCLUDES);
-  const blacklistNameIncludes = parsePrefixList(env.BLACKLIST_NAME_INCLUDES);
-  const blacklistPathIncludes = parsePrefixList(env.BLACKLIST_PATH_INCLUDES);
-  const whitelistDirIncludes = parsePrefixList(env.WHITELIST_DIR_INCLUDES);
-  const whitelistNameIncludes = parsePrefixList(env.WHITELIST_NAME_INCLUDES);
-  const whitelistPathIncludes = parsePrefixList(env.WHITELIST_PATH_INCLUDES);
-  const exceptDirIncludes = parsePrefixList(env.EXCEPT_DIR_INCLUDES);
-  const exceptNameIncludes = parsePrefixList(env.EXCEPT_NAME_INCLUDES);
-  const exceptPathIncludes = parsePrefixList(env.EXCEPT_PATH_INCLUDES);
-  const blacklistActions = validateActions(env.BLACKLIST_ACTION, 'BLACKLIST_ACTION');
-  const whitelistActions = validateActions(env.WHITELIST_ACTION, 'WHITELIST_ACTION');
-  const exceptActions = validateExceptActions(env.EXCEPT_ACTION, 'EXCEPT_ACTION');
 
   const dbModeRaw = normalizeString(env.DB_MODE);
   const normalizedDbMode = dbModeRaw ? dbModeRaw.toLowerCase() : '';
@@ -401,8 +309,6 @@ const resolveConfig = (env = {}) => {
     console.error('[Fair Queue] slot-handler enabled but FAIR_QUEUE_SLOT_HANDLER_URL is missing');
   }
 
-  const originCheckModes = parseCheckOriginEnv(env.CHECK_ORIGIN);
-
   return {
     address: String(env.ADDRESS).trim(),
     token: String(env.TOKEN).trim(),
@@ -416,21 +322,6 @@ const resolveConfig = (env = {}) => {
     additionCheck: parseBoolean(env.ADDITION_CHECK, true),
     additionExpireTimeCheck: parseBoolean(env.ADDITION_EXPIRETIME_CHECK, true),
     ipv4Only: parseBoolean(env.IPV4_ONLY, true),
-    blacklistPrefixes,
-    whitelistPrefixes,
-    exceptPrefixes,
-    blacklistDirIncludes,
-    blacklistNameIncludes,
-    blacklistPathIncludes,
-    whitelistDirIncludes,
-    whitelistNameIncludes,
-    whitelistPathIncludes,
-    exceptDirIncludes,
-    exceptNameIncludes,
-    exceptPathIncludes,
-    blacklistActions,
-    whitelistActions,
-    exceptActions,
     dbMode,
     cacheEnabled,
     cacheConfig,
@@ -455,7 +346,6 @@ const resolveConfig = (env = {}) => {
     pgErrorHandle,
     idleTimeout: idleTimeoutSeconds,
     lastActiveTableName,
-    originCheckModes,
     fairQueueEnabled: actualFairQueueEnabled,
     fairQueueHostnamePatterns,
     fairQueueConfig: {
@@ -547,144 +437,43 @@ async function sha256Hex(text) {
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Check if a path matches blacklist or whitelist and return the actions array
-const checkPathListAction = (path, config) => {
-  let decodedPath;
-  try {
-    decodedPath = decodeURIComponent(path);
-  } catch (error) {
-    // If path cannot be decoded, use as-is
-    decodedPath = path;
+// Normalize controller decision.pathAction into VALID_ACTIONS; controller is source of truth.
+const normalizeControllerPathActions = (downloadDecision) => {
+  if (!downloadDecision || !Array.isArray(downloadDecision.pathAction)) {
+    return [];
   }
 
-  const lastSlashIndex = decodedPath.lastIndexOf('/');
-  const dirPath = lastSlashIndex > 0 ? decodedPath.substring(0, lastSlashIndex) : '';
-  const fileName = lastSlashIndex >= 0 ? decodedPath.substring(lastSlashIndex + 1) : decodedPath;
+  const normalized = [];
+  const seen = new Set();
 
-  // Check blacklist first (highest priority)
-  if (config.blacklistPrefixes.length > 0 && config.blacklistActions.length > 0) {
-    for (const prefix of config.blacklistPrefixes) {
-      if (decodedPath.startsWith(prefix)) {
-        return config.blacklistActions;
-      }
+  for (const action of downloadDecision.pathAction) {
+    const token = typeof action === 'string' ? action.trim().toLowerCase() : '';
+    if (!token) {
+      continue;
     }
-  }
-
-  if (config.blacklistActions.length > 0) {
-    if (config.blacklistDirIncludes.length > 0) {
-      for (const keyword of config.blacklistDirIncludes) {
-        if (dirPath.includes(keyword)) {
-          return config.blacklistActions;
-        }
-      }
+    if (!VALID_ACTIONS.has(token)) {
+      console.warn(`[controller] unsupported pathAction '${action}' ignored`);
+      continue;
     }
-
-    if (config.blacklistNameIncludes.length > 0) {
-      for (const keyword of config.blacklistNameIncludes) {
-        if (fileName.includes(keyword)) {
-          return config.blacklistActions;
-        }
-      }
-    }
-
-    if (config.blacklistPathIncludes.length > 0) {
-      for (const keyword of config.blacklistPathIncludes) {
-        if (decodedPath.includes(keyword)) {
-          return config.blacklistActions;
-        }
-      }
+    if (!seen.has(token)) {
+      normalized.push(token);
+      seen.add(token);
     }
   }
 
-  // Check whitelist second (second priority)
-  if (config.whitelistPrefixes.length > 0 && config.whitelistActions.length > 0) {
-    for (const prefix of config.whitelistPrefixes) {
-      if (decodedPath.startsWith(prefix)) {
-        return config.whitelistActions;
-      }
-    }
+  return normalized;
+};
+
+// Extract origin check modes from controller decision; controller is source of truth.
+const extractControllerOriginModes = (downloadDecision) => {
+  if (!downloadDecision || typeof downloadDecision.checkOriginMode === 'undefined') {
+    return [];
   }
-
-  if (config.whitelistActions.length > 0) {
-    if (config.whitelistDirIncludes.length > 0) {
-      for (const keyword of config.whitelistDirIncludes) {
-        if (dirPath.includes(keyword)) {
-          return config.whitelistActions;
-        }
-      }
-    }
-
-    if (config.whitelistNameIncludes.length > 0) {
-      for (const keyword of config.whitelistNameIncludes) {
-        if (fileName.includes(keyword)) {
-          return config.whitelistActions;
-        }
-      }
-    }
-
-    if (config.whitelistPathIncludes.length > 0) {
-      for (const keyword of config.whitelistPathIncludes) {
-        if (decodedPath.includes(keyword)) {
-          return config.whitelistActions;
-        }
-      }
-    }
+  if (typeof downloadDecision.checkOriginMode !== 'string') {
+    console.warn('[controller] checkOriginMode is not a string, ignore');
+    return [];
   }
-
-  // Check exception list third (third priority) - inverse matching logic
-  const hasExceptRules =
-    config.exceptPrefixes.length > 0 ||
-    config.exceptDirIncludes.length > 0 ||
-    config.exceptNameIncludes.length > 0 ||
-    config.exceptPathIncludes.length > 0;
-
-  if (config.exceptActions.length > 0 && hasExceptRules) {
-    let matchesExceptRule = false;
-
-    if (config.exceptPrefixes.length > 0) {
-      for (const prefix of config.exceptPrefixes) {
-        if (decodedPath.startsWith(prefix)) {
-          matchesExceptRule = true;
-          break;
-        }
-      }
-    }
-
-    if (!matchesExceptRule && config.exceptDirIncludes.length > 0) {
-      for (const keyword of config.exceptDirIncludes) {
-        if (dirPath.includes(keyword)) {
-          matchesExceptRule = true;
-          break;
-        }
-      }
-    }
-
-    if (!matchesExceptRule && config.exceptNameIncludes.length > 0) {
-      for (const keyword of config.exceptNameIncludes) {
-        if (fileName.includes(keyword)) {
-          matchesExceptRule = true;
-          break;
-        }
-      }
-    }
-
-    if (!matchesExceptRule && config.exceptPathIncludes.length > 0) {
-      for (const keyword of config.exceptPathIncludes) {
-        if (decodedPath.includes(keyword)) {
-          matchesExceptRule = true;
-          break;
-        }
-      }
-    }
-
-    if (!matchesExceptRule) {
-      return config.exceptActions.map(action => action.replace('-except', ''));
-    }
-    // If path matches except prefix, use default behavior (return empty array)
-  }
-
-  // No match - use default behavior
-  return [];
+  return parseCheckOriginEnv(downloadDecision.checkOriginMode);
 };
 
 // src/verify.ts
@@ -1139,8 +928,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return createErrorResponse(origin, 400, "invalid path encoding");
   }
 
-  // Check blacklist/whitelist
-  const actions = checkPathListAction(path, config);
+  const downloadDecision = ctx && ctx.controllerState ? ctx.controllerState?.decision?.download : null;
+  if (!downloadDecision) {
+    return createErrorResponse(origin, 503, "controller decision unavailable");
+  }
+
+  const actions = normalizeControllerPathActions(downloadDecision);
+  const originCheckModes = extractControllerOriginModes(downloadDecision);
 
   // Handle block action
   if (actions.includes('block')) {
@@ -1148,7 +942,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   }
 
   const skipOriginByAction = actions.includes('skip-origin');
-  const needOriginCheck = !skipOriginByAction && config.originCheckModes.length > 0;
+  const needOriginCheck = !skipOriginByAction && originCheckModes.length > 0;
 
   const clientIpValue = getClientIp(request);
   const clientIP = clientIpValue || "";
@@ -1325,7 +1119,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       city: cf.city,
       asn: typeof cf.asn === 'undefined' || cf.asn === null ? undefined : String(cf.asn),
     };
-    const originResult = checkOriginMatch(snapshot, currentOrigin, config.originCheckModes, {
+    const originResult = checkOriginMatch(snapshot, currentOrigin, originCheckModes, {
       ipv4Suffix: config.ipv4Suffix,
       ipv6Suffix: config.ipv6Suffix,
     });
@@ -2019,15 +1813,32 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
   return await handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 }
 // src/index.ts
+export { BootstrapDO, DecisionDO, MetricsDO };
+
 export default {
   async fetch(request, env, ctx) {
     try {
+      const internalResponse = await handleInternalApiIfAny(request, env, ctx);
+      if (internalResponse) {
+        return internalResponse;
+      }
+
       const config = resolveConfig(env || {});
       // Create cache manager instance based on DB_MODE
       const cacheManager = config.cacheEnabled ? createCacheManager(config.dbMode) : null;
       // Create throttle manager instance based on DB_MODE (if throttle enabled)
       const throttleManager = config.throttleEnabled ? createThrottleManager(config.dbMode) : null;
       const rateLimiter = config.rateLimitEnabled ? createRateLimiter(config.dbMode) : null;
+
+      // 预拉取 controller bootstrap/decision 便于后续切换策略来源，不影响现有流程。
+      let controllerState = null;
+      try {
+        controllerState = await fetchControllerState(request, env);
+      } catch (error) {
+        console.error('[controller] state fetch error:', error instanceof Error ? error.message : String(error));
+      }
+      ctx.controllerState = controllerState;
+
       const response = await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 
       scheduleAllCleanups(config, env, ctx).catch((error) => {
