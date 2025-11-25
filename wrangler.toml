@@ -4,256 +4,43 @@ compatibility_date = "2024-01-01"
 
 # Environment variables (configure these in Cloudflare Dashboard or use secrets)
 # [vars]
-# # Origin Encrypt Binding (NEW):
-# #   Landing worker now encrypts client origin snapshot (IP / geo / ASN) into additionalInfo.encrypt.
-# #   Origin binding 与路径策略均由 controller `/bootstrap` + `/decision` 下发，无需在 wrangler 配置 CHECK_ORIGIN 或 path actions。
-# ADDRESS = "https://your-alist-server.com"
-# TOKEN = "your-hmac-token"
-# WORKER_ADDRESS = "https://your-worker.workers.dev"
-# VERIFY_HEADER = ""
-# VERIFY_SECRET = ""
-# # ⚠️ NEW: Multi-Authentication Header Support (comma-separated format)
-# # You can now specify multiple authentication header/secret pairs for different services
-# # Format: "header1,header2,header3"
-# # Example for AList + PostgREST:
-# #   VERIFY_HEADER = "X-Auth-Token,X-Postgrest-Auth"
-# #   VERIFY_SECRET = "alist-secret-key,postgrest-secret-key"
-# # Requirements:
-# #   - Both arrays must have the same length (if non-empty)
-# #   - No spaces between commas: "header1,header2" (spaces will be trimmed automatically)
-# #   - All header/secret pairs will be sent in requests to AList API and PostgREST
-# # Backward Compatible: Single value still works: VERIFY_HEADER = "X-Auth-Token"
-# SIGN_CHECK = "true"
-# HASH_CHECK = "true"
-# WORKER_CHECK = "true"
-# # 路径策略与 origin 绑定由 controller 下发，勿在 wrangler 设置 BLACKLIST/WHITELIST/EXCEPT/CHECK_ORIGIN。
-# # 如需调整策略，请修改 controller config 与决策。
-# ADDITION_CHECK = "true"             # Require additionalInfo and additionalInfoSign, validate signature/path binding
-# ADDITION_EXPIRETIME_CHECK = "true"  # Validate expireTime field (only when ADDITION_CHECK is true)
-# IPV4_ONLY = "true"
+# 控制面为唯一策略来源，wrangler 仅保留 infra 级 env：
+# - ENV / ROLE / INSTANCE_ID / APP_NAME / APP_VERSION
+# - CONTROLLER_URL / CONTROLLER_API_PREFIX / CONTROLLER_API_TOKEN
+# - BOOTSTRAP_CACHE_MODE / DECISION_CACHE_MODE / METRICS_MODE
+# - BOOTSTRAP_DO / DECISION_DO / METRICS_DO / BOOTSTRAP_KV 绑定
+# - INTERNAL_API_TOKEN（控制 API）
+# - TOKEN / WORKER_ADDRESS / SIGN_SECRET（可选覆盖）
+# - SIGN_CHECK / HASH_CHECK / WORKER_CHECK / ADDITION_CHECK / ADDITION_EXPIRETIME_CHECK / IPV4_ONLY
+# - ENABLE_CF_RATELIMITER / CF_RATELIMITER_BINDING（如需启用 CF 原生限流，请同时配置 [[rate_limit]] 绑定）
+# 路径规则、origin binding、上游地址、PostgREST/RateLimit/Throttle/FairQueue 等全部由 controller config.yaml 下发，勿在 wrangler 配置策略类 env。
 #
-# # Database Mode for Download Link Cache
-# # Options: "" (disable DB) or "custom-pg-rest" (Custom PostgreSQL + PostgREST)
-# # D1 / D1-REST 已废弃，不再支持
-# # If not set, caching is completely disabled (always call AList API)
-# DB_MODE = ""
-# DOWNLOAD_CACHE_TABLE = "DOWNLOAD_CACHE_TABLE"
-# THROTTLE_PROTECTION_TABLE = "THROTTLE_PROTECTION"
-# DOWNLOAD_IP_RATELIMIT_TABLE = "DOWNLOAD_IP_RATELIMIT_TABLE"
-# IDLE_TIMEOUT = "0"
-# DOWNLOAD_LAST_ACTIVE_TABLE = "DOWNLOAD_LAST_ACTIVE_TABLE"
-#
-# IDLE_TIMEOUT: 如果链接在此时间内未被访问，视为过期
-#   - 格式: 数字+单位 (s=秒, m=分钟, h=小时, d=天)
-#   - 例如: "30m" (30分钟), "1h" (1小时)
-#   - 设置为 "0" 或空字符串关闭此功能
-# DOWNLOAD_LAST_ACTIVE_TABLE: 自定义空闲追踪表名，默认 DOWNLOAD_LAST_ACTIVE_TABLE
-#   - 仅在 DB_MODE="custom-pg-rest" 时生效
-#
-# # Link Cache TTL - how long to cache download links before re-fetching from AList
-# # Format: {number}{unit} where unit is h (hour), m (minute), s (second)
-# # Examples: "30m", "1h", "120s"
-# # Default: "30m" (1800 seconds)
-# LINK_TTL = "30m"
-#
-# # Cleanup Percentage - probability of triggering cache cleanup per request
-# # Range: 0-100 (supports decimals, e.g., "0.1" = 0.1% chance)
-# # Default: "1" (1% chance per request)
-# # Cleanup removes records older than LINK_TTL * 2
-# CLEANUP_PERCENTAGE = "1"
-#
-# # Custom PostgreSQL + PostgREST Download Cache - requires DB_MODE="custom-pg-rest"
-# # Use this mode when you have self-hosted PostgreSQL with PostgREST REST API
-# # ⚠️ IMPORTANT: You MUST run init.sql on your PostgreSQL database first!
-# #   - Creates required tables & stored procedures (see init.sql)
-# POSTGREST_URL = "https://your-domain.com/postgrest"  # PostgREST API endpoint (without table name)
-# # Note: VERIFY_HEADER and VERIFY_SECRET (already defined above) are used for PostgREST authentication
-#
-# # ═══════════════════════════════════════════════════════════════
-# # Throttle Protection System - Prevent Repeated Requests to Failing Hostnames
-# # ═══════════════════════════════════════════════════════════════
-# #
-# # Purpose: Protect against repeated requests to hostnames that are returning errors
-# # (e.g., OneDrive throttling with 429, Google Drive service errors with 503)
-# #
-# # How it works:
-# # 1. When a download URL returns 4xx/5xx, the hostname is marked as "protected"
-# # 2. Subsequent requests to that hostname will return the cached error without fetching
-# # 3. After the time window expires, requests resume normally
-# # 4. If successful, protection is cleared automatically
-# #
-# # Requirements:
-# # - DB_MODE must be set to "custom-pg-rest"
-# # - For custom-pg-rest: Run init.sql to create THROTTLE_PROTECTION table and stored procedures
-# #
-# # Configuration:
-# THROTTLE_PROTECT_HOSTNAME = ""  # Comma-separated hostname patterns to protect
-#                                  # Examples: "*.sharepoint.com,*.googleapis.com"
-#                                  #   - "*.sharepoint.com" matches both "xxx.sharepoint.com" and "sharepoint.com"
-#                                  #   - "example.com" matches only "example.com"
-#                                  # Default: "" (disabled - no protection)
-#
-# THROTTLE_TIME_WINDOW = "60s"    # Time window for protection (format: {number}{unit})
-#                                  # Units: s (seconds), m (minutes), h (hours)
-#                                  # Examples: "30s", "5m", "1h"
-#                                  # Default: "60s"
-#                                  # After this time, requests will resume to check if service recovered
-#
-# THROTTLE_TIME_WINDOW_SECONDS = "" # Optional numeric override (seconds) for protection window
-#                                   # If set, this value takes precedence over THROTTLE_TIME_WINDOW
-#
-# THROTTLE_OBSERVE_WINDOW_SECONDS = "60"  # Observation window length for counting successes/errors
-# THROTTLE_ERROR_RATIO_PERCENT = "20"     # Error ratio threshold (requires min sample count)
-# THROTTLE_CONSECUTIVE_THRESHOLD = "4"    # Consecutive protected responses to trigger protection (set to 1 for immediate)
-# THROTTLE_MIN_SAMPLE_COUNT = "8"         # Minimum samples (success + error) before ratio-based protection is evaluated
-# THROTTLE_FAST_MIN_SAMPLE_COUNT = "4"    # Fast trigger sample threshold (scheme B). Set to "0" to disable fast ratio.
-# THROTTLE_FAST_ERROR_RATIO_PERCENT = "60" # Fast trigger error ratio (scheme B) - enforced to be >= ERROR_RATIO_PERCENT
-#
-# THROTTLE_PROTECT_HTTP_CODE = "429,500,503"  # Status codes that trigger protection (comma-separated)
-#                                             # Provide only the codes that should cause throttle protect writes
-#                                             # Example: "500" or "429,500,503"
-#                                             # Default: "429,500,503"
-
-# # ═══════════════════════════════════════════════════════════════
-# # IP Subnet Rate Limiting (database-backed)
-# # ═══════════════════════════════════════════════════════════════
-# #
-# # WINDOW_TIME = "24h"                  # Counting window per subnet
-# # IPSUBNET_WINDOWTIME_LIMIT = "100"    # Max requests per subnet within WINDOW_TIME
-# # IPV4_SUFFIX = "/32"                  # IPv4 subnet mask applied before hashing
-# # IPV6_SUFFIX = "/60"                  # IPv6 subnet mask applied before hashing
-# # BLOCK_TIME = "10m"                   # Additional block duration after hitting the limit
-# # PG_ERROR_HANDLE = "fail-closed"      # Use "fail-open" to bypass DB errors gracefully
-
-# # ═══════════════════════════════════════════════════════════════
-# # ⚠️ NEW: Cloudflare Rate Limiter (Binding-based, Stateless/Stateful)
-# # ═══════════════════════════════════════════════════════════════
-# #
-# # Purpose: First-layer rate limiting using Cloudflare's native Rate Limiter binding
-# # Benefits:
-# #   - Ultra-low latency (<10ms, edge-based enforcement)
-# #   - Works in both stateless (DB_MODE="") and stateful (DB_MODE set) modes
-# #   - Zero database cost for stateless deployments
-# #   - Can be used as additional protection layer when combined with DB rate limiting
-# #
-# # How it works:
-# # 1. Request arrives → CF Rate Limiter checks (based on IP subnet SHA256)
-# # 2. If limit exceeded → Return 429 immediately (no DB queries)
-# # 3. If allowed → Continue to DB rate limiting (if DB_MODE set) or handle request
-# #
-# # Dual Protection (Stateful Mode):
-# # - CF Rate Limiter: Blocks obvious abuse at edge (e.g., 10 req/10s)
-# # - DB Rate Limiting: Fine-grained control (e.g., 100 req/24h)
-# # - Advantages: CF absorbs high-frequency attacks, DB handles long-term limits
-# #
-# # Requirements:
-# # - Must configure [[rate_limit]] binding in wrangler.toml (see below)
-# # - ENABLE_CF_RATELIMITER must be "true" to activate
-# # - Binding validation enforced at startup (throws error if binding not found)
-# #
-# # Configuration:
-# ENABLE_CF_RATELIMITER = "false"      # Enable Cloudflare Rate Limiter binding
-#                                       # Default: "false" (disabled)
-#                                       # Set to "true" to enable first-layer rate limiting
-#                                       # Works in both stateless and stateful modes
-#                                       # If enabled but binding not found → startup error
-#
-# CF_RATELIMITER_BINDING = "CF_RATE_LIMITER"  # Rate Limiter binding name
-#                                              # Default: "CF_RATE_LIMITER"
-#                                              # Must match [[rate_limit]].binding below
-#                                              # Change if using custom binding name
-#
-# # Limiting Key Strategy:
-# # - Uses SHA256(IP subnet) as rate limiting key
-# # - Respects IPV4_SUFFIX and IPV6_SUFFIX settings (same as DB rate limiting)
-# # - Example: IPV4_SUFFIX="/24" → all IPs in 192.168.1.0/24 share the same limit
-# #
-# # Error Handling:
-# # - Binding not found when enabled → Throws startup error
-# # - Rate limit exceeded → Returns 429 with Retry-After: 60 header
-# # - CF Rate Limiter failure → fail-open (continues to DB or handles request)
-# #
-# # Example Configuration (Stateless Mode):
-# #   ENABLE_CF_RATELIMITER = "true"
-# #   CF_RATELIMITER_BINDING = "CF_RATE_LIMITER"
-# #   DB_MODE = ""  # No database, pure edge rate limiting
-# #   IPV4_SUFFIX = "/24"
-# #   IPV6_SUFFIX = "/60"
-# #
-# # Example Configuration (Stateful Dual Protection):
-# #   ENABLE_CF_RATELIMITER = "true"
-# #   CF_RATELIMITER_BINDING = "CF_RATE_LIMITER"
-# #   DB_MODE = "custom-pg-rest"
-# #   WINDOW_TIME = "24h"
-# #   IPSUBNET_WINDOWTIME_LIMIT = "100"  # 100 requests per 24h (DB layer)
-# #   # CF Rate Limiter configured in binding: 10 requests per 10s (edge layer)
-
-# ═══════════════════════════════════════════════════════════════
-# ⚠️ NEW: Cloudflare Rate Limiter Binding (for ENABLE_CF_RATELIMITER="true")
-# ═══════════════════════════════════════════════════════════════
-#
-# Uncomment and configure this section if enabling CF Rate Limiter
-# The rate limit rules (period, limit) are configured here, NOT in environment variables
-# Documentation: https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
-#
-# [[rate_limit]]
-# binding = "CF_RATE_LIMITER"  # Must match CF_RATELIMITER_BINDING env var
-#
-# # Simple Algorithm (Fixed Window)
-# # Example: 10 requests per 10 seconds
-# simple = { period = 10, limit = 10 }
-#
-# # Alternative: Sliding Window Algorithm (More accurate)
-# # Example: 100 requests per 60 seconds (sliding window)
-# # sliding_window = { period = 60, limit = 100 }
-#
-# # Notes:
-# # - period: Time window in seconds (max 86400 = 24h)
-# # - limit: Maximum requests per period per key (IP subnet SHA256)
-# # - Choose simple for lower latency, sliding_window for more accurate enforcement
-# # - These parameters cannot be changed via environment variables
-# # - Must redeploy worker to change rate limit rules
-#
-# # Recommended Configurations:
-# #
-# # Light Protection (Edge layer):
-# #   simple = { period = 10, limit = 20 }
-# #   # 20 requests per 10 seconds = ~2 req/s burst
-# #
-# # Medium Protection (Edge layer):
-# #   simple = { period = 10, limit = 10 }
-# #   # 10 requests per 10 seconds = 1 req/s sustained
-# #
-# # Heavy Protection (Edge + DB layer):
-# #   simple = { period = 10, limit = 5 }
-# #   # Edge: 5 req/10s, DB: 100 req/24h (configure in WINDOW_TIME/IPSUBNET_WINDOWTIME_LIMIT)
-
-# ═══════════════════════════════════════════════════════════════
-# Fair Upstream Queue (slot-handler only)
-# ═══════════════════════════════════════════════════════════════
-#
-# Purpose: Limit concurrent upstream fetch requests per hostname pattern and keep fairness between IPs.
-# Implementation:
-# - Worker only matches FAIR_QUEUE_HOST_PATTERNS and calls slot-handler /api/v0/fairqueue/acquire + /release.
-# - All queueing, concurrency limits, and cleanup schedule live in slot-handler/config.json (fairQueue.*, fairQueue.cleanup.*).
-# - PostgreSQL schema required by slot-handler: upstream_slot_pool / upstream_ip_queue_depth / upstream_ip_cooldown +
-#   download_register_fq_waiter / download_release_fq_waiter / download_try_acquire_slot / download_release_slot and cleanup funcs from init.sql.
-#
-# Configuration (Worker side):
-# FAIR_QUEUE_ENABLED = "false"       # Enable fair queue (requires non-empty HOST_PATTERNS)
-# FAIR_QUEUE_HOST_PATTERNS = ""      # Comma-separated hostname patterns (supports wildcards)
-# FAIR_QUEUE_MAX_WAIT_MS = "15000"   # Max wait per request before giving up (feeds slot-handler total wait cap)
-# FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS = "" # Total wait budget for slot-handler polling (defaults to FAIR_QUEUE_MAX_WAIT_MS + 5000ms)
-# SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = "8000" # Per-poll HTTP timeout (ms)
-# SLOT_HANDLER_MAX_ATTEMPTS_CAP = "35"   # Max poll attempts before giving up
-# FAIR_QUEUE_SLOT_HANDLER_URL = ""      # Required slot-handler base URL
-# FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY = "" # Optional shared secret header X-FQ-Auth
-#
-# Error Responses:
-# - throttled → 503 + Retry-After from slot-handler throttle result
-# - timeout   → 503 (queue wait exceeded)
-
-# For local development, create a .dev.vars file with:
-# ADDRESS=https://your-alist-server.com
+# For local development (.dev.vars 示例):
+# ENV=staging
+# ROLE=download
+# INSTANCE_ID=download-dev-1
+# APP_NAME=simple-alist-cf-proxy
+# APP_VERSION=dev
 # TOKEN=your-hmac-token
 # WORKER_ADDRESS=https://your-worker.workers.dev
+# SIGN_CHECK=true
+# HASH_CHECK=true
+# WORKER_CHECK=true
+# ADDITION_CHECK=true
+# ADDITION_EXPIRETIME_CHECK=true
+# IPV4_ONLY=true
+# CONTROLLER_URL=https://controller.example.com
+# CONTROLLER_API_PREFIX=/api/v0
+# CONTROLLER_API_TOKEN=replace-with-token
+# BOOTSTRAP_CACHE_MODE=do
+# DECISION_CACHE_MODE=do
+# METRICS_MODE=do
+# BOOTSTRAP_DO=BootstrapDO
+# DECISION_DO=DecisionDO
+# METRICS_DO=MetricsDO
+# BOOTSTRAP_KV=BOOTSTRAP_KV
+# INTERNAL_API_TOKEN=replace-with-internal-token
+# ENABLE_CF_RATELIMITER=false
+# CF_RATELIMITER_BINDING=CF_RATE_LIMITER
+#
+# 如启用 ENABLE_CF_RATELIMITER，请配置 [[rate_limit]] binding 名称与 CF_RATELIMITER_BINDING 一致。

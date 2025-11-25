@@ -4,7 +4,7 @@ import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
 import { unifiedCheck } from './unified-check.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
-import { parseBoolean, parseInteger, parseNumber, parseWindowTime, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
+import { parseBoolean, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
 import { checkOriginMatch, decryptOriginSnapshot, getClientIp, parseCheckOriginEnv } from './origin-binding.js';
 import { handleInternalApiIfAny } from './internal-api.js';
 import { fetchControllerState } from './controller-adapter.js';
@@ -13,10 +13,17 @@ import { DecisionDO } from './do/decision-do.js';
 import { MetricsDO } from './do/metrics-do.js';
 
 // Configuration constants
-const REQUIRED_ENV = ['ADDRESS', 'TOKEN', 'WORKER_ADDRESS'];
+const REQUIRED_ENV = ['TOKEN', 'WORKER_ADDRESS'];
 const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-addition', 'skip-addition-expiretime', 'skip-origin', 'asis']);
-
-let ipRateLimitDisabledLogged = false;
+const DEFAULT_LINK_TTL_SECONDS = 1800;
+const DEFAULT_CLEANUP_PERCENTAGE = 1;
+const DEFAULT_RATE_LIMIT_BLOCK_SECONDS = 600;
+const DEFAULT_RATE_LIMIT_IPV4_SUFFIX = '/32';
+const DEFAULT_RATE_LIMIT_IPV6_SUFFIX = '/60';
+const DEFAULT_FQ_QUEUE_WAIT_MS = 15000;
+const DEFAULT_SLOT_HANDLER_TIMEOUT_MS = 20000;
+const DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = 8000;
+const DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS = 35;
 
 const DOWNLOAD_EXPOSE_HEADERS = 'Content-Length, Content-Range, X-Throttle-Status, X-Throttle-Retry-After, Accept-Ranges';
 const DOWNLOAD_ALLOW_HEADERS = 'Range, Content-Type, X-Requested-With';
@@ -38,37 +45,9 @@ const handleOptions = () => {
   return new Response(null, { status: 204, headers });
 };
 
-const parseTimeString = (value, label) => {
-  if (typeof value !== 'string' || value.trim() === '') {
-    throw new Error(`${label} must be a non-empty string`);
-  }
-
-  const trimmed = value.trim();
-  const parsed = parseWindowTime(trimmed);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error(`${label} is invalid: ${value}`);
-  }
-
-  if (parsed === 0 && trimmed !== '0') {
-    throw new Error(`${label} is invalid: ${value}`);
-  }
-
-  return parsed;
-};
-
-const parseIntegerStrict = (value, defaultValue, label) => {
-  if (value === undefined || value === null || value === '') {
-    if (defaultValue === undefined) {
-      throw new Error(`${label} is required`);
-    }
-    return defaultValue;
-  }
-
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isFinite(parsed)) {
-    throw new Error(`${label} must be an integer`);
-  }
-  return parsed;
+const normalizePgErrorHandleConfig = (value) => {
+  const lowered = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return lowered === 'fail-open' ? 'fail-open' : 'fail-closed';
 };
 
 // Ensure required environment variables are set
@@ -80,8 +59,8 @@ const ensureRequiredEnv = (env) => {
   });
 };
 
-// Resolve configuration from environment variables
-const resolveConfig = (env = {}) => {
+// Resolve configuration from controller bootstrap/decision
+const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   ensureRequiredEnv(env);
 
   const normalizeString = (value, defaultValue = '') => {
@@ -91,169 +70,232 @@ const resolveConfig = (env = {}) => {
     return trimmed === '' ? defaultValue : trimmed;
   };
 
-  const dbModeRaw = normalizeString(env.DB_MODE);
-  const normalizedDbMode = dbModeRaw ? dbModeRaw.toLowerCase() : '';
-  const dbMode = normalizedDbMode === 'custom-pg-rest' ? 'custom-pg-rest' : '';
-  if (normalizedDbMode && dbMode !== 'custom-pg-rest') {
-    throw new Error(`Invalid DB_MODE: "${dbModeRaw}". Only "" or "custom-pg-rest" are supported.`);
-  }
-  const enableCfRatelimiter = normalizeString(env.ENABLE_CF_RATELIMITER, 'false').toLowerCase() === 'true';
-  const cfRatelimiterBinding = normalizeString(env.CF_RATELIMITER_BINDING, 'CF_RATE_LIMITER');
-
-  const linkTTL = normalizeString(env.LINK_TTL, '30m');
-  const linkTTLSeconds = parseWindowTime(linkTTL);
-  const cleanupPercentage = parseNumber(env.CLEANUP_PERCENTAGE, 1);
-  const cleanupProbability = Math.max(0, Math.min(100, cleanupPercentage)) / 100;
-  const idleTimeoutRaw = normalizeString(env.IDLE_TIMEOUT);
-  const idleTimeoutSeconds =
-    dbMode === 'custom-pg-rest' && idleTimeoutRaw
-      ? parseTimeString(idleTimeoutRaw, 'IDLE_TIMEOUT')
-      : 0;
-  const lastActiveTableName =
-    normalizeString(env.DOWNLOAD_LAST_ACTIVE_TABLE, 'DOWNLOAD_LAST_ACTIVE_TABLE') ||
-    'DOWNLOAD_LAST_ACTIVE_TABLE';
-
-  const downloadCacheTableName = (() => {
-    const explicit = normalizeString(env.DOWNLOAD_CACHE_TABLE);
-    if (explicit) return explicit;
-    const legacyPg = normalizeString(env.POSTGREST_TABLE_NAME);
-    if (legacyPg) return legacyPg;
-    return 'DOWNLOAD_CACHE_TABLE';
-  })();
-  const throttleTableName = normalizeString(env.THROTTLE_PROTECTION_TABLE, 'THROTTLE_PROTECTION');
-  const rateLimitTableName = normalizeString(env.DOWNLOAD_IP_RATELIMIT_TABLE, 'DOWNLOAD_IP_RATELIMIT_TABLE');
-
-  const windowTime = normalizeString(env.WINDOW_TIME);
-  const windowTimeSeconds = parseWindowTime(windowTime);
-  const ipSubnetLimit = parseInteger(env.IPSUBNET_WINDOWTIME_LIMIT, 0);
-  const ipv4Suffix = normalizeString(env.IPV4_SUFFIX, '/32');
-  const ipv6Suffix = normalizeString(env.IPV6_SUFFIX, '/60');
-  const pgErrorHandleRaw = normalizeString(env.PG_ERROR_HANDLE, 'fail-closed').toLowerCase();
-  const pgErrorHandle = pgErrorHandleRaw === 'fail-open' ? 'fail-open' : 'fail-closed';
-  const blockTime = normalizeString(env.BLOCK_TIME, '10m');
-  const blockTimeSeconds = parseWindowTime(blockTime);
-
-  const throttleProtectHostname = normalizeString(env.THROTTLE_PROTECT_HOSTNAME);
-  const throttleTimeWindow = normalizeString(env.THROTTLE_TIME_WINDOW, '60s');
-  const throttleTimeWindowSecondsEnv = parseInteger(env.THROTTLE_TIME_WINDOW_SECONDS);
-  const throttleTimeWindowSeconds = Number.isFinite(throttleTimeWindowSecondsEnv) && throttleTimeWindowSecondsEnv > 0
-    ? throttleTimeWindowSecondsEnv
-    : parseWindowTime(throttleTimeWindow);
-  const throttleObserveWindowSeconds = parseInteger(env.THROTTLE_OBSERVE_WINDOW_SECONDS, 60);
-  const throttleErrorRatioPercent = parseInteger(env.THROTTLE_ERROR_RATIO_PERCENT, 20);
-  const throttleConsecutiveThreshold = parseInteger(env.THROTTLE_CONSECUTIVE_THRESHOLD, 4);
-  const throttleMinSampleCount = parseInteger(env.THROTTLE_MIN_SAMPLE_COUNT, 8);
-  const throttleFastMinSampleCount = parseInteger(env.THROTTLE_FAST_MIN_SAMPLE_COUNT, 4);
-  const throttleFastErrorRatioPercent = parseInteger(env.THROTTLE_FAST_ERROR_RATIO_PERCENT, 60);
-  const throttleProtectHttpCodeRaw = normalizeString(env.THROTTLE_PROTECT_HTTP_CODE, '429,500,503');
-  const throttleProtectHttpCodes = throttleProtectHttpCodeRaw
-    ? throttleProtectHttpCodeRaw
-        .split(',')
-        .map((code) => code.trim())
-        .filter((code) => code.length > 0)
-        .map((code) => Number.parseInt(code, 10))
-        .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
-    : [];
-
-  const throttleHostnamePatterns = throttleProtectHostname
-    ? throttleProtectHostname.split(',').map((p) => p.trim()).filter((p) => p.length > 0)
-    : [];
-
-  const parseVerifyValues = (value) => {
-    if (!value || typeof value !== 'string') {
-      return [];
-    }
-    return value
-      .split(',')
-      .map((entry) => entry.trim())
-      .filter((entry) => entry.length > 0);
-  };
-
-  const verifyHeaders = parseVerifyValues(normalizeString(env.VERIFY_HEADER));
-  const verifySecrets = parseVerifyValues(normalizeString(env.VERIFY_SECRET));
-
-  if (verifyHeaders.length > 0 && verifySecrets.length > 0 && verifyHeaders.length !== verifySecrets.length) {
-    throw new Error('VERIFY_HEADER and VERIFY_SECRET must have the same number of comma-separated entries');
+  const downloadBootstrap = bootstrap && typeof bootstrap === 'object'
+    ? bootstrap.download || null
+    : null;
+  if (!downloadBootstrap) {
+    throw new Error('controller bootstrap.download is required');
   }
 
-  const postgrestUrl = normalizeString(env.POSTGREST_URL);
+  const downloadDecision = decision && typeof decision === 'object'
+    ? decision.download || null
+    : null;
+
+  const address = normalizeString(downloadBootstrap.address);
+  if (!address) {
+    throw new Error('controller download.address is required');
+  }
+
+  const token = String(env.TOKEN).trim();
+  const workerAddress = normalizeString(env.WORKER_ADDRESS);
+  const signCheck = parseBoolean(env.SIGN_CHECK, true);
+  const hashCheck = parseBoolean(env.HASH_CHECK, true);
+  const workerCheck = parseBoolean(env.WORKER_CHECK, true);
+  const additionCheck = parseBoolean(env.ADDITION_CHECK, true);
+  const additionExpireTimeCheck = parseBoolean(env.ADDITION_EXPIRETIME_CHECK, true);
+  const ipv4Only = parseBoolean(env.IPV4_ONLY, true);
+  const signSecret = env.SIGN_SECRET && env.SIGN_SECRET.trim() !== '' ? env.SIGN_SECRET : token;
+
+  // DB & cache from controller
+  const dbConfig = downloadBootstrap.db && typeof downloadBootstrap.db === 'object'
+    ? downloadBootstrap.db
+    : {};
+  const dbModeRaw = normalizeString(dbConfig.mode);
+  const dbMode = dbModeRaw ? dbModeRaw.toLowerCase() : '';
+  if (dbMode && dbMode !== 'custom-pg-rest') {
+    throw new Error(`Invalid controller download.db.mode: "${dbModeRaw}". Only "" or "custom-pg-rest" are supported.`);
+  }
+  const isCustomDb = dbMode === 'custom-pg-rest';
+
+  const postgrestUrl = normalizeString(dbConfig.postgrestUrl);
+  const verifyHeader = Array.isArray(dbConfig.verifyHeader)
+    ? dbConfig.verifyHeader.map((v) => normalizeString(v)).filter((v) => v.length > 0)
+    : [];
+  const verifySecret = Array.isArray(dbConfig.verifySecret)
+    ? dbConfig.verifySecret.map((v) => normalizeString(v)).filter((v) => v.length > 0)
+    : [];
+
+  if (verifyHeader.length > 0 && verifySecret.length > 0 && verifyHeader.length !== verifySecret.length) {
+    throw new Error('controller download.db.verifyHeader and verifySecret must have the same length');
+  }
+  if (isCustomDb && (!postgrestUrl || verifyHeader.length === 0 || verifySecret.length === 0)) {
+    throw new Error('controller download.db requires postgrestUrl, verifyHeader, and verifySecret when mode=custom-pg-rest');
+  }
+
+  const cleanupPercentRaw = Number.parseFloat(dbConfig.cleanupPercentage);
+  const cleanupProbability = Number.isFinite(cleanupPercentRaw) && cleanupPercentRaw >= 0
+    ? Math.min(100, cleanupPercentRaw) / 100
+    : DEFAULT_CLEANUP_PERCENTAGE / 100;
+
+  const linkTTLSecondsRaw = Number(dbConfig.linkTTLSeconds);
+  const linkTTLSeconds = Number.isFinite(linkTTLSecondsRaw) && linkTTLSecondsRaw > 0
+    ? linkTTLSecondsRaw
+    : DEFAULT_LINK_TTL_SECONDS;
+
+  const idleTimeoutSecondsRaw = Number(dbConfig.idleTimeoutSeconds);
+  const idleTimeoutSeconds = Number.isFinite(idleTimeoutSecondsRaw) && idleTimeoutSecondsRaw >= 0
+    ? idleTimeoutSecondsRaw
+    : 0;
+
+  const cacheTableName = normalizeString(dbConfig.cacheTable, 'DOWNLOAD_CACHE_TABLE');
+  const lastActiveTableName = normalizeString(dbConfig.lastActiveTable, 'DOWNLOAD_LAST_ACTIVE_TABLE');
 
   let cacheEnabled = false;
   let cacheConfig = {};
 
-  if (dbMode === 'custom-pg-rest') {
-    if (postgrestUrl && verifyHeaders.length > 0 && verifySecrets.length > 0 && linkTTLSeconds > 0) {
-      cacheEnabled = true;
-      cacheConfig = {
-        postgrestUrl,
-        verifyHeader: verifyHeaders,
-        verifySecret: verifySecrets,
-        tableName: downloadCacheTableName,
-        linkTTL: linkTTLSeconds,
-        idleTimeout: idleTimeoutSeconds,
-        lastActiveTableName,
-        cleanupProbability,
-      };
-    } else {
-      throw new Error('DB_MODE is set to "custom-pg-rest" but required environment variables are missing: POSTGREST_URL, VERIFY_HEADER, VERIFY_SECRET, LINK_TTL');
-    }
-  }
-
-  const throttleEnabled = throttleHostnamePatterns.length > 0 && dbMode === 'custom-pg-rest';
-  let throttleConfig = {};
-  if (throttleEnabled) {
-    if (!postgrestUrl || verifyHeaders.length === 0 || verifySecrets.length === 0) {
-      throw new Error('Throttle protection requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
-    }
-    throttleConfig = {
+  if (isCustomDb) {
+    cacheEnabled = true;
+    cacheConfig = {
       postgrestUrl,
-      verifyHeader: verifyHeaders,
-      verifySecret: verifySecrets,
-      tableName: throttleTableName,
-      throttleTimeWindow: throttleTimeWindowSeconds,
-      observeWindowSeconds: throttleObserveWindowSeconds,
-      errorRatioPercent: throttleErrorRatioPercent,
-      consecutiveThreshold: throttleConsecutiveThreshold,
-      minSampleCount: throttleMinSampleCount,
-      fastErrorRatioPercent: throttleFastErrorRatioPercent,
-      fastMinSampleCount: throttleFastMinSampleCount,
+      verifyHeader,
+      verifySecret,
+      tableName: cacheTableName,
+      linkTTL: linkTTLSeconds,
+      idleTimeout: idleTimeoutSeconds,
+      lastActiveTableName,
       cleanupProbability,
-      protectedHttpCodes: throttleProtectHttpCodes,
     };
   }
 
-  const ipRateLimitActive = dbMode === 'custom-pg-rest' && windowTimeSeconds > 0 && ipSubnetLimit > 0;
-  let rateLimitEnabled = false;
-  let rateLimitConfig = {};
+  // rate limit from controller
+  const rateLimit = dbConfig.rateLimit && typeof dbConfig.rateLimit === 'object'
+    ? dbConfig.rateLimit
+    : {};
+  const rateLimitWindowSecondsRaw = Number(rateLimit.windowSeconds);
+  const rateLimitWindowSeconds = Number.isFinite(rateLimitWindowSecondsRaw) && rateLimitWindowSecondsRaw > 0
+    ? rateLimitWindowSecondsRaw
+    : 0;
+  const rateLimitLimitRaw = Number(rateLimit.limit);
+  const ipSubnetLimit = Number.isFinite(rateLimitLimitRaw) && rateLimitLimitRaw > 0 ? rateLimitLimitRaw : 0;
+  const rateLimitCleanupPercentRaw = Number.parseFloat(rateLimit.cleanupPercentage);
+  const rateLimitCleanupProbability = Number.isFinite(rateLimitCleanupPercentRaw) && rateLimitCleanupPercentRaw >= 0
+    ? Math.min(100, rateLimitCleanupPercentRaw) / 100
+    : cleanupProbability;
+  const rateLimitEnabled = Boolean(isCustomDb && rateLimit.enabled && rateLimitWindowSeconds > 0 && ipSubnetLimit > 0);
+  const rateLimitConfig = {
+    postgrestUrl,
+    verifyHeader,
+    verifySecret,
+    tableName: normalizeString(rateLimit.tableName, 'DOWNLOAD_IP_RATELIMIT_TABLE'),
+    windowTimeSeconds: rateLimitWindowSeconds > 0 ? rateLimitWindowSeconds : 86400,
+    limit: ipSubnetLimit,
+    ipv4Suffix: normalizeString(rateLimit.ipv4Suffix, DEFAULT_RATE_LIMIT_IPV4_SUFFIX) || DEFAULT_RATE_LIMIT_IPV4_SUFFIX,
+    ipv6Suffix: normalizeString(rateLimit.ipv6Suffix, DEFAULT_RATE_LIMIT_IPV6_SUFFIX) || DEFAULT_RATE_LIMIT_IPV6_SUFFIX,
+    pgErrorHandle: normalizePgErrorHandleConfig(rateLimit.pgErrorHandle || 'fail-closed'),
+    cleanupProbability: rateLimitCleanupProbability,
+    blockTimeSeconds: Number(rateLimit.blockSeconds) > 0 ? Number(rateLimit.blockSeconds) : DEFAULT_RATE_LIMIT_BLOCK_SECONDS,
+  };
+  const windowTime = rateLimitWindowSeconds > 0 ? `${rateLimitWindowSeconds}s` : '';
 
-  if (dbMode === 'custom-pg-rest' && ipSubnetLimit === 0 && !ipRateLimitDisabledLogged) {
-    console.log('IP rate limiting disabled (limit=0)');
-    ipRateLimitDisabledLogged = true;
-  }
+  // throttle profile from controller + decision
+  const throttleProfiles = downloadBootstrap.throttleProfiles && typeof downloadBootstrap.throttleProfiles === 'object'
+    ? downloadBootstrap.throttleProfiles
+    : {};
+  const throttleProfileName = typeof downloadDecision?.throttleProfile === 'string' && downloadDecision.throttleProfile.trim() !== ''
+    ? downloadDecision.throttleProfile.trim()
+    : 'default';
+  const throttleProfile = throttleProfiles[throttleProfileName] || throttleProfiles.default || {};
+  const throttleHostnamePatterns = Array.isArray(throttleProfile.hostPatterns)
+    ? throttleProfile.hostPatterns.map((p) => normalizeString(p)).filter((p) => p.length > 0)
+    : [];
+  const throttleCleanupPercentRaw = Number.parseFloat(throttleProfile.cleanupPercentage);
+  const throttleCleanupProbability = Number.isFinite(throttleCleanupPercentRaw) && throttleCleanupPercentRaw >= 0
+    ? Math.min(100, throttleCleanupPercentRaw) / 100
+    : cleanupProbability;
+  const throttleEnabled = isCustomDb && throttleHostnamePatterns.length > 0;
+  const throttleConfig = {
+    postgrestUrl,
+    verifyHeader,
+    verifySecret,
+    tableName: normalizeString(throttleProfile.tableName, 'download_throttle'),
+    throttleTimeWindow: Number(throttleProfile.windowSeconds) > 0 ? Number(throttleProfile.windowSeconds) : 60,
+    observeWindowSeconds: Number(throttleProfile.observeWindowSeconds) > 0 ? Number(throttleProfile.observeWindowSeconds) : 60,
+    errorRatioPercent: Number(throttleProfile.errorRatioPercent) > 0 ? Number(throttleProfile.errorRatioPercent) : 20,
+    consecutiveThreshold: Number.isFinite(Number(throttleProfile.consecutiveThreshold)) && Number(throttleProfile.consecutiveThreshold) > 0
+      ? Number(throttleProfile.consecutiveThreshold)
+      : 4,
+    minSampleCount: Number.isFinite(Number(throttleProfile.minSampleCount)) && Number(throttleProfile.minSampleCount) > 0
+      ? Number(throttleProfile.minSampleCount)
+      : 8,
+    fastErrorRatioPercent: Number(throttleProfile.fastErrorRatioPercent) > 0
+      ? Number(throttleProfile.fastErrorRatioPercent)
+      : undefined,
+    fastMinSampleCount: Number.isFinite(Number(throttleProfile.fastMinSampleCount)) && Number(throttleProfile.fastMinSampleCount) >= 0
+      ? Number(throttleProfile.fastMinSampleCount)
+      : 4,
+    cleanupProbability: throttleCleanupProbability,
+    protectedHttpCodes: Array.isArray(throttleProfile.protectHttpCodes)
+      ? throttleProfile.protectHttpCodes
+          .map((code) => Number(code))
+          .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
+      : [],
+  };
+  throttleConfig.fastErrorRatioPercent = throttleConfig.fastErrorRatioPercent
+    || throttleConfig.errorRatioPercent;
 
-  if (dbMode === 'custom-pg-rest' && ipSubnetLimit > 0 && windowTimeSeconds <= 0) {
-    throw new Error('WINDOW_TIME must be greater than zero when IPSUBNET_WINDOWTIME_LIMIT > 0');
+  // fair queue from controller + decision
+  const fairQueueConfigRaw = downloadBootstrap.fairQueue && typeof downloadBootstrap.fairQueue === 'object'
+    ? downloadBootstrap.fairQueue
+    : {};
+  const fairQueueProfiles = fairQueueConfigRaw.profiles && typeof fairQueueConfigRaw.profiles === 'object'
+    ? fairQueueConfigRaw.profiles
+    : {};
+  const fairQueueProfileName = typeof downloadDecision?.fairQueueProfile === 'string' && downloadDecision.fairQueueProfile.trim() !== ''
+    ? downloadDecision.fairQueueProfile.trim()
+    : 'default';
+  const fairQueueProfile = fairQueueProfiles[fairQueueProfileName] || fairQueueProfiles.default || {};
+  const fairQueueHostnamePatterns = Array.isArray(fairQueueConfigRaw.hostPatterns)
+    ? fairQueueConfigRaw.hostPatterns.map((p) => normalizeString(p)).filter((p) => p.length > 0)
+    : [];
+  const fairQueueEnabled = Boolean(fairQueueConfigRaw.enabled) && fairQueueHostnamePatterns.length > 0;
+  const queueWaitTimeoutMsRaw = Number(fairQueueConfigRaw.queueWaitTimeoutMs);
+  const queueWaitTimeoutMs = Number.isFinite(queueWaitTimeoutMsRaw) && queueWaitTimeoutMsRaw > 0
+    ? queueWaitTimeoutMsRaw
+    : DEFAULT_FQ_QUEUE_WAIT_MS;
+  const slotHandlerTimeoutMsRaw = Number(fairQueueConfigRaw.slotHandlerTimeoutMs);
+  const slotHandlerTimeoutMs = Number.isFinite(slotHandlerTimeoutMsRaw) && slotHandlerTimeoutMsRaw > 0
+    ? slotHandlerTimeoutMsRaw
+    : DEFAULT_SLOT_HANDLER_TIMEOUT_MS;
+  const perRequestTimeoutMsRaw = Number(fairQueueConfigRaw.perRequestTimeoutMs);
+  const perRequestTimeoutMs = Number.isFinite(perRequestTimeoutMsRaw) && perRequestTimeoutMsRaw > 0
+    ? perRequestTimeoutMsRaw
+    : DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS;
+  const maxAttemptsCapRaw = Number(fairQueueConfigRaw.maxAttemptsCap);
+  const maxAttemptsCap = Number.isFinite(maxAttemptsCapRaw) && maxAttemptsCapRaw > 0
+    ? maxAttemptsCapRaw
+    : DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS;
+  const slotHandlerUrl = normalizeString(fairQueueConfigRaw.slotHandlerUrl);
+  const slotHandlerAuthKey = normalizeString(fairQueueConfigRaw.slotHandlerAuthKey);
+  if (fairQueueEnabled && !slotHandlerUrl) {
+    throw new Error('controller fairQueue.slotHandlerUrl is required when fairQueue.enabled is true');
   }
+  const fairQueueProfileNormalized = {
+    maxWaitMs: Number(fairQueueProfile.maxWaitMs) > 0 ? Number(fairQueueProfile.maxWaitMs) : queueWaitTimeoutMs,
+    maxSlotPerHost: Number(fairQueueProfile.maxSlotPerHost) > 0 ? Number(fairQueueProfile.maxSlotPerHost) : 8,
+    maxSlotPerIp: Number(fairQueueProfile.maxSlotPerIp) > 0 ? Number(fairQueueProfile.maxSlotPerIp) : 3,
+    maxWaitersPerIp: Number(fairQueueProfile.maxWaitersPerIp) > 0 ? Number(fairQueueProfile.maxWaitersPerIp) : 8,
+  };
+  const fairQueueConfig = {
+    queueWaitTimeoutMs,
+    profile: fairQueueProfileName,
+    slotHandlerTimeoutMs,
+    profileConfig: fairQueueProfileNormalized,
+  };
+  const slotHandlerConfig = {
+    url: slotHandlerUrl,
+    totalMaxWaitMs: slotHandlerTimeoutMs,
+    perRequestTimeoutMs,
+    maxAttemptsCap,
+    authKey: slotHandlerAuthKey,
+  };
+  const fairQueueContext = {
+    fairQueueEnabled,
+    fairQueueHostnamePatterns,
+    fairQueueConfig,
+  };
 
-  if (ipRateLimitActive) {
-    if (!postgrestUrl || verifyHeaders.length === 0 || verifySecrets.length === 0) {
-      throw new Error('Rate limiting requires POSTGREST_URL, VERIFY_HEADER, and VERIFY_SECRET when DB_MODE is "custom-pg-rest"');
-    }
-    rateLimitEnabled = true;
-    rateLimitConfig = {
-      postgrestUrl,
-      verifyHeader: verifyHeaders,
-      verifySecret: verifySecrets,
-      tableName: rateLimitTableName,
-      windowTimeSeconds,
-      limit: ipSubnetLimit,
-      ipv4Suffix,
-      ipv6Suffix,
-      pgErrorHandle,
-      cleanupProbability,
-      blockTimeSeconds,
-    };
-  }
+  const enableCfRatelimiter = normalizeString(env.ENABLE_CF_RATELIMITER, 'false').toLowerCase() === 'true';
+  const cfRatelimiterBinding = normalizeString(env.CF_RATELIMITER_BINDING, 'CF_RATE_LIMITER');
 
   if (enableCfRatelimiter) {
     const ratelimiter = env[cfRatelimiterBinding];
@@ -264,64 +306,19 @@ const resolveConfig = (env = {}) => {
     }
   }
 
-  // Fair Upstream Queue Configuration
-  const fairQueueEnabled = parseBoolean(env.FAIR_QUEUE_ENABLED, false);
-  const fairQueueHostPatternsRaw = normalizeString(env.FAIR_QUEUE_HOST_PATTERNS, '');
-  const fairQueueHostnamePatterns = fairQueueHostPatternsRaw
-    ? fairQueueHostPatternsRaw.split(',').map((p) => p.trim()).filter((p) => p.length > 0)
-    : [];
-  const fairQueueSlotHandlerUrl = normalizeString(env.FAIR_QUEUE_SLOT_HANDLER_URL, '');
-  const fairQueueWaitTimeoutMs = parseIntegerStrict(
-    env.FAIR_QUEUE_MAX_WAIT_MS,
-    15000,
-    'FAIR_QUEUE_MAX_WAIT_MS'
-  );
-  if (fairQueueWaitTimeoutMs <= 0) {
-    throw new Error('FAIR_QUEUE_MAX_WAIT_MS must be greater than 0');
-  }
-  const slotHandlerMaxWaitLabel = 'FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS';
-  const slotHandlerMaxWaitSource = env.FAIR_QUEUE_SLOT_HANDLER_TIMEOUT_MS;
-  const slotHandlerDefaultTotalMaxWaitMs =
-    fairQueueWaitTimeoutMs > 0 ? fairQueueWaitTimeoutMs + 5000 : 20000;
-  const slotHandlerTotalMaxWaitMs = parseIntegerStrict(
-    slotHandlerMaxWaitSource,
-    slotHandlerDefaultTotalMaxWaitMs,
-    slotHandlerMaxWaitLabel
-  );
-  if (slotHandlerTotalMaxWaitMs <= 0) {
-    throw new Error(`${slotHandlerMaxWaitLabel} must be greater than 0`);
-  }
-  const slotHandlerPerRequestTimeoutMs = parseInteger(
-    env.SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS,
-    8000
-  );
-  if (slotHandlerPerRequestTimeoutMs <= 0) {
-    throw new Error('SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS must be greater than 0');
-  }
-  const slotHandlerMaxAttemptsCapRaw = parseInteger(env.SLOT_HANDLER_MAX_ATTEMPTS_CAP, 35);
-  const slotHandlerMaxAttemptsCap = slotHandlerMaxAttemptsCapRaw > 0 ? slotHandlerMaxAttemptsCapRaw : 35;
-  const fairQueueSlotHandlerAuthKey = normalizeString(env.FAIR_QUEUE_SLOT_HANDLER_AUTH_KEY, '');
-  const actualFairQueueEnabled = fairQueueEnabled && fairQueueHostnamePatterns.length > 0;
-  if (fairQueueEnabled && fairQueueHostnamePatterns.length === 0) {
-    console.warn('[Fair Queue] Disabled: HOST_PATTERNS empty');
-  }
-  if (fairQueueEnabled && !fairQueueSlotHandlerUrl) {
-    console.error('[Fair Queue] slot-handler enabled but FAIR_QUEUE_SLOT_HANDLER_URL is missing');
-  }
-
   return {
-    address: String(env.ADDRESS).trim(),
-    token: String(env.TOKEN).trim(),
-    workerAddress: String(env.WORKER_ADDRESS).trim(),
-    verifyHeader: verifyHeaders,
-    verifySecret: verifySecrets,
-    signSecret: env.SIGN_SECRET && env.SIGN_SECRET.trim() !== '' ? env.SIGN_SECRET : env.TOKEN,
-    signCheck: parseBoolean(env.SIGN_CHECK, true),
-    hashCheck: parseBoolean(env.HASH_CHECK, true),
-    workerCheck: parseBoolean(env.WORKER_CHECK, true),
-    additionCheck: parseBoolean(env.ADDITION_CHECK, true),
-    additionExpireTimeCheck: parseBoolean(env.ADDITION_EXPIRETIME_CHECK, true),
-    ipv4Only: parseBoolean(env.IPV4_ONLY, true),
+    address,
+    token,
+    workerAddress,
+    verifyHeader,
+    verifySecret,
+    signSecret,
+    signCheck,
+    hashCheck,
+    workerCheck,
+    additionCheck,
+    additionExpireTimeCheck,
+    ipv4Only,
     dbMode,
     cacheEnabled,
     cacheConfig,
@@ -330,27 +327,19 @@ const resolveConfig = (env = {}) => {
     throttleConfig,
     rateLimitEnabled,
     rateLimitConfig,
-    slotHandlerConfig: {
-      url: fairQueueSlotHandlerUrl,
-      totalMaxWaitMs: slotHandlerTotalMaxWaitMs,
-      perRequestTimeoutMs: slotHandlerPerRequestTimeoutMs,
-      maxAttemptsCap: slotHandlerMaxAttemptsCap,
-      authKey: fairQueueSlotHandlerAuthKey,
-    },
+    slotHandlerConfig,
     windowTime,
     ipSubnetLimit,
     enableCfRatelimiter,
     cfRatelimiterBinding,
-    ipv4Suffix,
-    ipv6Suffix,
-    pgErrorHandle,
+    ipv4Suffix: rateLimitConfig.ipv4Suffix,
+    ipv6Suffix: rateLimitConfig.ipv6Suffix,
+    pgErrorHandle: rateLimitConfig.pgErrorHandle,
     idleTimeout: idleTimeoutSeconds,
     lastActiveTableName,
-    fairQueueEnabled: actualFairQueueEnabled,
-    fairQueueHostnamePatterns,
-    fairQueueConfig: {
-      queueWaitTimeoutMs: fairQueueWaitTimeoutMs,
-    },
+    fairQueueEnabled: fairQueueContext.fairQueueEnabled,
+    fairQueueHostnamePatterns: fairQueueContext.fairQueueHostnamePatterns,
+    fairQueueConfig: fairQueueContext.fairQueueConfig,
   };
 };
 
@@ -1823,20 +1812,23 @@ export default {
         return internalResponse;
       }
 
-      const config = resolveConfig(env || {});
-      // Create cache manager instance based on DB_MODE
-      const cacheManager = config.cacheEnabled ? createCacheManager(config.dbMode) : null;
-      // Create throttle manager instance based on DB_MODE (if throttle enabled)
-      const throttleManager = config.throttleEnabled ? createThrottleManager(config.dbMode) : null;
-      const rateLimiter = config.rateLimitEnabled ? createRateLimiter(config.dbMode) : null;
-
-      // 预拉取 controller bootstrap/decision 便于后续切换策略来源，不影响现有流程。
       let controllerState = null;
       try {
         controllerState = await fetchControllerState(request, env);
       } catch (error) {
         console.error('[controller] state fetch error:', error instanceof Error ? error.message : String(error));
       }
+      if (!controllerState || !controllerState.bootstrap || !controllerState.decision) {
+        return createErrorResponse("*", 503, "controller state unavailable");
+      }
+
+      const config = resolveConfig(env || {}, controllerState.bootstrap, controllerState.decision);
+      // Create cache manager instance based on DB_MODE
+      const cacheManager = config.cacheEnabled ? createCacheManager(config.dbMode) : null;
+      // Create throttle manager instance based on DB_MODE (if throttle enabled)
+      const throttleManager = config.throttleEnabled ? createThrottleManager(config.dbMode) : null;
+      const rateLimiter = config.rateLimitEnabled ? createRateLimiter(config.dbMode) : null;
+
       ctx.controllerState = controllerState;
 
       const response = await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
