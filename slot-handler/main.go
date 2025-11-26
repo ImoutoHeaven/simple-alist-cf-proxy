@@ -272,13 +272,46 @@ func (sr *smoothHostReleaser) nextReleaseAfter(base time.Time, interval time.Dur
 	return next
 }
 
+type runtimeMeta struct {
+	appName    string
+	appVersion string
+	env        string
+	role       string
+	instanceID string
+}
+
 type server struct {
-	cfg             Config
-	backend         queueBackend
-	log             *logger
-	sessionStore    sessionStore
-	smoothMu        sync.Mutex
-	smoothReleasers map[string]*smoothHostReleaser
+	mu               sync.RWMutex
+	cfg              *Config
+	backend          queueBackend
+	log              *logger
+	sessionStore     sessionStore
+	smoothMu         sync.Mutex
+	smoothReleasers  map[string]*smoothHostReleaser
+	controller       *controllerEnv
+	meta             runtimeMeta
+	internalAPIToken string
+}
+
+func (s *server) getConfig() *Config {
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	return cfg
+}
+
+func (s *server) getBackend() queueBackend {
+	s.mu.RLock()
+	backend := s.backend
+	s.mu.RUnlock()
+	return backend
+}
+
+func (s *server) updateRuntime(cfg *Config, backend queueBackend) {
+	s.mu.Lock()
+	s.cfg = cfg
+	s.backend = backend
+	s.mu.Unlock()
 }
 
 type logger struct {
@@ -471,20 +504,63 @@ func sanitizeThrottleWindowSeconds(v int) int {
 	return 60
 }
 
-func loadConfig(path string) (Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Config{}, err
+type controllerEnv struct {
+	Env        string
+	Role       string
+	InstanceID string
+	AppName    string
+	AppVersion string
+	URL        string
+	APIPrefix  string
+	APIToken   string
+}
+
+type controllerBootstrap struct {
+	ConfigVersion string `json:"configVersion"`
+	SlotHandler   Config `json:"slotHandler"`
+}
+
+func readControllerEnv() controllerEnv {
+	prefix := strings.TrimSpace(os.Getenv("CONTROLLER_API_PREFIX"))
+	if prefix == "" {
+		prefix = "/api/v0"
 	}
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return Config{}, err
+	role := strings.TrimSpace(os.Getenv("ROLE"))
+	if role == "" {
+		role = "slot-handler"
 	}
 
+	return controllerEnv{
+		Env:        strings.TrimSpace(os.Getenv("ENV")),
+		Role:       role,
+		InstanceID: strings.TrimSpace(os.Getenv("INSTANCE_ID")),
+		AppName:    strings.TrimSpace(os.Getenv("APP_NAME")),
+		AppVersion: strings.TrimSpace(os.Getenv("APP_VERSION")),
+		URL:        strings.TrimSpace(os.Getenv("CONTROLLER_URL")),
+		APIPrefix:  prefix,
+		APIToken:   strings.TrimSpace(os.Getenv("CONTROLLER_API_TOKEN")),
+	}
+}
+
+func (c controllerEnv) enabled() bool {
+	return strings.TrimSpace(c.URL) != ""
+}
+
+func (c controllerEnv) bootstrapURL() string {
+	prefix := strings.Trim(c.APIPrefix, "/")
+	if prefix == "" {
+		prefix = "api/v0"
+	}
+	return strings.TrimSuffix(c.URL, "/") + "/" + prefix + "/bootstrap"
+}
+
+func parseConfigBytes(data []byte) (Config, error) {
+	var cfg Config
 	var cleanupEnabledProvided bool
 	var cleanupIntervalProvided bool
 	var maxWaitersPerHostProvided bool
 	var raw map[string]json.RawMessage
+
 	if err := json.Unmarshal(data, &raw); err == nil {
 		if fqRaw, ok := raw["fairQueue"]; ok {
 			var fq map[string]json.RawMessage
@@ -507,6 +583,10 @@ func loadConfig(path string) (Config, error) {
 		}
 	}
 
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, err
+	}
+
 	if strings.TrimSpace(cfg.Listen) == "" {
 		cfg.Listen = ":8080"
 	}
@@ -523,18 +603,225 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
+func validateConfig(cfg Config) (Config, error) {
+	mode := strings.ToLower(strings.TrimSpace(cfg.Backend.Mode))
+	if mode == "" {
+		mode = "postgrest"
+	}
+	cfg.Backend.Mode = mode
+
+	if cfg.Auth.Enabled && strings.TrimSpace(cfg.Auth.Token) == "" {
+		return cfg, errors.New("auth.token is required when auth.enabled is true")
+	}
+
+	switch mode {
+	case "postgrest":
+		if strings.TrimSpace(cfg.Backend.Postgrest.BaseURL) == "" {
+			return cfg, errors.New("backend.postgrest.baseUrl is required when mode=postgrest")
+		}
+	case "postgres":
+		if strings.TrimSpace(cfg.Backend.Postgres.DSN) == "" {
+			return cfg, errors.New("backend.postgres.dsn is required when mode=postgres")
+		}
+	default:
+		return cfg, fmt.Errorf("backend.mode must be postgrest or postgres, got %s", mode)
+	}
+
+	if strings.TrimSpace(cfg.FairQueue.RPC.TryAcquireFunc) == "" {
+		return cfg, errors.New("fairQueue.rpc.tryAcquireFunc is required")
+	}
+	if strings.TrimSpace(cfg.FairQueue.RPC.ReleaseFunc) == "" {
+		return cfg, errors.New("fairQueue.rpc.releaseFunc is required")
+	}
+
+	return cfg, nil
+}
+
+func parseAndValidateConfig(data []byte) (Config, error) {
+	cfg, err := parseConfigBytes(data)
+	if err != nil {
+		return Config{}, err
+	}
+	return validateConfig(cfg)
+}
+
+func loadConfig(path string) (Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, err
+	}
+	return parseAndValidateConfig(data)
+}
+
+func loadConfigFromController(ctx context.Context, env controllerEnv) (Config, string, error) {
+	if !env.enabled() {
+		return Config{}, "", errors.New("controller bootstrap requested but CONTROLLER_URL is empty")
+	}
+	if strings.TrimSpace(env.Env) == "" {
+		return Config{}, "", errors.New("ENV is required for controller bootstrap")
+	}
+	if strings.TrimSpace(env.APIToken) == "" {
+		return Config{}, "", errors.New("CONTROLLER_API_TOKEN is required for controller bootstrap")
+	}
+
+	role := env.Role
+	if role == "" {
+		role = "slot-handler"
+	}
+
+	body := map[string]any{
+		"role":        role,
+		"env":         env.Env,
+		"instance_id": env.InstanceID,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return Config{}, "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, env.bootstrapURL(), bytes.NewReader(payload))
+	if err != nil {
+		return Config{}, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+env.APIToken)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return Config{}, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return Config{}, "", fmt.Errorf("controller bootstrap failed: status=%d body=%s", resp.StatusCode, string(data))
+	}
+
+	var boot controllerBootstrap
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&boot); err != nil {
+		return Config{}, "", fmt.Errorf("decode controller bootstrap: %w", err)
+	}
+
+	cfgBytes, err := json.Marshal(boot.SlotHandler)
+	if err != nil {
+		return Config{}, boot.ConfigVersion, fmt.Errorf("marshal slotHandler config: %w", err)
+	}
+
+	cfg, err := parseAndValidateConfig(cfgBytes)
+	if err != nil {
+		return Config{}, boot.ConfigVersion, err
+	}
+
+	return cfg, boot.ConfigVersion, nil
+}
+
 func (s *server) authPassed(r *http.Request) bool {
-	if !s.cfg.Auth.Enabled {
+	cfg := s.getConfig()
+	if cfg == nil {
+		return false
+	}
+	if !cfg.Auth.Enabled || strings.TrimSpace(cfg.Auth.Token) == "" {
 		return true
 	}
-	if s.cfg.Auth.Token == "" {
-		return true
-	}
-	headerName := s.cfg.Auth.Header
+	headerName := cfg.Auth.Header
 	if headerName == "" {
 		headerName = "X-FQ-Auth"
 	}
-	return r.Header.Get(headerName) == s.cfg.Auth.Token
+	return r.Header.Get(headerName) == cfg.Auth.Token
+}
+
+func (s *server) internalAuthPassed(r *http.Request) bool {
+	token := strings.TrimSpace(s.internalAPIToken)
+	if token == "" {
+		return false
+	}
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer ")) == token
+}
+
+func (s *server) handleInternalHealth(w http.ResponseWriter, r *http.Request) {
+	if !s.internalAuthPassed(r) {
+		http.NotFound(w, r)
+		return
+	}
+
+	if s.meta.appName != "" {
+		w.Header().Set("X-App-Name", s.meta.appName)
+	}
+	if s.meta.appVersion != "" {
+		w.Header().Set("X-App-Version", s.meta.appVersion)
+	}
+	if s.meta.env != "" {
+		w.Header().Set("X-Env", s.meta.env)
+	}
+	if s.meta.role != "" {
+		w.Header().Set("X-Role", s.meta.role)
+	}
+	if s.meta.instanceID != "" {
+		w.Header().Set("X-Instance-Id", s.meta.instanceID)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) handleInternalRefresh(w http.ResponseWriter, r *http.Request) {
+	if !s.internalAuthPassed(r) {
+		http.NotFound(w, r)
+		return
+	}
+	defer r.Body.Close()
+
+	var reqBody struct {
+		Targets []string `json:"targets"`
+		Mode    string   `json:"mode"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&reqBody)
+
+	targets := reqBody.Targets
+	if len(targets) == 0 {
+		targets = []string{"all"}
+	}
+
+	shouldReload := false
+	for _, t := range targets {
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "all", "config", "bootstrap", "fairqueue":
+			shouldReload = true
+		}
+	}
+
+	if shouldReload && s.controller != nil && s.controller.enabled() {
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		cfg, version, err := loadConfigFromController(ctx, *s.controller)
+		cancel()
+		if err != nil {
+			s.log.Errorf("refresh from controller failed: %v", err)
+			http.Error(w, "refresh failed", http.StatusBadGateway)
+			return
+		}
+		backend, err := newBackend(cfg, s.log)
+		if err != nil {
+			s.log.Errorf("refresh backend init failed: %v", err)
+			http.Error(w, "refresh failed", http.StatusInternalServerError)
+			return
+		}
+		s.updateRuntime(&cfg, backend)
+		s.log.Infof("config refreshed from controller version=%s", version)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) handleInternalFlush(w http.ResponseWriter, r *http.Request) {
+	if !s.internalAuthPassed(r) {
+		http.NotFound(w, r)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
@@ -646,11 +933,20 @@ func (s *server) handleAcquireSlot(ctx context.Context, req AcquireRequest) (*Ac
 }
 
 func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
+	cfg := s.getConfig()
+	if cfg == nil {
+		return nil, errors.New("config not loaded")
+	}
+	backend := s.getBackend()
+	if backend == nil {
+		return nil, errors.New("backend not initialized")
+	}
+
 	now := time.Now()
 	throttleWindow := sanitizeThrottleWindowSeconds(req.ThrottleTimeWindow)
-	backendReq := s.buildAcquireRequest(req.Hostname, req.HostnameHash, req.IPBucket, throttleWindow, now)
+	backendReq := s.buildAcquireRequest(cfg, req.Hostname, req.HostnameHash, req.IPBucket, throttleWindow, now)
 
-	throttleRes, err := s.backend.CheckThrottle(ctx, backendReq)
+	throttleRes, err := backend.CheckThrottle(ctx, backendReq)
 	if err != nil {
 		return nil, err
 	}
@@ -694,6 +990,15 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 }
 
 func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
+	cfg := s.getConfig()
+	if cfg == nil {
+		return nil, errors.New("config not loaded")
+	}
+	backend := s.getBackend()
+	if backend == nil {
+		return nil, errors.New("backend not initialized")
+	}
+
 	token := strings.TrimSpace(req.QueryToken)
 	sess, ok := s.sessionStore.Load(token)
 	if !ok || sess == nil {
@@ -706,7 +1011,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 
 	now := time.Now()
 
-	idleLimit := s.cfg.FairQueue.sessionIdleDuration()
+	idleLimit := cfg.FairQueue.sessionIdleDuration()
 	if idleLimit > 0 && now.Sub(sess.LastSeenAt) > idleLimit {
 		s.log.Infof(
 			"session idle-timeout token=%s host=%s ip=%s idle_ms=%d",
@@ -717,7 +1022,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
 
-	maxWait := s.cfg.FairQueue.maxWaitDuration()
+	maxWait := cfg.FairQueue.maxWaitDuration()
 	if now.Sub(sess.CreatedAt) >= maxWait {
 		s.log.Infof(
 			"session max-wait-timeout token=%s host=%s ip=%s wait_ms=%d",
@@ -764,8 +1069,8 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
 
-	budget := s.cfg.FairQueue.pollWindowDuration()
-	if err := s.runQueueCycle(ctx, sess, budget); err != nil {
+	budget := cfg.FairQueue.pollWindowDuration()
+	if err := s.runQueueCycle(ctx, cfg, backend, sess, budget); err != nil {
 		if errors.Is(err, context.Canceled) {
 			s.log.Infof("runQueueCycle canceled token=%s host=%s ip=%s", sess.Token, sess.Hostname, sess.IPBucket)
 		} else {
@@ -816,17 +1121,17 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 	}
 }
 
-func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time.Duration) error {
+func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBackend, sess *FQSession, budget time.Duration) error {
 	start := time.Now()
-	pollInterval := s.cfg.FairQueue.pollInterval()
+	pollInterval := cfg.FairQueue.pollInterval()
 	s.log.Debugf(
 		"runQueueCycle start token=%s host=%s ip=%s waiterRegistered=%v budget_ms=%d poll_ms=%d",
 		sess.Token, sess.Hostname, sess.IPBucket, sess.WaiterRegistered,
 		budget.Milliseconds(), pollInterval.Milliseconds(),
 	)
 
-	hostCap := s.cfg.FairQueue.maxWaitersPerHost()
-	ipCap := s.cfg.FairQueue.maxWaitersPerIP()
+	hostCap := cfg.FairQueue.maxWaitersPerHost()
+	ipCap := cfg.FairQueue.maxWaitersPerIP()
 
 	if sess.IPBucket != "" && (ipCap > 0 || hostCap > 0) && !sess.WaiterRegistered {
 		for {
@@ -834,8 +1139,8 @@ func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time
 				return nil
 			}
 
-			req := s.buildAcquireRequest(sess.Hostname, sess.HostnameHash, sess.IPBucket, sess.ThrottleTimeWindow, time.Now())
-			regRes, err := s.backend.RegisterWaiter(ctx, req)
+			req := s.buildAcquireRequest(cfg, sess.Hostname, sess.HostnameHash, sess.IPBucket, sess.ThrottleTimeWindow, time.Now())
+			regRes, err := backend.RegisterWaiter(ctx, req)
 			if err != nil {
 				s.log.Warnf("register waiter error: %v", err)
 				return err
@@ -867,8 +1172,8 @@ func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time
 			return nil
 		}
 
-		req := s.buildAcquireRequest(sess.Hostname, sess.HostnameHash, sess.IPBucket, sess.ThrottleTimeWindow, time.Now())
-		tryRes, err := s.backend.TryAcquire(ctx, req)
+		req := s.buildAcquireRequest(cfg, sess.Hostname, sess.HostnameHash, sess.IPBucket, sess.ThrottleTimeWindow, time.Now())
+		tryRes, err := backend.TryAcquire(ctx, req)
 		if err != nil {
 			s.log.Warnf("tryAcquire error: %v", err)
 			return err
@@ -910,26 +1215,38 @@ func (s *server) runQueueCycle(ctx context.Context, sess *FQSession, budget time
 	}
 }
 
-func (s *server) buildAcquireRequest(hostname, hostnameHash, ipBucket string, throttleTimeWindow int, now time.Time) AcquireRequest {
+func (s *server) buildAcquireRequest(cfg *Config, hostname, hostnameHash, ipBucket string, throttleTimeWindow int, now time.Time) AcquireRequest {
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	fq := cfg.FairQueue
+
 	return AcquireRequest{
 		Hostname:             hostname,
 		HostnameHash:         hostnameHash,
 		IPBucket:             ipBucket,
 		Now:                  now.UnixMilli(),
 		ThrottleTimeWindow:   sanitizeThrottleWindowSeconds(throttleTimeWindow),
-		MaxSlotPerHost:       s.cfg.FairQueue.maxSlotPerHost(),
-		MaxSlotPerIP:         s.cfg.FairQueue.maxSlotPerIP(),
-		MaxWaitersPerHost:    s.cfg.FairQueue.maxWaitersPerHost(),
-		MaxWaitersPerIP:      s.cfg.FairQueue.maxWaitersPerIP(),
-		ZombieTimeoutSeconds: s.cfg.FairQueue.zombieTimeoutSeconds(),
-		CooldownSeconds:      s.cfg.FairQueue.cooldownSeconds(),
+		MaxSlotPerHost:       fq.maxSlotPerHost(),
+		MaxSlotPerIP:         fq.maxSlotPerIP(),
+		MaxWaitersPerHost:    fq.maxWaitersPerHost(),
+		MaxWaitersPerIP:      fq.maxWaitersPerIP(),
+		ZombieTimeoutSeconds: fq.zombieTimeoutSeconds(),
+		CooldownSeconds:      fq.cooldownSeconds(),
 	}
 }
 
 func (s *server) cleanupSession(sess *FQSession) {
+	cfg := s.getConfig()
+	backend := s.getBackend()
+
 	token := sess.Token
-	hostCap := s.cfg.FairQueue.maxWaitersPerHost()
-	ipCap := s.cfg.FairQueue.maxWaitersPerIP()
+	hostCap := 0
+	ipCap := 0
+	if cfg != nil {
+		hostCap = cfg.FairQueue.maxWaitersPerHost()
+		ipCap = cfg.FairQueue.maxWaitersPerIP()
+	}
 	shouldReleaseWaiter := sess.WaiterRegistered && sess.IPBucket != "" && (ipCap > 0 || hostCap > 0)
 	hostname := sess.Hostname
 	hostnameHash := sess.HostnameHash
@@ -940,8 +1257,12 @@ func (s *server) cleanupSession(sess *FQSession) {
 
 	if shouldReleaseWaiter {
 		go func() {
-			req := s.buildAcquireRequest(hostname, hostnameHash, ipBucket, sess.ThrottleTimeWindow, time.Now())
-			if err := s.backend.ReleaseWaiter(context.Background(), req); err != nil {
+			req := s.buildAcquireRequest(cfg, hostname, hostnameHash, ipBucket, sess.ThrottleTimeWindow, time.Now())
+			if backend == nil {
+				s.log.Warnf("skip release waiter host=%s ip=%s: backend nil", hostname, ipBucket)
+				return
+			}
+			if err := backend.ReleaseWaiter(context.Background(), req); err != nil {
 				s.log.Warnf("release waiter failed: %v", err)
 			} else {
 				s.log.Debugf("waiter released host=%s ip=%s token=%s", hostname, ipBucket, token)
@@ -960,8 +1281,19 @@ func (s *server) deleteSessionLocked(sess *FQSession) {
 }
 
 func (s *server) handleGrantedLocked(sess *FQSession) {
-	hostCap := s.cfg.FairQueue.maxWaitersPerHost()
-	ipCap := s.cfg.FairQueue.maxWaitersPerIP()
+	cfg := s.getConfig()
+	backend := s.getBackend()
+
+	hostCap := 0
+	ipCap := 0
+	if cfg != nil {
+		hostCap = cfg.FairQueue.maxWaitersPerHost()
+		ipCap = cfg.FairQueue.maxWaitersPerIP()
+	}
+	cleanupDelay := 5 * time.Second
+	if cfg != nil {
+		cleanupDelay = cfg.FairQueue.grantedCleanupDelay()
+	}
 	shouldReleaseWaiter := sess.WaiterRegistered && sess.IPBucket != "" && (ipCap > 0 || hostCap > 0)
 
 	if shouldReleaseWaiter {
@@ -973,8 +1305,12 @@ func (s *server) handleGrantedLocked(sess *FQSession) {
 		throttleWindow := sess.ThrottleTimeWindow
 
 		go func() {
-			req := s.buildAcquireRequest(hostname, hostnameHash, ipBucket, throttleWindow, time.Now())
-			if err := s.backend.ReleaseWaiter(context.Background(), req); err != nil {
+			req := s.buildAcquireRequest(cfg, hostname, hostnameHash, ipBucket, throttleWindow, time.Now())
+			if backend == nil {
+				s.log.Warnf("release waiter (granted) skipped host=%s ip=%s: backend nil", hostname, ipBucket)
+				return
+			}
+			if err := backend.ReleaseWaiter(context.Background(), req); err != nil {
 				s.log.Warnf("release waiter (granted) failed: %v", err)
 			} else {
 				s.log.Debugf("waiter released (granted) host=%s ip=%s token=%s", hostname, ipBucket, token)
@@ -984,18 +1320,24 @@ func (s *server) handleGrantedLocked(sess *FQSession) {
 
 	if !sess.CleanupScheduled {
 		sess.CleanupScheduled = true
-		go func(sess *FQSession) {
-			time.Sleep(s.cfg.FairQueue.grantedCleanupDelay())
+		go func(sess *FQSession, delay time.Duration) {
+			time.Sleep(delay)
 			sess.mu.Lock()
 			defer sess.mu.Unlock()
 			s.deleteSessionLocked(sess)
-		}(sess)
+		}(sess, cleanupDelay)
 	}
 }
 
 func (s *server) releaseSlotForSession(ctx context.Context, hostname, hostnameHash, ipBucket, slotToken, token string) {
 	if ctx == nil || ctx.Err() != nil {
 		ctx = context.Background()
+	}
+
+	backend := s.getBackend()
+	if backend == nil {
+		s.log.Warnf("release slot (cancel) skipped host=%s ip=%s: backend nil", hostname, ipBucket)
+		return
 	}
 
 	req := ReleaseRequest{
@@ -1006,7 +1348,7 @@ func (s *server) releaseSlotForSession(ctx context.Context, hostname, hostnameHa
 		Now:          time.Now().UnixMilli(),
 	}
 
-	if err := s.backend.ReleaseSlot(ctx, req); err != nil {
+	if err := backend.ReleaseSlot(ctx, req); err != nil {
 		s.log.Warnf("release slot (cancel) failed token=%s host=%s ip=%s: %v",
 			token, hostname, ipBucket, err)
 	} else {
@@ -1030,46 +1372,74 @@ func (s *server) startSessionGC(ctx context.Context) {
 }
 
 func (s *server) startFairQueueCleanup(ctx context.Context) {
-	c := s.cfg.FairQueue.Cleanup
-	if !c.Enabled {
-		s.log.Infof("fairqueue cleanup disabled")
-		return
-	}
-
-	interval := s.cfg.FairQueue.cleanupInterval()
-	if interval <= 0 {
-		s.log.Infof("fairqueue cleanup disabled (interval<=0)")
-		return
-	}
-	s.log.Infof("fairqueue cleanup interval=%s", interval)
-
-	ticker := time.NewTicker(interval)
 	go func() {
-		defer ticker.Stop()
+		var timer *time.Timer
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if err := s.runFairQueueCleanup(ctx); err != nil {
-					s.log.Warnf("fairqueue cleanup error: %v", err)
+			cfg := s.getConfig()
+			interval := time.Minute
+			if cfg != nil {
+				if iv := cfg.FairQueue.cleanupInterval(); iv > 0 {
+					interval = iv
 				}
 			}
+
+			if timer == nil {
+				timer = time.NewTimer(interval)
+			} else {
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(interval)
+			}
+
+			select {
+			case <-ctx.Done():
+				if timer != nil {
+					timer.Stop()
+				}
+				return
+			case <-timer.C:
+			}
+
+			cfg = s.getConfig()
+			if cfg == nil || !cfg.FairQueue.Cleanup.Enabled || cfg.FairQueue.cleanupInterval() <= 0 {
+				continue
+			}
+
+			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := s.runFairQueueCleanup(cctx, cfg); err != nil {
+				s.log.Warnf("fairqueue cleanup error: %v", err)
+			}
+			cancel()
 		}
 	}()
 }
 
-func (s *server) runFairQueueCleanup(ctx context.Context) error {
-	if backend, ok := s.backend.(fairQueueCleanupBackend); ok {
-		return backend.CleanupFairQueue(ctx, s.cfg.FairQueue)
+func (s *server) runFairQueueCleanup(ctx context.Context, cfg *Config) error {
+	if cfg == nil {
+		return errors.New("config not loaded")
+	}
+
+	backend := s.getBackend()
+	if backend == nil {
+		return errors.New("backend not initialized")
+	}
+
+	if cleanupBackend, ok := backend.(fairQueueCleanupBackend); ok {
+		return cleanupBackend.CleanupFairQueue(ctx, cfg.FairQueue)
 	}
 	return nil
 }
 
 func (s *server) gcSessions() {
+	cfg := s.getConfig()
+	if cfg == nil {
+		return
+	}
+
 	now := time.Now()
-	idleLimit := s.cfg.FairQueue.sessionIdleDuration()
-	maxWait := s.cfg.FairQueue.maxWaitDuration()
+	idleLimit := cfg.FairQueue.sessionIdleDuration()
+	maxWait := cfg.FairQueue.maxWaitDuration()
 
 	s.sessionStore.Range(func(token string, sess *FQSession) bool {
 		sess.mu.Lock()
@@ -1110,7 +1480,16 @@ func (s *server) getSmoothReleaser(hostnameHash, hostname string) *smoothHostRel
 }
 
 func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
-	minHoldMs := s.cfg.FairQueue.minHold(0)
+	cfg := s.getConfig()
+	if cfg == nil {
+		return errors.New("config not loaded")
+	}
+	backend := s.getBackend()
+	if backend == nil {
+		return errors.New("backend not initialized")
+	}
+
+	minHoldMs := cfg.FairQueue.minHold(0)
 
 	hitAt := time.UnixMilli(req.HitUpstreamAt)
 	if req.HitUpstreamAt == 0 || hitAt.IsZero() {
@@ -1124,7 +1503,7 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 		baseTime = now
 	}
 
-	interval := s.cfg.FairQueue.smoothInterval()
+	interval := cfg.FairQueue.smoothInterval()
 	releaser := s.getSmoothReleaser(req.HostnameHash, req.Hostname)
 
 	target := baseTime
@@ -1139,7 +1518,7 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 	now = time.Now()
 	holdMs := now.Sub(hitAt).Milliseconds()
 
-	if err := s.backend.ReleaseSlot(ctx, req); err != nil {
+	if err := backend.ReleaseSlot(ctx, req); err != nil {
 		s.log.Errorf("release slot error: %v", err)
 		return err
 	}
@@ -1556,34 +1935,78 @@ func main() {
 	flag.StringVar(configPath, "config", "", "config file path")
 	flag.Parse()
 
-	if strings.TrimSpace(*configPath) == "" {
-		log.Fatalf("config file path is required (-c)")
-	}
+	ctrlEnv := readControllerEnv()
+	useController := ctrlEnv.enabled()
 
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+	var (
+		cfg        Config
+		cfgVersion string
+		err        error
+	)
+
+	if useController {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		cfg, cfgVersion, err = loadConfigFromController(ctx, ctrlEnv)
+		cancel()
+		if err != nil {
+			log.Fatalf("failed to load config from controller: %v", err)
+		}
+	} else {
+		if strings.TrimSpace(*configPath) == "" {
+			log.Fatalf("config file path is required (-c) when CONTROLLER_URL is not set")
+		}
+
+		cfg, err = loadConfig(*configPath)
+		if err != nil {
+			log.Fatalf("failed to load config: %v", err)
+		}
 	}
 
 	l := newLogger(cfg.LogLevel)
+	if useController && cfgVersion != "" {
+		l.Infof("loaded config from controller version=%s", cfgVersion)
+	}
+
 	backend, err := newBackend(cfg, l)
 	if err != nil {
 		log.Fatalf("failed to init backend: %v", err)
 	}
 
+	meta := runtimeMeta{
+		appName:    ctrlEnv.AppName,
+		appVersion: ctrlEnv.AppVersion,
+		env:        ctrlEnv.Env,
+		role:       ctrlEnv.Role,
+		instanceID: ctrlEnv.InstanceID,
+	}
+	if meta.role == "" {
+		meta.role = "slot-handler"
+	}
+
 	gcCtx, gcCancel := context.WithCancel(context.Background())
 	defer gcCancel()
 
+	var controllerPtr *controllerEnv
+	if useController {
+		controllerPtr = &ctrlEnv
+	}
+
 	s := &server{
-		cfg:          cfg,
-		backend:      backend,
-		log:          l,
-		sessionStore: newMemorySessionStore(),
+		cfg:              &cfg,
+		backend:          backend,
+		log:              l,
+		sessionStore:     newMemorySessionStore(),
+		controller:       controllerPtr,
+		internalAPIToken: strings.TrimSpace(os.Getenv("INTERNAL_API_TOKEN")),
+		meta:             meta,
 	}
 	s.startSessionGC(gcCtx)
 	s.startFairQueueCleanup(gcCtx)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v0/health", s.handleInternalHealth)
+	mux.HandleFunc("/api/v0/refresh", s.handleInternalRefresh)
+	mux.HandleFunc("/api/v0/flush", s.handleInternalFlush)
 	mux.HandleFunc("/api/v0/fairqueue/acquire", s.handleAcquire)
 	mux.HandleFunc("/api/v0/fairqueue/release", s.handleRelease)
 	mux.HandleFunc("/api/v0/fairqueue/cancel", s.handleCancelSession)

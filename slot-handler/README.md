@@ -74,3 +74,8 @@
 - 暂时错误/队列已满/IP 过多一律保持 `pending`，内部按 `pollIntervalMs` 自行 sleep 重试，避免客户端重试风暴。
 - release 阶段即使数据库报错也只记录日志，不向调用方新增错误分支。
 - Cleanup：`cleanup.enabled=true` 时，每隔 `intervalSeconds` 触发一次后台任务，依次调用 `func_cleanup_zombie_slots` / `func_cleanup_ip_cooldown` / `func_cleanup_queue_depth`。
+
+## 控制面接入
+
+- 默认优先从 controller `/api/v0/bootstrap`（`role=slot-handler`）拉取配置，需提供 `ENV/ROLE/INSTANCE_ID/APP_NAME/APP_VERSION/CONTROLLER_URL/CONTROLLER_API_PREFIX/CONTROLLER_API_TOKEN` 环境变量；本地 `config.json` 仅作为显式回退。
+- 暴露内部控制 API：`GET /api/v0/health`、`POST /api/v0/refresh`（重拉 controller 配置）与 `POST /api/v0/flush`（占位），调用需携带 `Authorization: Bearer $INTERNAL_API_TOKEN`，未配置 token 时默认 404 静默。
