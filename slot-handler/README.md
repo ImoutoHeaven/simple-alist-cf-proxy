@@ -78,4 +78,5 @@
 ## 控制面接入
 
 - 默认优先从 controller `/api/v0/bootstrap`（`role=slot-handler`）拉取配置，需提供 `ENV/ROLE/INSTANCE_ID/APP_NAME/APP_VERSION/CONTROLLER_URL/CONTROLLER_API_PREFIX/CONTROLLER_API_TOKEN` 环境变量；本地 `config.json` 仅作为显式回退。
-- 暴露内部控制 API：`GET /api/v0/health`、`POST /api/v0/refresh`（重拉 controller 配置）与 `POST /api/v0/flush`（占位），调用需携带 `Authorization: Bearer $INTERNAL_API_TOKEN`，未配置 token 时默认 404 静默。
+- 暴露内部控制 API：`GET /api/v0/health`、`POST /api/v0/refresh`（重拉 controller 配置，如未配置 controller 则重载本地 config 文件并重置会话/平滑释放缓存）与 `POST /api/v0/flush`（触发一次 session GC + 清理任务 + 向 controller `/api/v0/metrics` 推送快照），调用需携带 `Authorization: Bearer $INTERNAL_API_TOKEN`，未配置 token 时默认 404 静默。
+- 当配置了 controller 接入且有 `CONTROLLER_API_TOKEN` 时，会每 60 秒自动向 controller `/api/v0/metrics` 上报一次快照，内容包含 configVersion、会话状态计数与近期事件计数（throttled/granted/timeout/released 等）。

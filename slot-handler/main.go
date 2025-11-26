@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,6 +21,10 @@ import (
 
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+const (
+	defaultMetricsFlushInterval = 60 * time.Second
 )
 
 type Config struct {
@@ -280,6 +285,68 @@ type runtimeMeta struct {
 	instanceID string
 }
 
+type metricsSnapshot struct {
+	Timestamp     int64
+	ConfigVersion string
+	Counts        map[string]int64
+	Sessions      map[string]int
+	SmoothHosts   int
+}
+
+func (m metricsSnapshot) empty() bool {
+	if len(m.Counts) > 0 {
+		return false
+	}
+	if len(m.Sessions) == 0 {
+		return true
+	}
+	if total, ok := m.Sessions["total"]; ok {
+		return total == 0
+	}
+	return false
+}
+
+type metricsCounters struct {
+	mu       sync.Mutex
+	counters map[string]int64
+}
+
+func newMetricsCounters() *metricsCounters {
+	return &metricsCounters{
+		counters: make(map[string]int64),
+	}
+}
+
+func (m *metricsCounters) inc(name string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.counters[name]++
+	m.mu.Unlock()
+}
+
+func (m *metricsCounters) snapshotAndReset() map[string]int64 {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	res := make(map[string]int64, len(m.counters))
+	for k, v := range m.counters {
+		res[k] = v
+	}
+	m.counters = make(map[string]int64)
+	return res
+}
+
+type metricsReporter struct {
+	env    controllerEnv
+	client *http.Client
+	log    *logger
+}
+
 type server struct {
 	mu               sync.RWMutex
 	cfg              *Config
@@ -291,6 +358,10 @@ type server struct {
 	controller       *controllerEnv
 	meta             runtimeMeta
 	internalAPIToken string
+	configPath       string
+	configVersion    string
+	metrics          *metricsReporter
+	metricsCounters  *metricsCounters
 }
 
 func (s *server) getConfig() *Config {
@@ -307,11 +378,122 @@ func (s *server) getBackend() queueBackend {
 	return backend
 }
 
-func (s *server) updateRuntime(cfg *Config, backend queueBackend) {
+func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion string, resetSessions bool) {
 	s.mu.Lock()
+	oldBackend := s.backend
+	if resetSessions {
+		s.sessionStore = newMemorySessionStore()
+		s.smoothReleasers = nil
+	}
 	s.cfg = cfg
 	s.backend = backend
+	s.configVersion = cfgVersion
 	s.mu.Unlock()
+
+	if oldBackend != nil && oldBackend != backend {
+		if closer, ok := oldBackend.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil && s.log != nil {
+				s.log.Warnf("close old backend failed: %v", err)
+			}
+		}
+	}
+}
+
+func (s *server) incrementMetric(name string) {
+	if s.metricsCounters != nil {
+		s.metricsCounters.inc(name)
+	}
+}
+
+func (s *server) collectMetricsSnapshot() metricsSnapshot {
+	counts := s.metricsCounters.snapshotAndReset()
+	if counts == nil {
+		counts = make(map[string]int64)
+	}
+	for _, key := range []string{"session_created", "granted", "throttled", "timeout", "released"} {
+		if _, ok := counts[key]; !ok {
+			counts[key] = 0
+		}
+	}
+
+	sessions := map[string]int{
+		"total":     0,
+		"pending":   0,
+		"granted":   0,
+		"throttled": 0,
+		"timeout":   0,
+	}
+
+	if s.sessionStore != nil {
+		s.sessionStore.Range(func(token string, sess *FQSession) bool {
+			if sess == nil {
+				return true
+			}
+			sessions["total"]++
+			sess.mu.Lock()
+			state := sess.State
+			sess.mu.Unlock()
+			switch state {
+			case StatePending:
+				sessions["pending"]++
+			case StateGranted:
+				sessions["granted"]++
+			case StateThrottled:
+				sessions["throttled"]++
+			case StateTimeout:
+				sessions["timeout"]++
+			}
+			return true
+		})
+	}
+
+	smoothHosts := 0
+	s.smoothMu.Lock()
+	if s.smoothReleasers != nil {
+		smoothHosts = len(s.smoothReleasers)
+	}
+	s.smoothMu.Unlock()
+
+	return metricsSnapshot{
+		Timestamp:     time.Now().UnixMilli(),
+		ConfigVersion: s.configVersion,
+		Counts:        counts,
+		Sessions:      sessions,
+		SmoothHosts:   smoothHosts,
+	}
+}
+
+func (s *server) flushMetrics(ctx context.Context) error {
+	if s.metrics == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.metrics.sendSnapshot(ctx, s.meta, s.collectMetricsSnapshot())
+}
+
+func (s *server) startMetricsReporter(ctx context.Context, interval time.Duration) {
+	if s.metrics == nil || interval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				mCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if err := s.flushMetrics(mCtx); err != nil && s.log != nil {
+					s.log.Warnf("metrics flush failed: %v", err)
+				}
+				cancel()
+			}
+		}
+	}()
 }
 
 type logger struct {
@@ -554,6 +736,92 @@ func (c controllerEnv) bootstrapURL() string {
 	return strings.TrimSuffix(c.URL, "/") + "/" + prefix + "/bootstrap"
 }
 
+func (c controllerEnv) metricsURL() string {
+	prefix := strings.Trim(c.APIPrefix, "/")
+	if prefix == "" {
+		prefix = "api/v0"
+	}
+	return strings.TrimSuffix(c.URL, "/") + "/" + prefix + "/metrics"
+}
+
+func newMetricsReporter(env controllerEnv, log *logger) *metricsReporter {
+	if !env.enabled() || strings.TrimSpace(env.APIToken) == "" || strings.TrimSpace(env.Env) == "" {
+		return nil
+	}
+
+	return &metricsReporter{
+		env:    env,
+		client: &http.Client{Timeout: 10 * time.Second},
+		log:    log,
+	}
+}
+
+func (m *metricsReporter) sendSnapshot(ctx context.Context, meta runtimeMeta, snap metricsSnapshot) error {
+	if m == nil {
+		return nil
+	}
+	if snap.empty() {
+		return nil
+	}
+
+	if strings.TrimSpace(meta.env) == "" {
+		return errors.New("env is required for metrics payload")
+	}
+
+	event := map[string]any{
+		"type":          "slot_handler.snapshot",
+		"ts":            snap.Timestamp,
+		"configVersion": snap.ConfigVersion,
+		"counts":        snap.Counts,
+		"sessions":      snap.Sessions,
+		"smoothHosts":   snap.SmoothHosts,
+	}
+	if meta.appName != "" {
+		event["appName"] = meta.appName
+	}
+	if meta.appVersion != "" {
+		event["appVersion"] = meta.appVersion
+	}
+	if meta.role != "" {
+		event["role"] = meta.role
+	}
+	if meta.instanceID != "" {
+		event["instanceId"] = meta.instanceID
+	}
+
+	payload := map[string]any{
+		"source":      "slot-handler",
+		"env":         meta.env,
+		"instance_id": meta.instanceID,
+		"events":      []map[string]any{event},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.env.metricsURL(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+m.env.APIToken)
+
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("controller metrics failed: status=%d body=%s", resp.StatusCode, string(data))
+	}
+
+	return nil
+}
+
 func parseConfigBytes(data []byte) (Config, error) {
 	var cfg Config
 	var cleanupEnabledProvided bool
@@ -764,6 +1032,9 @@ func (s *server) handleInternalHealth(w http.ResponseWriter, r *http.Request) {
 	if s.meta.instanceID != "" {
 		w.Header().Set("X-Instance-Id", s.meta.instanceID)
 	}
+	if s.configVersion != "" {
+		w.Header().Set("X-Config-Version", s.configVersion)
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -794,12 +1065,31 @@ func (s *server) handleInternalRefresh(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if shouldReload && s.controller != nil && s.controller.enabled() {
-		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-		cfg, version, err := loadConfigFromController(ctx, *s.controller)
-		cancel()
+	if shouldReload {
+		var (
+			cfg        Config
+			version    string
+			err        error
+			sourceDesc string
+		)
+
+		if s.controller != nil && s.controller.enabled() {
+			ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+			cfg, version, err = loadConfigFromController(ctx, *s.controller)
+			cancel()
+			sourceDesc = "controller"
+		} else if strings.TrimSpace(s.configPath) != "" {
+			cfg, err = loadConfig(s.configPath)
+			version = "file"
+			sourceDesc = fmt.Sprintf("file=%s", s.configPath)
+		} else {
+			s.log.Warnf("refresh requested but no controller or config path configured")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 		if err != nil {
-			s.log.Errorf("refresh from controller failed: %v", err)
+			s.log.Errorf("refresh load failed from %s: %v", sourceDesc, err)
 			http.Error(w, "refresh failed", http.StatusBadGateway)
 			return
 		}
@@ -809,8 +1099,15 @@ func (s *server) handleInternalRefresh(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "refresh failed", http.StatusInternalServerError)
 			return
 		}
-		s.updateRuntime(&cfg, backend)
-		s.log.Infof("config refreshed from controller version=%s", version)
+		s.updateRuntime(&cfg, backend, version, true)
+		if sourceDesc == "" {
+			sourceDesc = "unknown"
+		}
+		if version != "" {
+			s.log.Infof("config refreshed from %s version=%s", sourceDesc, version)
+		} else {
+			s.log.Infof("config refreshed from %s", sourceDesc)
+		}
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -821,6 +1118,27 @@ func (s *server) handleInternalFlush(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+
+	s.gcSessions()
+
+	cfg := s.getConfig()
+	if cfg != nil && cfg.FairQueue.Cleanup.Enabled && cfg.FairQueue.cleanupInterval() > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		err := s.runFairQueueCleanup(ctx, cfg)
+		cancel()
+		if err != nil {
+			s.log.Warnf("flush cleanup failed: %v", err)
+			http.Error(w, "flush failed", http.StatusBadGateway)
+			return
+		}
+	}
+
+	if err := s.flushMetrics(r.Context()); err != nil {
+		s.log.Warnf("flush metrics failed: %v", err)
+		http.Error(w, "flush failed", http.StatusBadGateway)
+		return
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -951,6 +1269,7 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 		return nil, err
 	}
 	if throttleRes.throttled {
+		s.incrementMetric("throttled")
 		s.log.Infof(
 			"acquire throttled host=%s ip=%s code=%d retryAfter=%d",
 			req.Hostname, req.IPBucket, throttleRes.code, throttleRes.retryAfter,
@@ -981,6 +1300,7 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 		ThrottleCode:       0,
 	}
 
+	s.incrementMetric("session_created")
 	s.sessionStore.Save(sess)
 
 	return &AcquireResponse{
@@ -1003,6 +1323,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 	sess, ok := s.sessionStore.Load(token)
 	if !ok || sess == nil {
 		s.log.Infof("session missing token=%s", token)
+		s.incrementMetric("timeout")
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
 
@@ -1018,6 +1339,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			sess.Token, sess.Hostname, sess.IPBucket,
 			now.Sub(sess.LastSeenAt).Milliseconds(),
 		)
+		s.incrementMetric("timeout")
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
@@ -1029,6 +1351,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			sess.Token, sess.Hostname, sess.IPBucket,
 			now.Sub(sess.CreatedAt).Milliseconds(),
 		)
+		s.incrementMetric("timeout")
 		sess.State = StateTimeout
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
@@ -1043,6 +1366,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
 		)
 		s.handleGrantedLocked(sess)
+		s.incrementMetric("granted")
 		return &AcquireResponse{
 			Result:     "granted",
 			SlotToken:  sess.SlotToken,
@@ -1054,6 +1378,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			sess.Token, sess.Hostname, sess.IPBucket,
 			sess.ThrottleCode, sess.ThrottleRetryAfter,
 		)
+		s.incrementMetric("throttled")
 		s.cleanupSession(sess)
 		return &AcquireResponse{
 			Result:       "throttled",
@@ -1065,6 +1390,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			"session timeout token=%s host=%s ip=%s",
 			sess.Token, sess.Hostname, sess.IPBucket,
 		)
+		s.incrementMetric("timeout")
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
@@ -1089,6 +1415,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
 		)
 		s.handleGrantedLocked(sess)
+		s.incrementMetric("granted")
 		return &AcquireResponse{
 			Result:     "granted",
 			SlotToken:  sess.SlotToken,
@@ -1100,6 +1427,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			sess.Token, sess.Hostname, sess.IPBucket,
 			sess.ThrottleCode, sess.ThrottleRetryAfter,
 		)
+		s.incrementMetric("throttled")
 		s.cleanupSession(sess)
 		return &AcquireResponse{
 			Result:       "throttled",
@@ -1111,6 +1439,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			"session timeout token=%s host=%s ip=%s",
 			sess.Token, sess.Hostname, sess.IPBucket,
 		)
+		s.incrementMetric("timeout")
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
 	default:
@@ -1353,6 +1682,7 @@ func (s *server) releaseSlotForSession(ctx context.Context, hostname, hostnameHa
 			token, hostname, ipBucket, err)
 	} else {
 		s.log.Infof("slot released (cancel) token=%s host=%s ip=%s", token, hostname, ipBucket)
+		s.incrementMetric("released")
 	}
 }
 
@@ -1443,14 +1773,18 @@ func (s *server) gcSessions() {
 
 	s.sessionStore.Range(func(token string, sess *FQSession) bool {
 		sess.mu.Lock()
-		shouldDelete := sess.State != StatePending ||
-			(idleLimit > 0 && now.Sub(sess.LastSeenAt) > idleLimit) ||
-			now.Sub(sess.CreatedAt) >= maxWait
+		timedOut := sess.State == StatePending &&
+			((idleLimit > 0 && now.Sub(sess.LastSeenAt) > idleLimit) ||
+				now.Sub(sess.CreatedAt) >= maxWait)
+		shouldDelete := sess.State != StatePending || timedOut
 		if shouldDelete {
 			s.log.Debugf(
 				"session gc token=%s host=%s ip=%s state=%s",
 				sess.Token, sess.Hostname, sess.IPBucket, sess.State,
 			)
+			if timedOut {
+				s.incrementMetric("timeout")
+			}
 			s.cleanupSession(sess)
 		}
 		sess.mu.Unlock()
@@ -1531,6 +1865,7 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 		"slot released host=%s ip=%s token=%s hold_ms=%d min_hold_ms=%d",
 		req.Hostname, req.IPBucket, tokenLog, holdMs, minHoldMs,
 	)
+	s.incrementMetric("released")
 	return nil
 }
 
@@ -1935,6 +2270,7 @@ func main() {
 	flag.StringVar(configPath, "config", "", "config file path")
 	flag.Parse()
 
+	configPathValue := strings.TrimSpace(*configPath)
 	ctrlEnv := readControllerEnv()
 	useController := ctrlEnv.enabled()
 
@@ -1952,20 +2288,28 @@ func main() {
 			log.Fatalf("failed to load config from controller: %v", err)
 		}
 	} else {
-		if strings.TrimSpace(*configPath) == "" {
+		if configPathValue == "" {
 			log.Fatalf("config file path is required (-c) when CONTROLLER_URL is not set")
 		}
 
-		cfg, err = loadConfig(*configPath)
+		cfg, err = loadConfig(configPathValue)
 		if err != nil {
 			log.Fatalf("failed to load config: %v", err)
 		}
+		cfgVersion = fmt.Sprintf("file:%s", filepath.Base(configPathValue))
 	}
 
 	l := newLogger(cfg.LogLevel)
-	if useController && cfgVersion != "" {
-		l.Infof("loaded config from controller version=%s", cfgVersion)
+	if cfgVersion != "" {
+		if useController {
+			l.Infof("loaded config from controller version=%s", cfgVersion)
+		} else {
+			l.Infof("loaded config version=%s", cfgVersion)
+		}
 	}
+
+	metricsReporter := newMetricsReporter(ctrlEnv, l)
+	metricsCounters := newMetricsCounters()
 
 	backend, err := newBackend(cfg, l)
 	if err != nil {
@@ -1999,9 +2343,14 @@ func main() {
 		controller:       controllerPtr,
 		internalAPIToken: strings.TrimSpace(os.Getenv("INTERNAL_API_TOKEN")),
 		meta:             meta,
+		configPath:       configPathValue,
+		configVersion:    cfgVersion,
+		metrics:          metricsReporter,
+		metricsCounters:  metricsCounters,
 	}
 	s.startSessionGC(gcCtx)
 	s.startFairQueueCleanup(gcCtx)
+	s.startMetricsReporter(gcCtx, defaultMetricsFlushInterval)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v0/health", s.handleInternalHealth)
@@ -2037,5 +2386,13 @@ func main() {
 		l.Errorf("shutdown error: %v", err)
 	} else {
 		l.Infof("server stopped")
+	}
+
+	if backend := s.getBackend(); backend != nil {
+		if closer, ok := backend.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				l.Warnf("backend close error: %v", err)
+			}
+		}
 	}
 }
