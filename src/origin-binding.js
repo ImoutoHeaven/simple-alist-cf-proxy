@@ -98,7 +98,7 @@ export const buildOriginSnapshot = (cf, ip) => {
 
 export const deriveAesKeyFromToken = async (token) => {
   if (typeof token !== 'string' || !token) {
-    throw new Error('TOKEN is required for origin encryption');
+    throw new Error('token secret is required for origin encryption');
   }
   const material = textEncoder.encode(`aes:${token}`);
   const hash = await crypto.subtle.digest('SHA-256', material);
@@ -255,4 +255,3 @@ export const checkOriginMatch = (snapshot, current, modes, options = {}) => {
     failedFields,
   };
 };
-

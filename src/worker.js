@@ -13,7 +13,7 @@ import { DecisionDO } from './do/decision-do.js';
 import { MetricsDO } from './do/metrics-do.js';
 
 // Configuration constants
-const REQUIRED_ENV = ['TOKEN', 'WORKER_ADDRESS'];
+const REQUIRED_ENV = ['WORKER_ADDRESS'];
 const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-addition', 'skip-addition-expiretime', 'skip-origin', 'asis']);
 const DEFAULT_LINK_TTL_SECONDS = 1800;
 const DEFAULT_CLEANUP_PERCENTAGE = 1;
@@ -70,6 +70,13 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     return trimmed === '' ? defaultValue : trimmed;
   };
 
+  const commonBootstrap = bootstrap && typeof bootstrap === 'object'
+    ? bootstrap.common || null
+    : null;
+  if (!commonBootstrap) {
+    throw new Error('controller bootstrap.common is required');
+  }
+
   const downloadBootstrap = bootstrap && typeof bootstrap === 'object'
     ? bootstrap.download || null
     : null;
@@ -81,20 +88,29 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     ? decision.download || null
     : null;
 
+  const token = normalizeString(commonBootstrap.tokenHmacKey);
+  if (!token) {
+    throw new Error('controller common.tokenHmacKey is required');
+  }
+  const signSecretFromController = normalizeString(commonBootstrap.signSecret) || token;
+
   const address = normalizeString(downloadBootstrap.address);
   if (!address) {
     throw new Error('controller download.address is required');
   }
 
-  const token = String(env.TOKEN).trim();
   const workerAddress = normalizeString(env.WORKER_ADDRESS);
-  const signCheck = parseBoolean(env.SIGN_CHECK, true);
-  const hashCheck = parseBoolean(env.HASH_CHECK, true);
-  const workerCheck = parseBoolean(env.WORKER_CHECK, true);
-  const additionCheck = parseBoolean(env.ADDITION_CHECK, true);
-  const additionExpireTimeCheck = parseBoolean(env.ADDITION_EXPIRETIME_CHECK, true);
-  const ipv4Only = parseBoolean(env.IPV4_ONLY, true);
-  const signSecret = env.SIGN_SECRET && env.SIGN_SECRET.trim() !== '' ? env.SIGN_SECRET : token;
+  const authConfig = downloadBootstrap.auth && typeof downloadBootstrap.auth === 'object'
+    ? downloadBootstrap.auth
+    : {};
+  const authSignSecret = normalizeString(authConfig.signSecret);
+  const signSecret = authSignSecret || signSecretFromController;
+  const signCheck = authConfig.signCheck !== false;
+  const hashCheck = authConfig.hashCheck !== false;
+  const workerCheck = authConfig.workerCheck !== false;
+  const additionCheck = authConfig.additionCheck !== false;
+  const additionExpireTimeCheck = authConfig.additionExpireTimeCheck !== false;
+  const ipv4Only = authConfig.ipv4Only !== false;
 
   // DB & cache from controller
   const dbConfig = downloadBootstrap.db && typeof downloadBootstrap.db === 'object'

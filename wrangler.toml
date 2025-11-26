@@ -6,14 +6,13 @@ compatibility_date = "2024-01-01"
 # [vars]
 # 控制面为唯一策略来源，wrangler 仅保留 infra 级 env：
 # - ENV / ROLE / INSTANCE_ID / APP_NAME / APP_VERSION
+# - WORKER_ADDRESS（实例对外地址，用于签名校验/跳转）
 # - CONTROLLER_URL / CONTROLLER_API_PREFIX / CONTROLLER_API_TOKEN
 # - BOOTSTRAP_CACHE_MODE / DECISION_CACHE_MODE / METRICS_MODE
 # - BOOTSTRAP_DO / DECISION_DO / METRICS_DO / BOOTSTRAP_KV 绑定
 # - INTERNAL_API_TOKEN（控制 API）
-# - TOKEN / WORKER_ADDRESS / SIGN_SECRET（可选覆盖）
-# - SIGN_CHECK / HASH_CHECK / WORKER_CHECK / ADDITION_CHECK / ADDITION_EXPIRETIME_CHECK / IPV4_ONLY
 # - ENABLE_CF_RATELIMITER / CF_RATELIMITER_BINDING（如需启用 CF 原生限流，请同时配置 [[rate_limit]] 绑定）
-# 路径规则、origin binding、上游地址、PostgREST/RateLimit/Throttle/FairQueue 等全部由 controller config.yaml 下发，勿在 wrangler 配置策略类 env。
+# 策略/签名/IPv4 限制等全部由 controller.common / download.auth 下发，勿在 wrangler 配置策略类 env。
 #
 # For local development (.dev.vars 示例):
 # ENV=staging
@@ -21,14 +20,7 @@ compatibility_date = "2024-01-01"
 # INSTANCE_ID=download-dev-1
 # APP_NAME=simple-alist-cf-proxy
 # APP_VERSION=dev
-# TOKEN=your-hmac-token
 # WORKER_ADDRESS=https://your-worker.workers.dev
-# SIGN_CHECK=true
-# HASH_CHECK=true
-# WORKER_CHECK=true
-# ADDITION_CHECK=true
-# ADDITION_EXPIRETIME_CHECK=true
-# IPV4_ONLY=true
 # CONTROLLER_URL=https://controller.example.com
 # CONTROLLER_API_PREFIX=/api/v0
 # CONTROLLER_API_TOKEN=replace-with-token
