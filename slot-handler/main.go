@@ -687,14 +687,19 @@ func sanitizeThrottleWindowSeconds(v int) int {
 }
 
 type controllerEnv struct {
-	Env        string
-	Role       string
-	InstanceID string
-	AppName    string
-	AppVersion string
-	URL        string
-	APIPrefix  string
-	APIToken   string
+	Env        string `json:"env"`
+	Role       string `json:"role"`
+	InstanceID string `json:"instanceId"`
+	AppName    string `json:"appName"`
+	AppVersion string `json:"appVersion"`
+	URL        string `json:"url"`
+	APIPrefix  string `json:"apiPrefix"`
+	APIToken   string `json:"apiToken"`
+}
+
+type configFileMeta struct {
+	Controller       controllerEnv `json:"controller"`
+	InternalAPIToken string        `json:"internalApiToken"`
 }
 
 type controllerBootstrap struct {
@@ -702,30 +707,8 @@ type controllerBootstrap struct {
 	SlotHandler   Config `json:"slotHandler"`
 }
 
-func readControllerEnv() controllerEnv {
-	prefix := strings.TrimSpace(os.Getenv("CONTROLLER_API_PREFIX"))
-	if prefix == "" {
-		prefix = "/api/v0"
-	}
-	role := strings.TrimSpace(os.Getenv("ROLE"))
-	if role == "" {
-		role = "slot-handler"
-	}
-
-	return controllerEnv{
-		Env:        strings.TrimSpace(os.Getenv("ENV")),
-		Role:       role,
-		InstanceID: strings.TrimSpace(os.Getenv("INSTANCE_ID")),
-		AppName:    strings.TrimSpace(os.Getenv("APP_NAME")),
-		AppVersion: strings.TrimSpace(os.Getenv("APP_VERSION")),
-		URL:        strings.TrimSpace(os.Getenv("CONTROLLER_URL")),
-		APIPrefix:  prefix,
-		APIToken:   strings.TrimSpace(os.Getenv("CONTROLLER_API_TOKEN")),
-	}
-}
-
 func (c controllerEnv) enabled() bool {
-	return strings.TrimSpace(c.URL) != ""
+	return strings.TrimSpace(c.URL) != "" && strings.TrimSpace(c.APIToken) != "" && strings.TrimSpace(c.Env) != ""
 }
 
 func (c controllerEnv) bootstrapURL() string {
@@ -913,12 +896,21 @@ func parseAndValidateConfig(data []byte) (Config, error) {
 	return validateConfig(cfg)
 }
 
-func loadConfig(path string) (Config, error) {
+func loadConfigWithMeta(path string) (Config, configFileMeta, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return Config{}, err
+		return Config{}, configFileMeta{}, err
 	}
-	return parseAndValidateConfig(data)
+
+	var meta configFileMeta
+	// best-effort decode; missing fields are allowed
+	_ = json.Unmarshal(data, &meta)
+
+	cfg, err := parseAndValidateConfig(data)
+	if err != nil {
+		return Config{}, meta, err
+	}
+	return cfg, meta, nil
 }
 
 func loadConfigFromController(ctx context.Context, env controllerEnv) (Config, string, error) {
@@ -1071,21 +1063,29 @@ func (s *server) handleInternalRefresh(w http.ResponseWriter, r *http.Request) {
 			version    string
 			err        error
 			sourceDesc string
+			meta       configFileMeta
 		)
+
+		if strings.TrimSpace(s.configPath) != "" {
+			cfg, meta, err = loadConfigWithMeta(s.configPath)
+			if err != nil {
+				s.log.Errorf("refresh load failed from file=%s: %v", s.configPath, err)
+				http.Error(w, "refresh failed", http.StatusBadGateway)
+				return
+			}
+			// Update controller settings from file for subsequent calls
+			s.controller = &meta.Controller
+			s.internalAPIToken = strings.TrimSpace(meta.InternalAPIToken)
+		}
 
 		if s.controller != nil && s.controller.enabled() {
 			ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 			cfg, version, err = loadConfigFromController(ctx, *s.controller)
 			cancel()
 			sourceDesc = "controller"
-		} else if strings.TrimSpace(s.configPath) != "" {
-			cfg, err = loadConfig(s.configPath)
-			version = "file"
-			sourceDesc = fmt.Sprintf("file=%s", s.configPath)
 		} else {
-			s.log.Warnf("refresh requested but no controller or config path configured")
-			w.WriteHeader(http.StatusNoContent)
-			return
+			version = fmt.Sprintf("file:%s", filepath.Base(s.configPath))
+			sourceDesc = fmt.Sprintf("file=%s", s.configPath)
 		}
 
 		if err != nil {
@@ -2271,13 +2271,24 @@ func main() {
 	flag.Parse()
 
 	configPathValue := strings.TrimSpace(*configPath)
-	ctrlEnv := readControllerEnv()
+	if configPathValue == "" {
+		configPathValue = "config.json"
+	}
+
+	cfgFromFile, fileMeta, err := loadConfigWithMeta(configPathValue)
+	if err != nil {
+		log.Fatalf("failed to load config: %v", err)
+	}
+
+	ctrlEnv := fileMeta.Controller
+	if strings.TrimSpace(ctrlEnv.APIPrefix) == "" {
+		ctrlEnv.APIPrefix = "/api/v0"
+	}
 	useController := ctrlEnv.enabled()
 
 	var (
 		cfg        Config
 		cfgVersion string
-		err        error
 	)
 
 	if useController {
@@ -2288,14 +2299,7 @@ func main() {
 			log.Fatalf("failed to load config from controller: %v", err)
 		}
 	} else {
-		if configPathValue == "" {
-			log.Fatalf("config file path is required (-c) when CONTROLLER_URL is not set")
-		}
-
-		cfg, err = loadConfig(configPathValue)
-		if err != nil {
-			log.Fatalf("failed to load config: %v", err)
-		}
+		cfg = cfgFromFile
 		cfgVersion = fmt.Sprintf("file:%s", filepath.Base(configPathValue))
 	}
 
@@ -2316,33 +2320,28 @@ func main() {
 		log.Fatalf("failed to init backend: %v", err)
 	}
 
-	meta := runtimeMeta{
+	rtMeta := runtimeMeta{
 		appName:    ctrlEnv.AppName,
 		appVersion: ctrlEnv.AppVersion,
 		env:        ctrlEnv.Env,
 		role:       ctrlEnv.Role,
 		instanceID: ctrlEnv.InstanceID,
 	}
-	if meta.role == "" {
-		meta.role = "slot-handler"
+	if rtMeta.role == "" {
+		rtMeta.role = "slot-handler"
 	}
 
 	gcCtx, gcCancel := context.WithCancel(context.Background())
 	defer gcCancel()
-
-	var controllerPtr *controllerEnv
-	if useController {
-		controllerPtr = &ctrlEnv
-	}
 
 	s := &server{
 		cfg:              &cfg,
 		backend:          backend,
 		log:              l,
 		sessionStore:     newMemorySessionStore(),
-		controller:       controllerPtr,
-		internalAPIToken: strings.TrimSpace(os.Getenv("INTERNAL_API_TOKEN")),
-		meta:             meta,
+		controller:       &ctrlEnv,
+		internalAPIToken: strings.TrimSpace(fileMeta.InternalAPIToken),
+		meta:             rtMeta,
 		configPath:       configPathValue,
 		configVersion:    cfgVersion,
 		metrics:          metricsReporter,

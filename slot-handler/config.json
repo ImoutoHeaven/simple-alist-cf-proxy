@@ -1,4 +1,15 @@
 {
+  "controller": {
+    "url": "",
+    "apiPrefix": "/api/v0",
+    "apiToken": "",
+    "env": "",
+    "role": "slot-handler",
+    "instanceId": "",
+    "appName": "slot-handler",
+    "appVersion": ""
+  },
+  "internalApiToken": "change-me",
   "listen": ":8080",
   "logLevel": "info",
   "auth": {
