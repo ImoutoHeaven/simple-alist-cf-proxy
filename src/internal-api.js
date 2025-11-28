@@ -23,6 +23,34 @@ const safeWaitUntil = (ctx, promise) => {
   }
 };
 
+const clearD1CacheIfAny = (env, targets) => {
+  const db = env?.CACHE_D1;
+  if (!db || !(targets?.length)) {
+    return null;
+  }
+  const shouldClearBootstrap = targets.includes('all') || targets.includes('bootstrap');
+  if (!shouldClearBootstrap) {
+    return null;
+  }
+
+  const envName = env?.ENV || '';
+  const role = env?.ROLE || '';
+
+  return (async () => {
+    const statements = [];
+  if (shouldClearBootstrap) {
+    statements.push(
+      db.prepare('DELETE FROM bootstrap_cache WHERE env = ? AND role = ?;').bind(envName, role)
+    );
+  }
+    if (statements.length) {
+      await db.batch(statements);
+    }
+  })().catch((error) => {
+    console.warn('[internal-api] clear D1 cache failed', error);
+  });
+};
+
 /**
  * 控制面内部 API 入口，token 不匹配时静默回退。
  * @param {Request} request
@@ -81,9 +109,6 @@ async function handleRefresh(request, env, ctx) {
   if (targets.includes('all') || targets.includes('bootstrap')) {
     globalThis.bootstrapCache = null;
   }
-  if (targets.includes('all') || targets.includes('decision')) {
-    globalThis.decisionCache = {};
-  }
 
   const promises = [];
 
@@ -91,9 +116,9 @@ async function handleRefresh(request, env, ctx) {
     const promise = notifyDo(env, 'BOOTSTRAP_DO', '/bootstrap/refresh', { mode: body?.mode || 'lazy', targets });
     if (promise) promises.push(promise);
   }
-  if (targets.includes('all') || targets.includes('decision')) {
-    const promise = notifyDo(env, 'DECISION_DO', '/decision/refresh', { mode: body?.mode || 'lazy', targets });
-    if (promise) promises.push(promise);
+  const d1Clear = clearD1CacheIfAny(env, targets);
+  if (d1Clear) {
+    promises.push(d1Clear);
   }
   if (targets.includes('metrics')) {
     const promise = notifyDo(env, 'METRICS_DO', '/metrics/flush', { reason: body?.reason || 'refresh' });

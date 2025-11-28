@@ -9,7 +9,6 @@ import { checkOriginMatch, decryptOriginSnapshot, getClientIp, parseCheckOriginE
 import { handleInternalApiIfAny } from './internal-api.js';
 import { fetchControllerState } from './controller-adapter.js';
 import { BootstrapDO } from './do/bootstrap-do.js';
-import { DecisionDO } from './do/decision-do.js';
 import { MetricsDO } from './do/metrics-do.js';
 
 // Configuration constants
@@ -1818,7 +1817,7 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
   return await handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 }
 // src/index.ts
-export { BootstrapDO, DecisionDO, MetricsDO };
+export { BootstrapDO, MetricsDO };
 
 export default {
   async fetch(request, env, ctx) {

@@ -1,6 +1,6 @@
 const DEFAULT_BOOTSTRAP_CACHE_MODE = 'do+kv';
-const DEFAULT_DECISION_CACHE_MODE = 'do';
 const CONTROL_PREFIX_DEFAULT = '/api/v0';
+const BOOTSTRAP_TTL_FALLBACK = 300;
 
 const getApiBase = (env) => {
   if (!env?.CONTROLLER_URL) {
@@ -26,13 +26,6 @@ const postJson = async (url, token, body) => {
   return resp;
 };
 
-/**
- * 直连 controller 获取 bootstrap。
- * @param {any} env
- * @param {string} envName
- * @param {string} role
- * @param {string} instanceId
- */
 export async function fetchBootstrapFromController(env, envName, role, instanceId) {
   const apiBase = getApiBase(env);
   const resp = await postJson(`${apiBase}/bootstrap`, env.CONTROLLER_API_TOKEN, {
@@ -43,31 +36,73 @@ export async function fetchBootstrapFromController(env, envName, role, instanceI
   return resp.json();
 }
 
-/**
- * 直连 controller 获取 decision。
- * @param {any} env
- * @param {any} body
- */
 export async function fetchDecisionFromController(env, body) {
   const apiBase = getApiBase(env);
   const resp = await postJson(`${apiBase}/decision`, env.CONTROLLER_API_TOKEN, body);
   return resp.json();
 }
 
-/**
- * 直连 controller 上报 metrics。
- * @param {any} env
- * @param {any} batch
- */
 export async function postMetricsToController(env, batch) {
   const apiBase = getApiBase(env);
   await postJson(`${apiBase}/metrics`, env.CONTROLLER_API_TOKEN, batch);
 }
 
-const rememberBootstrapInMemory = (data) => {
-  const ttlMs = (Number.isFinite(data?.ttlSeconds) ? data.ttlSeconds : 300) * 1000;
+const toBool = (value) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') return value.toLowerCase() === 'true';
+  return Boolean(value);
+};
+
+const parseNumber = (value) => {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+};
+
+const safeJsonParse = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+};
+
+const getCacheDb = (env) => env?.CACHE_D1;
+
+const ensureD1Tables = async (env) => {
+  if (!toBool(env?.INIT_TABLES)) {
+    return;
+  }
+  if (globalThis.cacheD1TablesInitialized) {
+    return;
+  }
+  const db = getCacheDb(env);
+  if (!db) {
+    throw new Error('CACHE_D1 binding is required for D1 cache mode');
+  }
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS bootstrap_cache (
+      env TEXT NOT NULL,
+      role TEXT NOT NULL,
+      config_version TEXT NOT NULL,
+      ttl_seconds INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (env, role)
+    );`),
+  ]);
+  globalThis.cacheD1TablesInitialized = true;
+};
+
+const rememberBootstrapInMemory = (data, expAtOverride) => {
+  const ttlMs = (Number.isFinite(data?.ttlSeconds) ? data.ttlSeconds : BOOTSTRAP_TTL_FALLBACK) * 1000;
+  const expAt = Number.isFinite(expAtOverride) ? expAtOverride : Date.now() + ttlMs;
   globalThis.bootstrapCache = {
-    expAt: Date.now() + ttlMs,
+    expAt,
     data,
   };
 };
@@ -82,10 +117,62 @@ const getBootstrapCache = () => {
   return null;
 };
 
-/**
- * 获取 bootstrap，支持 direct / DO / DO+KV。
- * @param {any} env
- */
+const readBootstrapFromD1 = async (env, envName, role) => {
+  const db = getCacheDb(env);
+  if (!db) {
+    throw new Error('CACHE_D1 binding is required for BOOTSTRAP_CACHE_MODE=d1');
+  }
+  await ensureD1Tables(env);
+
+  const row = await db
+    .prepare(
+      `SELECT payload_json, expires_at FROM bootstrap_cache WHERE env = ? AND role = ? LIMIT 1;`
+    )
+    .bind(envName, role)
+    .first();
+
+  if (!row) {
+    return null;
+  }
+
+  const expAt = parseNumber(row.expires_at);
+  if (!expAt || expAt <= Date.now()) {
+    return null;
+  }
+
+  const payload = safeJsonParse(row.payload_json) || row.payload_json;
+  if (!payload) {
+    return null;
+  }
+
+  rememberBootstrapInMemory(payload, expAt);
+  return payload;
+};
+
+const writeBootstrapToD1 = async (env, envName, role, data, expAtOverride) => {
+  const db = getCacheDb(env);
+  if (!db) {
+    throw new Error('CACHE_D1 binding is required for BOOTSTRAP_CACHE_MODE=d1');
+  }
+  await ensureD1Tables(env);
+
+  const ttlSeconds = Number.isFinite(data?.ttlSeconds) ? data.ttlSeconds : BOOTSTRAP_TTL_FALLBACK;
+  const expAt = Number.isFinite(expAtOverride)
+    ? expAtOverride
+    : Date.now() + Math.max(60, ttlSeconds) * 1000;
+
+  await db
+    .prepare(
+      `INSERT OR REPLACE INTO bootstrap_cache (
+        env, role, config_version, ttl_seconds, expires_at, payload_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?);`
+    )
+    .bind(envName, role, data?.configVersion || '', ttlSeconds, expAt, JSON.stringify(data), Date.now())
+    .run();
+
+  rememberBootstrapInMemory(data, expAt);
+};
+
 export async function getBootstrapConfig(env) {
   const cached = getBootstrapCache();
   if (cached) {
@@ -100,6 +187,16 @@ export async function getBootstrapConfig(env) {
   if (mode === 'direct') {
     const data = await fetchBootstrapFromController(env, envName, role, instanceId);
     rememberBootstrapInMemory(data);
+    return data;
+  }
+
+  if (mode === 'd1') {
+    const cachedD1 = await readBootstrapFromD1(env, envName, role);
+    if (cachedD1) {
+      return cachedD1;
+    }
+    const data = await fetchBootstrapFromController(env, envName, role, instanceId);
+    await writeBootstrapToD1(env, envName, role, data);
     return data;
   }
 
@@ -120,83 +217,6 @@ export async function getBootstrapConfig(env) {
   return data;
 }
 
-const buildDecisionCacheKey = (env, ctx) => {
-  const host = ctx?.host || '';
-  const path = ctx?.path || '';
-  const method = ctx?.method || '';
-  return `${env.ENV || ''}|${env.ROLE || ''}|${host}|${path}|${method}|${ctx?.bootstrapVersion || ''}`;
-};
-
-const rememberDecisionInMemory = (key, data) => {
-  const ttlMs = (Number.isFinite(data?.ttlSeconds) ? data.ttlSeconds : 60) * 1000;
-  if (!globalThis.decisionCache) {
-    globalThis.decisionCache = {};
-  }
-  globalThis.decisionCache[key] = {
-    expAt: Date.now() + ttlMs,
-    data,
-  };
-};
-
-const getDecisionFromMemory = (key) => {
-  const cache = globalThis.decisionCache;
-  if (!cache || !cache[key]) {
-    return null;
-  }
-  if (cache[key].expAt > Date.now()) {
-    return cache[key].data;
-  }
-  return null;
-};
-
-/**
- * 获取 decision，支持 direct / DO。
- * @param {any} env
- * @param {any} bootstrap
- * @param {any} ctx
- */
-export async function getDecisionForRequest(env, bootstrap, ctx) {
-  const mode = env.DECISION_CACHE_MODE || DEFAULT_DECISION_CACHE_MODE;
-  const cacheKey = buildDecisionCacheKey(env, { ...ctx, bootstrapVersion: bootstrap?.configVersion });
-
-  if (mode === 'direct') {
-    const direct = await fetchDecisionFromController(env, {
-      role: env.ROLE,
-      env: env.ENV,
-      instance_id: env.INSTANCE_ID,
-      request: ctx,
-      bootstrapVersion: bootstrap?.configVersion,
-    });
-    rememberDecisionInMemory(cacheKey, direct);
-    return direct;
-  }
-
-  const cached = getDecisionFromMemory(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  if (!env.DECISION_DO) {
-    throw new Error('DECISION_DO binding is required for DO decision mode');
-  }
-
-  const stub = env.DECISION_DO.get(env.DECISION_DO.idFromName('global'));
-  const resp = await stub.fetch('https://do.internal/decision', {
-    method: 'POST',
-    body: JSON.stringify({
-      env: env.ENV,
-      role: env.ROLE,
-      instance_id: env.INSTANCE_ID,
-      request: ctx,
-      bootstrapVersion: bootstrap?.configVersion,
-    }),
-  });
-
-  if (!resp.ok) {
-    throw new Error(`DecisionDO failed: ${resp.status}`);
-  }
-
-  const data = await resp.json();
-  rememberDecisionInMemory(cacheKey, data);
-  return data;
+export async function getDecisionForRequest(env, payload) {
+  return fetchDecisionFromController(env, payload);
 }
