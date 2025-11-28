@@ -87,6 +87,8 @@ const ruleMatches = (rule, filepath) => {
     || (Array.isArray(rule.pathIncludes) && rule.pathIncludes.length > 0);
 
   if (hasLegacyFields) {
+    // Controller-overhaul no longer emits legacy prefix/includes; keep parsing only
+    // to tolerate stale bootstrap payloads.
     return (
       pathHasPrefix(filepath, rule.prefix)
       && pathContainsAnyDir(filepath, rule.dirIncludes)
