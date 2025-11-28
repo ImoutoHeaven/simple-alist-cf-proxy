@@ -1822,9 +1822,14 @@ export { BootstrapDO, MetricsDO };
 export default {
   async fetch(request, env, ctx) {
     try {
-      const internalResponse = await handleInternalApiIfAny(request, env, ctx);
-      if (internalResponse) {
-        return internalResponse;
+      const url = new URL(request.url);
+      const pathname = url.pathname || '/';
+
+      if (pathname.startsWith('/api/v0/')) {
+        const internalResponse = await handleInternalApiIfAny(request, env, ctx);
+        if (internalResponse) {
+          return internalResponse;
+        }
       }
 
       let controllerState = null;

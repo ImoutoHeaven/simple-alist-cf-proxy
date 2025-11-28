@@ -63,6 +63,7 @@ npm run dev
 
 默认监听：`http://localhost:8787`。  
 可将 landing worker 的 `WORKER_ADDRESS_DOWNLOAD` 指向该地址进行联调，或手工构造带签名的测试 URL。
+控制面 `/api/v0/*`：携带正确 `INTERNAL_API_TOKEN` 时直接命中控制 handler、绕过 paths/pathAction；token 缺失或错误时按普通下载路径走 paths（若配置了 `/api/v0/**` 的阻断，仅在 token 失败时生效）。
 
 ### 1.5 部署到 Cloudflare
 
