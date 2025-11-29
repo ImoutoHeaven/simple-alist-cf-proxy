@@ -12,7 +12,7 @@ import { BootstrapDO } from './do/bootstrap-do.js';
 import { MetricsDO } from './do/metrics-do.js';
 
 // Configuration constants
-const REQUIRED_ENV = ['WORKER_ADDRESS'];
+const REQUIRED_ENV = [];
 const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-addition', 'skip-addition-expiretime', 'skip-origin', 'asis']);
 const DEFAULT_LINK_TTL_SECONDS = 1800;
 const DEFAULT_CLEANUP_PERCENTAGE = 1;
@@ -98,7 +98,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     throw new Error('controller download.address is required');
   }
 
-  const workerAddress = normalizeString(env.WORKER_ADDRESS);
   const authConfig = downloadBootstrap.auth && typeof downloadBootstrap.auth === 'object'
     ? downloadBootstrap.auth
     : {};
@@ -324,7 +323,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   return {
     address,
     token,
-    workerAddress,
     verifyHeader,
     verifySecret,
     signSecret,
@@ -1029,7 +1027,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // WorkerSign verification
   const workerSign = url.searchParams.get("workerSign") ?? "";
   if (shouldCheckWorker) {
-    const workerVerifyData = JSON.stringify({ path: path, worker_addr: config.workerAddress });
+    const actualWorkerAddress = new URL(request.url).origin;
+    const workerVerifyData = JSON.stringify({ path: path, worker_addr: actualWorkerAddress });
     const workerVerifyResult = await verify("workerSign", workerVerifyData, workerSign, config.token);
     if (workerVerifyResult !== "") {
       return createUnauthorizedResponse(origin, workerVerifyResult);
@@ -1561,7 +1560,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     while (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("Location");
       if (location) {
-        if (location.startsWith(`${config.workerAddress}/`)) {
+        const currentOrigin = new URL(originalRequest.url).origin;
+        if (location.startsWith(`${currentOrigin}/`)) {
           request = new Request(location, request);
           return await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
         } else {
@@ -1594,7 +1594,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         while (response.status >= 300 && response.status < 400) {
           const location = response.headers.get("Location");
           if (location) {
-            if (location.startsWith(`${config.workerAddress}/`)) {
+            const currentOrigin = new URL(originalRequest.url).origin;
+            if (location.startsWith(`${currentOrigin}/`)) {
               request = new Request(location, request);
               return await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
             } else {
