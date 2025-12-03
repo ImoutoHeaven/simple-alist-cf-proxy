@@ -38,6 +38,12 @@
   - `zombieTimeoutSeconds` / `ipCooldownSeconds`：僵尸锁超时 & 冷却时间。
   - `cleanup`：后台清理配置（`enabled`、`intervalSeconds` 默认 1800 秒、`queueDepthZombieTtlSeconds` 未指定时默认 20 秒）。
   - `defaultGrantedCleanupDelay`：GRANTED 会话在释放 waiter 后延迟删除的秒数，默认 5 秒，用于给 client-cancel 遗言留短窗口。
+  - `weightedScheduler`：热点 host 上的加权调度开关与调参（默认关闭，开后才会按等待次数/等待时长分配 TryAcquire 名额）：
+    - `enabled`：是否启用加权调度。
+    - `hotPendingFactor` / `hotPendingMin`：判定热点 host 的 pending 阈值，`maxSlotPerHost*factor` 与 `hotPendingMin` 取大。
+    - `coldAvgWaitMs` / `hotAvgWaitMs`：基于 host 平均等待时长的冷/热点界线，通常不需要手调，默认由 `pollIntervalMs + minSlotHoldMs` 推导。
+    - `maxProbesPerCycle`：每个 poll 周期允许的 TryAcquire 次数上限，用于限制单 host 打 PG 的 QPS。
+    - `baseWeight` / `weightPerWait`：权重公式 `w = baseWeight + weightPerWait*waitCount`，权重越大越容易被选中 TryAcquire。
 - `rpc`：数据库 RPC 函数名（默认与 `download-init.sql` 中保持一致）。
 
 ## HTTP 接口
