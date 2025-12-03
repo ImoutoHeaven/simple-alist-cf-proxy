@@ -57,22 +57,34 @@ type PostgresConfig struct {
 }
 
 type FairQueueConfig struct {
-	MaxWaitMs                  int64                  `json:"maxWaitMs"`
-	PollIntervalMs             int64                  `json:"pollIntervalMs"`
-	PollWindowMs               int64                  `json:"pollWindowMs"`
-	MinSlotHoldMs              int64                  `json:"minSlotHoldMs"`
-	SmoothReleaseIntervalMs    *int64                 `json:"smoothReleaseIntervalMs,omitempty"`
-	MaxSlotPerHost             int                    `json:"maxSlotPerHost"`
-	MaxSlotPerIP               int                    `json:"maxSlotPerIp"`
-	MaxWaitersPerIP            int                    `json:"maxWaitersPerIp"`
-	MaxWaitersPerHost          int                    `json:"maxWaitersPerHost"`
-	ZombieTimeoutSeconds       int                    `json:"zombieTimeoutSeconds"`
-	IPCooldownSeconds          int                    `json:"ipCooldownSeconds"`
-	SessionIdleSeconds         int                    `json:"sessionIdleSeconds"`
-	RPC                        RPCConfig              `json:"rpc"`
-	Cleanup                    FairQueueCleanupConfig `json:"cleanup"`
-	DefaultGrantedCleanupDelay int                    `json:"defaultGrantedCleanupDelay"`
+	MaxWaitMs                  int64                   `json:"maxWaitMs"`
+	PollIntervalMs             int64                   `json:"pollIntervalMs"`
+	PollWindowMs               int64                   `json:"pollWindowMs"`
+	MinSlotHoldMs              int64                   `json:"minSlotHoldMs"`
+	SmoothReleaseIntervalMs    *int64                  `json:"smoothReleaseIntervalMs,omitempty"`
+	WeightedScheduler          WeightedSchedulerConfig `json:"weightedScheduler"`
+	MaxSlotPerHost             int                     `json:"maxSlotPerHost"`
+	MaxSlotPerIP               int                     `json:"maxSlotPerIp"`
+	MaxWaitersPerIP            int                     `json:"maxWaitersPerIp"`
+	MaxWaitersPerHost          int                     `json:"maxWaitersPerHost"`
+	ZombieTimeoutSeconds       int                     `json:"zombieTimeoutSeconds"`
+	IPCooldownSeconds          int                     `json:"ipCooldownSeconds"`
+	SessionIdleSeconds         int                     `json:"sessionIdleSeconds"`
+	RPC                        RPCConfig               `json:"rpc"`
+	Cleanup                    FairQueueCleanupConfig  `json:"cleanup"`
+	DefaultGrantedCleanupDelay int                     `json:"defaultGrantedCleanupDelay"`
 	maxWaitersPerHostProvided  bool
+}
+
+type WeightedSchedulerConfig struct {
+	Enabled           bool    `json:"enabled"`
+	HotPendingFactor  int     `json:"hotPendingFactor"`
+	HotPendingMin     int     `json:"hotPendingMin"`
+	ColdAvgWaitMs     int64   `json:"coldAvgWaitMs"`
+	HotAvgWaitMs      int64   `json:"hotAvgWaitMs"`
+	MaxProbesPerCycle int     `json:"maxProbesPerCycle"`
+	BaseWeight        float64 `json:"baseWeight"`
+	WeightPerWait     float64 `json:"weightPerWait"`
 }
 
 type RPCConfig struct {
@@ -196,6 +208,8 @@ type FQSession struct {
 	ThrottleRetryAfter int
 	ThrottleTimeWindow int
 	CleanupScheduled   bool
+	SchedulerTracked   bool
+	StatsRecorded      bool
 }
 
 type sessionStore interface {
@@ -277,6 +291,28 @@ func (sr *smoothHostReleaser) nextReleaseAfter(base time.Time, interval time.Dur
 	return next
 }
 
+type fqBucketKey struct {
+	HostnameHash string
+	IPBucket     string
+}
+
+type fqBucketState struct {
+	PendingSessions int64
+	WaitCount       int64
+	VirtualTime     float64
+	LastProbedAt    time.Time
+	LastFailedAt    time.Time
+}
+
+type fqHostState struct {
+	mu             sync.Mutex
+	Buckets        map[fqBucketKey]*fqBucketState
+	TotalPending   int64
+	AvgWaitMs      int64
+	LastCycleStart time.Time
+	ProbesInCycle  int
+}
+
 type runtimeMeta struct {
 	appName    string
 	appVersion string
@@ -347,6 +383,13 @@ type metricsReporter struct {
 	log    *logger
 }
 
+func fqHostKey(hostnameHash, hostname string) string {
+	if strings.TrimSpace(hostnameHash) != "" {
+		return hostnameHash
+	}
+	return hostname
+}
+
 type server struct {
 	mu               sync.RWMutex
 	cfg              *Config
@@ -355,6 +398,8 @@ type server struct {
 	sessionStore     sessionStore
 	smoothMu         sync.Mutex
 	smoothReleasers  map[string]*smoothHostReleaser
+	fqMu             sync.RWMutex
+	fqHosts          map[string]*fqHostState
 	controller       *controllerEnv
 	meta             runtimeMeta
 	internalAPIToken string
@@ -378,12 +423,40 @@ func (s *server) getBackend() queueBackend {
 	return backend
 }
 
+func (s *server) getHostState(hostKey string) *fqHostState {
+	if hostKey == "" {
+		return nil
+	}
+	s.fqMu.RLock()
+	host := s.fqHosts[hostKey]
+	s.fqMu.RUnlock()
+	return host
+}
+
+func (s *server) getOrCreateHostState(hostKey string) *fqHostState {
+	if hostKey == "" {
+		return nil
+	}
+	s.fqMu.Lock()
+	defer s.fqMu.Unlock()
+	if s.fqHosts == nil {
+		s.fqHosts = make(map[string]*fqHostState)
+	}
+	host := s.fqHosts[hostKey]
+	if host == nil {
+		host = &fqHostState{Buckets: make(map[fqBucketKey]*fqBucketState)}
+		s.fqHosts[hostKey] = host
+	}
+	return host
+}
+
 func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion string, resetSessions bool) {
 	s.mu.Lock()
 	oldBackend := s.backend
 	if resetSessions {
 		s.sessionStore = newMemorySessionStore()
 		s.smoothReleasers = nil
+		s.fqHosts = nil
 	}
 	s.cfg = cfg
 	s.backend = backend
@@ -399,6 +472,241 @@ func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion str
 	}
 }
 
+func (s *server) registerPendingSession(sess *FQSession) {
+	if sess == nil || sess.SchedulerTracked {
+		return
+	}
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getOrCreateHostState(hostKey)
+	if host == nil {
+		return
+	}
+
+	host.mu.Lock()
+	defer host.mu.Unlock()
+
+	if host.Buckets == nil {
+		host.Buckets = make(map[fqBucketKey]*fqBucketState)
+	}
+
+	bucketKey := fqBucketKey{HostnameHash: sess.HostnameHash, IPBucket: sess.IPBucket}
+	bucket := host.Buckets[bucketKey]
+	if bucket == nil {
+		vt := 0.0
+		first := true
+		for _, b := range host.Buckets {
+			if first || b.VirtualTime < vt {
+				vt = b.VirtualTime
+				first = false
+			}
+		}
+		bucket = &fqBucketState{VirtualTime: vt}
+		host.Buckets[bucketKey] = bucket
+	}
+
+	bucket.PendingSessions++
+	host.TotalPending++
+	sess.SchedulerTracked = true
+}
+
+func (s *server) unregisterSession(sess *FQSession) {
+	if sess == nil || !sess.SchedulerTracked {
+		return
+	}
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getHostState(hostKey)
+	if host == nil {
+		return
+	}
+
+	host.mu.Lock()
+	defer host.mu.Unlock()
+
+	bucketKey := fqBucketKey{HostnameHash: sess.HostnameHash, IPBucket: sess.IPBucket}
+	bucket := host.Buckets[bucketKey]
+	if bucket != nil {
+		if bucket.PendingSessions > 0 {
+			bucket.PendingSessions--
+			if host.TotalPending > 0 {
+				host.TotalPending--
+			}
+		}
+		if bucket.PendingSessions == 0 {
+			delete(host.Buckets, bucketKey)
+		}
+	}
+
+	sess.SchedulerTracked = false
+}
+
+func (s *server) onTryAcquireFailed(sess *FQSession) {
+	if sess == nil {
+		return
+	}
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getHostState(hostKey)
+	if host == nil {
+		return
+	}
+
+	host.mu.Lock()
+	defer host.mu.Unlock()
+
+	bucketKey := fqBucketKey{HostnameHash: sess.HostnameHash, IPBucket: sess.IPBucket}
+	bucket := host.Buckets[bucketKey]
+	if bucket == nil {
+		bucket = &fqBucketState{}
+		host.Buckets[bucketKey] = bucket
+	}
+
+	bucket.WaitCount++
+	bucket.LastFailedAt = time.Now()
+}
+
+func (s *server) onTryAcquireResult(sess *FQSession, status string) {
+	if sess == nil {
+		return
+	}
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getHostState(hostKey)
+	if host == nil {
+		return
+	}
+
+	host.mu.Lock()
+	defer host.mu.Unlock()
+
+	bucketKey := fqBucketKey{HostnameHash: sess.HostnameHash, IPBucket: sess.IPBucket}
+	bucket := host.Buckets[bucketKey]
+	if bucket == nil {
+		return
+	}
+
+	switch strings.ToUpper(status) {
+	case "ACQUIRED":
+		bucket.WaitCount = bucket.WaitCount / 2
+	case "THROTTLED":
+		// keep WaitCount to reflect recent contention
+	}
+}
+
+func (s *server) markSessionFinished(sess *FQSession) {
+	if sess == nil || sess.StatsRecorded {
+		return
+	}
+	if sess.State == StateThrottled {
+		sess.StatsRecorded = true
+		return
+	}
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getHostState(hostKey)
+	if host == nil {
+		sess.StatsRecorded = true
+		return
+	}
+
+	waitMs := time.Since(sess.CreatedAt).Milliseconds()
+	host.mu.Lock()
+	const alpha = 0.8
+	host.AvgWaitMs = int64(alpha*float64(host.AvgWaitMs) + (1-alpha)*float64(waitMs))
+	host.mu.Unlock()
+	sess.StatsRecorded = true
+}
+
+func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
+	if cfg == nil || sess == nil {
+		return true
+	}
+	ws := cfg.FairQueue.weightedScheduler()
+	if !ws.Enabled {
+		return true
+	}
+
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getHostState(hostKey)
+	if host == nil {
+		return true
+	}
+
+	pollInterval := cfg.FairQueue.pollInterval()
+	hotPendingThreshold := ws.HotPendingFactor * cfg.FairQueue.maxSlotPerHost()
+	if hotPendingThreshold < ws.HotPendingMin {
+		hotPendingThreshold = ws.HotPendingMin
+	}
+
+	host.mu.Lock()
+	totalPending := host.TotalPending
+	avgWaitMs := host.AvgWaitMs
+	host.mu.Unlock()
+
+	if totalPending == 0 || avgWaitMs <= ws.ColdAvgWaitMs {
+		return true
+	}
+	if totalPending < int64(hotPendingThreshold) || avgWaitMs < ws.HotAvgWaitMs {
+		return true
+	}
+
+	now := time.Now()
+	host.mu.Lock()
+	defer host.mu.Unlock()
+
+	if host.LastCycleStart.IsZero() || now.Sub(host.LastCycleStart) >= pollInterval {
+		host.LastCycleStart = now
+		host.ProbesInCycle = 0
+	}
+	if ws.MaxProbesPerCycle > 0 && host.ProbesInCycle >= ws.MaxProbesPerCycle {
+		return false
+	}
+
+	if host.Buckets == nil {
+		host.Buckets = make(map[fqBucketKey]*fqBucketState)
+	}
+	bucketKey := fqBucketKey{HostnameHash: sess.HostnameHash, IPBucket: sess.IPBucket}
+	bucket := host.Buckets[bucketKey]
+	if bucket == nil {
+		vt := 0.0
+		first := true
+		for _, b := range host.Buckets {
+			if first || b.VirtualTime < vt {
+				vt = b.VirtualTime
+				first = false
+			}
+		}
+		bucket = &fqBucketState{VirtualTime: vt}
+		host.Buckets[bucketKey] = bucket
+	}
+
+	var chosenKey fqBucketKey
+	var chosenBucket *fqBucketState
+	first := true
+	for key, b := range host.Buckets {
+		if first || b.VirtualTime < chosenBucket.VirtualTime {
+			chosenKey = key
+			chosenBucket = b
+			first = false
+		}
+	}
+
+	if chosenBucket == nil {
+		return true
+	}
+
+	if chosenKey != bucketKey {
+		return false
+	}
+
+	weight := ws.BaseWeight + ws.WeightPerWait*float64(bucket.WaitCount)
+	if weight <= 0 {
+		weight = ws.BaseWeight
+	}
+	if weight <= 0 {
+		weight = 1
+	}
+	bucket.VirtualTime += 1.0 / weight
+	bucket.LastProbedAt = now
+	host.ProbesInCycle++
+	return true
+}
 func (s *server) incrementMetric(name string) {
 	if s.metricsCounters != nil {
 		s.metricsCounters.inc(name)
@@ -677,6 +985,36 @@ func (c FairQueueConfig) queueDepthCleanupTTL() int {
 		ttl = 20
 	}
 	return ttl
+}
+
+func (c FairQueueConfig) weightedScheduler() WeightedSchedulerConfig {
+	ws := c.WeightedScheduler
+	if ws.HotPendingFactor <= 0 {
+		ws.HotPendingFactor = 4
+	}
+	if ws.HotPendingMin <= 0 {
+		ws.HotPendingMin = 16
+	}
+	pollMs := c.pollInterval().Milliseconds()
+	if ws.ColdAvgWaitMs <= 0 {
+		ws.ColdAvgWaitMs = pollMs
+	}
+	if ws.HotAvgWaitMs <= 0 {
+		ws.HotAvgWaitMs = 3*pollMs + c.minHold(0)
+	}
+	if ws.MaxProbesPerCycle <= 0 {
+		ws.MaxProbesPerCycle = c.maxSlotPerHost()
+		if ws.MaxProbesPerCycle <= 0 {
+			ws.MaxProbesPerCycle = 1
+		}
+	}
+	if ws.BaseWeight <= 0 {
+		ws.BaseWeight = 1
+	}
+	if ws.WeightPerWait <= 0 {
+		ws.WeightPerWait = 1
+	}
+	return ws
 }
 
 func sanitizeThrottleWindowSeconds(v int) int {
@@ -1302,6 +1640,7 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 
 	s.incrementMetric("session_created")
 	s.sessionStore.Save(sess)
+	s.registerPendingSession(sess)
 
 	return &AcquireResponse{
 		Result:     "pending",
@@ -1330,6 +1669,10 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 
+	if !sess.SchedulerTracked {
+		s.registerPendingSession(sess)
+	}
+
 	now := time.Now()
 
 	idleLimit := cfg.FairQueue.sessionIdleDuration()
@@ -1340,6 +1683,9 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			now.Sub(sess.LastSeenAt).Milliseconds(),
 		)
 		s.incrementMetric("timeout")
+		sess.State = StateTimeout
+		s.unregisterSession(sess)
+		s.markSessionFinished(sess)
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
@@ -1353,6 +1699,8 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 		)
 		s.incrementMetric("timeout")
 		sess.State = StateTimeout
+		s.unregisterSession(sess)
+		s.markSessionFinished(sess)
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
@@ -1365,6 +1713,8 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			"session granted token=%s host=%s ip=%s slotToken=%s",
 			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
 		)
+		s.unregisterSession(sess)
+		s.markSessionFinished(sess)
 		s.handleGrantedLocked(sess)
 		s.incrementMetric("granted")
 		return &AcquireResponse{
@@ -1378,6 +1728,8 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			sess.Token, sess.Hostname, sess.IPBucket,
 			sess.ThrottleCode, sess.ThrottleRetryAfter,
 		)
+		s.unregisterSession(sess)
+		s.markSessionFinished(sess)
 		s.incrementMetric("throttled")
 		s.cleanupSession(sess)
 		return &AcquireResponse{
@@ -1390,6 +1742,8 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			"session timeout token=%s host=%s ip=%s",
 			sess.Token, sess.Hostname, sess.IPBucket,
 		)
+		s.unregisterSession(sess)
+		s.markSessionFinished(sess)
 		s.incrementMetric("timeout")
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
@@ -1414,6 +1768,8 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			"session granted token=%s host=%s ip=%s slotToken=%s",
 			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
 		)
+		s.unregisterSession(sess)
+		s.markSessionFinished(sess)
 		s.handleGrantedLocked(sess)
 		s.incrementMetric("granted")
 		return &AcquireResponse{
@@ -1427,6 +1783,8 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			sess.Token, sess.Hostname, sess.IPBucket,
 			sess.ThrottleCode, sess.ThrottleRetryAfter,
 		)
+		s.unregisterSession(sess)
+		s.markSessionFinished(sess)
 		s.incrementMetric("throttled")
 		s.cleanupSession(sess)
 		return &AcquireResponse{
@@ -1439,6 +1797,8 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			"session timeout token=%s host=%s ip=%s",
 			sess.Token, sess.Hostname, sess.IPBucket,
 		)
+		s.unregisterSession(sess)
+		s.markSessionFinished(sess)
 		s.incrementMetric("timeout")
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
@@ -1501,6 +1861,11 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 			return nil
 		}
 
+		if !s.shouldProbe(cfg, sess) {
+			time.Sleep(pollInterval)
+			continue
+		}
+
 		req := s.buildAcquireRequest(cfg, sess.Hostname, sess.HostnameHash, sess.IPBucket, sess.ThrottleTimeWindow, time.Now())
 		tryRes, err := backend.TryAcquire(ctx, req)
 		if err != nil {
@@ -1508,6 +1873,7 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 			return err
 		}
 		if tryRes == nil {
+			s.onTryAcquireFailed(sess)
 			time.Sleep(pollInterval)
 			continue
 		}
@@ -1518,16 +1884,22 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 			sess.State = StateThrottled
 			sess.ThrottleCode = tryRes.throttleCode
 			sess.ThrottleRetryAfter = tryRes.throttleRetryAfter
+			s.onTryAcquireResult(sess, tryRes.status)
 			s.log.Infof(
 				"slot throttled token=%s host=%s ip=%s code=%d retryAfter=%d qDepth=%d ipQDepth=%d",
 				sess.Token, sess.Hostname, sess.IPBucket,
 				tryRes.throttleCode, tryRes.throttleRetryAfter,
 				tryRes.queueDepth, tryRes.ipQueueDepth,
 			)
+			s.unregisterSession(sess)
+			s.markSessionFinished(sess)
 			return nil
 		case "ACQUIRED":
 			sess.State = StateGranted
 			sess.SlotToken = tryRes.slotToken
+			s.onTryAcquireResult(sess, tryRes.status)
+			s.unregisterSession(sess)
+			s.markSessionFinished(sess)
 			slotLog := tryRes.slotToken
 			if len(slotLog) > 8 {
 				slotLog = slotLog[len(slotLog)-8:]
@@ -1539,6 +1911,7 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 			)
 			return nil
 		default:
+			s.onTryAcquireFailed(sess)
 			time.Sleep(pollInterval)
 		}
 	}
@@ -1568,6 +1941,9 @@ func (s *server) buildAcquireRequest(cfg *Config, hostname, hostnameHash, ipBuck
 func (s *server) cleanupSession(sess *FQSession) {
 	cfg := s.getConfig()
 	backend := s.getBackend()
+
+	s.unregisterSession(sess)
+	s.markSessionFinished(sess)
 
 	token := sess.Token
 	hostCap := 0
@@ -1612,6 +1988,9 @@ func (s *server) deleteSessionLocked(sess *FQSession) {
 func (s *server) handleGrantedLocked(sess *FQSession) {
 	cfg := s.getConfig()
 	backend := s.getBackend()
+
+	s.unregisterSession(sess)
+	s.markSessionFinished(sess)
 
 	hostCap := 0
 	ipCap := 0
@@ -1784,6 +2163,7 @@ func (s *server) gcSessions() {
 			)
 			if timedOut {
 				s.incrementMetric("timeout")
+				sess.State = StateTimeout
 			}
 			s.cleanupSession(sess)
 		}
