@@ -324,6 +324,11 @@ type fqWaiterIpState struct {
 	WaiterDenyUntil     time.Time
 }
 
+type fqThrottleState struct {
+	ProtectedUntil time.Time
+	Code           int
+}
+
 type fqHostState struct {
 	mu                    sync.Mutex
 	Buckets               map[fqBucketKey]*fqBucketState
@@ -432,6 +437,8 @@ type server struct {
 	metrics          *metricsReporter
 	metricsCounters  *metricsCounters
 	globalWaiters    int64
+	throttleMu       sync.Mutex
+	throttleHost     map[string]*fqThrottleState
 }
 
 func (s *server) getConfig() *Config {
@@ -505,6 +512,42 @@ func (s *server) getOrCreateWaiterState(host *fqHostState, ipBucket string) *fqW
 	return state
 }
 
+func (s *server) getThrottleState(hostKey string, now time.Time) (bool, int, int) {
+	s.throttleMu.Lock()
+	defer s.throttleMu.Unlock()
+
+	st := s.throttleHost[hostKey]
+	if st == nil || st.ProtectedUntil.IsZero() || now.After(st.ProtectedUntil) {
+		return false, 0, 0
+	}
+	remaining := int(st.ProtectedUntil.Sub(now).Seconds())
+	if remaining < 0 {
+		remaining = 0
+	}
+	return true, st.Code, remaining
+}
+
+func (s *server) setThrottleState(hostKey string, now time.Time, code, retryAfter int) {
+	if retryAfter <= 0 {
+		return
+	}
+	ra := retryAfter
+	const maxCacheSeconds = 600
+	if ra > maxCacheSeconds {
+		ra = maxCacheSeconds
+	}
+
+	s.throttleMu.Lock()
+	defer s.throttleMu.Unlock()
+	if s.throttleHost == nil {
+		s.throttleHost = make(map[string]*fqThrottleState)
+	}
+	s.throttleHost[hostKey] = &fqThrottleState{
+		ProtectedUntil: now.Add(time.Duration(ra) * time.Second),
+		Code:           code,
+	}
+}
+
 func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion string, resetSessions bool) {
 	s.mu.Lock()
 	oldBackend := s.backend
@@ -512,6 +555,7 @@ func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion str
 		s.sessionStore = newMemorySessionStore()
 		s.smoothReleasers = nil
 		s.fqHosts = nil
+		s.throttleHost = nil
 	}
 	s.cfg = cfg
 	s.backend = backend
@@ -1954,6 +1998,24 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 	if cfg == nil {
 		return nil, errors.New("config not loaded")
 	}
+	hostKey := fqHostKey(req.HostnameHash, req.Hostname)
+	now := time.Now()
+
+	if protected, code, retryAfter := s.getThrottleState(hostKey, now); protected {
+		if s.log != nil {
+			s.log.Infof(
+				"[FQ] throttle (cached) host=%s ip=%s code=%d retryAfter=%d",
+				hostKey, req.IPBucket, code, retryAfter,
+			)
+		}
+		s.incrementMetric("throttled")
+		return &AcquireResponse{
+			Result:       "throttled",
+			ThrottleCode: code,
+			ThrottleWait: retryAfter,
+			Reason:       "throttle_cached",
+		}, nil
+	}
 	if !s.canAcceptNewWaiter(cfg) {
 		limit := cfg.FairQueue.globalMaxWaiters()
 		current := atomic.LoadInt64(&s.globalWaiters)
@@ -1974,7 +2036,6 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 		return nil, errors.New("backend not initialized")
 	}
 
-	now := time.Now()
 	throttleWindow := sanitizeThrottleWindowSeconds(req.ThrottleTimeWindow)
 	backendReq := s.buildAcquireRequest(cfg, req.Hostname, req.HostnameHash, req.IPBucket, throttleWindow, now)
 
@@ -1984,6 +2045,7 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 	}
 	if throttleRes.throttled {
 		s.incrementMetric("throttled")
+		s.setThrottleState(hostKey, now, throttleRes.code, throttleRes.retryAfter)
 		s.log.Infof(
 			"acquire throttled host=%s ip=%s code=%d retryAfter=%d",
 			req.Hostname, req.IPBucket, throttleRes.code, throttleRes.retryAfter,

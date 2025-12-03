@@ -244,6 +244,7 @@ slot-handler 的调度路径可以理解成一个「漏斗」：从外层大量�
 
 - 全局漏斗：当本机 PENDING 会话数达到 `globalMaxWaiters`（默认 500）时，首次 `/fairqueue/acquire` 直接返回 `result="overloaded"`，不创建 session，保护 slot-handler 自身。
 - RegisterWaiter gating：当本机观察到 host/IP 已达上限，或连续收到 PG `HOST_QUEUE_FULL/QUEUE_FULL`，会开启本地 deny window，短时间内不再打 RegisterWaiter RPC，防止风暴。
+- 断路器缓存：PG 返回 `throttled` 时会缓存 `retryAfter` 窗口，后续同 host 在窗口内直接返回 throttled（reason=`throttle_cached`），减少重复的断路器 RPC。
 - 短轮询：每次 HTTP 请求只使用 `pollWindowMs` 预算注册/抢锁，Worker 端默认 8 秒超时，多次轮询在 `maxWaitMs` + `SLOT_HANDLER_MAX_ATTEMPTS_CAP` 限制内完成。
 - 终态/短路结果：`granted`（拿到 slot）、`timeout`（等待超时/会话过期）、`throttled`（熔断，立即退出）；当本机过载时会返回 `overloaded`（不会创建 session）；终态会立刻删除会话。
 - 会话清理：`sessionIdleSeconds` 内无轮询或累计等待超过 `maxWaitMs` → 直接返回 `timeout` 并清理。

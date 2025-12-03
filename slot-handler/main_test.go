@@ -14,6 +14,22 @@ func newTestServer() *server {
 	}
 }
 
+type stubBackend struct {
+	throttle throttleResult
+}
+
+func (s *stubBackend) CheckThrottle(ctx context.Context, req AcquireRequest) (throttleResult, error) {
+	return s.throttle, nil
+}
+func (s *stubBackend) RegisterWaiter(ctx context.Context, req AcquireRequest) (*registerResult, error) {
+	return &registerResult{allowed: true}, nil
+}
+func (s *stubBackend) ReleaseWaiter(ctx context.Context, req AcquireRequest) error { return nil }
+func (s *stubBackend) TryAcquire(ctx context.Context, req AcquireRequest) (*tryAcquireResult, error) {
+	return &tryAcquireResult{status: "WAIT"}, nil
+}
+func (s *stubBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }
+
 func testWeightedConfig() *Config {
 	return &Config{
 		FairQueue: FairQueueConfig{
@@ -202,6 +218,47 @@ func TestHandleFirstAcquireOverloaded(t *testing.T) {
 	}
 	if resp == nil || resp.Result != "overloaded" {
 		t.Fatalf("expected overloaded result, got %+v", resp)
+	}
+}
+
+func TestThrottleCacheHit(t *testing.T) {
+	s := newTestServer()
+	s.cfg = &Config{FairQueue: FairQueueConfig{}}
+	hostKey := fqHostKey("h1", "example.com")
+	now := time.Now()
+	s.setThrottleState(hostKey, now, 503, 30)
+
+	resp, err := s.handleFirstAcquire(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Result != "throttled" || resp.Reason != "throttle_cached" {
+		t.Fatalf("expected cached throttled response, got %+v", resp)
+	}
+}
+
+func TestThrottleCachePopulatedFromBackend(t *testing.T) {
+	s := newTestServer()
+	s.cfg = &Config{FairQueue: FairQueueConfig{}}
+	s.backend = &stubBackend{throttle: throttleResult{throttled: true, code: 429, retryAfter: 15}}
+
+	resp, err := s.handleFirstAcquire(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Result != "throttled" {
+		t.Fatalf("expected throttled, got %+v", resp)
+	}
+
+	protected, code, retry := s.getThrottleState(fqHostKey("h1", "example.com"), time.Now())
+	if !protected || code != 429 || retry <= 0 {
+		t.Fatalf("expected throttle cache set, got protected=%v code=%d retry=%d", protected, code, retry)
 	}
 }
 
