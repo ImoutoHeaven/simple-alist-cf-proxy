@@ -39,11 +39,46 @@
   - `cleanup`：后台清理配置（`enabled`、`intervalSeconds` 默认 1800 秒、`queueDepthZombieTtlSeconds` 未指定时默认 20 秒）。
   - `defaultGrantedCleanupDelay`：GRANTED 会话在释放 waiter 后延迟删除的秒数，默认 5 秒，用于给 client-cancel 遗言留短窗口。
   - `weightedScheduler`：热点 host 上的加权调度开关与调参（默认关闭，开后才会按等待次数/等待时长分配 TryAcquire 名额）：
-    - `enabled`：是否启用加权调度。
-    - `hotPendingFactor` / `hotPendingMin`：判定热点 host 的 pending 阈值，`maxSlotPerHost*factor` 与 `hotPendingMin` 取大。
-    - `coldAvgWaitMs` / `hotAvgWaitMs`：基于 host 平均等待时长的冷/热点界线，通常不需要手调，默认由 `pollIntervalMs + minSlotHoldMs` 推导。
-    - `maxProbesPerCycle`：每个 poll 周期允许的 TryAcquire 次数上限，用于限制单 host 打 PG 的 QPS。
-    - `baseWeight` / `weightPerWait`：权重公式 `w = baseWeight + weightPerWait*waitCount`，权重越大越容易被选中 TryAcquire。
+    - `enabled`  
+      - 是否启用加权调度。  
+      - `false` 时：逻辑退回「每个 session 在 pollInterval 到来时，都自行 TryAcquire」，只受 `pollIntervalMs/maxWaitMs` 控制。  
+      - `true` 时：只有被判定为热点的 host，会在每轮 TryAcquire 前经过调度器筛选，按权重挑出有限几个 session 去打 PG。
+    - `hotPendingFactor` / `hotPendingMin`  
+      - 用来判定「一个 host 的 pending 数量是否够多，值得启用热点调度」。  
+      - 内部会算一个阈值：  
+        - `hotPendingThreshold = max(hotPendingFactor * maxSlotPerHost, hotPendingMin)`。  
+      - 当 `TotalPending < hotPendingThreshold` 时，即使平均等待时间稍微升高，也不会立刻视为“热点 host”，避免少量请求的抖动触发重度调度。  
+      - 默认值：`hotPendingFactor=4, hotPendingMin=16`，配合典型 `maxSlotPerHost=4` 时，意味着大约有 16+ 个排队连接才会进入热点判定。
+    - `coldAvgWaitMs` / `hotAvgWaitMs`  
+      - 基于 host 级平均等待时间（AvgWaitMs）判定冷/热点的时间阈值。  
+      - slot-handler 会在 session 结束时（GRANTED/TIMEOUT 等）更新每个 host 的 `AvgWaitMs`。  
+      - 判定规则大致如下：  
+        - `AvgWaitMs <= coldAvgWaitMs`：认为这是冷 host，排队仅相当于一两轮轮询，无需复杂调度；  
+        - `AvgWaitMs >= hotAvgWaitMs` 且 pending 数也超过阈值：认为 host 真正“挤爆”，才开启 Weighted 调度。  
+      - 默认值：  
+        - `coldAvgWaitMs` 默认为 `pollIntervalMs`；  
+        - `hotAvgWaitMs` 默认为 `3*pollIntervalMs + minSlotHoldMs`。  
+      - 直观理解：当平均等待时间接近一次轮询，就算轻微排队；当平均等待时间已经是「多轮轮询 + 至少一次完整持锁时间」时，才视为热点。
+    - `maxProbesPerCycle`  
+      - 每个 poll 周期内，允许一个 host 对 PG 发起的 TryAcquire 次数上限。  
+      - 用于限制某个热点 host 对 PG 的 QPS，避免所有 pending session 在每个 pollInterval 一起打 PG。  
+      - 默认值：  
+        - 若未配置，则为 `maxSlotPerHost`（若 `maxSlotPerHost<=0` 则退回到内置的默认 slot 上限）。  
+      - 推荐策略：  
+        - 第一版可以先保持默认值，让单个 host 的 TryAcquire 速率略高于理论 slot 释放速率；  
+        - 若压测发现 PG 仍然很闲且队列较长，可适当增大；若 PG 压力较高，则可适当减小。
+    - `baseWeight` / `weightPerWait`  
+      - 控制「等待次数」对调度优先级的影响。  
+      - 内部的权重公式为：  
+        - `weight = baseWeight + weightPerWait * WaitCount`；  
+        - 每个 `(hostnameHash, ipBucket)` bucket 都有一个 `VirtualTime`，每次被选中 TryAcquire 时 `VirtualTime += 1/weight`；  
+        - 每轮总是选择 `VirtualTime` 最小的 bucket 进行 TryAcquire，因此 **weight 越大，VirtualTime 增长越慢，越容易被反复选中**。  
+      - 默认：`baseWeight=1.0, weightPerWait=1.0`，即：  
+        - 刚进入队列、一次 TryAcquire 都没失败时，`weight=1`；  
+        - 失败 3 次的 bucket，`weight=4`；失败 10 次时，`weight=11`。  
+      - 含义：  
+        - 等得越久（WaitCount 越大）的 IP 子网会在多轮调度中获得更高被选中的频次；  
+        - 新进来的 session 仍有机会尝试，只是当 host 真正拥挤时，整体倾向先照顾已经等很久的老 session。
 - `rpc`：数据库 RPC 函数名（默认与 `download-init.sql` 中保持一致）。
 
 ## HTTP 接口
