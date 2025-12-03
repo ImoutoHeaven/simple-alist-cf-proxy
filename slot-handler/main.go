@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"math/rand"
+
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -305,6 +307,13 @@ type fqBucketState struct {
 	LastFailedAt    time.Time
 }
 
+// fqIpState tracks recent structural failures for an IP bucket.
+type fqIpState struct {
+	LastIpTooManyAt time.Time
+	LastQueueFullAt time.Time
+	DenyUntil       time.Time
+}
+
 type fqHostState struct {
 	mu             sync.Mutex
 	Buckets        map[fqBucketKey]*fqBucketState
@@ -312,6 +321,7 @@ type fqHostState struct {
 	AvgWaitMs      int64
 	LastCycleStart time.Time
 	ProbesInCycle  int
+	IpStates       map[string]*fqIpState
 }
 
 type runtimeMeta struct {
@@ -449,6 +459,21 @@ func (s *server) getOrCreateHostState(hostKey string) *fqHostState {
 		s.fqHosts[hostKey] = host
 	}
 	return host
+}
+
+func (s *server) getOrCreateIpState(host *fqHostState, ipBucket string) *fqIpState {
+	if host == nil || ipBucket == "" {
+		return nil
+	}
+	if host.IpStates == nil {
+		host.IpStates = make(map[string]*fqIpState)
+	}
+	state := host.IpStates[ipBucket]
+	if state == nil {
+		state = &fqIpState{}
+		host.IpStates[ipBucket] = state
+	}
+	return state
 }
 
 func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion string, resetSessions bool) {
@@ -591,6 +616,77 @@ func (s *server) onTryAcquireResult(sess *FQSession, status string) {
 	}
 }
 
+func (s *server) onStructurallyFailed(sess *FQSession, status string, cfg *Config) {
+	if sess == nil || cfg == nil {
+		return
+	}
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getHostState(hostKey)
+	if host == nil {
+		return
+	}
+
+	host.mu.Lock()
+	defer host.mu.Unlock()
+
+	bucketKey := fqBucketKey{HostnameHash: sess.HostnameHash, IPBucket: sess.IPBucket}
+	bucket := host.Buckets[bucketKey]
+	if bucket == nil {
+		bucket = &fqBucketState{}
+		host.Buckets[bucketKey] = bucket
+	}
+
+	// Avoid keeping this IP at the top of WRR when PG already rejected it.
+	if bucket.WaitCount > 0 {
+		bucket.WaitCount = bucket.WaitCount / 2
+	}
+
+	ipState := s.getOrCreateIpState(host, sess.IPBucket)
+	if ipState != nil {
+		now := time.Now()
+		ipState.LastIpTooManyAt = now
+		baseSeconds := cfg.FairQueue.cooldownSeconds()
+		if baseSeconds <= 0 {
+			baseSeconds = 3
+		}
+		jitterMax := baseSeconds / 3
+		if jitterMax < 1 {
+			jitterMax = 1
+		}
+		jitter := rand.Intn(jitterMax + 1) // [0, jitterMax]
+		denySeconds := baseSeconds + jitter
+		ipState.DenyUntil = now.Add(time.Duration(denySeconds) * time.Second)
+
+		if s.log != nil {
+			s.log.Infof("[FQ] ip deny window: host=%s ip=%s reason=%s cooldown=%ds jitter=%d", hostKey, sess.IPBucket, status, baseSeconds, jitter)
+		}
+	}
+}
+
+func (s *server) onQueueFull(sess *FQSession, status string) {
+	s.onTryAcquireFailed(sess)
+
+	if sess == nil {
+		return
+	}
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getHostState(hostKey)
+	if host == nil {
+		return
+	}
+	host.mu.Lock()
+	defer host.mu.Unlock()
+
+	ipState := s.getOrCreateIpState(host, sess.IPBucket)
+	if ipState != nil {
+		ipState.LastQueueFullAt = time.Now()
+	}
+}
+
+func (s *server) onWait(sess *FQSession, status string) {
+	s.onTryAcquireFailed(sess)
+}
+
 func (s *server) markSessionFinished(sess *FQSession) {
 	if sess == nil || sess.StatsRecorded {
 		return
@@ -624,6 +720,20 @@ func (s *server) finalizeSession(sess *FQSession) {
 	})
 }
 
+func (s *server) isIpInStructuralDenyWindow(host *fqHostState, ipBucket string, now time.Time) bool {
+	if host == nil || ipBucket == "" {
+		return false
+	}
+	ipState := host.IpStates[ipBucket]
+	if ipState == nil {
+		return false
+	}
+	if !ipState.DenyUntil.IsZero() && now.Before(ipState.DenyUntil) {
+		return true
+	}
+	return false
+}
+
 func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 	if cfg == nil || sess == nil {
 		return true
@@ -645,6 +755,17 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 		hotPendingThreshold = ws.HotPendingMin
 	}
 
+	now := time.Now()
+	host.mu.Lock()
+	if s.isIpInStructuralDenyWindow(host, sess.IPBucket, now) {
+		host.mu.Unlock()
+		if s.log != nil {
+			s.log.Infof("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
+		}
+		return false
+	}
+	host.mu.Unlock()
+
 	host.mu.Lock()
 	totalPending := host.TotalPending
 	avgWaitMs := host.AvgWaitMs
@@ -657,7 +778,7 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 		return true
 	}
 
-	now := time.Now()
+	now = time.Now()
 	host.mu.Lock()
 	defer host.mu.Unlock()
 
@@ -703,6 +824,13 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 	}
 
 	if chosenKey != bucketKey {
+		return false
+	}
+
+	if s.isIpInStructuralDenyWindow(host, sess.IPBucket, now) {
+		if s.log != nil {
+			s.log.Infof("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
+		}
 		return false
 	}
 
@@ -1926,6 +2054,15 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 				slotLog, tryRes.queueDepth, tryRes.ipQueueDepth,
 			)
 			return nil
+		case "IP_TOO_MANY":
+			s.onStructurallyFailed(sess, tryRes.status, cfg)
+			time.Sleep(pollInterval)
+		case "QUEUE_FULL":
+			s.onQueueFull(sess, tryRes.status)
+			time.Sleep(pollInterval)
+		case "WAIT":
+			s.onWait(sess, tryRes.status)
+			time.Sleep(pollInterval)
 		default:
 			s.onTryAcquireFailed(sess)
 			time.Sleep(pollInterval)

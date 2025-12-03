@@ -73,6 +73,34 @@ func TestOnTryAcquireWaitCountUpdates(t *testing.T) {
 	}
 }
 
+func TestOnStructurallyFailedSetsDenyWindow(t *testing.T) {
+	cfg := testWeightedConfig()
+	s := newTestServer()
+	hostKey := fqHostKey("h1", "example.com")
+	host := &fqHostState{
+		Buckets: map[fqBucketKey]*fqBucketState{
+			{HostnameHash: "h1", IPBucket: "ip1"}: {WaitCount: 4},
+		},
+		IpStates: make(map[string]*fqIpState),
+	}
+	s.fqHosts = map[string]*fqHostState{hostKey: host}
+
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	s.onStructurallyFailed(sess, "IP_TOO_MANY", cfg)
+
+	bucket := host.Buckets[fqBucketKey{HostnameHash: "h1", IPBucket: "ip1"}]
+	if bucket.WaitCount >= 4 {
+		t.Fatalf("expected WaitCount to decrease on structural failure, got %d", bucket.WaitCount)
+	}
+	ipState := host.IpStates["ip1"]
+	if ipState == nil {
+		t.Fatalf("expected ip state to be created")
+	}
+	if !ipState.DenyUntil.After(time.Now()) {
+		t.Fatalf("expected deny window in the future, got %v", ipState.DenyUntil)
+	}
+}
+
 func TestShouldProbeRespectsMaxProbes(t *testing.T) {
 	cfg := testWeightedConfig()
 	s := newTestServer()
@@ -112,6 +140,29 @@ func TestShouldProbeColdHost(t *testing.T) {
 	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
 	if !s.shouldProbe(cfg, sess) {
 		t.Fatalf("cold host should always probe")
+	}
+}
+
+func TestShouldProbeBlocksIpDenyWindow(t *testing.T) {
+	cfg := testWeightedConfig()
+	s := newTestServer()
+
+	hostKey := fqHostKey("h1", "example.com")
+	host := &fqHostState{
+		Buckets: map[fqBucketKey]*fqBucketState{
+			{HostnameHash: "h1", IPBucket: "ip1"}: {},
+		},
+		TotalPending: 2,
+		AvgWaitMs:    2,
+		IpStates: map[string]*fqIpState{
+			"ip1": {DenyUntil: time.Now().Add(5 * time.Second)},
+		},
+	}
+	s.fqHosts = map[string]*fqHostState{hostKey: host}
+
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	if s.shouldProbe(cfg, sess) {
+		t.Fatalf("probe should be blocked by IP deny window")
 	}
 }
 
