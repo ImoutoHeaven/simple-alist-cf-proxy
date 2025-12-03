@@ -168,6 +168,52 @@ slot-handler 的调度路径可以理解成一个「漏斗」：从外层大量�
 
 这样可以在不改 PG schema 的前提下，把「防止疯狂 IP 打爆 PG」和「让等得久的 IP 更容易拿到 slot」这两个目标同时实现。
 
+### Waiter 池漏斗模型（RegisterWaiter Funnel）
+
+在加权调度漏斗之外，waiter 注册路径也有一套独立的漏斗，用来保护 PG 的 `download_register_fq_waiter`：
+
+1. **全局 waiter 漏斗（globalMaxWaiters）**
+   - slot-handler 维护一个全局 `globalWaiters` 计数，代表当前本机 PENDING 会话的大致数量。
+   - 配置项 `fairQueue.globalMaxWaiters`（<=0 使用默认 500）控制本机愿意接受的最大排队会话数：
+     - 如果 `globalWaiters >= globalMaxWaiters`，首次 `/fairqueue/acquire` 会直接返回：  
+       `{"result":"overloaded","reason":"slot_handler_overloaded"}`，不会创建 session。
+   - 作用：
+     - 保护 slot-handler 自身（内存/CPU/协程数），避免在上游 host 或 PG 还没“挂”时，slot-handler 先被拖垮。
+
+2. **本机 host/IP waiter 计数漏斗**
+   - 对于开启了 `maxWaitersPerHost/maxWaitersPerIp` 的 host：
+     - slot-handler 在内存中维护：
+       - `RegisteredWaiters`：当前 host 已成功在 PG 注册的 waiter 数。
+       - `RegisteredWaitersByIP[ipBucket]`：当前 `(host, ip)` 已成功注册的 waiter 数。
+   - 注册前会调用 `shouldAttemptRegisterWaiter`：
+     - 如果本机视角上 host/IP 已经达到配置上限（`RegisteredWaiters >= maxWaitersPerHost` 或 `RegisteredWaitersByIP[ip] >= maxWaitersPerIp`），则本轮不再调 PG 的 RegisterWaiter，只在本地 sleep 等下一轮。
+   - 作用：
+     - 当某个 host 或 IP 的等待池已经“足够满”时，优先通过本机视角拦截，减少明显必败的注册请求打到 PG。
+
+3. **PG 反馈驱动的 waiter deny window**
+   - 调用 `download_register_fq_waiter` 时，PG 会返回 `status/queueDepth/ipQueueDepth`：
+     - 当 `status` 为 `HOST_QUEUE_FULL` / `QUEUE_FULL` 这类“队列已满”状态时：
+       - slot-handler 会记录本次时间戳，并为对应 `(host, ip)` 设置一个 `WaiterDenyUntil`：
+         - 基础时长来自 `fairQueue.waiterDenyDuration()`（默认约为 `sessionIdleSeconds/10`，兜底 3s）；
+         - 叠加一个随机抖动（jitter），避免所有 IP 在同一时间点解封。
+   - 后续 RegisterWaiter 尝试前，会先检查：
+     - 若当前时间早于 `WaiterDenyUntil`，则视为处于 waiter deny 窗口 → 本轮不打 PG，只在本地 sleep。
+   - 作用：
+     - 在“PG 明确告诉你队列已满”的场景下，及时在 Go 侧为该 `(host, ip)` 盖上一段 deny 窗口，短期内直接在内存里拦截注册风暴。
+
+4. **PG waiter 池层（最内层）**
+   - 只有穿过上述全局 & 本机漏斗的请求，才会真正调 PG 的 `download_register_fq_waiter`：
+     - 在 `upstream_ip_queue_depth` 中维护 host/IP 的 `waiting_count`；
+     - 按 `maxWaitersPerHost` / `maxWaitersPerIp` 控制“全局视角”的等待池容量。
+   - slot-handler 再根据 PG 返回的 `status/queueDepth/ipQueueDepth` 更新本机状态（`RegisteredWaiters*`、waiter deny window），形成闭环。
+
+总体上，waiter 池的漏斗模型是对 TryAcquire 漏斗的补充：
+
+- **TryAcquire 漏斗** 关注的是“谁有资格去抢 slot、多久抢一次、抢多快”，主要保护 PG 的 slot 分配路径；
+- **Waiter 漏斗** 关注的是“谁有资格进入排队池、排队池多大、多快重试”，主要保护 PG 的队列深度更新路径和 slot-handler 自身资源。  
+
+两者叠加，可以在不改 PG schema 的前提下，尽量把“必然失败”的调用挡在 slot-handler 内存层面，降低 PG 在高并发和攻击场景下的压力。
+
 ## HTTP 接口
 
 - `POST /api/v0/fairqueue/acquire`
