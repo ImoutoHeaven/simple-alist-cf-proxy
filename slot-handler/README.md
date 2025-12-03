@@ -81,6 +81,91 @@
         - 新进来的 session 仍有机会尝试，只是当 host 真正拥挤时，整体倾向先照顾已经等很久的老 session。
 - `rpc`：数据库 RPC 函数名（默认与 `download-init.sql` 中保持一致）。
 
+## 加权调度漏斗模型（Weighted Scheduler Funnel）
+
+slot-handler 的调度路径可以理解成一个「漏斗」：从外层大量短轮询请求，到最终少量 TryAcquire 打到 PG，中间会经过多层“放行/阻拦/加权/降权”：
+
+1. **会话与断路器层（最外层）**
+   - Worker 首次调用 `/fairqueue/acquire` 时：
+     - slot-handler 先调用 `download_check_throttle_protection` 检查 host 是否处于断路器保护（throttled）；若是，直接返回 `result="throttled"`，不进入排队。
+     - 否则创建 `FQSession`：记录 `hostnameHash/ipBucket/CreatedAt/LastSeenAt/State=PENDING`，并注册到本机 `sessionStore` 与 `fqHostState.Buckets`。
+   - 后续轮询带着 `queryToken`：
+     - 对 idle 或超时会话：直接返回 `timeout`，并清理内存与 waiter。
+     - 已经 `GRANTED/THROTTLED/TIMEOUT` 的会话：直接返回终态结果，不再进入调度。
+
+2. **等待池层（per-host/per-IP waiter 池）**
+   - 在一次 `runQueueCycle` 内：
+     - 若开启了 `maxWaitersPerHost`/`maxWaitersPerIp`，且当前 session 还未注册过 waiter：
+       - slot-handler 会循环调用 `download_register_fq_waiter`，尝试把该 `(host, ipBucket)` 放入 `upstream_ip_queue_depth` 表。
+       - 超过 host 或 IP 的等待池上限时，PG 会返回 `HOST_QUEUE_FULL/QUEUE_FULL` 等状态，此时 slot-handler 只在本机 sleep（不改 HTTP result），等待下一个 pollWindow。
+   - 作用：
+     - 这层限制的是“**有资格参与调度的等待人数**”，防止无限排队。
+
+3. **IP 结构性失败层（per-IP deny window）**
+   - TryAcquire 层面，PG 通过 `download_try_acquire_slot → func_try_acquire_slot` 把两类「结构性失败」统一编码为 `status="IP_TOO_MANY"`：
+     - 某 IP 当前持有的 slot 数已经达到 per-IP 并发上限。
+     - 某 IP 最近刚释放 slot，仍处于 `ipCooldownSeconds` 冷却窗口内。
+   - slot-handler 收到 `IP_TOO_MANY` 时：
+     - 调整该 IP 的 `WaitCount`（减半），避免继续占据 WRR 顶部；
+     - 为该 IP 写入 `fqIpState{LastIpTooManyAt, DenyUntil}`，`DenyUntil = cooldownSeconds + jitter`，jitter 范围约为 `[0, cooldownSeconds/3]`。
+   - 在 `shouldProbe` 中，无论 host 冷/热，都会先检查：
+     - 若 `now < DenyUntil`，立即返回 `false`，并打印 Info 日志：  
+       `"[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window"`。
+   - 作用：
+     - 这一层是“IP 级熔断漏斗”，保证所有处于 cooldown 或并发已满的 IP 在一个短时间窗口内不会再打 PG。
+
+4. **host 热度判定层（cold/hot host）**
+   - 对于没有被 IP deny 拦截的请求，slot-handler 会按 host 级统计决定是否启用 Weighted 调度：
+     - `TotalPending`：该 host 当前在 scheduler 中挂着的 PENDING 会话数。
+     - `AvgWaitMs`：该 host 最近完成的非 throttled 会话的平均等待时间（EWMA）。
+   - 判定逻辑：
+     - `TotalPending == 0` 或 `AvgWaitMs <= coldAvgWaitMs`：视为冷 host → **不启用热点调度，所有 session 每个 pollInterval 都能 TryAcquire**（但仍会先经过 IP deny 层）。
+     - `TotalPending >= hotPendingThreshold` 且 `AvgWaitMs >= hotAvgWaitMs`：视为热 host → 进入 Weighted 调度。
+   - 作用：
+     - 冷 host 时不做复杂分配，保持简单直接；只有真正拥挤的 host 才进入漏斗更窄的一层。
+
+5. **host 级探测额度层（MaxProbesPerCycle）**
+   - 对于被判定为热点的 host：
+     - 每个 `pollInterval` 视为一轮 cycle：`LastCycleStart` / `ProbesInCycle`。
+     - 若当前 cycle 已经做过 `MaxProbesPerCycle` 次 TryAcquire，则后续 session 一律被阻止 probe PG（即使它们权重很高），下一轮再说。
+   - 作用：
+     - 限制单个热点 host 对 PG 的 TryAcquire QPS，防止“所有 goroutine 每 500ms 一起打 PG”的风暴。
+
+6. **IP 加权调度层（WRR on buckets）**
+   - 仍然只对热点 host 生效：
+     - 每个 `(hostnameHash, ipBucket)` 都对应一个 `fqBucketState{WaitCount, VirtualTime, PendingSessions,...}`。
+     - 每当 host 需要选择下一位候选 session 去 TryAcquire 时：
+       - 在所有 bucket 中选 `VirtualTime` 最小者作为 winner；
+       - 如果 winner 不是当前 session 所属 bucket：本轮直接返回 `false`（让位给其他 IP）。
+       - 如果 winner 正是当前 bucket：
+         - 计算权重：`weight = baseWeight + weightPerWait * WaitCount`（不足 1 时兜底为 1）；
+         - 更新 `VirtualTime += 1/weight`，再增加 `ProbesInCycle`，最终返回 `true`。
+   - TryAcquire 结果发生后：
+     - `status="ACQUIRED"`：通过 `onTryAcquireResult` 将该 bucket 的 WaitCount 对半衰减；
+     - `status="WAIT"/"QUEUE_FULL"`：视为继续排队，通过 `onWait/onQueueFull` 把 WaitCount 小步增加；
+     - `status="IP_TOO_MANY"`：属于结构性失败，通过 `onStructurallyFailed` 降权 + 进入 deny window。
+   - 作用：
+     - 这一层是漏斗最窄的口：在有限的 TryAcquire 名额内，把更多机会给“等待次数多的 IP”，同时通过结构性失败降权，避免某个 IP 永久霸占调度。
+
+7. **PG slot + cooldown + queue depth 层（最内层）**
+   - 只有穿过上述所有漏斗层（会话有效、waiter 注册、未被 IP deny、host 已判热且未超探测额度、WRR 选中）的请求，才会真正打到 PG：
+     - `download_try_acquire_slot`：
+       - 再次检查断路器（THROTTLED）；
+       - 读取当前 host/IP 的排队深度；  
+       - 调用 `func_try_acquire_slot` 判断：
+         - 是否有空闲 slot 或可回收的僵尸 slot；
+         - 是否超过 per-IP 并发上限；
+         - 是否处于 IP cooldown 窗口。
+   - 结果回流到 Go 后，按照上述分类更新 WaitCount / IP deny 状态。
+
+综合来看，slot-handler 的公平队列调度可以理解为：
+
+- **先在外围做大粒度的“是否值得继续等待”（断路器 + 会话超时 + waiter 池）判断；**  
+- 再在中间层按 host 热度和 IP 结构性限制做“是否值得打 PG”的 gating；  
+- 最后在热点 host 内，用 WRR + MaxProbesPerCycle 在有限的 TryAcquire 名额里分配给合适的 IP bucket。  
+
+这样可以在不改 PG schema 的前提下，把「防止疯狂 IP 打爆 PG」和「让等得久的 IP 更容易拿到 slot」这两个目标同时实现。
+
 ## HTTP 接口
 
 - `POST /api/v0/fairqueue/acquire`
