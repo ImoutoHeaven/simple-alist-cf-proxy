@@ -40,6 +40,16 @@
     "maxWaitersPerHost": 50,
     "zombieTimeoutSeconds": 30,
     "ipCooldownSeconds": 0,
+    "weightedScheduler": {
+      "enabled": false,
+      "hotPendingFactor": 4,
+      "hotPendingMin": 16,
+      "coldAvgWaitMs": 500,
+      "hotAvgWaitMs": 2300,
+      "maxProbesPerCycle": 5,
+      "baseWeight": 1,
+      "weightPerWait": 1
+    },
     "rpc": {
       "throttleCheckFunc": "download_check_throttle_protection",
       "registerWaiterFunc": "download_register_fq_waiter",
