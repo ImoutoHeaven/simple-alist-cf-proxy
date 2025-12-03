@@ -816,6 +816,12 @@ const createSlotHandlerClient = (config) => {
             };
           case 'timeout':
             return { kind: 'timeout' };
+          case 'overloaded':
+            console.warn(`[FQ] slot-handler overloaded for host=${fqContext.hostname}`);
+            return {
+              kind: 'overloaded',
+              reason: typeof data?.reason === 'string' ? data.reason : 'slot-handler-overloaded',
+            };
           case 'pending':
             continue;
           default: {
@@ -1493,6 +1499,25 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
             errorCode: fqResult.throttleCode || 503,
             retryAfter: fqResult.retryAfter,
           });
+        }
+
+        if (fqResult.kind === 'overloaded') {
+          const safeHeaders = new Headers();
+          safeHeaders.set("content-type", "application/json;charset=UTF-8");
+          safeHeaders.set("Access-Control-Allow-Origin", origin);
+          safeHeaders.append("Vary", "Origin");
+          safeHeaders.set("Retry-After", "30");
+
+          return new Response(
+            JSON.stringify({
+              code: 503,
+              message: 'Fair queue overloaded, please retry later'
+            }),
+            {
+              status: 503,
+              headers: safeHeaders
+            }
+          );
         }
 
         if (fqResult.kind === 'timeout') {

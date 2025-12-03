@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -65,6 +66,7 @@ type FairQueueConfig struct {
 	MinSlotHoldMs              int64                   `json:"minSlotHoldMs"`
 	SmoothReleaseIntervalMs    *int64                  `json:"smoothReleaseIntervalMs,omitempty"`
 	WeightedScheduler          WeightedSchedulerConfig `json:"weightedScheduler"`
+	GlobalMaxWaiters           int                     `json:"globalMaxWaiters"`
 	MaxSlotPerHost             int                     `json:"maxSlotPerHost"`
 	MaxSlotPerIP               int                     `json:"maxSlotPerIp"`
 	MaxWaitersPerIP            int                     `json:"maxWaitersPerIp"`
@@ -196,23 +198,25 @@ const (
 )
 
 type FQSession struct {
-	mu                 sync.Mutex
-	Token              string
-	Hostname           string
-	HostnameHash       string
-	IPBucket           string
-	CreatedAt          time.Time
-	LastSeenAt         time.Time
-	State              FQSessionState
-	SlotToken          string
-	WaiterRegistered   bool
-	ThrottleCode       int
-	ThrottleRetryAfter int
-	ThrottleTimeWindow int
-	CleanupScheduled   bool
-	SchedulerTracked   bool
-	StatsRecorded      bool
-	cleanupOnce        sync.Once
+	mu                  sync.Mutex
+	Token               string
+	Hostname            string
+	HostnameHash        string
+	IPBucket            string
+	CreatedAt           time.Time
+	LastSeenAt          time.Time
+	State               FQSessionState
+	SlotToken           string
+	WaiterRegistered    bool
+	WaiterCounted       bool
+	ThrottleCode        int
+	ThrottleRetryAfter  int
+	ThrottleTimeWindow  int
+	CleanupScheduled    bool
+	SchedulerTracked    bool
+	StatsRecorded       bool
+	GlobalWaiterTracked bool
+	cleanupOnce         sync.Once
 }
 
 type sessionStore interface {
@@ -314,14 +318,23 @@ type fqIpState struct {
 	DenyUntil       time.Time
 }
 
+type fqWaiterIpState struct {
+	LastHostQueueFullAt time.Time
+	LastIpQueueFullAt   time.Time
+	WaiterDenyUntil     time.Time
+}
+
 type fqHostState struct {
-	mu             sync.Mutex
-	Buckets        map[fqBucketKey]*fqBucketState
-	TotalPending   int64
-	AvgWaitMs      int64
-	LastCycleStart time.Time
-	ProbesInCycle  int
-	IpStates       map[string]*fqIpState
+	mu                    sync.Mutex
+	Buckets               map[fqBucketKey]*fqBucketState
+	TotalPending          int64
+	AvgWaitMs             int64
+	LastCycleStart        time.Time
+	ProbesInCycle         int
+	IpStates              map[string]*fqIpState
+	WaiterIpStates        map[string]*fqWaiterIpState
+	RegisteredWaiters     int64
+	RegisteredWaitersByIP map[string]int64
 }
 
 type runtimeMeta struct {
@@ -418,6 +431,7 @@ type server struct {
 	configVersion    string
 	metrics          *metricsReporter
 	metricsCounters  *metricsCounters
+	globalWaiters    int64
 }
 
 func (s *server) getConfig() *Config {
@@ -476,6 +490,21 @@ func (s *server) getOrCreateIpState(host *fqHostState, ipBucket string) *fqIpSta
 	return state
 }
 
+func (s *server) getOrCreateWaiterState(host *fqHostState, ipBucket string) *fqWaiterIpState {
+	if host == nil || ipBucket == "" {
+		return nil
+	}
+	if host.WaiterIpStates == nil {
+		host.WaiterIpStates = make(map[string]*fqWaiterIpState)
+	}
+	state := host.WaiterIpStates[ipBucket]
+	if state == nil {
+		state = &fqWaiterIpState{}
+		host.WaiterIpStates[ipBucket] = state
+	}
+	return state
+}
+
 func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion string, resetSessions bool) {
 	s.mu.Lock()
 	oldBackend := s.backend
@@ -498,10 +527,41 @@ func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion str
 	}
 }
 
+func (s *server) trackGlobalWaiter(sess *FQSession) {
+	if sess == nil || sess.GlobalWaiterTracked {
+		return
+	}
+	atomic.AddInt64(&s.globalWaiters, 1)
+	sess.GlobalWaiterTracked = true
+}
+
+func (s *server) untrackGlobalWaiter(sess *FQSession) {
+	if sess == nil || !sess.GlobalWaiterTracked {
+		return
+	}
+	newVal := atomic.AddInt64(&s.globalWaiters, -1)
+	if newVal < 0 {
+		atomic.StoreInt64(&s.globalWaiters, 0)
+	}
+	sess.GlobalWaiterTracked = false
+}
+
+func (s *server) canAcceptNewWaiter(cfg *Config) bool {
+	if cfg == nil {
+		return true
+	}
+	limit := cfg.FairQueue.globalMaxWaiters()
+	if limit <= 0 {
+		return true
+	}
+	return atomic.LoadInt64(&s.globalWaiters) < int64(limit)
+}
+
 func (s *server) registerPendingSession(sess *FQSession) {
 	if sess == nil || sess.SchedulerTracked {
 		return
 	}
+	s.trackGlobalWaiter(sess)
 	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
 	host := s.getOrCreateHostState(hostKey)
 	if host == nil {
@@ -715,9 +775,144 @@ func (s *server) finalizeSession(sess *FQSession) {
 		return
 	}
 	sess.cleanupOnce.Do(func() {
+		s.untrackGlobalWaiter(sess)
 		s.unregisterSession(sess)
 		s.markSessionFinished(sess)
 	})
+}
+
+func (s *server) markWaiterRegistered(sess *FQSession) {
+	if sess == nil {
+		return
+	}
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getOrCreateHostState(hostKey)
+	if host != nil {
+		host.mu.Lock()
+		if !sess.WaiterCounted {
+			host.RegisteredWaiters++
+			if sess.IPBucket != "" {
+				if host.RegisteredWaitersByIP == nil {
+					host.RegisteredWaitersByIP = make(map[string]int64)
+				}
+				host.RegisteredWaitersByIP[sess.IPBucket]++
+			}
+			sess.WaiterCounted = true
+		}
+		host.mu.Unlock()
+	}
+	sess.WaiterRegistered = true
+}
+
+func (s *server) untrackWaiter(sess *FQSession) {
+	if sess == nil || !sess.WaiterCounted {
+		return
+	}
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getHostState(hostKey)
+	if host != nil {
+		host.mu.Lock()
+		if host.RegisteredWaiters > 0 {
+			host.RegisteredWaiters--
+		}
+		if sess.IPBucket != "" && host.RegisteredWaitersByIP != nil {
+			if count := host.RegisteredWaitersByIP[sess.IPBucket]; count > 1 {
+				host.RegisteredWaitersByIP[sess.IPBucket] = count - 1
+			} else {
+				delete(host.RegisteredWaitersByIP, sess.IPBucket)
+			}
+		}
+		host.mu.Unlock()
+	}
+	sess.WaiterCounted = false
+}
+
+func (s *server) shouldAttemptRegisterWaiter(cfg *Config, sess *FQSession) bool {
+	if cfg == nil || sess == nil {
+		return true
+	}
+	hostCap := cfg.FairQueue.maxWaitersPerHost()
+	ipCap := cfg.FairQueue.maxWaitersPerIP()
+	if hostCap <= 0 && ipCap <= 0 {
+		return true
+	}
+
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getOrCreateHostState(hostKey)
+	if host == nil {
+		return true
+	}
+
+	host.mu.Lock()
+	defer host.mu.Unlock()
+
+	hostCount := host.RegisteredWaiters
+	ipCount := int64(0)
+	if sess.IPBucket != "" && host.RegisteredWaitersByIP != nil {
+		ipCount = host.RegisteredWaitersByIP[sess.IPBucket]
+	}
+
+	if hostCap > 0 && hostCount >= int64(hostCap) {
+		if s.log != nil {
+			s.log.Debugf("[FQ] waiter gating: host=%s ip=%s reason=local_limit hostCount=%d ipCount=%d hostCap=%d ipCap=%d", hostKey, sess.IPBucket, hostCount, ipCount, hostCap, ipCap)
+		}
+		return false
+	}
+	if ipCap > 0 && ipCount >= int64(ipCap) {
+		if s.log != nil {
+			s.log.Debugf("[FQ] waiter gating: host=%s ip=%s reason=local_limit hostCount=%d ipCount=%d hostCap=%d ipCap=%d", hostKey, sess.IPBucket, hostCount, ipCount, hostCap, ipCap)
+		}
+		return false
+	}
+	return true
+}
+
+func (s *server) isWaiterDenyWindow(host *fqHostState, ipBucket string, now time.Time) bool {
+	if host == nil || ipBucket == "" {
+		return false
+	}
+	state := host.WaiterIpStates[ipBucket]
+	if state == nil {
+		return false
+	}
+	return !state.WaiterDenyUntil.IsZero() && now.Before(state.WaiterDenyUntil)
+}
+
+func (s *server) onRegisterWaiterResult(sess *FQSession, regRes *registerResult, cfg *Config) {
+	if sess == nil || regRes == nil || cfg == nil {
+		return
+	}
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getOrCreateHostState(hostKey)
+	if host == nil {
+		return
+	}
+
+	status := strings.ToUpper(strings.TrimSpace(regRes.statusMessage))
+	now := time.Now()
+
+	host.mu.Lock()
+	defer host.mu.Unlock()
+
+	state := s.getOrCreateWaiterState(host, sess.IPBucket)
+	switch status {
+	case "HOST_QUEUE_FULL", "QUEUE_FULL":
+		if state != nil {
+			state.LastHostQueueFullAt = now
+			state.LastIpQueueFullAt = now
+			base := cfg.FairQueue.waiterDenyDuration()
+			jitterMax := base / 3
+			var jitter time.Duration
+			if jitterMax > 0 {
+				jitter = time.Duration(rand.Int63n(int64(jitterMax) + 1))
+			}
+			deny := base + jitter
+			state.WaiterDenyUntil = now.Add(deny)
+			if s.log != nil {
+				s.log.Infof("[FQ] waiter deny window: host=%s ip=%s reason=%s base_ms=%d jitter_ms=%d", hostKey, sess.IPBucket, status, base.Milliseconds(), jitter.Milliseconds())
+			}
+		}
+	}
 }
 
 func (s *server) isIpInStructuralDenyWindow(host *fqHostState, ipBucket string, now time.Time) bool {
@@ -1077,6 +1272,13 @@ func (c FairQueueConfig) maxSlotPerIP() int {
 	return 1
 }
 
+func (c FairQueueConfig) globalMaxWaiters() int {
+	if c.GlobalMaxWaiters <= 0 {
+		return 500
+	}
+	return c.GlobalMaxWaiters
+}
+
 func (c FairQueueConfig) maxWaitersPerIP() int {
 	if c.MaxWaitersPerIP > 0 {
 		return c.MaxWaitersPerIP
@@ -1113,6 +1315,14 @@ func (c FairQueueConfig) sessionIdleDuration() time.Duration {
 		return 90 * time.Second
 	}
 	return time.Duration(c.SessionIdleSeconds) * time.Second
+}
+
+func (c FairQueueConfig) waiterDenyDuration() time.Duration {
+	d := c.sessionIdleDuration() / 10
+	if d <= 0 {
+		return 3 * time.Second
+	}
+	return d
 }
 
 func (c FairQueueConfig) grantedCleanupDelay() time.Duration {
@@ -1744,6 +1954,21 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 	if cfg == nil {
 		return nil, errors.New("config not loaded")
 	}
+	if !s.canAcceptNewWaiter(cfg) {
+		limit := cfg.FairQueue.globalMaxWaiters()
+		current := atomic.LoadInt64(&s.globalWaiters)
+		if s.log != nil {
+			s.log.Infof(
+				"[FQ] overloaded: reject new session host=%s ip=%s globalWaiters=%d limit=%d",
+				req.Hostname, req.IPBucket, current, limit,
+			)
+		}
+		return &AcquireResponse{
+			Result: "overloaded",
+			Reason: "slot_handler_overloaded",
+		}, nil
+	}
+
 	backend := s.getBackend()
 	if backend == nil {
 		return nil, errors.New("backend not initialized")
@@ -1967,11 +2192,30 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 
 	hostCap := cfg.FairQueue.maxWaitersPerHost()
 	ipCap := cfg.FairQueue.maxWaitersPerIP()
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getOrCreateHostState(hostKey)
 
 	if sess.IPBucket != "" && (ipCap > 0 || hostCap > 0) && !sess.WaiterRegistered {
 		for {
 			if time.Since(start) >= budget {
 				return nil
+			}
+
+			now := time.Now()
+			if host != nil {
+				host.mu.Lock()
+				deny := s.isWaiterDenyWindow(host, sess.IPBucket, now)
+				host.mu.Unlock()
+				if deny {
+					s.log.Debugf("[FQ] waiter deny hit host=%s ip=%s", hostKey, sess.IPBucket)
+					time.Sleep(pollInterval)
+					continue
+				}
+			}
+
+			if !s.shouldAttemptRegisterWaiter(cfg, sess) {
+				time.Sleep(pollInterval)
+				continue
 			}
 
 			req := s.buildAcquireRequest(cfg, sess.Hostname, sess.HostnameHash, sess.IPBucket, sess.ThrottleTimeWindow, time.Now())
@@ -1980,8 +2224,9 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 				s.log.Warnf("register waiter error: %v", err)
 				return err
 			}
+			s.onRegisterWaiterResult(sess, regRes, cfg)
 			if regRes != nil && regRes.allowed {
-				sess.WaiterRegistered = true
+				s.markWaiterRegistered(sess)
 				s.log.Infof(
 					"waiter registered token=%s host=%s ip=%s qDepth=%d ipQDepth=%d status=%s",
 					sess.Token, sess.Hostname, sess.IPBucket,
@@ -2109,6 +2354,9 @@ func (s *server) cleanupSession(sess *FQSession) {
 	hostnameHash := sess.HostnameHash
 	ipBucket := sess.IPBucket
 
+	if shouldReleaseWaiter {
+		s.untrackWaiter(sess)
+	}
 	sess.WaiterRegistered = false
 	s.sessionStore.Delete(token)
 
@@ -2156,6 +2404,7 @@ func (s *server) handleGrantedLocked(sess *FQSession) {
 	shouldReleaseWaiter := sess.WaiterRegistered && sess.IPBucket != "" && (ipCap > 0 || hostCap > 0)
 
 	if shouldReleaseWaiter {
+		s.untrackWaiter(sess)
 		sess.WaiterRegistered = false
 		hostname := sess.Hostname
 		hostnameHash := sess.HostnameHash

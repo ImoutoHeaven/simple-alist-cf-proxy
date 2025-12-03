@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -183,5 +185,58 @@ func TestMarkSessionFinishedSkipsThrottled(t *testing.T) {
 	s.markSessionFinished(sess)
 	if sess.StatsRecorded && s.getHostState(hostKey).AvgWaitMs != 0 {
 		t.Fatalf("throttled session should not update AvgWaitMs")
+	}
+}
+
+func TestHandleFirstAcquireOverloaded(t *testing.T) {
+	s := newTestServer()
+	s.cfg = &Config{FairQueue: FairQueueConfig{GlobalMaxWaiters: 1}}
+	atomic.StoreInt64(&s.globalWaiters, 1)
+
+	resp, err := s.handleFirstAcquire(context.Background(), AcquireRequest{
+		Hostname: "example.com",
+		IPBucket: "ip1",
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if resp == nil || resp.Result != "overloaded" {
+		t.Fatalf("expected overloaded result, got %+v", resp)
+	}
+}
+
+func TestShouldAttemptRegisterWaiterBlocksWhenAtLocalCap(t *testing.T) {
+	cfg := &Config{FairQueue: FairQueueConfig{MaxWaitersPerHost: 1, MaxWaitersPerIP: 1}}
+	s := newTestServer()
+	hostKey := fqHostKey("h1", "example.com")
+	s.fqHosts = map[string]*fqHostState{
+		hostKey: {
+			RegisteredWaiters:     1,
+			RegisteredWaitersByIP: map[string]int64{"ip1": 1},
+		},
+	}
+
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	if s.shouldAttemptRegisterWaiter(cfg, sess) {
+		t.Fatalf("expected local gating to block register waiter")
+	}
+}
+
+func TestOnRegisterWaiterResultSetsDenyWindow(t *testing.T) {
+	cfg := &Config{FairQueue: FairQueueConfig{SessionIdleSeconds: 30}}
+	s := newTestServer()
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+
+	s.onRegisterWaiterResult(sess, &registerResult{statusMessage: "HOST_QUEUE_FULL"}, cfg)
+
+	host := s.getHostState(fqHostKey(sess.HostnameHash, sess.Hostname))
+	if host == nil {
+		t.Fatalf("expected host state to be created")
+	}
+	host.mu.Lock()
+	state := host.WaiterIpStates[sess.IPBucket]
+	host.mu.Unlock()
+	if state == nil || state.WaiterDenyUntil.IsZero() || !state.WaiterDenyUntil.After(time.Now()) {
+		t.Fatalf("expected deny window set, got %+v", state)
 	}
 }

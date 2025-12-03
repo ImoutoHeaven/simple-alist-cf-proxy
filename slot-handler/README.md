@@ -32,6 +32,7 @@
 - `fairQueue`：公平队列参数。
   - `maxWaitMs` / `pollIntervalMs` / `pollWindowMs` / `minSlotHoldMs`：总等待时长、内部轮询间隔、本次轮询窗口预算、最小持锁时间。
   - `sessionIdleSeconds`：会话多久不轮询就判定过期（默认 90 秒）。
+  - `globalMaxWaiters`：slot-handler 本机允许的 PENDING 会话上限，超过后直接返回 `result="overloaded"`（不创建 session），默认 500（<=0 使用默认）。
   - `maxSlotPerHost` / `maxSlotPerIp`：单 hostname/单 IP 的并发 slot 上限。
   - `maxWaitersPerIp`：每个 IP 允许的排队人数（>0 时才会注册/释放 waiter）。
   - `maxWaitersPerHost`：单 hostname 的全局排队上限（默认 50，<=0 关闭 host 级上限，不影响 Worker 返回的枚举，仅在内部 sleep 重试；当 `maxWaitersPerHost>0` 且 `maxWaitersPerIp<=0` 时仅启用 host 级排队）。
@@ -98,6 +99,7 @@ slot-handler 的调度路径可以理解成一个「漏斗」：从外层大量�
      - 若开启了 `maxWaitersPerHost`/`maxWaitersPerIp`，且当前 session 还未注册过 waiter：
        - slot-handler 会循环调用 `download_register_fq_waiter`，尝试把该 `(host, ipBucket)` 放入 `upstream_ip_queue_depth` 表。
        - 超过 host 或 IP 的等待池上限时，PG 会返回 `HOST_QUEUE_FULL/QUEUE_FULL` 等状态，此时 slot-handler 只在本机 sleep（不改 HTTP result），等待下一个 pollWindow。
+       - 新增 gating：当本机观测到 host/IP 已经有足够多的 waiter，或刚收到上述 `*_QUEUE_FULL`，会在本地开启一个短暂 deny window，期间不打 RegisterWaiter RPC，只在本机 sleep，减少 PG 压力。
    - 作用：
      - 这层限制的是“**有资格参与调度的等待人数**”，防止无限排队。
 
@@ -178,7 +180,7 @@ slot-handler 的调度路径可以理解成一个「漏斗」：从外层大量�
       "now": 1732170000000
     }
     ```
-    返回 `{"result":"pending","queryToken":"..."}` 或 `{"result":"throttled",...}`。
+    返回 `{"result":"pending","queryToken":"..."}`、`{"result":"throttled",...}`，或当本机已满时返回 `{"result":"overloaded","reason":"slot_handler_overloaded"}`（不创建 session）。
   - 轮询请求（带 `queryToken`）：
     ```json
     {
@@ -194,8 +196,10 @@ slot-handler 的调度路径可以理解成一个「漏斗」：从外层大量�
 
 ## 运行时行为
 
+- 全局漏斗：当本机 PENDING 会话数达到 `globalMaxWaiters`（默认 500）时，首次 `/fairqueue/acquire` 直接返回 `result="overloaded"`，不创建 session，保护 slot-handler 自身。
+- RegisterWaiter gating：当本机观察到 host/IP 已达上限，或连续收到 PG `HOST_QUEUE_FULL/QUEUE_FULL`，会开启本地 deny window，短时间内不再打 RegisterWaiter RPC，防止风暴。
 - 短轮询：每次 HTTP 请求只使用 `pollWindowMs` 预算注册/抢锁，Worker 端默认 8 秒超时，多次轮询在 `maxWaitMs` + `SLOT_HANDLER_MAX_ATTEMPTS_CAP` 限制内完成。
-- 终态只有三种：`granted`（拿到 slot）、`timeout`（等待超时/会话过期）、`throttled`（熔断，立即退出）；终态会立刻删除会话。
+- 终态/短路结果：`granted`（拿到 slot）、`timeout`（等待超时/会话过期）、`throttled`（熔断，立即退出）；当本机过载时会返回 `overloaded`（不会创建 session）；终态会立刻删除会话。
 - 会话清理：`sessionIdleSeconds` 内无轮询或累计等待超过 `maxWaitMs` → 直接返回 `timeout` 并清理。
 - 暂时错误/队列已满/IP 过多一律保持 `pending`，内部按 `pollIntervalMs` 自行 sleep 重试，避免客户端重试风暴。
 - release 阶段即使数据库报错也只记录日志，不向调用方新增错误分支。

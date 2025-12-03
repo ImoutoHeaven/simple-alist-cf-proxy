@@ -33,6 +33,7 @@
     "pollWindowMs": 6000,
     "minSlotHoldMs": 800,
     "smoothReleaseIntervalMs": null,
+    "globalMaxWaiters": 500,
     "sessionIdleSeconds": 90,
     "maxSlotPerHost": 5,
     "maxSlotPerIp": 1,

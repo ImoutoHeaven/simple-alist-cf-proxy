@@ -203,6 +203,7 @@ slot-handler 是一个独立运行于服务器上的 HTTP 服务，它为 Worker
     - `"pending"`：仍在队列中，客户端需继续轮询；
     - `"granted"`：获得 slot，带 slotToken；
     - `"throttled"`：上游 throttle，返回 code+retryAfter；
+    - `"overloaded"`：slot-handler 本机排队已满，worker 不再重试，直接失败返回；
     - `"timeout"`：会话超时。
   - 会使用 sessionStore（内存 map）保存 session 状态，配合 GC 协程定期清理。
 - `POST /api/v0/fairqueue/release`：
