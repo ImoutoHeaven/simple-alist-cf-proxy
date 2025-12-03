@@ -210,6 +210,7 @@ type FQSession struct {
 	CleanupScheduled   bool
 	SchedulerTracked   bool
 	StatsRecorded      bool
+	cleanupOnce        sync.Once
 }
 
 type sessionStore interface {
@@ -613,6 +614,16 @@ func (s *server) markSessionFinished(sess *FQSession) {
 	sess.StatsRecorded = true
 }
 
+func (s *server) finalizeSession(sess *FQSession) {
+	if sess == nil {
+		return
+	}
+	sess.cleanupOnce.Do(func() {
+		s.unregisterSession(sess)
+		s.markSessionFinished(sess)
+	})
+}
+
 func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 	if cfg == nil || sess == nil {
 		return true
@@ -693,6 +704,18 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 
 	if chosenKey != bucketKey {
 		return false
+	}
+
+	if chosenBucket.VirtualTime > 1e9 {
+		minVT := chosenBucket.VirtualTime
+		for _, b := range host.Buckets {
+			if b.VirtualTime < minVT {
+				minVT = b.VirtualTime
+			}
+		}
+		for _, b := range host.Buckets {
+			b.VirtualTime -= minVT
+		}
 	}
 
 	weight := ws.BaseWeight + ws.WeightPerWait*float64(bucket.WaitCount)
@@ -1684,8 +1707,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 		)
 		s.incrementMetric("timeout")
 		sess.State = StateTimeout
-		s.unregisterSession(sess)
-		s.markSessionFinished(sess)
+		s.finalizeSession(sess)
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
@@ -1699,8 +1721,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 		)
 		s.incrementMetric("timeout")
 		sess.State = StateTimeout
-		s.unregisterSession(sess)
-		s.markSessionFinished(sess)
+		s.finalizeSession(sess)
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
@@ -1713,8 +1734,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			"session granted token=%s host=%s ip=%s slotToken=%s",
 			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
 		)
-		s.unregisterSession(sess)
-		s.markSessionFinished(sess)
+		s.finalizeSession(sess)
 		s.handleGrantedLocked(sess)
 		s.incrementMetric("granted")
 		return &AcquireResponse{
@@ -1728,8 +1748,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			sess.Token, sess.Hostname, sess.IPBucket,
 			sess.ThrottleCode, sess.ThrottleRetryAfter,
 		)
-		s.unregisterSession(sess)
-		s.markSessionFinished(sess)
+		s.finalizeSession(sess)
 		s.incrementMetric("throttled")
 		s.cleanupSession(sess)
 		return &AcquireResponse{
@@ -1742,8 +1761,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			"session timeout token=%s host=%s ip=%s",
 			sess.Token, sess.Hostname, sess.IPBucket,
 		)
-		s.unregisterSession(sess)
-		s.markSessionFinished(sess)
+		s.finalizeSession(sess)
 		s.incrementMetric("timeout")
 		s.cleanupSession(sess)
 		return &AcquireResponse{Result: "timeout"}, nil
@@ -1891,15 +1909,13 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 				tryRes.throttleCode, tryRes.throttleRetryAfter,
 				tryRes.queueDepth, tryRes.ipQueueDepth,
 			)
-			s.unregisterSession(sess)
-			s.markSessionFinished(sess)
+			s.finalizeSession(sess)
 			return nil
 		case "ACQUIRED":
 			sess.State = StateGranted
 			sess.SlotToken = tryRes.slotToken
 			s.onTryAcquireResult(sess, tryRes.status)
-			s.unregisterSession(sess)
-			s.markSessionFinished(sess)
+			s.finalizeSession(sess)
 			slotLog := tryRes.slotToken
 			if len(slotLog) > 8 {
 				slotLog = slotLog[len(slotLog)-8:]
@@ -1942,8 +1958,7 @@ func (s *server) cleanupSession(sess *FQSession) {
 	cfg := s.getConfig()
 	backend := s.getBackend()
 
-	s.unregisterSession(sess)
-	s.markSessionFinished(sess)
+	s.finalizeSession(sess)
 
 	token := sess.Token
 	hostCap := 0
@@ -1989,8 +2004,7 @@ func (s *server) handleGrantedLocked(sess *FQSession) {
 	cfg := s.getConfig()
 	backend := s.getBackend()
 
-	s.unregisterSession(sess)
-	s.markSessionFinished(sess)
+	s.finalizeSession(sess)
 
 	hostCap := 0
 	ipCap := 0
