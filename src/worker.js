@@ -35,6 +35,11 @@ const RL_STATE = {
   byIpRange: new Map(),
 };
 
+const IDLE_410_CACHE_CAPACITY = 64;
+const idle410Cache = {
+  entries: new Map(),
+};
+
 const nowMs = () => Date.now();
 
 const normalizePositiveSeconds = (value, fallback) => {
@@ -113,6 +118,53 @@ async function slowFailDelay() {
     return;
   }
   await new Promise((resolve) => setTimeout(resolve, SLOW_FAIL_DELAY_MS));
+}
+
+function touchIdle410Entry(key) {
+  const entries = idle410Cache.entries;
+  const value = entries.get(key);
+  if (value !== undefined) {
+    entries.delete(key);
+    entries.set(key, value);
+  }
+}
+
+function getIdle410Cached(key) {
+  if (!key) {
+    return false;
+  }
+  const entries = idle410Cache.entries;
+  if (!entries.has(key)) {
+    return false;
+  }
+  touchIdle410Entry(key);
+  return true;
+}
+
+function putIdle410Cached(key) {
+  if (!key) {
+    return;
+  }
+  const entries = idle410Cache.entries;
+  if (entries.has(key)) {
+    touchIdle410Entry(key);
+    return;
+  }
+  if (entries.size >= IDLE_410_CACHE_CAPACITY) {
+    const firstKey = entries.keys().next().value;
+    if (firstKey !== undefined) {
+      entries.delete(firstKey);
+    }
+  }
+  entries.set(key, { lastSeen: Date.now() });
+}
+
+async function buildIdleCacheKey(url) {
+  if (!url || typeof url.pathname !== 'string') {
+    return null;
+  }
+  const raw = `${url.pathname}${url.search || ''}`;
+  return sha256Hex(raw);
 }
 
 function markRateLimited(ipSubnet, retryAfterSeconds) {
@@ -1325,6 +1377,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
+  const effectiveIdleTimeoutForCache =
+    (dynamicIdleTimeout ?? config.cacheConfig?.idleTimeout ?? config.idleTimeout ?? 0);
+  const idleCacheEnabled = Number.isFinite(effectiveIdleTimeoutForCache) && effectiveIdleTimeoutForCache > 0;
+  const idleCacheKey = idleCacheEnabled ? await buildIdleCacheKey(url) : null;
+
+  if (idleCacheKey && getIdle410Cached(idleCacheKey)) {
+    await slowFailDelay();
+    return createErrorResponse(origin, 410, 'Link expired due to inactivity');
+  }
+
   // ========================================
   // UNIFIED CHECK (RTT 3→1 OPTIMIZATION)
   // ========================================
@@ -1424,6 +1486,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         console.warn(
           `[Idle Timeout] Link expired (idle ${idleDuration}s, timeout ${idleTimeout}s)`
         );
+        if (idleCacheKey) {
+          putIdle410Cached(idleCacheKey);
+        }
         return createErrorResponse(origin, 410, idleReason);
       }
 
