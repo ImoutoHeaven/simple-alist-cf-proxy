@@ -24,6 +24,92 @@ const DEFAULT_SLOT_HANDLER_TIMEOUT_MS = 20000;
 const DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = 8000;
 const DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS = 35;
 
+// Fair Queue in-memory state (per Worker instance)
+const FQ_GLOBAL_STATE = {
+  overloadedUntilMs: 0,
+  throttledByHost: new Map(),
+};
+
+const nowMs = () => Date.now();
+
+const normalizePositiveSeconds = (value, fallback) => {
+  const num = Number(value);
+  if (Number.isFinite(num) && num > 0) {
+    return num;
+  }
+  const fb = Number(fallback);
+  return Number.isFinite(fb) && fb > 0 ? fb : 0;
+};
+
+function markOverloaded(retryAfterSeconds) {
+  const seconds = normalizePositiveSeconds(retryAfterSeconds, 0);
+  if (!seconds) {
+    return;
+  }
+
+  const until = nowMs() + seconds * 1000;
+  const prev = FQ_GLOBAL_STATE.overloadedUntilMs || 0;
+  if (until > prev) {
+    FQ_GLOBAL_STATE.overloadedUntilMs = until;
+  }
+}
+
+function markThrottled(hostname, code, retryAfterSeconds) {
+  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
+  if (!hostKey) {
+    return;
+  }
+
+  const seconds = normalizePositiveSeconds(retryAfterSeconds, 0);
+  if (!seconds) {
+    return;
+  }
+
+  const until = nowMs() + seconds * 1000;
+  const prev = FQ_GLOBAL_STATE.throttledByHost.get(hostKey);
+  const codeNumber = Number(code);
+  const normalizedCode = Number.isFinite(codeNumber) ? codeNumber : 503;
+  if (!prev || until > prev.untilMs) {
+    FQ_GLOBAL_STATE.throttledByHost.set(hostKey, {
+      untilMs: until,
+      code: normalizedCode,
+    });
+  }
+}
+
+function getOverloadedRemainingSeconds(now = nowMs()) {
+  const until = FQ_GLOBAL_STATE.overloadedUntilMs || 0;
+  if (!until || until <= now) {
+    return 0;
+  }
+  return Math.ceil((until - now) / 1000);
+}
+
+function getHostThrottledRemainingSeconds(hostname, now = nowMs()) {
+  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
+  if (!hostKey) {
+    return 0;
+  }
+
+  const state = FQ_GLOBAL_STATE.throttledByHost.get(hostKey);
+  if (!state || !state.untilMs || state.untilMs <= now) {
+    if (state && state.untilMs && state.untilMs <= now) {
+      FQ_GLOBAL_STATE.throttledByHost.delete(hostKey);
+    }
+    return 0;
+  }
+  return Math.ceil((state.untilMs - now) / 1000);
+}
+
+const SLOW_FAIL_DELAY_MS = 5000;
+
+async function slowFailDelay() {
+  if (!SLOW_FAIL_DELAY_MS || SLOW_FAIL_DELAY_MS <= 0) {
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, SLOW_FAIL_DELAY_MS));
+}
+
 const DOWNLOAD_EXPOSE_HEADERS = 'Content-Length, Content-Range, X-Throttle-Status, X-Throttle-Retry-After, Accept-Ranges';
 const DOWNLOAD_ALLOW_HEADERS = 'Range, Content-Type, X-Requested-With';
 
@@ -737,11 +823,39 @@ const createSlotHandlerClient = (config) => {
   return {
     async waitForSlot(ctx, fqContext) {
       const maxAttempts = computeMaxAttempts();
+      const hostKey = fqContext?.hostname || '';
       let queryToken = null;
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const now = Date.now();
+
+        const overloadedRemain = getOverloadedRemainingSeconds(now);
+        if (overloadedRemain > 0) {
+          console.warn(
+            `[FQ] slot-handler overloaded (cached), skip acquire host=${hostKey}, retryAfter=${overloadedRemain}s`
+          );
+          return {
+            kind: 'overloaded',
+            reason: 'slot-handler-overloaded-cached',
+            retryAfter: overloadedRemain,
+          };
+        }
+
+        const throttledRemain = getHostThrottledRemainingSeconds(hostKey, now);
+        if (throttledRemain > 0) {
+          const cachedState = FQ_GLOBAL_STATE.throttledByHost.get(hostKey);
+          console.warn(
+            `[FQ] slot-handler throttled (cached), skip acquire host=${hostKey}, retryAfter=${throttledRemain}s`
+          );
+          return {
+            kind: 'throttled',
+            throttleCode: cachedState?.code || 503,
+            retryAfter: throttledRemain,
+          };
+        }
+
         const payload = queryToken
-          ? { queryToken, now: Date.now() }
+          ? { queryToken, now }
           : {
               hostname: fqContext.hostname,
               hostnameHash: fqContext.hostnameHash,
@@ -809,19 +923,28 @@ const createSlotHandlerClient = (config) => {
                     : Number.isFinite(data?.retryAfter) && data.retryAfter > 0
                       ? data.retryAfter
                       : null;
+            const throttleCode = Number.isFinite(data.throttleCode) ? data.throttleCode : 503;
+            markThrottled(hostKey, throttleCode, retryAfter);
             return {
               kind: 'throttled',
-              throttleCode: Number.isFinite(data.throttleCode) ? data.throttleCode : 503,
+              throttleCode,
               retryAfter: retryAfter ?? undefined,
             };
           case 'timeout':
             return { kind: 'timeout' };
-          case 'overloaded':
+          case 'overloaded': {
             console.warn(`[FQ] slot-handler overloaded for host=${fqContext.hostname}`);
+            const overloadRetryAfter =
+              Number.isFinite(data?.retryAfter) && data.retryAfter > 0
+                ? data.retryAfter
+                : 30;
+            markOverloaded(overloadRetryAfter);
             return {
               kind: 'overloaded',
               reason: typeof data?.reason === 'string' ? data.reason : 'slot-handler-overloaded',
+              retryAfter: overloadRetryAfter,
             };
+          }
           case 'pending':
             continue;
           default: {
@@ -1234,9 +1357,28 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       }
 
       if (config.throttleEnabled && unifiedResult.throttle.status === 'protected') {
-        console.log(`[Throttle] Protected from unified check, returning error ${unifiedResult.throttle.errorCode}, retry after ${unifiedResult.throttle.retryAfter}s`);
+        const throttleInfo = unifiedResult.throttle || {};
+        const retryAfter = normalizePositiveSeconds(
+          throttleInfo.retryAfter,
+          config.throttleConfig?.throttleTimeWindow || 60
+        );
+        const throttleHostnameRaw = extractHostname(unifiedResult?.cache?.linkData?.url || '');
+        const throttleHostname = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : '';
 
-        return createThrottleProtectedResponse(origin, unifiedResult.throttle);
+        if (throttleHostname) {
+          markThrottled(throttleHostname, throttleInfo.errorCode || 503, retryAfter);
+        }
+
+        await slowFailDelay();
+
+        console.log(
+          `[Throttle] Protected from unified check, returning error ${throttleInfo.errorCode}, retry after ${retryAfter}s`
+        );
+
+        return createThrottleProtectedResponse(origin, {
+          ...throttleInfo,
+          retryAfter,
+        });
       }
 
       if (rateLimiter && config.rateLimitConfig) {
@@ -1410,7 +1552,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const throttleCheckEnabled = config.throttleEnabled && throttleManager;
   if (throttleCheckEnabled) {
-    throttleHostname = extractHostname(downloadUrl);
+    const throttleHostnameRaw = extractHostname(downloadUrl);
+    throttleHostname = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : null;
 
     const unifiedThrottleUsable =
       unifiedResult &&
@@ -1442,10 +1585,21 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     if (throttleStatus) {
       if (throttleStatus.status === 'protected') {
-        console.log(
-          `[Throttle] Protected: ${throttleHostname}, returning error ${throttleStatus.errorCode}, retry after ${throttleStatus.retryAfter}s`
+        const retryAfter = normalizePositiveSeconds(
+          throttleStatus.retryAfter,
+          config.throttleConfig?.throttleTimeWindow || 60
         );
-        return createThrottleProtectedResponse(origin, throttleStatus);
+        if (throttleHostname) {
+          markThrottled(throttleHostname, throttleStatus.errorCode || 503, retryAfter);
+        }
+        await slowFailDelay();
+        console.log(
+          `[Throttle] Protected: ${throttleHostname}, returning error ${throttleStatus.errorCode}, retry after ${retryAfter}s`
+        );
+        return createThrottleProtectedResponse(origin, {
+          ...throttleStatus,
+          retryAfter,
+        });
       } else if (throttleStatus.status === 'resume_operation') {
         console.log(`[Throttle] Resume operation: ${throttleHostname}`);
       }
@@ -1455,7 +1609,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // ========================================
   // Fair Upstream Queue Integration
   // ========================================
-  const upstreamHostname = extractHostname(downloadUrl);
+  const upstreamHostnameRaw = extractHostname(downloadUrl);
+  const upstreamHostname = upstreamHostnameRaw ? upstreamHostnameRaw.toLowerCase() : null;
   const needFairQueue =
     config.fairQueueEnabled &&
     upstreamHostname &&
@@ -1494,19 +1649,30 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       try {
         const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext);
         if (fqResult.kind === 'throttled') {
+          const retryAfter = normalizePositiveSeconds(
+            fqResult.retryAfter,
+            config.throttleConfig?.throttleTimeWindow || 60
+          );
+          if (upstreamHostname) {
+            markThrottled(upstreamHostname, fqResult.throttleCode || 503, retryAfter);
+          }
+          await slowFailDelay();
           return createThrottleProtectedResponse(origin, {
             status: 'protected',
             errorCode: fqResult.throttleCode || 503,
-            retryAfter: fqResult.retryAfter,
+            retryAfter,
           });
         }
 
         if (fqResult.kind === 'overloaded') {
+          const retryAfter = normalizePositiveSeconds(fqResult.retryAfter, 30);
+          markOverloaded(retryAfter);
+          await slowFailDelay();
           const safeHeaders = new Headers();
           safeHeaders.set("content-type", "application/json;charset=UTF-8");
           safeHeaders.set("Access-Control-Allow-Origin", origin);
           safeHeaders.append("Vary", "Origin");
-          safeHeaders.set("Retry-After", "30");
+          safeHeaders.set("Retry-After", String(retryAfter));
 
           return new Response(
             JSON.stringify({
