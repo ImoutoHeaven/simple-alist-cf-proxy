@@ -30,6 +30,11 @@ const FQ_GLOBAL_STATE = {
   throttledByHost: new Map(),
 };
 
+// Rate Limit in-memory state (per Worker instance, iprange-level)
+const RL_STATE = {
+  byIpRange: new Map(),
+};
+
 const nowMs = () => Date.now();
 
 const normalizePositiveSeconds = (value, fallback) => {
@@ -108,6 +113,42 @@ async function slowFailDelay() {
     return;
   }
   await new Promise((resolve) => setTimeout(resolve, SLOW_FAIL_DELAY_MS));
+}
+
+function markRateLimited(ipSubnet, retryAfterSeconds) {
+  const key = typeof ipSubnet === 'string' ? ipSubnet.trim() : '';
+  if (!key) {
+    return;
+  }
+
+  const seconds = normalizePositiveSeconds(retryAfterSeconds, 0);
+  if (!seconds) {
+    return;
+  }
+
+  const now = nowMs();
+  const until = now + seconds * 1000;
+  const prev = RL_STATE.byIpRange.get(key);
+  if (!prev || until > prev.untilMs) {
+    RL_STATE.byIpRange.set(key, { untilMs: until });
+  }
+}
+
+function getRateLimitRemainingSeconds(ipSubnet, now = nowMs()) {
+  const key = typeof ipSubnet === 'string' ? ipSubnet.trim() : '';
+  if (!key) {
+    return 0;
+  }
+
+  const state = RL_STATE.byIpRange.get(key);
+  if (!state || !state.untilMs || state.untilMs <= now) {
+    if (state && state.untilMs && state.untilMs <= now) {
+      RL_STATE.byIpRange.delete(key);
+    }
+    return 0;
+  }
+
+  return Math.ceil((state.untilMs - now) / 1000);
 }
 
 const DOWNLOAD_EXPOSE_HEADERS = 'Content-Length, Content-Range, X-Throttle-Status, X-Throttle-Retry-After, Accept-Ranges';
@@ -1077,6 +1118,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const clientIpValue = getClientIp(request);
   const clientIP = clientIpValue || "";
+  const ipSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
 
   // CF Rate Limiter检查（第一道防线）
   if (config.enableCfRatelimiter) {
@@ -1103,6 +1145,28 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const message = error instanceof Error ? error.message : String(error);
       console.error('[CF Rate Limiter] Error during check:', message);
       // fail-open: continue processing if rate limiter check fails
+    }
+  }
+
+  if (config.rateLimitEnabled && ipSubnet) {
+    const remaining = getRateLimitRemainingSeconds(ipSubnet);
+    if (remaining > 0) {
+      await slowFailDelay();
+      const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
+      console.warn(
+        '[Rate Limit] Blocked by local cache:',
+        ipSubnet,
+        `limit=${config.ipSubnetLimit}`,
+        `window=${windowLabel}`,
+        `retryAfter=${remaining}s`
+      );
+      return createRateLimitResponse(
+        origin,
+        ipSubnet,
+        config.ipSubnetLimit,
+        windowLabel,
+        remaining
+      );
     }
   }
 
@@ -1324,20 +1388,32 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           return createErrorResponse(origin, 500, unifiedResult.rateLimit.error);
         }
 
+        const ipSubnetForBlock = unifiedResult.rateLimit.ipSubnet || ipSubnet || clientIP;
+        const retryAfter = normalizePositiveSeconds(
+          unifiedResult.rateLimit.retryAfter,
+          config.rateLimitConfig?.windowTimeSeconds || 0
+        );
+
+        if (ipSubnetForBlock && retryAfter > 0) {
+          markRateLimited(ipSubnetForBlock, retryAfter);
+        }
+
+        await slowFailDelay();
+
         const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
         console.warn(
-          '[Rate Limit] Subnet blocked:',
-          unifiedResult.rateLimit.ipSubnet || clientIP,
+          '[Rate Limit] Subnet blocked (unified):',
+          ipSubnetForBlock,
           `limit=${config.ipSubnetLimit}`,
           `window=${windowLabel}`,
-          `retryAfter=${unifiedResult.rateLimit.retryAfter || 0}s`
+          `retryAfter=${retryAfter}s`
         );
         return createRateLimitResponse(
           origin,
-          unifiedResult.rateLimit.ipSubnet || clientIP,
+          ipSubnetForBlock,
           config.ipSubnetLimit,
           windowLabel,
-          unifiedResult.rateLimit.retryAfter
+          retryAfter
         );
       }
 
@@ -1414,20 +1490,32 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
             console.error('[Rate Limit] fail-closed error:', rateLimitResult.error);
             return createErrorResponse(origin, 500, rateLimitResult.error);
           }
+          const ipSubnetForBlock = rateLimitResult.ipSubnet || ipSubnet || clientIP;
+          const retryAfter = normalizePositiveSeconds(
+            rateLimitResult.retryAfter,
+            config.rateLimitConfig?.windowTimeSeconds || 0
+          );
+
+          if (ipSubnetForBlock && retryAfter > 0) {
+            markRateLimited(ipSubnetForBlock, retryAfter);
+          }
+
+          await slowFailDelay();
+
           const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
           console.warn(
             '[Rate Limit] Subnet blocked:',
-            rateLimitResult.ipSubnet || clientIP,
+            ipSubnetForBlock,
             `limit=${config.ipSubnetLimit}`,
             `window=${windowLabel}`,
-            `retryAfter=${rateLimitResult.retryAfter || 0}s`
+            `retryAfter=${retryAfter}s`
           );
           return createRateLimitResponse(
             origin,
-            rateLimitResult.ipSubnet || clientIP,
+            ipSubnetForBlock,
             config.ipSubnetLimit,
             windowLabel,
-            rateLimitResult.retryAfter
+            retryAfter
           );
         }
       } catch (error) {
