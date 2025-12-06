@@ -27,7 +27,8 @@ import (
 )
 
 const (
-	defaultMetricsFlushInterval = 60 * time.Second
+	defaultMetricsFlushInterval        = 60 * time.Second
+	defaultOverloadedRetryAfterSeconds = 30
 )
 
 type Config struct {
@@ -122,6 +123,7 @@ type AcquireResponse struct {
 	HoldMs       int64                  `json:"holdMs,omitempty"`
 	ThrottleCode int                    `json:"throttleCode,omitempty"`
 	ThrottleWait int                    `json:"throttleRetryAfter,omitempty"`
+	RetryAfter   int                    `json:"retryAfter,omitempty"`
 	Reason       string                 `json:"reason,omitempty"`
 	Meta         map[string]interface{} `json:"meta,omitempty"`
 }
@@ -2026,8 +2028,9 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 			)
 		}
 		return &AcquireResponse{
-			Result: "overloaded",
-			Reason: "slot_handler_overloaded",
+			Result:     "overloaded",
+			Reason:     "slot_handler_overloaded",
+			RetryAfter: defaultOverloadedRetryAfterSeconds,
 		}, nil
 	}
 
