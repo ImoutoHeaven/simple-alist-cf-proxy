@@ -14,25 +14,25 @@ compatibility_date = "2024-01-01"
 # - ENABLE_CF_RATELIMITER / CF_RATELIMITER_BINDING（如需启用 CF 原生限流，请同时配置 [[rate_limit]] 绑定）
 # 策略/签名/IPv4 限制等全部由 controller.common / download.auth 下发，勿在 wrangler 配置策略类 env。
 #
-# For local development (.dev.vars 示例):
-# ENV=staging
-# ROLE=download
-# INSTANCE_ID=download-dev-1
-# APP_NAME=simple-alist-cf-proxy
-# APP_VERSION=dev
-# CONTROLLER_URL=https://controller.example.com
-# CONTROLLER_API_PREFIX=/api/v0
-# CONTROLLER_API_TOKEN=replace-with-token
-# BOOTSTRAP_CACHE_MODE=d1
-# METRICS_MODE=do
-# CACHE_D1=CACHE_D1
-# INIT_TABLES=false
-# BOOTSTRAP_DO=BootstrapDO
-# METRICS_DO=MetricsDO
-# BOOTSTRAP_KV=BOOTSTRAP_KV
-# INTERNAL_API_TOKEN=replace-with-internal-token
-# ENABLE_CF_RATELIMITER=false
-# CF_RATELIMITER_BINDING=CF_RATE_LIMITER
+# For local development (.dev.vars 示例，注意 TOML 语法需要双引号包裹字符串):
+# ENV="staging"
+# ROLE="download"
+# INSTANCE_ID="download-dev-1"
+# APP_NAME="simple-alist-cf-proxy"
+# APP_VERSION="dev"
+# CONTROLLER_URL="https://controller.example.com"
+# CONTROLLER_API_PREFIX="/api/v0"
+# CONTROLLER_API_TOKEN="replace-with-token"
+# BOOTSTRAP_CACHE_MODE="d1"
+# METRICS_MODE="do"
+# CACHE_D1="CACHE_D1"
+# INIT_TABLES="false"
+# BOOTSTRAP_DO="BootstrapDO"
+# METRICS_DO="MetricsDO"
+# BOOTSTRAP_KV="BOOTSTRAP_KV"
+# INTERNAL_API_TOKEN="replace-with-internal-token"
+# ENABLE_CF_RATELIMITER="false"
+# CF_RATELIMITER_BINDING="CF_RATE_LIMITER"
 #
 # 如启用 ENABLE_CF_RATELIMITER，请配置 [[rate_limit]] binding 名称与 CF_RATELIMITER_BINDING 一致。
 
