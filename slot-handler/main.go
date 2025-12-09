@@ -219,6 +219,9 @@ type FQSession struct {
 	StatsRecorded       bool
 	GlobalWaiterTracked bool
 	cleanupOnce         sync.Once
+
+	// LocalVT is a bucket-local selection counter. Accessed only while holding host.mu.
+	LocalVT uint64
 }
 
 type sessionStore interface {
@@ -311,6 +314,10 @@ type fqBucketState struct {
 	VirtualTime     float64
 	LastProbedAt    time.Time
 	LastFailedAt    time.Time
+
+	// Bucket-local scheduling state
+	MinLocalVT uint64
+	Sessions   map[string]*FQSession
 }
 
 // fqIpState tracks recent structural failures for an IP bucket.
@@ -514,6 +521,70 @@ func (s *server) getOrCreateWaiterState(host *fqHostState, ipBucket string) *fqW
 	return state
 }
 
+// pickSessionInBucketLocked selects the session with the smallest LocalVT (then earliest CreatedAt)
+// in a bucket. Caller must hold host.mu.
+func pickSessionInBucketLocked(_ *fqHostState, bucket *fqBucketState) *FQSession {
+	if bucket == nil || len(bucket.Sessions) == 0 {
+		return nil
+	}
+
+	var best *FQSession
+	var bestVT uint64
+	var bestCreatedAt time.Time
+	first := true
+
+	for _, sess := range bucket.Sessions {
+		if sess == nil {
+			continue
+		}
+		vt := sess.LocalVT
+		createdAt := sess.CreatedAt
+
+		if first || vt < bestVT || (vt == bestVT && createdAt.Before(bestCreatedAt)) {
+			best = sess
+			bestVT = vt
+			bestCreatedAt = createdAt
+			first = false
+		}
+	}
+
+	return best
+}
+
+// markSessionSelectedInBucketLocked increments LocalVT for the chosen session and refreshes MinLocalVT.
+// Caller must hold host.mu.
+func markSessionSelectedInBucketLocked(_ *fqHostState, bucket *fqBucketState, sess *FQSession) {
+	if bucket == nil || sess == nil {
+		return
+	}
+
+	prevVT := sess.LocalVT
+	sess.LocalVT++
+
+	if len(bucket.Sessions) == 0 {
+		bucket.MinLocalVT = sess.LocalVT
+		return
+	}
+
+	if prevVT == bucket.MinLocalVT {
+		newMin := sess.LocalVT
+		for _, other := range bucket.Sessions {
+			if other == nil {
+				continue
+			}
+			if other.LocalVT < newMin {
+				newMin = other.LocalVT
+			}
+		}
+		bucket.MinLocalVT = newMin
+		return
+	}
+
+	if sess.LocalVT < bucket.MinLocalVT || bucket.MinLocalVT == 0 {
+		bucket.MinLocalVT = sess.LocalVT
+	}
+}
+
 func (s *server) getThrottleState(hostKey string, now time.Time) (bool, int, int) {
 	s.throttleMu.Lock()
 	defer s.throttleMu.Unlock()
@@ -632,12 +703,24 @@ func (s *server) registerPendingSession(sess *FQSession) {
 				first = false
 			}
 		}
-		bucket = &fqBucketState{VirtualTime: vt}
+		bucket = &fqBucketState{
+			VirtualTime: vt,
+			Sessions:    make(map[string]*FQSession),
+			MinLocalVT:  0,
+		}
 		host.Buckets[bucketKey] = bucket
 	}
 
-	bucket.PendingSessions++
-	host.TotalPending++
+	if bucket.Sessions == nil {
+		bucket.Sessions = make(map[string]*FQSession)
+	}
+
+	sess.LocalVT = bucket.MinLocalVT
+	if _, exists := bucket.Sessions[sess.Token]; !exists {
+		bucket.PendingSessions++
+		host.TotalPending++
+	}
+	bucket.Sessions[sess.Token] = sess
 	sess.SchedulerTracked = true
 }
 
@@ -663,8 +746,28 @@ func (s *server) unregisterSession(sess *FQSession) {
 				host.TotalPending--
 			}
 		}
-		if bucket.PendingSessions == 0 {
+
+		oldVT := sess.LocalVT
+		if bucket.Sessions != nil {
+			delete(bucket.Sessions, sess.Token)
+		}
+
+		if bucket.Sessions == nil || len(bucket.Sessions) == 0 {
 			delete(host.Buckets, bucketKey)
+		} else if oldVT == bucket.MinLocalVT {
+			minVT := ^uint64(0)
+			for _, s2 := range bucket.Sessions {
+				if s2 == nil {
+					continue
+				}
+				if s2.LocalVT < minVT {
+					minVT = s2.LocalVT
+				}
+			}
+			if minVT == ^uint64(0) {
+				minVT = 0
+			}
+			bucket.MinLocalVT = minVT
 		}
 	}
 
@@ -998,19 +1101,17 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 
 	now := time.Now()
 	host.mu.Lock()
-	if s.isIpInStructuralDenyWindow(host, sess.IPBucket, now) {
-		host.mu.Unlock()
+	inDenyWindow := s.isIpInStructuralDenyWindow(host, sess.IPBucket, now)
+	totalPending := host.TotalPending
+	avgWaitMs := host.AvgWaitMs
+	host.mu.Unlock()
+
+	if inDenyWindow {
 		if s.log != nil {
 			s.log.Infof("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
 		}
 		return false
 	}
-	host.mu.Unlock()
-
-	host.mu.Lock()
-	totalPending := host.TotalPending
-	avgWaitMs := host.AvgWaitMs
-	host.mu.Unlock()
 
 	if totalPending == 0 || avgWaitMs <= ws.ColdAvgWaitMs {
 		return true
@@ -1023,11 +1124,25 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 	host.mu.Lock()
 	defer host.mu.Unlock()
 
+	if s.isIpInStructuralDenyWindow(host, sess.IPBucket, now) {
+		if s.log != nil {
+			s.log.Infof("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
+		}
+		return false
+	}
+
 	if host.LastCycleStart.IsZero() || now.Sub(host.LastCycleStart) >= pollInterval {
 		host.LastCycleStart = now
 		host.ProbesInCycle = 0
 	}
 	if ws.MaxProbesPerCycle > 0 && host.ProbesInCycle >= ws.MaxProbesPerCycle {
+		return false
+	}
+
+	if s.isIpInStructuralDenyWindow(host, sess.IPBucket, now) {
+		if s.log != nil {
+			s.log.Infof("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
+		}
 		return false
 	}
 
@@ -1045,8 +1160,14 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 				first = false
 			}
 		}
-		bucket = &fqBucketState{VirtualTime: vt}
+		bucket = &fqBucketState{
+			VirtualTime: vt,
+			Sessions:    make(map[string]*FQSession),
+			MinLocalVT:  0,
+		}
 		host.Buckets[bucketKey] = bucket
+	} else if bucket.Sessions == nil {
+		bucket.Sessions = make(map[string]*FQSession)
 	}
 
 	var chosenKey fqBucketKey
@@ -1068,10 +1189,12 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 		return false
 	}
 
-	if s.isIpInStructuralDenyWindow(host, sess.IPBucket, now) {
-		if s.log != nil {
-			s.log.Infof("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
-		}
+	if len(bucket.Sessions) == 0 {
+		return false
+	}
+
+	chosenSess := pickSessionInBucketLocked(host, bucket)
+	if chosenSess == nil || chosenSess.Token != sess.Token {
 		return false
 	}
 
@@ -1097,6 +1220,7 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 	bucket.VirtualTime += 1.0 / weight
 	bucket.LastProbedAt = now
 	host.ProbesInCycle++
+	markSessionSelectedInBucketLocked(host, bucket, sess)
 	return true
 }
 func (s *server) incrementMetric(name string) {

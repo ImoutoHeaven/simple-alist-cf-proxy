@@ -124,15 +124,14 @@ func TestShouldProbeRespectsMaxProbes(t *testing.T) {
 	s := newTestServer()
 
 	hostKey := fqHostKey("h1", "example.com")
-	host := &fqHostState{
-		Buckets:      map[fqBucketKey]*fqBucketState{},
-		TotalPending: 2,
-		AvgWaitMs:    2,
-	}
-	host.Buckets[fqBucketKey{HostnameHash: "h1", IPBucket: "ip1"}] = &fqBucketState{}
-	s.fqHosts = map[string]*fqHostState{hostKey: host}
-
 	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	s.registerPendingSession(sess)
+
+	host := s.getHostState(hostKey)
+	host.mu.Lock()
+	host.TotalPending = 2
+	host.AvgWaitMs = 2
+	host.mu.Unlock()
 
 	if !s.shouldProbe(cfg, sess) {
 		t.Fatalf("expected first probe allowed")
@@ -181,6 +180,88 @@ func TestShouldProbeBlocksIpDenyWindow(t *testing.T) {
 	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
 	if s.shouldProbe(cfg, sess) {
 		t.Fatalf("probe should be blocked by IP deny window")
+	}
+}
+
+func TestBucketLocalWRRPrefersLowestLocalVTThenCreatedAt(t *testing.T) {
+	cfg := testWeightedConfig()
+	cfg.FairQueue.WeightedScheduler.MaxProbesPerCycle = 2
+	s := newTestServer()
+
+	older := time.Now().Add(-time.Second)
+	now := time.Now()
+	sess1 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", Token: "s1", CreatedAt: older}
+	sess2 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", Token: "s2", CreatedAt: now}
+
+	s.registerPendingSession(sess1)
+	s.registerPendingSession(sess2)
+
+	hostKey := fqHostKey("h1", "example.com")
+	host := s.getHostState(hostKey)
+	if host == nil {
+		t.Fatalf("expected host state to exist")
+	}
+	host.mu.Lock()
+	host.TotalPending = 2
+	host.AvgWaitMs = 2
+	host.mu.Unlock()
+
+	if !s.shouldProbe(cfg, sess1) {
+		t.Fatalf("expected earliest session to be selected first")
+	}
+	if !s.shouldProbe(cfg, sess2) {
+		t.Fatalf("expected second session to be selected after first probe consumes opportunity")
+	}
+
+	host.mu.Lock()
+	bucket := host.Buckets[fqBucketKey{HostnameHash: "h1", IPBucket: "ip1"}]
+	if bucket == nil {
+		host.mu.Unlock()
+		t.Fatalf("expected bucket state to exist")
+	}
+	minVT := bucket.MinLocalVT
+	host.mu.Unlock()
+	if minVT == 0 {
+		t.Fatalf("expected MinLocalVT to advance after both sessions probed, got %d", minVT)
+	}
+}
+
+func TestUnregisterSessionRecomputesMinLocalVT(t *testing.T) {
+	s := newTestServer()
+	sess1 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", Token: "s1"}
+	sess2 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", Token: "s2"}
+
+	s.registerPendingSession(sess1)
+	s.registerPendingSession(sess2)
+
+	hostKey := fqHostKey("h1", "example.com")
+	host := s.getHostState(hostKey)
+	if host == nil {
+		t.Fatalf("expected host state to exist")
+	}
+	bucketKey := fqBucketKey{HostnameHash: "h1", IPBucket: "ip1"}
+
+	host.mu.Lock()
+	bucket := host.Buckets[bucketKey]
+	if bucket == nil {
+		host.mu.Unlock()
+		t.Fatalf("expected bucket state to exist")
+	}
+	bucket.MinLocalVT = 1
+	sess1.LocalVT = 1
+	sess2.LocalVT = 5
+	host.mu.Unlock()
+
+	s.unregisterSession(sess1)
+
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	bucket = host.Buckets[bucketKey]
+	if bucket == nil {
+		t.Fatalf("bucket should remain after unregistering one session")
+	}
+	if bucket.MinLocalVT != 5 {
+		t.Fatalf("expected MinLocalVT to be recalculated to 5, got %d", bucket.MinLocalVT)
 	}
 }
 
