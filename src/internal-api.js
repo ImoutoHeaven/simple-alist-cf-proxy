@@ -112,17 +112,9 @@ async function handleRefresh(request, env, ctx) {
 
   const promises = [];
 
-  if (targets.includes('all') || targets.includes('bootstrap')) {
-    const promise = notifyDo(env, 'BOOTSTRAP_DO', '/bootstrap/refresh', { mode: body?.mode || 'lazy', targets });
-    if (promise) promises.push(promise);
-  }
   const d1Clear = clearD1CacheIfAny(env, targets);
   if (d1Clear) {
     promises.push(d1Clear);
-  }
-  if (targets.includes('metrics')) {
-    const promise = notifyDo(env, 'METRICS_DO', '/metrics/flush', { reason: body?.reason || 'refresh' });
-    if (promise) promises.push(promise);
   }
 
   for (const p of promises) {
@@ -138,26 +130,9 @@ async function handleFlush(request, env, ctx) {
 
   const promises = [];
 
-  if (targets.includes('metrics')) {
-    const promise = notifyDo(env, 'METRICS_DO', '/metrics/flush', { reason: body?.reason || 'flush' });
-    if (promise) promises.push(promise);
-  }
-
   for (const p of promises) {
     safeWaitUntil(ctx, p);
   }
 
   return new Response(null, { status: 204 });
-}
-
-function notifyDo(env, bindingName, path, body) {
-  if (!env || !env[bindingName]) {
-    return null;
-  }
-  const namespace = env[bindingName];
-  const stub = namespace.get(namespace.idFromName('global'));
-  return stub.fetch(`https://do.internal${path}`, {
-    method: 'POST',
-    body: JSON.stringify(body || {}),
-  });
 }

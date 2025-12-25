@@ -7,8 +7,7 @@ compatibility_date = "2024-01-01"
 # 控制面为唯一策略来源，wrangler 仅保留 infra 级 env：
 # - ENV / ROLE / INSTANCE_ID / APP_NAME / APP_VERSION
 # - CONTROLLER_URL / CONTROLLER_API_PREFIX / CONTROLLER_API_TOKEN
-# - BOOTSTRAP_CACHE_MODE / METRICS_MODE（direct/do/do+kv/d1，决策仅 direct）
-# - BOOTSTRAP_DO / METRICS_DO / BOOTSTRAP_KV 绑定
+# - BOOTSTRAP_CACHE_MODE（direct/d1，决策仅 direct）
 # - CACHE_D1（D1 缓存绑定，可选）/ INIT_TABLES（是否由 Worker 自动建表，默认 false）
 # - INTERNAL_API_TOKEN（控制 API）
 # - ENABLE_CF_RATELIMITER / CF_RATELIMITER_BINDING（如需启用 CF 原生限流，请同时配置 [[rate_limit]] 绑定）
@@ -24,12 +23,8 @@ compatibility_date = "2024-01-01"
 # CONTROLLER_API_PREFIX="/api/v0"
 # CONTROLLER_API_TOKEN="replace-with-token"
 # BOOTSTRAP_CACHE_MODE="d1"
-# METRICS_MODE="do"
 # CACHE_D1="CACHE_D1"
 # INIT_TABLES="false"
-# BOOTSTRAP_DO="BootstrapDO"
-# METRICS_DO="MetricsDO"
-# BOOTSTRAP_KV="BOOTSTRAP_KV"
 # INTERNAL_API_TOKEN="replace-with-internal-token"
 # ENABLE_CF_RATELIMITER="false"
 # CF_RATELIMITER_BINDING="CF_RATE_LIMITER"

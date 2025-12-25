@@ -8,8 +8,6 @@ import { parseBoolean, extractHostname, matchHostnamePattern, applyVerifyHeaders
 import { checkOriginMatch, decryptOriginSnapshot, getClientIp, parseCheckOriginEnv } from './origin-binding.js';
 import { handleInternalApiIfAny } from './internal-api.js';
 import { fetchControllerState } from './controller-adapter.js';
-import { BootstrapDO } from './do/bootstrap-do.js';
-import { MetricsDO } from './do/metrics-do.js';
 
 // Configuration constants
 const REQUIRED_ENV = [];
@@ -2162,8 +2160,6 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
   return await handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 }
 // src/index.ts
-export { BootstrapDO, MetricsDO };
-
 export default {
   async fetch(request, env, ctx) {
     try {

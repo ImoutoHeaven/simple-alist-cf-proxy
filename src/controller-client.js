@@ -1,4 +1,4 @@
-const DEFAULT_BOOTSTRAP_CACHE_MODE = 'do+kv';
+const DEFAULT_BOOTSTRAP_CACHE_MODE = 'd1';
 const CONTROL_PREFIX_DEFAULT = '/api/v0';
 const BOOTSTRAP_TTL_FALLBACK = 300;
 
@@ -200,21 +200,7 @@ export async function getBootstrapConfig(env) {
     return data;
   }
 
-  if (!env.BOOTSTRAP_DO) {
-    throw new Error('BOOTSTRAP_DO binding is required for DO bootstrap mode');
-  }
-
-  const stub = env.BOOTSTRAP_DO.get(env.BOOTSTRAP_DO.idFromName('global'));
-  const resp = await stub.fetch('https://do.internal/bootstrap', {
-    method: 'POST',
-    body: JSON.stringify({ env: envName, role, instance_id: instanceId }),
-  });
-  if (!resp.ok) {
-    throw new Error(`BootstrapDO failed: ${resp.status}`);
-  }
-  const data = await resp.json();
-  rememberBootstrapInMemory(data);
-  return data;
+  throw new Error(`Unsupported BOOTSTRAP_CACHE_MODE: ${mode}. Use "direct" or "d1".`);
 }
 
 export async function getDecisionForRequest(env, payload) {

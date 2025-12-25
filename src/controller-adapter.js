@@ -5,10 +5,10 @@ const hasControllerBase = (env) =>
   !!(env?.CONTROLLER_URL && env?.CONTROLLER_API_TOKEN && env?.ENV && env?.ROLE && env?.INSTANCE_ID);
 
 const canUseBootstrap = (env) => {
-  const mode = env?.BOOTSTRAP_CACHE_MODE || 'do+kv';
+  const mode = env?.BOOTSTRAP_CACHE_MODE || 'd1';
   if (mode === 'direct') return true;
   if (mode === 'd1') return !!env?.CACHE_D1;
-  return !!env?.BOOTSTRAP_DO;
+  return false;
 };
 
 const normalizePath = (pathname) => {
