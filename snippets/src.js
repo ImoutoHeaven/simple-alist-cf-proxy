@@ -9,10 +9,6 @@ const CACHE_HOST = "cache.local";
 const REQUIRE_HASH_SIGN = true;
 const REQUIRE_WORKER_SIGN = true;
 
-// Optional: restrict checks to a hostname set (empty = all).
-const DOWNLOAD_HOSTS = new Set([
-  // "dl.example.com",
-]);
 
 const encoder = new TextEncoder();
 let hmacKeyPromise = null;
@@ -88,10 +84,8 @@ export default {
     if (!signMeta) return deny("sign invalid");
     if (isExpired(signMeta.expire, nowSeconds)) return deny("sign expired");
 
-    const isDownloadHost =
-      DOWNLOAD_HOSTS.size === 0 || DOWNLOAD_HOSTS.has(url.hostname);
-    const requireHashSign = isDownloadHost && REQUIRE_HASH_SIGN;
-    const requireWorkerSign = isDownloadHost && REQUIRE_WORKER_SIGN;
+    const requireHashSign = REQUIRE_HASH_SIGN;
+    const requireWorkerSign = REQUIRE_WORKER_SIGN;
 
     const hashSign = url.searchParams.get("hashSign") || "";
     const workerSign = url.searchParams.get("workerSign") || "";
