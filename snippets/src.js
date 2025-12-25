@@ -4,12 +4,6 @@ const HMAC_SECRET = "replace-with-common-tokenHmacKey";
 const CACHE_TTL = 7 * 24 * 60 * 60;
 const MAX_CACHE_SIZE = 512 * 1024 * 1024;
 const CACHE_HOST = "cache.local";
-
-// Download should verify all three signatures.
-const REQUIRE_HASH_SIGN = true;
-const REQUIRE_WORKER_SIGN = true;
-
-
 const encoder = new TextEncoder();
 let hmacKeyPromise = null;
 
@@ -84,25 +78,28 @@ export default {
     if (!signMeta) return deny("sign invalid");
     if (isExpired(signMeta.expire, nowSeconds)) return deny("sign expired");
 
-    const requireHashSign = REQUIRE_HASH_SIGN;
-    const requireWorkerSign = REQUIRE_WORKER_SIGN;
-
     const hashSign = url.searchParams.get("hashSign") || "";
     const workerSign = url.searchParams.get("workerSign") || "";
+    const additionalInfo = url.searchParams.get("additionalInfo") || "";
+    const additionalInfoSign = url.searchParams.get("additionalInfoSign") || "";
 
     let hashMeta = null;
     let workerMeta = null;
+    let additionalMeta = null;
 
-    if (requireHashSign) {
-      hashMeta = parseSignature(hashSign);
-      if (!hashMeta) return deny("hashSign invalid");
-      if (isExpired(hashMeta.expire, nowSeconds)) return deny("hashSign expired");
-    }
+    hashMeta = parseSignature(hashSign);
+    if (!hashMeta) return deny("hashSign invalid");
+    if (isExpired(hashMeta.expire, nowSeconds)) return deny("hashSign expired");
 
-    if (requireWorkerSign) {
-      workerMeta = parseSignature(workerSign);
-      if (!workerMeta) return deny("workerSign invalid");
-      if (isExpired(workerMeta.expire, nowSeconds)) return deny("workerSign expired");
+    workerMeta = parseSignature(workerSign);
+    if (!workerMeta) return deny("workerSign invalid");
+    if (isExpired(workerMeta.expire, nowSeconds)) return deny("workerSign expired");
+
+    if (additionalInfo) {
+      if (!additionalInfoSign) return deny("additionalInfoSign missing");
+      additionalMeta = parseSignature(additionalInfoSign);
+      if (!additionalMeta) return deny("additionalInfoSign invalid");
+      if (isExpired(additionalMeta.expire, nowSeconds)) return deny("additionalInfoSign expired");
     }
 
     const workerAddr = new URL(request.url).origin;
@@ -111,15 +108,12 @@ export default {
 
     const tasks = [
       hmacSha256Sign(path, signMeta.expire).then((expected) => ({ label: "sign", expected })),
+      hmacSha256Sign(base64Path, hashMeta.expire).then((expected) => ({ label: "hashSign", expected })),
+      hmacSha256Sign(workerVerifyData, workerMeta.expire).then((expected) => ({ label: "workerSign", expected })),
     ];
-    if (requireHashSign) {
+    if (additionalMeta) {
       tasks.push(
-        hmacSha256Sign(base64Path, hashMeta.expire).then((expected) => ({ label: "hashSign", expected }))
-      );
-    }
-    if (requireWorkerSign) {
-      tasks.push(
-        hmacSha256Sign(workerVerifyData, workerMeta.expire).then((expected) => ({ label: "workerSign", expected }))
+        hmacSha256Sign(additionalInfo, additionalMeta.expire).then((expected) => ({ label: "additionalInfoSign", expected }))
       );
     }
 
@@ -128,6 +122,9 @@ export default {
       if (item.label === "sign" && item.expected !== sign) return deny("sign mismatch");
       if (item.label === "hashSign" && item.expected !== hashSign) return deny("hashSign mismatch");
       if (item.label === "workerSign" && item.expected !== workerSign) return deny("workerSign mismatch");
+      if (item.label === "additionalInfoSign" && item.expected !== additionalInfoSign) {
+        return deny("additionalInfoSign mismatch");
+      }
     }
 
     const isGet = request.method === "GET";
