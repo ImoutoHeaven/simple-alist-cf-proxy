@@ -66,6 +66,9 @@ const deny = (msg) =>
 export default {
   async fetch(request, env, ctx) {
     if (!HMAC_SECRET) return new Response("misconfigured", { status: 500 });
+    if (!globalThis.crypto || !crypto.subtle) {
+      return new Response("crypto unavailable", { status: 500 });
+    }
 
     const url = new URL(request.url);
     const nowSeconds = Math.floor(Date.now() / 1000);
@@ -133,7 +136,10 @@ export default {
       return fetch(request);
     }
 
-    const cache = caches.default;
+    const cache = globalThis.caches && caches.default ? caches.default : null;
+    if (!cache) {
+      return fetch(request);
+    }
     const cacheUrl = new URL(request.url);
     cacheUrl.protocol = "https:";
     cacheUrl.username = "";
@@ -164,7 +170,10 @@ export default {
             "Cache-Control",
             `public, max-age=${CACHE_TTL}, s-maxage=${CACHE_TTL}`
           );
-          ctx.waitUntil(cache.put(cacheKey, toCache).catch(() => {}));
+          const cachePromise = cache.put(cacheKey, toCache).catch(() => {});
+          if (ctx && typeof ctx.waitUntil === "function") {
+            ctx.waitUntil(cachePromise);
+          }
         }
       }
     }
