@@ -62,96 +62,83 @@ const deny = (msg) =>
 
 export default {
   async fetch(request, env, ctx) {
-    try {
-      if (!HMAC_SECRET) return new Response("misconfigured", { status: 500 });
+    if (!HMAC_SECRET) return new Response("misconfigured", { status: 500 });
 
-      const url = new URL(request.url);
-      const nowSeconds = Math.floor(Date.now() / 1000);
+    const url = new URL(request.url);
+    const nowSeconds = Math.floor(Date.now() / 1000);
 
-      const path = normalizePath(url.pathname);
-      if (!path) return new Response("invalid path", { status: 400 });
+    const path = normalizePath(url.pathname);
+    if (!path) return new Response("invalid path", { status: 400 });
 
-      const sign = url.searchParams.get("sign") || "";
-      const signMeta = parseSignature(sign);
-      if (!signMeta) return deny("sign invalid");
-      if (isExpired(signMeta.expire, nowSeconds)) return deny("sign expired");
+    const sign = url.searchParams.get("sign") || "";
+    const signMeta = parseSignature(sign);
+    if (!signMeta) return deny("sign invalid");
+    if (isExpired(signMeta.expire, nowSeconds)) return deny("sign expired");
 
-      const hashSign = url.searchParams.get("hashSign") || "";
-      const workerSign = url.searchParams.get("workerSign") || "";
-      const additionalInfo = url.searchParams.get("additionalInfo") || "";
-      const additionalInfoSign = url.searchParams.get("additionalInfoSign") || "";
+    const hashSign = url.searchParams.get("hashSign") || "";
+    const workerSign = url.searchParams.get("workerSign") || "";
+    const additionalInfo = url.searchParams.get("additionalInfo") || "";
+    const additionalInfoSign = url.searchParams.get("additionalInfoSign") || "";
 
-      let hashMeta = null;
-      let workerMeta = null;
-      let additionalMeta = null;
+    let hashMeta = null;
+    let workerMeta = null;
+    let additionalMeta = null;
 
-      hashMeta = parseSignature(hashSign);
-      if (!hashMeta) return deny("hashSign invalid");
-      if (isExpired(hashMeta.expire, nowSeconds)) return deny("hashSign expired");
+    hashMeta = parseSignature(hashSign);
+    if (!hashMeta) return deny("hashSign invalid");
+    if (isExpired(hashMeta.expire, nowSeconds)) return deny("hashSign expired");
 
-      workerMeta = parseSignature(workerSign);
-      if (!workerMeta) return deny("workerSign invalid");
-      if (isExpired(workerMeta.expire, nowSeconds)) return deny("workerSign expired");
+    workerMeta = parseSignature(workerSign);
+    if (!workerMeta) return deny("workerSign invalid");
+    if (isExpired(workerMeta.expire, nowSeconds)) return deny("workerSign expired");
 
-      if (additionalInfo) {
-        if (!additionalInfoSign) return deny("additionalInfoSign missing");
-        additionalMeta = parseSignature(additionalInfoSign);
-        if (!additionalMeta) return deny("additionalInfoSign invalid");
-        if (isExpired(additionalMeta.expire, nowSeconds)) return deny("additionalInfoSign expired");
-      }
-
-      const workerAddr = new URL(request.url).origin;
-      const base64Path = base64EncodeUtf8(path);
-      const workerVerifyData = JSON.stringify({ path, worker_addr: workerAddr });
-
-      const tasks = [
-        hmacSha256Sign(path, signMeta.expire).then((expected) => ({ label: "sign", expected })),
-        hmacSha256Sign(base64Path, hashMeta.expire).then((expected) => ({ label: "hashSign", expected })),
-        hmacSha256Sign(workerVerifyData, workerMeta.expire).then((expected) => ({ label: "workerSign", expected })),
-      ];
-      if (additionalMeta) {
-        tasks.push(
-          hmacSha256Sign(additionalInfo, additionalMeta.expire).then((expected) => ({ label: "additionalInfoSign", expected }))
-        );
-      }
-
-      const results = await Promise.all(tasks);
-      for (const item of results) {
-        if (item.label === "sign" && item.expected !== sign) return deny("sign mismatch");
-        if (item.label === "hashSign" && item.expected !== hashSign) return deny("hashSign mismatch");
-        if (item.label === "workerSign" && item.expected !== workerSign) return deny("workerSign mismatch");
-        if (item.label === "additionalInfoSign" && item.expected !== additionalInfoSign) {
-          return deny("additionalInfoSign mismatch");
-        }
-      }
-
-      const isGet = request.method === "GET";
-      const hasRange = request.headers.has("range");
-      if (!isGet || hasRange) {
-        return fetch(request);
-      }
-
-      const cache = caches.default;
-      const cacheUrl = new URL(request.url);
-      cacheUrl.search = "";
-      cacheUrl.hash = "";
-
-      const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
-      const cached = await cache.match(cacheKey);
-      if (cached) return cached;
-
-      return fetch(request);
-    } catch (error) {
-      const message = error instanceof Error
-        ? `${error.message}\n${error.stack || ""}`
-        : String(error);
-      return new Response(`snippet error: ${message}`, {
-        status: 500,
-        headers: {
-          "content-type": "text/plain; charset=UTF-8",
-          "cache-control": "no-store",
-        },
-      });
+    if (additionalInfo) {
+      if (!additionalInfoSign) return deny("additionalInfoSign missing");
+      additionalMeta = parseSignature(additionalInfoSign);
+      if (!additionalMeta) return deny("additionalInfoSign invalid");
+      if (isExpired(additionalMeta.expire, nowSeconds)) return deny("additionalInfoSign expired");
     }
+
+    const workerAddr = new URL(request.url).origin;
+    const base64Path = base64EncodeUtf8(path);
+    const workerVerifyData = JSON.stringify({ path, worker_addr: workerAddr });
+
+    const tasks = [
+      hmacSha256Sign(path, signMeta.expire).then((expected) => ({ label: "sign", expected })),
+      hmacSha256Sign(base64Path, hashMeta.expire).then((expected) => ({ label: "hashSign", expected })),
+      hmacSha256Sign(workerVerifyData, workerMeta.expire).then((expected) => ({ label: "workerSign", expected })),
+    ];
+    if (additionalMeta) {
+      tasks.push(
+        hmacSha256Sign(additionalInfo, additionalMeta.expire).then((expected) => ({ label: "additionalInfoSign", expected }))
+      );
+    }
+
+    const results = await Promise.all(tasks);
+    for (const item of results) {
+      if (item.label === "sign" && item.expected !== sign) return deny("sign mismatch");
+      if (item.label === "hashSign" && item.expected !== hashSign) return deny("hashSign mismatch");
+      if (item.label === "workerSign" && item.expected !== workerSign) return deny("workerSign mismatch");
+      if (item.label === "additionalInfoSign" && item.expected !== additionalInfoSign) {
+        return deny("additionalInfoSign mismatch");
+      }
+    }
+
+    const isGet = request.method === "GET";
+    const hasRange = request.headers.has("range");
+    if (!isGet || hasRange) {
+      return fetch(request);
+    }
+
+    const cache = caches.default;
+    const cacheUrl = new URL(request.url);
+    cacheUrl.search = "";
+    cacheUrl.hash = "";
+
+    const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
+
+    return fetch(request);
   },
 };
