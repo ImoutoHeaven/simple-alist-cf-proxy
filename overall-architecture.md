@@ -37,7 +37,7 @@ Landing Worker 本身不提供实际文件下载，仅返回 HTML 页面或 `/in
 - 验证 landing worker 发放的票据：
   - `sign` / `hashSign` / `workerSign`
   - `additionalInfo` + `additionalInfoSign`
-  - OPTIONAL：解密 origin snapshot 并执行 `CHECK_ORIGIN`；
+  - 解密 origin snapshot（含 issuer）并按需执行 `CHECK_ORIGIN`；
 - 再次与 AList API 交互（`/api/fs/link`），获取实际 download URL（可缓存）；
 - 在 Worker 层统一实现：
   - 下载链接缓存（PostgreSQL）
@@ -110,7 +110,7 @@ Landing Worker 的 `/info`：
 3. 调用 AList `/api/fs/get` 获取文件信息；
 4. 构造 download worker 的 download URL：
    - `sign`/`hashSign`/`workerSign` 三重 HMAC；
-   - `additionalInfo`（包含 pathHash/filesize/expireTime/idle_timeout/encrypt(origin snapshot)）；
+   - `additionalInfo`（包含 pathHash/filesize/expireTime/idle_timeout/encrypt(origin snapshot, 含 issuer)）；
    - `additionalInfoSign`（整体 HMAC）。
 5. 返回 JSON：
    - `data.download.url`: 完整 download worker URL；
@@ -135,7 +135,7 @@ Download Worker 接到请求后：
    - `additionalInfo` 内容一致性（pathHash, expireTime 等）；
 3. 若 `CHECK_ORIGIN` 非空且未被 skip-origin 覆盖：
    - 使用 TOKEN 派生 key，AES-256-GCM 解密 `encrypt` 字段；
-   - 拿到 landing 当时记录的 origin snapshot（IP/Geo/ASN 等）；
+   - 拿到 landing 当时记录的 origin snapshot（IP/Geo/ASN/issuer 等）；
    - 对照当前请求环境（IP & Cloudflare header）；
    - 不一致则拒绝（降低「票据转移」「跳 IP 下载」风险）。
 4. 使用 Unified Check（download_unified_check，需 DB_MODE="custom-pg-rest"）：
@@ -161,7 +161,7 @@ Download Worker 接到请求后：
    - ALTCHA 与 Powdet 提供可调强度的 PoW，能显著增加机器人成本；
    - ALTCHA 支持动态难度（按 IP 行为调整）。
 2. **Origin 绑定：**
-   - Landing 通过 AES-GCM 对 origin snapshot 加密并交给 download 执行；
+   - Landing 通过 AES-GCM 对 origin snapshot（含 issuer）加密并交给 download 执行；
    - Download 根据 `CHECK_ORIGIN` 确保票据只能在相似/相同环境下被使用（例如 IP 段 / ASN / 国家）。
 3. **Token 一次性与时间窗口：**
    - Turnstile / ALTCHA / Powdet 都通过表结构 + TTL 实现一次性或有限次数使用；

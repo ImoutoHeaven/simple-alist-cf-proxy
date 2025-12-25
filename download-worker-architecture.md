@@ -91,16 +91,15 @@
   - `additionalInfo`, `additionalInfoSign`
   - 其中 `additionalInfo` 是 landing worker 生成的 Base64url JSON 字符串，包含：
     - `pathHash`、`filesize`、`expireTime`、`idle_timeout`；
-    - `encrypt` 字段 → 用 AES-256-GCM 加密的 origin snapshot（landing 使用同 TOKEN 派生的密钥加密）。
+    - `encrypt` 字段 → 用 AES-256-GCM 加密的 origin snapshot（包含 issuer；landing 使用同 TOKEN 派生的密钥加密）。
 - 逐项校验：
   - 签名：`verify(label, data, sign, TOKEN)` 或 `verifySignature(SIGN_SECRET, path, sign)`；
   - `additionalInfoSign` 校验整体 payload：
     - 先 verify，再 base64 解码 + JSON.parse；
     - 核对 pathHash 是否等于 `sha256Hex(normalizePath(url.pathname))`；
     - 校验 `expireTime`（若启用 `ADDITION_EXPIRETIME_CHECK`）；
+  - 解密 `encrypt` 并校验 issuer 是否位于允许的 landing 域名列表；
   - 若 `CHECK_ORIGIN` 非空且未被 `skip-origin` 覆盖：
-    - 使用 TOKEN 派生 AES key，解密 `encrypt`；
-    - 得到 origin snapshot（IP / Geo / ASN）；
     - 将 snapshot 中选定字段与当前请求（`getClientIp` + CF header）对比，不一致则拒绝。
 
 5. **DB 统一检查：下载缓存 + IP 限流 + Throttle + Last Active**

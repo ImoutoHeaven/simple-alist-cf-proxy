@@ -12,7 +12,7 @@ simple-alist-cf-proxy 是 AList 下载体系中的「download worker」，通常
 ## 特性概览
 
 - **多重签名链**：验证 `sign` / `hashSign` / `workerSign`，确保路径未被篡改且票据绑定到指定 download worker。
-- **Origin 绑定**：解密 `additionalInfo.encrypt` 内的 origin snapshot 并按 `CHECK_ORIGIN` 校验 IP / Geo / ASN 等信息。
+- **Origin 绑定**：解密 `additionalInfo.encrypt` 内的 origin snapshot（含 issuer）并按 `CHECK_ORIGIN` 校验 IP / Geo / ASN 等信息。
 - **Path ACL**：基于黑名单/白名单/EXCEPT + `*_INCLUDES` 实现精细路径访问控制和 per-path 校验开关。
 - **下载缓存 & 限流**：可选使用 D1 / D1-REST / PostgREST 进行下载链接缓存、IP 限流与上游 Throttle 保护。
 - **Fair Queue 支持**：通过外部 `slot-handler` 服务实现公平队列，保护 OneDrive/SharePoint 等上游存储。
@@ -168,7 +168,7 @@ download worker 假定 landing worker 已经生成并验证了初始签名，并
      - `filesize`
      - `expireTime`
      - `idle_timeout`
-     - `encrypt`（AES-256-GCM 加密的 origin snapshot）
+     - `encrypt`（AES-256-GCM 加密的 origin snapshot，包含 issuer）
      - `isCrypted`（当前是否为加密下载）  
    - `additionalInfoSign = HMAC-SHA256(additionalInfo, expire)`  
 
@@ -177,7 +177,8 @@ download worker 会：
 - 校验 `additionalInfoSign` 后解包 payload 并确认：
   - `pathHash` 与当前请求路径一致；
   - `expireTime` 未过期（当 `ADDITION_EXPIRETIME_CHECK=true` 时）；  
-- 若 `CHECK_ORIGIN` 非空，则解密 `encrypt` 并对指定字段（如 `asn` / `iprange` 等）做匹配。  
+- 解密 `encrypt` 并校验 issuer 是否位于允许的 landing 域名列表；  
+- 若 `CHECK_ORIGIN` 非空，则对指定字段（如 `asn` / `iprange` 等）做匹配。  
 
 典型 download URL 形如：
 

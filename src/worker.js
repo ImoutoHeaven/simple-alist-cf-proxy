@@ -49,6 +49,39 @@ const normalizePositiveSeconds = (value, fallback) => {
   return Number.isFinite(fb) && fb > 0 ? fb : 0;
 };
 
+const normalizeOrigin = (value) => {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return '';
+  }
+  const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    return new URL(candidate).origin;
+  } catch {
+    return '';
+  }
+};
+
+const normalizeOriginList = (values) => {
+  const normalized = [];
+  const seen = new Set();
+  if (!Array.isArray(values)) {
+    return normalized;
+  }
+  for (const value of values) {
+    const origin = normalizeOrigin(value);
+    if (!origin || seen.has(origin)) {
+      continue;
+    }
+    seen.add(origin);
+    normalized.push(origin);
+  }
+  return normalized;
+};
+
 function markOverloaded(retryAfterSeconds) {
   const seconds = normalizePositiveSeconds(retryAfterSeconds, 0);
   if (!seconds) {
@@ -269,6 +302,14 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     throw new Error('controller common.tokenHmacKey is required');
   }
   const signSecretFromController = normalizeString(commonBootstrap.signSecret) || token;
+  const workerAddresses = normalizeOriginList(commonBootstrap.workerAddresses);
+  if (workerAddresses.length === 0) {
+    throw new Error('controller common.workerAddresses is required');
+  }
+  const landingWorkerAddresses = normalizeOriginList(commonBootstrap.landingWorkerAddresses);
+  if (landingWorkerAddresses.length === 0) {
+    throw new Error('controller common.landingWorkerAddresses is required');
+  }
 
   const address = normalizeString(downloadBootstrap.address);
   if (!address) {
@@ -500,6 +541,8 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   return {
     address,
     token,
+    workerAddresses,
+    landingWorkerAddresses,
     verifyHeader,
     verifySecret,
     signSecret,
@@ -1281,6 +1324,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   const additionalInfo = url.searchParams.get("additionalInfo") ?? "";
   const additionalInfoSign = url.searchParams.get("additionalInfoSign") ?? "";
   let additionalPayload = null;
+  let originSnapshot = null;
   if (shouldCheckAddition) {
     if (!additionalInfo) {
       return createUnauthorizedResponse(origin, "additionalInfo missing");
@@ -1341,20 +1385,27 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         return createUnauthorizedResponse(origin, "link expired");
       }
     }
-  }
 
-  if (needOriginCheck) {
-    if (!additionalPayload || typeof additionalPayload !== 'object') {
-      return createUnauthorizedResponse(origin, "origin payload missing");
-    }
     const encryptedSnapshot = typeof additionalPayload.encrypt === 'string' ? additionalPayload.encrypt : '';
     if (!encryptedSnapshot) {
       return createUnauthorizedResponse(origin, "origin encrypt missing");
     }
-    const snapshot = await decryptOriginSnapshot(encryptedSnapshot, config.token);
-    if (!snapshot) {
+    originSnapshot = await decryptOriginSnapshot(encryptedSnapshot, config.token);
+    if (!originSnapshot) {
       console.warn('[Origin Binding] Failed to decrypt snapshot');
       return createUnauthorizedResponse(origin, "origin decrypt failed");
+    }
+
+    const issuerRaw = typeof originSnapshot.issuer === 'string' ? originSnapshot.issuer : '';
+    const issuer = normalizeOrigin(issuerRaw);
+    if (!issuer || !config.landingWorkerAddresses.includes(issuer)) {
+      return createUnauthorizedResponse(origin, "prohibited issuer");
+    }
+  }
+
+  if (needOriginCheck) {
+    if (!originSnapshot || typeof originSnapshot !== 'object') {
+      return createUnauthorizedResponse(origin, "origin payload missing");
     }
     const cf = request.cf || {};
     const currentOrigin = {
@@ -1365,7 +1416,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       city: cf.city,
       asn: typeof cf.asn === 'undefined' || cf.asn === null ? undefined : String(cf.asn),
     };
-    const originResult = checkOriginMatch(snapshot, currentOrigin, originCheckModes, {
+    const originResult = checkOriginMatch(originSnapshot, currentOrigin, originCheckModes, {
       ipv4Suffix: config.ipv4Suffix,
       ipv6Suffix: config.ipv6Suffix,
     });
@@ -2166,13 +2217,6 @@ export default {
       const url = new URL(request.url);
       const pathname = url.pathname || '/';
 
-      if (pathname.startsWith('/api/v0/')) {
-        const internalResponse = await handleInternalApiIfAny(request, env, ctx);
-        if (internalResponse) {
-          return internalResponse;
-        }
-      }
-
       let controllerState = null;
       try {
         controllerState = await fetchControllerState(request, env);
@@ -2191,6 +2235,19 @@ export default {
       const rateLimiter = config.rateLimitEnabled ? createRateLimiter(config.dbMode) : null;
 
       ctx.controllerState = controllerState;
+
+      const requestOrigin = url.origin;
+      if (!config.workerAddresses.includes(requestOrigin)) {
+        const origin = request.headers.get('origin') || '*';
+        return createErrorResponse(origin, 403, 'prohibited source');
+      }
+
+      if (pathname.startsWith('/api/v0/')) {
+        const internalResponse = await handleInternalApiIfAny(request, env, ctx);
+        if (internalResponse) {
+          return internalResponse;
+        }
+      }
 
       const response = await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 
