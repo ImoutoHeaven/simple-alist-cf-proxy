@@ -66,9 +66,6 @@ const deny = (msg) =>
 export default {
   async fetch(request, env, ctx) {
     if (!HMAC_SECRET) return new Response("misconfigured", { status: 500 });
-    if (!globalThis.crypto || !crypto.subtle) {
-      return new Response("crypto unavailable", { status: 500 });
-    }
 
     const url = new URL(request.url);
     const nowSeconds = Math.floor(Date.now() / 1000);
@@ -136,10 +133,7 @@ export default {
       return fetch(request);
     }
 
-    const cache = globalThis.caches && caches.default ? caches.default : null;
-    if (!cache) {
-      return fetch(request);
-    }
+    const cache = caches.default;
     const cacheUrl = new URL(request.url);
     cacheUrl.protocol = "https:";
     cacheUrl.username = "";
@@ -165,15 +159,18 @@ export default {
 
       if (!Number.isFinite(size) || size <= MAX_CACHE_SIZE) {
         if (!isChunked) {
-          const toCache = origin.clone();
-          toCache.headers.set(
+          const originClone = origin.clone();
+          const headers = new Headers(originClone.headers);
+          headers.set(
             "Cache-Control",
             `public, max-age=${CACHE_TTL}, s-maxage=${CACHE_TTL}`
           );
-          const cachePromise = cache.put(cacheKey, toCache).catch(() => {});
-          if (ctx && typeof ctx.waitUntil === "function") {
-            ctx.waitUntil(cachePromise);
-          }
+          const toCache = new Response(originClone.body, {
+            status: originClone.status,
+            statusText: originClone.statusText,
+            headers,
+          });
+          ctx.waitUntil(cache.put(cacheKey, toCache).catch(() => {}));
         }
       }
     }
