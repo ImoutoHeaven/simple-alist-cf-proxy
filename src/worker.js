@@ -2194,7 +2194,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       safeHeaders.set('content-disposition', buildAttachmentContentDisposition(encryptedFileName));
     }
 
-    if (config.overrideCacheControl) {
+    if (config.overrideCacheControl && response.status === 200) {
       const fileSize = readAdditionalFileSize(additionalPayload);
       if (typeof fileSize === 'number' && fileSize <= config.cacheOverrideMaxSizeBytes) {
         const maxAge = config.cacheOverrideSeconds;
