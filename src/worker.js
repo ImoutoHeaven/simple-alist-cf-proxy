@@ -58,6 +58,13 @@ const CACHE_OVERRIDE_UNIT_SECONDS = {
   y: 31536000,
 };
 
+const CACHE_OVERRIDE_SIZE_MULTIPLIER = {
+  b: 1,
+  kb: 1024,
+  mb: 1024 * 1024,
+  gb: 1024 * 1024 * 1024,
+};
+
 const parseCacheOverrideSeconds = (value) => {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value > 0 ? Math.max(1, Math.round(value)) : 0;
@@ -84,6 +91,51 @@ const parseCacheOverrideSeconds = (value) => {
     return 0;
   }
   return Math.max(1, Math.round(seconds));
+};
+
+const parseCacheOverrideMaxSizeBytes = (value) => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 0 ? Math.max(1, Math.round(value)) : 0;
+  }
+  if (typeof value !== 'string') {
+    return 0;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return 0;
+  }
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)$/i);
+  if (!match) {
+    return 0;
+  }
+  const amount = Number.parseFloat(match[1]);
+  const unit = match[2].toLowerCase();
+  const multiplier = CACHE_OVERRIDE_SIZE_MULTIPLIER[unit] || 0;
+  if (!Number.isFinite(amount) || amount <= 0 || multiplier <= 0) {
+    return 0;
+  }
+  const bytes = amount * multiplier;
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return 0;
+  }
+  return Math.max(1, Math.round(bytes));
+};
+
+const readAdditionalFileSize = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+  const raw = payload.filesize ?? payload.fileSize;
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return raw > 0 ? raw : null;
+  }
+  if (typeof raw === 'string') {
+    const parsed = Number.parseFloat(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return null;
 };
 
 const normalizeOrigin = (value) => {
@@ -373,8 +425,16 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     downloadBootstrap.cacheOverrideTime ?? downloadBootstrap['cache-override-time']
   );
   const cacheOverrideSeconds = parseCacheOverrideSeconds(cacheOverrideTimeRaw);
+  const cacheOverrideMaxSizeRaw = normalizeString(
+    downloadBootstrap.cacheOverrideMaxSize ?? downloadBootstrap['cache-override-max-size'],
+    '500MB'
+  );
+  const cacheOverrideMaxSizeBytes = parseCacheOverrideMaxSizeBytes(cacheOverrideMaxSizeRaw);
   if (overrideCacheControl && !cacheOverrideSeconds) {
     throw new Error('controller download.cacheOverrideTime is required when overrideCacheControl is true');
+  }
+  if (overrideCacheControl && !cacheOverrideMaxSizeBytes) {
+    throw new Error('controller download.cacheOverrideMaxSize is required when overrideCacheControl is true');
   }
 
   // DB & cache from controller
@@ -603,6 +663,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     ipv4Only,
     overrideCacheControl,
     cacheOverrideSeconds,
+    cacheOverrideMaxSizeBytes,
     dbMode,
     cacheEnabled,
     cacheConfig,
@@ -2134,9 +2195,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     if (config.overrideCacheControl) {
-      const maxAge = config.cacheOverrideSeconds;
-      safeHeaders.set('cache-control', `public, max-age=${maxAge}, s-maxage=${maxAge}`);
-      safeHeaders.delete('x-cache');
+      const fileSize = readAdditionalFileSize(additionalPayload);
+      if (typeof fileSize === 'number' && fileSize <= config.cacheOverrideMaxSizeBytes) {
+        const maxAge = config.cacheOverrideSeconds;
+        safeHeaders.set('cache-control', `public, max-age=${maxAge}, s-maxage=${maxAge}`);
+        safeHeaders.delete('x-cache');
+      }
     }
 
     // 设置CORS headers
