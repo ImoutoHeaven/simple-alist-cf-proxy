@@ -68,34 +68,37 @@ export const parseWindowTime = (value) => {
 export const calculateIPSubnet = (ip, ipv4Suffix, ipv6Suffix) => {
   if (!ip || typeof ip !== 'string') return '';
   const trimmedIP = ip.trim();
+  if (!trimmedIP) return '';
 
-  if (trimmedIP.includes(':')) {
+  let processingIP = trimmedIP;
+  const lowerIP = trimmedIP.toLowerCase();
+  if (lowerIP.startsWith('::ffff:') && lowerIP.includes('.')) {
+    processingIP = trimmedIP.substring(7);
+  }
+
+  if (processingIP.includes(':') && !processingIP.includes('.')) {
     const suffix = ipv6Suffix || '/60';
     const prefixLength = Number.parseInt(suffix.replace('/', ''), 10);
     if (Number.isNaN(prefixLength) || prefixLength < 0 || prefixLength > 128) {
-      return `${trimmedIP}${suffix}`;
+      return `${processingIP}${suffix}`;
     }
 
     try {
-      const parts = trimmedIP.split(':');
-      const expanded = [];
-      let emptyIndex = -1;
-
-      for (let i = 0; i < parts.length; i += 1) {
-        if (parts[i] === '') {
-          if (emptyIndex === -1) emptyIndex = i;
-          continue;
-        }
-        expanded.push(Number.parseInt(parts[i] || '0', 16));
+      const parts = processingIP.split('::');
+      if (parts.length > 2) {
+        return `${processingIP}${suffix}`;
       }
-
-      if (emptyIndex !== -1) {
-        const zerosNeeded = 8 - expanded.length;
-        const before = expanded.slice(0, emptyIndex);
-        const after = expanded.slice(emptyIndex);
-        expanded.length = 0;
-        expanded.push(...before, ...Array(zerosNeeded).fill(0), ...after);
+      const left = parts[0] ? parts[0].split(':').filter(Boolean) : [];
+      const right = parts.length === 2 && parts[1] ? parts[1].split(':').filter(Boolean) : [];
+      if (left.length + right.length > 8) {
+        return `${processingIP}${suffix}`;
       }
+      const full = [
+        ...left,
+        ...Array(8 - (left.length + right.length)).fill('0'),
+        ...right,
+      ];
+      const expanded = full.map((h) => Number.parseInt(h, 16) || 0);
 
       const bitsPerGroup = 16;
       const fullGroups = Math.floor(prefixLength / bitsPerGroup);
@@ -113,19 +116,19 @@ export const calculateIPSubnet = (ip, ipv4Suffix, ipv6Suffix) => {
       const hex = expanded.map((n) => (n || 0).toString(16));
       return `${hex.join(':')}${suffix}`;
     } catch (error) {
-      return `${trimmedIP}${suffix}`;
+      return `${processingIP}${suffix}`;
     }
   } else {
     const suffix = ipv4Suffix || '/32';
     const prefixLength = Number.parseInt(suffix.replace('/', ''), 10);
     if (Number.isNaN(prefixLength) || prefixLength < 0 || prefixLength > 32) {
-      return `${trimmedIP}${suffix}`;
+      return `${processingIP}${suffix}`;
     }
 
     try {
-      const octets = trimmedIP.split('.').map((o) => Number.parseInt(o, 10));
+      const octets = processingIP.split('.').map((o) => Number.parseInt(o, 10));
       if (octets.length !== 4 || octets.some((o) => Number.isNaN(o) || o < 0 || o > 255)) {
-        return `${trimmedIP}${suffix}`;
+        return `${processingIP}${suffix}`;
       }
 
       let ipInt = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
@@ -141,7 +144,7 @@ export const calculateIPSubnet = (ip, ipv4Suffix, ipv6Suffix) => {
 
       return `${subnetOctets.join('.')}${suffix}`;
     } catch (error) {
-      return `${trimmedIP}${suffix}`;
+      return `${processingIP}${suffix}`;
     }
   }
 };
