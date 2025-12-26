@@ -49,6 +49,43 @@ const normalizePositiveSeconds = (value, fallback) => {
   return Number.isFinite(fb) && fb > 0 ? fb : 0;
 };
 
+const CACHE_OVERRIDE_UNIT_SECONDS = {
+  s: 1,
+  m: 60,
+  h: 3600,
+  d: 86400,
+  w: 604800,
+  y: 31536000,
+};
+
+const parseCacheOverrideSeconds = (value) => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 0 ? Math.max(1, Math.round(value)) : 0;
+  }
+  if (typeof value !== 'string') {
+    return 0;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return 0;
+  }
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*([smhdwy])$/i);
+  if (!match) {
+    return 0;
+  }
+  const amount = Number.parseFloat(match[1]);
+  const unit = match[2].toLowerCase();
+  const multiplier = CACHE_OVERRIDE_UNIT_SECONDS[unit] || 0;
+  if (!Number.isFinite(amount) || amount <= 0 || multiplier <= 0) {
+    return 0;
+  }
+  const seconds = amount * multiplier;
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return 0;
+  }
+  return Math.max(1, Math.round(seconds));
+};
+
 const normalizeOrigin = (value) => {
   if (typeof value !== 'string') {
     return '';
@@ -328,6 +365,18 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   const additionExpireTimeCheck = authConfig.additionExpireTimeCheck !== false;
   const ipv4Only = authConfig.ipv4Only !== false;
 
+  const overrideCacheControlRaw = downloadBootstrap.overrideCacheControl ?? downloadBootstrap['override-cache-control'];
+  const overrideCacheControl = typeof overrideCacheControlRaw === 'string'
+    ? overrideCacheControlRaw.trim().toLowerCase() === 'true'
+    : Boolean(overrideCacheControlRaw);
+  const cacheOverrideTimeRaw = normalizeString(
+    downloadBootstrap.cacheOverrideTime ?? downloadBootstrap['cache-override-time']
+  );
+  const cacheOverrideSeconds = parseCacheOverrideSeconds(cacheOverrideTimeRaw);
+  if (overrideCacheControl && !cacheOverrideSeconds) {
+    throw new Error('controller download.cacheOverrideTime is required when overrideCacheControl is true');
+  }
+
   // DB & cache from controller
   const dbConfig = downloadBootstrap.db && typeof downloadBootstrap.db === 'object'
     ? downloadBootstrap.db
@@ -552,6 +601,8 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     additionCheck,
     additionExpireTimeCheck,
     ipv4Only,
+    overrideCacheControl,
+    cacheOverrideSeconds,
     dbMode,
     cacheEnabled,
     cacheConfig,
@@ -2080,6 +2131,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const derivedName = deriveFileNameFromPath(path);
       const encryptedFileName = ensureEncryptedFileName(derivedName);
       safeHeaders.set('content-disposition', buildAttachmentContentDisposition(encryptedFileName));
+    }
+
+    if (config.overrideCacheControl) {
+      const maxAge = config.cacheOverrideSeconds;
+      safeHeaders.set('cache-control', `public, max-age=${maxAge}, s-maxage=${maxAge}`);
+      safeHeaders.delete('x-cache');
     }
 
     // 设置CORS headers
