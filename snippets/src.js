@@ -1,9 +1,13 @@
 // Cloudflare Snippet: pre-auth + cache lookup for download
 // Set HMAC_SECRET in CONFIG to common.tokenHmacKey (and keep common.signSecret aligned).
 
+const DEFAULTS = {
+  additionExpireTimeCheck: true,
+};
+
 const CONFIG = [
   // Example:
-  // { pattern: "alist-download-*.example.com", config: { HMAC_SECRET: "replace-with-common-tokenHmacKey" } },
+  // { pattern: "alist-download-*.example.com", config: { HMAC_SECRET: "replace-with-common-tokenHmacKey", additionExpireTimeCheck: true } },
 ];
 
 const compilePattern = (pattern) => {
@@ -35,6 +39,7 @@ const pickConfig = (hostname) => {
 };
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 const hmacKeyCache = new Map();
 
 const getHmacKey = (secret) => {
@@ -67,6 +72,22 @@ const base64EncodeUtf8 = (text) => {
   return btoa(binary);
 };
 
+const base64UrlDecodeToString = (value) => {
+  if (typeof value !== "string" || !value) return null;
+  let normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const mod = normalized.length % 4;
+  if (mod === 1) return null;
+  if (mod > 0) normalized = normalized.padEnd(normalized.length + (4 - mod), "=");
+  try {
+    const binary = atob(normalized);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return decoder.decode(bytes);
+  } catch {
+    return null;
+  }
+};
+
 const normalizePath = (pathname) => {
   if (typeof pathname !== "string") return null;
   let decoded;
@@ -97,6 +118,17 @@ const hmacSha256Sign = async (secret, data, expire) => {
   return `${base64UrlEncode(new Uint8Array(buf))}:${expire}`;
 };
 
+const readAdditionalExpireTime = (payload) => {
+  if (!payload || typeof payload !== "object") return null;
+  const raw = payload.expireTime;
+  if (typeof raw === "number" && Number.isFinite(raw)) return Math.trunc(raw);
+  if (typeof raw === "string") {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+};
+
 const deny = (msg) =>
   new Response(msg, { status: 403, headers: { "Cache-Control": "no-store" } });
 
@@ -105,8 +137,10 @@ export default {
     const url = new URL(request.url);
     const hostname = url.hostname;
     const selected = pickConfig(hostname);
-    const secret = selected && typeof selected.HMAC_SECRET === "string" ? selected.HMAC_SECRET : "";
+    const config = selected && typeof selected === "object" ? { ...DEFAULTS, ...selected } : { ...DEFAULTS };
+    const secret = typeof config.HMAC_SECRET === "string" ? config.HMAC_SECRET : "";
     if (!secret) return new Response("misconfigured", { status: 500 });
+    const additionExpireTimeCheck = config.additionExpireTimeCheck !== false;
 
     const nowSeconds = Math.floor(Date.now() / 1000);
 
@@ -168,6 +202,22 @@ export default {
       if (item.label === "additionalInfoSign" && item.expected !== additionalInfoSign) {
         return deny("additionalInfoSign mismatch");
       }
+    }
+
+    if (additionExpireTimeCheck && additionalMeta) {
+      const decodedAdditional = base64UrlDecodeToString(additionalInfo);
+      if (!decodedAdditional) return deny("additionalInfo decode failed");
+      let additionalPayload;
+      try {
+        additionalPayload = JSON.parse(decodedAdditional);
+      } catch {
+        return deny("additionalInfo invalid");
+      }
+      const expireTimestamp = readAdditionalExpireTime(additionalPayload);
+      if (!Number.isFinite(expireTimestamp) || expireTimestamp <= 0) {
+        return deny("additionalInfo expire invalid");
+      }
+      if (nowSeconds > expireTimestamp) return deny("link expired");
     }
 
     const isGet = request.method === "GET";
