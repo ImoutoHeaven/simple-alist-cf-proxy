@@ -1,20 +1,60 @@
 // Cloudflare Snippet: pre-auth + cache lookup for download
-// Set HMAC_SECRET to common.tokenHmacKey (and keep common.signSecret aligned).
-const HMAC_SECRET = "replace-with-common-tokenHmacKey";
-const encoder = new TextEncoder();
-let hmacKeyPromise = null;
+// Set HMAC_SECRET in CONFIG to common.tokenHmacKey (and keep common.signSecret aligned).
 
-const getHmacKey = () => {
-  if (!hmacKeyPromise) {
-    hmacKeyPromise = crypto.subtle.importKey(
-      "raw",
-      encoder.encode(HMAC_SECRET),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"]
+const CONFIG = [
+  // Example:
+  // { pattern: "alist-download-*.example.com", config: { HMAC_SECRET: "replace-with-common-tokenHmacKey" } },
+];
+
+const compilePattern = (pattern) => {
+  if (typeof pattern !== "string") return null;
+  const trimmed = pattern.trim().toLowerCase();
+  if (!trimmed) return null;
+  const escaped = trimmed.replace(/\./g, "\\.").replace(/\*/g, "[^.]*");
+  try {
+    return new RegExp(`^${escaped}$`);
+  } catch {
+    return null;
+  }
+};
+
+const COMPILED_CONFIG = CONFIG.map((entry) => ({
+  pattern: entry && entry.pattern,
+  regex: compilePattern(entry && entry.pattern),
+  config: (entry && entry.config) || {},
+}));
+
+const pickConfig = (hostname) => {
+  const host = typeof hostname === "string" ? hostname.toLowerCase() : "";
+  if (!host) return null;
+  for (const rule of COMPILED_CONFIG) {
+    if (!rule || !rule.regex) continue;
+    if (rule.regex.test(host)) return rule.config || null;
+  }
+  return null;
+};
+
+const encoder = new TextEncoder();
+const hmacKeyCache = new Map();
+
+const getHmacKey = (secret) => {
+  const key = typeof secret === "string" ? secret : "";
+  if (!key) {
+    return Promise.reject(new Error("HMAC secret missing"));
+  }
+  if (!hmacKeyCache.has(key)) {
+    hmacKeyCache.set(
+      key,
+      crypto.subtle.importKey(
+        "raw",
+        encoder.encode(key),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+      )
     );
   }
-  return hmacKeyPromise;
+  return hmacKeyCache.get(key);
 };
 
 const base64UrlEncode = (bytes) =>
@@ -50,8 +90,8 @@ const parseSignature = (sig) => {
 
 const isExpired = (expire, nowSeconds) => expire > 0 && expire < nowSeconds;
 
-const hmacSha256Sign = async (data, expire) => {
-  const key = await getHmacKey();
+const hmacSha256Sign = async (secret, data, expire) => {
+  const key = await getHmacKey(secret);
   const payload = `${data}:${expire}`;
   const buf = await crypto.subtle.sign("HMAC", key, encoder.encode(payload));
   return `${base64UrlEncode(new Uint8Array(buf))}:${expire}`;
@@ -62,9 +102,12 @@ const deny = (msg) =>
 
 export default {
   async fetch(request, env, ctx) {
-    if (!HMAC_SECRET) return new Response("misconfigured", { status: 500 });
-
     const url = new URL(request.url);
+    const hostname = url.hostname;
+    const selected = pickConfig(hostname);
+    const secret = selected && typeof selected.HMAC_SECRET === "string" ? selected.HMAC_SECRET : "";
+    if (!secret) return new Response("misconfigured", { status: 500 });
+
     const nowSeconds = Math.floor(Date.now() / 1000);
 
     const path = normalizePath(url.pathname);
@@ -99,18 +142,21 @@ export default {
       if (isExpired(additionalMeta.expire, nowSeconds)) return deny("additionalInfoSign expired");
     }
 
-    const workerAddr = new URL(request.url).origin;
+    const workerAddr = url.origin;
     const base64Path = base64EncodeUtf8(path);
     const workerVerifyData = JSON.stringify({ path, worker_addr: workerAddr });
 
     const tasks = [
-      hmacSha256Sign(path, signMeta.expire).then((expected) => ({ label: "sign", expected })),
-      hmacSha256Sign(base64Path, hashMeta.expire).then((expected) => ({ label: "hashSign", expected })),
-      hmacSha256Sign(workerVerifyData, workerMeta.expire).then((expected) => ({ label: "workerSign", expected })),
+      hmacSha256Sign(secret, path, signMeta.expire).then((expected) => ({ label: "sign", expected })),
+      hmacSha256Sign(secret, base64Path, hashMeta.expire).then((expected) => ({ label: "hashSign", expected })),
+      hmacSha256Sign(secret, workerVerifyData, workerMeta.expire).then((expected) => ({ label: "workerSign", expected })),
     ];
     if (additionalMeta) {
       tasks.push(
-        hmacSha256Sign(additionalInfo, additionalMeta.expire).then((expected) => ({ label: "additionalInfoSign", expected }))
+        hmacSha256Sign(secret, additionalInfo, additionalMeta.expire).then((expected) => ({
+          label: "additionalInfoSign",
+          expected,
+        }))
       );
     }
 
