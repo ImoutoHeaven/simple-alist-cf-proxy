@@ -327,7 +327,15 @@ export default {
 
     const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
     const cached = await cache.match(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      const headers = new Headers(cached.headers);
+      headers.set("X-Snippet-Cache", "HIT");
+      return new Response(cached.body, {
+        status: cached.status,
+        statusText: cached.statusText,
+        headers,
+      });
+    }
 
     return fetch(request);
   },
