@@ -325,7 +325,7 @@ export default {
     cacheUrl.search = "";
     cacheUrl.hash = "";
 
-    const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+    const cacheKey = new Request(cacheUrl.toString(), request);
     const cached = await cache.match(cacheKey);
     if (cached) {
       const headers = new Headers(cached.headers);
