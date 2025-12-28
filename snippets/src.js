@@ -1,4 +1,4 @@
-// Cloudflare Snippet: pre-auth + cache lookup for download
+// Cloudflare Snippet: pre-auth for download
 // Set HMAC_SECRET in CONFIG to common.tokenHmacKey (and keep common.signSecret aligned).
 
 const DEFAULTS = {
@@ -313,21 +313,6 @@ export default {
       }
       if (nowSeconds > expireTimestamp) return deny("link expired");
     }
-
-    const isGet = request.method === "GET";
-    const hasRange = request.headers.has("range");
-    if (!isGet || hasRange) {
-      return fetch(request);
-    }
-
-    const cache = caches.default;
-    const cacheUrl = new URL(request.url);
-    cacheUrl.search = "";
-    cacheUrl.hash = "";
-
-    const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
-    const cached = await cache.match(cacheKey);
-    if (cached) return cached;
 
     return fetch(request);
   },
