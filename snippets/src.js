@@ -1,5 +1,6 @@
 // Cloudflare Snippet: pre-auth + cache lookup for download
 // Set HMAC_SECRET in CONFIG to common.tokenHmacKey (and keep common.signSecret aligned).
+// Leave HMAC_SECRET empty to skip all signature checks.
 
 const DEFAULTS = {
   additionalInfoCheck: true,
@@ -209,12 +210,12 @@ export default {
     const selected = pickConfig(hostname, path);
     const config = selected && typeof selected === "object" ? { ...DEFAULTS, ...selected } : { ...DEFAULTS };
     const secret = typeof config.HMAC_SECRET === "string" ? config.HMAC_SECRET : "";
-    if (!secret) return new Response("misconfigured", { status: 500 });
-    const additionalInfoCheck = config.additionalInfoCheck !== false;
-    const additionExpireTimeCheck = config.additionExpireTimeCheck !== false;
-    const hashCheck = config.hashCheck !== false;
-    const signCheck = config.signCheck !== false;
-    const workerCheck = config.workerCheck !== false;
+    const hasSecret = secret.length > 0;
+    const additionalInfoCheck = hasSecret && config.additionalInfoCheck !== false;
+    const additionExpireTimeCheck = hasSecret && config.additionExpireTimeCheck !== false;
+    const hashCheck = hasSecret && config.hashCheck !== false;
+    const signCheck = hasSecret && config.signCheck !== false;
+    const workerCheck = hasSecret && config.workerCheck !== false;
 
     const nowSeconds = Math.floor(Date.now() / 1000);
 
