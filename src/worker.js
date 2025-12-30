@@ -2194,7 +2194,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       safeHeaders.set('content-disposition', buildAttachmentContentDisposition(encryptedFileName));
     }
 
-    if (config.overrideCacheControl && response.status === 200) {
+    const hasRangeRequest = Boolean(request.headers.get('range'));
+    const hasContentRange = Boolean(response.headers.get('content-range'));
+    const shouldOverrideCacheControl = config.overrideCacheControl
+      && (
+        response.status === 200
+        || (response.status === 206 && hasRangeRequest && hasContentRange)
+      );
+
+    if (shouldOverrideCacheControl) {
       const fileSize = readAdditionalFileSize(additionalPayload);
       if (typeof fileSize === 'number' && fileSize <= config.cacheOverrideMaxSizeBytes) {
         const maxAge = config.cacheOverrideSeconds;
