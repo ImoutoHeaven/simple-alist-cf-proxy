@@ -2346,6 +2346,14 @@ export default {
       const url = new URL(request.url);
       const pathname = url.pathname || '/';
 
+      const isInternalPath = pathname.startsWith('/api/v0/');
+      if (isInternalPath) {
+        const internalResponse = await handleInternalApiIfAny(request, env, ctx);
+        if (internalResponse) {
+          return internalResponse;
+        }
+      }
+
       const innerAuthSecret = typeof env?.INNER_AUTH_SECRET === 'string' ? env.INNER_AUTH_SECRET.trim() : '';
       if (innerAuthSecret) {
         const headerNameRaw = typeof env?.INNER_AUTH_HEADER === 'string' ? env.INNER_AUTH_HEADER.trim() : '';
@@ -2379,13 +2387,6 @@ export default {
       if (!config.workerAddresses.includes(requestOrigin)) {
         const origin = request.headers.get('origin') || '*';
         return createErrorResponse(origin, 403, 'prohibited source');
-      }
-
-      if (pathname.startsWith('/api/v0/')) {
-        const internalResponse = await handleInternalApiIfAny(request, env, ctx);
-        if (internalResponse) {
-          return internalResponse;
-        }
       }
 
       const response = await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
