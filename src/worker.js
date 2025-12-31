@@ -2346,6 +2346,16 @@ export default {
       const url = new URL(request.url);
       const pathname = url.pathname || '/';
 
+      const innerAuthSecret = typeof env?.INNER_AUTH_SECRET === 'string' ? env.INNER_AUTH_SECRET.trim() : '';
+      if (innerAuthSecret) {
+        const headerNameRaw = typeof env?.INNER_AUTH_HEADER === 'string' ? env.INNER_AUTH_HEADER.trim() : '';
+        const headerName = headerNameRaw || 'X-Inner-Auth';
+        const provided = request.headers.get(headerName) || '';
+        if (provided !== innerAuthSecret) {
+          return new Response('Forbidden', { status: 403 });
+        }
+      }
+
       let controllerState = null;
       try {
         controllerState = await fetchControllerState(request, env);

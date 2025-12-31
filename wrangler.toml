@@ -10,6 +10,7 @@ compatibility_date = "2024-01-01"
 # - BOOTSTRAP_CACHE_MODE（direct/d1，决策仅 direct）
 # - CACHE_D1（D1 缓存绑定，可选）/ INIT_TABLES（是否由 Worker 自动建表，默认 false）
 # - INTERNAL_API_TOKEN（控制 API）
+# - INNER_AUTH_HEADER / INNER_AUTH_SECRET（入口内网鉴权，可选）
 # - ENABLE_CF_RATELIMITER / CF_RATELIMITER_BINDING（如需启用 CF 原生限流，请同时配置 [[rate_limit]] 绑定）
 # 策略/签名/IPv4 限制等全部由 controller.common / download.auth 下发，勿在 wrangler 配置策略类 env。
 #
@@ -26,6 +27,8 @@ compatibility_date = "2024-01-01"
 # CACHE_D1="CACHE_D1"
 # INIT_TABLES="false"
 # INTERNAL_API_TOKEN="replace-with-internal-token"
+# INNER_AUTH_HEADER="X-Inner-Auth"
+# INNER_AUTH_SECRET="replace-with-inner-auth-secret"
 # ENABLE_CF_RATELIMITER="false"
 # CF_RATELIMITER_BINDING="CF_RATE_LIMITER"
 #
