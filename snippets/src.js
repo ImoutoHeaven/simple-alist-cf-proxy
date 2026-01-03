@@ -199,6 +199,9 @@ const readAdditionalExpireTime = (payload) => {
 const deny = (msg) =>
   new Response(msg, { status: 403, headers: { "Cache-Control": "no-store" } });
 
+const unauthorized = (msg) =>
+  new Response(msg, { status: 401, headers: { "Cache-Control": "no-store" } });
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -233,32 +236,32 @@ export default {
     if (signCheck) {
       sign = url.searchParams.get("sign") || "";
       signMeta = parseSignature(sign);
-      if (!signMeta) return deny("sign invalid");
-      if (isExpired(signMeta.expire, nowSeconds)) return deny("sign expired");
+      if (!signMeta) return unauthorized("sign invalid");
+      if (isExpired(signMeta.expire, nowSeconds)) return unauthorized("sign expired");
     }
 
     if (hashCheck) {
       hashSign = url.searchParams.get("hashSign") || "";
       hashMeta = parseSignature(hashSign);
-      if (!hashMeta) return deny("hashSign invalid");
-      if (isExpired(hashMeta.expire, nowSeconds)) return deny("hashSign expired");
+      if (!hashMeta) return unauthorized("hashSign invalid");
+      if (isExpired(hashMeta.expire, nowSeconds)) return unauthorized("hashSign expired");
     }
 
     if (workerCheck) {
       workerSign = url.searchParams.get("workerSign") || "";
       workerMeta = parseSignature(workerSign);
-      if (!workerMeta) return deny("workerSign invalid");
-      if (isExpired(workerMeta.expire, nowSeconds)) return deny("workerSign expired");
+      if (!workerMeta) return unauthorized("workerSign invalid");
+      if (isExpired(workerMeta.expire, nowSeconds)) return unauthorized("workerSign expired");
     }
 
     if (additionalInfoCheck) {
       additionalInfo = url.searchParams.get("additionalInfo") || "";
       additionalInfoSign = url.searchParams.get("additionalInfoSign") || "";
-      if (!additionalInfo) return deny("additionalInfo missing");
-      if (!additionalInfoSign) return deny("additionalInfoSign missing");
+      if (!additionalInfo) return unauthorized("additionalInfo missing");
+      if (!additionalInfoSign) return unauthorized("additionalInfoSign missing");
       additionalMeta = parseSignature(additionalInfoSign);
-      if (!additionalMeta) return deny("additionalInfoSign invalid");
-      if (isExpired(additionalMeta.expire, nowSeconds)) return deny("additionalInfoSign expired");
+      if (!additionalMeta) return unauthorized("additionalInfoSign invalid");
+      if (isExpired(additionalMeta.expire, nowSeconds)) return unauthorized("additionalInfoSign expired");
     }
 
     const tasks = [];
@@ -291,28 +294,28 @@ export default {
 
     const results = await Promise.all(tasks);
     for (const item of results) {
-      if (item.label === "sign" && item.expected !== sign) return deny("sign mismatch");
-      if (item.label === "hashSign" && item.expected !== hashSign) return deny("hashSign mismatch");
-      if (item.label === "workerSign" && item.expected !== workerSign) return deny("workerSign mismatch");
+      if (item.label === "sign" && item.expected !== sign) return unauthorized("sign mismatch");
+      if (item.label === "hashSign" && item.expected !== hashSign) return unauthorized("hashSign mismatch");
+      if (item.label === "workerSign" && item.expected !== workerSign) return unauthorized("workerSign mismatch");
       if (item.label === "additionalInfoSign" && item.expected !== additionalInfoSign) {
-        return deny("additionalInfoSign mismatch");
+        return unauthorized("additionalInfoSign mismatch");
       }
     }
 
     if (additionalInfoCheck && additionExpireTimeCheck && additionalMeta) {
       const decodedAdditional = base64UrlDecodeToString(additionalInfo);
-      if (!decodedAdditional) return deny("additionalInfo decode failed");
+      if (!decodedAdditional) return new Response("additionalInfo decode failed", { status: 400 });
       let additionalPayload;
       try {
         additionalPayload = JSON.parse(decodedAdditional);
       } catch {
-        return deny("additionalInfo invalid");
+        return new Response("additionalInfo invalid", { status: 400 });
       }
       const expireTimestamp = readAdditionalExpireTime(additionalPayload);
       if (!Number.isFinite(expireTimestamp) || expireTimestamp <= 0) {
-        return deny("additionalInfo expire invalid");
+        return new Response("additionalInfo expire invalid", { status: 400 });
       }
-      if (nowSeconds > expireTimestamp) return deny("link expired");
+      if (nowSeconds > expireTimestamp) return unauthorized("link expired");
     }
 
     const isGet = request.method === "GET";
