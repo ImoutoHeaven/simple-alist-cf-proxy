@@ -2068,7 +2068,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         const currentOrigin = new URL(originalRequest.url).origin;
         if (location.startsWith(`${currentOrigin}/`)) {
           request = new Request(location, request);
-          return await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
+          return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
         } else {
           request = new Request(location, request);
           response = await fetch(request);
@@ -2102,7 +2102,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
             const currentOrigin = new URL(originalRequest.url).origin;
             if (location.startsWith(`${currentOrigin}/`)) {
               request = new Request(location, request);
-              return await handleRequest(request, config, cacheManager, throttleManager, rateLimiter, ctx);
+              return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
             } else {
               request = new Request(location, request);
               response = await fetch(request);
