@@ -171,6 +171,28 @@ const normalizeOriginList = (values) => {
   return normalized;
 };
 
+const normalizeHeaderMap = (value) => {
+  const normalized = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return normalized;
+  }
+  for (const [rawName, rawValue] of Object.entries(value)) {
+    const name = typeof rawName === 'string' ? rawName.trim() : '';
+    if (!name) {
+      continue;
+    }
+    if (rawValue === undefined || rawValue === null) {
+      continue;
+    }
+    const stringValue = typeof rawValue === 'string' ? rawValue : String(rawValue);
+    if (!stringValue || stringValue.trim().length === 0) {
+      continue;
+    }
+    normalized[name] = stringValue;
+  }
+  return normalized;
+};
+
 function markOverloaded(retryAfterSeconds) {
   const seconds = normalizePositiveSeconds(retryAfterSeconds, 0);
   if (!seconds) {
@@ -399,6 +421,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   if (landingWorkerAddresses.length === 0) {
     throw new Error('controller common.landingWorkerAddresses is required');
   }
+  const alistAuthHeaders = normalizeHeaderMap(commonBootstrap.alistAuthHeaders);
 
   const address = normalizeString(downloadBootstrap.address);
   if (!address) {
@@ -652,6 +675,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     token,
     workerAddresses,
     landingWorkerAddresses,
+    alistAuthHeaders,
     verifyHeader,
     verifySecret,
     signSecret,
@@ -1761,6 +1785,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       "CF-Connecting-IP-WORKERS": clientIP,
     };
     applyVerifyHeaders(headers, config.verifyHeader, config.verifySecret);
+    if (config.alistAuthHeaders && typeof config.alistAuthHeaders === 'object') {
+      for (const [headerName, headerValue] of Object.entries(config.alistAuthHeaders)) {
+        headers[headerName] = headerValue;
+      }
+    }
     const requestUrl = new URL(`${config.address}/api/fs/link`);
     if (forceRefresh) {
       requestUrl.searchParams.set("refresh", "true");
