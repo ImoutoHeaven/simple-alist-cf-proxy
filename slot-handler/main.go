@@ -867,7 +867,7 @@ func (s *server) onStructurallyFailed(sess *FQSession, status string, cfg *Confi
 		ipState.DenyUntil = now.Add(time.Duration(denySeconds) * time.Second)
 
 		if s.log != nil {
-			s.log.Infof("[FQ] ip deny window: host=%s ip=%s reason=%s cooldown=%ds jitter=%d", hostKey, sess.IPBucket, status, baseSeconds, jitter)
+			s.log.Debugf("[FQ] ip deny window: host=%s ip=%s reason=%s cooldown=%ds jitter=%d", hostKey, sess.IPBucket, status, baseSeconds, jitter)
 		}
 	}
 }
@@ -1058,7 +1058,7 @@ func (s *server) onRegisterWaiterResult(sess *FQSession, regRes *registerResult,
 			deny := base + jitter
 			state.WaiterDenyUntil = now.Add(deny)
 			if s.log != nil {
-				s.log.Infof("[FQ] waiter deny window: host=%s ip=%s reason=%s base_ms=%d jitter_ms=%d", hostKey, sess.IPBucket, status, base.Milliseconds(), jitter.Milliseconds())
+				s.log.Debugf("[FQ] waiter deny window: host=%s ip=%s reason=%s base_ms=%d jitter_ms=%d", hostKey, sess.IPBucket, status, base.Milliseconds(), jitter.Milliseconds())
 			}
 		}
 	}
@@ -1108,7 +1108,7 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 
 	if inDenyWindow {
 		if s.log != nil {
-			s.log.Infof("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
+			s.log.Debugf("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
 		}
 		return false
 	}
@@ -1126,7 +1126,7 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 
 	if s.isIpInStructuralDenyWindow(host, sess.IPBucket, now) {
 		if s.log != nil {
-			s.log.Infof("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
+			s.log.Debugf("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
 		}
 		return false
 	}
@@ -1141,7 +1141,7 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 
 	if s.isIpInStructuralDenyWindow(host, sess.IPBucket, now) {
 		if s.log != nil {
-			s.log.Infof("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
+			s.log.Debugf("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
 		}
 		return false
 	}
@@ -2089,7 +2089,7 @@ func (s *server) handleCancelSession(w http.ResponseWriter, r *http.Request) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 
-	s.log.Infof("session cancel request token=%s host=%s ip=%s state=%s",
+	s.log.Debugf("session cancel request token=%s host=%s ip=%s state=%s",
 		sess.Token, sess.Hostname, sess.IPBucket, sess.State)
 
 	hostname := sess.Hostname
@@ -2129,7 +2129,7 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 
 	if protected, code, retryAfter := s.getThrottleState(hostKey, now); protected {
 		if s.log != nil {
-			s.log.Infof(
+			s.log.Debugf(
 				"[FQ] throttle (cached) host=%s ip=%s code=%d retryAfter=%d",
 				hostKey, req.IPBucket, code, retryAfter,
 			)
@@ -2146,7 +2146,7 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 		limit := cfg.FairQueue.globalMaxWaiters()
 		current := atomic.LoadInt64(&s.globalWaiters)
 		if s.log != nil {
-			s.log.Infof(
+			s.log.Debugf(
 				"[FQ] overloaded: reject new session host=%s ip=%s globalWaiters=%d limit=%d",
 				req.Hostname, req.IPBucket, current, limit,
 			)
@@ -2173,7 +2173,7 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 	if throttleRes.throttled {
 		s.incrementMetric("throttled")
 		s.setThrottleState(hostKey, now, throttleRes.code, throttleRes.retryAfter)
-		s.log.Infof(
+		s.log.Debugf(
 			"acquire throttled host=%s ip=%s code=%d retryAfter=%d",
 			req.Hostname, req.IPBucket, throttleRes.code, throttleRes.retryAfter,
 		)
@@ -2186,7 +2186,7 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 	}
 
 	token := uuid.New().String()
-	s.log.Infof(
+	s.log.Debugf(
 		"session created host=%s ip=%s token=%s window=%ds",
 		req.Hostname, req.IPBucket, token, throttleWindow,
 	)
@@ -2226,7 +2226,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 	token := strings.TrimSpace(req.QueryToken)
 	sess, ok := s.sessionStore.Load(token)
 	if !ok || sess == nil {
-		s.log.Infof("session missing token=%s", token)
+		s.log.Debugf("session missing token=%s", token)
 		s.incrementMetric("timeout")
 		return &AcquireResponse{Result: "timeout"}, nil
 	}
@@ -2242,7 +2242,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 
 	idleLimit := cfg.FairQueue.sessionIdleDuration()
 	if idleLimit > 0 && now.Sub(sess.LastSeenAt) > idleLimit {
-		s.log.Infof(
+		s.log.Debugf(
 			"session idle-timeout token=%s host=%s ip=%s idle_ms=%d",
 			sess.Token, sess.Hostname, sess.IPBucket,
 			now.Sub(sess.LastSeenAt).Milliseconds(),
@@ -2256,7 +2256,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 
 	maxWait := cfg.FairQueue.maxWaitDuration()
 	if now.Sub(sess.CreatedAt) >= maxWait {
-		s.log.Infof(
+		s.log.Debugf(
 			"session max-wait-timeout token=%s host=%s ip=%s wait_ms=%d",
 			sess.Token, sess.Hostname, sess.IPBucket,
 			now.Sub(sess.CreatedAt).Milliseconds(),
@@ -2272,7 +2272,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 
 	switch sess.State {
 	case StateGranted:
-		s.log.Infof(
+		s.log.Debugf(
 			"session granted token=%s host=%s ip=%s slotToken=%s",
 			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
 		)
@@ -2285,7 +2285,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			QueryToken: sess.Token,
 		}, nil
 	case StateThrottled:
-		s.log.Infof(
+		s.log.Debugf(
 			"session throttled token=%s host=%s ip=%s code=%d retryAfter=%d",
 			sess.Token, sess.Hostname, sess.IPBucket,
 			sess.ThrottleCode, sess.ThrottleRetryAfter,
@@ -2299,7 +2299,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			ThrottleWait: sess.ThrottleRetryAfter,
 		}, nil
 	case StateTimeout:
-		s.log.Infof(
+		s.log.Debugf(
 			"session timeout token=%s host=%s ip=%s",
 			sess.Token, sess.Hostname, sess.IPBucket,
 		)
@@ -2312,7 +2312,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 	budget := cfg.FairQueue.pollWindowDuration()
 	if err := s.runQueueCycle(ctx, cfg, backend, sess, budget); err != nil {
 		if errors.Is(err, context.Canceled) {
-			s.log.Infof("runQueueCycle canceled token=%s host=%s ip=%s", sess.Token, sess.Hostname, sess.IPBucket)
+			s.log.Debugf("runQueueCycle canceled token=%s host=%s ip=%s", sess.Token, sess.Hostname, sess.IPBucket)
 		} else {
 			s.log.Warnf("runQueueCycle error: %v", err)
 		}
@@ -2324,7 +2324,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 
 	switch sess.State {
 	case StateGranted:
-		s.log.Infof(
+		s.log.Debugf(
 			"session granted token=%s host=%s ip=%s slotToken=%s",
 			sess.Token, sess.Hostname, sess.IPBucket, sess.SlotToken,
 		)
@@ -2338,7 +2338,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			QueryToken: sess.Token,
 		}, nil
 	case StateThrottled:
-		s.log.Infof(
+		s.log.Debugf(
 			"session throttled token=%s host=%s ip=%s code=%d retryAfter=%d",
 			sess.Token, sess.Hostname, sess.IPBucket,
 			sess.ThrottleCode, sess.ThrottleRetryAfter,
@@ -2353,7 +2353,7 @@ func (s *server) handlePollAcquire(ctx context.Context, req AcquireRequest) (*Ac
 			ThrottleWait: sess.ThrottleRetryAfter,
 		}, nil
 	case StateTimeout:
-		s.log.Infof(
+		s.log.Debugf(
 			"session timeout token=%s host=%s ip=%s",
 			sess.Token, sess.Hostname, sess.IPBucket,
 		)
@@ -2416,7 +2416,7 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 			s.onRegisterWaiterResult(sess, regRes, cfg)
 			if regRes != nil && regRes.allowed {
 				s.markWaiterRegistered(sess)
-				s.log.Infof(
+				s.log.Debugf(
 					"waiter registered token=%s host=%s ip=%s qDepth=%d ipQDepth=%d status=%s",
 					sess.Token, sess.Hostname, sess.IPBucket,
 					regRes.queueDepth, regRes.ipQueueDepth, regRes.statusMessage,
@@ -2465,7 +2465,7 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 			sess.ThrottleCode = tryRes.throttleCode
 			sess.ThrottleRetryAfter = tryRes.throttleRetryAfter
 			s.onTryAcquireResult(sess, tryRes.status)
-			s.log.Infof(
+			s.log.Debugf(
 				"slot throttled token=%s host=%s ip=%s code=%d retryAfter=%d qDepth=%d ipQDepth=%d",
 				sess.Token, sess.Hostname, sess.IPBucket,
 				tryRes.throttleCode, tryRes.throttleRetryAfter,
@@ -2482,7 +2482,7 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 			if len(slotLog) > 8 {
 				slotLog = slotLog[len(slotLog)-8:]
 			}
-			s.log.Infof(
+			s.log.Debugf(
 				"slot acquired token=%s host=%s ip=%s slot=%s qDepth=%d ipQDepth=%d",
 				sess.Token, sess.Hostname, sess.IPBucket,
 				slotLog, tryRes.queueDepth, tryRes.ipQueueDepth,
@@ -2649,7 +2649,7 @@ func (s *server) releaseSlotForSession(ctx context.Context, hostname, hostnameHa
 		s.log.Warnf("release slot (cancel) failed token=%s host=%s ip=%s: %v",
 			token, hostname, ipBucket, err)
 	} else {
-		s.log.Infof("slot released (cancel) token=%s host=%s ip=%s", token, hostname, ipBucket)
+		s.log.Debugf("slot released (cancel) token=%s host=%s ip=%s", token, hostname, ipBucket)
 		s.incrementMetric("released")
 	}
 }
@@ -2830,7 +2830,7 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 	if len(tokenLog) > 8 {
 		tokenLog = tokenLog[len(tokenLog)-8:]
 	}
-	s.log.Infof(
+	s.log.Debugf(
 		"slot released host=%s ip=%s token=%s hold_ms=%d min_hold_ms=%d",
 		req.Hostname, req.IPBucket, tokenLog, holdMs, minHoldMs,
 	)
