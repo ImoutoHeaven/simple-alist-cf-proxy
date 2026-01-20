@@ -36,11 +36,16 @@ go build -o slot-handler .
      - `globalMaxWaiters`：本机允许的最大排队会话数，超过后直接返回 `overloaded`
      - `sessionIdleSeconds`：会话长时间不轮询即超时
      - `maxSlotPerHost` / `maxSlotPerIp`：并发 slot 上限
-     - `maxWaitersPerIp` / `maxWaitersPerHost`：等待队列上限（显式设置为 0 可关闭）
-     - `zombieTimeoutSeconds` / `ipCooldownSeconds`
-     - `defaultGrantedCleanupDelay`：GRANTED 会话延迟清理秒数（默认 5 秒）
-     - `weightedScheduler`：热点 host 的加权调度开关与参数
-     - `cleanup`：后台清理配置
+    - `maxWaitersPerIp` / `maxWaitersPerHost`：等待队列上限（显式设置为 0 可关闭）
+    - `zombieTimeoutSeconds` / `ipCooldownSeconds`
+    - `defaultGrantedCleanupDelay`：GRANTED 会话延迟清理秒数（默认 5 秒）
+    - `weightedScheduler`：热点 host 的加权调度开关与参数
+      - `weightedScheduler.enabled`：是否启用加权调度
+      - `weightedScheduler.hotPendingFactor` / `weightedScheduler.hotPendingMin`：热点判定阈值
+      - `weightedScheduler.coldAvgWaitMs` / `weightedScheduler.hotAvgWaitMs`：冷/热点平均等待时间阈值
+      - `weightedScheduler.maxProbesPerCycle`：每轮允许的 TryAcquire 上限
+      - `weightedScheduler.baseWeight` / `weightedScheduler.weightPerWait`：权重基值与等待次数权重
+    - `cleanup`：后台清理配置
    - `fairQueue.rpc`：RPC 函数名（需与 `init.sql` 对齐）
 
 ### controller 模式
