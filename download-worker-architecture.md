@@ -48,11 +48,12 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 
 主要由 controller 下发：
 
-- `common.tokenHmacKey`：签名与 origin 加解密核心密钥（必填）
+- `common.tokenHmacKey`：`payloadSign`/`bindingStr` HMAC 与 `payload.encrypt` 加解密核心密钥（必填）
 - `common.workerAddresses` / `common.landingWorkerAddresses`
+- `common.binding`：bindingStr 版本、默认绑定模式与 IP 段配置
 - `common.alistAuthHeaders`
 - `download.address`
-- `download.auth.*`：`signCheck` / `hashCheck` / `workerCheck` / `additionCheck` / `additionExpireTimeCheck` / `ipv4Only`
+- `download.auth.ipv4Only`：IPv4-only 开关
 - `download.overrideCacheControl` / `download.cacheOverrideTime` / `download.cacheOverrideMaxSize`
 - `download.db.mode` 仅支持 `""` 或 `custom-pg-rest`
 - `download.db.*`：PostgREST 地址、校验 header/secret、缓存表/last-active 表、TTL/idle 等
@@ -77,25 +78,21 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 2. **Controller 决策**
    - 从 `decision.download.pathAction` 读取动作：
      - `block`：直接 403
-     - `skip-sign` / `skip-hash` / `skip-worker`
-     - `skip-addition` / `skip-addition-expiretime`
      - `skip-origin`
      - `asis`：不做动作覆盖
-   - `skip-addition*` 仅在未启用 origin 绑定时生效；若 `checkOriginMode` 非空，`additionalInfo` 必须存在。
 
 3. **CF Rate Limiter（可选）**
    - `ENABLE_CF_RATELIMITER=true` 时调用 `env[CF_RATELIMITER_BINDING].limit()`；失败 fail-open。
 
-4. **签名与 additionalInfo 校验**
-   - `sign` / `hashSign` / `workerSign` 使用 `common.tokenHmacKey` 校验。
-   - `additionalInfo` / `additionalInfoSign`：解码 Base64url → JSON。
-   - 校验 `pathHash` 与当前路径一致；校验 `expireTime`（若启用）。
+4. **payload/payloadSign 校验**
+   - 校验 `payloadSign`（HMAC + expire）。
+   - 解码 `payload`，读取 `expireTime`，取 `payloadSign.expire` 与 `payload.expireTime` 的最短生效期。
    - 读取 `idle_timeout`，作为 idle 超时的动态覆盖值。
 
-5. **Origin 绑定**
-   - 解析 `additionalInfo.encrypt`（AES-256-GCM）得到 origin snapshot。
-   - 校验 `issuer` 是否在 `common.landingWorkerAddresses`。
-   - 按 `decision.download.checkOriginMode` 校验 ip/iprange/Geo/ASN（`iprange` 使用 `ipv4Suffix`/`ipv6Suffix` 计算）。
+5. **bindingStr 校验**
+   - 解密 `payload.encrypt`（AES-256-GCM）得到 `{ issuer, workerAddress }`。
+   - 校验 `issuer` 是否在 `common.landingWorkerAddresses` 内，且 `workerAddress` 与当前 `request.url.origin` 一致。
+   - 按 `decision.download.checkOriginMode` 重算 `bindingStr`（ip/iprange/Geo/ASN/TLS/path）并比对。
 
 6. **本地速率缓存**
    - 若本机记录了当前 IP 子网的 block 窗口，直接返回 429。
@@ -121,8 +118,8 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 11. **上游请求与响应封装**
     - 支持 3xx 重定向与 401/410 触发的 refresh（`refresh=true`）重试一次。
     - 只保留安全的响应头（Content-Type/Disposition/Length/Range 等）。
-    - `additionalInfo.isCrypted=true` 时强制设置附件名为 `*.enc`。
-    - 按 `download.overrideCacheControl` 与 `additionalInfo.filesize` 覆盖 Cache-Control。
+    - `payload.isCrypted=true` 时强制设置附件名为 `*.enc`。
+    - 按 `download.overrideCacheControl` 与 `payload.filesize` 覆盖 Cache-Control。
     - 统一附加下载 CORS 头。
 
 12. **Last Active 更新与清理**
@@ -145,4 +142,4 @@ Fair Queue 相关表与函数由 `slot-handler` 使用（`download_register_fq_w
 
 - 业务策略**只能**来自控制面；本仓库不再支持通过环境变量设置策略。
 - 缓存/限流/Throttle 仅支持 `custom-pg-rest` 模式；D1 仅用于 bootstrap 缓存。
-- `skip-addition` / `skip-addition-expiretime` 不会绕过 origin 绑定需求。
+- `skip-origin` 仅跳过 bindingStr 校验，仍需通过 payloadSign 与 issuer/workerAddress 校验。

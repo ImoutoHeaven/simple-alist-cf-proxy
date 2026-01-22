@@ -4,8 +4,8 @@ simple-alist-cf-proxy 是 AList 下载体系里的 Cloudflare Worker 下载代�
 
 ## 主要能力
 
-- 多重签名校验：`sign` / `hashSign` / `workerSign` / `additionalInfoSign`
-- Origin 绑定：解密 `additionalInfo.encrypt`，并按 controller 决策校验 ip/iprange/Geo/ASN
+- `payload` / `payloadSign` 校验（HMAC + expire）
+- Origin 绑定：解密 `payload.encrypt` 并重算 `bindingStr`（ip/iprange/Geo/ASN/TLS/path）
 - PostgREST 模式缓存与限流：`download_unified_check` 一次 RTT 统一检查
 - Throttle 保护与 Fair Queue：针对指定 hostname 限速与公平排队
 - 可选 Cloudflare 原生 Rate Limiter
@@ -80,12 +80,13 @@ npm run deploy
 
 控制面是策略唯一来源，核心字段如下（字段名以 controller payload 为准）：
 
-- `common.tokenHmacKey`：HMAC 校验与 origin snapshot 加解密密钥（必填）
+- `common.tokenHmacKey`：`payloadSign`/`bindingStr` HMAC 与 `payload.encrypt` 加解密密钥（必填）
 - `common.workerAddresses`：允许的 download worker 域名列表（需包含当前 Worker 的 origin）
 - `common.landingWorkerAddresses`：允许的 landing worker 域名列表（用于 issuer 校验）
+- `common.binding`：bindingStr 版本与默认绑定模式（ip/iprange/geo/asn/tls/path）
 - `common.alistAuthHeaders`：透传到 AList `/api/fs/link` 的额外 header
 - `download.address`：AList 基地址（必填）
-- `download.auth.*`：签名/附加信息检查与 IPv4-only 开关
+- `download.auth.ipv4Only`：IPv4-only 开关
 - `download.overrideCacheControl` + `download.cacheOverrideTime` + `download.cacheOverrideMaxSize`：小文件缓存覆盖
 - `download.db.mode=custom-pg-rest` 时：
   - `download.db.postgrestUrl`
@@ -95,14 +96,14 @@ npm run deploy
   - `download.db.rateLimit.*`（`windowSeconds` / `limit` / `blockSeconds` / `pgErrorHandle` 等）
 - `download.throttleProfiles` + `decision.download.throttleProfile`：上游错误保护策略
 - `download.fairQueue.*` + `decision.download.fairQueueProfile`：公平排队开关与等待策略
-- `decision.download.pathAction` / `decision.download.checkOriginMode`：单路径策略与 origin 绑定字段
+- `decision.download.pathAction` / `decision.download.checkOriginMode`：单路径策略与 bindingStr 绑定字段
 
 ## 请求流程概要
 
 - 校验 `/api/v0/*` 内部控制 API（Bearer token）与可选 `INNER_AUTH_*` 入口鉴权
 - 从控制面拉取 bootstrap/decision，解析为运行配置
 - 依据 `decision.pathAction` 执行阻断或跳过某些校验
-- 校验签名与 `additionalInfo`，必要时解密 origin snapshot 并校验客户端绑定
+- 校验 `payloadSign` 与 `payload.expireTime`，解密 `payload.encrypt` 并重算 `bindingStr`
 - 可选 CF Rate Limiter；可选 PostgREST 限流/缓存/Throttle（统一检查）
 - 访问 AList `/api/fs/link` 获取真实下载链接（带鉴权 header）
 - 可选 Fair Queue（slot-handler）获取 slot
@@ -120,18 +121,18 @@ npm run deploy
 
 下载 URL 需要包含：
 
-- `sign`：`HMAC-SHA256(path, expire)`
-- `hashSign`：`HMAC-SHA256(base64(path), expire)`
-- `workerSign`：`HMAC-SHA256(JSON.stringify({ path, worker_addr }), expire)`
-- `additionalInfo`（Base64url JSON）与 `additionalInfoSign`
+- `payload`：Base64Url(JSON)
+- `payloadSign`：`HMAC-SHA256(payload, expire):expire`（expire 来自 landing `?sign`）
 
-`additionalInfo` 常见字段：
+`payload` 常见字段：
 
-- `pathHash`：`sha256(path)`
-- `expireTime`：秒级过期时间
+- `v`：payload 版本（当前为 1）
+- `expireTime`：秒级过期时间（与 `payloadSign.expire` 取最短生效）
 - `filesize`：用于缓存覆盖判断
 - `idle_timeout`：空闲超时覆盖值（秒）
-- `encrypt`：AES-256-GCM 加密的 origin snapshot（含 issuer）
+- `encrypt`：AES-256-GCM 加密的 issuer/workerAddress（v2）
+- `bindingStr`：origin 绑定 HMAC 串
+- `bindingVer`：bindingStr 版本
 - `isCrypted`：加密下载标记（影响 Content-Disposition）
 
 ## 相关文档

@@ -1,7 +1,17 @@
-import { calculateIPSubnet } from './utils.js';
+import { calculateIPSubnet, sha256Hash } from './utils.js';
 
 const BASE64_CHARS = { '+': '-', '/': '_', '=': '' };
-const VALID_ORIGIN_MODES = new Set(['ip', 'iprange', 'continent', 'country', 'region', 'city', 'asn']);
+const VALID_ORIGIN_MODES = new Set([
+  'ip',
+  'iprange',
+  'continent',
+  'country',
+  'region',
+  'city',
+  'asn',
+  'tls',
+  'path',
+]);
 
 const base64UrlEncode = (bytes) => {
   if (!(bytes instanceof Uint8Array)) {
@@ -40,6 +50,7 @@ const base64UrlDecode = (value) => {
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+const hmacKeyCache = new Map();
 
 const normalizeHeaderValue = (headers, name) => {
   if (!headers) return null;
@@ -69,100 +80,86 @@ export const getClientIp = (request) => {
   return ip || null;
 };
 
-export const buildOriginSnapshot = (cf, ip) => {
-  if (!ip || typeof ip !== 'string' || !ip.trim()) {
+export const normalizePath = (pathname) => {
+  if (typeof pathname !== 'string') {
     return null;
   }
-  const safeCf = cf && typeof cf === 'object' ? cf : {};
-  const snapshot = {
-    ver: 1,
-    ip_addr: ip.trim(),
-  };
-  if (typeof safeCf.country === 'string' && safeCf.country) {
-    snapshot.country = safeCf.country;
-  }
-  if (typeof safeCf.continent === 'string' && safeCf.continent) {
-    snapshot.continent = safeCf.continent;
-  }
-  if (typeof safeCf.region === 'string' && safeCf.region) {
-    snapshot.region = safeCf.region;
-  }
-  if (typeof safeCf.city === 'string' && safeCf.city) {
-    snapshot.city = safeCf.city;
-  }
-  if (typeof safeCf.asn !== 'undefined' && safeCf.asn !== null) {
-    snapshot.asn = String(safeCf.asn);
-  }
-  return snapshot;
-};
-
-export const deriveAesKeyFromToken = async (token) => {
-  if (typeof token !== 'string' || !token) {
-    throw new Error('token secret is required for origin encryption');
-  }
-  const material = textEncoder.encode(`aes:${token}`);
-  const hash = await crypto.subtle.digest('SHA-256', material);
-  return crypto.subtle.importKey(
-    'raw',
-    hash,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt', 'decrypt']
-  );
-};
-
-export const encryptOriginSnapshot = async (snapshot, token) => {
-  if (!snapshot || typeof snapshot !== 'object') {
-    throw new Error('snapshot is required');
-  }
-  const aesKey = await deriveAesKeyFromToken(token);
-  const iv = new Uint8Array(12);
-  crypto.getRandomValues(iv);
-  const plaintext = textEncoder.encode(JSON.stringify(snapshot));
-  const cipherBuffer = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, plaintext);
-  const cipherBytes = new Uint8Array(cipherBuffer);
-  const payload = {
-    v: 1,
-    iv: base64UrlEncode(iv),
-    ct: base64UrlEncode(cipherBytes),
-  };
-  return base64UrlEncode(textEncoder.encode(JSON.stringify(payload)));
-};
-
-export const decryptOriginSnapshot = async (encryptValue, token) => {
-  if (typeof encryptValue !== 'string' || encryptValue.length === 0) {
-    return null;
-  }
-  const payloadBytes = base64UrlDecode(encryptValue);
-  if (!payloadBytes) {
-    return null;
-  }
-  let payload;
+  let decoded;
   try {
-    payload = JSON.parse(textDecoder.decode(payloadBytes));
-  } catch (_error) {
+    decoded = decodeURIComponent(pathname);
+  } catch {
     return null;
   }
-  if (!payload || payload.v !== 1 || typeof payload.iv !== 'string' || typeof payload.ct !== 'string') {
+  if (decoded.length === 0) {
+    return '/';
+  }
+  return decoded.startsWith('/') ? decoded : `/${decoded}`;
+};
+
+const normalizeRegionValue = (mode, value) => {
+  if (typeof value !== 'string' && typeof value !== 'number') {
     return null;
   }
-  const ivBytes = base64UrlDecode(payload.iv);
-  const cipherBytes = base64UrlDecode(payload.ct);
-  if (!ivBytes || ivBytes.length !== 12 || !cipherBytes || cipherBytes.length === 0) {
+  const str = String(value).trim();
+  if (!str) {
     return null;
   }
-  try {
-    const aesKey = await deriveAesKeyFromToken(token);
-    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, aesKey, cipherBytes);
-    const decoded = textDecoder.decode(new Uint8Array(plaintext));
-    const snapshot = JSON.parse(decoded);
-    if (!snapshot || snapshot.ver !== 1 || typeof snapshot.ip_addr !== 'string') {
-      return null;
-    }
-    return snapshot;
-  } catch (_error) {
+  if (mode === 'country' || mode === 'continent') {
+    return str.toUpperCase();
+  }
+  return str.toLowerCase();
+};
+
+const normalizeAsnValue = (value) => {
+  if (value === undefined || value === null) {
     return null;
   }
+  const str = String(value).trim();
+  return str ? str : null;
+};
+
+const normalizeBindingConfig = (bindingConfig) => {
+  const cfg = bindingConfig && typeof bindingConfig === 'object' ? bindingConfig : {};
+  const version = Number.isFinite(cfg.version) && cfg.version > 0 ? Math.trunc(cfg.version) : 1;
+  const ipv4Suffix = typeof cfg.ipv4Suffix === 'string' && cfg.ipv4Suffix.trim()
+    ? cfg.ipv4Suffix.trim()
+    : '/32';
+  const ipv6Suffix = typeof cfg.ipv6Suffix === 'string' && cfg.ipv6Suffix.trim()
+    ? cfg.ipv6Suffix.trim()
+    : '/60';
+  const bindTls = cfg.bindTls !== false;
+  return {
+    version,
+    ipv4Suffix,
+    ipv6Suffix,
+    bindTls,
+  };
+};
+
+const getHmacKey = (secret) => {
+  const key = typeof secret === 'string' ? secret : '';
+  if (!key) {
+    return Promise.reject(new Error('HMAC secret missing'));
+  }
+  if (!hmacKeyCache.has(key)) {
+    hmacKeyCache.set(
+      key,
+      crypto.subtle.importKey(
+        'raw',
+        textEncoder.encode(key),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+      )
+    );
+  }
+  return hmacKeyCache.get(key);
+};
+
+const hmacSha256 = async (secret, data) => {
+  const key = await getHmacKey(secret);
+  const buf = await crypto.subtle.sign('HMAC', key, textEncoder.encode(data));
+  return new Uint8Array(buf);
 };
 
 export const parseCheckOriginEnv = (rawValue) => {
@@ -188,70 +185,212 @@ export const parseCheckOriginEnv = (rawValue) => {
   return modes;
 };
 
-const normalizeRegionValue = (mode, value) => {
-  if (typeof value !== 'string' && typeof value !== 'number') {
-    return null;
-  }
-  const str = String(value).trim();
-  if (!str) {
-    return null;
-  }
-  if (mode === 'country' || mode === 'continent') {
-    return str.toUpperCase();
-  }
-  return str.toLowerCase();
-};
+export const buildBindingStr = async ({
+  modes,
+  path,
+  cf,
+  clientIP,
+  bindingConfig,
+  token,
+}) => {
+  const modeList = Array.isArray(modes) ? modes : [];
+  const modeSet = new Set(modeList);
+  const cfg = normalizeBindingConfig(bindingConfig);
+  const fail = (reason) => ({ ok: false, reason });
 
-export const checkOriginMatch = (snapshot, current, modes, options = {}) => {
-  if (!Array.isArray(modes) || modes.length === 0) {
-    return { ok: true, failedFields: [] };
+  if (typeof token !== 'string' || !token) {
+    return fail('binding token missing');
   }
-  const failedFields = [];
-  const ipv4Suffix = typeof options.ipv4Suffix === 'string' ? options.ipv4Suffix : '/32';
-  const ipv6Suffix = typeof options.ipv6Suffix === 'string' ? options.ipv6Suffix : '/60';
-  const currentIp = current?.ip_addr || null;
-  const snapshotIp = snapshot?.ip_addr || null;
 
-  for (const mode of modes) {
-    switch (mode) {
-      case 'ip': {
-        if (!snapshotIp || !currentIp || snapshotIp !== currentIp) {
-          failedFields.push('ip');
-        }
-        break;
-      }
-      case 'iprange': {
-        if (!snapshotIp || !currentIp) {
-          failedFields.push('iprange');
-          break;
-        }
-        const sRange = calculateIPSubnet(snapshotIp, ipv4Suffix, ipv6Suffix);
-        const cRange = calculateIPSubnet(currentIp, ipv4Suffix, ipv6Suffix);
-        if (!sRange || !cRange || sRange !== cRange) {
-          failedFields.push('iprange');
-        }
-        break;
-      }
-      case 'continent':
-      case 'country':
-      case 'region':
-      case 'city':
-      case 'asn': {
-        const left = normalizeRegionValue(mode, snapshot?.[mode]);
-        const right = normalizeRegionValue(mode, current?.[mode]);
-        if (!left || !right || left !== right) {
-          failedFields.push(mode);
-        }
-        break;
-      }
-      default:
-        // Unknown modes are ignored (already warned during parsing)
-        break;
+  let pathHash = 'any';
+  if (modeSet.has('path')) {
+    const normalizedPath = normalizePath(path);
+    if (!normalizedPath) {
+      return fail('binding path missing');
+    }
+    pathHash = await sha256Hash(normalizedPath);
+    if (!pathHash) {
+      return fail('binding path hash missing');
     }
   }
 
-  return {
-    ok: failedFields.length === 0,
-    failedFields,
+  const ipValue = typeof clientIP === 'string' ? clientIP.trim() : '';
+  let ipScope = 'any';
+  if (modeSet.has('ip')) {
+    if (!ipValue) {
+      return fail('binding ip missing');
+    }
+    ipScope = ipValue;
+  } else if (modeSet.has('iprange')) {
+    if (!ipValue) {
+      return fail('binding ip missing');
+    }
+    const subnet = calculateIPSubnet(ipValue, cfg.ipv4Suffix, cfg.ipv6Suffix);
+    if (!subnet) {
+      return fail('binding iprange missing');
+    }
+    ipScope = subnet;
+  }
+
+  const safeCf = cf && typeof cf === 'object' ? cf : {};
+
+  let country = 'any';
+  if (modeSet.has('country')) {
+    country = normalizeRegionValue('country', safeCf.country);
+    if (!country) {
+      return fail('binding country missing');
+    }
+  }
+
+  let continent = 'any';
+  if (modeSet.has('continent')) {
+    continent = normalizeRegionValue('continent', safeCf.continent);
+    if (!continent) {
+      return fail('binding continent missing');
+    }
+  }
+
+  let region = 'any';
+  if (modeSet.has('region')) {
+    region = normalizeRegionValue('region', safeCf.region);
+    if (!region) {
+      return fail('binding region missing');
+    }
+  }
+
+  let city = 'any';
+  if (modeSet.has('city')) {
+    city = normalizeRegionValue('city', safeCf.city);
+    if (!city) {
+      return fail('binding city missing');
+    }
+  }
+
+  let asn = 'any';
+  if (modeSet.has('asn')) {
+    asn = normalizeAsnValue(safeCf.asn);
+    if (!asn) {
+      return fail('binding asn missing');
+    }
+  }
+
+  let tlsHash = 'any';
+  const wantsTls = modeSet.has('tls') && cfg.bindTls;
+  if (wantsTls) {
+    const tlsExtensions = typeof safeCf.tlsClientExtensionsSha1 === 'string'
+      ? safeCf.tlsClientExtensionsSha1.trim()
+      : '';
+    const tlsCiphers = typeof safeCf.tlsClientCiphersSha1 === 'string'
+      ? safeCf.tlsClientCiphersSha1.trim()
+      : '';
+    if (!tlsExtensions || !tlsCiphers) {
+      return fail('binding tls missing');
+    }
+    tlsHash = await sha256Hash(`${tlsExtensions}|${tlsCiphers}`);
+    if (!tlsHash) {
+      return fail('binding tls hash missing');
+    }
+  }
+
+  const canonical = [
+    `v${cfg.version}`,
+    pathHash || 'any',
+    ipScope || 'any',
+    country || 'any',
+    continent || 'any',
+    region || 'any',
+    city || 'any',
+    asn || 'any',
+    tlsHash || 'any',
+  ].join('|');
+
+  try {
+    const macBytes = await hmacSha256(token, canonical);
+    const bindingStr = base64UrlEncode(macBytes).replace(/=+$/u, '');
+    return { ok: true, bindingStr };
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : 'binding hmac failed');
+  }
+};
+
+export const deriveAesKeyFromToken = async (token) => {
+  if (typeof token !== 'string' || !token) {
+    throw new Error('token secret is required for origin encryption');
+  }
+  const material = textEncoder.encode(`aes:${token}`);
+  const hash = await crypto.subtle.digest('SHA-256', material);
+  return crypto.subtle.importKey(
+    'raw',
+    hash,
+    { name: 'AES-GCM' },
+    false,
+    ['encrypt', 'decrypt']
+  );
+};
+
+const encryptPayload = async (payload, token) => {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('payload is required');
+  }
+  const aesKey = await deriveAesKeyFromToken(token);
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  const plaintext = textEncoder.encode(JSON.stringify(payload));
+  const cipherBuffer = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, plaintext);
+  const cipherBytes = new Uint8Array(cipherBuffer);
+  const envelope = {
+    v: 2,
+    iv: base64UrlEncode(iv),
+    ct: base64UrlEncode(cipherBytes),
   };
+  return base64UrlEncode(textEncoder.encode(JSON.stringify(envelope)));
+};
+
+const decryptPayload = async (encryptValue, token) => {
+  if (typeof encryptValue !== 'string' || encryptValue.length === 0) {
+    return null;
+  }
+  const payloadBytes = base64UrlDecode(encryptValue);
+  if (!payloadBytes) {
+    return null;
+  }
+  let envelope;
+  try {
+    envelope = JSON.parse(textDecoder.decode(payloadBytes));
+  } catch (_error) {
+    return null;
+  }
+  if (!envelope || (envelope.v !== 1 && envelope.v !== 2)) {
+    return null;
+  }
+  if (typeof envelope.iv !== 'string' || typeof envelope.ct !== 'string') {
+    return null;
+  }
+  const ivBytes = base64UrlDecode(envelope.iv);
+  const cipherBytes = base64UrlDecode(envelope.ct);
+  if (!ivBytes || ivBytes.length !== 12 || !cipherBytes || cipherBytes.length === 0) {
+    return null;
+  }
+  try {
+    const aesKey = await deriveAesKeyFromToken(token);
+    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, aesKey, cipherBytes);
+    const decoded = textDecoder.decode(new Uint8Array(plaintext));
+    const payload = JSON.parse(decoded);
+    if (!payload || typeof payload !== 'object') {
+      return null;
+    }
+    return payload;
+  } catch (_error) {
+    return null;
+  }
+};
+
+export const encryptBindingPayload = async (payload, token) => encryptPayload(payload, token);
+
+export const decryptBindingPayload = async (encryptValue, token) => {
+  const payload = await decryptPayload(encryptValue, token);
+  if (!payload || payload.v !== 2) {
+    return null;
+  }
+  return payload;
 };

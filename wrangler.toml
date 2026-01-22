@@ -12,7 +12,7 @@ compatibility_date = "2024-01-01"
 # - INTERNAL_API_TOKEN（控制 API）
 # - INNER_AUTH_HEADER / INNER_AUTH_SECRET（入口内网鉴权，可选）
 # - ENABLE_CF_RATELIMITER / CF_RATELIMITER_BINDING（如需启用 CF 原生限流，请同时配置 [[rate_limit]] 绑定）
-# 策略/签名/IPv4 限制等全部由 controller.common / download.auth 下发，勿在 wrangler 配置策略类 env。
+# 策略/绑定/IPv4 限制等全部由 controller.common / download.* 下发，勿在 wrangler 配置策略类 env。
 #
 # For local development (.dev.vars 示例，注意 TOML 语法需要双引号包裹字符串):
 # ENV="staging"

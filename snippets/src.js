@@ -1,20 +1,17 @@
 // Cloudflare Snippet: pre-auth + cache lookup for download
-// Set HMAC_SECRET in CONFIG to common.tokenHmacKey (and keep common.signSecret aligned).
-// Leave HMAC_SECRET empty to skip all signature checks.
+// Set HMAC_SECRET in CONFIG to common.tokenHmacKey.
+// Leave HMAC_SECRET empty to skip payloadSign verification.
 
 const DEFAULTS = {
-  additionalInfoCheck: true,
-  additionExpireTimeCheck: true,
-  hashCheck: true,
-  signCheck: true,
-  workerCheck: true,
+  payloadSignCheck: true,
+  payloadExpireTimeCheck: true,
 };
 
 const CONFIG = [
   // Example:
-  // { pattern: "alist-download-*.example.com/*", config: { HMAC_SECRET: "replace-with-common-tokenHmacKey", additionalInfoCheck: true, additionExpireTimeCheck: true, hashCheck: true, signCheck: true, workerCheck: true } },
-  // { pattern: "alist-download-*.example.com/**", config: { HMAC_SECRET: "replace-with-common-tokenHmacKey", additionalInfoCheck: true, additionExpireTimeCheck: true, hashCheck: true, signCheck: true, workerCheck: true } },
-  // { pattern: "alist-download-*.example.com", config: { HMAC_SECRET: "replace-with-common-tokenHmacKey", additionalInfoCheck: true, additionExpireTimeCheck: true, hashCheck: true, signCheck: true, workerCheck: true } },
+  // { pattern: "alist-download-*.example.com/*", config: { HMAC_SECRET: "replace-with-common-tokenHmacKey", payloadSignCheck: true, payloadExpireTimeCheck: true } },
+  // { pattern: "alist-download-*.example.com/**", config: { HMAC_SECRET: "replace-with-common-tokenHmacKey", payloadSignCheck: true, payloadExpireTimeCheck: true } },
+  // { pattern: "alist-download-*.example.com", config: { HMAC_SECRET: "replace-with-common-tokenHmacKey", payloadSignCheck: true, payloadExpireTimeCheck: true } },
 ];
 
 const splitPattern = (pattern) => {
@@ -132,13 +129,6 @@ const getHmacKey = (secret) => {
 const base64UrlEncode = (bytes) =>
   btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_");
 
-const base64EncodeUtf8 = (text) => {
-  const bytes = encoder.encode(text);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary);
-};
-
 const base64UrlDecodeToString = (value) => {
   if (typeof value !== "string" || !value) return null;
   let normalized = value.replace(/-/g, "+").replace(/_/g, "/");
@@ -185,7 +175,7 @@ const hmacSha256Sign = async (secret, data, expire) => {
   return `${base64UrlEncode(new Uint8Array(buf))}:${expire}`;
 };
 
-const readAdditionalExpireTime = (payload) => {
+const readPayloadExpireTime = (payload) => {
   if (!payload || typeof payload !== "object") return null;
   const raw = payload.expireTime;
   if (typeof raw === "number" && Number.isFinite(raw)) return Math.trunc(raw);
@@ -214,106 +204,50 @@ export default {
     const config = selected && typeof selected === "object" ? { ...DEFAULTS, ...selected } : { ...DEFAULTS };
     const secret = typeof config.HMAC_SECRET === "string" ? config.HMAC_SECRET : "";
     const hasSecret = secret.length > 0;
-    const additionalInfoCheck = hasSecret && config.additionalInfoCheck !== false;
-    const additionExpireTimeCheck = hasSecret && config.additionExpireTimeCheck !== false;
-    const hashCheck = hasSecret && config.hashCheck !== false;
-    const signCheck = hasSecret && config.signCheck !== false;
-    const workerCheck = hasSecret && config.workerCheck !== false;
+    const payloadSignCheck = hasSecret && config.payloadSignCheck !== false;
+    const payloadExpireTimeCheck = hasSecret && config.payloadExpireTimeCheck !== false;
 
     const nowSeconds = Math.floor(Date.now() / 1000);
 
-    let sign = "";
-    let signMeta = null;
-    let hashSign = "";
-    let workerSign = "";
-    let additionalInfo = "";
-    let additionalInfoSign = "";
+    const payload = url.searchParams.get("payload") || "";
+    const payloadSign = url.searchParams.get("payloadSign") || "";
+    let payloadMeta = null;
 
-    let hashMeta = null;
-    let workerMeta = null;
-    let additionalMeta = null;
-
-    if (signCheck) {
-      sign = url.searchParams.get("sign") || "";
-      signMeta = parseSignature(sign);
-      if (!signMeta) return unauthorized("sign invalid");
-      if (isExpired(signMeta.expire, nowSeconds)) return unauthorized("sign expired");
-    }
-
-    if (hashCheck) {
-      hashSign = url.searchParams.get("hashSign") || "";
-      hashMeta = parseSignature(hashSign);
-      if (!hashMeta) return unauthorized("hashSign invalid");
-      if (isExpired(hashMeta.expire, nowSeconds)) return unauthorized("hashSign expired");
-    }
-
-    if (workerCheck) {
-      workerSign = url.searchParams.get("workerSign") || "";
-      workerMeta = parseSignature(workerSign);
-      if (!workerMeta) return unauthorized("workerSign invalid");
-      if (isExpired(workerMeta.expire, nowSeconds)) return unauthorized("workerSign expired");
-    }
-
-    if (additionalInfoCheck) {
-      additionalInfo = url.searchParams.get("additionalInfo") || "";
-      additionalInfoSign = url.searchParams.get("additionalInfoSign") || "";
-      if (!additionalInfo) return unauthorized("additionalInfo missing");
-      if (!additionalInfoSign) return unauthorized("additionalInfoSign missing");
-      additionalMeta = parseSignature(additionalInfoSign);
-      if (!additionalMeta) return unauthorized("additionalInfoSign invalid");
-      if (isExpired(additionalMeta.expire, nowSeconds)) return unauthorized("additionalInfoSign expired");
+    if (payloadSignCheck) {
+      if (!payload) return unauthorized("payload missing");
+      if (!payloadSign) return unauthorized("payloadSign missing");
+      payloadMeta = parseSignature(payloadSign);
+      if (!payloadMeta) return unauthorized("payloadSign invalid");
+      if (isExpired(payloadMeta.expire, nowSeconds)) return unauthorized("payloadSign expired");
     }
 
     const tasks = [];
-    if (signCheck && signMeta) {
+    if (payloadSignCheck && payloadMeta) {
       tasks.push(
-        hmacSha256Sign(secret, path, signMeta.expire).then((expected) => ({ label: "sign", expected }))
-      );
-    }
-    if (hashCheck && hashMeta) {
-      const base64Path = base64EncodeUtf8(path);
-      tasks.push(
-        hmacSha256Sign(secret, base64Path, hashMeta.expire).then((expected) => ({ label: "hashSign", expected }))
-      );
-    }
-    if (workerCheck && workerMeta) {
-      const workerAddr = url.origin;
-      const workerVerifyData = JSON.stringify({ path, worker_addr: workerAddr });
-      tasks.push(
-        hmacSha256Sign(secret, workerVerifyData, workerMeta.expire).then((expected) => ({ label: "workerSign", expected }))
-      );
-    }
-    if (additionalInfoCheck && additionalMeta) {
-      tasks.push(
-        hmacSha256Sign(secret, additionalInfo, additionalMeta.expire).then((expected) => ({
-          label: "additionalInfoSign",
-          expected,
-        }))
+        hmacSha256Sign(secret, payload, payloadMeta.expire).then((expected) => ({ label: "payloadSign", expected }))
       );
     }
 
     const results = await Promise.all(tasks);
     for (const item of results) {
-      if (item.label === "sign" && item.expected !== sign) return unauthorized("sign mismatch");
-      if (item.label === "hashSign" && item.expected !== hashSign) return unauthorized("hashSign mismatch");
-      if (item.label === "workerSign" && item.expected !== workerSign) return unauthorized("workerSign mismatch");
-      if (item.label === "additionalInfoSign" && item.expected !== additionalInfoSign) {
-        return unauthorized("additionalInfoSign mismatch");
+      if (item.label === "payloadSign" && item.expected !== payloadSign) {
+        return unauthorized("payloadSign mismatch");
       }
     }
 
-    if (additionalInfoCheck && additionExpireTimeCheck && additionalMeta) {
-      const decodedAdditional = base64UrlDecodeToString(additionalInfo);
-      if (!decodedAdditional) return new Response("additionalInfo decode failed", { status: 400 });
-      let additionalPayload;
+    if (payloadExpireTimeCheck) {
+      if (!payload) return unauthorized("payload missing");
+      const decodedPayload = base64UrlDecodeToString(payload);
+      if (!decodedPayload) return new Response("payload decode failed", { status: 400 });
+      let payloadData;
       try {
-        additionalPayload = JSON.parse(decodedAdditional);
+        payloadData = JSON.parse(decodedPayload);
       } catch {
-        return new Response("additionalInfo invalid", { status: 400 });
+        return new Response("payload invalid", { status: 400 });
       }
-      const expireTimestamp = readAdditionalExpireTime(additionalPayload);
+      const expireTimestamp = readPayloadExpireTime(payloadData);
       if (!Number.isFinite(expireTimestamp) || expireTimestamp <= 0) {
-        return new Response("additionalInfo expire invalid", { status: 400 });
+        return new Response("payload expire invalid", { status: 400 });
       }
       if (nowSeconds > expireTimestamp) return unauthorized("link expired");
     }

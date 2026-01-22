@@ -5,13 +5,13 @@ import { createRateLimiter } from './ratelimit/factory.js';
 import { unifiedCheck } from './unified-check.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
 import { parseBoolean, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
-import { checkOriginMatch, decryptOriginSnapshot, getClientIp, parseCheckOriginEnv } from './origin-binding.js';
+import { buildBindingStr, decryptBindingPayload, getClientIp, normalizePath, parseCheckOriginEnv } from './origin-binding.js';
 import { handleInternalApiIfAny } from './internal-api.js';
 import { fetchControllerState } from './controller-adapter.js';
 
 // Configuration constants
 const REQUIRED_ENV = [];
-const VALID_ACTIONS = new Set(['block', 'skip-sign', 'skip-hash', 'skip-worker', 'skip-addition', 'skip-addition-expiretime', 'skip-origin', 'asis']);
+const VALID_ACTIONS = new Set(['block', 'skip-origin', 'asis']);
 const DEFAULT_LINK_TTL_SECONDS = 1800;
 const DEFAULT_CLEANUP_PERCENTAGE = 1;
 const DEFAULT_RATE_LIMIT_BLOCK_SECONDS = 600;
@@ -121,7 +121,7 @@ const parseCacheOverrideMaxSizeBytes = (value) => {
   return Math.max(1, Math.round(bytes));
 };
 
-const readAdditionalFileSize = (payload) => {
+const readPayloadFileSize = (payload) => {
   if (!payload || typeof payload !== 'object') {
     return null;
   }
@@ -132,6 +132,23 @@ const readAdditionalFileSize = (payload) => {
   if (typeof raw === 'string') {
     const parsed = Number.parseFloat(raw);
     if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return null;
+};
+
+const readPayloadExpireTime = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+  const raw = payload.expireTime;
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return Math.trunc(raw);
+  }
+  if (typeof raw === 'string') {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed)) {
       return parsed;
     }
   }
@@ -412,7 +429,24 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   if (!token) {
     throw new Error('controller common.tokenHmacKey is required');
   }
-  const signSecretFromController = normalizeString(commonBootstrap.signSecret) || token;
+  const bindingBootstrap = commonBootstrap.binding && typeof commonBootstrap.binding === 'object'
+    ? commonBootstrap.binding
+    : {};
+  const bindingDefaultModesRaw = typeof bindingBootstrap.defaultModes === 'string'
+    ? bindingBootstrap.defaultModes.trim()
+    : '';
+  const bindingDefaultModes = Object.prototype.hasOwnProperty.call(bindingBootstrap, 'defaultModes')
+    ? bindingDefaultModesRaw
+    : 'asn,iprange';
+  const bindingVersionRaw = Number(bindingBootstrap.version);
+  const bindingVersion = Number.isFinite(bindingVersionRaw) && bindingVersionRaw > 0
+    ? Math.trunc(bindingVersionRaw)
+    : 1;
+  const bindingIpv4Suffix = normalizeString(bindingBootstrap.ipv4Suffix, '/32') || '/32';
+  const bindingIpv6Suffix = normalizeString(bindingBootstrap.ipv6Suffix, '/60') || '/60';
+  const bindingBindTls = Object.prototype.hasOwnProperty.call(bindingBootstrap, 'bindTls')
+    ? bindingBootstrap.bindTls !== false
+    : true;
   const workerAddresses = normalizeOriginList(commonBootstrap.workerAddresses);
   if (workerAddresses.length === 0) {
     throw new Error('controller common.workerAddresses is required');
@@ -431,13 +465,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   const authConfig = downloadBootstrap.auth && typeof downloadBootstrap.auth === 'object'
     ? downloadBootstrap.auth
     : {};
-  const authSignSecret = normalizeString(authConfig.signSecret);
-  const signSecret = authSignSecret || signSecretFromController;
-  const signCheck = authConfig.signCheck !== false;
-  const hashCheck = authConfig.hashCheck !== false;
-  const workerCheck = authConfig.workerCheck !== false;
-  const additionCheck = authConfig.additionCheck !== false;
-  const additionExpireTimeCheck = authConfig.additionExpireTimeCheck !== false;
   const ipv4Only = authConfig.ipv4Only !== false;
 
   const overrideCacheControlRaw = downloadBootstrap.overrideCacheControl ?? downloadBootstrap['override-cache-control'];
@@ -673,17 +700,18 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   return {
     address,
     token,
+    binding: {
+      version: bindingVersion,
+      defaultModes: bindingDefaultModes,
+      ipv4Suffix: bindingIpv4Suffix,
+      ipv6Suffix: bindingIpv6Suffix,
+      bindTls: bindingBindTls,
+    },
     workerAddresses,
     landingWorkerAddresses,
     alistAuthHeaders,
     verifyHeader,
     verifySecret,
-    signSecret,
-    signCheck,
-    hashCheck,
-    workerCheck,
-    additionCheck,
-    additionExpireTimeCheck,
     ipv4Only,
     overrideCacheControl,
     cacheOverrideSeconds,
@@ -717,26 +745,18 @@ function isIPv6(ip) {
   return ip && ip.includes(':');
 }
 
-function base64Encode(input) {
-  const bytes = new TextEncoder().encode(input);
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary);
-}
-
-function base64DecodeToString(input) {
+function base64UrlDecodeToString(input) {
   if (!input) {
     return null;
   }
   try {
+    const normalizedInput = String(input).replace(/-/g, '+').replace(/_/g, '/');
     const normalized = (() => {
-      const remainder = input.length % 4;
-      if (remainder === 0) return input;
+      const remainder = normalizedInput.length % 4;
+      if (remainder === 0) return normalizedInput;
       if (remainder === 1) return null;
       const padding = 4 - remainder;
-      return `${input}${'='.repeat(padding)}`;
+      return `${normalizedInput}${'='.repeat(padding)}`;
     })();
     if (normalized === null) {
       return null;
@@ -823,39 +843,22 @@ const normalizeControllerPathActions = (downloadDecision) => {
 };
 
 // Extract origin check modes from controller decision; controller is source of truth.
-const extractControllerOriginModes = (downloadDecision) => {
+const extractControllerOriginModes = (downloadDecision, bindingConfig) => {
   if (!downloadDecision || typeof downloadDecision.checkOriginMode === 'undefined') {
-    return [];
+    return parseCheckOriginEnv(bindingConfig?.defaultModes || '');
   }
   if (typeof downloadDecision.checkOriginMode !== 'string') {
     console.warn('[controller] checkOriginMode is not a string, ignore');
-    return [];
+    return parseCheckOriginEnv(bindingConfig?.defaultModes || '');
   }
-  return parseCheckOriginEnv(downloadDecision.checkOriginMode);
+  const parsed = parseCheckOriginEnv(downloadDecision.checkOriginMode);
+  if (parsed.length > 0) {
+    return parsed;
+  }
+  return parseCheckOriginEnv(bindingConfig?.defaultModes || '');
 };
 
 // src/verify.ts
-const verify = async (label, data, _sign, token) => {
-  if (!_sign) {
-    return `${label} missing`;
-  }
-  const signSlice = _sign.split(":");
-  if (!signSlice[signSlice.length - 1]) {
-    return `${label} expire missing`;
-  }
-  const expire = parseInt(signSlice[signSlice.length - 1]);
-  if (isNaN(expire)) {
-    return `${label} expire invalid`;
-  }
-  if (expire < Date.now() / 1e3 && expire > 0) {
-    return `${label} expired`;
-  }
-  const right = await hmacSha256Sign(data, expire, token);
-  if (_sign !== right) {
-    return `${label} mismatch`;
-  }
-  return "";
-};
 const hmacSha256Sign = async (data, expire, token) => {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -876,16 +879,25 @@ const hmacSha256Sign = async (data, expire, token) => {
 };
 
 const verifySignature = async (secret, data, signature) => {
-  if (!signature) return 'sign missing';
+  if (!signature) return 'payloadSign missing';
   const parts = signature.split(':');
   const expirePart = parts[parts.length - 1];
-  if (!expirePart) return 'expire missing';
+  if (!expirePart) return 'payloadSign expire missing';
   const expire = Number.parseInt(expirePart, 10);
-  if (Number.isNaN(expire)) return 'expire invalid';
-  if (expire < Date.now() / 1e3 && expire > 0) return 'expire expired';
+  if (Number.isNaN(expire)) return 'payloadSign expire invalid';
+  if (expire < Date.now() / 1e3 && expire > 0) return 'payloadSign expired';
   const expected = await hmacSha256Sign(data, expire, secret);
-  if (expected !== signature) return 'sign mismatch';
+  if (expected !== signature) return 'payloadSign mismatch';
   return '';
+};
+
+const extractExpireFromSign = (signature) => {
+  if (!signature) return 0;
+  const parts = signature.split(':');
+  const expirePart = parts[parts.length - 1];
+  if (!expirePart) return 0;
+  const expire = Number.parseInt(expirePart, 10);
+  return Number.isNaN(expire) ? 0 : expire;
 };
 
 function createErrorResponse(origin, status, message, extraHeaders) {
@@ -1288,28 +1300,6 @@ const createSlotHandlerClient = (config) => {
   };
 };
 
-function safeDecodePathname(pathname) {
-  try {
-    return decodeURIComponent(pathname);
-  } catch {
-    return null;
-  }
-}
-
-// Normalizes the request path the same way Landing uses it for hashing.
-function normalizePath(pathname) {
-  if (typeof pathname !== 'string') {
-    return null;
-  }
-  const decoded = safeDecodePathname(pathname);
-  if (decoded === null) {
-    return null;
-  }
-  if (decoded.length === 0) {
-    return '/';
-  }
-  return decoded.startsWith('/') ? decoded : `/${decoded}`;
-}
 // src/handleDownload.ts
 async function handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
   const originalRequest = request;
@@ -1335,7 +1325,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   }
 
   const actions = normalizeControllerPathActions(downloadDecision);
-  const originCheckModes = extractControllerOriginModes(downloadDecision);
+  const originCheckModes = extractControllerOriginModes(downloadDecision, config.binding);
 
   // Handle block action
   if (actions.includes('block')) {
@@ -1399,165 +1389,103 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  // Initialize check flags from config (each *_CHECK only controls itself)
-  let shouldCheckSign = config.signCheck;
-  let shouldCheckHash = config.hashCheck;
-  let shouldCheckWorker = config.workerCheck;
-  let shouldCheckAddition = config.additionCheck || needOriginCheck;
-  let shouldCheckAdditionExpireTime = config.additionExpireTimeCheck || needOriginCheck;
   let dynamicIdleTimeout = null;
 
-  // Apply action overrides (unless 'asis' is specified)
-  // Each skip-* only affects its own check, completely decoupled
-  if (!actions.includes('asis')) {
-    if (actions.includes('skip-sign')) {
-      shouldCheckSign = false;
-    }
-    if (actions.includes('skip-hash')) {
-      shouldCheckHash = false;
-    }
-    if (actions.includes('skip-worker')) {
-      shouldCheckWorker = false;
-    }
-    if (actions.includes('skip-addition') && !needOriginCheck) {
-      shouldCheckAddition = false;
-    }
-    if (actions.includes('skip-addition-expiretime') && !needOriginCheck) {
-      shouldCheckAdditionExpireTime = false;
+  const payload = url.searchParams.get("payload") ?? "";
+  const payloadSign = url.searchParams.get("payloadSign") ?? "";
+  if (!payload) {
+    return createUnauthorizedResponse(origin, "payload missing");
+  }
+  if (!payloadSign) {
+    return createUnauthorizedResponse(origin, "payloadSign missing");
+  }
+
+  const payloadVerifyResult = await verifySignature(config.token, payload, payloadSign);
+  if (payloadVerifyResult !== "") {
+    return createUnauthorizedResponse(origin, payloadVerifyResult);
+  }
+
+  const payloadSignExpire = extractExpireFromSign(payloadSign);
+  const decodedPayload = base64UrlDecodeToString(payload);
+  if (!decodedPayload) {
+    return createUnauthorizedResponse(origin, "payload decode failed");
+  }
+
+  let payloadData = null;
+  try {
+    payloadData = JSON.parse(decodedPayload);
+  } catch (_error) {
+    return createUnauthorizedResponse(origin, "payload invalid");
+  }
+
+  const payloadVersion = Number(payloadData?.v);
+  if (!Number.isFinite(payloadVersion) || payloadVersion !== 1) {
+    return createUnauthorizedResponse(origin, "payload version invalid");
+  }
+
+  const payloadExpireTime = readPayloadExpireTime(payloadData);
+  if (!Number.isFinite(payloadExpireTime) || payloadExpireTime <= 0) {
+    return createUnauthorizedResponse(origin, "payload expire invalid");
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const hardExpire = payloadSignExpire > 0 ? payloadSignExpire : Number.POSITIVE_INFINITY;
+  const effectiveExpire = Math.min(hardExpire, payloadExpireTime);
+  if (nowSeconds > effectiveExpire) {
+    return createUnauthorizedResponse(origin, "link expired");
+  }
+
+  if (payloadData && typeof payloadData === "object") {
+    const { idle_timeout: idleTimeoutOverride } = payloadData;
+    if (typeof idleTimeoutOverride === "number" && Number.isFinite(idleTimeoutOverride) && idleTimeoutOverride >= 0) {
+      dynamicIdleTimeout = Math.trunc(idleTimeoutOverride);
+      console.log("[IDLE] Using idle_timeout from payload:", dynamicIdleTimeout);
     }
   }
 
-  // Sign verification
-  const sign = url.searchParams.get("sign") ?? "";
-  if (shouldCheckSign) {
-    const verifyResult = await verify("sign", path, sign, config.token);
-    if (verifyResult !== "") {
-      return createUnauthorizedResponse(origin, verifyResult);
-    }
+  const encryptedPayload = typeof payloadData.encrypt === "string" ? payloadData.encrypt : "";
+  if (!encryptedPayload) {
+    return createUnauthorizedResponse(origin, "payload encrypt missing");
+  }
+  const bindingPayload = await decryptBindingPayload(encryptedPayload, config.token);
+  if (!bindingPayload) {
+    console.warn('[Binding] Failed to decrypt payload');
+    return createUnauthorizedResponse(origin, "payload decrypt failed");
   }
 
-  // HashSign verification
-  const hashSign = url.searchParams.get("hashSign") ?? "";
-  if (shouldCheckHash) {
-    const base64Path = base64Encode(path);
-    const hashVerifyResult = await verify("hashSign", base64Path, hashSign, config.token);
-    if (hashVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, hashVerifyResult);
-    }
+  const issuer = normalizeOrigin(typeof bindingPayload.issuer === "string" ? bindingPayload.issuer : "");
+  if (!issuer || !config.landingWorkerAddresses.includes(issuer)) {
+    return createUnauthorizedResponse(origin, "prohibited issuer");
   }
 
-  // WorkerSign verification
-  const workerSign = url.searchParams.get("workerSign") ?? "";
-  if (shouldCheckWorker) {
-    const actualWorkerAddress = new URL(request.url).origin;
-    const workerVerifyData = JSON.stringify({ path: path, worker_addr: actualWorkerAddress });
-    const workerVerifyResult = await verify("workerSign", workerVerifyData, workerSign, config.token);
-    if (workerVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, workerVerifyResult);
-    }
+  const workerAddress = normalizeOrigin(typeof bindingPayload.workerAddress === "string" ? bindingPayload.workerAddress : "");
+  const actualWorkerOrigin = new URL(request.url).origin;
+  if (!workerAddress || workerAddress !== actualWorkerOrigin) {
+    return createUnauthorizedResponse(origin, "worker address mismatch");
   }
 
-  const additionalInfo = url.searchParams.get("additionalInfo") ?? "";
-  const additionalInfoSign = url.searchParams.get("additionalInfoSign") ?? "";
-  let additionalPayload = null;
-  let originSnapshot = null;
-  if (shouldCheckAddition) {
-    if (!additionalInfo) {
-      return createUnauthorizedResponse(origin, "additionalInfo missing");
-    }
-    if (!additionalInfoSign) {
-      return createUnauthorizedResponse(origin, "additionalInfoSign missing");
-    }
-
-    const additionalVerifyResult = await verify("additionalInfoSign", additionalInfo, additionalInfoSign, config.token);
-    if (additionalVerifyResult !== "") {
-      return createUnauthorizedResponse(origin, additionalVerifyResult);
-    }
-
-    const decodedAdditional = base64DecodeToString(additionalInfo);
-    if (!decodedAdditional) {
-      return createUnauthorizedResponse(origin, "additionalInfo decode failed");
-    }
-
-    try {
-      additionalPayload = JSON.parse(decodedAdditional);
-    } catch (_error) {
-      return createUnauthorizedResponse(origin, "additionalInfo invalid");
-    }
-
-    // Extract idle_timeout from additionalInfo (priority: additionalInfo > env)
-    if (additionalPayload && typeof additionalPayload === "object") {
-      const { idle_timeout: idleTimeoutOverride } = additionalPayload;
-
-      if (typeof idleTimeoutOverride === "number" && Number.isFinite(idleTimeoutOverride) && idleTimeoutOverride >= 0) {
-        dynamicIdleTimeout = Math.trunc(idleTimeoutOverride);
-        console.log("[IDLE] Using idle_timeout from additionalInfo:", dynamicIdleTimeout);
-      }
-    }
-
-    const normalizedPathForHash = normalizedPath ?? normalizePath(url.pathname);
-    if (typeof normalizedPathForHash !== "string" || normalizedPathForHash.length === 0) {
-      return createErrorResponse(origin, 400, "invalid path encoding");
-    }
-    const currentPathHash = await sha256Hex(normalizedPathForHash);
-    if (typeof additionalPayload.pathHash !== "string" || additionalPayload.pathHash !== currentPathHash) {
-      return createUnauthorizedResponse(origin, "additionalInfo path mismatch");
-    }
-
-    if (shouldCheckAdditionExpireTime) {
-      let expireTimestamp = 0;
-      if (typeof additionalPayload.expireTime === "number") {
-        expireTimestamp = Math.trunc(additionalPayload.expireTime);
-      } else if (typeof additionalPayload.expireTime === "string") {
-        expireTimestamp = Number.parseInt(additionalPayload.expireTime, 10);
-      }
-
-      if (!Number.isFinite(expireTimestamp) || expireTimestamp <= 0) {
-        return createUnauthorizedResponse(origin, "additionalInfo expire invalid");
-      }
-
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      if (nowSeconds > expireTimestamp) {
-        return createUnauthorizedResponse(origin, "link expired");
-      }
-    }
-
-    const encryptedSnapshot = typeof additionalPayload.encrypt === 'string' ? additionalPayload.encrypt : '';
-    if (!encryptedSnapshot) {
-      return createUnauthorizedResponse(origin, "origin encrypt missing");
-    }
-    originSnapshot = await decryptOriginSnapshot(encryptedSnapshot, config.token);
-    if (!originSnapshot) {
-      console.warn('[Origin Binding] Failed to decrypt snapshot');
-      return createUnauthorizedResponse(origin, "origin decrypt failed");
-    }
-
-    const issuerRaw = typeof originSnapshot.issuer === 'string' ? originSnapshot.issuer : '';
-    const issuer = normalizeOrigin(issuerRaw);
-    if (!issuer || !config.landingWorkerAddresses.includes(issuer)) {
-      return createUnauthorizedResponse(origin, "prohibited issuer");
-    }
+  const bindingStr = typeof payloadData.bindingStr === "string" ? payloadData.bindingStr : "";
+  const bindingVer = Number(payloadData.bindingVer);
+  if (Number.isFinite(bindingVer) && bindingVer > 0 && bindingVer !== config.binding.version) {
+    return createUnauthorizedResponse(origin, "binding version mismatch");
   }
 
   if (needOriginCheck) {
-    if (!originSnapshot || typeof originSnapshot !== 'object') {
-      return createUnauthorizedResponse(origin, "origin payload missing");
+    if (!bindingStr) {
+      return createUnauthorizedResponse(origin, "bindingStr missing");
     }
-    const cf = request.cf || {};
-    const currentOrigin = {
-      ip_addr: clientIpValue || null,
-      country: cf.country,
-      continent: cf.continent,
-      region: cf.region,
-      city: cf.city,
-      asn: typeof cf.asn === 'undefined' || cf.asn === null ? undefined : String(cf.asn),
-    };
-    const originResult = checkOriginMatch(originSnapshot, currentOrigin, originCheckModes, {
-      ipv4Suffix: config.ipv4Suffix,
-      ipv6Suffix: config.ipv6Suffix,
+    const bindingResult = await buildBindingStr({
+      modes: originCheckModes,
+      path: url.pathname,
+      cf: request.cf,
+      clientIP: clientIpValue,
+      bindingConfig: config.binding,
+      token: config.token,
     });
-    if (!originResult.ok) {
-      console.warn('[Origin Binding] Mismatch:', originResult.failedFields);
+    if (!bindingResult.ok) {
+      return createUnauthorizedResponse(origin, bindingResult.reason || "binding unavailable");
+    }
+    if (bindingResult.bindingStr !== bindingStr) {
       return createUnauthorizedResponse(origin, "origin mismatch");
     }
   }
@@ -2187,7 +2115,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     // 创建仅包含安全必要headers的响应
     const safeHeaders = new Headers();
-    const isCryptedDownload = additionalPayload?.isCrypted === true;
+    const isCryptedDownload = payloadData?.isCrypted === true;
 
     // 保留重要的内容相关headers
     const preserveHeaders = [
@@ -2232,7 +2160,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       );
 
     if (shouldOverrideCacheControl) {
-      const fileSize = readAdditionalFileSize(additionalPayload);
+      const fileSize = readPayloadFileSize(payloadData);
       if (typeof fileSize === 'number' && fileSize <= config.cacheOverrideMaxSizeBytes) {
         const maxAge = config.cacheOverrideSeconds;
         safeHeaders.set('cache-control', `public, max-age=${maxAge}, s-maxage=${maxAge}`);

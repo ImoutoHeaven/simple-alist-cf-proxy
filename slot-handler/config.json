@@ -1,4 +1,5 @@
 {
+  "notes": "Download tickets now use payload/payloadSign; see controller common.binding defaults.",
   "controller": {
     "url": "",
     "apiPrefix": "/api/v0",

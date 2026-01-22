@@ -17,8 +17,8 @@
   - `*` 匹配单段，`**` 匹配多段
 - `config`：规则配置对象
   - `HMAC_SECRET`：与 controller 的 `common.tokenHmacKey` 保持一致；为空时跳过所有校验
-  - `signCheck` / `hashCheck` / `workerCheck`
-  - `additionalInfoCheck` / `additionExpireTimeCheck`
+  - `payloadSignCheck`：校验 `payloadSign`（HMAC+expire）
+  - `payloadExpireTimeCheck`：校验 `payload.expireTime` 是否过期
 
 示例：
 
@@ -28,11 +28,8 @@ const CONFIG = [
     pattern: "alist-download-*.example.com/**",
     config: {
       HMAC_SECRET: "replace-with-common-tokenHmacKey",
-      additionalInfoCheck: true,
-      additionExpireTimeCheck: true,
-      hashCheck: true,
-      signCheck: true,
-      workerCheck: true,
+      payloadSignCheck: true,
+      payloadExpireTimeCheck: true,
     },
   },
 ];
@@ -40,8 +37,7 @@ const CONFIG = [
 
 ## 行为说明
 
-- 校验项：`sign` / `hashSign` / `workerSign` / `additionalInfoSign`。
-- `additionalInfo` 只解析 `expireTime` 来做超时判断，不做 `pathHash` 与 origin 绑定校验。
+- 校验项：`payloadSign` 与 `payload.expireTime`。
 - 当 `HMAC_SECRET` 为空时，所有校验均跳过（只做缓存逻辑）。
 - 仅对 **GET 且无 Range** 的请求尝试缓存：
   - 使用 `caches.default`；
