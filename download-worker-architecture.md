@@ -78,7 +78,6 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 2. **Controller 决策**
    - 从 `decision.download.pathAction` 读取动作：
      - `block`：直接 403
-     - `skip-origin`
      - `asis`：不做动作覆盖
 
 3. **CF Rate Limiter（可选）**
@@ -142,4 +141,3 @@ Fair Queue 相关表与函数由 `slot-handler` 使用（`download_register_fq_w
 
 - 业务策略**只能**来自控制面；本仓库不再支持通过环境变量设置策略。
 - 缓存/限流/Throttle 仅支持 `custom-pg-rest` 模式；D1 仅用于 bootstrap 缓存。
-- `skip-origin` 仅跳过 bindingStr 校验，仍需通过 payloadSign 与 issuer/workerAddress 校验。

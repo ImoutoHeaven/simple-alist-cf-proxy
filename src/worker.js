@@ -11,7 +11,7 @@ import { fetchControllerState } from './controller-adapter.js';
 
 // Configuration constants
 const REQUIRED_ENV = [];
-const VALID_ACTIONS = new Set(['block', 'skip-origin', 'asis']);
+const VALID_ACTIONS = new Set(['block', 'asis']);
 const DEFAULT_LINK_TTL_SECONDS = 1800;
 const DEFAULT_CLEANUP_PERCENTAGE = 1;
 const DEFAULT_RATE_LIMIT_BLOCK_SECONDS = 600;
@@ -1332,8 +1332,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return createErrorResponse(origin, 403, "access denied");
   }
 
-  const skipOriginByAction = actions.includes('skip-origin');
-  const needOriginCheck = !skipOriginByAction && originCheckModes.length > 0;
+  const needOriginCheck = originCheckModes.length > 0;
 
   const clientIpValue = getClientIp(request);
   const clientIP = clientIpValue || "";
