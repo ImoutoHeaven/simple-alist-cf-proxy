@@ -4,6 +4,14 @@ compatibility_date = "2024-01-01"
 workers_dev = false
 preview_urls = false
 
+[observability]
+  [observability.logs]
+  enabled = true
+  invocation_logs = true
+
+  [observability.traces]
+  enabled = true
+
 # Environment variables (configure these in Cloudflare Dashboard or use secrets)
 # [vars]
 # 控制面为唯一策略来源，wrangler 仅保留 infra 级 env：
