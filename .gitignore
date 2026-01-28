@@ -2,6 +2,7 @@ node_modules/
 .wrangler/
 .dev.vars
 dist/
+pages_entrance/dist/
 .DS_Store
 *.log
 slot-handler/slot-handler

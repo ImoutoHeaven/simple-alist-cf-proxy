@@ -6,10 +6,8 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "build:pages": "node build_pages.mjs",
     "dev": "wrangler dev",
-    "deploy": "npm run build && wrangler deploy",
-    "deploy:pages": "npm run build:pages && wrangler pages deploy --config wrangler_pages.toml"
+    "deploy": "npm run build && wrangler deploy"
   },
   "keywords": [
     "cloudflare",

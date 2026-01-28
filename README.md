@@ -76,6 +76,15 @@ npm run dev
 npm run deploy
 ```
 
+### Pages 透明入口
+
+用于自定义域名入口，保持请求透明转发到 Worker（Service Binding）。入口构建与部署位于 `pages_entrance/`：
+
+```bash
+node pages_entrance/build.mjs
+wrangler pages deploy --config pages_entrance/wrangler.toml
+```
+
 ## 控制面配置要点（bootstrap + decision）
 
 控制面是策略唯一来源，核心字段如下（字段名以 controller payload 为准）：

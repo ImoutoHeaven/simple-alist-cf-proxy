@@ -21,4 +21,4 @@ await build({
   minify: true,
 });
 
-console.log('✓ Build completed: dist/_worker.js');
+console.log('✓ Build completed: pages_entrance/dist/_worker.js');

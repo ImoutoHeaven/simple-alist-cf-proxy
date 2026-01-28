@@ -9,6 +9,7 @@
 - AList：通过 `/api/fs/link` 获取真实下载地址
 - 可选：PostgREST + PostgreSQL（缓存/限流/Throttle/Idle）
 - 可选：`slot-handler`（公平队列服务）
+- 可选：Pages Entrance（透明转发入口，Service Binding → Worker；入口域名需加入 `common.workerAddresses` allowlist）
 
 ## 2. 配置与决策来源
 
