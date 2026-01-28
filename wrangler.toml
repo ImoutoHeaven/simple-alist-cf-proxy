@@ -13,7 +13,7 @@ preview_urls = false
 # - CACHE_D1（D1 缓存绑定，可选）/ INIT_TABLES（是否由 Worker 自动建表，默认 false）
 # - INTERNAL_API_TOKEN（控制 API）
 # - INNER_AUTH_HEADER / INNER_AUTH_SECRET（入口内网鉴权，可选）
-# - ENABLE_CF_RATELIMITER / CF_RATELIMITER_BINDING（如需启用 CF 原生限流，请同时配置 [[rate_limit]] 绑定）
+# - ENABLE_CF_RATELIMITER / CF_RATELIMITER_BINDING（如需启用 CF 原生限流，请同时配置 [[ratelimits]] 绑定）
 # 策略/绑定/IPv4 限制等全部由 controller.common / download.* 下发，勿在 wrangler 配置策略类 env。
 #
 # For local development (.dev.vars 示例，注意 TOML 语法需要双引号包裹字符串):
@@ -34,10 +34,16 @@ preview_urls = false
 # ENABLE_CF_RATELIMITER="false"
 # CF_RATELIMITER_BINDING="CF_RATE_LIMITER"
 #
-# 如启用 ENABLE_CF_RATELIMITER，请配置 [[rate_limit]] binding 名称与 CF_RATELIMITER_BINDING 一致。
+# 如启用 ENABLE_CF_RATELIMITER，请配置 [[ratelimits]] 的 name 与 CF_RATELIMITER_BINDING 一致。
 
 # Optional: D1 cache binding example
 # [[d1_databases]]
 # binding = "CACHE_D1"
 # database_name = "controller_cache"
 # database_id = "replace-with-id"
+
+# Optional: Cloudflare Rate Limiter binding example
+# [[ratelimits]]
+# name = "CF_RATE_LIMITER"
+# namespace_id = "1001"
+# simple = { period = 60, limit = 100 }
