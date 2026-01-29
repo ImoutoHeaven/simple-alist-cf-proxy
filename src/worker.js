@@ -2094,6 +2094,104 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       } else if (refreshedLink && refreshedLink.data && refreshedLink.data.url) {
         downloadUrl = refreshedLink.data.url;
         res = refreshedLink;
+        if (fairQueueClient && fqContext) {
+          const updatedHostnameRaw = extractHostname(downloadUrl);
+          const updatedHostname = updatedHostnameRaw ? updatedHostnameRaw.toLowerCase() : null;
+          const shouldUseFairQueue =
+            config.fairQueueEnabled &&
+            updatedHostname &&
+            config.fairQueueHostnamePatterns.some((pattern) => matchHostnamePattern(updatedHostname, pattern));
+
+          if (!shouldUseFairQueue) {
+            if (fqContext.slotToken) {
+              try {
+                await fairQueueClient.releaseSlot(ctx, fqContext);
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                console.warn('[Fair Queue] releaseSlot failed during refresh:', message);
+              }
+            }
+            fqContext = null;
+          } else {
+            const updatedSiteBucket = await deriveSiteBucket(updatedHostname, downloadUrl, config.fairQueueSiteBucket);
+            if (updatedHostname !== fqContext.hostname || updatedSiteBucket !== fqContext.siteBucket) {
+              if (fqContext.slotToken) {
+                try {
+                  await fairQueueClient.releaseSlot(ctx, fqContext);
+                } catch (error) {
+                  const message = error instanceof Error ? error.message : String(error);
+                  console.warn('[Fair Queue] releaseSlot failed during refresh:', message);
+                }
+              }
+              const updatedHostnameHash = await sha256Hash(updatedHostname);
+              fqContext = {
+                hostname: updatedHostname,
+                hostnameHash: updatedHostnameHash,
+                ipBucket: fqContext.ipBucket,
+                siteBucket: updatedSiteBucket,
+                nowMs: Date.now(),
+              };
+
+              const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext);
+              if (fqResult.kind === 'throttled') {
+                const retryAfter = normalizePositiveSeconds(
+                  fqResult.retryAfter,
+                  config.throttleConfig?.throttleTimeWindow || 60
+                );
+                if (updatedHostname) {
+                  markThrottled(updatedHostname, fqResult.throttleCode || 503, retryAfter);
+                }
+                await slowFailDelay();
+                return createThrottleProtectedResponse(origin, {
+                  status: 'protected',
+                  errorCode: fqResult.throttleCode || 503,
+                  retryAfter,
+                });
+              }
+
+              if (fqResult.kind === 'overloaded') {
+                const retryAfter = normalizePositiveSeconds(fqResult.retryAfter, 30);
+                markOverloaded(retryAfter);
+                await slowFailDelay();
+                const safeHeaders = new Headers();
+                safeHeaders.set("content-type", "application/json;charset=UTF-8");
+                safeHeaders.set("Access-Control-Allow-Origin", origin);
+                safeHeaders.append("Vary", "Origin");
+                safeHeaders.set("Retry-After", String(retryAfter));
+
+                return new Response(
+                  JSON.stringify({
+                    code: 503,
+                    message: 'Fair queue overloaded, please retry later'
+                  }),
+                  {
+                    status: 503,
+                    headers: safeHeaders
+                  }
+                );
+              }
+
+              if (fqResult.kind === 'timeout') {
+                const safeHeaders = new Headers();
+                safeHeaders.set("content-type", "application/json;charset=UTF-8");
+                safeHeaders.set("Access-Control-Allow-Origin", origin);
+                safeHeaders.append("Vary", "Origin");
+                safeHeaders.set("Retry-After", "60");
+
+                return new Response(
+                  JSON.stringify({
+                    code: 503,
+                    message: 'Upstream queue timeout, please retry later'
+                  }),
+                  {
+                    status: 503,
+                    headers: safeHeaders
+                  }
+                );
+              }
+            }
+          }
+        }
         request = buildUpstreamRequest(downloadUrl, res.data.header);
         response = await fetch(request);
         while (response.status >= 300 && response.status < 400) {

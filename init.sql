@@ -1256,6 +1256,7 @@ DECLARE
   v_error_code INTEGER;
   v_is_protected INTEGER;
   v_retry_after INTEGER := NULL;
+  v_rows INTEGER := 0;
 BEGIN
   IF p_hostname_hash IS NULL OR p_hostname_hash = '' THEN
     RETURN QUERY SELECT FALSE, NULL::INTEGER, NULL::INTEGER;
@@ -1280,7 +1281,8 @@ BEGIN
   FROM "THROTTLE_PROTECTION"
   WHERE "HOSTNAME_HASH" = p_hostname_hash;
 
-  IF NOT FOUND THEN
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  IF v_rows = 0 THEN
     RETURN QUERY SELECT FALSE, NULL::INTEGER, NULL::INTEGER;
     RETURN;
   END IF;
@@ -1327,6 +1329,7 @@ DECLARE
   v_site_ip_depth INT := 0;
   v_host_ip_updated_at TIMESTAMP WITH TIME ZONE;
   v_site_ip_updated_at TIMESTAMP WITH TIME ZONE;
+  v_rows INTEGER := 0;
 BEGIN
   v_hostname := COALESCE(NULLIF(p_hostname, ''), NULLIF(p_hostname_hash, ''));
   IF v_hostname IS NULL THEN
@@ -1360,7 +1363,8 @@ BEGIN
   WHERE "hostname_pattern" = v_hostname
     AND "ip_hash" = p_ip_bucket;
 
-  IF NOT FOUND THEN
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  IF v_rows = 0 THEN
     v_host_ip_depth := 0;
     v_host_ip_updated_at := NULL;
   END IF;
@@ -1377,7 +1381,8 @@ BEGIN
     AND "site_bucket" = v_site_bucket
     AND "ip_hash" = p_ip_bucket;
 
-  IF NOT FOUND THEN
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  IF v_rows = 0 THEN
     v_site_ip_depth := 0;
     v_site_ip_updated_at := NULL;
   END IF;

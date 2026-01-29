@@ -107,9 +107,9 @@ func TestOnStructurallyFailedSetsDenyWindow(t *testing.T) {
 				Buckets: map[fqBucketKey]*fqBucketState{
 					{IPBucket: "ip1"}: {WaitCount: 4},
 				},
+				IpStates: make(map[string]*fqIpState),
 			},
 		},
-		IpStates: make(map[string]*fqIpState),
 	}
 	s.fqHosts = map[string]*fqHostState{hostKey: host}
 
@@ -120,7 +120,7 @@ func TestOnStructurallyFailedSetsDenyWindow(t *testing.T) {
 	if bucket.WaitCount >= 4 {
 		t.Fatalf("expected WaitCount to decrease on structural failure, got %d", bucket.WaitCount)
 	}
-	ipState := host.IpStates["ip1"]
+	ipState := host.Sites[siteKey].IpStates["ip1"]
 	if ipState == nil {
 		t.Fatalf("expected ip state to be created")
 	}
@@ -185,13 +185,13 @@ func TestShouldProbeBlocksIpDenyWindow(t *testing.T) {
 				Buckets: map[fqBucketKey]*fqBucketState{
 					{IPBucket: "ip1"}: {},
 				},
+				IpStates: map[string]*fqIpState{
+					"ip1": {DenyUntil: time.Now().Add(5 * time.Second)},
+				},
 			},
 		},
 		TotalPending: 2,
 		AvgWaitMs:    2,
-		IpStates: map[string]*fqIpState{
-			"ip1": {DenyUntil: time.Now().Add(5 * time.Second)},
-		},
 	}
 	s.fqHosts = map[string]*fqHostState{hostKey: host}
 
@@ -390,7 +390,12 @@ func TestOnRegisterWaiterResultSetsDenyWindow(t *testing.T) {
 		t.Fatalf("expected host state to be created")
 	}
 	host.mu.Lock()
-	state := host.WaiterIpStates[sess.IPBucket]
+	site := host.Sites["s1"]
+	if site == nil {
+		host.mu.Unlock()
+		t.Fatalf("expected site state to be created")
+	}
+	state := site.WaiterIpStates[sess.IPBucket]
 	host.mu.Unlock()
 	if state == nil || state.WaiterDenyUntil.IsZero() || !state.WaiterDenyUntil.After(time.Now()) {
 		t.Fatalf("expected deny window set, got %+v", state)

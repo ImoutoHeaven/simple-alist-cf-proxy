@@ -356,6 +356,8 @@ type fqSiteState struct {
 	LastProbedAt          time.Time
 	RegisteredWaiters     int64
 	RegisteredWaitersByIP map[string]int64
+	IpStates              map[string]*fqIpState
+	WaiterIpStates        map[string]*fqWaiterIpState
 }
 
 // fqIpState tracks recent structural failures for an IP bucket.
@@ -383,8 +385,6 @@ type fqHostState struct {
 	AvgWaitMs             int64
 	LastCycleStart        time.Time
 	ProbesInCycle         int
-	IpStates              map[string]*fqIpState
-	WaiterIpStates        map[string]*fqWaiterIpState
 	RegisteredWaiters     int64
 	RegisteredWaitersByIP map[string]int64
 }
@@ -561,32 +561,32 @@ func (s *server) getOrCreateSiteState(host *fqHostState, siteKey string) *fqSite
 	return site
 }
 
-func (s *server) getOrCreateIpState(host *fqHostState, ipBucket string) *fqIpState {
-	if host == nil || ipBucket == "" {
+func (s *server) getOrCreateIpState(site *fqSiteState, ipBucket string) *fqIpState {
+	if site == nil || ipBucket == "" {
 		return nil
 	}
-	if host.IpStates == nil {
-		host.IpStates = make(map[string]*fqIpState)
+	if site.IpStates == nil {
+		site.IpStates = make(map[string]*fqIpState)
 	}
-	state := host.IpStates[ipBucket]
+	state := site.IpStates[ipBucket]
 	if state == nil {
 		state = &fqIpState{}
-		host.IpStates[ipBucket] = state
+		site.IpStates[ipBucket] = state
 	}
 	return state
 }
 
-func (s *server) getOrCreateWaiterState(host *fqHostState, ipBucket string) *fqWaiterIpState {
-	if host == nil || ipBucket == "" {
+func (s *server) getOrCreateWaiterState(site *fqSiteState, ipBucket string) *fqWaiterIpState {
+	if site == nil || ipBucket == "" {
 		return nil
 	}
-	if host.WaiterIpStates == nil {
-		host.WaiterIpStates = make(map[string]*fqWaiterIpState)
+	if site.WaiterIpStates == nil {
+		site.WaiterIpStates = make(map[string]*fqWaiterIpState)
 	}
-	state := host.WaiterIpStates[ipBucket]
+	state := site.WaiterIpStates[ipBucket]
 	if state == nil {
 		state = &fqWaiterIpState{}
-		host.WaiterIpStates[ipBucket] = state
+		site.WaiterIpStates[ipBucket] = state
 	}
 	return state
 }
@@ -1010,7 +1010,7 @@ func (s *server) onStructurallyFailed(sess *FQSession, status string, cfg *Confi
 		bucket.WaitCount = bucket.WaitCount / 2
 	}
 
-	ipState := s.getOrCreateIpState(host, sess.IPBucket)
+	ipState := s.getOrCreateIpState(site, sess.IPBucket)
 	if ipState != nil {
 		now := time.Now()
 		ipState.LastIpTooManyAt = now
@@ -1046,7 +1046,12 @@ func (s *server) onQueueFull(sess *FQSession, status string) {
 	host.mu.Lock()
 	defer host.mu.Unlock()
 
-	ipState := s.getOrCreateIpState(host, sess.IPBucket)
+	siteKey := strings.TrimSpace(sess.SiteBucket)
+	if siteKey == "" {
+		siteKey = "unknown"
+	}
+	site := s.getOrCreateSiteState(host, siteKey)
+	ipState := s.getOrCreateIpState(site, sess.IPBucket)
 	if ipState != nil {
 		ipState.LastQueueFullAt = time.Now()
 	}
@@ -1235,11 +1240,11 @@ func (s *server) shouldAttemptRegisterWaiter(cfg *Config, sess *FQSession) bool 
 	return true
 }
 
-func (s *server) isWaiterDenyWindow(host *fqHostState, ipBucket string, now time.Time) bool {
-	if host == nil || ipBucket == "" {
+func (s *server) isWaiterDenyWindow(site *fqSiteState, ipBucket string, now time.Time) bool {
+	if site == nil || ipBucket == "" {
 		return false
 	}
-	state := host.WaiterIpStates[ipBucket]
+	state := site.WaiterIpStates[ipBucket]
 	if state == nil {
 		return false
 	}
@@ -1262,7 +1267,12 @@ func (s *server) onRegisterWaiterResult(sess *FQSession, regRes *registerResult,
 	host.mu.Lock()
 	defer host.mu.Unlock()
 
-	state := s.getOrCreateWaiterState(host, sess.IPBucket)
+	siteKey := strings.TrimSpace(sess.SiteBucket)
+	if siteKey == "" {
+		siteKey = "unknown"
+	}
+	site := s.getOrCreateSiteState(host, siteKey)
+	state := s.getOrCreateWaiterState(site, sess.IPBucket)
 	switch status {
 	case "HOST_QUEUE_FULL", "SITE_QUEUE_FULL", "QUEUE_FULL":
 		if state != nil {
@@ -1283,11 +1293,11 @@ func (s *server) onRegisterWaiterResult(sess *FQSession, regRes *registerResult,
 	}
 }
 
-func (s *server) isIpInStructuralDenyWindow(host *fqHostState, ipBucket string, now time.Time) bool {
-	if host == nil || ipBucket == "" {
+func (s *server) isIpInStructuralDenyWindow(site *fqSiteState, ipBucket string, now time.Time) bool {
+	if site == nil || ipBucket == "" {
 		return false
 	}
-	ipState := host.IpStates[ipBucket]
+	ipState := site.IpStates[ipBucket]
 	if ipState == nil {
 		return false
 	}
@@ -1315,7 +1325,12 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 	host.mu.Lock()
 	defer host.mu.Unlock()
 
-	if s.isIpInStructuralDenyWindow(host, sess.IPBucket, now) {
+	siteKey := strings.TrimSpace(sess.SiteBucket)
+	if siteKey == "" {
+		siteKey = "unknown"
+	}
+	site := host.Sites[siteKey]
+	if s.isIpInStructuralDenyWindow(site, sess.IPBucket, now) {
 		if s.log != nil {
 			s.log.Debugf("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
 		}
@@ -1342,15 +1357,9 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 		return false
 	}
 
-	siteKey := strings.TrimSpace(sess.SiteBucket)
-	if siteKey == "" {
-		siteKey = "unknown"
-	}
-
 	if host.Sites == nil {
 		return true
 	}
-	site := host.Sites[siteKey]
 	if site == nil {
 		return true
 	}
@@ -2688,7 +2697,12 @@ func (s *server) runQueueCycle(ctx context.Context, cfg *Config, backend queueBa
 			now := time.Now()
 			if host != nil {
 				host.mu.Lock()
-				deny := s.isWaiterDenyWindow(host, sess.IPBucket, now)
+				siteKey := strings.TrimSpace(sess.SiteBucket)
+				if siteKey == "" {
+					siteKey = "unknown"
+				}
+				site := host.Sites[siteKey]
+				deny := s.isWaiterDenyWindow(site, sess.IPBucket, now)
 				host.mu.Unlock()
 				if deny {
 					s.log.Debugf("[FQ] waiter deny hit host=%s ip=%s", hostKey, sess.IPBucket)
