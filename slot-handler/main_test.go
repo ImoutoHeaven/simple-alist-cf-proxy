@@ -14,6 +14,10 @@ func newTestServer() *server {
 	}
 }
 
+func intPtr(v int) *int {
+	return &v
+}
+
 type stubBackend struct {
 	throttle throttleResult
 }
@@ -35,8 +39,8 @@ func testWeightedConfig() *Config {
 		FairQueue: FairQueueConfig{
 			PollIntervalMs:  100,
 			MinSlotHoldMs:   0,
-			MaxSlotPerHost:  2,
-			MaxWaitersPerIP: 0,
+			HostCaps:        HostCapsConfig{MaxSlotPerHost: intPtr(2)},
+			SiteCaps:        SiteCapsConfig{MaxSlotPerSite: intPtr(2)},
 			WeightedScheduler: WeightedSchedulerConfig{
 				Enabled:           true,
 				HotPendingFactor:  1,
@@ -53,7 +57,7 @@ func testWeightedConfig() *Config {
 
 func TestRegisterAndUnregisterSession(t *testing.T) {
 	s := newTestServer()
-	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1"}
 
 	s.registerPendingSession(sess)
 	host := s.getHostState(fqHostKey(sess.HostnameHash, sess.Hostname))
@@ -73,14 +77,15 @@ func TestRegisterAndUnregisterSession(t *testing.T) {
 
 func TestOnTryAcquireWaitCountUpdates(t *testing.T) {
 	s := newTestServer()
-	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1"}
 	s.registerPendingSession(sess)
 
 	s.onTryAcquireFailed(sess)
 	s.onTryAcquireFailed(sess)
 
 	host := s.getHostState(fqHostKey(sess.HostnameHash, sess.Hostname))
-	bucket := host.Buckets[fqBucketKey{HostnameHash: sess.HostnameHash, IPBucket: sess.IPBucket}]
+	site := host.Sites[sess.SiteBucket]
+	bucket := site.Buckets[fqBucketKey{IPBucket: sess.IPBucket}]
 	if bucket.WaitCount != 2 {
 		t.Fatalf("expected WaitCount=2, got %d", bucket.WaitCount)
 	}
@@ -95,18 +100,23 @@ func TestOnStructurallyFailedSetsDenyWindow(t *testing.T) {
 	cfg := testWeightedConfig()
 	s := newTestServer()
 	hostKey := fqHostKey("h1", "example.com")
+	siteKey := "s1"
 	host := &fqHostState{
-		Buckets: map[fqBucketKey]*fqBucketState{
-			{HostnameHash: "h1", IPBucket: "ip1"}: {WaitCount: 4},
+		Sites: map[string]*fqSiteState{
+			siteKey: {
+				Buckets: map[fqBucketKey]*fqBucketState{
+					{IPBucket: "ip1"}: {WaitCount: 4},
+				},
+			},
 		},
 		IpStates: make(map[string]*fqIpState),
 	}
 	s.fqHosts = map[string]*fqHostState{hostKey: host}
 
-	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: siteKey}
 	s.onStructurallyFailed(sess, "IP_TOO_MANY", cfg)
 
-	bucket := host.Buckets[fqBucketKey{HostnameHash: "h1", IPBucket: "ip1"}]
+	bucket := host.Sites[siteKey].Buckets[fqBucketKey{IPBucket: "ip1"}]
 	if bucket.WaitCount >= 4 {
 		t.Fatalf("expected WaitCount to decrease on structural failure, got %d", bucket.WaitCount)
 	}
@@ -124,7 +134,7 @@ func TestShouldProbeRespectsMaxProbes(t *testing.T) {
 	s := newTestServer()
 
 	hostKey := fqHostKey("h1", "example.com")
-	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1"}
 	s.registerPendingSession(sess)
 
 	host := s.getHostState(hostKey)
@@ -146,15 +156,18 @@ func TestShouldProbeColdHost(t *testing.T) {
 	s := newTestServer()
 
 	hostKey := fqHostKey("h1", "example.com")
+	siteKey := "s1"
 	host := &fqHostState{
-		Buckets:      map[fqBucketKey]*fqBucketState{},
+		Sites:        map[string]*fqSiteState{},
 		TotalPending: 0,
 		AvgWaitMs:    0,
 	}
-	host.Buckets[fqBucketKey{HostnameHash: "h1", IPBucket: "ip1"}] = &fqBucketState{}
+	host.Sites[siteKey] = &fqSiteState{Buckets: map[fqBucketKey]*fqBucketState{
+		{IPBucket: "ip1"}: {},
+	}}
 	s.fqHosts = map[string]*fqHostState{hostKey: host}
 
-	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: siteKey}
 	if !s.shouldProbe(cfg, sess) {
 		t.Fatalf("cold host should always probe")
 	}
@@ -165,9 +178,14 @@ func TestShouldProbeBlocksIpDenyWindow(t *testing.T) {
 	s := newTestServer()
 
 	hostKey := fqHostKey("h1", "example.com")
+	siteKey := "s1"
 	host := &fqHostState{
-		Buckets: map[fqBucketKey]*fqBucketState{
-			{HostnameHash: "h1", IPBucket: "ip1"}: {},
+		Sites: map[string]*fqSiteState{
+			siteKey: {
+				Buckets: map[fqBucketKey]*fqBucketState{
+					{IPBucket: "ip1"}: {},
+				},
+			},
 		},
 		TotalPending: 2,
 		AvgWaitMs:    2,
@@ -177,7 +195,7 @@ func TestShouldProbeBlocksIpDenyWindow(t *testing.T) {
 	}
 	s.fqHosts = map[string]*fqHostState{hostKey: host}
 
-	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: siteKey}
 	if s.shouldProbe(cfg, sess) {
 		t.Fatalf("probe should be blocked by IP deny window")
 	}
@@ -190,8 +208,8 @@ func TestBucketLocalWRRPrefersLowestLocalVTThenCreatedAt(t *testing.T) {
 
 	older := time.Now().Add(-time.Second)
 	now := time.Now()
-	sess1 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", Token: "s1", CreatedAt: older}
-	sess2 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", Token: "s2", CreatedAt: now}
+	sess1 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "s1", CreatedAt: older}
+	sess2 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "s2", CreatedAt: now}
 
 	s.registerPendingSession(sess1)
 	s.registerPendingSession(sess2)
@@ -214,7 +232,7 @@ func TestBucketLocalWRRPrefersLowestLocalVTThenCreatedAt(t *testing.T) {
 	}
 
 	host.mu.Lock()
-	bucket := host.Buckets[fqBucketKey{HostnameHash: "h1", IPBucket: "ip1"}]
+	bucket := host.Sites["s1"].Buckets[fqBucketKey{IPBucket: "ip1"}]
 	if bucket == nil {
 		host.mu.Unlock()
 		t.Fatalf("expected bucket state to exist")
@@ -228,8 +246,8 @@ func TestBucketLocalWRRPrefersLowestLocalVTThenCreatedAt(t *testing.T) {
 
 func TestUnregisterSessionRecomputesMinLocalVT(t *testing.T) {
 	s := newTestServer()
-	sess1 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", Token: "s1"}
-	sess2 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", Token: "s2"}
+	sess1 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "s1"}
+	sess2 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "s2"}
 
 	s.registerPendingSession(sess1)
 	s.registerPendingSession(sess2)
@@ -239,10 +257,10 @@ func TestUnregisterSessionRecomputesMinLocalVT(t *testing.T) {
 	if host == nil {
 		t.Fatalf("expected host state to exist")
 	}
-	bucketKey := fqBucketKey{HostnameHash: "h1", IPBucket: "ip1"}
+	bucketKey := fqBucketKey{IPBucket: "ip1"}
 
 	host.mu.Lock()
-	bucket := host.Buckets[bucketKey]
+	bucket := host.Sites["s1"].Buckets[bucketKey]
 	if bucket == nil {
 		host.mu.Unlock()
 		t.Fatalf("expected bucket state to exist")
@@ -256,7 +274,7 @@ func TestUnregisterSessionRecomputesMinLocalVT(t *testing.T) {
 
 	host.mu.Lock()
 	defer host.mu.Unlock()
-	bucket = host.Buckets[bucketKey]
+	bucket = host.Sites["s1"].Buckets[bucketKey]
 	if bucket == nil {
 		t.Fatalf("bucket should remain after unregistering one session")
 	}
@@ -269,7 +287,7 @@ func TestMarkSessionFinishedSkipsThrottled(t *testing.T) {
 	s := newTestServer()
 	hostKey := fqHostKey("h1", "example.com")
 	s.fqHosts = map[string]*fqHostState{
-		hostKey: {Buckets: map[fqBucketKey]*fqBucketState{}, TotalPending: 1},
+		hostKey: {Sites: map[string]*fqSiteState{}, TotalPending: 1},
 	}
 
 	sess := &FQSession{
@@ -344,7 +362,7 @@ func TestThrottleCachePopulatedFromBackend(t *testing.T) {
 }
 
 func TestShouldAttemptRegisterWaiterBlocksWhenAtLocalCap(t *testing.T) {
-	cfg := &Config{FairQueue: FairQueueConfig{MaxWaitersPerHost: 1, MaxWaitersPerIP: 1}}
+	cfg := &Config{FairQueue: FairQueueConfig{HostCaps: HostCapsConfig{MaxWaitersPerHost: intPtr(1), MaxWaitersPerIP: intPtr(1)}}}
 	s := newTestServer()
 	hostKey := fqHostKey("h1", "example.com")
 	s.fqHosts = map[string]*fqHostState{
@@ -354,7 +372,7 @@ func TestShouldAttemptRegisterWaiterBlocksWhenAtLocalCap(t *testing.T) {
 		},
 	}
 
-	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1"}
 	if s.shouldAttemptRegisterWaiter(cfg, sess) {
 		t.Fatalf("expected local gating to block register waiter")
 	}
@@ -363,7 +381,7 @@ func TestShouldAttemptRegisterWaiterBlocksWhenAtLocalCap(t *testing.T) {
 func TestOnRegisterWaiterResultSetsDenyWindow(t *testing.T) {
 	cfg := &Config{FairQueue: FairQueueConfig{SessionIdleSeconds: 30}}
 	s := newTestServer()
-	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1"}
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1"}
 
 	s.onRegisterWaiterResult(sess, &registerResult{statusMessage: "HOST_QUEUE_FULL"}, cfg)
 

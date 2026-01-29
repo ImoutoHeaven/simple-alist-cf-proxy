@@ -60,8 +60,8 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 - `download.db.*`：PostgREST 地址、校验 header/secret、缓存表/last-active 表、TTL/idle 等
 - `download.db.rateLimit.*`：窗口、限额、block 时间、`pgErrorHandle` 等
 - `download.throttleProfiles.*`
-- `download.fairQueue.*`：slot-handler 地址、等待超时、轮询策略等
-- `decision.download.*`：`pathAction` / `checkOriginMode` / `throttleProfile` / `fairQueueProfile`
+- `download.fairQueue.*`：slot-handler 地址、等待超时、轮询策略、siteBucket 计算方式等
+- `decision.download.*`：`pathAction` / `checkOriginMode` / `throttleProfile`
 
 ## 5. 请求处理流程
 
@@ -110,9 +110,9 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
    - 下载后按 `protectedHttpCodes` 上报成功或错误，用于后续保护判断。
 
 10. **Fair Queue（slot-handler）**
-    - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v0/fairqueue/acquire` 轮询。
+    - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
     - 支持 `granted` / `throttled` / `overloaded` / `timeout`；缓存过载/节流状态在内存中做短期抑制。
-    - 客户端中断时发送 `/fairqueue/cancel`，完成后发送 `/fairqueue/release`。
+    - 客户端中断时发送 `/fairqueue/cancel`，完成后发送 `/fairqueue/release`（均为 `/api/v1`）。
     - 若 `pgErrorHandle=fail-open` 且 slot-handler 不可用，则跳过排队。
 
 11. **上游请求与响应封装**
@@ -136,7 +136,7 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 - Last Active：`DOWNLOAD_LAST_ACTIVE_TABLE` + `download_update_last_active`
 - 统一检查：`download_unified_check`
 
-Fair Queue 相关表与函数由 `slot-handler` 使用（`download_register_fq_waiter` / `download_try_acquire_slot` 等）。
+Fair Queue 相关表与函数由 `slot-handler` 使用（`fq_register_waiter` / `fq_try_acquire_dual` 等）。
 
 ## 7. 限制与注意事项
 

@@ -31,14 +31,16 @@ go build -o slot-handler .
      - `postgrest.baseUrl` / `postgrest.authHeader`
      - `postgres.dsn`
    - `fairQueue`：公平队列参数
-     - `maxWaitMs` / `pollIntervalMs` / `pollWindowMs` / `minSlotHoldMs`
-     - `smoothReleaseIntervalMs`：平滑释放同一 host 的 slot（为空或 <=0 表示不启用）
-     - `globalMaxWaiters`：本机允许的最大排队会话数，超过后直接返回 `overloaded`
-     - `sessionIdleSeconds`：会话长时间不轮询即超时
-     - `maxSlotPerHost` / `maxSlotPerIp`：并发 slot 上限
-    - `maxWaitersPerIp` / `maxWaitersPerHost`：等待队列上限（显式设置为 0 可关闭）
+    - `pollIntervalMs` / `pollWindowMs` / `minSlotHoldMs`
+    - `smoothReleaseIntervalMs`：平滑释放同一 host 的 slot（为空或 <=0 表示不启用）
+    - `globalMaxWaiters`：本机允许的最大排队会话数，超过后直接返回 `overloaded`
+    - `sessionIdleSeconds`：会话长时间不轮询即超时
     - `zombieTimeoutSeconds` / `ipCooldownSeconds`
     - `defaultGrantedCleanupDelay`：GRANTED 会话延迟清理秒数（默认 5 秒）
+    - `hostCaps`：host 维度 caps（未填用默认值；<=0 表示不限制）
+      - `maxWaitMs` / `maxSlotPerHost` / `maxWaitersPerHost` / `maxSlotPerIp` / `maxWaitersPerIp`
+    - `siteCaps`：site 维度 caps（未填用默认值；<=0 表示不限制）
+      - `maxWaitMs` / `maxSlotPerSite` / `maxWaitersPerSite` / `maxSlotPerIp` / `maxWaitersPerIp`
     - `weightedScheduler`：热点 host 的加权调度开关与参数
       - `weightedScheduler.enabled`：是否启用加权调度
       - `weightedScheduler.hotPendingFactor` / `weightedScheduler.hotPendingMin`：热点判定阈值
@@ -58,18 +60,18 @@ go build -o slot-handler .
 
 请求头：`X-FQ-Auth: <token>`（或自定义 header）
 
-- `POST /api/v0/fairqueue/acquire`
-  - 入参：`hostname` / `hostnameHash` / `ipBucket` / `now` / `throttleTimeWindowSeconds` / `queryToken`
+- `POST /api/v1/fairqueue/acquire`
+  - 入参：`hostname` / `hostnameHash` / `ipBucket` / `siteBucket` / `now` / `throttleTimeWindowSeconds` / `queryToken`
   - 返回：
     - `result=granted`：包含 `slotToken`
     - `result=pending`：继续轮询（携带 `queryToken`）
     - `result=throttled`：包含 `throttleCode` / `throttleRetryAfter`
     - `result=overloaded`：slot-handler 过载，建议退避
     - `result=timeout`
-- `POST /api/v0/fairqueue/release`
-  - 入参：`slotToken` / `hostnameHash` / `ipBucket` / `hitUpstreamAtMs` / `now`
+- `POST /api/v1/fairqueue/release`
+  - 入参：`slotToken` / `hostnameHash` / `ipBucket` / `siteBucket` / `hitUpstreamAtMs` / `now`
   - 返回：`{"result":"ok"}`
-- `POST /api/v0/fairqueue/cancel`
+- `POST /api/v1/fairqueue/cancel`
   - 入参：`queryToken`
   - 返回：`{"result":"ok"}`
 

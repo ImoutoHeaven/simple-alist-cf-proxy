@@ -197,17 +197,8 @@ const mergeDownloadDecision = (base, dynamic) => {
   if (dynamic.checkOriginMode) {
     merged.checkOriginMode = pickString(dynamic.checkOriginMode, merged.checkOriginMode);
   }
-  if (dynamic.fairQueueProfile) {
-    merged.fairQueueProfile = pickString(dynamic.fairQueueProfile, merged.fairQueueProfile);
-  }
   if (dynamic.throttleProfile) {
     merged.throttleProfile = pickString(dynamic.throttleProfile, merged.throttleProfile);
-  }
-  if (typeof dynamic.maxSlotsPerIpOverride === 'number') {
-    merged.maxSlotsPerIpOverride = dynamic.maxSlotsPerIpOverride;
-  }
-  if (typeof dynamic.maxWaitersPerIpOverride === 'number') {
-    merged.maxWaitersPerIpOverride = dynamic.maxWaitersPerIpOverride;
   }
   if (dynamic.blockReason) {
     merged.blockReason = dynamic.blockReason;
@@ -220,22 +211,13 @@ const buildStaticDownloadDecision = (profile, bootstrap) => {
   const downloadBootstrap = bootstrap?.download || {};
   const pathAction = normalizeStringArray(actions.pathAction);
   const checkOriginMode = pickString(actions.checkOriginMode, downloadBootstrap.originBindingDefault || '');
-  const fairQueueProfile = pickString(actions.fairQueueProfile, 'default');
   const throttleProfile = pickString(actions.throttleProfile, 'default');
-
-  const maxSlotsPerIpValue = Number(actions.maxSlotsPerIp);
-  const maxWaitersPerIpValue = Number(actions.maxWaitersPerIp);
-  const maxSlotsPerIp = Number.isFinite(maxSlotsPerIpValue) ? maxSlotsPerIpValue : undefined;
-  const maxWaitersPerIp = Number.isFinite(maxWaitersPerIpValue) ? maxWaitersPerIpValue : undefined;
   const blockReason = pickString(actions.blockReason, '');
 
   return {
     pathAction,
     checkOriginMode,
-    fairQueueProfile,
     throttleProfile,
-    maxSlotsPerIpOverride: Number.isFinite(maxSlotsPerIp) ? maxSlotsPerIp : undefined,
-    maxWaitersPerIpOverride: Number.isFinite(maxWaitersPerIp) ? maxWaitersPerIp : undefined,
     blockReason: blockReason || undefined,
   };
 };

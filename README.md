@@ -104,7 +104,7 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
   - `download.db.cacheTable` / `download.db.lastActiveTable`
   - `download.db.rateLimit.*`（`windowSeconds` / `limit` / `blockSeconds` / `pgErrorHandle` 等）
 - `download.throttleProfiles` + `decision.download.throttleProfile`：上游错误保护策略
-- `download.fairQueue.*` + `decision.download.fairQueueProfile`：公平排队开关与等待策略
+- `download.fairQueue.*`：公平排队开关与等待策略（含 siteBucket 计算）
 - `decision.download.pathAction` / `decision.download.checkOriginMode`：单路径策略与 bindingStr 绑定字段
 
 ## 请求流程概要

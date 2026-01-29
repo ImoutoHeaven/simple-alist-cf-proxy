@@ -40,6 +40,56 @@ const idle410Cache = {
 
 const nowMs = () => Date.now();
 
+const normalizeStringValue = (value, fallback = '') => {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+};
+
+const extractPathname = (urlValue) => {
+  if (!urlValue || typeof urlValue !== 'string') {
+    return '';
+  }
+  try {
+    const parsed = new URL(urlValue);
+    return parsed.pathname || '';
+  } catch (_error) {
+    return '';
+  }
+};
+
+const deriveSiteKey = (hostname, pathname) => {
+  const lowerHost = (hostname || '').toLowerCase();
+  const segments = typeof pathname === 'string'
+    ? pathname.toLowerCase().split('/').filter((segment) => segment.length > 0)
+    : [];
+
+  if (lowerHost.endsWith('.sharepoint.com')) {
+    if (segments[0] === 'personal' && segments[1]) return `personal:${segments[1]}`;
+    if (segments[0] === 'sites' && segments[1]) return `sites:${segments[1]}`;
+    if (segments[0] === 'teams' && segments[1]) return `teams:${segments[1]}`;
+    return 'unknown';
+  }
+
+  if (lowerHost) {
+    return `host:${lowerHost}`;
+  }
+
+  return 'unknown';
+};
+
+const deriveSiteBucket = async (hostname, urlValue, siteBucketConfig) => {
+  const mode = normalizeStringValue(siteBucketConfig?.mode, 'sharepoint').toLowerCase();
+  const path = extractPathname(urlValue);
+  const siteKey = mode === 'sharepoint'
+    ? deriveSiteKey(hostname, path)
+    : (hostname ? `host:${hostname.toLowerCase()}` : 'unknown');
+  const hash = await sha256Hash(siteKey || 'unknown');
+  return hash || '';
+};
+
 const normalizePositiveSeconds = (value, fallback) => {
   const num = Number(value);
   if (Number.isFinite(num) && num > 0) {
@@ -628,13 +678,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   const fairQueueConfigRaw = downloadBootstrap.fairQueue && typeof downloadBootstrap.fairQueue === 'object'
     ? downloadBootstrap.fairQueue
     : {};
-  const fairQueueProfiles = fairQueueConfigRaw.profiles && typeof fairQueueConfigRaw.profiles === 'object'
-    ? fairQueueConfigRaw.profiles
-    : {};
-  const fairQueueProfileName = typeof downloadDecision?.fairQueueProfile === 'string' && downloadDecision.fairQueueProfile.trim() !== ''
-    ? downloadDecision.fairQueueProfile.trim()
-    : 'default';
-  const fairQueueProfile = fairQueueProfiles[fairQueueProfileName] || fairQueueProfiles.default || {};
   const fairQueueHostnamePatterns = Array.isArray(fairQueueConfigRaw.hostPatterns)
     ? fairQueueConfigRaw.hostPatterns.map((p) => normalizeString(p)).filter((p) => p.length > 0)
     : [];
@@ -660,18 +703,13 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   if (fairQueueEnabled && !slotHandlerUrl) {
     throw new Error('controller fairQueue.slotHandlerUrl is required when fairQueue.enabled is true');
   }
-  const fairQueueProfileNormalized = {
-    maxWaitMs: Number(fairQueueProfile.maxWaitMs) > 0 ? Number(fairQueueProfile.maxWaitMs) : queueWaitTimeoutMs,
-    maxSlotPerHost: Number(fairQueueProfile.maxSlotPerHost) > 0 ? Number(fairQueueProfile.maxSlotPerHost) : 8,
-    maxSlotPerIp: Number(fairQueueProfile.maxSlotPerIp) > 0 ? Number(fairQueueProfile.maxSlotPerIp) : 3,
-    maxWaitersPerIp: Number(fairQueueProfile.maxWaitersPerIp) > 0 ? Number(fairQueueProfile.maxWaitersPerIp) : 8,
-  };
   const fairQueueConfig = {
     queueWaitTimeoutMs,
-    profile: fairQueueProfileName,
     slotHandlerTimeoutMs,
-    profileConfig: fairQueueProfileNormalized,
   };
+  const fairQueueSiteBucket = fairQueueConfigRaw.siteBucket && typeof fairQueueConfigRaw.siteBucket === 'object'
+    ? fairQueueConfigRaw.siteBucket
+    : {};
   const slotHandlerConfig = {
     url: slotHandlerUrl,
     totalMaxWaitMs: slotHandlerTimeoutMs,
@@ -683,6 +721,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     fairQueueEnabled,
     fairQueueHostnamePatterns,
     fairQueueConfig,
+    fairQueueSiteBucket,
   };
 
   const enableCfRatelimiter = normalizeString(env.ENABLE_CF_RATELIMITER, 'false').toLowerCase() === 'true';
@@ -737,6 +776,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     fairQueueEnabled: fairQueueContext.fairQueueEnabled,
     fairQueueHostnamePatterns: fairQueueContext.fairQueueHostnamePatterns,
     fairQueueConfig: fairQueueContext.fairQueueConfig,
+    fairQueueSiteBucket: fairQueueContext.fairQueueSiteBucket,
   };
 };
 
@@ -1052,9 +1092,9 @@ const createSlotHandlerClient = (config) => {
     throw new Error('[FQ] slot-handler backend enabled but FAIR_QUEUE_SLOT_HANDLER_URL is missing');
   }
 
-  const acquireUrl = `${baseUrl}/api/v0/fairqueue/acquire`;
-  const releaseUrl = `${baseUrl}/api/v0/fairqueue/release`;
-  const cancelUrl = `${baseUrl}/api/v0/fairqueue/cancel`;
+  const acquireUrl = `${baseUrl}/api/v1/fairqueue/acquire`;
+  const releaseUrl = `${baseUrl}/api/v1/fairqueue/release`;
+  const cancelUrl = `${baseUrl}/api/v1/fairqueue/cancel`;
   const authKey = slotCfg.authKey || '';
   const throttleTimeWindowSeconds =
     Number(config.throttleConfig?.throttleTimeWindow) > 0
@@ -1142,6 +1182,7 @@ const createSlotHandlerClient = (config) => {
               hostname: fqContext.hostname,
               hostnameHash: fqContext.hostnameHash,
               ipBucket: fqContext.ipBucket,
+              siteBucket: fqContext.siteBucket,
               now: fqContext.nowMs,
               throttleTimeWindowSeconds,
             };
@@ -1280,6 +1321,7 @@ const createSlotHandlerClient = (config) => {
         hostname: fqContext.hostname,
         hostnameHash: fqContext.hostnameHash,
         ipBucket: fqContext.ipBucket,
+        siteBucket: fqContext.siteBucket,
         slotToken: fqContext.slotToken,
         hitUpstreamAtMs: fqContext.hitUpstreamAtMs || fqContext.nowMs,
         now: Date.now(),
@@ -1909,10 +1951,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         console.error('[Fair Queue] Failed to initialize client:', message);
         return createErrorResponse(origin, 503, 'Fair queue unavailable');
       }
+      const siteBucket = await deriveSiteBucket(upstreamHostname, downloadUrl, config.fairQueueSiteBucket);
       fqContext = {
         hostname: upstreamHostname,
         hostnameHash,
         ipBucket: clientIpSubnetHash,
+        siteBucket,
         nowMs: Date.now(),
       };
 
