@@ -1082,7 +1082,7 @@ const createSlotHandlerClient = (config) => {
   if (!baseUrl) {
     if (pgErrorHandle === 'fail-open') {
       return {
-        async waitForSlot() {
+        async waitForSlot(ctx, fqContext, signal) {
           console.warn('[FQ] slot-handler URL missing, granting slot (fail-open)');
           return { kind: 'granted' };
         },
@@ -1121,9 +1121,17 @@ const createSlotHandlerClient = (config) => {
     return headers;
   };
 
-  const fetchWithTimeout = async (url, payload, timeoutMs) => {
+  const fetchWithTimeout = async (url, payload, timeoutMs, signal) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const abortHandler = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) {
+        controller.abort();
+      } else {
+        signal.addEventListener('abort', abortHandler, { once: true });
+      }
+    }
     try {
       return await fetch(url, {
         method: 'POST',
@@ -1133,6 +1141,9 @@ const createSlotHandlerClient = (config) => {
       });
     } finally {
       clearTimeout(timer);
+      if (signal) {
+        signal.removeEventListener('abort', abortHandler);
+      }
     }
   };
 
@@ -1142,13 +1153,68 @@ const createSlotHandlerClient = (config) => {
     return Math.max(1, Math.min(maxAttemptsCap, safeAttempts));
   };
 
+  const createAbortError = () => {
+    const error = new Error('Aborted');
+    error.name = 'AbortError';
+    return error;
+  };
+
+  const sendCancel = async (ctx, fqContext, tokenOverride, reason) => {
+    const token = tokenOverride || fqContext?.queryToken;
+    if (!token) {
+      return;
+    }
+    const payload = { queryToken: token };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      await fetch(cancelUrl, {
+        method: 'POST',
+        headers: buildHeaders(),
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      if (reason) {
+        console.log(`[FQ] cancel session via slot-handler host=${fqContext?.hostname || ''} reason=${reason}`);
+      } else {
+        console.log(`[FQ] cancel session via slot-handler host=${fqContext?.hostname || ''}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn('[FQ] cancelSession error (slot-handler):', message);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
   return {
-    async waitForSlot(ctx, fqContext) {
+    async waitForSlot(ctx, fqContext, signal) {
       const maxAttempts = computeMaxAttempts();
       const hostKey = fqContext?.hostname || '';
       let queryToken = null;
 
+      const scheduleCancel = (reason) => {
+        const token = queryToken || fqContext?.queryToken;
+        if (!token || !fqContext || fqContext.cancelIssued) {
+          return;
+        }
+        fqContext.cancelIssued = true;
+        const cancelPromise = sendCancel(ctx, fqContext, token, reason);
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil(cancelPromise);
+        }
+      };
+
+      const throwIfAborted = () => {
+        if (signal && signal.aborted) {
+          scheduleCancel('client_abort');
+          throw createAbortError();
+        }
+      };
+
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        throwIfAborted();
         const now = Date.now();
 
         const overloadedRemain = getOverloadedRemainingSeconds(now);
@@ -1189,11 +1255,16 @@ const createSlotHandlerClient = (config) => {
 
         let res;
         try {
-          res = await fetchWithTimeout(acquireUrl, payload, perRequestTimeoutMs);
+          res = await fetchWithTimeout(acquireUrl, payload, perRequestTimeoutMs, signal);
         } catch (error) {
+          if (signal && signal.aborted) {
+            scheduleCancel('client_abort');
+            throw createAbortError();
+          }
           const message = error instanceof Error ? error.message : String(error);
           console.error('[FQ] slot-handler acquire error:', message);
           if (attempt === maxAttempts) {
+            scheduleCancel('slot-handler-unreachable');
             return pgErrorHandle === 'fail-open'
               ? { kind: 'granted' }
               : { kind: 'timeout', reason: 'slot-handler-unreachable' };
@@ -1205,8 +1276,10 @@ const createSlotHandlerClient = (config) => {
           const message = `[FQ] slot-handler acquire failed: status ${res.status}`;
           console.error(message);
           if (pgErrorHandle === 'fail-open') {
+            scheduleCancel('slot-handler-bad-status');
             return { kind: 'granted' };
           }
+          scheduleCancel('slot-handler-bad-status');
           throw new Error(message);
         }
 
@@ -1217,6 +1290,7 @@ const createSlotHandlerClient = (config) => {
           const message = error instanceof Error ? error.message : String(error);
           console.error('[FQ] slot-handler response parse error:', message);
           if (attempt === maxAttempts) {
+            scheduleCancel('slot-handler-invalid-response');
             return pgErrorHandle === 'fail-open'
               ? { kind: 'granted' }
               : { kind: 'timeout', reason: 'slot-handler-invalid-response' };
@@ -1254,6 +1328,7 @@ const createSlotHandlerClient = (config) => {
               retryAfter: retryAfter ?? undefined,
             };
           case 'timeout':
+            scheduleCancel('slot-handler-timeout');
             return { kind: 'timeout' };
           case 'overloaded': {
             console.warn(`[FQ] slot-handler overloaded for host=${fqContext.hostname}`);
@@ -1274,13 +1349,16 @@ const createSlotHandlerClient = (config) => {
             const message = `[FQ] unexpected slot-handler result: ${data?.result}`;
             console.error(message);
             if (pgErrorHandle === 'fail-open') {
+              scheduleCancel('slot-handler-unexpected');
               return { kind: 'granted' };
             }
+            scheduleCancel('slot-handler-unexpected');
             throw new Error(message);
           }
         }
       }
 
+      scheduleCancel('slot-handler-loop-exhausted');
       return pgErrorHandle === 'fail-open'
         ? { kind: 'granted' }
         : { kind: 'timeout', reason: 'slot-handler-loop-exhausted' };
@@ -1288,28 +1366,11 @@ const createSlotHandlerClient = (config) => {
 
     async cancelSession(ctx, fqContext) {
       const token = fqContext?.queryToken;
-      if (!token) {
+      if (!token || !fqContext || fqContext.cancelIssued) {
         return;
       }
-
-      const payload = { queryToken: token };
-
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
-      try {
-        await fetch(cancelUrl, {
-          method: 'POST',
-          headers: buildHeaders(),
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        });
-        console.log(`[FQ] cancel session via slot-handler host=${fqContext.hostname}`);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn('[FQ] cancelSession error (slot-handler):', message);
-      } finally {
-        clearTimeout(timer);
-      }
+      fqContext.cancelIssued = true;
+      await sendCancel(ctx, fqContext, token);
     },
 
     async releaseSlot(ctx, fqContext) {
@@ -1961,7 +2022,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       };
 
       try {
-        const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext);
+        const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, clientSignal);
         if (fqResult.kind === 'throttled') {
           const retryAfter = normalizePositiveSeconds(
             fqResult.retryAfter,
@@ -2132,7 +2193,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
                 nowMs: Date.now(),
               };
 
-              const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext);
+              const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, clientSignal);
               if (fqResult.kind === 'throttled') {
                 const retryAfter = normalizePositiveSeconds(
                   fqResult.retryAfter,
@@ -2358,7 +2419,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     return safeResponse;
   } finally {
-    if (shouldSendFQCancel && fairQueueClient && fqContext && fqContext.queryToken) {
+    if (shouldSendFQCancel && fairQueueClient && fqContext && fqContext.queryToken && !fqContext.cancelIssued) {
       const cancelPromise = fairQueueClient.cancelSession(ctx, fqContext);
       if (ctx && typeof ctx.waitUntil === 'function') {
         ctx.waitUntil(cancelPromise);

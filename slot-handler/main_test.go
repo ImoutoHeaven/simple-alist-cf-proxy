@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,10 +38,10 @@ func (s *stubBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error
 func testWeightedConfig() *Config {
 	return &Config{
 		FairQueue: FairQueueConfig{
-			PollIntervalMs:  100,
-			MinSlotHoldMs:   0,
-			HostCaps:        HostCapsConfig{MaxSlotPerHost: intPtr(2)},
-			SiteCaps:        SiteCapsConfig{MaxSlotPerSite: intPtr(2)},
+			PollIntervalMs: 100,
+			MinSlotHoldMs:  0,
+			HostCaps:       HostCapsConfig{MaxSlotPerHost: intPtr(2)},
+			SiteCaps:       SiteCapsConfig{MaxSlotPerSite: intPtr(2)},
 			WeightedScheduler: WeightedSchedulerConfig{
 				Enabled:           true,
 				HotPendingFactor:  1,
@@ -67,11 +68,8 @@ func TestRegisterAndUnregisterSession(t *testing.T) {
 
 	s.unregisterSession(sess)
 	host = s.getHostState(fqHostKey(sess.HostnameHash, sess.Hostname))
-	if host == nil {
-		t.Fatalf("host state removed unexpectedly")
-	}
-	if host.TotalPending != 0 {
-		t.Fatalf("expected host.TotalPending=0 after unregister, got %d", host.TotalPending)
+	if host != nil {
+		t.Fatalf("expected host state to be removed when empty, got %+v", host)
 	}
 }
 
@@ -241,6 +239,136 @@ func TestBucketLocalWRRPrefersLowestLocalVTThenCreatedAt(t *testing.T) {
 	host.mu.Unlock()
 	if minVT == 0 {
 		t.Fatalf("expected MinLocalVT to advance after both sessions probed, got %d", minVT)
+	}
+}
+
+func TestWeightedSchedulerAppliesWeightsWhenHot(t *testing.T) {
+	cfg := &Config{
+		FairQueue: FairQueueConfig{
+			PollIntervalMs: 100,
+			HostCaps:       HostCapsConfig{MaxSlotPerHost: intPtr(1)},
+			SiteCaps:       SiteCapsConfig{MaxSlotPerSite: intPtr(1)},
+			WeightedScheduler: WeightedSchedulerConfig{
+				Enabled:           true,
+				HotPendingFactor:  1,
+				HotPendingMin:     1,
+				ColdAvgWaitMs:     500,
+				HotAvgWaitMs:      2000,
+				MaxProbesPerCycle: 2,
+				BaseWeight:        1,
+				WeightPerWait:     1,
+			},
+		},
+	}
+	s := newTestServer()
+
+	older := time.Now().Add(-time.Second)
+	sess1 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "s1", CreatedAt: older}
+	sess2 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "s2", CreatedAt: time.Now()}
+	s.registerPendingSession(sess1)
+	s.registerPendingSession(sess2)
+
+	hostKey := fqHostKey("h1", "example.com")
+	host := s.getHostState(hostKey)
+	if host == nil {
+		t.Fatalf("expected host state to exist")
+	}
+	host.mu.Lock()
+	site := host.Sites["s1"]
+	bucket := site.Buckets[fqBucketKey{IPBucket: "ip1"}]
+	site.WaitCount = 3
+	bucket.WaitCount = 3
+	host.TotalPending = 2
+	host.mu.Unlock()
+
+	if !s.shouldProbe(cfg, sess1) {
+		t.Fatalf("expected probe allowed for hot host")
+	}
+
+	host.mu.Lock()
+	site = host.Sites["s1"]
+	bucket = site.Buckets[fqBucketKey{IPBucket: "ip1"}]
+	siteVT := site.VirtualTime
+	bucketVT := bucket.VirtualTime
+	host.mu.Unlock()
+
+	if math.Abs(siteVT-0.25) > 0.0001 {
+		t.Fatalf("expected site VirtualTime weighted to ~0.25, got %f", siteVT)
+	}
+	if math.Abs(bucketVT-0.25) > 0.0001 {
+		t.Fatalf("expected bucket VirtualTime weighted to ~0.25, got %f", bucketVT)
+	}
+}
+
+func TestWeightedSchedulerSkipsWeightsWhenCold(t *testing.T) {
+	cfg := &Config{
+		FairQueue: FairQueueConfig{
+			PollIntervalMs: 100,
+			HostCaps:       HostCapsConfig{MaxSlotPerHost: intPtr(1)},
+			SiteCaps:       SiteCapsConfig{MaxSlotPerSite: intPtr(1)},
+			WeightedScheduler: WeightedSchedulerConfig{
+				Enabled:           true,
+				HotPendingFactor:  100,
+				HotPendingMin:     100,
+				ColdAvgWaitMs:     500,
+				HotAvgWaitMs:      2000,
+				MaxProbesPerCycle: 2,
+				BaseWeight:        1,
+				WeightPerWait:     10,
+			},
+		},
+	}
+	s := newTestServer()
+
+	older := time.Now().Add(-time.Second)
+	sess1 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "s1", CreatedAt: older}
+	sess2 := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "s2", CreatedAt: time.Now()}
+	s.registerPendingSession(sess1)
+	s.registerPendingSession(sess2)
+
+	hostKey := fqHostKey("h1", "example.com")
+	host := s.getHostState(hostKey)
+	if host == nil {
+		t.Fatalf("expected host state to exist")
+	}
+	host.mu.Lock()
+	host.AvgWaitMs = 100
+	site := host.Sites["s1"]
+	bucket := site.Buckets[fqBucketKey{IPBucket: "ip1"}]
+	site.WaitCount = 5
+	bucket.WaitCount = 5
+	host.TotalPending = 2
+	host.mu.Unlock()
+
+	if !s.shouldProbe(cfg, sess1) {
+		t.Fatalf("expected probe allowed for cold host")
+	}
+
+	host.mu.Lock()
+	site = host.Sites["s1"]
+	bucket = site.Buckets[fqBucketKey{IPBucket: "ip1"}]
+	siteVT := site.VirtualTime
+	bucketVT := bucket.VirtualTime
+	host.mu.Unlock()
+
+	if math.Abs(siteVT-1.0) > 0.0001 {
+		t.Fatalf("expected site VirtualTime to advance by 1 when cold, got %f", siteVT)
+	}
+	if math.Abs(bucketVT-1.0) > 0.0001 {
+		t.Fatalf("expected bucket VirtualTime to advance by 1 when cold, got %f", bucketVT)
+	}
+}
+
+func TestHotPendingThresholdUsesMax(t *testing.T) {
+	ws := WeightedSchedulerConfig{
+		HotPendingFactor: 2,
+		HotPendingMin:    10,
+	}
+	if isHotByPending(ws, 6, 2) {
+		t.Fatalf("expected pending=6 to be below max threshold (10)")
+	}
+	if !isHotByPending(ws, 10, 2) {
+		t.Fatalf("expected pending=10 to meet max threshold (10)")
 	}
 }
 

@@ -113,24 +113,24 @@ type SiteCapsConfig struct {
 }
 
 type AcquireRequest struct {
-	Hostname             string `json:"hostname"`
-	HostnameHash         string `json:"hostnameHash"`
-	IPBucket             string `json:"ipBucket"`
-	SiteBucket           string `json:"siteBucket"`
-	Now                  int64  `json:"now"`
-	ThrottleTimeWindow   int    `json:"throttleTimeWindowSeconds,omitempty"`
-	HostMaxSlotPerHost   int    `json:"hostMaxSlotPerHost,omitempty"`
-	HostMaxSlotPerIP     int    `json:"hostMaxSlotPerIp,omitempty"`
-	HostMaxWaitersPerIP  int    `json:"hostMaxWaitersPerIp,omitempty"`
-	HostMaxWaitersPerHost int   `json:"hostMaxWaitersPerHost,omitempty"`
-	SiteMaxSlotPerSite   int    `json:"siteMaxSlotPerSite,omitempty"`
-	SiteMaxSlotPerIP     int    `json:"siteMaxSlotPerIp,omitempty"`
-	SiteMaxWaitersPerIP  int    `json:"siteMaxWaitersPerIp,omitempty"`
-	SiteMaxWaitersPerSite int   `json:"siteMaxWaitersPerSite,omitempty"`
-	ZombieTimeoutSeconds int    `json:"zombieTimeoutSeconds,omitempty"`
-	CooldownSeconds      int    `json:"cooldownSeconds,omitempty"`
-	PollIntervalMs       int64  `json:"pollIntervalMs,omitempty"`
-	QueryToken           string `json:"queryToken,omitempty"`
+	Hostname              string `json:"hostname"`
+	HostnameHash          string `json:"hostnameHash"`
+	IPBucket              string `json:"ipBucket"`
+	SiteBucket            string `json:"siteBucket"`
+	Now                   int64  `json:"now"`
+	ThrottleTimeWindow    int    `json:"throttleTimeWindowSeconds,omitempty"`
+	HostMaxSlotPerHost    int    `json:"hostMaxSlotPerHost,omitempty"`
+	HostMaxSlotPerIP      int    `json:"hostMaxSlotPerIp,omitempty"`
+	HostMaxWaitersPerIP   int    `json:"hostMaxWaitersPerIp,omitempty"`
+	HostMaxWaitersPerHost int    `json:"hostMaxWaitersPerHost,omitempty"`
+	SiteMaxSlotPerSite    int    `json:"siteMaxSlotPerSite,omitempty"`
+	SiteMaxSlotPerIP      int    `json:"siteMaxSlotPerIp,omitempty"`
+	SiteMaxWaitersPerIP   int    `json:"siteMaxWaitersPerIp,omitempty"`
+	SiteMaxWaitersPerSite int    `json:"siteMaxWaitersPerSite,omitempty"`
+	ZombieTimeoutSeconds  int    `json:"zombieTimeoutSeconds,omitempty"`
+	CooldownSeconds       int    `json:"cooldownSeconds,omitempty"`
+	PollIntervalMs        int64  `json:"pollIntervalMs,omitempty"`
+	QueryToken            string `json:"queryToken,omitempty"`
 }
 
 type AcquirePayload struct {
@@ -311,11 +311,14 @@ func (m *memorySessionStore) Range(fn func(token string, sess *FQSession) bool) 
 type smoothHostReleaser struct {
 	mu            sync.Mutex
 	lastReleaseAt time.Time
+	lastAccessAt  time.Time
 }
 
 func (sr *smoothHostReleaser) nextReleaseAfter(base time.Time, interval time.Duration) time.Time {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
+
+	sr.lastAccessAt = time.Now()
 
 	if interval <= 0 {
 		sr.lastReleaseAt = base
@@ -512,6 +515,27 @@ func (s *server) getHostState(hostKey string) *fqHostState {
 	return host
 }
 
+func (s *server) maybeRemoveHost(hostKey string) {
+	if hostKey == "" {
+		return
+	}
+	s.fqMu.Lock()
+	defer s.fqMu.Unlock()
+	if s.fqHosts == nil {
+		return
+	}
+	host := s.fqHosts[hostKey]
+	if host == nil {
+		return
+	}
+	host.mu.Lock()
+	removable := len(host.Sites) == 0 && host.TotalPending == 0 && host.RegisteredWaiters == 0
+	host.mu.Unlock()
+	if removable {
+		delete(s.fqHosts, hostKey)
+	}
+}
+
 func (s *server) getOrCreateHostState(hostKey string) *fqHostState {
 	if hostKey == "" {
 		return nil
@@ -661,6 +685,9 @@ func (s *server) getThrottleState(hostKey string, now time.Time) (bool, int, int
 
 	st := s.throttleHost[hostKey]
 	if st == nil || st.ProtectedUntil.IsZero() || now.After(st.ProtectedUntil) {
+		if st != nil && (st.ProtectedUntil.IsZero() || now.After(st.ProtectedUntil)) {
+			delete(s.throttleHost, hostKey)
+		}
 		return false, 0, 0
 	}
 	remaining := int(st.ProtectedUntil.Sub(now).Seconds())
@@ -699,6 +726,7 @@ func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion str
 		s.smoothReleasers = nil
 		s.fqHosts = nil
 		s.throttleHost = nil
+		atomic.StoreInt64(&s.globalWaiters, 0)
 	}
 	s.cfg = cfg
 	s.backend = backend
@@ -815,7 +843,6 @@ func (s *server) unregisterSession(sess *FQSession) {
 	}
 
 	host.mu.Lock()
-	defer host.mu.Unlock()
 
 	siteKey := strings.TrimSpace(sess.SiteBucket)
 	if siteKey == "" {
@@ -824,6 +851,11 @@ func (s *server) unregisterSession(sess *FQSession) {
 	site := host.Sites[siteKey]
 	if site == nil {
 		sess.SchedulerTracked = false
+		shouldRemoveHost := len(host.Sites) == 0 && host.TotalPending == 0 && host.RegisteredWaiters == 0
+		host.mu.Unlock()
+		if shouldRemoveHost {
+			s.maybeRemoveHost(hostKey)
+		}
 		return
 	}
 
@@ -875,6 +907,11 @@ func (s *server) unregisterSession(sess *FQSession) {
 	}
 
 	sess.SchedulerTracked = false
+	shouldRemoveHost := len(host.Sites) == 0 && host.TotalPending == 0 && host.RegisteredWaiters == 0
+	host.mu.Unlock()
+	if shouldRemoveHost {
+		s.maybeRemoveHost(hostKey)
+	}
 }
 
 func (s *server) onTryAcquireFailed(sess *FQSession) {
@@ -1167,7 +1204,11 @@ func (s *server) untrackWaiter(sess *FQSession) {
 				}
 			}
 		}
+		shouldRemoveHost := len(host.Sites) == 0 && host.TotalPending == 0 && host.RegisteredWaiters == 0
 		host.mu.Unlock()
+		if shouldRemoveHost {
+			s.maybeRemoveHost(hostKey)
+		}
 	}
 	sess.WaiterCounted = false
 }
@@ -1307,6 +1348,27 @@ func (s *server) isIpInStructuralDenyWindow(site *fqSiteState, ipBucket string, 
 	return false
 }
 
+func isHotByPending(ws WeightedSchedulerConfig, pending int64, slotCap int) bool {
+	if pending <= 0 {
+		return false
+	}
+	factor := ws.HotPendingFactor
+	if factor <= 0 {
+		factor = 1
+	}
+	if slotCap <= 0 {
+		slotCap = 1
+	}
+	threshold := ws.HotPendingMin
+	if threshold <= 0 {
+		threshold = 1
+	}
+	if scaled := factor * slotCap; scaled > threshold {
+		threshold = scaled
+	}
+	return pending >= int64(threshold)
+}
+
 func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 	if cfg == nil || sess == nil {
 		return true
@@ -1324,6 +1386,15 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 	now := time.Now()
 	host.mu.Lock()
 	defer host.mu.Unlock()
+
+	hostHot := false
+	if ws.Enabled {
+		hostHot = isHotByPending(ws, host.TotalPending, cfg.FairQueue.hostMaxSlotPerHost()) ||
+			(ws.HotAvgWaitMs > 0 && host.AvgWaitMs >= ws.HotAvgWaitMs)
+		if !hostHot && ws.ColdAvgWaitMs > 0 && host.AvgWaitMs <= ws.ColdAvgWaitMs {
+			hostHot = false
+		}
+	}
 
 	siteKey := strings.TrimSpace(sess.SiteBucket)
 	if siteKey == "" {
@@ -1454,8 +1525,12 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 
 	siteWeight := 1.0
 	bucketWeight := 1.0
-	if ws.Enabled {
+	if ws.Enabled && hostHot {
 		siteWeight = ws.BaseWeight + ws.WeightPerWait*float64(chosenSite.WaitCount)
+	}
+
+	siteHot := hostHot && isHotByPending(ws, chosenSite.PendingSessions, cfg.FairQueue.siteMaxSlotPerSite())
+	if ws.Enabled && siteHot {
 		bucketWeight = ws.BaseWeight + ws.WeightPerWait*float64(chosenBucket.WaitCount)
 	}
 	if siteWeight <= 0 {
@@ -2420,6 +2495,15 @@ func (s *server) handleFirstAcquire(ctx context.Context, req AcquireRequest) (*A
 	if cfg == nil {
 		return nil, errors.New("config not loaded")
 	}
+	if strings.TrimSpace(req.Hostname) == "" && strings.TrimSpace(req.HostnameHash) == "" {
+		if s.log != nil {
+			s.log.Warnf("invalid acquire request: empty hostname")
+		}
+		return &AcquireResponse{
+			Result: "timeout",
+			Reason: "invalid_hostname",
+		}, nil
+	}
 	hostKey := fqHostKey(req.HostnameHash, req.Hostname)
 	now := time.Now()
 	siteBucket := strings.TrimSpace(req.SiteBucket)
@@ -2824,22 +2908,22 @@ func (s *server) buildAcquireRequest(cfg *Config, hostname, hostnameHash, ipBuck
 	}
 
 	return AcquireRequest{
-		Hostname:             hostname,
-		HostnameHash:         hostnameHash,
-		IPBucket:             ipBucket,
-		SiteBucket:           siteBucket,
-		Now:                  now.UnixMilli(),
-		ThrottleTimeWindow:   sanitizeThrottleWindowSeconds(throttleTimeWindow),
-		HostMaxSlotPerHost:   fq.hostMaxSlotPerHost(),
-		HostMaxSlotPerIP:     fq.hostMaxSlotPerIP(),
+		Hostname:              hostname,
+		HostnameHash:          hostnameHash,
+		IPBucket:              ipBucket,
+		SiteBucket:            siteBucket,
+		Now:                   now.UnixMilli(),
+		ThrottleTimeWindow:    sanitizeThrottleWindowSeconds(throttleTimeWindow),
+		HostMaxSlotPerHost:    fq.hostMaxSlotPerHost(),
+		HostMaxSlotPerIP:      fq.hostMaxSlotPerIP(),
 		HostMaxWaitersPerHost: fq.hostMaxWaitersPerHost(),
-		HostMaxWaitersPerIP:  fq.hostMaxWaitersPerIP(),
-		SiteMaxSlotPerSite:   fq.siteMaxSlotPerSite(),
-		SiteMaxSlotPerIP:     fq.siteMaxSlotPerIP(),
+		HostMaxWaitersPerIP:   fq.hostMaxWaitersPerIP(),
+		SiteMaxSlotPerSite:    fq.siteMaxSlotPerSite(),
+		SiteMaxSlotPerIP:      fq.siteMaxSlotPerIP(),
 		SiteMaxWaitersPerSite: fq.siteMaxWaitersPerSite(),
-		SiteMaxWaitersPerIP:  fq.siteMaxWaitersPerIP(),
-		ZombieTimeoutSeconds: fq.zombieTimeoutSeconds(),
-		CooldownSeconds:      fq.cooldownSeconds(),
+		SiteMaxWaitersPerIP:   fq.siteMaxWaitersPerIP(),
+		ZombieTimeoutSeconds:  fq.zombieTimeoutSeconds(),
+		CooldownSeconds:       fq.cooldownSeconds(),
 	}
 }
 
@@ -2957,28 +3041,23 @@ func (s *server) releaseSlotForSession(ctx context.Context, hostname, hostnameHa
 		ctx = context.Background()
 	}
 
-	backend := s.getBackend()
-	if backend == nil {
-		s.log.Warnf("release slot (cancel) skipped host=%s ip=%s: backend nil", hostname, ipBucket)
-		return
-	}
-
+	now := time.Now().UnixMilli()
 	req := ReleaseRequest{
-		Hostname:     hostname,
-		HostnameHash: hostnameHash,
-		IPBucket:     ipBucket,
-		SiteBucket:   siteBucket,
-		SlotToken:    slotToken,
-		Now:          time.Now().UnixMilli(),
+		Hostname:      hostname,
+		HostnameHash:  hostnameHash,
+		IPBucket:      ipBucket,
+		SiteBucket:    siteBucket,
+		SlotToken:     slotToken,
+		HitUpstreamAt: now,
+		Now:           now,
 	}
 
-	if err := backend.ReleaseSlot(ctx, req); err != nil {
+	if err := s.releaseSlot(ctx, req); err != nil {
 		s.log.Warnf("release slot (cancel) failed token=%s host=%s ip=%s: %v",
 			token, hostname, ipBucket, err)
-	} else {
-		s.log.Debugf("slot released (cancel) token=%s host=%s ip=%s", token, hostname, ipBucket)
-		s.incrementMetric("released")
+		return
 	}
+	s.log.Debugf("slot released (cancel) token=%s host=%s ip=%s", token, hostname, ipBucket)
 }
 
 func (s *server) startSessionGC(ctx context.Context) {
@@ -3068,9 +3147,9 @@ func (s *server) gcSessions() {
 
 	s.sessionStore.Range(func(token string, sess *FQSession) bool {
 		sess.mu.Lock()
-	timedOut := sess.State == StatePending &&
-		((idleLimit > 0 && now.Sub(sess.LastSeenAt) > idleLimit) ||
-			(maxWait > 0 && now.Sub(sess.CreatedAt) >= maxWait))
+		timedOut := sess.State == StatePending &&
+			((idleLimit > 0 && now.Sub(sess.LastSeenAt) > idleLimit) ||
+				(maxWait > 0 && now.Sub(sess.CreatedAt) >= maxWait))
 		shouldDelete := sess.State != StatePending || timedOut
 		if shouldDelete {
 			s.log.Debugf(
@@ -3086,6 +3165,58 @@ func (s *server) gcSessions() {
 		sess.mu.Unlock()
 		return true
 	})
+
+	s.cleanupHostCaches(now, cfg)
+}
+
+func (s *server) cleanupHostCaches(now time.Time, cfg *Config) {
+	if cfg == nil {
+		return
+	}
+
+	s.throttleMu.Lock()
+	for key, st := range s.throttleHost {
+		if st == nil || st.ProtectedUntil.IsZero() || now.After(st.ProtectedUntil) {
+			delete(s.throttleHost, key)
+		}
+	}
+	s.throttleMu.Unlock()
+
+	smoothTTL := cfg.FairQueue.sessionIdleDuration() * 2
+	if smoothTTL < 5*time.Minute {
+		smoothTTL = 5 * time.Minute
+	}
+	cutoff := now.Add(-smoothTTL)
+
+	s.smoothMu.Lock()
+	for key, releaser := range s.smoothReleasers {
+		if releaser == nil {
+			delete(s.smoothReleasers, key)
+			continue
+		}
+		releaser.mu.Lock()
+		lastAccess := releaser.lastAccessAt
+		releaser.mu.Unlock()
+		if !lastAccess.IsZero() && lastAccess.Before(cutoff) {
+			delete(s.smoothReleasers, key)
+		}
+	}
+	s.smoothMu.Unlock()
+
+	s.fqMu.Lock()
+	for key, host := range s.fqHosts {
+		if host == nil {
+			delete(s.fqHosts, key)
+			continue
+		}
+		host.mu.Lock()
+		removable := len(host.Sites) == 0 && host.TotalPending == 0 && host.RegisteredWaiters == 0
+		host.mu.Unlock()
+		if removable {
+			delete(s.fqHosts, key)
+		}
+	}
+	s.fqMu.Unlock()
 }
 
 func (s *server) getSmoothReleaser(hostnameHash, hostname string) *smoothHostReleaser {
@@ -3106,6 +3237,9 @@ func (s *server) getSmoothReleaser(hostnameHash, hostname string) *smoothHostRel
 		releaser = &smoothHostReleaser{}
 		s.smoothReleasers[key] = releaser
 	}
+	releaser.mu.Lock()
+	releaser.lastAccessAt = time.Now()
+	releaser.mu.Unlock()
 	return releaser
 }
 
@@ -3287,15 +3421,15 @@ func (b *postgrestBackend) RegisterWaiter(ctx context.Context, req AcquireReques
 		return &registerResult{allowed: true}, nil
 	}
 	body := map[string]interface{}{
-		"p_hostname_hash":          req.HostnameHash,
-		"p_hostname":               req.Hostname,
-		"p_site_bucket":            req.SiteBucket,
-		"p_ip_bucket":              req.IPBucket,
+		"p_hostname_hash":             req.HostnameHash,
+		"p_hostname":                  req.Hostname,
+		"p_site_bucket":               req.SiteBucket,
+		"p_ip_bucket":                 req.IPBucket,
 		"p_host_max_waiters_per_host": req.HostMaxWaitersPerHost,
 		"p_host_max_waiters_per_ip":   req.HostMaxWaitersPerIP,
 		"p_site_max_waiters_per_site": req.SiteMaxWaitersPerSite,
 		"p_site_max_waiters_per_ip":   req.SiteMaxWaitersPerIP,
-		"p_zombie_timeout_seconds": req.ZombieTimeoutSeconds,
+		"p_zombie_timeout_seconds":    req.ZombieTimeoutSeconds,
 	}
 	var resp struct {
 		Status       string `json:"status"`
@@ -3320,9 +3454,9 @@ func (b *postgrestBackend) ReleaseWaiter(ctx context.Context, req AcquireRequest
 		return nil
 	}
 	body := map[string]interface{}{
-		"p_hostname":   req.Hostname,
+		"p_hostname":    req.Hostname,
 		"p_site_bucket": req.SiteBucket,
-		"p_ip_bucket":  req.IPBucket,
+		"p_ip_bucket":   req.IPBucket,
 	}
 	return b.doRPC(ctx, fn, body, nil)
 }
@@ -3334,20 +3468,20 @@ func (b *postgrestBackend) TryAcquire(ctx context.Context, req AcquireRequest) (
 	}
 	window := pickInt(req.ThrottleTimeWindow, 60)
 	body := map[string]interface{}{
-		"p_hostname_hash":        req.HostnameHash,
-		"p_hostname":             req.Hostname,
-		"p_site_bucket":          req.SiteBucket,
-		"p_ip_bucket":            req.IPBucket,
-		"p_now_ms":               req.Now,
-		"p_host_max_slot_per_host": req.HostMaxSlotPerHost,
-		"p_host_max_slot_per_ip":   req.HostMaxSlotPerIP,
-		"p_site_max_slot_per_site": req.SiteMaxSlotPerSite,
-		"p_site_max_slot_per_ip":   req.SiteMaxSlotPerIP,
+		"p_hostname_hash":           req.HostnameHash,
+		"p_hostname":                req.Hostname,
+		"p_site_bucket":             req.SiteBucket,
+		"p_ip_bucket":               req.IPBucket,
+		"p_now_ms":                  req.Now,
+		"p_host_max_slot_per_host":  req.HostMaxSlotPerHost,
+		"p_host_max_slot_per_ip":    req.HostMaxSlotPerIP,
+		"p_site_max_slot_per_site":  req.SiteMaxSlotPerSite,
+		"p_site_max_slot_per_ip":    req.SiteMaxSlotPerIP,
 		"p_host_max_waiters_per_ip": req.HostMaxWaitersPerIP,
 		"p_site_max_waiters_per_ip": req.SiteMaxWaitersPerIP,
-		"p_zombie_timeout":       req.ZombieTimeoutSeconds,
-		"p_cooldown_seconds":     req.CooldownSeconds,
-		"p_throttle_time_window": window,
+		"p_zombie_timeout":          req.ZombieTimeoutSeconds,
+		"p_cooldown_seconds":        req.CooldownSeconds,
+		"p_throttle_time_window":    window,
 	}
 	var resp struct {
 		Status             string `json:"status"`
@@ -3443,6 +3577,13 @@ func newPostgresBackend(cfg Config, log *logger) (*postgresBackend, error) {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	return &postgresBackend{cfg: cfg, db: db, log: log}, nil
+}
+
+func (p *postgresBackend) Close() error {
+	if p == nil || p.db == nil {
+		return nil
+	}
+	return p.db.Close()
 }
 
 func (p *postgresBackend) CheckThrottle(ctx context.Context, req AcquireRequest) (throttleResult, error) {
