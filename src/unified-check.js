@@ -11,6 +11,9 @@ export const unifiedCheck = async (path, clientIP, config) => {
   if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
     throw new Error('[Unified Check] Missing PostgREST configuration');
   }
+  if (typeof config.cacheEnabled !== 'boolean') {
+    throw new Error('[Unified Check] cacheEnabled must be boolean');
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const throttleWindow = config.throttleTimeWindow ?? 60;
@@ -49,6 +52,7 @@ export const unifiedCheck = async (path, clientIP, config) => {
   const rpcUrl = `${config.postgrestUrl}/rpc/download_unified_check`;
   const rpcBody = {
     p_path_hash: pathHash,
+    p_cache_enabled: config.cacheEnabled,
     p_cache_ttl: cacheTTL,
     p_cache_table_name: cacheTableName,
 
@@ -61,6 +65,7 @@ export const unifiedCheck = async (path, clientIP, config) => {
 
     p_throttle_time_window: throttleWindow,
     p_throttle_table_name: throttleTableName,
+    p_throttle_hostname_hash: config.throttleHostnameHash ?? null,
 
     p_now: now,
 
@@ -103,7 +108,7 @@ export const unifiedCheck = async (path, clientIP, config) => {
     hostnameHash: null,
   };
   
-  if (row.cache_link_data) {
+  if (config.cacheEnabled && row.cache_link_data) {
     try {
       cacheResult.hit = true;
       cacheResult.linkData = JSON.parse(row.cache_link_data);
@@ -113,6 +118,8 @@ export const unifiedCheck = async (path, clientIP, config) => {
     } catch (error) {
       console.error('[Unified Check] Failed to parse cache link data:', error.message);
     }
+  } else if (!config.cacheEnabled) {
+    console.log('[Unified Check] Cache disabled for path:', path);
   } else {
     console.log('[Unified Check] Cache MISS for path:', path);
   }
@@ -155,16 +162,34 @@ export const unifiedCheck = async (path, clientIP, config) => {
   //   0 = normal operation (initialized or recovered)
   //   NULL = record does not exist
 
+  const normalizeThrottleRecordExists = (value) => {
+    if (value === true || value === 1 || value === '1') return true;
+    if (typeof value === 'string') {
+      const lowered = value.trim().toLowerCase();
+      if (lowered === 'true' || lowered === 't') return true;
+      if (lowered === 'false' || lowered === 'f') return false;
+    }
+    return false;
+  };
+
+  const normalizeThrottleProtected = (value) => {
+    if (value === 1 || value === '1' || value === true) return 1;
+    if (value === 0 || value === '0' || value === false) return 0;
+    return null;
+  };
+
+  const throttleIsProtected = normalizeThrottleProtected(row.throttle_is_protected);
+
   let throttleResult = {
     status: 'normal_operation',
-    recordExists: row.throttle_record_exists === true,
-    isProtected: row.throttle_is_protected,
+    recordExists: normalizeThrottleRecordExists(row.throttle_record_exists),
+    isProtected: throttleIsProtected,
     errorTimestamp: row.throttle_error_timestamp,
     errorCode: row.throttle_error_code,
     retryAfter: 0,
   };
 
-  if (row.throttle_is_protected === 1) {
+  if (throttleIsProtected === 1) {
     const errorTimestamp = parseInt(row.throttle_error_timestamp, 10);
     if (Number.isNaN(errorTimestamp)) {
       throttleResult.status = 'protected';
@@ -182,7 +207,7 @@ export const unifiedCheck = async (path, clientIP, config) => {
         console.log('[Unified Check] Throttle resume_operation (time window expired)');
       }
     }
-  } else if (row.throttle_is_protected === 0) {
+  } else if (throttleIsProtected === 0) {
     console.log('[Unified Check] Throttle normal_operation (IS_PROTECTED = 0)');
   } else {
     console.log('[Unified Check] Throttle normal_operation (no record)');

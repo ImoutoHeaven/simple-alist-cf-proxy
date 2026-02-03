@@ -585,7 +585,10 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   let cacheConfig = {};
 
   if (isCustomDb) {
-    cacheEnabled = true;
+    if (typeof dbConfig.cacheEnabled !== 'boolean') {
+      throw new Error('controller download.db.cacheEnabled must be boolean when mode=custom-pg-rest');
+    }
+    cacheEnabled = dbConfig.cacheEnabled;
     cacheConfig = {
       postgrestUrl,
       verifyHeader,
@@ -1608,20 +1611,21 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let unifiedResult = null;
   let cacheHit = false;
   let linkData = null;
+  let unifiedThrottleHostnameHash = null;
   
   // Use unified check when rate limit is enabled and dbMode is custom-pg-rest
   const supportsUnifiedCheck = config.rateLimitEnabled && config.dbMode === 'custom-pg-rest';
+  const rateLimitConfig = config.rateLimitConfig || {};
+  const unifiedRateLimit = rateLimitConfig.limit ?? config.ipSubnetLimit;
 
-  if (supportsUnifiedCheck) {
+  const runUnifiedCheck = async (throttleHostnameHash = null) => {
     try {
-      const rateLimitConfig = config.rateLimitConfig || {};
       const cacheConfig = config.cacheConfig || {};
       const throttleConfig = config.throttleConfig || {};
-      const limitConfigValue = rateLimitConfig.limit ?? config.ipSubnetLimit;
       const effectiveIdleTimeout =
         dynamicIdleTimeout ?? cacheConfig.idleTimeout ?? config.idleTimeout ?? 0;
 
-      unifiedResult = await unifiedCheck(path, clientIP, {
+      const result = await unifiedCheck(path, clientIP, {
         postgrestUrl: rateLimitConfig.postgrestUrl,
         verifyHeader: rateLimitConfig.verifyHeader,
         verifySecret: rateLimitConfig.verifySecret,
@@ -1629,7 +1633,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         idleTimeout: effectiveIdleTimeout,
         cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
         windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
-        limit: limitConfigValue ?? 100,
+        limit: unifiedRateLimit ?? 100,
         blockTimeSeconds: rateLimitConfig.blockTimeSeconds ?? 600,
         ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
         ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
@@ -1637,129 +1641,152 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
         throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
         lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
+        cacheEnabled: config.cacheEnabled,
+        throttleHostnameHash,
       });
-    } catch (error) {
-      console.error('[Unified Check] Failed:', error instanceof Error ? error.message : String(error));
-      console.error('[Unified Check] Stack:', error.stack);
 
-      // Respect PG_ERROR_HANDLE configuration
+      return { result };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error('[Unified Check] Failed:', errorMessage);
+      console.error('[Unified Check] Stack:', error instanceof Error ? error.stack : '');
+
       const pgErrorHandle = config.rateLimitConfig?.pgErrorHandle || 'fail-closed';
 
       if (pgErrorHandle === 'fail-open') {
         console.warn('[Unified Check] Fail-open mode: allowing request despite error');
-        // Reset unified check outputs so downstream logic can run without them
-        unifiedResult = null;
-        cacheHit = false;
-        linkData = null;
-        // Continue execution without returning
-      } else {
-        console.error('[Unified Check] Fail-closed mode: blocking request');
-        return createErrorResponse(origin, 500, `Unified check failed: ${error.message}`);
+        return { result: null };
+      }
+      console.error('[Unified Check] Fail-closed mode: blocking request');
+      return { errorResponse: createErrorResponse(origin, 500, `Unified check failed: ${errorMessage}`) };
+    }
+  };
+
+  const applyUnifiedResult = async (options = {}) => {
+    if (!unifiedResult) {
+      return null;
+    }
+
+    console.log('[Idle Debug] Unified check idle payload:', unifiedResult.idle ?? null);
+    if (!unifiedResult.rateLimit.allowed) {
+      if (unifiedResult.rateLimit.error) {
+        console.error('[Rate Limit] fail-closed error:', unifiedResult.rateLimit.error);
+        return createErrorResponse(origin, 500, unifiedResult.rateLimit.error);
+      }
+
+      const ipSubnetForBlock = unifiedResult.rateLimit.ipSubnet || ipSubnet || clientIP;
+      const retryAfter = normalizePositiveSeconds(
+        unifiedResult.rateLimit.retryAfter,
+        config.rateLimitConfig?.windowTimeSeconds || 0
+      );
+
+      if (ipSubnetForBlock && retryAfter > 0) {
+        markRateLimited(ipSubnetForBlock, retryAfter);
+      }
+
+      await slowFailDelay();
+
+      const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
+      console.warn(
+        '[Rate Limit] Subnet blocked (unified):',
+        ipSubnetForBlock,
+        `limit=${unifiedRateLimit}`,
+        `window=${windowLabel}`,
+        `retryAfter=${retryAfter}s`
+      );
+      return createRateLimitResponse(
+        origin,
+        ipSubnetForBlock,
+        unifiedRateLimit,
+        windowLabel,
+        retryAfter
+      );
+    }
+
+    if (unifiedResult.idle && unifiedResult.idle.expired) {
+      const idleReason = unifiedResult.idle.reason || 'Link expired due to inactivity';
+      const idleDuration = unifiedResult.idle.idleDuration ?? 'unknown';
+      const idleTimeout = unifiedResult.idle.timeout ?? 'unknown';
+      console.warn(
+        `[Idle Timeout] Link expired (idle ${idleDuration}s, timeout ${idleTimeout}s)`
+      );
+      if (idleCacheKey) {
+        putIdle410Cached(idleCacheKey);
+      }
+      return createErrorResponse(origin, 410, idleReason);
+    }
+
+    if (unifiedResult.cache.hit) {
+      cacheHit = true;
+      linkData = unifiedResult.cache.linkData;
+      if (unifiedResult.cache.hostnameHash) {
+        unifiedThrottleHostnameHash = unifiedResult.cache.hostnameHash;
       }
     }
-    if (unifiedResult) {
-      console.log('[Idle Debug] Unified check idle payload:', unifiedResult.idle ?? null);
-      if (!unifiedResult.rateLimit.allowed) {
-        if (unifiedResult.rateLimit.error) {
-          console.error('[Rate Limit] fail-closed error:', unifiedResult.rateLimit.error);
-          return createErrorResponse(origin, 500, unifiedResult.rateLimit.error);
-        }
 
-        const ipSubnetForBlock = unifiedResult.rateLimit.ipSubnet || ipSubnet || clientIP;
-        const retryAfter = normalizePositiveSeconds(
-          unifiedResult.rateLimit.retryAfter,
-          config.rateLimitConfig?.windowTimeSeconds || 0
-        );
+    if (config.throttleEnabled && unifiedResult.throttle.status === 'protected') {
+      const throttleInfo = unifiedResult.throttle || {};
+      const retryAfter = normalizePositiveSeconds(
+        throttleInfo.retryAfter,
+        config.throttleConfig?.throttleTimeWindow || 60
+      );
+      const throttleHostnameRaw = extractHostname(unifiedResult?.cache?.linkData?.url || '');
+      const throttleHostnameFromCache = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : '';
+      const throttleHostnameOverride = options.throttleHostname || '';
+      const throttleHostname = (throttleHostnameOverride || throttleHostnameFromCache).toLowerCase();
 
-        if (ipSubnetForBlock && retryAfter > 0) {
-          markRateLimited(ipSubnetForBlock, retryAfter);
-        }
-
-        await slowFailDelay();
-
-        const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
-        console.warn(
-          '[Rate Limit] Subnet blocked (unified):',
-          ipSubnetForBlock,
-          `limit=${config.ipSubnetLimit}`,
-          `window=${windowLabel}`,
-          `retryAfter=${retryAfter}s`
-        );
-        return createRateLimitResponse(
-          origin,
-          ipSubnetForBlock,
-          config.ipSubnetLimit,
-          windowLabel,
-          retryAfter
-        );
+      if (throttleHostname) {
+        markThrottled(throttleHostname, throttleInfo.errorCode || 503, retryAfter);
       }
 
-      if (unifiedResult.idle && unifiedResult.idle.expired) {
-        const idleReason = unifiedResult.idle.reason || 'Link expired due to inactivity';
-        const idleDuration = unifiedResult.idle.idleDuration ?? 'unknown';
-        const idleTimeout = unifiedResult.idle.timeout ?? 'unknown';
-        console.warn(
-          `[Idle Timeout] Link expired (idle ${idleDuration}s, timeout ${idleTimeout}s)`
-        );
-        if (idleCacheKey) {
-          putIdle410Cached(idleCacheKey);
-        }
-        return createErrorResponse(origin, 410, idleReason);
-      }
+      await slowFailDelay();
 
-      if (unifiedResult.cache.hit) {
-        cacheHit = true;
-        linkData = unifiedResult.cache.linkData;
-      }
+      console.log(
+        `[Throttle] Protected from unified check, returning error ${throttleInfo.errorCode}, retry after ${retryAfter}s`
+      );
 
-      if (config.throttleEnabled && unifiedResult.throttle.status === 'protected') {
-        const throttleInfo = unifiedResult.throttle || {};
-        const retryAfter = normalizePositiveSeconds(
-          throttleInfo.retryAfter,
-          config.throttleConfig?.throttleTimeWindow || 60
-        );
-        const throttleHostnameRaw = extractHostname(unifiedResult?.cache?.linkData?.url || '');
-        const throttleHostname = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : '';
+      return createThrottleProtectedResponse(origin, {
+        ...throttleInfo,
+        retryAfter,
+      });
+    }
 
-        if (throttleHostname) {
-          markThrottled(throttleHostname, throttleInfo.errorCode || 503, retryAfter);
-        }
+    if (rateLimiter && config.rateLimitConfig) {
+      const probability = config.rateLimitConfig.cleanupProbability || 0.01;
+      if (Math.random() < probability) {
+        console.log(`[Rate Limit Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
 
-        await slowFailDelay();
-
-        console.log(
-          `[Throttle] Protected from unified check, returning error ${throttleInfo.errorCode}, retry after ${retryAfter}s`
-        );
-
-        return createThrottleProtectedResponse(origin, {
-          ...throttleInfo,
-          retryAfter,
+        const { cleanupExpiredRecords } = await import('./ratelimit/custom-pg-rest.js');
+        const cleanupPromise = cleanupExpiredRecords(
+          config.rateLimitConfig.postgrestUrl,
+          config.rateLimitConfig.verifyHeader,
+          config.rateLimitConfig.verifySecret,
+          config.rateLimitConfig.tableName,
+          config.rateLimitConfig.windowTimeSeconds
+        ).catch((cleanupError) => {
+          console.error('[Rate Limit Cleanup] Failed:', cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
         });
-      }
 
-      if (rateLimiter && config.rateLimitConfig) {
-        const probability = config.rateLimitConfig.cleanupProbability || 0.01;
-        if (Math.random() < probability) {
-          console.log(`[Rate Limit Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
-
-          const { cleanupExpiredRecords } = await import('./ratelimit/custom-pg-rest.js');
-          const cleanupPromise = cleanupExpiredRecords(
-            config.rateLimitConfig.postgrestUrl,
-            config.rateLimitConfig.verifyHeader,
-            config.rateLimitConfig.verifySecret,
-            config.rateLimitConfig.tableName,
-            config.rateLimitConfig.windowTimeSeconds
-          ).catch((cleanupError) => {
-            console.error('[Rate Limit Cleanup] Failed:', cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
-          });
-
-          if (cleanupPromise && ctx && ctx.waitUntil) {
-            ctx.waitUntil(cleanupPromise);
-          }
+        if (cleanupPromise && ctx && ctx.waitUntil) {
+          ctx.waitUntil(cleanupPromise);
         }
       }
     }
-  } else {
+
+    return null;
+  };
+
+  if (supportsUnifiedCheck && config.cacheEnabled) {
+    const { result, errorResponse } = await runUnifiedCheck();
+    if (errorResponse) {
+      return errorResponse;
+    }
+    unifiedResult = result;
+    const unifiedResponse = await applyUnifiedResult();
+    if (unifiedResponse) {
+      return unifiedResponse;
+    }
+  } else if (!supportsUnifiedCheck) {
     // Fallback to original logic when unified check is not supported
     
     if (rateLimiter && config.rateLimitEnabled && clientIP) {
@@ -1917,6 +1944,26 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   // Use linkData from cache or API response
   let downloadUrl = res.data.url;
+  let unifiedThrottleHostname = null;
+
+  if (supportsUnifiedCheck && !config.cacheEnabled && !unifiedResult) {
+    const throttleHostnameRaw = extractHostname(downloadUrl);
+    unifiedThrottleHostname = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : null;
+    const throttleHostnameHash = unifiedThrottleHostname
+      ? await sha256Hash(unifiedThrottleHostname)
+      : null;
+    unifiedThrottleHostnameHash = throttleHostnameHash || null;
+
+    const { result, errorResponse } = await runUnifiedCheck(throttleHostnameHash);
+    if (errorResponse) {
+      return errorResponse;
+    }
+    unifiedResult = result;
+    const unifiedResponse = await applyUnifiedResult({ throttleHostname: unifiedThrottleHostname });
+    if (unifiedResponse) {
+      return unifiedResponse;
+    }
+  }
   // ========================================
   // Throttle protection logic (pre-check)
   // ========================================
@@ -1928,12 +1975,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     const throttleHostnameRaw = extractHostname(downloadUrl);
     throttleHostname = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : null;
 
-    const unifiedThrottleUsable =
-      unifiedResult &&
-      unifiedResult.cache &&
-      unifiedResult.cache.hit &&
-      unifiedResult.cache.hostnameHash &&
-      unifiedResult.throttle;
+    const unifiedThrottleUsable = Boolean(
+      unifiedResult && unifiedResult.throttle && unifiedThrottleHostnameHash
+    );
 
     if (unifiedThrottleUsable) {
       throttleStatus = unifiedResult.throttle;

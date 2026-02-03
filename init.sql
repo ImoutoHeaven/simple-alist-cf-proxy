@@ -507,6 +507,7 @@ CREATE OR REPLACE FUNCTION download_unified_check(
   -- Cache parameters
   p_path_hash TEXT,
   p_cache_ttl INTEGER,
+  p_cache_enabled BOOLEAN,
   p_cache_table_name TEXT,
 
   -- Rate limit parameters
@@ -520,6 +521,7 @@ CREATE OR REPLACE FUNCTION download_unified_check(
   -- Throttle parameters
   p_throttle_time_window INTEGER,
   p_throttle_table_name TEXT,
+  p_throttle_hostname_hash TEXT,
 
   -- General parameters
   p_now BIGINT DEFAULT NULL,
@@ -555,6 +557,7 @@ DECLARE
   v_rate_record RECORD;
   v_throttle_record RECORD;
   v_cache_hostname_hash TEXT;
+  v_throttle_hostname_hash TEXT;
   v_active_record RECORD;
 
   v_cache_link_data TEXT := NULL;
@@ -578,18 +581,20 @@ BEGIN
   -- Step 1: Cache lookup
   v_actual_path_hash := p_path_hash;
 
-  EXECUTE format('SELECT "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH" FROM %1$I WHERE "PATH_HASH" = $1', p_cache_table_name)
-    INTO v_cache_record
-    USING v_actual_path_hash;
+  IF p_cache_enabled THEN
+    EXECUTE format('SELECT "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH" FROM %1$I WHERE "PATH_HASH" = $1', p_cache_table_name)
+      INTO v_cache_record
+      USING v_actual_path_hash;
 
-  IF v_cache_record."TIMESTAMP" IS NOT NULL AND (v_now - v_cache_record."TIMESTAMP") <= p_cache_ttl THEN
-    v_cache_link_data := v_cache_record."LINK_DATA";
-    v_cache_timestamp := v_cache_record."TIMESTAMP";
-    v_cache_hostname_hash := v_cache_record."HOSTNAME_HASH";
-  ELSE
-    v_cache_link_data := NULL;
-    v_cache_timestamp := NULL;
-    v_cache_hostname_hash := NULL;
+    IF v_cache_record."TIMESTAMP" IS NOT NULL AND (v_now - v_cache_record."TIMESTAMP") <= p_cache_ttl THEN
+      v_cache_link_data := v_cache_record."LINK_DATA";
+      v_cache_timestamp := v_cache_record."TIMESTAMP";
+      v_cache_hostname_hash := v_cache_record."HOSTNAME_HASH";
+    ELSE
+      v_cache_link_data := NULL;
+      v_cache_timestamp := NULL;
+      v_cache_hostname_hash := NULL;
+    END IF;
   END IF;
 
   -- Step 2: Rate limit upsert
@@ -609,11 +614,12 @@ BEGIN
   v_rate_last_window_time := v_rate_record."LAST_WINDOW_TIME";
   v_rate_block_until := v_rate_record."BLOCK_UNTIL";
 
-  -- Step 3: Throttle lookup (only when cache provided hostname)
-  IF v_cache_hostname_hash IS NOT NULL THEN
+  -- Step 3: Throttle lookup (provided hostname hash or cache hostname)
+  v_throttle_hostname_hash := COALESCE(p_throttle_hostname_hash, v_cache_hostname_hash);
+  IF v_throttle_hostname_hash IS NOT NULL THEN
     EXECUTE format('SELECT "IS_PROTECTED", "ERROR_TIMESTAMP", "LAST_ERROR_CODE" FROM %1$I WHERE "HOSTNAME_HASH" = $1', p_throttle_table_name)
       INTO v_throttle_record
-      USING v_cache_hostname_hash;
+      USING v_throttle_hostname_hash;
 
     IF v_throttle_record."IS_PROTECTED" IS NOT NULL THEN
       v_throttle_record_exists := TRUE;
