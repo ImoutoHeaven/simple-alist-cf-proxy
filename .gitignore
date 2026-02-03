@@ -7,3 +7,4 @@ pages_entrance/dist/
 *.log
 slot-handler/slot-handler
 slot-handler/slot-handler-*
+.worktrees/
