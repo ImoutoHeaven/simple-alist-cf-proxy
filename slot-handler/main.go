@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -59,6 +60,10 @@ type FairQueueConfig struct {
 	PollWindowMs            int64                  `json:"pollWindowMs"`
 	GraceMs                 int64                  `json:"graceMs"`
 	MinSlotHoldMs           int64                  `json:"minSlotHoldMs"`
+	UtilWindowSec           int                    `json:"utilWindowSec"`
+	MaxBatch                int                    `json:"maxBatch"`
+	MaxProbeParallel        int                    `json:"maxProbeParallel"`
+	MaxProbeQpsPerHost      int                    `json:"maxProbeQpsPerHost"`
 	SmoothReleaseIntervalMs *int64                 `json:"smoothReleaseIntervalMs,omitempty"`
 	ZombieTimeoutSeconds    int                    `json:"zombieTimeoutSeconds"`
 	IPCooldownSeconds       int                    `json:"ipCooldownSeconds"`
@@ -149,8 +154,34 @@ type tryAcquireResult struct {
 	throttleRetryAfter int
 }
 
+func validateAcquireBatchInputs(reqs []AcquireRequest) error {
+	if len(reqs) == 0 {
+		return nil
+	}
+	first := reqs[0]
+	for i := 1; i < len(reqs); i++ {
+		req := reqs[i]
+		if req.Hostname != first.Hostname || req.HostnameHash != first.HostnameHash || req.Now != first.Now {
+			return fmt.Errorf("tryAcquire batch inputs must match hostname/hash/now (index=%d)", i)
+		}
+		if req.HostMaxSlotPerHost != first.HostMaxSlotPerHost || req.HostMaxSlotPerIP != first.HostMaxSlotPerIP {
+			return fmt.Errorf("tryAcquire batch inputs must match host caps (index=%d)", i)
+		}
+		if req.SiteMaxSlotPerSite != first.SiteMaxSlotPerSite || req.SiteMaxSlotPerIP != first.SiteMaxSlotPerIP {
+			return fmt.Errorf("tryAcquire batch inputs must match site caps (index=%d)", i)
+		}
+		if req.ZombieTimeoutSeconds != first.ZombieTimeoutSeconds || req.CooldownSeconds != first.CooldownSeconds {
+			return fmt.Errorf("tryAcquire batch inputs must match timeouts (index=%d)", i)
+		}
+		if req.ThrottleTimeWindow != first.ThrottleTimeWindow {
+			return fmt.Errorf("tryAcquire batch inputs must match throttle window (index=%d)", i)
+		}
+	}
+	return nil
+}
+
 type queueBackend interface {
-	TryAcquire(ctx context.Context, req AcquireRequest) (*tryAcquireResult, error)
+	TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error)
 	ReleaseSlot(ctx context.Context, req ReleaseRequest) error
 }
 
@@ -273,6 +304,12 @@ type server struct {
 	backend          queueBackend
 	log              *logger
 	flowStore        *flowStore
+	activeSlots      *activeTracker
+	utilMu           sync.Mutex
+	utilHost         map[string]*utilWindow
+	utilSite         map[string]*utilWindow
+	utilHostLast     map[string]int64
+	utilSiteLast     map[string]int64
 	flowSchedMu      sync.Mutex
 	flowSched        map[string]*fqHostFlowScheduler
 	flowRunnerMu     sync.Mutex
@@ -352,6 +389,10 @@ func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion str
 		s.flowSched = nil
 		s.smoothReleasers = nil
 		s.throttleHost = nil
+		s.utilHost = nil
+		s.utilSite = nil
+		s.utilHostLast = nil
+		s.utilSiteLast = nil
 	}
 	s.cfg = cfg
 	s.backend = backend
@@ -571,6 +612,41 @@ func (c FairQueueConfig) minHold(override int64) int64 {
 		value = 0
 	}
 	return value
+}
+
+func (c FairQueueConfig) utilWindowSeconds() int {
+	v := c.UtilWindowSec
+	if v <= 0 {
+		v = 10
+	}
+	if v > 30 {
+		v = 30
+	}
+	return v
+}
+
+func (c FairQueueConfig) maxBatchSize() int {
+	v := c.MaxBatch
+	if v <= 0 {
+		v = 8
+	}
+	return v
+}
+
+func (c FairQueueConfig) maxProbeParallel() int {
+	v := c.MaxProbeParallel
+	if v <= 0 {
+		v = 4
+	}
+	return v
+}
+
+func (c FairQueueConfig) maxProbeQpsPerHost() int {
+	v := c.MaxProbeQpsPerHost
+	if v <= 0 {
+		v = 20
+	}
+	return v
 }
 
 func (c FairQueueConfig) hostMaxSlotPerHost() int {
@@ -825,6 +901,11 @@ func validateConfig(cfg Config) (Config, error) {
 	if strings.TrimSpace(cfg.FairQueue.RPC.ReleaseFunc) == "" {
 		return cfg, errors.New("fairQueue.rpc.releaseFunc is required")
 	}
+
+	cfg.FairQueue.UtilWindowSec = cfg.FairQueue.utilWindowSeconds()
+	cfg.FairQueue.MaxBatch = cfg.FairQueue.maxBatchSize()
+	cfg.FairQueue.MaxProbeParallel = cfg.FairQueue.maxProbeParallel()
+	cfg.FairQueue.MaxProbeQpsPerHost = cfg.FairQueue.maxProbeQpsPerHost()
 
 	return cfg, nil
 }
@@ -1314,6 +1395,15 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 		return err
 	}
 
+	hostKey := fqHostKey(req.HostnameHash, req.Hostname)
+	siteKey := strings.TrimSpace(req.SiteBucket)
+	if siteKey == "" {
+		siteKey = "unknown"
+	}
+	if s.activeSlots != nil {
+		s.activeSlots.Add(hostKey, siteKey, -1)
+	}
+
 	tokenLog := req.SlotToken
 	if len(tokenLog) > 8 {
 		tokenLog = tokenLog[len(tokenLog)-8:]
@@ -1394,8 +1484,11 @@ func (b *postgrestBackend) doRPC(ctx context.Context, funcName string, payload i
 		return err
 	}
 
-	normalized := normalizeRPCPayload(raw)
 	if result != nil {
+		normalized := raw
+		if !isPointerToSlice(result) {
+			normalized = normalizeRPCPayload(raw)
+		}
 		buf, err := json.Marshal(normalized)
 		if err != nil {
 			return err
@@ -1419,27 +1512,48 @@ func normalizeRPCPayload(data interface{}) interface{} {
 	return data
 }
 
-func (b *postgrestBackend) TryAcquire(ctx context.Context, req AcquireRequest) (*tryAcquireResult, error) {
+func isPointerToSlice(v interface{}) bool {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Ptr {
+		return false
+	}
+	return rv.Elem().Kind() == reflect.Slice
+}
+
+func (b *postgrestBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+	if err := validateAcquireBatchInputs(reqs); err != nil {
+		return nil, err
+	}
 	fn := b.cfg.FairQueue.RPC.TryAcquireFunc
 	if fn == "" {
-		return nil, errors.New("tryAcquire function not configured")
+		return nil, errors.New("tryAcquire batch function not configured")
 	}
-	window := pickInt(req.ThrottleTimeWindow, 60)
+	first := reqs[0]
+	window := pickInt(first.ThrottleTimeWindow, 60)
+	siteBuckets := make([]string, len(reqs))
+	ipBuckets := make([]string, len(reqs))
+	for i, req := range reqs {
+		siteBuckets[i] = req.SiteBucket
+		ipBuckets[i] = req.IPBucket
+	}
 	body := map[string]interface{}{
-		"p_hostname_hash":          req.HostnameHash,
-		"p_hostname":               req.Hostname,
-		"p_site_bucket":            req.SiteBucket,
-		"p_ip_bucket":              req.IPBucket,
-		"p_now_ms":                 req.Now,
-		"p_host_max_slot_per_host": req.HostMaxSlotPerHost,
-		"p_host_max_slot_per_ip":   req.HostMaxSlotPerIP,
-		"p_site_max_slot_per_site": req.SiteMaxSlotPerSite,
-		"p_site_max_slot_per_ip":   req.SiteMaxSlotPerIP,
-		"p_zombie_timeout":         req.ZombieTimeoutSeconds,
-		"p_cooldown_seconds":       req.CooldownSeconds,
+		"p_hostname_hash":          first.HostnameHash,
+		"p_hostname":               first.Hostname,
+		"p_site_buckets":           siteBuckets,
+		"p_ip_buckets":             ipBuckets,
+		"p_now_ms":                 first.Now,
+		"p_host_max_slot_per_host": first.HostMaxSlotPerHost,
+		"p_host_max_slot_per_ip":   first.HostMaxSlotPerIP,
+		"p_site_max_slot_per_site": first.SiteMaxSlotPerSite,
+		"p_site_max_slot_per_ip":   first.SiteMaxSlotPerIP,
+		"p_zombie_timeout":         first.ZombieTimeoutSeconds,
+		"p_cooldown_seconds":       first.CooldownSeconds,
 		"p_throttle_time_window":   window,
 	}
-	var resp struct {
+	var resp []struct {
 		Status             string `json:"status"`
 		SlotToken          string `json:"slot_token"`
 		ThrottleCode       int    `json:"throttle_code"`
@@ -1448,12 +1562,19 @@ func (b *postgrestBackend) TryAcquire(ctx context.Context, req AcquireRequest) (
 	if err := b.doRPC(ctx, fn, body, &resp); err != nil {
 		return nil, err
 	}
-	return &tryAcquireResult{
-		status:             resp.Status,
-		slotToken:          resp.SlotToken,
-		throttleCode:       resp.ThrottleCode,
-		throttleRetryAfter: resp.ThrottleRetryAfter,
-	}, nil
+	if len(resp) != len(reqs) {
+		return nil, fmt.Errorf("tryAcquire batch result length mismatch: got %d want %d", len(resp), len(reqs))
+	}
+	results := make([]*tryAcquireResult, len(resp))
+	for i, item := range resp {
+		results[i] = &tryAcquireResult{
+			status:             item.Status,
+			slotToken:          item.SlotToken,
+			throttleCode:       item.ThrottleCode,
+			throttleRetryAfter: item.ThrottleRetryAfter,
+		}
+	}
+	return results, nil
 }
 
 func (b *postgrestBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
@@ -1526,27 +1647,54 @@ func (p *postgresBackend) Close() error {
 	return p.db.Close()
 }
 
-func (p *postgresBackend) TryAcquire(ctx context.Context, req AcquireRequest) (*tryAcquireResult, error) {
-	fn := p.cfg.FairQueue.RPC.TryAcquireFunc
-	if fn == "" {
-		return nil, errors.New("tryAcquire function not configured")
+func (p *postgresBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+	if len(reqs) == 0 {
+		return nil, nil
 	}
-	window := pickInt(req.ThrottleTimeWindow, 60)
-	row := p.db.QueryRowContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)", fn),
-		req.HostnameHash, req.Hostname, req.SiteBucket, req.IPBucket, req.Now,
-		req.HostMaxSlotPerHost, req.HostMaxSlotPerIP, req.SiteMaxSlotPerSite, req.SiteMaxSlotPerIP,
-		req.ZombieTimeoutSeconds, req.CooldownSeconds, window)
-	var status, slotToken sql.NullString
-	var throttleCode, throttleRetryAfter sql.NullInt64
-	if err := row.Scan(&status, &slotToken, &throttleCode, &throttleRetryAfter); err != nil {
+	if err := validateAcquireBatchInputs(reqs); err != nil {
 		return nil, err
 	}
-	return &tryAcquireResult{
-		status:             status.String,
-		slotToken:          slotToken.String,
-		throttleCode:       int(throttleCode.Int64),
-		throttleRetryAfter: int(throttleRetryAfter.Int64),
-	}, nil
+	fn := p.cfg.FairQueue.RPC.TryAcquireFunc
+	if fn == "" {
+		return nil, errors.New("tryAcquire batch function not configured")
+	}
+	first := reqs[0]
+	window := pickInt(first.ThrottleTimeWindow, 60)
+	siteBuckets := make([]string, len(reqs))
+	ipBuckets := make([]string, len(reqs))
+	for i, req := range reqs {
+		siteBuckets[i] = req.SiteBucket
+		ipBuckets[i] = req.IPBucket
+	}
+	rows, err := p.db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)", fn),
+		first.HostnameHash, first.Hostname, siteBuckets, ipBuckets, first.Now,
+		first.HostMaxSlotPerHost, first.HostMaxSlotPerIP, first.SiteMaxSlotPerSite, first.SiteMaxSlotPerIP,
+		first.ZombieTimeoutSeconds, first.CooldownSeconds, window)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	results := make([]*tryAcquireResult, 0, len(reqs))
+	for rows.Next() {
+		var status, slotToken sql.NullString
+		var throttleCode, throttleRetryAfter sql.NullInt64
+		if err := rows.Scan(&status, &slotToken, &throttleCode, &throttleRetryAfter); err != nil {
+			return nil, err
+		}
+		results = append(results, &tryAcquireResult{
+			status:             status.String,
+			slotToken:          slotToken.String,
+			throttleCode:       int(throttleCode.Int64),
+			throttleRetryAfter: int(throttleRetryAfter.Int64),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(results) != len(reqs) {
+		return nil, fmt.Errorf("tryAcquire batch result length mismatch: got %d want %d", len(results), len(reqs))
+	}
+	return results, nil
 }
 
 func (p *postgresBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
@@ -1695,6 +1843,7 @@ func main() {
 		configVersion:    cfgVersion,
 		metrics:          metricsReporter,
 		metricsCounters:  metricsCounters,
+		activeSlots:      newActiveTracker(),
 	}
 	s.startFairQueueCleanup(gcCtx)
 	s.startMetricsReporter(gcCtx, defaultMetricsFlushInterval)

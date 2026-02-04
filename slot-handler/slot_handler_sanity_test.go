@@ -53,3 +53,28 @@ func TestSlotHandlerHasNoQueueDepthCleanup(t *testing.T) {
 		t.Fatalf("scan slot-handler: %v", err)
 	}
 }
+
+func TestDocsHaveNoLegacyFairQueueEndpoints(t *testing.T) {
+	files := []string{
+		"README.md",
+		"config.json",
+		filepath.Join("..", "download-worker-architecture.md"),
+	}
+	banned := []string{
+		"/fairqueue/cancel",
+		"overloaded",
+	}
+
+	for _, path := range files {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read docs: %v", err)
+		}
+		text := strings.ToLower(string(raw))
+		for _, token := range banned {
+			if strings.Contains(text, token) {
+				t.Fatalf("docs contain legacy token: %s (file=%s)", token, path)
+			}
+		}
+	}
+}

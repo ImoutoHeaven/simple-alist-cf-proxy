@@ -15,6 +15,21 @@ type sequenceBackend struct {
 	errNext error
 }
 
+type batchBackend struct {
+	called bool
+}
+
+func (b *batchBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+	b.called = true
+	res := make([]*tryAcquireResult, len(reqs))
+	for i := range res {
+		res[i] = &tryAcquireResult{status: "WAIT"}
+	}
+	return res, nil
+}
+
+func (b *batchBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }
+
 func (b *sequenceBackend) TryAcquire(ctx context.Context, req AcquireRequest) (*tryAcquireResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -38,6 +53,18 @@ func (b *sequenceBackend) TryAcquire(ctx context.Context, req AcquireRequest) (*
 	}
 	copy := *res
 	return &copy, nil
+}
+
+func (b *sequenceBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+	results := make([]*tryAcquireResult, len(reqs))
+	for i, req := range reqs {
+		res, err := b.TryAcquire(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		results[i] = res
+	}
+	return results, nil
 }
 
 func (b *sequenceBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }
@@ -238,5 +265,168 @@ func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
 	backend.mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("expected backend calls to remain 1 with cache, got %d", calls)
+	}
+}
+
+func TestProbeBudgetFillOnLowUtil(t *testing.T) {
+	cfg := &Config{FairQueue: FairQueueConfig{UtilWindowSec: 10, MaxBatch: 8, MaxProbeParallel: 4, MaxProbeQpsPerHost: 20}}
+	s := newTestServer()
+	s.updateRuntime(cfg, &stubBackend{}, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+	hostKey := "h1"
+	for i := 0; i < 10; i++ {
+		s.recordUtilizationSample(hostKey, "s1", 5, 10, 9, 10, now.Add(time.Duration(i)*time.Second))
+	}
+
+	inFlight := []fqFlowSnapshot{
+		{Token: "t1", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip1"},
+		{Token: "t2", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip2"},
+		{Token: "t3", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip3"},
+	}
+
+	budget, _ := s.computeProbeBudget(cfg, hostKey, inFlight, now.Add(10*time.Second))
+	if budget <= 1 {
+		t.Fatalf("expected budget > 1, got %d", budget)
+	}
+}
+
+func TestProbeBudgetFillOnLowSiteUtil(t *testing.T) {
+	cfg := &Config{FairQueue: FairQueueConfig{UtilWindowSec: 10, MaxBatch: 8, MaxProbeParallel: 4, MaxProbeQpsPerHost: 20}}
+	s := newTestServer()
+	s.updateRuntime(cfg, &stubBackend{}, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+	hostKey := "h1"
+	for i := 0; i < 10; i++ {
+		ts := now.Add(time.Duration(i) * time.Second)
+		s.recordUtilizationSample(hostKey, "s1", 9, 10, 9, 10, ts)
+		s.recordUtilizationSample(hostKey, "s2", 9, 10, 1, 10, ts)
+	}
+
+	inFlight := []fqFlowSnapshot{
+		{Token: "t1", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip1"},
+		{Token: "t2", Hostname: "h1", SiteBucket: "s2", IPBucket: "ip2"},
+		{Token: "t3", Hostname: "h1", SiteBucket: "s2", IPBucket: "ip3"},
+	}
+
+	budget, _ := s.computeProbeBudget(cfg, hostKey, inFlight, now.Add(10*time.Second))
+	if budget <= 1 {
+		t.Fatalf("expected budget > 1, got %d", budget)
+	}
+}
+
+func TestProbeBudgetSteadyAtHighUtil(t *testing.T) {
+	cfg := &Config{FairQueue: FairQueueConfig{UtilWindowSec: 10, MaxBatch: 8, MaxProbeParallel: 4, MaxProbeQpsPerHost: 20}}
+	s := newTestServer()
+	s.updateRuntime(cfg, &stubBackend{}, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+	hostKey := "h1"
+	for i := 0; i < 10; i++ {
+		ts := now.Add(time.Duration(i) * time.Second)
+		s.recordUtilizationSample(hostKey, "s1", 9, 10, 9, 10, ts)
+	}
+
+	inFlight := []fqFlowSnapshot{
+		{Token: "t1", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip1"},
+		{Token: "t2", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip2"},
+		{Token: "t3", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip3"},
+	}
+
+	budget, mode := s.computeProbeBudget(cfg, hostKey, inFlight, now.Add(10*time.Second))
+	if mode != probeModeSteady {
+		t.Fatalf("expected steady mode at high util, got %s", mode)
+	}
+	if budget != 1 {
+		t.Fatalf("expected steady budget 1, got %d", budget)
+	}
+}
+
+func TestProbeBudgetIgnoresUncappedUtilization(t *testing.T) {
+	zero := 0
+	cfg := &Config{FairQueue: FairQueueConfig{
+		UtilWindowSec:      10,
+		MaxBatch:           8,
+		MaxProbeParallel:   4,
+		MaxProbeQpsPerHost: 20,
+		HostCaps:           HostCapsConfig{MaxSlotPerHost: &zero},
+		SiteCaps:           SiteCapsConfig{MaxSlotPerSite: &zero},
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, &stubBackend{}, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+	hostKey := "h1"
+	for i := 0; i < 10; i++ {
+		ts := now.Add(time.Duration(i) * time.Second)
+		s.recordUtilizationSample(hostKey, "s1", 5, 0, 5, 0, ts)
+	}
+
+	inFlight := []fqFlowSnapshot{
+		{Token: "t1", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip1"},
+		{Token: "t2", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip2"},
+		{Token: "t3", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip3"},
+	}
+
+	budget, mode := s.computeProbeBudget(cfg, hostKey, inFlight, now.Add(10*time.Second))
+	if mode != probeModeSteady {
+		t.Fatalf("expected steady mode with uncapped utilization, got %s", mode)
+	}
+	if budget != 1 {
+		t.Fatalf("expected steady budget 1 with uncapped utilization, got %d", budget)
+	}
+}
+
+func TestProbeBudgetRespectsSiteHeadroom(t *testing.T) {
+	maxHost := 10
+	maxSlots := 3
+	cfg := &Config{FairQueue: FairQueueConfig{UtilWindowSec: 10, MaxBatch: 8, MaxProbeParallel: 4, MaxProbeQpsPerHost: 20, HostCaps: HostCapsConfig{MaxSlotPerHost: &maxHost}, SiteCaps: SiteCapsConfig{MaxSlotPerSite: &maxSlots}}}
+	s := newTestServer()
+	s.updateRuntime(cfg, &stubBackend{}, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+	hostKey := "h1"
+	for i := 0; i < 10; i++ {
+		s.recordUtilizationSample(hostKey, "s1", 2, 10, 1, 10, now.Add(time.Duration(i)*time.Second))
+	}
+
+	s.activeSlots.Add(hostKey, "s1", 2)
+	s.activeSlots.Add(hostKey, "s2", 3)
+
+	inFlight := []fqFlowSnapshot{
+		{Token: "t1", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip1"},
+		{Token: "t2", Hostname: "h1", SiteBucket: "s2", IPBucket: "ip2"},
+		{Token: "t3", Hostname: "h1", SiteBucket: "s2", IPBucket: "ip3"},
+		{Token: "t4", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip4"},
+	}
+
+	budget, _ := s.computeProbeBudget(cfg, hostKey, inFlight, now.Add(10*time.Second))
+	if budget != 1 {
+		t.Fatalf("expected budget 1 due to site headroom, got %d", budget)
+	}
+}
+
+func TestTryAcquireBatchUsesBackend(t *testing.T) {
+	cfg := &Config{FairQueue: FairQueueConfig{UtilWindowSec: 10}}
+	batch := &batchBackend{}
+	s := newTestServer()
+	s.updateRuntime(cfg, batch, "test", true)
+
+	reqs := []AcquireRequest{{Hostname: "h1"}, {Hostname: "h1"}}
+	res, err := s.tryAcquireBatch(context.Background(), reqs)
+	if err != nil {
+		t.Fatalf("expected batch call to succeed, got %v", err)
+	}
+	if !batch.called {
+		t.Fatalf("expected TryAcquireBatch to be called")
+	}
+	if len(res) != len(reqs) {
+		t.Fatalf("expected %d results, got %d", len(reqs), len(res))
 	}
 }

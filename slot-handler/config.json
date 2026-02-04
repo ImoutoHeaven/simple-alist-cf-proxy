@@ -31,6 +31,10 @@
     "pollIntervalMs": 500,
     "pollWindowMs": 6000,
     "graceMs": 4000,
+    "utilWindowSec": 10,
+    "maxBatch": 8,
+    "maxProbeParallel": 4,
+    "maxProbeQpsPerHost": 20,
     "minSlotHoldMs": 800,
     "smoothReleaseIntervalMs": null,
     "zombieTimeoutSeconds": 30,
@@ -44,7 +48,7 @@
       "maxSlotPerIp": 1
     },
     "rpc": {
-      "tryAcquireFunc": "fq_try_acquire_dual",
+      "tryAcquireFunc": "fq_try_acquire_batch",
       "releaseFunc": "fq_release_dual"
     },
     "cleanup": {

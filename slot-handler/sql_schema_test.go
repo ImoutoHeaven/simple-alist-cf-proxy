@@ -64,3 +64,18 @@ func TestInitSQLHasNoFoundUsage(t *testing.T) {
 		t.Fatalf("init.sql must not use plpgsql FOUND")
 	}
 }
+
+func TestInitSQLHasBatchTryAcquireFunction(t *testing.T) {
+	path := filepath.Join("..", "init.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read init.sql: %v", err)
+	}
+	text := strings.ToLower(string(raw))
+	if !strings.Contains(text, "fq_try_acquire_batch") {
+		t.Fatalf("init.sql missing fq_try_acquire_batch")
+	}
+	if strings.Contains(text, "fq_try_acquire_dual") {
+		t.Fatalf("init.sql should not include fq_try_acquire_dual")
+	}
+}

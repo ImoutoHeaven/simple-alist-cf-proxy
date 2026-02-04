@@ -1234,11 +1234,11 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION fq_try_acquire_dual(
+CREATE OR REPLACE FUNCTION fq_try_acquire_batch(
   p_hostname_hash TEXT,
   p_hostname TEXT,
-  p_site_bucket TEXT,
-  p_ip_bucket TEXT,
+  p_site_buckets TEXT[],
+  p_ip_buckets TEXT[],
   p_now_ms BIGINT,
   p_host_max_slot_per_host INT,
   p_host_max_slot_per_ip INT,
@@ -1257,18 +1257,22 @@ RETURNS TABLE(
 DECLARE
   v_hostname TEXT;
   v_site_bucket TEXT;
+  v_ip_bucket TEXT;
   v_throttled BOOLEAN := FALSE;
   v_throttle_code INTEGER := NULL;
   v_throttle_retry_after INTEGER := NULL;
   v_host_slot_id INT;
   v_site_slot_id INT;
+  v_site_len INT;
+  v_ip_len INT;
+  v_idx INT;
 BEGIN
   v_hostname := COALESCE(NULLIF(p_hostname, ''), NULLIF(p_hostname_hash, ''));
-  IF v_hostname IS NULL THEN
-    RETURN QUERY SELECT 'WAIT', NULL::TEXT, NULL::INTEGER, NULL::INTEGER;
+  v_site_len := COALESCE(array_length(p_site_buckets, 1), 0);
+  v_ip_len := COALESCE(array_length(p_ip_buckets, 1), 0);
+  IF v_site_len = 0 OR v_ip_len = 0 OR v_site_len <> v_ip_len THEN
     RETURN;
   END IF;
-  v_site_bucket := COALESCE(NULLIF(p_site_bucket, ''), 'unknown');
 
   IF p_hostname_hash IS NOT NULL AND p_hostname_hash <> '' THEN
     SELECT t.is_protected, t.error_code, t.retry_after
@@ -1276,102 +1280,120 @@ BEGIN
     FROM fq_check_throttle(p_hostname_hash, v_hostname, p_throttle_time_window) AS t;
   END IF;
 
+  IF v_hostname IS NULL THEN
+    FOR v_idx IN 1..v_site_len LOOP
+      status := 'WAIT';
+      slot_token := NULL::TEXT;
+      throttle_code := NULL::INTEGER;
+      throttle_retry_after := NULL::INTEGER;
+      RETURN NEXT;
+    END LOOP;
+    RETURN;
+  END IF;
+
   IF v_throttled THEN
-    status := 'THROTTLED';
-    slot_token := NULL::TEXT;
-    throttle_code := v_throttle_code;
-    throttle_retry_after := v_throttle_retry_after;
-    RETURN NEXT;
+    FOR v_idx IN 1..v_site_len LOOP
+      status := 'THROTTLED';
+      slot_token := NULL::TEXT;
+      throttle_code := v_throttle_code;
+      throttle_retry_after := v_throttle_retry_after;
+      RETURN NEXT;
+    END LOOP;
     RETURN;
   END IF;
 
-  BEGIN
-    v_host_slot_id := func_try_acquire_host_slot(
-      v_hostname,
-      p_ip_bucket,
-      COALESCE(p_host_max_slot_per_host, 0),
-      COALESCE(p_host_max_slot_per_ip, 0),
-      COALESCE(p_zombie_timeout, 0),
-      COALESCE(p_cooldown_seconds, 0)
-    );
-  EXCEPTION
-    WHEN others THEN
-      v_host_slot_id := NULL;
-  END;
+  FOR v_idx IN 1..v_site_len LOOP
+    v_site_bucket := COALESCE(NULLIF(p_site_buckets[v_idx], ''), 'unknown');
+    v_ip_bucket := p_ip_buckets[v_idx];
 
-  IF v_host_slot_id IS NULL THEN
-    status := 'WAIT';
-    slot_token := NULL::TEXT;
+    BEGIN
+      v_host_slot_id := func_try_acquire_host_slot(
+        v_hostname,
+        v_ip_bucket,
+        COALESCE(p_host_max_slot_per_host, 0),
+        COALESCE(p_host_max_slot_per_ip, 0),
+        COALESCE(p_zombie_timeout, 0),
+        COALESCE(p_cooldown_seconds, 0)
+      );
+    EXCEPTION
+      WHEN others THEN
+        v_host_slot_id := NULL;
+    END;
+
+    IF v_host_slot_id IS NULL THEN
+      status := 'WAIT';
+      slot_token := NULL::TEXT;
+      throttle_code := v_throttle_code;
+      throttle_retry_after := v_throttle_retry_after;
+      RETURN NEXT;
+      CONTINUE;
+    END IF;
+
+    IF v_host_slot_id = 0 THEN
+      status := 'IP_TOO_MANY';
+      slot_token := NULL::TEXT;
+      throttle_code := v_throttle_code;
+      throttle_retry_after := v_throttle_retry_after;
+      RETURN NEXT;
+      CONTINUE;
+    ELSIF v_host_slot_id < 0 THEN
+      status := 'QUEUE_FULL';
+      slot_token := NULL::TEXT;
+      throttle_code := v_throttle_code;
+      throttle_retry_after := v_throttle_retry_after;
+      RETURN NEXT;
+      CONTINUE;
+    END IF;
+
+    BEGIN
+      v_site_slot_id := func_try_acquire_site_slot(
+        v_hostname,
+        v_site_bucket,
+        v_ip_bucket,
+        COALESCE(p_site_max_slot_per_site, 0),
+        COALESCE(p_site_max_slot_per_ip, 0),
+        COALESCE(p_zombie_timeout, 0),
+        COALESCE(p_cooldown_seconds, 0)
+      );
+    EXCEPTION
+      WHEN others THEN
+        v_site_slot_id := NULL;
+    END;
+
+    IF v_site_slot_id IS NULL THEN
+      PERFORM func_release_host_slot(v_host_slot_id, FALSE);
+      status := 'WAIT';
+      slot_token := NULL::TEXT;
+      throttle_code := v_throttle_code;
+      throttle_retry_after := v_throttle_retry_after;
+      RETURN NEXT;
+      CONTINUE;
+    END IF;
+
+    IF v_site_slot_id = 0 THEN
+      PERFORM func_release_host_slot(v_host_slot_id, FALSE);
+      status := 'IP_TOO_MANY';
+      slot_token := NULL::TEXT;
+      throttle_code := v_throttle_code;
+      throttle_retry_after := v_throttle_retry_after;
+      RETURN NEXT;
+      CONTINUE;
+    ELSIF v_site_slot_id < 0 THEN
+      PERFORM func_release_host_slot(v_host_slot_id, FALSE);
+      status := 'QUEUE_FULL';
+      slot_token := NULL::TEXT;
+      throttle_code := v_throttle_code;
+      throttle_retry_after := v_throttle_retry_after;
+      RETURN NEXT;
+      CONTINUE;
+    END IF;
+
+    status := 'ACQUIRED';
+    slot_token := encode(convert_to(jsonb_build_object('host', v_host_slot_id, 'site', v_site_slot_id)::text, 'UTF8'), 'base64');
     throttle_code := v_throttle_code;
     throttle_retry_after := v_throttle_retry_after;
     RETURN NEXT;
-    RETURN;
-  END IF;
-
-  IF v_host_slot_id = 0 THEN
-    status := 'IP_TOO_MANY';
-    slot_token := NULL::TEXT;
-    throttle_code := v_throttle_code;
-    throttle_retry_after := v_throttle_retry_after;
-    RETURN NEXT;
-    RETURN;
-  ELSIF v_host_slot_id < 0 THEN
-    status := 'QUEUE_FULL';
-    slot_token := NULL::TEXT;
-    throttle_code := v_throttle_code;
-    throttle_retry_after := v_throttle_retry_after;
-    RETURN NEXT;
-    RETURN;
-  END IF;
-
-  BEGIN
-    v_site_slot_id := func_try_acquire_site_slot(
-      v_hostname,
-      v_site_bucket,
-      p_ip_bucket,
-      COALESCE(p_site_max_slot_per_site, 0),
-      COALESCE(p_site_max_slot_per_ip, 0),
-      COALESCE(p_zombie_timeout, 0),
-      COALESCE(p_cooldown_seconds, 0)
-    );
-  EXCEPTION
-    WHEN others THEN
-      v_site_slot_id := NULL;
-  END;
-
-  IF v_site_slot_id IS NULL THEN
-    PERFORM func_release_host_slot(v_host_slot_id, FALSE);
-    status := 'WAIT';
-    slot_token := NULL::TEXT;
-    throttle_code := v_throttle_code;
-    throttle_retry_after := v_throttle_retry_after;
-    RETURN NEXT;
-    RETURN;
-  END IF;
-
-  IF v_site_slot_id = 0 THEN
-    PERFORM func_release_host_slot(v_host_slot_id, FALSE);
-    status := 'IP_TOO_MANY';
-    slot_token := NULL::TEXT;
-    throttle_code := v_throttle_code;
-    throttle_retry_after := v_throttle_retry_after;
-    RETURN NEXT;
-    RETURN;
-  ELSIF v_site_slot_id < 0 THEN
-    PERFORM func_release_host_slot(v_host_slot_id, FALSE);
-    status := 'QUEUE_FULL';
-    slot_token := NULL::TEXT;
-    throttle_code := v_throttle_code;
-    throttle_retry_after := v_throttle_retry_after;
-    RETURN NEXT;
-    RETURN;
-  END IF;
-
-  status := 'ACQUIRED';
-  slot_token := encode(convert_to(jsonb_build_object('host', v_host_slot_id, 'site', v_site_slot_id)::text, 'UTF8'), 'base64');
-  throttle_code := v_throttle_code;
-  throttle_retry_after := v_throttle_retry_after;
-  RETURN NEXT;
+  END LOOP;
 END;
 $$ LANGUAGE plpgsql;
 

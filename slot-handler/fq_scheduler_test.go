@@ -181,3 +181,156 @@ func TestSchedulerSkipsDeniedBuckets(t *testing.T) {
 		t.Fatalf("expected denied bucket skipped; got token=%q want %q", chosen.Token, okTok)
 	}
 }
+
+func TestPickNextInFlightBatchRespectsFairness(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	// Deterministic CreatedAt ordering.
+	t0 := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	store.nowFn = func() time.Time {
+		calls++
+		return t0.Add(time.Duration(calls) * time.Millisecond)
+	}
+
+	now := t0.Add(10 * time.Millisecond)
+
+	// Two site buckets (s1, s2) with three flows total; s1 has two flows.
+	tokS1Older := store.newFlow("h1", "example.com", "ip1", "s1")
+	tokS2 := store.newFlow("h1", "example.com", "ip2", "s2")
+	tokS1Newer := store.newFlow("h1", "example.com", "ip1", "s1")
+
+	for _, tok := range []string{tokS1Older, tokS2, tokS1Newer} {
+		if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+			t.Fatalf("expected attach ok for token %q: ok=%t err=%v", tok, ok, err)
+		}
+	}
+
+	sched := newFQHostFlowScheduler()
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 3)
+	if len(picks) != 3 {
+		t.Fatalf("expected 3 picks, got %d", len(picks))
+	}
+
+	got := []string{picks[0].Token, picks[1].Token, picks[2].Token}
+	want := []string{tokS1Older, tokS2, tokS1Newer}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("unexpected pick[%d]: got %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestPickNextInFlightBatchReturnsUniqueFlows(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+
+	// Two flows in the same bucket should still be unique in a batch.
+	tok1 := store.newFlow("h1", "example.com", "ip1", "s1")
+	tok2 := store.newFlow("h1", "example.com", "ip1", "s1")
+
+	for _, tok := range []string{tok1, tok2} {
+		if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+			t.Fatalf("expected attach ok for token %q: ok=%t err=%v", tok, ok, err)
+		}
+	}
+
+	sched := newFQHostFlowScheduler()
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 3)
+	if len(picks) != 2 {
+		t.Fatalf("expected 2 picks, got %d", len(picks))
+	}
+
+	seen := map[string]struct{}{}
+	for _, snap := range picks {
+		if _, ok := seen[snap.Token]; ok {
+			t.Fatalf("expected unique picks, saw duplicate token %q", snap.Token)
+		}
+		seen[snap.Token] = struct{}{}
+	}
+}
+
+func TestPickNextInFlightBatchStopsWhenFewerThanN(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+
+	tok := store.newFlow("h1", "example.com", "ip1", "s1")
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("expected attach ok: ok=%t err=%v", ok, err)
+	}
+
+	sched := newFQHostFlowScheduler()
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 5)
+	if len(picks) != 1 {
+		t.Fatalf("expected 1 pick, got %d", len(picks))
+	}
+	if picks[0].Token != tok {
+		t.Fatalf("expected token %q, got %q", tok, picks[0].Token)
+	}
+}
+
+func TestPickNextInFlightBatchNZeroOrLess(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+
+	tok := store.newFlow("h1", "example.com", "ip1", "s1")
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("expected attach ok: ok=%t err=%v", ok, err)
+	}
+
+	sched := newFQHostFlowScheduler()
+	if picks := sched.PickNextInFlightBatch(store, "h1", now, 0); len(picks) != 0 {
+		t.Fatalf("expected empty picks for n=0, got %d", len(picks))
+	}
+	if picks := sched.PickNextInFlightBatch(store, "h1", now, -2); len(picks) != 0 {
+		t.Fatalf("expected empty picks for n<0, got %d", len(picks))
+	}
+}
+
+func TestPickNextInFlightBatchSkipsDuplicatesAndContinues(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+
+	// Make one flow much less favorable by LocalVT so the other would be picked twice.
+	tokFavored := store.newFlow("h1", "example.com", "ip1", "s1")
+	tokUnfavored := store.newFlow("h1", "example.com", "ip1", "s1")
+
+	for i := 0; i < 10; i++ {
+		store.incrementLocalVT(tokUnfavored)
+	}
+
+	for _, tok := range []string{tokFavored, tokUnfavored} {
+		if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+			t.Fatalf("expected attach ok for token %q: ok=%t err=%v", tok, ok, err)
+		}
+	}
+
+	sched := newFQHostFlowScheduler()
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 2)
+	if len(picks) != 2 {
+		t.Fatalf("expected 2 picks, got %d", len(picks))
+	}
+
+	seen := map[string]struct{}{}
+	for _, snap := range picks {
+		if _, ok := seen[snap.Token]; ok {
+			t.Fatalf("expected unique picks, saw duplicate token %q", snap.Token)
+		}
+		seen[snap.Token] = struct{}{}
+	}
+	if _, ok := seen[tokFavored]; !ok {
+		t.Fatalf("expected favored token %q in picks", tokFavored)
+	}
+	if _, ok := seen[tokUnfavored]; !ok {
+		t.Fatalf("expected unfavored token %q in picks", tokUnfavored)
+	}
+}

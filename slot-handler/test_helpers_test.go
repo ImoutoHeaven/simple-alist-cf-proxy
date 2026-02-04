@@ -14,8 +14,12 @@ func newTestServer() *server {
 type stubBackend struct {
 }
 
-func (s *stubBackend) TryAcquire(ctx context.Context, req AcquireRequest) (*tryAcquireResult, error) {
-	return &tryAcquireResult{status: "WAIT"}, nil
+func (s *stubBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+	results := make([]*tryAcquireResult, len(reqs))
+	for i := range results {
+		results[i] = &tryAcquireResult{status: "WAIT"}
+	}
+	return results, nil
 }
 
 func (s *stubBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }

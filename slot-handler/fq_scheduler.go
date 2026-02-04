@@ -69,6 +69,29 @@ func (h *fqHostFlowScheduler) getOrInitBucket(site *fqSiteFlowState, bucketKey s
 // Selection MUST be based only on the in-flight set (flows with waiter != nil).
 // It does not use time-based heuristics like active windows.
 func (h *fqHostFlowScheduler) PickNextInFlight(store *flowStore, hostKey string, now time.Time) (fqFlowSnapshot, bool) {
+	return h.pickNextInFlightExcluding(store, hostKey, now, nil)
+}
+
+// PickNextInFlightBatch selects up to n unique in-flight flows using the same wall-clock now.
+// Virtual time advances per pick.
+func (h *fqHostFlowScheduler) PickNextInFlightBatch(store *flowStore, hostKey string, now time.Time, n int) []fqFlowSnapshot {
+	if n <= 0 {
+		return nil
+	}
+	res := make([]fqFlowSnapshot, 0, n)
+	seen := map[string]struct{}{}
+	for i := 0; i < n; i++ {
+		snap, ok := h.pickNextInFlightExcluding(store, hostKey, now, seen)
+		if !ok {
+			break
+		}
+		seen[snap.Token] = struct{}{}
+		res = append(res, snap)
+	}
+	return res
+}
+
+func (h *fqHostFlowScheduler) pickNextInFlightExcluding(store *flowStore, hostKey string, now time.Time, exclude map[string]struct{}) (fqFlowSnapshot, bool) {
 	if h == nil || store == nil {
 		return fqFlowSnapshot{}, false
 	}
@@ -79,6 +102,19 @@ func (h *fqHostFlowScheduler) PickNextInFlight(store *flowStore, hostKey string,
 	cands := store.listInFlightByHost(hostKey, now)
 	if len(cands) == 0 {
 		return fqFlowSnapshot{}, false
+	}
+	if len(exclude) > 0 {
+		filtered := cands[:0]
+		for _, f := range cands {
+			if _, skip := exclude[f.Token]; skip {
+				continue
+			}
+			filtered = append(filtered, f)
+		}
+		cands = filtered
+		if len(cands) == 0 {
+			return fqFlowSnapshot{}, false
+		}
 	}
 
 	// Ensure site/bucket states exist for all current candidates.

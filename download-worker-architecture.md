@@ -111,8 +111,9 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 
 10. **Fair Queue（slot-handler）**
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
-    - 支持 `granted` / `throttled` / `overloaded` / `timeout`；缓存过载/节流状态在内存中做短期抑制。
-    - 客户端中断时发送 `/fairqueue/cancel`，完成后发送 `/fairqueue/release`（均为 `/api/v1`）。
+    - 支持 `pending` / `granted` / `throttled` / `timeout`；节流状态在内存中做短期抑制。
+    - 完成后发送 `/api/v1/fairqueue/release`。
+    - 轮询探测受 `utilWindowSec` 与 `maxBatch` / `maxProbeParallel` / `maxProbeQpsPerHost` 控制。
     - 若 `pgErrorHandle=fail-open` 且 slot-handler 不可用，则跳过排队。
 
 11. **上游请求与响应封装**
@@ -136,7 +137,7 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 - Last Active：`DOWNLOAD_LAST_ACTIVE_TABLE` + `download_update_last_active`
 - 统一检查：`download_unified_check`
 
-Fair Queue 相关函数由 `slot-handler` 使用（`fq_try_acquire_dual` / `fq_release_dual`）。
+Fair Queue 相关函数由 `slot-handler` 使用（`fq_try_acquire_batch` / `fq_release_dual`）。
 
 ## 7. 限制与注意事项
 

@@ -54,11 +54,9 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - `queryToken`（首次可不传；轮询时传回上一次返回的 token）
 
 响应字段：
-- `result`: `pending` / `granted` / `throttled`
+- `result`: `pending` / `granted` / `throttled` / `timeout`
 - `queryToken`
 - `slotToken`（granted 时）
-
-注意：不再提供 `/cancel` endpoint；客户端取消连接即等价放弃本次 in-flight。
 
 ### POST /api/v1/fairqueue/release
 
@@ -72,7 +70,11 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - `pollIntervalMs`：probe runner 节奏
 - `pollWindowMs`：单次 /acquire long-poll 的最大等待时间
 - `graceMs`：pending 后 flow 保留窗口
+- `utilWindowSec`：利用率采样窗口，用于 probe 调度权重
 - `minSlotHoldMs` / `smoothReleaseIntervalMs`：release 节奏控制
+- `maxBatch`：单轮 probe 尝试的最大 flow 数
+- `maxProbeParallel`：每个 host 并发 probe 的上限
+- `maxProbeQpsPerHost`：每个 host 的 probe QPS 上限
 - `zombieTimeoutSeconds` / `ipCooldownSeconds`：传给 DB 的控制参数
 - `hostCaps` / `siteCaps`：并发与 waiters 上限（会透传给 DB 函数）
 - `rpc`：DB 函数名
@@ -105,7 +107,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 
 slot-handler 依赖以下函数（名称可在配置中改）：
 
-- `fq_try_acquire_dual`：尝试分配 host/site 双 slot
+- `fq_try_acquire_batch`：批量尝试分配 host/site 双 slot
 - `fq_release_dual`：释放双 slot
 
 具体函数签名与表结构见仓库根目录 `init.sql`。
