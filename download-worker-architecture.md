@@ -136,7 +136,7 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 - Last Active：`DOWNLOAD_LAST_ACTIVE_TABLE` + `download_update_last_active`
 - 统一检查：`download_unified_check`
 
-Fair Queue 相关表与函数由 `slot-handler` 使用（`fq_register_waiter` / `fq_try_acquire_dual` 等）。
+Fair Queue 相关函数由 `slot-handler` 使用（`fq_try_acquire_dual` / `fq_release_dual`）。
 
 ## 7. 限制与注意事项
 

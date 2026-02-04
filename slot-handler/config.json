@@ -30,47 +30,26 @@
   "fairQueue": {
     "pollIntervalMs": 500,
     "pollWindowMs": 6000,
+    "graceMs": 4000,
     "minSlotHoldMs": 800,
     "smoothReleaseIntervalMs": null,
-    "globalMaxWaiters": 500,
-    "sessionIdleSeconds": 90,
     "zombieTimeoutSeconds": 30,
     "ipCooldownSeconds": 0,
-    "weightedScheduler": {
-      "enabled": false,
-      "hotPendingFactor": 4,
-      "hotPendingMin": 16,
-      "coldAvgWaitMs": 500,
-      "hotAvgWaitMs": 2300,
-      "maxProbesPerCycle": 5,
-      "baseWeight": 1,
-      "weightPerWait": 1
-    },
     "hostCaps": {
-      "maxWaitMs": 60000,
       "maxSlotPerHost": 5,
-      "maxWaitersPerHost": 50,
-      "maxSlotPerIp": 1,
-      "maxWaitersPerIp": 3
+      "maxSlotPerIp": 1
     },
     "siteCaps": {
-      "maxWaitMs": 60000,
       "maxSlotPerSite": 5,
-      "maxWaitersPerSite": 50,
-      "maxSlotPerIp": 1,
-      "maxWaitersPerIp": 3
+      "maxSlotPerIp": 1
     },
     "rpc": {
-      "throttleCheckFunc": "fq_check_throttle",
-      "registerWaiterFunc": "fq_register_waiter",
-      "releaseWaiterFunc": "fq_release_waiter",
       "tryAcquireFunc": "fq_try_acquire_dual",
       "releaseFunc": "fq_release_dual"
     },
     "cleanup": {
       "enabled": true,
-      "intervalSeconds": 1800,
-      "queueDepthZombieTtlSeconds": 20
+      "intervalSeconds": 1800
     }
   }
 }

@@ -723,29 +723,6 @@ CREATE TABLE IF NOT EXISTS "fq_site_ip_cooldown" (
 CREATE INDEX IF NOT EXISTS idx_fq_site_ip_cooldown_ts
   ON "fq_site_ip_cooldown" ("last_release_at");
 
-CREATE TABLE IF NOT EXISTS "fq_host_waiter_depth" (
-  "hostname_pattern" TEXT NOT NULL,
-  "ip_hash" TEXT NOT NULL,
-  "waiting_count" INTEGER NOT NULL DEFAULT 0,
-  "updated_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-  PRIMARY KEY ("hostname_pattern", "ip_hash")
-);
-
-CREATE INDEX IF NOT EXISTS idx_fq_host_waiter_depth_ts
-  ON "fq_host_waiter_depth" ("updated_at");
-
-CREATE TABLE IF NOT EXISTS "fq_site_waiter_depth" (
-  "hostname_pattern" TEXT NOT NULL,
-  "site_bucket" TEXT NOT NULL,
-  "ip_hash" TEXT NOT NULL,
-  "waiting_count" INTEGER NOT NULL DEFAULT 0,
-  "updated_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-  PRIMARY KEY ("hostname_pattern", "site_bucket", "ip_hash")
-);
-
-CREATE INDEX IF NOT EXISTS idx_fq_site_waiter_depth_ts
-  ON "fq_site_waiter_depth" ("updated_at");
-
 -- ========================================
 -- Fair Queue Slot RPCs
 -- ========================================
@@ -1194,54 +1171,6 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION func_cleanup_host_queue_depth(
-  p_ttl_seconds INT
-)
-RETURNS INTEGER
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_cutoff  TIMESTAMP WITH TIME ZONE;
-  v_deleted INTEGER;
-BEGIN
-  IF p_ttl_seconds <= 0 THEN
-    RETURN 0;
-  END IF;
-
-  v_cutoff := clock_timestamp() - (p_ttl_seconds::TEXT || ' seconds')::INTERVAL;
-
-  DELETE FROM "fq_host_waiter_depth"
-  WHERE "updated_at" < v_cutoff;
-
-  GET DIAGNOSTICS v_deleted = ROW_COUNT;
-  RETURN v_deleted;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION func_cleanup_site_queue_depth(
-  p_ttl_seconds INT
-)
-RETURNS INTEGER
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_cutoff  TIMESTAMP WITH TIME ZONE;
-  v_deleted INTEGER;
-BEGIN
-  IF p_ttl_seconds <= 0 THEN
-    RETURN 0;
-  END IF;
-
-  v_cutoff := clock_timestamp() - (p_ttl_seconds::TEXT || ' seconds')::INTERVAL;
-
-  DELETE FROM "fq_site_waiter_depth"
-  WHERE "updated_at" < v_cutoff;
-
-  GET DIAGNOSTICS v_deleted = ROW_COUNT;
-  RETURN v_deleted;
-END;
-$$;
-
 -- ========================================
 -- Slot-Handler Friendly Fair Queue RPCs
 -- ========================================
@@ -1305,240 +1234,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION fq_register_waiter(
-  p_hostname_hash TEXT,
-  p_hostname TEXT,
-  p_site_bucket TEXT,
-  p_ip_bucket TEXT,
-  p_host_max_waiters_per_ip INT DEFAULT 0,
-  p_site_max_waiters_per_ip INT DEFAULT 0,
-  p_zombie_timeout_seconds INT DEFAULT 20,
-  p_host_max_waiters_per_host INT DEFAULT 0,
-  p_site_max_waiters_per_site INT DEFAULT 0
-)
-RETURNS TABLE(
-  status TEXT,
-  queue_depth INT,
-  ip_queue_depth INT
-) AS $$
-DECLARE
-  v_now TIMESTAMP WITH TIME ZONE := clock_timestamp();
-  v_hostname TEXT;
-  v_site_bucket TEXT;
-  v_zombie_timeout INTERVAL := CASE
-    WHEN p_zombie_timeout_seconds IS NULL OR p_zombie_timeout_seconds <= 0 THEN INTERVAL '20 seconds'
-    ELSE (p_zombie_timeout_seconds::TEXT || ' seconds')::INTERVAL
-  END;
-  v_host_queue_depth INT := 0;
-  v_host_ip_depth INT := 0;
-  v_site_queue_depth INT := 0;
-  v_site_ip_depth INT := 0;
-  v_host_ip_updated_at TIMESTAMP WITH TIME ZONE;
-  v_site_ip_updated_at TIMESTAMP WITH TIME ZONE;
-  v_rows INTEGER := 0;
-BEGIN
-  v_hostname := COALESCE(NULLIF(p_hostname, ''), NULLIF(p_hostname_hash, ''));
-  IF v_hostname IS NULL THEN
-    status := 'REGISTERED';
-    queue_depth := 0;
-    ip_queue_depth := 0;
-    RETURN NEXT;
-    RETURN;
-  END IF;
-
-  v_site_bucket := COALESCE(NULLIF(p_site_bucket, ''), 'unknown');
-
-  IF p_ip_bucket IS NULL OR p_ip_bucket = '' THEN
-    status := 'REGISTERED';
-    queue_depth := 0;
-    ip_queue_depth := 0;
-    RETURN NEXT;
-    RETURN;
-  END IF;
-
-  PERFORM pg_advisory_xact_lock(1, hashtext(v_hostname));
-  PERFORM pg_advisory_xact_lock(2, hashtext(v_hostname || ':' || v_site_bucket));
-
-  SELECT COALESCE(SUM("waiting_count"), 0) INTO v_host_queue_depth
-  FROM "fq_host_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname;
-
-  SELECT "waiting_count", "updated_at"
-  INTO v_host_ip_depth, v_host_ip_updated_at
-  FROM "fq_host_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname
-    AND "ip_hash" = p_ip_bucket;
-
-  GET DIAGNOSTICS v_rows = ROW_COUNT;
-  IF v_rows = 0 THEN
-    v_host_ip_depth := 0;
-    v_host_ip_updated_at := NULL;
-  END IF;
-
-  SELECT COALESCE(SUM("waiting_count"), 0) INTO v_site_queue_depth
-  FROM "fq_site_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname
-    AND "site_bucket" = v_site_bucket;
-
-  SELECT "waiting_count", "updated_at"
-  INTO v_site_ip_depth, v_site_ip_updated_at
-  FROM "fq_site_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname
-    AND "site_bucket" = v_site_bucket
-    AND "ip_hash" = p_ip_bucket;
-
-  GET DIAGNOSTICS v_rows = ROW_COUNT;
-  IF v_rows = 0 THEN
-    v_site_ip_depth := 0;
-    v_site_ip_updated_at := NULL;
-  END IF;
-
-  IF p_host_max_waiters_per_host > 0 AND v_host_queue_depth >= p_host_max_waiters_per_host THEN
-    status := 'HOST_QUEUE_FULL';
-    queue_depth := GREATEST(v_host_queue_depth, v_site_queue_depth);
-    ip_queue_depth := GREATEST(v_host_ip_depth, v_site_ip_depth);
-    RETURN NEXT;
-    RETURN;
-  END IF;
-
-  IF p_site_max_waiters_per_site > 0 AND v_site_queue_depth >= p_site_max_waiters_per_site THEN
-    status := 'SITE_QUEUE_FULL';
-    queue_depth := GREATEST(v_host_queue_depth, v_site_queue_depth);
-    ip_queue_depth := GREATEST(v_host_ip_depth, v_site_ip_depth);
-    RETURN NEXT;
-    RETURN;
-  END IF;
-
-  IF p_host_max_waiters_per_ip > 0 AND v_host_ip_depth >= p_host_max_waiters_per_ip THEN
-    status := 'QUEUE_FULL';
-    queue_depth := GREATEST(v_host_queue_depth, v_site_queue_depth);
-    ip_queue_depth := GREATEST(v_host_ip_depth, v_site_ip_depth);
-    RETURN NEXT;
-    RETURN;
-  END IF;
-
-  IF p_site_max_waiters_per_ip > 0 AND v_site_ip_depth >= p_site_max_waiters_per_ip THEN
-    status := 'QUEUE_FULL';
-    queue_depth := GREATEST(v_host_queue_depth, v_site_queue_depth);
-    ip_queue_depth := GREATEST(v_host_ip_depth, v_site_ip_depth);
-    RETURN NEXT;
-    RETURN;
-  END IF;
-
-  IF v_host_ip_updated_at IS NOT NULL THEN
-    IF v_host_ip_updated_at < (v_now - v_zombie_timeout) THEN
-      UPDATE "fq_host_waiter_depth"
-        SET "waiting_count" = 1,
-            "updated_at" = v_now
-      WHERE "hostname_pattern" = v_hostname
-        AND "ip_hash" = p_ip_bucket;
-    ELSE
-      UPDATE "fq_host_waiter_depth"
-        SET "waiting_count" = "waiting_count" + 1,
-            "updated_at" = v_now
-      WHERE "hostname_pattern" = v_hostname
-        AND "ip_hash" = p_ip_bucket;
-    END IF;
-  ELSE
-    INSERT INTO "fq_host_waiter_depth" ("hostname_pattern", "ip_hash", "waiting_count", "updated_at")
-    VALUES (v_hostname, p_ip_bucket, 1, v_now)
-    ON CONFLICT ("hostname_pattern", "ip_hash")
-    DO UPDATE SET
-      "waiting_count" = "fq_host_waiter_depth"."waiting_count" + 1,
-      "updated_at" = EXCLUDED."updated_at";
-  END IF;
-
-  IF v_site_ip_updated_at IS NOT NULL THEN
-    IF v_site_ip_updated_at < (v_now - v_zombie_timeout) THEN
-      UPDATE "fq_site_waiter_depth"
-        SET "waiting_count" = 1,
-            "updated_at" = v_now
-      WHERE "hostname_pattern" = v_hostname
-        AND "site_bucket" = v_site_bucket
-        AND "ip_hash" = p_ip_bucket;
-    ELSE
-      UPDATE "fq_site_waiter_depth"
-        SET "waiting_count" = "waiting_count" + 1,
-            "updated_at" = v_now
-      WHERE "hostname_pattern" = v_hostname
-        AND "site_bucket" = v_site_bucket
-        AND "ip_hash" = p_ip_bucket;
-    END IF;
-  ELSE
-    INSERT INTO "fq_site_waiter_depth" ("hostname_pattern", "site_bucket", "ip_hash", "waiting_count", "updated_at")
-    VALUES (v_hostname, v_site_bucket, p_ip_bucket, 1, v_now)
-    ON CONFLICT ("hostname_pattern", "site_bucket", "ip_hash")
-    DO UPDATE SET
-      "waiting_count" = "fq_site_waiter_depth"."waiting_count" + 1,
-      "updated_at" = EXCLUDED."updated_at";
-  END IF;
-
-  SELECT COALESCE(SUM("waiting_count"), 0) INTO v_host_queue_depth
-  FROM "fq_host_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname;
-
-  SELECT COALESCE("waiting_count", 0) INTO v_host_ip_depth
-  FROM "fq_host_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname
-    AND "ip_hash" = p_ip_bucket;
-
-  SELECT COALESCE(SUM("waiting_count"), 0) INTO v_site_queue_depth
-  FROM "fq_site_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname
-    AND "site_bucket" = v_site_bucket;
-
-  SELECT COALESCE("waiting_count", 0) INTO v_site_ip_depth
-  FROM "fq_site_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname
-    AND "site_bucket" = v_site_bucket
-    AND "ip_hash" = p_ip_bucket;
-
-  status := 'REGISTERED';
-  queue_depth := GREATEST(v_host_queue_depth, v_site_queue_depth);
-  ip_queue_depth := GREATEST(v_host_ip_depth, v_site_ip_depth);
-  RETURN NEXT;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION fq_release_waiter(
-  p_hostname TEXT,
-  p_site_bucket TEXT,
-  p_ip_bucket TEXT
-)
-RETURNS VOID
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_now TIMESTAMP WITH TIME ZONE := clock_timestamp();
-  v_hostname TEXT := p_hostname;
-  v_site_bucket TEXT := COALESCE(NULLIF(p_site_bucket, ''), 'unknown');
-BEGIN
-  IF p_ip_bucket IS NULL OR p_ip_bucket = '' THEN
-    RETURN;
-  END IF;
-
-  IF v_hostname IS NULL OR v_hostname = '' THEN
-    RETURN;
-  END IF;
-
-  PERFORM pg_advisory_xact_lock(1, hashtext(v_hostname));
-  PERFORM pg_advisory_xact_lock(2, hashtext(v_hostname || ':' || v_site_bucket));
-
-  UPDATE "fq_host_waiter_depth"
-      SET "waiting_count" = GREATEST("waiting_count" - 1, 0),
-          "updated_at" = v_now
-    WHERE "hostname_pattern" = v_hostname
-      AND "ip_hash" = p_ip_bucket;
-
-  UPDATE "fq_site_waiter_depth"
-      SET "waiting_count" = GREATEST("waiting_count" - 1, 0),
-          "updated_at" = v_now
-    WHERE "hostname_pattern" = v_hostname
-      AND "site_bucket" = v_site_bucket
-      AND "ip_hash" = p_ip_bucket;
-END;
-$$;
-
 CREATE OR REPLACE FUNCTION fq_try_acquire_dual(
   p_hostname_hash TEXT,
   p_hostname TEXT,
@@ -1549,8 +1244,6 @@ CREATE OR REPLACE FUNCTION fq_try_acquire_dual(
   p_host_max_slot_per_ip INT,
   p_site_max_slot_per_site INT,
   p_site_max_slot_per_ip INT,
-  p_host_max_waiters_per_ip INT DEFAULT 0,
-  p_site_max_waiters_per_ip INT DEFAULT 0,
   p_zombie_timeout INT DEFAULT 30,
   p_cooldown_seconds INT DEFAULT 0,
   p_throttle_time_window INT DEFAULT 60
@@ -1558,18 +1251,12 @@ CREATE OR REPLACE FUNCTION fq_try_acquire_dual(
 RETURNS TABLE(
   status TEXT,
   slot_token TEXT,
-  queue_depth INT,
-  ip_queue_depth INT,
   throttle_code INT,
   throttle_retry_after INT
 ) AS $$
 DECLARE
   v_hostname TEXT;
   v_site_bucket TEXT;
-  v_host_queue_depth INT := 0;
-  v_host_ip_queue_depth INT := 0;
-  v_site_queue_depth INT := 0;
-  v_site_ip_queue_depth INT := 0;
   v_throttled BOOLEAN := FALSE;
   v_throttle_code INTEGER := NULL;
   v_throttle_retry_after INTEGER := NULL;
@@ -1578,33 +1265,10 @@ DECLARE
 BEGIN
   v_hostname := COALESCE(NULLIF(p_hostname, ''), NULLIF(p_hostname_hash, ''));
   IF v_hostname IS NULL THEN
-    RETURN QUERY SELECT 'WAIT', NULL::TEXT, 0, 0, NULL::INTEGER, NULL::INTEGER;
+    RETURN QUERY SELECT 'WAIT', NULL::TEXT, NULL::INTEGER, NULL::INTEGER;
     RETURN;
   END IF;
   v_site_bucket := COALESCE(NULLIF(p_site_bucket, ''), 'unknown');
-
-  SELECT COALESCE(SUM("waiting_count"), 0) INTO v_host_queue_depth
-  FROM "fq_host_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname;
-
-  SELECT COALESCE("waiting_count", 0) INTO v_host_ip_queue_depth
-  FROM "fq_host_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname
-    AND "ip_hash" = p_ip_bucket;
-
-  SELECT COALESCE(SUM("waiting_count"), 0) INTO v_site_queue_depth
-  FROM "fq_site_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname
-    AND "site_bucket" = v_site_bucket;
-
-  SELECT COALESCE("waiting_count", 0) INTO v_site_ip_queue_depth
-  FROM "fq_site_waiter_depth"
-  WHERE "hostname_pattern" = v_hostname
-    AND "site_bucket" = v_site_bucket
-    AND "ip_hash" = p_ip_bucket;
-
-  queue_depth := GREATEST(v_host_queue_depth, v_site_queue_depth);
-  ip_queue_depth := GREATEST(v_host_ip_queue_depth, v_site_ip_queue_depth);
 
   IF p_hostname_hash IS NOT NULL AND p_hostname_hash <> '' THEN
     SELECT t.is_protected, t.error_code, t.retry_after

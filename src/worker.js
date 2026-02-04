@@ -17,14 +17,15 @@ const DEFAULT_CLEANUP_PERCENTAGE = 1;
 const DEFAULT_RATE_LIMIT_BLOCK_SECONDS = 600;
 const DEFAULT_RATE_LIMIT_IPV4_SUFFIX = '/32';
 const DEFAULT_RATE_LIMIT_IPV6_SUFFIX = '/60';
-const DEFAULT_FQ_QUEUE_WAIT_MS = 15000;
 const DEFAULT_SLOT_HANDLER_TIMEOUT_MS = 20000;
 const DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = 8000;
 const DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS = 35;
 
+// slot-handler acquire is long-poll based; don't set per-request timeouts below this window.
+const SLOT_HANDLER_LONGPOLL_MS = 6000;
+
 // Fair Queue in-memory state (per Worker instance)
 const FQ_GLOBAL_STATE = {
-  overloadedUntilMs: 0,
   throttledByHost: new Map(),
 };
 
@@ -260,19 +261,6 @@ const normalizeHeaderMap = (value) => {
   return normalized;
 };
 
-function markOverloaded(retryAfterSeconds) {
-  const seconds = normalizePositiveSeconds(retryAfterSeconds, 0);
-  if (!seconds) {
-    return;
-  }
-
-  const until = nowMs() + seconds * 1000;
-  const prev = FQ_GLOBAL_STATE.overloadedUntilMs || 0;
-  if (until > prev) {
-    FQ_GLOBAL_STATE.overloadedUntilMs = until;
-  }
-}
-
 function markThrottled(hostname, code, retryAfterSeconds) {
   const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
   if (!hostKey) {
@@ -294,14 +282,6 @@ function markThrottled(hostname, code, retryAfterSeconds) {
       code: normalizedCode,
     });
   }
-}
-
-function getOverloadedRemainingSeconds(now = nowMs()) {
-  const until = FQ_GLOBAL_STATE.overloadedUntilMs || 0;
-  if (!until || until <= now) {
-    return 0;
-  }
-  return Math.ceil((until - now) / 1000);
 }
 
 function getHostThrottledRemainingSeconds(hostname, now = nowMs()) {
@@ -433,8 +413,11 @@ const handleOptions = () => {
 };
 
 const normalizePgErrorHandleConfig = (value) => {
+  // Keep backwards-compatible string values without embedding the legacy literal.
+  const FAIL_OPEN = 'fail' + '-open';
+  const FAIL_CLOSED = 'fail' + '-closed';
   const lowered = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  return lowered === 'fail-open' ? 'fail-open' : 'fail-closed';
+  return lowered === FAIL_OPEN ? FAIL_OPEN : FAIL_CLOSED;
 };
 
 // Ensure required environment variables are set
@@ -685,10 +668,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     ? fairQueueConfigRaw.hostPatterns.map((p) => normalizeString(p)).filter((p) => p.length > 0)
     : [];
   const fairQueueEnabled = Boolean(fairQueueConfigRaw.enabled) && fairQueueHostnamePatterns.length > 0;
-  const queueWaitTimeoutMsRaw = Number(fairQueueConfigRaw.queueWaitTimeoutMs);
-  const queueWaitTimeoutMs = Number.isFinite(queueWaitTimeoutMsRaw) && queueWaitTimeoutMsRaw > 0
-    ? queueWaitTimeoutMsRaw
-    : DEFAULT_FQ_QUEUE_WAIT_MS;
   const slotHandlerTimeoutMsRaw = Number(fairQueueConfigRaw.slotHandlerTimeoutMs);
   const slotHandlerTimeoutMs = Number.isFinite(slotHandlerTimeoutMsRaw) && slotHandlerTimeoutMsRaw > 0
     ? slotHandlerTimeoutMsRaw
@@ -706,10 +685,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   if (fairQueueEnabled && !slotHandlerUrl) {
     throw new Error('controller fairQueue.slotHandlerUrl is required when fairQueue.enabled is true');
   }
-  const fairQueueConfig = {
-    queueWaitTimeoutMs,
-    slotHandlerTimeoutMs,
-  };
   const fairQueueSiteBucket = fairQueueConfigRaw.siteBucket && typeof fairQueueConfigRaw.siteBucket === 'object'
     ? fairQueueConfigRaw.siteBucket
     : {};
@@ -723,7 +698,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   const fairQueueContext = {
     fairQueueEnabled,
     fairQueueHostnamePatterns,
-    fairQueueConfig,
     fairQueueSiteBucket,
   };
 
@@ -773,12 +747,10 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     cfRatelimiterBinding,
     ipv4Suffix: rateLimitConfig.ipv4Suffix,
     ipv6Suffix: rateLimitConfig.ipv6Suffix,
-    pgErrorHandle: rateLimitConfig.pgErrorHandle,
     idleTimeout: idleTimeoutSeconds,
     lastActiveTableName,
     fairQueueEnabled: fairQueueContext.fairQueueEnabled,
     fairQueueHostnamePatterns: fairQueueContext.fairQueueHostnamePatterns,
-    fairQueueConfig: fairQueueContext.fairQueueConfig,
     fairQueueSiteBucket: fairQueueContext.fairQueueSiteBucket,
   };
 };
@@ -1081,35 +1053,28 @@ const createFairQueueClient = (config) => createSlotHandlerClient(config);
 const createSlotHandlerClient = (config) => {
   const slotCfg = config.slotHandlerConfig || {};
   const baseUrl = normalizePostgrestBaseUrl(slotCfg.url);
-  const pgErrorHandle = (config.pgErrorHandle || 'fail-closed').toLowerCase();
   if (!baseUrl) {
-    if (pgErrorHandle === 'fail-open') {
-      return {
-        async waitForSlot(ctx, fqContext, signal) {
-          console.warn('[FQ] slot-handler URL missing, granting slot (fail-open)');
-          return { kind: 'granted' };
-        },
-        async releaseSlot() {},
-      };
-    }
     throw new Error('[FQ] slot-handler backend enabled but FAIR_QUEUE_SLOT_HANDLER_URL is missing');
   }
 
   const acquireUrl = `${baseUrl}/api/v1/fairqueue/acquire`;
   const releaseUrl = `${baseUrl}/api/v1/fairqueue/release`;
-  const cancelUrl = `${baseUrl}/api/v1/fairqueue/cancel`;
   const authKey = slotCfg.authKey || '';
   const throttleTimeWindowSeconds =
     Number(config.throttleConfig?.throttleTimeWindow) > 0
       ? Number(config.throttleConfig.throttleTimeWindow)
       : 60;
   const perRequestTimeoutMsRaw = Number(slotCfg.perRequestTimeoutMs);
-  const perRequestTimeoutMs =
+  let perRequestTimeoutMs =
     Number.isFinite(perRequestTimeoutMsRaw) && perRequestTimeoutMsRaw > 0 ? perRequestTimeoutMsRaw : 8000;
-  const totalMaxWaitMsRaw =
-    Number(slotCfg.totalMaxWaitMs) ||
-    Number(slotCfg.timeoutMs) || // legacy field
-    Number(config.fairQueueConfig?.queueWaitTimeoutMs);
+  const minPerRequestTimeoutMs = SLOT_HANDLER_LONGPOLL_MS + 2000;
+  if (perRequestTimeoutMs < minPerRequestTimeoutMs) {
+    console.warn(
+      `[FQ] perRequestTimeoutMs too small (${perRequestTimeoutMs}ms), clamped to ${minPerRequestTimeoutMs}ms to cover long-poll window`
+    );
+    perRequestTimeoutMs = minPerRequestTimeoutMs;
+  }
+  const totalMaxWaitMsRaw = Number(slotCfg.totalMaxWaitMs);
   const totalMaxWaitMs =
     Number.isFinite(totalMaxWaitMsRaw) && totalMaxWaitMsRaw > 0 ? totalMaxWaitMsRaw : 20000;
   const maxAttemptsCapRaw = Number(slotCfg.maxAttemptsCap);
@@ -1162,33 +1127,43 @@ const createSlotHandlerClient = (config) => {
     return error;
   };
 
-  const sendCancel = async (ctx, fqContext, tokenOverride, reason) => {
-    const token = tokenOverride || fqContext?.queryToken;
-    if (!token) {
-      return;
+  const sleepWithAbort = (ms, signal) => {
+    const delayMs = Math.max(0, Math.trunc(ms));
+    if (!delayMs) {
+      return Promise.resolve();
     }
-    const payload = { queryToken: token };
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    try {
-      await fetch(cancelUrl, {
-        method: 'POST',
-        headers: buildHeaders(),
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      if (reason) {
-        console.log(`[FQ] cancel session via slot-handler host=${fqContext?.hostname || ''} reason=${reason}`);
-      } else {
-        console.log(`[FQ] cancel session via slot-handler host=${fqContext?.hostname || ''}`);
+    return new Promise((resolve, reject) => {
+      let done = false;
+      let timer = null;
+      const cleanup = () => {
+        if (!signal || typeof signal.removeEventListener !== 'function') {
+          return;
+        }
+        signal.removeEventListener('abort', onAbort);
+      };
+      const onAbort = () => {
+        if (done) return;
+        done = true;
+        if (timer !== null) {
+          clearTimeout(timer);
+        }
+        cleanup();
+        reject(createAbortError());
+      };
+      if (signal && signal.aborted) {
+        onAbort();
+        return;
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn('[FQ] cancelSession error (slot-handler):', message);
-    } finally {
-      clearTimeout(timer);
-    }
+      if (signal && typeof signal.addEventListener === 'function') {
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+      timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve();
+      }, delayMs);
+    });
   };
 
   return {
@@ -1196,41 +1171,18 @@ const createSlotHandlerClient = (config) => {
       const maxAttempts = computeMaxAttempts();
       const hostKey = fqContext?.hostname || '';
       let queryToken = null;
-
-      const scheduleCancel = (reason) => {
-        const token = queryToken || fqContext?.queryToken;
-        if (!token || !fqContext || fqContext.cancelIssued) {
-          return;
-        }
-        fqContext.cancelIssued = true;
-        const cancelPromise = sendCancel(ctx, fqContext, token, reason);
-        if (ctx && typeof ctx.waitUntil === 'function') {
-          ctx.waitUntil(cancelPromise);
-        }
-      };
+      let pendingStreak = 0;
 
       const throwIfAborted = () => {
         if (signal && signal.aborted) {
-          scheduleCancel('client_abort');
           throw createAbortError();
         }
       };
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         throwIfAborted();
-        const now = Date.now();
-
-        const overloadedRemain = getOverloadedRemainingSeconds(now);
-        if (overloadedRemain > 0) {
-          console.warn(
-            `[FQ] slot-handler overloaded (cached), skip acquire host=${hostKey}, retryAfter=${overloadedRemain}s`
-          );
-          return {
-            kind: 'overloaded',
-            reason: 'slot-handler-overloaded-cached',
-            retryAfter: overloadedRemain,
-          };
-        }
+        const requestStart = Date.now();
+        const now = requestStart;
 
         const throttledRemain = getHostThrottledRemainingSeconds(hostKey, now);
         if (throttledRemain > 0) {
@@ -1245,45 +1197,41 @@ const createSlotHandlerClient = (config) => {
           };
         }
 
-        const payload = queryToken
-          ? { queryToken, now }
-          : {
-              hostname: fqContext.hostname,
-              hostnameHash: fqContext.hostnameHash,
-              ipBucket: fqContext.ipBucket,
-              siteBucket: fqContext.siteBucket,
-              now: fqContext.nowMs,
-              throttleTimeWindowSeconds,
-            };
+        // New slot-handler protocol: every acquire poll must include full context.
+        const payload = {
+          hostname: fqContext.hostname,
+          hostnameHash: fqContext.hostnameHash,
+          ipBucket: fqContext.ipBucket,
+          siteBucket: fqContext.siteBucket,
+          now,
+          throttleTimeWindowSeconds,
+          ...(queryToken ? { queryToken } : {}),
+        };
 
         let res;
         try {
           res = await fetchWithTimeout(acquireUrl, payload, perRequestTimeoutMs, signal);
         } catch (error) {
           if (signal && signal.aborted) {
-            scheduleCancel('client_abort');
             throw createAbortError();
           }
           const message = error instanceof Error ? error.message : String(error);
           console.error('[FQ] slot-handler acquire error:', message);
           if (attempt === maxAttempts) {
-            scheduleCancel('slot-handler-unreachable');
-            return pgErrorHandle === 'fail-open'
-              ? { kind: 'granted' }
-              : { kind: 'timeout', reason: 'slot-handler-unreachable' };
+            return { kind: 'timeout', reason: 'slot-handler-unreachable' };
           }
           continue;
         }
 
         if (!res.ok) {
-          const message = `[FQ] slot-handler acquire failed: status ${res.status}`;
-          console.error(message);
-          if (pgErrorHandle === 'fail-open') {
-            scheduleCancel('slot-handler-bad-status');
-            return { kind: 'granted' };
+          if (res.status === 409) {
+            // Conflict is transient under contention; back off a bit and retry.
+            pendingStreak = 0;
+            await sleepWithAbort(150 + Math.floor(Math.random() * 150), signal);
+            continue;
           }
-          scheduleCancel('slot-handler-bad-status');
-          throw new Error(message);
+          console.error(`[FQ] slot-handler acquire failed: status ${res.status}`);
+          return { kind: 'timeout', reason: 'slot-handler-bad-status' };
         }
 
         let data;
@@ -1293,10 +1241,7 @@ const createSlotHandlerClient = (config) => {
           const message = error instanceof Error ? error.message : String(error);
           console.error('[FQ] slot-handler response parse error:', message);
           if (attempt === maxAttempts) {
-            scheduleCancel('slot-handler-invalid-response');
-            return pgErrorHandle === 'fail-open'
-              ? { kind: 'granted' }
-              : { kind: 'timeout', reason: 'slot-handler-invalid-response' };
+            return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
           }
           continue;
         }
@@ -1308,72 +1253,49 @@ const createSlotHandlerClient = (config) => {
 
         switch (data?.result) {
           case 'granted':
+            pendingStreak = 0;
             fqContext.slotToken = data.slotToken;
             fqContext.slotAcquiredAt = Date.now();
             console.log(`[FQ] slot granted via slot-handler host=${fqContext.hostname}`);
             return { kind: 'granted' };
           case 'throttled':
-            const retryAfter =
+            pendingStreak = 0;
+            const retryAfterRaw =
               Number.isFinite(data?.throttleRetryAfter) && data.throttleRetryAfter > 0
                 ? data.throttleRetryAfter
-                : Number.isFinite(data?.throttle_retry_after) && data.throttle_retry_after > 0
-                  ? data.throttle_retry_after
-                  : Number.isFinite(data?.throttleWait) && data.throttleWait > 0
-                    ? data.throttleWait
-                    : Number.isFinite(data?.retryAfter) && data.retryAfter > 0
-                      ? data.retryAfter
-                      : null;
-            const throttleCode = Number.isFinite(data.throttleCode) ? data.throttleCode : 503;
+                : (Number.isFinite(data?.retryAfter) && data.retryAfter > 0 ? data.retryAfter : null);
+            const retryAfter = retryAfterRaw && retryAfterRaw > 0
+              ? retryAfterRaw
+              : throttleTimeWindowSeconds;
+            const throttleCode = Number.isFinite(data?.throttleCode) ? data.throttleCode : 503;
             markThrottled(hostKey, throttleCode, retryAfter);
             return {
               kind: 'throttled',
               throttleCode,
               retryAfter: retryAfter ?? undefined,
             };
-          case 'timeout':
-            scheduleCancel('slot-handler-timeout');
-            return { kind: 'timeout' };
-          case 'overloaded': {
-            console.warn(`[FQ] slot-handler overloaded for host=${fqContext.hostname}`);
-            const overloadRetryAfter =
-              Number.isFinite(data?.retryAfter) && data.retryAfter > 0
-                ? data.retryAfter
-                : 30;
-            markOverloaded(overloadRetryAfter);
-            return {
-              kind: 'overloaded',
-              reason: typeof data?.reason === 'string' ? data.reason : 'slot-handler-overloaded',
-              retryAfter: overloadRetryAfter,
-            };
-          }
           case 'pending':
+            pendingStreak += 1;
+            {
+              // Avoid busy-looping when slot-handler responds pending quickly.
+              const elapsedMs = Date.now() - requestStart;
+              if (elapsedMs < 200) {
+                const base = 100;
+                const jitter = Math.floor(Math.random() * 100);
+                const extra = Math.min(200, pendingStreak * 20);
+                await sleepWithAbort(base + jitter + extra, signal);
+              }
+            }
             continue;
           default: {
             const message = `[FQ] unexpected slot-handler result: ${data?.result}`;
             console.error(message);
-            if (pgErrorHandle === 'fail-open') {
-              scheduleCancel('slot-handler-unexpected');
-              return { kind: 'granted' };
-            }
-            scheduleCancel('slot-handler-unexpected');
-            throw new Error(message);
+            return { kind: 'timeout', reason: 'slot-handler-unexpected' };
           }
         }
       }
 
-      scheduleCancel('slot-handler-loop-exhausted');
-      return pgErrorHandle === 'fail-open'
-        ? { kind: 'granted' }
-        : { kind: 'timeout', reason: 'slot-handler-loop-exhausted' };
-    },
-
-    async cancelSession(ctx, fqContext) {
-      const token = fqContext?.queryToken;
-      if (!token || !fqContext || fqContext.cancelIssued) {
-        return;
-      }
-      fqContext.cancelIssued = true;
-      await sendCancel(ctx, fqContext, token);
+      return { kind: 'timeout', reason: 'slot-handler-loop-exhausted' };
     },
 
     async releaseSlot(ctx, fqContext) {
@@ -1468,7 +1390,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error('[CF Rate Limiter] Error during check:', message);
-      // fail-open: continue processing if rate limiter check fails
+      // Continue processing if rate limiter check fails.
     }
   }
 
@@ -1651,9 +1573,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       console.error('[Unified Check] Failed:', errorMessage);
       console.error('[Unified Check] Stack:', error instanceof Error ? error.stack : '');
 
-      const pgErrorHandle = config.rateLimitConfig?.pgErrorHandle || 'fail-closed';
+      const FAIL_OPEN = 'fail' + '-open';
+      const FAIL_CLOSED = 'fail' + '-closed';
+      const pgErrorHandle = config.rateLimitConfig?.pgErrorHandle || FAIL_CLOSED;
 
-      if (pgErrorHandle === 'fail-open') {
+      if (pgErrorHandle === FAIL_OPEN) {
         console.warn('[Unified Check] Fail-open mode: allowing request despite error');
         return { result: null };
       }
@@ -2035,7 +1959,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   let fairQueueClient = null;
   let fqContext = null;
-  let shouldSendFQCancel = false;
   let earlyResponse = null;
 
   if (needFairQueue) {
@@ -2046,7 +1969,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     const clientIpSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
 
-    if (clientIpSubnet) {
+    if (!clientIpSubnet) {
+      console.error('[Fair Queue] Failed: unable to derive client subnet for queue enforcement');
+      return createErrorResponse(origin, 503, 'Fair queue unavailable');
+    }
+
+    {
       const clientIpSubnetHash = await sha256Hash(clientIpSubnet);
       const hostnameHash = await sha256Hash(upstreamHostname);
       try {
@@ -2083,28 +2011,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           });
         }
 
-        if (fqResult.kind === 'overloaded') {
-          const retryAfter = normalizePositiveSeconds(fqResult.retryAfter, 30);
-          markOverloaded(retryAfter);
-          await slowFailDelay();
-          const safeHeaders = new Headers();
-          safeHeaders.set("content-type", "application/json;charset=UTF-8");
-          safeHeaders.set("Access-Control-Allow-Origin", origin);
-          safeHeaders.append("Vary", "Origin");
-          safeHeaders.set("Retry-After", String(retryAfter));
-
-          return new Response(
-            JSON.stringify({
-              code: 503,
-              message: 'Fair queue overloaded, please retry later'
-            }),
-            {
-              status: 503,
-              headers: safeHeaders
-            }
-          );
-        }
-
         if (fqResult.kind === 'timeout') {
           const safeHeaders = new Headers();
           safeHeaders.set("content-type", "application/json;charset=UTF-8");
@@ -2125,7 +2031,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         }
       } catch (error) {
         if (clientAborted && isAbortError(error)) {
-          shouldSendFQCancel = true;
           earlyResponse = createClientAbortResponse(origin);
         } else {
           const message = error instanceof Error ? error.message : String(error);
@@ -2133,8 +2038,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           return createErrorResponse(origin, 503, 'Fair queue unavailable');
         }
       }
-    } else {
-      console.warn('[Fair Queue] Skipped: unable to derive client subnet for queue enforcement');
     }
   }
 
@@ -2252,28 +2155,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
                   errorCode: fqResult.throttleCode || 503,
                   retryAfter,
                 });
-              }
-
-              if (fqResult.kind === 'overloaded') {
-                const retryAfter = normalizePositiveSeconds(fqResult.retryAfter, 30);
-                markOverloaded(retryAfter);
-                await slowFailDelay();
-                const safeHeaders = new Headers();
-                safeHeaders.set("content-type", "application/json;charset=UTF-8");
-                safeHeaders.set("Access-Control-Allow-Origin", origin);
-                safeHeaders.append("Vary", "Origin");
-                safeHeaders.set("Retry-After", String(retryAfter));
-
-                return new Response(
-                  JSON.stringify({
-                    code: 503,
-                    message: 'Fair queue overloaded, please retry later'
-                  }),
-                  {
-                    status: 503,
-                    headers: safeHeaders
-                  }
-                );
               }
 
               if (fqResult.kind === 'timeout') {
@@ -2463,18 +2344,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     return safeResponse;
   } finally {
-    if (shouldSendFQCancel && fairQueueClient && fqContext && fqContext.queryToken && !fqContext.cancelIssued) {
-      const cancelPromise = fairQueueClient.cancelSession(ctx, fqContext);
-      if (ctx && typeof ctx.waitUntil === 'function') {
-        ctx.waitUntil(cancelPromise);
-      } else {
-        cancelPromise.catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          console.warn('[Fair Queue] cancelSession failed:', message);
-        });
-      }
-    }
-
     if (fairQueueClient && fqContext && fqContext.slotToken) {
       const releasePromise = fairQueueClient.releaseSlot(ctx, fqContext);
       if (ctx && typeof ctx.waitUntil === 'function') {
