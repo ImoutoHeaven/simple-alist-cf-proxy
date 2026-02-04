@@ -228,14 +228,17 @@ const (
 )
 
 type FQSession struct {
-	mu                  sync.Mutex
-	Token               string
-	Hostname            string
-	HostnameHash        string
-	IPBucket            string
-	SiteBucket          string
-	CreatedAt           time.Time
-	LastSeenAt          time.Time
+	mu           sync.Mutex
+	Token        string
+	Hostname     string
+	HostnameHash string
+	IPBucket     string
+	SiteBucket   string
+	CreatedAt    time.Time
+	LastSeenAt   time.Time
+
+	// SchedLastSeenAt is scheduler-side activity timestamp. Accessed only while holding host.mu.
+	SchedLastSeenAt     time.Time
 	State               FQSessionState
 	SlotToken           string
 	WaiterRegistered    bool
@@ -345,6 +348,7 @@ type fqBucketState struct {
 	VirtualTime     float64
 	LastProbedAt    time.Time
 	LastFailedAt    time.Time
+	LastActiveAt    time.Time
 
 	// Bucket-local scheduling state
 	MinLocalVT uint64
@@ -357,6 +361,7 @@ type fqSiteState struct {
 	WaitCount             int64
 	VirtualTime           float64
 	LastProbedAt          time.Time
+	LastActiveAt          time.Time
 	RegisteredWaiters     int64
 	RegisteredWaitersByIP map[string]int64
 	IpStates              map[string]*fqIpState
@@ -645,6 +650,90 @@ func pickSessionInBucketLocked(_ *fqHostState, bucket *fqBucketState) *FQSession
 	return best
 }
 
+// pickActiveSessionInBucketLocked selects the active session with the smallest LocalVT
+// (then earliest CreatedAt) in a bucket. Caller must hold host.mu.
+func pickActiveSessionInBucketLocked(bucket *fqBucketState, now time.Time, window time.Duration) *FQSession {
+	if bucket == nil || len(bucket.Sessions) == 0 {
+		return nil
+	}
+
+	var best *FQSession
+	var bestVT uint64
+	var bestCreatedAt time.Time
+	first := true
+
+	for _, sess := range bucket.Sessions {
+		if sess == nil {
+			continue
+		}
+		if !isRecentlyActive(sess.SchedLastSeenAt, now, window) {
+			continue
+		}
+		vt := sess.LocalVT
+		createdAt := sess.CreatedAt
+
+		if first || vt < bestVT || (vt == bestVT && createdAt.Before(bestCreatedAt)) {
+			best = sess
+			bestVT = vt
+			bestCreatedAt = createdAt
+			first = false
+		}
+	}
+
+	return best
+}
+
+// minActiveLocalVTInBucketLocked returns the smallest LocalVT among sessions
+// that are considered recently active. Caller must hold host.mu.
+func minActiveLocalVTInBucketLocked(bucket *fqBucketState, now time.Time, window time.Duration) (uint64, bool) {
+	if bucket == nil || len(bucket.Sessions) == 0 {
+		return 0, false
+	}
+	first := true
+	var minVT uint64
+	for _, sess := range bucket.Sessions {
+		if sess == nil {
+			continue
+		}
+		if !isRecentlyActive(sess.SchedLastSeenAt, now, window) {
+			continue
+		}
+		if first || sess.LocalVT < minVT {
+			minVT = sess.LocalVT
+			first = false
+		}
+	}
+	if first {
+		return 0, false
+	}
+	return minVT, true
+}
+
+// recomputeBucketMinLocalVTLocked recalculates bucket.MinLocalVT from all sessions.
+// Caller must hold host.mu.
+func recomputeBucketMinLocalVTLocked(bucket *fqBucketState) {
+	if bucket == nil {
+		return
+	}
+	if len(bucket.Sessions) == 0 {
+		bucket.MinLocalVT = 0
+		return
+	}
+	minVT := ^uint64(0)
+	for _, sess := range bucket.Sessions {
+		if sess == nil {
+			continue
+		}
+		if sess.LocalVT < minVT {
+			minVT = sess.LocalVT
+		}
+	}
+	if minVT == ^uint64(0) {
+		minVT = 0
+	}
+	bucket.MinLocalVT = minVT
+}
+
 // markSessionSelectedInBucketLocked increments LocalVT for the chosen session and refreshes MinLocalVT.
 // Caller must hold host.mu.
 func markSessionSelectedInBucketLocked(_ *fqHostState, bucket *fqBucketState, sess *FQSession) {
@@ -822,7 +911,23 @@ func (s *server) registerPendingSession(sess *FQSession) {
 		bucket.Sessions = make(map[string]*FQSession)
 	}
 
-	sess.LocalVT = bucket.MinLocalVT
+	// Initialize LocalVT from the active baseline to avoid stale inactive sessions
+	// pinning newcomers to an old MinLocalVT.
+	cfg := s.getConfig()
+	if cfg == nil {
+		// Legacy behavior when config isn't available.
+		sess.LocalVT = bucket.MinLocalVT
+	} else if len(bucket.Sessions) > 0 {
+		now := time.Now()
+		activeWindow := computeActiveWindow(cfg, host)
+		if activeMinVT, ok := minActiveLocalVTInBucketLocked(bucket, now, activeWindow); ok {
+			sess.LocalVT = activeMinVT
+		} else {
+			sess.LocalVT = bucket.MinLocalVT
+		}
+	} else {
+		sess.LocalVT = bucket.MinLocalVT
+	}
 	if _, exists := bucket.Sessions[sess.Token]; !exists {
 		bucket.PendingSessions++
 		site.PendingSessions++
@@ -1369,6 +1474,72 @@ func isHotByPending(ws WeightedSchedulerConfig, pending int64, slotCap int) bool
 	return pending >= int64(threshold)
 }
 
+func computeGlobalWaitTimeMs(cfg *Config, host *fqHostState) int64 {
+	if cfg == nil || host == nil {
+		return 0
+	}
+	// Caller must hold host.mu when reading host.AvgWaitMs.
+	pollWindowMs := cfg.FairQueue.pollWindowDuration().Milliseconds()
+	globalWaitTimeMs := host.AvgWaitMs
+	if pollWindowMs > globalWaitTimeMs {
+		globalWaitTimeMs = pollWindowMs
+	}
+	if globalWaitTimeMs < 0 {
+		globalWaitTimeMs = 0
+	}
+
+	// Cap the baseline so an idle/non-polling site can't be treated as "active" for too long.
+	// Prefer max-wait (if configured), otherwise bound it by the polling rhythm.
+	if maxWaitMs := cfg.FairQueue.maxWaitDuration().Milliseconds(); maxWaitMs > 0 {
+		if globalWaitTimeMs > maxWaitMs {
+			globalWaitTimeMs = maxWaitMs
+		}
+	} else {
+		// If maxWait is disabled (0), do not let this grow unbounded with AvgWaitMs.
+		maxBound := int64(2) * pollWindowMs
+		if maxBound > 0 && globalWaitTimeMs > maxBound {
+			globalWaitTimeMs = maxBound
+		}
+	}
+
+	// Secondary cap: never exceed session-idle duration.
+	if idleMs := cfg.FairQueue.sessionIdleDuration().Milliseconds(); idleMs > 0 && globalWaitTimeMs > idleMs {
+		globalWaitTimeMs = idleMs
+	}
+	return globalWaitTimeMs
+}
+
+func computeActiveWindow(cfg *Config, host *fqHostState) time.Duration {
+	if cfg == nil || host == nil {
+		return 0
+	}
+	// Caller must hold host.mu when passing host.
+	globalWaitTimeMs := computeGlobalWaitTimeMs(cfg, host)
+	pollWindowMs := cfg.FairQueue.pollWindowDuration().Milliseconds()
+	activeWindowMs := int64(2) * pollWindowMs
+	if globalWaitTimeMs > activeWindowMs {
+		activeWindowMs = globalWaitTimeMs
+	}
+	if idleMs := cfg.FairQueue.sessionIdleDuration().Milliseconds(); idleMs > 0 && activeWindowMs > idleMs {
+		activeWindowMs = idleMs
+	}
+	if activeWindowMs < 0 {
+		activeWindowMs = 0
+	}
+	return time.Duration(activeWindowMs) * time.Millisecond
+}
+
+func isRecentlyActive(last, now time.Time, window time.Duration) bool {
+	if last.IsZero() || window <= 0 {
+		return false
+	}
+	// Treat clock skew as active.
+	if now.Before(last) {
+		return true
+	}
+	return now.Sub(last) <= window
+}
+
 func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 	if cfg == nil || sess == nil {
 		return true
@@ -1381,11 +1552,115 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 		return true
 	}
 
-	pollInterval := cfg.FairQueue.pollInterval()
-
-	now := time.Now()
 	host.mu.Lock()
 	defer host.mu.Unlock()
+
+	now := time.Now()
+	activeWindow := computeActiveWindow(cfg, host)
+
+	siteKey := strings.TrimSpace(sess.SiteBucket)
+	if siteKey == "" {
+		siteKey = "unknown"
+	}
+	site := host.Sites[siteKey]
+	bucketKey := fqBucketKey{IPBucket: sess.IPBucket}
+	var bucket *fqBucketState
+	if site != nil {
+		bucket = site.Buckets[bucketKey]
+	}
+	if s.isIpInStructuralDenyWindow(site, sess.IPBucket, now) {
+		if s.log != nil {
+			s.log.Debugf("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
+		}
+		return false
+	}
+
+	// Detect "reactivation" using the pre-touch timestamps.
+	prevSessActive := sess.SchedLastSeenAt
+	var prevSiteActive time.Time
+	var prevBucketActive time.Time
+	if site != nil {
+		prevSiteActive = site.LastActiveAt
+		if bucket != nil {
+			prevBucketActive = bucket.LastActiveAt
+		}
+	}
+
+	siteWasInactive := site != nil && !isRecentlyActive(prevSiteActive, now, activeWindow)
+	bucketWasInactive := bucket != nil && !isRecentlyActive(prevBucketActive, now, activeWindow)
+	sessWasInactive := !isRecentlyActive(prevSessActive, now, activeWindow)
+
+	// On reactivation, align VT/WaitCount/LocalVT to the active baseline so a long-idle
+	// site/bucket/session cannot jump the queue or pin the head.
+	if siteWasInactive {
+		baseVT := 0.0
+		found := false
+		for key, s2 := range host.Sites {
+			if s2 == nil || key == siteKey {
+				continue
+			}
+			if !isRecentlyActive(s2.LastActiveAt, now, activeWindow) {
+				continue
+			}
+			if !found || s2.VirtualTime < baseVT {
+				baseVT = s2.VirtualTime
+				found = true
+			}
+		}
+		if found && site.VirtualTime < baseVT {
+			site.VirtualTime = baseVT
+		}
+		// Clear stale contention weights.
+		site.WaitCount = 0
+		for _, b := range site.Buckets {
+			if b == nil {
+				continue
+			}
+			b.WaitCount = 0
+		}
+	}
+	if bucketWasInactive && bucket != nil && site != nil {
+		if bucket.VirtualTime < site.VirtualTime {
+			bucket.VirtualTime = site.VirtualTime
+		}
+		if !siteWasInactive {
+			// Clear stale contention weight for this bucket and keep site.WaitCount consistent.
+			bucket.WaitCount = 0
+			var sum int64
+			for _, b := range site.Buckets {
+				if b == nil {
+					continue
+				}
+				sum += b.WaitCount
+			}
+			site.WaitCount = sum
+		}
+	}
+	if sessWasInactive && bucket != nil {
+		baseLocalVT := bucket.MinLocalVT
+		if activeMinVT, ok := minActiveLocalVTInBucketLocked(bucket, now, activeWindow); ok {
+			baseLocalVT = activeMinVT
+		}
+		oldVT := sess.LocalVT
+		if sess.LocalVT < baseLocalVT {
+			sess.LocalVT = baseLocalVT
+			// If we just raised the previous minimum, recompute to avoid stale MinLocalVT.
+			if oldVT == bucket.MinLocalVT {
+				recomputeBucketMinLocalVTLocked(bucket)
+			}
+		}
+	}
+
+	// Touch scheduler-side activity timestamps early (before any early returns).
+	sess.SchedLastSeenAt = now
+	if site != nil {
+		site.LastActiveAt = now
+		if bucket != nil {
+			bucket.LastActiveAt = now
+		}
+	}
+
+	pollInterval := cfg.FairQueue.pollInterval()
 
 	hostHot := false
 	if ws.Enabled {
@@ -1394,18 +1669,6 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 		if !hostHot && ws.ColdAvgWaitMs > 0 && host.AvgWaitMs <= ws.ColdAvgWaitMs {
 			hostHot = false
 		}
-	}
-
-	siteKey := strings.TrimSpace(sess.SiteBucket)
-	if siteKey == "" {
-		siteKey = "unknown"
-	}
-	site := host.Sites[siteKey]
-	if s.isIpInStructuralDenyWindow(site, sess.IPBucket, now) {
-		if s.log != nil {
-			s.log.Debugf("[FQ] probe decision: host=%s ip=%s allowed=false reason=ip_deny_window", hostKey, sess.IPBucket)
-		}
-		return false
 	}
 
 	if host.TotalPending <= 1 {
@@ -1428,17 +1691,22 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 		return false
 	}
 
-	if host.Sites == nil {
-		return true
-	}
-	if site == nil {
+	failOpen := func() bool {
+		// Keep progress even if scheduler state is incomplete, but still honor MaxProbesPerCycle.
+		host.ProbesInCycle++
 		return true
 	}
 
-	bucketKey := fqBucketKey{IPBucket: sess.IPBucket}
-	bucket := site.Buckets[bucketKey]
+	if host.Sites == nil {
+		return failOpen()
+	}
+	if site == nil {
+		return failOpen()
+	}
+
+	bucket = site.Buckets[bucketKey]
 	if bucket == nil {
-		return true
+		return failOpen()
 	}
 
 	var chosenSiteKey string
@@ -1448,10 +1716,29 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 		if s2 == nil || len(s2.Buckets) == 0 {
 			continue
 		}
+		if !isRecentlyActive(s2.LastActiveAt, now, activeWindow) {
+			continue
+		}
 		if first || s2.VirtualTime < chosenSite.VirtualTime {
 			chosenSiteKey = key
 			chosenSite = s2
 			first = false
+		}
+	}
+	if chosenSite == nil {
+		// Fail-open: activity timestamps are set lazily and may be zero after restart.
+		// Falling back to the legacy unfiltered selection avoids starving all sessions;
+		// probe concurrency is still bounded by MaxProbesPerCycle under host.mu.
+		first = true
+		for key, s2 := range host.Sites {
+			if s2 == nil || len(s2.Buckets) == 0 {
+				continue
+			}
+			if first || s2.VirtualTime < chosenSite.VirtualTime {
+				chosenSiteKey = key
+				chosenSite = s2
+				first = false
+			}
 		}
 	}
 	if chosenSite == nil || chosenSiteKey != siteKey {
@@ -1465,15 +1752,33 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 		if b == nil || len(b.Sessions) == 0 {
 			continue
 		}
+		if !isRecentlyActive(b.LastActiveAt, now, activeWindow) {
+			continue
+		}
 		if first || b.VirtualTime < chosenBucket.VirtualTime {
 			chosenBucketKey = key
 			chosenBucket = b
 			first = false
 		}
 	}
+	if chosenBucket == nil {
+		// Fail-open: buckets may not have LastActiveAt populated yet.
+		// Keep legacy behavior to avoid stalling the host when no bucket is considered active.
+		first = true
+		for key, b := range chosenSite.Buckets {
+			if b == nil || len(b.Sessions) == 0 {
+				continue
+			}
+			if first || b.VirtualTime < chosenBucket.VirtualTime {
+				chosenBucketKey = key
+				chosenBucket = b
+				first = false
+			}
+		}
+	}
 
 	if chosenBucket == nil {
-		return true
+		return failOpen()
 	}
 	if chosenBucketKey != bucketKey {
 		return false
@@ -1482,7 +1787,12 @@ func (s *server) shouldProbe(cfg *Config, sess *FQSession) bool {
 		return false
 	}
 
-	chosenSess := pickSessionInBucketLocked(host, bucket)
+	chosenSess := pickActiveSessionInBucketLocked(chosenBucket, now, activeWindow)
+	if chosenSess == nil {
+		// Fail-open: if all sessions in this bucket look inactive (e.g. timestamps not yet touched),
+		// fall back to legacy selection to prevent a permanent block.
+		chosenSess = pickSessionInBucketLocked(host, bucket)
+	}
 	if chosenSess == nil || chosenSess.Token != sess.Token {
 		return false
 	}

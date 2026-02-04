@@ -73,6 +73,72 @@ func TestRegisterAndUnregisterSession(t *testing.T) {
 	}
 }
 
+func TestRegisterPendingSessionUsesActiveMinLocalVT(t *testing.T) {
+	s := newTestServer()
+	cfg := testWeightedConfig()
+	// Ensure s.getConfig() returns non-nil inside registerPendingSession.
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+
+	now := time.Now()
+	inactive := &FQSession{
+		Hostname:        "example.com",
+		HostnameHash:    "h1",
+		IPBucket:        "ip1",
+		SiteBucket:      "s1",
+		Token:           "inactive",
+		SchedLastSeenAt: now.Add(-time.Minute),
+	}
+	active := &FQSession{
+		Hostname:        "example.com",
+		HostnameHash:    "h1",
+		IPBucket:        "ip1",
+		SiteBucket:      "s1",
+		Token:           "active",
+		SchedLastSeenAt: now,
+	}
+
+	s.registerPendingSession(inactive)
+	s.registerPendingSession(active)
+
+	host := s.getHostState(fqHostKey("h1", "example.com"))
+	if host == nil {
+		t.Fatalf("expected host state to exist")
+	}
+
+	host.mu.Lock()
+	bucket := host.Sites["s1"].Buckets[fqBucketKey{IPBucket: "ip1"}]
+	if bucket == nil {
+		host.mu.Unlock()
+		t.Fatalf("expected bucket state to exist")
+	}
+	// Simulate an inactive session with a pinned min, and an active session that has progressed.
+	inactive.LocalVT = 0
+	active.LocalVT = 5
+	bucket.MinLocalVT = 0
+	host.mu.Unlock()
+
+	newcomer := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "new"}
+	s.registerPendingSession(newcomer)
+	if newcomer.LocalVT != 5 {
+		t.Fatalf("expected newcomer.LocalVT=5 from active min, got %d", newcomer.LocalVT)
+	}
+}
+
+func TestComputeActiveWindowCappedByIdle(t *testing.T) {
+	cfg := &Config{
+		FairQueue: FairQueueConfig{
+			PollWindowMs:       6000,
+			SessionIdleSeconds: 1,
+		},
+	}
+	host := &fqHostState{AvgWaitMs: 0}
+
+	got := computeActiveWindow(cfg, host)
+	if got > time.Second {
+		t.Fatalf("expected active window <= 1s, got %s", got)
+	}
+}
+
 func TestOnTryAcquireWaitCountUpdates(t *testing.T) {
 	s := newTestServer()
 	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1"}
@@ -149,6 +215,58 @@ func TestShouldProbeRespectsMaxProbes(t *testing.T) {
 	}
 }
 
+func TestShouldProbeTouchesActivityTimestamps(t *testing.T) {
+	cfg := testWeightedConfig()
+	s := newTestServer()
+
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "t1"}
+	s.registerPendingSession(sess)
+
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getHostState(hostKey)
+	if host == nil {
+		t.Fatalf("expected host state to exist")
+	}
+
+	start := time.Now()
+	_ = s.shouldProbe(cfg, sess)
+
+	const slack = 50 * time.Millisecond
+	minAllowed := start.Add(-slack)
+
+	host.mu.Lock()
+	defer host.mu.Unlock()
+
+	if sess.SchedLastSeenAt.IsZero() {
+		t.Fatalf("expected sess.SchedLastSeenAt to be set")
+	}
+	if sess.SchedLastSeenAt.Before(minAllowed) {
+		t.Fatalf("expected sess.SchedLastSeenAt >= %v (with slack), got %v", minAllowed, sess.SchedLastSeenAt)
+	}
+
+	site := host.Sites["s1"]
+	if site == nil {
+		t.Fatalf("expected site state to exist")
+	}
+	if site.LastActiveAt.IsZero() {
+		t.Fatalf("expected site.LastActiveAt to be set")
+	}
+	if site.LastActiveAt.Before(minAllowed) {
+		t.Fatalf("expected site.LastActiveAt >= %v (with slack), got %v", minAllowed, site.LastActiveAt)
+	}
+
+	bucket := site.Buckets[fqBucketKey{IPBucket: "ip1"}]
+	if bucket == nil {
+		t.Fatalf("expected bucket state to exist")
+	}
+	if bucket.LastActiveAt.IsZero() {
+		t.Fatalf("expected bucket.LastActiveAt to be set")
+	}
+	if bucket.LastActiveAt.Before(minAllowed) {
+		t.Fatalf("expected bucket.LastActiveAt >= %v (with slack), got %v", minAllowed, bucket.LastActiveAt)
+	}
+}
+
 func TestShouldProbeColdHost(t *testing.T) {
 	cfg := testWeightedConfig()
 	s := newTestServer()
@@ -168,6 +286,121 @@ func TestShouldProbeColdHost(t *testing.T) {
 	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: siteKey}
 	if !s.shouldProbe(cfg, sess) {
 		t.Fatalf("cold host should always probe")
+	}
+}
+
+func TestShouldProbeSkipsInactiveSiteToAvoidHOL(t *testing.T) {
+	cfg := testWeightedConfig()
+	s := newTestServer()
+
+	// Two sites under the same host:
+	// - cold has smaller VirtualTime but only stale activity timestamps
+	// - hot has larger VirtualTime and is active
+	// Old (unfiltered) logic would pick cold and block hot.
+
+	coldSess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip-cold", SiteBucket: "cold", Token: "cold", CreatedAt: time.Now().Add(-2 * time.Second)}
+	hotSess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip-hot", SiteBucket: "hot", Token: "hot", CreatedAt: time.Now().Add(-time.Second)}
+
+	s.registerPendingSession(coldSess)
+	s.registerPendingSession(hotSess)
+
+	hostKey := fqHostKey("h1", "example.com")
+	host := s.getHostState(hostKey)
+	if host == nil {
+		t.Fatalf("expected host state to exist")
+	}
+
+	stale := time.Now().Add(-time.Hour)
+
+	host.mu.Lock()
+	if host.Sites == nil {
+		host.mu.Unlock()
+		t.Fatalf("expected host sites")
+	}
+	coldSite := host.Sites["cold"]
+	hotSite := host.Sites["hot"]
+	if coldSite == nil || hotSite == nil {
+		host.mu.Unlock()
+		t.Fatalf("expected both cold and hot sites")
+	}
+
+	// Force cold to win by VT under legacy logic.
+	coldSite.VirtualTime = 0
+	hotSite.VirtualTime = 100
+
+	coldBucket := coldSite.Buckets[fqBucketKey{IPBucket: "ip-cold"}]
+	if coldBucket == nil || len(coldBucket.Sessions) == 0 {
+		host.mu.Unlock()
+		t.Fatalf("expected cold bucket to exist and have sessions")
+	}
+
+	// Mark cold as inactive at all levels so it gets filtered out.
+	coldSite.LastActiveAt = stale
+	coldBucket.LastActiveAt = stale
+	coldSess.SchedLastSeenAt = stale
+
+	// Ensure the host is considered contended so shouldProbe does scheduling.
+	host.TotalPending = 2
+	host.AvgWaitMs = 0
+	host.mu.Unlock()
+
+	if !s.shouldProbe(cfg, hotSess) {
+		t.Fatalf("expected hot session to probe (not be blocked by inactive cold site)")
+	}
+}
+
+func TestShouldProbeDenyDoesNotTouchActivity(t *testing.T) {
+	cfg := testWeightedConfig()
+	s := newTestServer()
+
+	sess := &FQSession{Hostname: "example.com", HostnameHash: "h1", IPBucket: "ip1", SiteBucket: "s1", Token: "t1"}
+	s.registerPendingSession(sess)
+
+	hostKey := fqHostKey(sess.HostnameHash, sess.Hostname)
+	host := s.getHostState(hostKey)
+	if host == nil {
+		t.Fatalf("expected host state to exist")
+	}
+
+	stale := time.Now().Add(-time.Hour)
+
+	host.mu.Lock()
+	site := host.Sites["s1"]
+	if site == nil {
+		host.mu.Unlock()
+		t.Fatalf("expected site state to exist")
+	}
+	bucket := site.Buckets[fqBucketKey{IPBucket: "ip1"}]
+	if bucket == nil {
+		host.mu.Unlock()
+		t.Fatalf("expected bucket state to exist")
+	}
+	// Put the IP into deny window and set stale activity timestamps.
+	if site.IpStates == nil {
+		site.IpStates = make(map[string]*fqIpState)
+	}
+	site.IpStates["ip1"] = &fqIpState{DenyUntil: time.Now().Add(5 * time.Second)}
+	sess.SchedLastSeenAt = stale
+	site.LastActiveAt = stale
+	bucket.LastActiveAt = stale
+	host.TotalPending = 2
+	host.AvgWaitMs = 2
+	host.mu.Unlock()
+
+	if s.shouldProbe(cfg, sess) {
+		t.Fatalf("expected probe denied")
+	}
+
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if !sess.SchedLastSeenAt.Equal(stale) {
+		t.Fatalf("expected sess.SchedLastSeenAt unchanged, got %v", sess.SchedLastSeenAt)
+	}
+	if !site.LastActiveAt.Equal(stale) {
+		t.Fatalf("expected site.LastActiveAt unchanged, got %v", site.LastActiveAt)
+	}
+	if !bucket.LastActiveAt.Equal(stale) {
+		t.Fatalf("expected bucket.LastActiveAt unchanged, got %v", bucket.LastActiveAt)
 	}
 }
 
@@ -218,6 +451,22 @@ func TestBucketLocalWRRPrefersLowestLocalVTThenCreatedAt(t *testing.T) {
 		t.Fatalf("expected host state to exist")
 	}
 	host.mu.Lock()
+	// Mark all states as active to avoid reactivation alignment affecting this test.
+	ts := time.Now()
+	siteState := host.Sites["s1"]
+	if siteState == nil {
+		host.mu.Unlock()
+		t.Fatalf("expected site state to exist")
+	}
+	bucketState := siteState.Buckets[fqBucketKey{IPBucket: "ip1"}]
+	if bucketState == nil {
+		host.mu.Unlock()
+		t.Fatalf("expected bucket state to exist")
+	}
+	siteState.LastActiveAt = ts
+	bucketState.LastActiveAt = ts
+	sess1.SchedLastSeenAt = ts
+	sess2.SchedLastSeenAt = ts
 	host.TotalPending = 2
 	host.AvgWaitMs = 2
 	host.mu.Unlock()
@@ -278,6 +527,11 @@ func TestWeightedSchedulerAppliesWeightsWhenHot(t *testing.T) {
 	bucket := site.Buckets[fqBucketKey{IPBucket: "ip1"}]
 	site.WaitCount = 3
 	bucket.WaitCount = 3
+	// Ensure we don't treat this as a reactivated site and wipe weights.
+	ts := time.Now()
+	site.LastActiveAt = ts
+	bucket.LastActiveAt = ts
+	sess1.SchedLastSeenAt = ts
 	host.TotalPending = 2
 	host.mu.Unlock()
 
