@@ -56,14 +56,23 @@ type flowStore struct {
 	// Injected for testability; defaults to time.AfterFunc/time.Now.
 	afterFunc func(time.Duration, func()) *time.Timer
 	nowFn     func() time.Time
+
+	// In-flight counter indexes for O(1) overload checks
+	inFlightGlobal int
+	inFlightByHost map[string]int // hostKey -> count
+	inFlightBySite map[string]int // "hostKey\x00site" -> count
+	inFlightByIP   map[string]int // "hostKey\x00site\x00ip" -> count
 }
 
 func newFlowStore(grace time.Duration) *flowStore {
 	return &flowStore{
-		grace:     grace,
-		byToken:   map[string]*fqFlow{},
-		afterFunc: time.AfterFunc,
-		nowFn:     time.Now,
+		grace:          grace,
+		byToken:        map[string]*fqFlow{},
+		afterFunc:      time.AfterFunc,
+		nowFn:          time.Now,
+		inFlightByHost: make(map[string]int),
+		inFlightBySite: make(map[string]int),
+		inFlightByIP:   make(map[string]int),
 	}
 }
 
@@ -101,11 +110,7 @@ func (s *flowStore) trySelectInFlight(token string, hostKey string, now time.Tim
 		return fqFlowSnapshot{}, false
 	}
 	if isFlowExpiredAt(f, now) {
-		if f.timer != nil {
-			f.timer.Stop()
-			f.timer = nil
-		}
-		delete(s.byToken, token)
+		s.removeFlowLocked(f)
 		return fqFlowSnapshot{}, false
 	}
 	key := f.HostnameHash
@@ -149,16 +154,12 @@ func (s *flowStore) listInFlightByHost(hostKey string, now time.Time) []fqFlowSn
 
 	// Only flows with a live attached waiter are candidates for the in-flight scheduler.
 	res := make([]fqFlowSnapshot, 0)
-	for tok, f := range s.byToken {
+	for _, f := range s.byToken {
 		if f == nil {
 			continue
 		}
 		if isFlowExpiredAt(f, now) {
-			if f.timer != nil {
-				f.timer.Stop()
-				f.timer = nil
-			}
-			delete(s.byToken, tok)
+			s.removeFlowLocked(f)
 			continue
 		}
 		key := f.HostnameHash
@@ -230,6 +231,107 @@ func normalizeIPBucket(ip string) string {
 	return strings.TrimSpace(ip)
 }
 
+func flowSiteKey(hostKey, site string) string {
+	return hostKey + "\x00" + site
+}
+
+func flowIPKey(hostKey, site, ip string) string {
+	return hostKey + "\x00" + site + "\x00" + ip
+}
+
+func safeStopTimer(t *time.Timer) {
+	if t == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	t.Stop()
+}
+
+func (s *flowStore) incrementInFlightLocked(f *fqFlow) {
+	if f == nil {
+		return
+	}
+	hostKey := fqHostKey(f.HostnameHash, f.Hostname)
+	site := normalizeSiteBucket(f.SiteBucket)
+	ip := normalizeIPBucket(f.IPBucket)
+
+	s.inFlightGlobal++
+	s.inFlightByHost[hostKey]++
+	siteKey := flowSiteKey(hostKey, site)
+	s.inFlightBySite[siteKey]++
+	ipKey := flowIPKey(hostKey, site, ip)
+	s.inFlightByIP[ipKey]++
+}
+
+func (s *flowStore) decrementInFlightLocked(f *fqFlow) {
+	if f == nil {
+		return
+	}
+	hostKey := fqHostKey(f.HostnameHash, f.Hostname)
+	site := normalizeSiteBucket(f.SiteBucket)
+	ip := normalizeIPBucket(f.IPBucket)
+
+	s.inFlightGlobal--
+	s.inFlightByHost[hostKey]--
+	if s.inFlightByHost[hostKey] <= 0 {
+		delete(s.inFlightByHost, hostKey)
+	}
+
+	siteKey := flowSiteKey(hostKey, site)
+	s.inFlightBySite[siteKey]--
+	if s.inFlightBySite[siteKey] <= 0 {
+		delete(s.inFlightBySite, siteKey)
+	}
+
+	ipKey := flowIPKey(hostKey, site, ip)
+	s.inFlightByIP[ipKey]--
+	if s.inFlightByIP[ipKey] <= 0 {
+		delete(s.inFlightByIP, ipKey)
+	}
+}
+
+func (s *flowStore) isOverloadedByCounters(hostKey, siteBucket, ipBucket string, limits inFlightLimits) bool {
+	if limits.global > 0 && s.inFlightGlobal >= limits.global {
+		return true
+	}
+	hostKey = strings.TrimSpace(hostKey)
+	if hostKey == "" {
+		return false
+	}
+	if limits.host > 0 && s.inFlightByHost[hostKey] >= limits.host {
+		return true
+	}
+	site := normalizeSiteBucket(siteBucket)
+	siteKey := flowSiteKey(hostKey, site)
+	if limits.site > 0 && s.inFlightBySite[siteKey] >= limits.site {
+		return true
+	}
+	ip := normalizeIPBucket(ipBucket)
+	ipKey := flowIPKey(hostKey, site, ip)
+	if limits.ip > 0 && s.inFlightByIP[ipKey] >= limits.ip {
+		return true
+	}
+	return false
+}
+
+func (s *flowStore) removeFlowLocked(f *fqFlow) {
+	if f == nil {
+		return
+	}
+	if f.waiter != nil {
+		s.decrementInFlightLocked(f)
+	}
+	if f.timer != nil {
+		safeStopTimer(f.timer)
+		f.timer = nil
+	}
+	delete(s.byToken, f.Token)
+}
+
+// countInFlightLocked is kept for debugging/verification purposes.
+// Production code should use isOverloadedByCounters for O(1) checks.
 func (s *flowStore) countInFlightLocked(hostKey, siteBucket, ipBucket string, now time.Time, limits inFlightLimits) (int, int, int, int) {
 	if s == nil {
 		return 0, 0, 0, 0
@@ -253,16 +355,12 @@ func (s *flowStore) countInFlightLocked(hostKey, siteBucket, ipBucket string, no
 	siteCount := 0
 	ipCount := 0
 
-	for tok, f := range s.byToken {
+	for _, f := range s.byToken {
 		if f == nil {
 			continue
 		}
 		if isFlowExpiredAt(f, now) {
-			if f.timer != nil {
-				f.timer.Stop()
-				f.timer = nil
-			}
-			delete(s.byToken, tok)
+			s.removeFlowLocked(f)
 			continue
 		}
 		if f.waiter == nil {
@@ -308,20 +406,7 @@ func (s *flowStore) countInFlightLocked(hostKey, siteBucket, ipBucket string, no
 }
 
 func (s *flowStore) isOverloadedLocked(hostKey, siteBucket, ipBucket string, now time.Time, limits inFlightLimits) bool {
-	globalCount, hostCount, siteCount, ipCount := s.countInFlightLocked(hostKey, siteBucket, ipBucket, now, limits)
-	if limits.global > 0 && globalCount >= limits.global {
-		return true
-	}
-	if limits.host > 0 && hostCount >= limits.host {
-		return true
-	}
-	if limits.site > 0 && siteCount >= limits.site {
-		return true
-	}
-	if limits.ip > 0 && ipCount >= limits.ip {
-		return true
-	}
-	return false
+	return s.isOverloadedByCounters(hostKey, siteBucket, ipBucket, limits)
 }
 
 func (s *flowStore) isOverloaded(hostKey, siteBucket, ipBucket string, now time.Time, limits inFlightLimits) bool {
@@ -352,7 +437,7 @@ func (s *flowStore) attachWaiter(token string, w *fqWaiter, now time.Time) (ok b
 		return false, nil
 	}
 	if isFlowExpiredAt(f, now) {
-		delete(s.byToken, token)
+		s.removeFlowLocked(f)
 		return false, nil
 	}
 	if f.waiter != nil {
@@ -362,10 +447,11 @@ func (s *flowStore) attachWaiter(token string, w *fqWaiter, now time.Time) (ok b
 	// Once a new long-poll is inflight, clear grace expiry.
 	f.expireAt = time.Time{}
 	if f.timer != nil {
-		f.timer.Stop()
+		safeStopTimer(f.timer)
 		f.timer = nil
 	}
 	f.waiter = w
+	s.incrementInFlightLocked(f)
 	return true, nil
 }
 
@@ -384,7 +470,7 @@ func (s *flowStore) attachWaiterWithLimits(token string, w *fqWaiter, now time.T
 		return false, nil
 	}
 	if isFlowExpiredAt(f, now) {
-		delete(s.byToken, token)
+		s.removeFlowLocked(f)
 		return false, nil
 	}
 	if f.waiter != nil {
@@ -394,17 +480,18 @@ func (s *flowStore) attachWaiterWithLimits(token string, w *fqWaiter, now time.T
 	hostKey := fqHostKey(f.HostnameHash, f.Hostname)
 	siteBucket := normalizeSiteBucket(f.SiteBucket)
 	ipBucket := normalizeIPBucket(f.IPBucket)
-	if s.isOverloadedLocked(hostKey, siteBucket, ipBucket, now, limits) {
+	if s.isOverloadedByCounters(hostKey, siteBucket, ipBucket, limits) {
 		return true, errWaiterOverloaded
 	}
 
 	// Once a new long-poll is inflight, clear grace expiry.
 	f.expireAt = time.Time{}
 	if f.timer != nil {
-		f.timer.Stop()
+		safeStopTimer(f.timer)
 		f.timer = nil
 	}
 	f.waiter = w
+	s.incrementInFlightLocked(f)
 	return true, nil
 }
 
@@ -418,6 +505,9 @@ func (s *flowStore) detachWaiter(token string) bool {
 	f := s.byToken[token]
 	if f == nil {
 		return false
+	}
+	if f.waiter != nil {
+		s.decrementInFlightLocked(f)
 	}
 	f.waiter = nil
 	return true
@@ -434,11 +524,7 @@ func (s *flowStore) deleteFlow(token string) bool {
 	if !ok {
 		return false
 	}
-	if f != nil && f.timer != nil {
-		f.timer.Stop()
-		f.timer = nil
-	}
-	delete(s.byToken, token)
+	s.removeFlowLocked(f)
 	return true
 }
 
@@ -450,13 +536,16 @@ func (s *flowStore) detachWithGrace(token string, now time.Time) {
 		return
 	}
 
+	if f.waiter != nil {
+		s.decrementInFlightLocked(f)
+	}
 	f.waiter = nil
 	if f.timer != nil {
-		f.timer.Stop()
+		safeStopTimer(f.timer)
 		f.timer = nil
 	}
 	if s.grace <= 0 {
-		delete(s.byToken, token)
+		s.removeFlowLocked(f)
 		s.mu.Unlock()
 		return
 	}
@@ -551,7 +640,7 @@ func (s *flowStore) deleteIfExpired(token string, now time.Time) bool {
 	if !isFlowExpiredAt(f, now) {
 		return false
 	}
-	delete(s.byToken, token)
+	s.removeFlowLocked(f)
 	return true
 }
 
@@ -560,16 +649,12 @@ func (s *flowStore) pruneExpired(now time.Time) int {
 	defer s.mu.Unlock()
 
 	deleted := 0
-	for tok, f := range s.byToken {
+	for _, f := range s.byToken {
 		if f == nil {
 			continue
 		}
 		if isFlowExpiredAt(f, now) {
-			if f.timer != nil {
-				f.timer.Stop()
-				f.timer = nil
-			}
-			delete(s.byToken, tok)
+			s.removeFlowLocked(f)
 			deleted++
 		}
 	}

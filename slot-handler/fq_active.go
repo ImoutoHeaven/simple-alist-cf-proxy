@@ -20,11 +20,17 @@ type activeTracker struct {
 	mu        sync.Mutex
 	leases    map[string]activeLease
 	legacySeq int64
+
+	// Counter indexes for O(1) lookups
+	hostCount map[string]int
+	siteCount map[string]int
 }
 
 func newActiveTracker() *activeTracker {
 	return &activeTracker{
-		leases: make(map[string]activeLease),
+		leases:    make(map[string]activeLease),
+		hostCount: make(map[string]int),
+		siteCount: make(map[string]int),
 	}
 }
 
@@ -47,6 +53,7 @@ func (t *activeTracker) Add(host, site string, delta int) {
 				site:      site,
 				expiresAt: now.Add(legacyLeaseTTL),
 			}
+			t.incrementCountersLocked(host, site)
 		}
 		return
 	}
@@ -57,6 +64,7 @@ func (t *activeTracker) Add(host, site string, delta int) {
 			break
 		}
 		if strings.HasPrefix(token, legacyLeasePrefix) && lease.host == host && lease.site == site {
+			t.decrementCountersLocked(lease.host, lease.site)
 			delete(t.leases, token)
 			remove--
 		}
@@ -79,11 +87,15 @@ func (t *activeTracker) AddLease(token, host, site string, ttl time.Duration, no
 	defer t.mu.Unlock()
 
 	t.pruneLocked(now)
+	if old, exists := t.leases[token]; exists {
+		t.decrementCountersLocked(old.host, old.site)
+	}
 	t.leases[token] = activeLease{
 		host:      host,
 		site:      site,
 		expiresAt: exp,
 	}
+	t.incrementCountersLocked(host, site)
 }
 
 func (t *activeTracker) ReleaseLease(token string) {
@@ -91,8 +103,12 @@ func (t *activeTracker) ReleaseLease(token string) {
 		return
 	}
 	t.mu.Lock()
-	delete(t.leases, token)
-	t.mu.Unlock()
+	defer t.mu.Unlock()
+
+	if lease, exists := t.leases[token]; exists {
+		t.decrementCountersLocked(lease.host, lease.site)
+		delete(t.leases, token)
+	}
 }
 
 func (t *activeTracker) Prune(now time.Time) {
@@ -121,13 +137,7 @@ func (t *activeTracker) ActiveHost(host string, now ...time.Time) int {
 	defer t.mu.Unlock()
 
 	t.pruneLocked(ref)
-	count := 0
-	for _, lease := range t.leases {
-		if lease.host == host {
-			count++
-		}
-	}
-	return count
+	return t.hostCount[host]
 }
 
 func (t *activeTracker) ActiveSite(host, site string, now ...time.Time) int {
@@ -143,13 +153,7 @@ func (t *activeTracker) ActiveSite(host, site string, now ...time.Time) int {
 	defer t.mu.Unlock()
 
 	t.pruneLocked(ref)
-	count := 0
-	for _, lease := range t.leases {
-		if lease.host == host && lease.site == site {
-			count++
-		}
-	}
-	return count
+	return t.siteCount[activeSiteKey(host, site)]
 }
 
 func (t *activeTracker) pruneLocked(now time.Time) {
@@ -161,7 +165,29 @@ func (t *activeTracker) pruneLocked(now time.Time) {
 	}
 	for token, lease := range t.leases {
 		if !lease.expiresAt.IsZero() && !lease.expiresAt.After(now) {
+			t.decrementCountersLocked(lease.host, lease.site)
 			delete(t.leases, token)
+		}
+	}
+}
+
+func (t *activeTracker) incrementCountersLocked(host, site string) {
+	t.hostCount[host]++
+	if site != "" {
+		t.siteCount[activeSiteKey(host, site)]++
+	}
+}
+
+func (t *activeTracker) decrementCountersLocked(host, site string) {
+	t.hostCount[host]--
+	if t.hostCount[host] <= 0 {
+		delete(t.hostCount, host)
+	}
+	if site != "" {
+		key := activeSiteKey(host, site)
+		t.siteCount[key]--
+		if t.siteCount[key] <= 0 {
+			delete(t.siteCount, key)
 		}
 	}
 }

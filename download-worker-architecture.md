@@ -116,6 +116,7 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 
 10. **Fair Queue（slot-handler）**
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
+    - `acquire` 轮询同时受 `maxAttempts` 与 `totalMaxWaitMs` 约束，任一达到即结束等待。
     - 支持 `pending` / `granted` / `throttled` / `overloaded` / `timeout`；节流状态在内存中做短期抑制。
     - `overloaded` 表示 slot-handler in-flight 超限，worker 内部退避后继续轮询，整体等待不超过 `slotHandlerTimeoutMs`。
     - `download.fairQueue.slotHandlerTimeoutMs` 由 controller 下发，worker 内映射为 `slotHandlerConfig.totalMaxWaitMs`，用于总等待上限。

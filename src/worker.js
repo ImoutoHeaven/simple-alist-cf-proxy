@@ -1191,8 +1191,11 @@ const createSlotHandlerClient = (config) => {
         }
       };
 
-      // totalMaxWaitMs is the hard cap; attempts cap should not cut retries short.
-      for (let attempt = 1; attempt <= maxAttempts || Date.now() - startedAt < totalMaxWaitMs; attempt++) {
+      // Both limits apply: exit when either maxAttempts OR totalMaxWaitMs is exceeded.
+      // With default maxAttempts=35 and typical in-flight duration ~6s, time limit
+      // will normally trigger first. The attempts limit prevents runaway loops when
+      // responses are abnormally fast (e.g., immediate "pending" responses).
+      for (let attempt = 1; attempt <= maxAttempts && Date.now() - startedAt < totalMaxWaitMs; attempt++) {
         throwIfAborted();
         const requestStart = Date.now();
         const elapsedTotalMs = requestStart - startedAt;

@@ -221,3 +221,77 @@ func TestAcquireOverloadedWithExistingToken(t *testing.T) {
 		t.Fatalf("expected overloaded, got %s", resp.Result)
 	}
 }
+
+func TestFlowStoreInFlightCounterConsistency(t *testing.T) {
+	fs := newFlowStore(5 * time.Second)
+	now := time.Unix(0, 0)
+
+	// Create flows
+	tok1 := fs.newFlow("hash1", "host1", "ip1", "site1")
+	tok2 := fs.newFlow("hash1", "host1", "ip1", "site1")
+	tok3 := fs.newFlow("hash1", "host1", "ip2", "site1")
+	tok4 := fs.newFlow("hash2", "host2", "ip1", "site1")
+
+	limits := inFlightLimits{global: 100, host: 50, site: 20, ip: 10}
+
+	// Attach waiters
+	w1 := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
+	w2 := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
+	w3 := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
+	w4 := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
+
+	if ok, err := fs.attachWaiterWithLimits(tok1, w1, now, limits); !ok || err != nil {
+		t.Fatalf("attach waiter tok1: ok=%t err=%v", ok, err)
+	}
+	if ok, err := fs.attachWaiterWithLimits(tok2, w2, now, limits); !ok || err != nil {
+		t.Fatalf("attach waiter tok2: ok=%t err=%v", ok, err)
+	}
+	if ok, err := fs.attachWaiterWithLimits(tok3, w3, now, limits); !ok || err != nil {
+		t.Fatalf("attach waiter tok3: ok=%t err=%v", ok, err)
+	}
+	if ok, err := fs.attachWaiterWithLimits(tok4, w4, now, limits); !ok || err != nil {
+		t.Fatalf("attach waiter tok4: ok=%t err=%v", ok, err)
+	}
+
+	// Verify counts via isOverloaded behavior
+	// Global should be 4
+	globalLimits := inFlightLimits{global: 4}
+	if !fs.isOverloaded("hash1", "site1", "ip1", now, globalLimits) {
+		t.Fatal("expected global overload at limit 4")
+	}
+	globalLimits.global = 5
+	if fs.isOverloaded("hash1", "site1", "ip1", now, globalLimits) {
+		t.Fatal("should not be overloaded at limit 5")
+	}
+
+	if !fs.isOverloaded("hash1", "site1", "ip1", now, inFlightLimits{host: 3}) {
+		t.Fatal("expected host overload at limit 3")
+	}
+	if fs.isOverloaded("hash1", "site1", "ip1", now, inFlightLimits{host: 4}) {
+		t.Fatal("should not be overloaded at limit 4 for host")
+	}
+
+	if !fs.isOverloaded("hash1", "site1", "ip1", now, inFlightLimits{site: 3}) {
+		t.Fatal("expected site overload at limit 3")
+	}
+	if fs.isOverloaded("hash1", "site1", "ip1", now, inFlightLimits{site: 4}) {
+		t.Fatal("should not be overloaded at limit 4 for site")
+	}
+
+	if !fs.isOverloaded("hash1", "site1", "ip1", now, inFlightLimits{ip: 2}) {
+		t.Fatal("expected ip overload at limit 2")
+	}
+	if fs.isOverloaded("hash1", "site1", "ip1", now, inFlightLimits{ip: 3}) {
+		t.Fatal("should not be overloaded at limit 3 for ip")
+	}
+
+	// Detach one waiter
+	fs.detachWaiter(tok1)
+	globalLimits.global = 4
+	if fs.isOverloaded("hash1", "site1", "ip1", now, globalLimits) {
+		t.Fatal("after detach, should not be overloaded at limit 4")
+	}
+	if fs.isOverloaded("hash1", "site1", "ip1", now, inFlightLimits{ip: 2}) {
+		t.Fatal("after detach, expected ip to be non-overloaded at limit 2")
+	}
+}
