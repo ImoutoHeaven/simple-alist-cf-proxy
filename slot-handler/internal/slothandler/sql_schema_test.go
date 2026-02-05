@@ -1,4 +1,4 @@
-package main
+package slothandler
 
 import (
 	"os"
@@ -9,7 +9,7 @@ import (
 )
 
 func TestInitSQLHasNoQueueDepthOrWaiterDeadCode(t *testing.T) {
-	path := filepath.Join("..", "init.sql")
+	path := filepath.Join(moduleRootDir(t), "..", "init.sql")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read init.sql: %v", err)
@@ -55,7 +55,7 @@ func containsBannedToken(text string) (bool, string) {
 }
 
 func TestInitSQLHasNoFoundUsage(t *testing.T) {
-	path := filepath.Join("..", "init.sql")
+	path := filepath.Join(moduleRootDir(t), "..", "init.sql")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read init.sql: %v", err)
@@ -66,7 +66,7 @@ func TestInitSQLHasNoFoundUsage(t *testing.T) {
 }
 
 func TestInitSQLHasBatchTryAcquireFunction(t *testing.T) {
-	path := filepath.Join("..", "init.sql")
+	path := filepath.Join(moduleRootDir(t), "..", "init.sql")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read init.sql: %v", err)

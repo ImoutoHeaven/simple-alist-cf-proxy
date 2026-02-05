@@ -1,4 +1,4 @@
-package main
+package slothandler
 
 import (
 	"fmt"
@@ -19,7 +19,8 @@ func TestSlotHandlerHasNoQueueDepthCleanup(t *testing.T) {
 		"func_cleanup_site_queue_depth",
 	}
 
-	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, walkErr error) error {
+	root := moduleRootDir(t)
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -55,10 +56,11 @@ func TestSlotHandlerHasNoQueueDepthCleanup(t *testing.T) {
 }
 
 func TestDocsHaveNoLegacyFairQueueEndpoints(t *testing.T) {
+	root := moduleRootDir(t)
 	files := []string{
-		"README.md",
-		"config.json",
-		filepath.Join("..", "download-worker-architecture.md"),
+		filepath.Join(root, "README.md"),
+		filepath.Join(root, "config.json"),
+		filepath.Join(root, "..", "download-worker-architecture.md"),
 	}
 	banned := []string{
 		"/fairqueue/cancel",
