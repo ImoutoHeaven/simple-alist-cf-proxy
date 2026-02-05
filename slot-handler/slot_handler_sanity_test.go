@@ -62,7 +62,6 @@ func TestDocsHaveNoLegacyFairQueueEndpoints(t *testing.T) {
 	}
 	banned := []string{
 		"/fairqueue/cancel",
-		"overloaded",
 	}
 
 	for _, path := range files {

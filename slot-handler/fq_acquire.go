@@ -47,6 +47,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		req.SiteBucket = "unknown"
 	}
 	hostKey := fqHostKey(req.HostnameHash, req.Hostname)
+	limits := cfg.FairQueue.inFlightLimits()
 
 	// THROTTLED global convergence: if the host is protected, return immediately.
 	if protected, code, retryAfter := s.getThrottleState(hostKey, now); protected {
@@ -81,21 +82,40 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			}
 		}
 	}
+	createdNew := false
 	if token == "" {
+		if store.isOverloaded(hostKey, req.SiteBucket, req.IPBucket, now, limits) {
+			return &AcquireResponse{Result: "overloaded"}, nil
+		}
 		token = store.newFlow(req.HostnameHash, req.Hostname, req.IPBucket, req.SiteBucket)
+		createdNew = true
 		s.incrementMetric("flow_created")
 	}
 
 	w := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-	ok, err := store.attachWaiter(token, w, now)
+	ok, err := store.attachWaiterWithLimits(token, w, now, limits)
 	if err != nil {
+		if errors.Is(err, errWaiterOverloaded) {
+			if createdNew {
+				store.deleteFlow(token)
+			}
+			return &AcquireResponse{Result: "overloaded"}, nil
+		}
 		return nil, err
 	}
 	if !ok {
+		if store.isOverloaded(hostKey, req.SiteBucket, req.IPBucket, now, limits) {
+			return &AcquireResponse{Result: "overloaded"}, nil
+		}
 		// Flow was deleted/expired concurrently; treat as a new join.
 		token = store.newFlow(req.HostnameHash, req.Hostname, req.IPBucket, req.SiteBucket)
+		createdNew = true
 		w = &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-		if _, err := store.attachWaiter(token, w, now); err != nil {
+		if _, err := store.attachWaiterWithLimits(token, w, now, limits); err != nil {
+			if errors.Is(err, errWaiterOverloaded) {
+				store.deleteFlow(token)
+				return &AcquireResponse{Result: "overloaded"}, nil
+			}
 			return nil, err
 		}
 	}

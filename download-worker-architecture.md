@@ -60,7 +60,12 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 - `download.db.*`：PostgREST 地址、校验 header/secret、缓存表/last-active 表、TTL/idle 等
 - `download.db.rateLimit.*`：窗口、限额、block 时间、`pgErrorHandle` 等
 - `download.throttleProfiles.*`
-- `download.fairQueue.*`：slot-handler 地址、等待超时、轮询策略、siteBucket 计算方式等
+- `download.fairQueue.*`：slot-handler 地址、等待超时、轮询策略、siteBucket 计算方式等（worker 侧解析字段）
+- slot-handler in-flight limits（slot-handler 配置项，写在 slot-handler 的 config 中，worker 不解析）：
+  - `globalMaxInFlightFlow`：slot-handler 全局 in-flight 上限，超过则返回 `overloaded`
+  - `hostMaxInFlightFlow`：按 hostname 维度的 in-flight 上限
+  - `siteMaxInFlightFlow`：按 siteBucket 维度的 in-flight 上限
+  - `ipBucketMaxInFlightFlow`：按 ipBucket 维度的 in-flight 上限
 - `decision.download.*`：`pathAction` / `checkOriginMode` / `throttleProfile`
 
 ## 5. 请求处理流程
@@ -111,7 +116,10 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 
 10. **Fair Queue（slot-handler）**
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
-    - 支持 `pending` / `granted` / `throttled` / `timeout`；节流状态在内存中做短期抑制。
+    - 支持 `pending` / `granted` / `throttled` / `overloaded` / `timeout`；节流状态在内存中做短期抑制。
+    - `overloaded` 表示 slot-handler in-flight 超限，worker 内部退避后继续轮询，整体等待不超过 `slotHandlerTimeoutMs`。
+    - `download.fairQueue.slotHandlerTimeoutMs` 由 controller 下发，worker 内映射为 `slotHandlerConfig.totalMaxWaitMs`，用于总等待上限。
+    - `overloaded` 退避 streak 在收到非 overloaded 结果（如 `pending`/`granted`/`throttled`/`409`）时重置。
     - 完成后发送 `/api/v1/fairqueue/release`。
     - 轮询探测受 `utilWindowSec` 与 `maxBatch` / `maxProbeParallel` / `maxProbeQpsPerHost` 控制。
     - 若 `pgErrorHandle=fail-open` 且 slot-handler 不可用，则跳过排队。

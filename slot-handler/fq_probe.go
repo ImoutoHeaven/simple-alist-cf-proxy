@@ -291,7 +291,7 @@ func (s *server) computeProbeBudget(cfg *Config, hostKey string, inFlight []fqFl
 	if hostCap > 0 {
 		active := 0
 		if s.activeSlots != nil {
-			active = s.activeSlots.ActiveHost(hostKey)
+			active = s.activeSlots.ActiveHost(hostKey, now)
 		}
 		hostHeadroom := hostCap - active
 		if hostHeadroom < 0 {
@@ -314,7 +314,7 @@ func (s *server) computeProbeBudget(cfg *Config, hostKey string, inFlight []fqFl
 			seen[siteKey] = struct{}{}
 			siteActive := 0
 			if s.activeSlots != nil {
-				siteActive = s.activeSlots.ActiveSite(hostKey, siteKey)
+				siteActive = s.activeSlots.ActiveSite(hostKey, siteKey, now)
 			}
 			remaining := siteCap - siteActive
 			if remaining < 0 {
@@ -530,7 +530,8 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 				siteKey = "unknown"
 			}
 			if s.activeSlots != nil {
-				s.activeSlots.Add(hostKey, siteKey, 1)
+				ttl := time.Duration(cfg.FairQueue.zombieTimeoutSeconds()) * time.Second
+				s.activeSlots.AddLease(res.slotToken, hostKey, siteKey, ttl, now)
 			}
 			delivered := store.deliverToWaiter(snap.Token, &AcquireResponse{
 				Result:     "granted",
@@ -568,7 +569,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 
 	hostActive := 0
 	if s.activeSlots != nil {
-		hostActive = s.activeSlots.ActiveHost(hostKey)
+		hostActive = s.activeSlots.ActiveHost(hostKey, now)
 	}
 	hostCap := cfg.FairQueue.hostMaxSlotPerHost()
 	siteCap := cfg.FairQueue.siteMaxSlotPerSite()
@@ -584,7 +585,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		seenSites[siteKey] = struct{}{}
 		siteActive := 0
 		if s.activeSlots != nil {
-			siteActive = s.activeSlots.ActiveSite(hostKey, siteKey)
+			siteActive = s.activeSlots.ActiveSite(hostKey, siteKey, now)
 		}
 		s.recordUtilizationSample(hostKey, siteKey, hostActive, hostCap, siteActive, siteCap, now)
 	}

@@ -11,11 +11,13 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,6 +26,8 @@ import (
 
 const (
 	defaultMetricsFlushInterval = 60 * time.Second
+	releaseRetryAttempts        = 2
+	releaseRetryBaseDelay       = 25 * time.Millisecond
 )
 
 type Config struct {
@@ -64,6 +68,10 @@ type FairQueueConfig struct {
 	MaxBatch                int                    `json:"maxBatch"`
 	MaxProbeParallel        int                    `json:"maxProbeParallel"`
 	MaxProbeQpsPerHost      int                    `json:"maxProbeQpsPerHost"`
+	GlobalMaxInFlightFlow   *int                   `json:"globalMaxInFlightFlow"`
+	HostMaxInFlightFlow     *int                   `json:"hostMaxInFlightFlow"`
+	SiteMaxInFlightFlow     *int                   `json:"siteMaxInFlightFlow"`
+	IPBucketMaxInFlightFlow *int                   `json:"ipBucketMaxInFlightFlow"`
 	SmoothReleaseIntervalMs *int64                 `json:"smoothReleaseIntervalMs,omitempty"`
 	ZombieTimeoutSeconds    int                    `json:"zombieTimeoutSeconds"`
 	IPCooldownSeconds       int                    `json:"ipCooldownSeconds"`
@@ -577,6 +585,22 @@ func capInt(value *int, fallback int) int {
 		return 0
 	}
 	return *value
+}
+
+type inFlightLimits struct {
+	global int
+	host   int
+	site   int
+	ip     int
+}
+
+func (c FairQueueConfig) inFlightLimits() inFlightLimits {
+	return inFlightLimits{
+		global: capInt(c.GlobalMaxInFlightFlow, 300),
+		host:   capInt(c.HostMaxInFlightFlow, 100),
+		site:   capInt(c.SiteMaxInFlightFlow, 50),
+		ip:     capInt(c.IPBucketMaxInFlightFlow, 10),
+	}
 }
 
 func (c FairQueueConfig) pollInterval() time.Duration {
@@ -1311,6 +1335,44 @@ func (s *server) startFairQueueCleanup(ctx context.Context) {
 	}()
 }
 
+func (s *server) startActiveLeasePrune(ctx context.Context) {
+	go func() {
+		var timer *time.Timer
+		for {
+			interval := time.Minute
+			cfg := s.getConfig()
+			if cfg != nil {
+				ttl := cfg.FairQueue.zombieTimeoutSeconds()
+				if ttl > 0 {
+					interval = time.Duration(ttl) * time.Second
+				}
+			}
+
+			if timer == nil {
+				timer = time.NewTimer(interval)
+			} else {
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(interval)
+			}
+
+			select {
+			case <-ctx.Done():
+				if timer != nil {
+					timer.Stop()
+				}
+				return
+			case <-timer.C:
+			}
+
+			if s.activeSlots != nil {
+				s.activeSlots.Prune(time.Now())
+			}
+		}
+	}()
+}
+
 func (s *server) runFairQueueCleanup(ctx context.Context, cfg *Config) error {
 	if cfg == nil {
 		return errors.New("config not loaded")
@@ -1351,6 +1413,65 @@ func (s *server) getSmoothReleaser(hostnameHash, hostname string) *smoothHostRel
 	return releaser
 }
 
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	if ctx == nil {
+		time.Sleep(d)
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isRetryableReleaseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() || netErr.Temporary() {
+			return true
+		}
+	}
+	msg := err.Error()
+	idx := strings.Index(msg, "status=")
+	if idx == -1 {
+		return false
+	}
+	start := idx + len("status=")
+	end := start
+	for end < len(msg) {
+		c := msg[end]
+		if c < '0' || c > '9' {
+			break
+		}
+		end++
+	}
+	if end == start {
+		return false
+	}
+	code, convErr := strconv.Atoi(msg[start:end])
+	if convErr != nil {
+		return false
+	}
+	return code >= 500
+}
+
 func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 	cfg := s.getConfig()
 	if cfg == nil {
@@ -1384,24 +1505,41 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 	}
 
 	if delay := time.Until(target); delay > 0 {
-		time.Sleep(delay)
+		if err := sleepWithContext(ctx, delay); err != nil {
+			return err
+		}
 	}
 
 	now = time.Now()
 	holdMs := now.Sub(hitAt).Milliseconds()
 
-	if err := backend.ReleaseSlot(ctx, req); err != nil {
+	var err error
+	for attempt := 1; attempt <= releaseRetryAttempts; attempt++ {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		err = backend.ReleaseSlot(ctx, req)
+		if err == nil {
+			break
+		}
+		if !isRetryableReleaseError(err) {
+			break
+		}
+		if attempt < releaseRetryAttempts {
+			if err := sleepWithContext(ctx, releaseRetryBaseDelay*time.Duration(attempt)); err != nil {
+				return err
+			}
+		}
+	}
+	if err != nil {
 		s.log.Errorf("release slot error: %v", err)
 		return err
 	}
 
-	hostKey := fqHostKey(req.HostnameHash, req.Hostname)
-	siteKey := strings.TrimSpace(req.SiteBucket)
-	if siteKey == "" {
-		siteKey = "unknown"
-	}
 	if s.activeSlots != nil {
-		s.activeSlots.Add(hostKey, siteKey, -1)
+		s.activeSlots.ReleaseLease(req.SlotToken)
 	}
 
 	tokenLog := req.SlotToken
@@ -1846,6 +1984,7 @@ func main() {
 		activeSlots:      newActiveTracker(),
 	}
 	s.startFairQueueCleanup(gcCtx)
+	s.startActiveLeasePrune(gcCtx)
 	s.startMetricsReporter(gcCtx, defaultMetricsFlushInterval)
 
 	mux := http.NewServeMux()

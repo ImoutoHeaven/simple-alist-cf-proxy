@@ -54,7 +54,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - `queryToken`（首次可不传；轮询时传回上一次返回的 token）
 
 响应字段：
-- `result`: `pending` / `granted` / `throttled` / `timeout`
+- `result`: `pending` / `granted` / `throttled` / `overloaded` / `timeout`
 - `queryToken`
 - `slotToken`（granted 时）
 
@@ -77,6 +77,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - `maxProbeQpsPerHost`：每个 host 的 probe QPS 上限
 - `zombieTimeoutSeconds` / `ipCooldownSeconds`：传给 DB 的控制参数
 - `hostCaps` / `siteCaps`：并发与 waiters 上限（会透传给 DB 函数）
+- `globalMaxInFlightFlow` / `hostMaxInFlightFlow` / `siteMaxInFlightFlow` / `ipBucketMaxInFlightFlow`：in-flight acquire 上限（超限返回 `overloaded`）
 - `rpc`：DB 函数名
 - `cleanup`：DB 清理任务节奏
 
@@ -128,3 +129,4 @@ slot-handler 依赖以下函数（名称可在配置中改）：
 
 - worker 调用 `acquire/release`；`acquire` 返回 `pending` 时持续轮询。
 - `queryToken` 是排队位置的唯一标识；在 `graceMs` 内重试可延续公平性。
+- `overloaded` 表示 in-flight 超限，worker 需内部退避后继续轮询。

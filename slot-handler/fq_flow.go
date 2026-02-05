@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -216,6 +217,124 @@ func (s *flowStore) newFlow(hostHash, host, ip, site string) string {
 }
 
 var errWaiterAlreadyAttached = errors.New("waiter already attached")
+var errWaiterOverloaded = errors.New("inflight overloaded")
+
+func normalizeSiteBucket(site string) string {
+	if strings.TrimSpace(site) == "" {
+		return "unknown"
+	}
+	return site
+}
+
+func normalizeIPBucket(ip string) string {
+	return strings.TrimSpace(ip)
+}
+
+func (s *flowStore) countInFlightLocked(hostKey, siteBucket, ipBucket string, now time.Time, limits inFlightLimits) (int, int, int, int) {
+	if s == nil {
+		return 0, 0, 0, 0
+	}
+	checkGlobal := limits.global > 0
+	checkHost := limits.host > 0
+	checkSite := limits.site > 0
+	checkIP := limits.ip > 0
+	if !checkGlobal && !checkHost && !checkSite && !checkIP {
+		return 0, 0, 0, 0
+	}
+	scopedEnabled := checkHost || checkSite || checkIP
+	hostKey = strings.TrimSpace(hostKey)
+	skipScoped := scopedEnabled && hostKey == ""
+
+	siteBucket = normalizeSiteBucket(siteBucket)
+	ipBucket = normalizeIPBucket(ipBucket)
+
+	globalCount := 0
+	hostCount := 0
+	siteCount := 0
+	ipCount := 0
+
+	for tok, f := range s.byToken {
+		if f == nil {
+			continue
+		}
+		if isFlowExpiredAt(f, now) {
+			if f.timer != nil {
+				f.timer.Stop()
+				f.timer = nil
+			}
+			delete(s.byToken, tok)
+			continue
+		}
+		if f.waiter == nil {
+			continue
+		}
+		if checkGlobal {
+			globalCount++
+		}
+		if skipScoped {
+			continue
+		}
+		if !checkHost && !checkSite && !checkIP {
+			continue
+		}
+		flowHostKey := fqHostKey(f.HostnameHash, f.Hostname)
+		if flowHostKey != hostKey {
+			continue
+		}
+		if checkHost {
+			hostCount++
+		}
+		if !checkSite && !checkIP {
+			continue
+		}
+		flowSite := normalizeSiteBucket(f.SiteBucket)
+		if flowSite != siteBucket {
+			continue
+		}
+		if checkSite {
+			siteCount++
+		}
+		if !checkIP {
+			continue
+		}
+		flowIP := normalizeIPBucket(f.IPBucket)
+		if flowIP != ipBucket {
+			continue
+		}
+		ipCount++
+	}
+
+	return globalCount, hostCount, siteCount, ipCount
+}
+
+func (s *flowStore) isOverloadedLocked(hostKey, siteBucket, ipBucket string, now time.Time, limits inFlightLimits) bool {
+	globalCount, hostCount, siteCount, ipCount := s.countInFlightLocked(hostKey, siteBucket, ipBucket, now, limits)
+	if limits.global > 0 && globalCount >= limits.global {
+		return true
+	}
+	if limits.host > 0 && hostCount >= limits.host {
+		return true
+	}
+	if limits.site > 0 && siteCount >= limits.site {
+		return true
+	}
+	if limits.ip > 0 && ipCount >= limits.ip {
+		return true
+	}
+	return false
+}
+
+func (s *flowStore) isOverloaded(hostKey, siteBucket, ipBucket string, now time.Time, limits inFlightLimits) bool {
+	if s == nil {
+		return false
+	}
+	if limits.global <= 0 && limits.host <= 0 && limits.site <= 0 && limits.ip <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.isOverloadedLocked(hostKey, siteBucket, ipBucket, now, limits)
+}
 
 // attachWaiter attaches a single in-flight acquire request to an existing flow.
 // If the flow is expired/missing it returns ok=false; if a waiter is already
@@ -238,6 +357,45 @@ func (s *flowStore) attachWaiter(token string, w *fqWaiter, now time.Time) (ok b
 	}
 	if f.waiter != nil {
 		return true, errWaiterAlreadyAttached
+	}
+
+	// Once a new long-poll is inflight, clear grace expiry.
+	f.expireAt = time.Time{}
+	if f.timer != nil {
+		f.timer.Stop()
+		f.timer = nil
+	}
+	f.waiter = w
+	return true, nil
+}
+
+// attachWaiterWithLimits attaches a single in-flight acquire request to an existing flow.
+// If in-flight limits are exceeded, it returns errWaiterOverloaded.
+func (s *flowStore) attachWaiterWithLimits(token string, w *fqWaiter, now time.Time, limits inFlightLimits) (ok bool, err error) {
+	if token == "" || w == nil {
+		return false, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return false, nil
+	}
+	if isFlowExpiredAt(f, now) {
+		delete(s.byToken, token)
+		return false, nil
+	}
+	if f.waiter != nil {
+		return true, errWaiterAlreadyAttached
+	}
+
+	hostKey := fqHostKey(f.HostnameHash, f.Hostname)
+	siteBucket := normalizeSiteBucket(f.SiteBucket)
+	ipBucket := normalizeIPBucket(f.IPBucket)
+	if s.isOverloadedLocked(hostKey, siteBucket, ipBucket, now, limits) {
+		return true, errWaiterOverloaded
 	}
 
 	// Once a new long-poll is inflight, clear grace expiry.

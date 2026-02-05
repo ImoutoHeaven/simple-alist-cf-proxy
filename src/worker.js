@@ -3,6 +3,7 @@ import { createCacheManager } from './cache/factory.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
 import { unifiedCheck } from './unified-check.js';
+import { nextOverloadDelayMs } from './fairqueue-overload.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
 import { parseBoolean, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
 import { buildBindingStr, decryptBindingPayload, getClientIp, normalizePath, parseCheckOriginEnv } from './origin-binding.js';
@@ -1121,6 +1122,14 @@ const createSlotHandlerClient = (config) => {
     return Math.max(1, Math.min(maxAttemptsCap, safeAttempts));
   };
 
+  const computeErrorBackoffMs = (streak) => {
+    const base = 150;
+    const step = 150;
+    const max = 1200;
+    const n = Number.isFinite(streak) && streak > 0 ? Math.floor(streak) : 0;
+    return Math.min(max, base + step * n);
+  };
+
   const createAbortError = () => {
     const error = new Error('Aborted');
     error.name = 'AbortError';
@@ -1172,6 +1181,9 @@ const createSlotHandlerClient = (config) => {
       const hostKey = fqContext?.hostname || '';
       let queryToken = null;
       let pendingStreak = 0;
+      let overloadStreak = 0;
+      let errorStreak = 0;
+      const startedAt = Date.now();
 
       const throwIfAborted = () => {
         if (signal && signal.aborted) {
@@ -1179,9 +1191,16 @@ const createSlotHandlerClient = (config) => {
         }
       };
 
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // totalMaxWaitMs is the hard cap; attempts cap should not cut retries short.
+      for (let attempt = 1; attempt <= maxAttempts || Date.now() - startedAt < totalMaxWaitMs; attempt++) {
         throwIfAborted();
         const requestStart = Date.now();
+        const elapsedTotalMs = requestStart - startedAt;
+        if (elapsedTotalMs >= totalMaxWaitMs) {
+          return { kind: 'timeout', reason: 'slot-handler-timeout' };
+        }
+        const remainingMs = totalMaxWaitMs - elapsedTotalMs;
+        const requestTimeoutMs = Math.min(perRequestTimeoutMs, remainingMs);
         const now = requestStart;
 
         const throttledRemain = getHostThrottledRemainingSeconds(hostKey, now);
@@ -1210,16 +1229,19 @@ const createSlotHandlerClient = (config) => {
 
         let res;
         try {
-          res = await fetchWithTimeout(acquireUrl, payload, perRequestTimeoutMs, signal);
+          res = await fetchWithTimeout(acquireUrl, payload, requestTimeoutMs, signal);
         } catch (error) {
           if (signal && signal.aborted) {
             throw createAbortError();
           }
           const message = error instanceof Error ? error.message : String(error);
           console.error('[FQ] slot-handler acquire error:', message);
-          if (attempt === maxAttempts) {
+          const delayMs = computeErrorBackoffMs(errorStreak);
+          errorStreak += 1;
+          if (Date.now() - startedAt + delayMs >= totalMaxWaitMs) {
             return { kind: 'timeout', reason: 'slot-handler-unreachable' };
           }
+          await sleepWithAbort(delayMs, signal);
           continue;
         }
 
@@ -1227,6 +1249,7 @@ const createSlotHandlerClient = (config) => {
           if (res.status === 409) {
             // Conflict is transient under contention; back off a bit and retry.
             pendingStreak = 0;
+            overloadStreak = 0;
             await sleepWithAbort(150 + Math.floor(Math.random() * 150), signal);
             continue;
           }
@@ -1240,11 +1263,16 @@ const createSlotHandlerClient = (config) => {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           console.error('[FQ] slot-handler response parse error:', message);
-          if (attempt === maxAttempts) {
+          const delayMs = computeErrorBackoffMs(errorStreak);
+          errorStreak += 1;
+          if (Date.now() - startedAt + delayMs >= totalMaxWaitMs) {
             return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
           }
+          await sleepWithAbort(delayMs, signal);
           continue;
         }
+
+        errorStreak = 0;
 
         if (data && data.queryToken) {
           queryToken = data.queryToken;
@@ -1254,12 +1282,14 @@ const createSlotHandlerClient = (config) => {
         switch (data?.result) {
           case 'granted':
             pendingStreak = 0;
+            overloadStreak = 0;
             fqContext.slotToken = data.slotToken;
             fqContext.slotAcquiredAt = Date.now();
             console.log(`[FQ] slot granted via slot-handler host=${fqContext.hostname}`);
             return { kind: 'granted' };
           case 'throttled':
             pendingStreak = 0;
+            overloadStreak = 0;
             const retryAfterRaw =
               Number.isFinite(data?.throttleRetryAfter) && data.throttleRetryAfter > 0
                 ? data.throttleRetryAfter
@@ -1274,8 +1304,24 @@ const createSlotHandlerClient = (config) => {
               throttleCode,
               retryAfter: retryAfter ?? undefined,
             };
+          case 'overloaded': {
+            pendingStreak = 0;
+            const delayMs = nextOverloadDelayMs(overloadStreak);
+            overloadStreak += 1;
+            const elapsed = Date.now() - startedAt;
+            if (elapsed + delayMs >= totalMaxWaitMs) {
+              return { kind: 'timeout', reason: 'slot-handler-overloaded' };
+            }
+            await sleepWithAbort(delayMs, signal);
+            continue;
+          }
+          case 'timeout':
+            pendingStreak = 0;
+            overloadStreak = 0;
+            return { kind: 'timeout', reason: 'slot-handler-timeout' };
           case 'pending':
             pendingStreak += 1;
+            overloadStreak = 0;
             {
               // Avoid busy-looping when slot-handler responds pending quickly.
               const elapsedMs = Date.now() - requestStart;
@@ -1295,7 +1341,7 @@ const createSlotHandlerClient = (config) => {
         }
       }
 
-      return { kind: 'timeout', reason: 'slot-handler-loop-exhausted' };
+      return { kind: 'timeout', reason: 'slot-handler-timeout' };
     },
 
     async releaseSlot(ctx, fqContext) {
