@@ -16,11 +16,34 @@ func testConfigForAcquire(pollWindow time.Duration, grace time.Duration) *Config
 	}
 }
 
-func TestAcquireUnknownTokenCreatesNewToken(t *testing.T) {
+func TestAcquireEmptyTokenCreatesNewToken(t *testing.T) {
 	s := newTestServer()
 	cfg := testConfigForAcquire(2*time.Millisecond, 10*time.Millisecond)
 	s.updateRuntime(cfg, &stubBackend{}, "test", false)
 	// Avoid scheduling real timers for grace cleanup in tests.
+	s.flowStore.afterFunc = nil
+
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "pending" {
+		t.Fatalf("expected pending, got %s", resp.Result)
+	}
+	if resp.QueryToken == "" {
+		t.Fatalf("expected new token, got %q", resp.QueryToken)
+	}
+}
+
+func TestAcquireUnknownTokenReturnsTimeout(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 10*time.Millisecond)
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
 	s.flowStore.afterFunc = nil
 
 	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
@@ -33,11 +56,124 @@ func TestAcquireUnknownTokenCreatesNewToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Result != "pending" {
-		t.Fatalf("expected pending, got %s", resp.Result)
+	if resp.Result != "timeout" {
+		t.Fatalf("expected timeout, got %s", resp.Result)
 	}
-	if resp.QueryToken == "" || resp.QueryToken == "missing" {
-		t.Fatalf("expected new token, got %q", resp.QueryToken)
+	if resp.Reason != "query_token_stale" {
+		t.Fatalf("expected stale reason, got %q", resp.Reason)
+	}
+	if resp.QueryToken != "" {
+		t.Fatalf("expected empty query token, got %q", resp.QueryToken)
+	}
+
+	s.flowStore.mu.Lock()
+	flowCount := len(s.flowStore.byToken)
+	s.flowStore.mu.Unlock()
+	if flowCount != 0 {
+		t.Fatalf("expected no flow creation for unknown non-empty token, got %d", flowCount)
+	}
+}
+
+func TestAcquireTokenMismatchDoesNotDeleteFlow(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	if tok == "" {
+		t.Fatalf("expected token")
+	}
+
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip-other",
+		SiteBucket:   "s1",
+		QueryToken:   tok,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "timeout" {
+		t.Fatalf("expected timeout for mismatched token, got %s", resp.Result)
+	}
+	if resp.Reason != "query_token_mismatch" {
+		t.Fatalf("expected mismatch reason, got %q", resp.Reason)
+	}
+
+	if _, ok := s.flowStore.getSnapshot(tok); !ok {
+		t.Fatalf("expected original flow to remain after mismatch")
+	}
+
+	resp2, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+		QueryToken:   tok,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp2.Result != "pending" {
+		t.Fatalf("expected pending for original token after mismatch attempt, got %s", resp2.Result)
+	}
+	if resp2.QueryToken != tok {
+		t.Fatalf("expected same query token %q, got %q", tok, resp2.QueryToken)
+	}
+}
+
+func TestAcquireTokenMetricsCounts(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 20*time.Millisecond)
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	now := time.Unix(1700000100, 0)
+	s.flowStore.nowFn = func() time.Time {
+		return now
+	}
+
+	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	s.flowStore.detachWithGrace(tok, now)
+	now = now.Add(25 * time.Millisecond)
+
+	respStale, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+		QueryToken:   tok,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if respStale.Result != "timeout" || respStale.Reason != "query_token_stale" {
+		t.Fatalf("expected stale timeout, got result=%s reason=%q", respStale.Result, respStale.Reason)
+	}
+
+	tok2 := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	respMismatch, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip-other",
+		SiteBucket:   "s1",
+		QueryToken:   tok2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if respMismatch.Result != "timeout" || respMismatch.Reason != "query_token_mismatch" {
+		t.Fatalf("expected mismatch timeout, got result=%s reason=%q", respMismatch.Result, respMismatch.Reason)
+	}
+
+	snap := s.collectMetricsSnapshot()
+	if got := snap.Counts["token_stale"]; got != 1 {
+		t.Fatalf("expected token_stale=1, got %d", got)
+	}
+	if got := snap.Counts["token_mismatch"]; got != 1 {
+		t.Fatalf("expected token_mismatch=1, got %d", got)
 	}
 }
 
@@ -139,5 +275,42 @@ func TestAcquirePendingViaSchedulerStartsGrace(t *testing.T) {
 		if snap.ExpireAt.IsZero() {
 			t.Fatalf("expected ExpireAt set after pending delivery")
 		}
+	}
+}
+
+func TestAcquireStaleTokenReturnsTimeout(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 20*time.Millisecond)
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	now := time.Unix(1700000000, 0)
+	s.flowStore.nowFn = func() time.Time {
+		return now
+	}
+
+	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	if tok == "" {
+		t.Fatalf("expected token")
+	}
+
+	s.flowStore.detachWithGrace(tok, now)
+	now = now.Add(21 * time.Millisecond)
+	if s.flowStore.isAlive(tok, now) {
+		t.Fatalf("expected token to be stale at now=%s", now)
+	}
+
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+		QueryToken:   tok,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "timeout" {
+		t.Fatalf("expected timeout for stale token, got %s (queryToken=%q)", resp.Result, resp.QueryToken)
 	}
 }

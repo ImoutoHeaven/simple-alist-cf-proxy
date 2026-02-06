@@ -16,6 +16,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - **Flow（流）**
   - `queryToken` 是 flow 的唯一标识。
   - flow 会跨多次 /acquire 轮询保留公平性状态（例如 LocalVT）。
+  - 带 `queryToken` 的请求若 token 已过期/不存在（stale）或与 host/ip/site 不匹配（mismatch），会返回 `timeout`；不会静默创建新 flow 重入队列。
 
 - **In-flight（在途请求）**
   - 同一个 `queryToken` 同一时间只允许 1 个 in-flight acquire（并发会返回冲突）。
@@ -86,7 +87,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 ## 5. 指标（controller 模式）
 
 周期上报 `slot_handler.snapshot`：
-- `counts`：关键计数（granted/throttled/released 等）
+- `counts`：关键计数（granted/throttled/released/token_stale/token_mismatch 等）
 - `flows`：`total/inflight/detached/grace`
 - `smoothHosts`：smooth releaser 的 host 数
 
@@ -130,3 +131,10 @@ slot-handler 依赖以下函数（名称可在配置中改）：
 - worker 调用 `acquire/release`；`acquire` 返回 `pending` 时持续轮询。
 - `queryToken` 是排队位置的唯一标识；在 `graceMs` 内重试可延续公平性。
 - `overloaded` 表示 in-flight 超限，worker 需内部退避后继续轮询。
+
+## 9. 多实例部署注意（sticky 路由）
+
+- fair-queue flow 状态保存在 slot-handler 进程内存中，`queryToken` 不是跨实例共享。
+- 同一 `queryToken` 的后续 `/acquire` 轮询应尽量命中同一 slot-handler 实例（例如基于 token 的一致性哈希或 LB sticky）。
+- 若未做 sticky，跨实例请求会被判定为 `query_token_stale`/`timeout`，worker 会重新入队，公平性与等待时延会退化。
+- 建议在 LB 层开启健康检查与平滑摘除，减少实例切换导致的 token 失效抖动。

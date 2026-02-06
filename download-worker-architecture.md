@@ -119,11 +119,13 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
     - `acquire` 轮询同时受 `maxAttempts` 与 `totalMaxWaitMs` 约束，任一达到即结束等待。
     - 支持 `pending` / `granted` / `throttled` / `overloaded` / `timeout`；节流状态在内存中做短期抑制。
     - `overloaded` 表示 slot-handler in-flight 超限，worker 内部退避后继续轮询，整体等待不超过 `slotHandlerTimeoutMs`。
+    - worker 维护 host 级 overloaded 冷却窗口与本地退避 `delayMs`，在下一次 acquire 前先等待剩余冷却时间，避免对同一 host 高频空转重试。
     - `download.fairQueue.slotHandlerTimeoutMs` 由 controller 下发，worker 内映射为 `slotHandlerConfig.totalMaxWaitMs`，用于总等待上限。
     - `overloaded` 退避 streak 在收到非 overloaded 结果（如 `pending`/`granted`/`throttled`/`409`）时重置。
     - 完成后发送 `/api/v1/fairqueue/release`。
     - 轮询探测受 `utilWindowSec` 与 `maxBatch` / `maxProbeParallel` / `maxProbeQpsPerHost` 控制。
     - 若 `pgErrorHandle=fail-open` 且 slot-handler 不可用，则跳过排队。
+    - 多实例 slot-handler 需要 sticky 路由：同一 `queryToken` 的轮询应稳定落到同一实例，否则会出现 `query_token_stale` 并触发重新入队。
 
 11. **上游请求与响应封装**
     - 支持 3xx 重定向与 401/410 触发的 refresh（`refresh=true`）重试一次。

@@ -7,12 +7,13 @@ import (
 	"time"
 )
 
-// handleAcquireSlotFlow implements the new token-stable acquire semantics.
+// handleAcquireSlotFlow implements token-stable acquire semantics for fair-queue long polling.
 //
-// In Task 2 we only implement:
-// - token lookup/create (unknown/expired => new token)
+// Key behaviors:
+// - token lookup/create (unknown/expired => timeout for provided token, new flow for first join)
 // - one in-flight waiter per token (concurrent waiters => conflict)
-// - long-poll up to pollWindow, then return pending and start grace at that moment
+// - long-poll up to pollWindow; timeout returns pending and starts grace at that moment
+// - terminal delivery (granted/throttled/timeout) detaches waiter and deletes the flow
 // - ctx cancellation detaches and deletes the flow (no grace)
 func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
 	if ctx == nil {
@@ -64,22 +65,25 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		}, nil
 	}
 
-	// Missing/unknown/expired token => new join.
-	token := strings.TrimSpace(req.QueryToken)
+	requestedToken := strings.TrimSpace(req.QueryToken)
+	token := requestedToken
 	if token != "" {
 		if !store.isAlive(token, now) {
 			store.deleteIfExpired(token, now)
-			token = ""
+			s.incrementMetric("token_stale")
+			return &AcquireResponse{Result: "timeout", Reason: "query_token_stale"}, nil
 		}
-	}
-	if token != "" {
-		if snap, ok := store.getSnapshot(token); ok {
-			if snap.Hostname != req.Hostname ||
-				snap.HostnameHash != req.HostnameHash ||
-				snap.IPBucket != req.IPBucket ||
-				snap.SiteBucket != req.SiteBucket {
-				token = ""
-			}
+		snap, ok := store.getSnapshot(token)
+		if !ok {
+			s.incrementMetric("token_stale")
+			return &AcquireResponse{Result: "timeout", Reason: "query_token_stale"}, nil
+		}
+		if snap.Hostname != req.Hostname ||
+			snap.HostnameHash != req.HostnameHash ||
+			snap.IPBucket != req.IPBucket ||
+			snap.SiteBucket != req.SiteBucket {
+			s.incrementMetric("token_mismatch")
+			return &AcquireResponse{Result: "timeout", Reason: "query_token_mismatch"}, nil
 		}
 	}
 	createdNew := false
@@ -104,6 +108,11 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		return nil, err
 	}
 	if !ok {
+		if requestedToken != "" {
+			store.deleteIfExpired(token, nowFn())
+			s.incrementMetric("token_stale")
+			return &AcquireResponse{Result: "timeout", Reason: "query_token_stale"}, nil
+		}
 		if store.isOverloaded(hostKey, req.SiteBucket, req.IPBucket, now, limits) {
 			return &AcquireResponse{Result: "overloaded"}, nil
 		}
@@ -127,14 +136,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 	timer := time.NewTimer(pollWindow)
 	defer timer.Stop()
 
-	select {
-	case <-ctx.Done():
-		// Avoid leaving a waiter attached; delete immediately (no grace) since the
-		// client aborted the request.
-		store.detachWaiter(token)
-		store.deleteFlow(token)
-		return nil, ctx.Err()
-	case resp := <-w.resCh:
+	finalizeDelivered := func(resp *AcquireResponse) *AcquireResponse {
 		if resp == nil {
 			resp = &AcquireResponse{Result: "pending"}
 		}
@@ -149,11 +151,36 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			// Terminal cleanup (double-insurance, probeOnce may also delete).
 			store.deleteFlow(token)
 		}
-		return resp, nil
+		return resp
+	}
+
+	select {
+	case <-ctx.Done():
+		// Avoid leaving a waiter attached; delete immediately (no grace) since the
+		// client aborted the request.
+		store.detachWaiter(token)
+		store.deleteFlow(token)
+		return nil, ctx.Err()
+	case resp := <-w.resCh:
+		return finalizeDelivered(resp), nil
 	case <-timer.C:
+		// Boundary race guard: prefer delivered outcomes over synthetic pending.
+		// We check once before detach, then detach, then check again. The second
+		// check closes the window where delivery could happen between a default
+		// branch and detachWithGrace.
+		select {
+		case resp := <-w.resCh:
+			return finalizeDelivered(resp), nil
+		default:
+		}
 		// Pending is the authoritative moment to start grace.
 		now2 := nowFn()
 		store.detachWithGrace(token, now2)
+		select {
+		case resp := <-w.resCh:
+			return finalizeDelivered(resp), nil
+		default:
+		}
 		return &AcquireResponse{Result: "pending", QueryToken: token}, nil
 	}
 }
