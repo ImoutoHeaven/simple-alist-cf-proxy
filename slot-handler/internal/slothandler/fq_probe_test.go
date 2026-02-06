@@ -7,6 +7,21 @@ import (
 	"time"
 )
 
+type releaseRecordingBackend struct {
+	sequenceBackend
+	released chan ReleaseRequest
+}
+
+func (b *releaseRecordingBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	if b.released != nil {
+		select {
+		case b.released <- req:
+		default:
+		}
+	}
+	return nil
+}
+
 type sequenceBackend struct {
 	mu      sync.Mutex
 	seq     []*tryAcquireResult
@@ -265,6 +280,42 @@ func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
 	backend.mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("expected backend calls to remain 1 with cache, got %d", calls)
+	}
+}
+
+func TestProbeOnceAcquireUndeliveredTriggersRelease(t *testing.T) {
+	backend := &releaseRecordingBackend{
+		sequenceBackend: sequenceBackend{seq: []*tryAcquireResult{{status: "ACQUIRED", slotToken: "slot-undelivered"}}},
+		released:        make(chan ReleaseRequest, 1),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	tok := store.newFlow("h1", "example.com", "ip1", "s1")
+	respCh := make(chan *AcquireResponse, 1)
+	respCh <- &AcquireResponse{Result: "pending", QueryToken: tok}
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiter")
+	}
+
+	select {
+	case req := <-backend.released:
+		if req.SlotToken != "slot-undelivered" || req.HostnameHash != "h1" || req.SiteBucket != "s1" || req.IPBucket != "ip1" {
+			t.Fatalf("unexpected release request: %+v", req)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected undelivered acquired slot to trigger release")
+	}
+
+	if _, ok := store.getSnapshot(tok); ok {
+		t.Fatalf("expected flow deleted after acquired handling")
 	}
 }
 

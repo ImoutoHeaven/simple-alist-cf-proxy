@@ -28,6 +28,7 @@ const SLOT_HANDLER_LONGPOLL_MS = 6000;
 // Fair Queue in-memory state (per Worker instance)
 const FQ_GLOBAL_STATE = {
   throttledByHost: new Map(),
+  overloadedByHost: new Map(),
 };
 
 // Rate Limit in-memory state (per Worker instance, iprange-level)
@@ -99,6 +100,18 @@ const normalizePositiveSeconds = (value, fallback) => {
   }
   const fb = Number(fallback);
   return Number.isFinite(fb) && fb > 0 ? fb : 0;
+};
+
+const normalizePositiveMs = (value, fallback) => {
+  const num = Number(value);
+  if (Number.isFinite(num) && num > 0) {
+    return Math.max(1, Math.trunc(num));
+  }
+  const fb = Number(fallback);
+  if (Number.isFinite(fb) && fb > 0) {
+    return Math.max(1, Math.trunc(fb));
+  }
+  return 0;
 };
 
 const CACHE_OVERRIDE_UNIT_SECONDS = {
@@ -299,6 +312,40 @@ function getHostThrottledRemainingSeconds(hostname, now = nowMs()) {
     return 0;
   }
   return Math.ceil((state.untilMs - now) / 1000);
+}
+
+function markHostOverloaded(hostname, retryAfterMs) {
+  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
+  if (!hostKey) {
+    return;
+  }
+
+  const durationMs = normalizePositiveMs(retryAfterMs, 0);
+  if (!durationMs) {
+    return;
+  }
+
+  const until = nowMs() + durationMs;
+  const prev = FQ_GLOBAL_STATE.overloadedByHost.get(hostKey);
+  if (!prev || until > prev.untilMs) {
+    FQ_GLOBAL_STATE.overloadedByHost.set(hostKey, { untilMs: until });
+  }
+}
+
+function getHostOverloadedRemainingMs(hostname, now = nowMs()) {
+  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
+  if (!hostKey) {
+    return 0;
+  }
+
+  const state = FQ_GLOBAL_STATE.overloadedByHost.get(hostKey);
+  if (!state || !state.untilMs || state.untilMs <= now) {
+    if (state && state.untilMs && state.untilMs <= now) {
+      FQ_GLOBAL_STATE.overloadedByHost.delete(hostKey);
+    }
+    return 0;
+  }
+  return Math.max(0, state.untilMs - now);
 }
 
 const SLOW_FAIL_DELAY_MS = 5000;
@@ -1219,6 +1266,16 @@ const createSlotHandlerClient = (config) => {
           };
         }
 
+        const overloadedRemainMs = getHostOverloadedRemainingMs(hostKey, now);
+        if (overloadedRemainMs > 0) {
+          const delayMs = Math.min(overloadedRemainMs, requestTimeoutMs);
+          if (Date.now() - startedAt + delayMs >= totalMaxWaitMs) {
+            return { kind: 'timeout', reason: 'slot-handler-overloaded' };
+          }
+          await sleepWithAbort(delayMs, signal);
+          continue;
+        }
+
         // New slot-handler protocol: every acquire poll must include full context.
         const payload = {
           hostname: fqContext.hostname,
@@ -1309,8 +1366,9 @@ const createSlotHandlerClient = (config) => {
             };
           case 'overloaded': {
             pendingStreak = 0;
-            const delayMs = nextOverloadDelayMs(overloadStreak);
+            const delayMs = nextOverloadDelayMs(overloadStreak, { hostOverload: true });
             overloadStreak += 1;
+            markHostOverloaded(hostKey, delayMs);
             const elapsed = Date.now() - startedAt;
             if (elapsed + delayMs >= totalMaxWaitMs) {
               return { kind: 'timeout', reason: 'slot-handler-overloaded' };
@@ -2460,6 +2518,16 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
 
   return await handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 }
+
+export const __fairQueueTestHooks = {
+  createSlotHandlerClient,
+  markHostOverloaded,
+  getHostOverloadedRemainingMs,
+  clearOverloadedByHost: () => {
+    FQ_GLOBAL_STATE.overloadedByHost.clear();
+  },
+};
+
 // src/index.ts
 export default {
   async fetch(request, env, ctx) {

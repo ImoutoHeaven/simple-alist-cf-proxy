@@ -435,7 +435,7 @@ func (s *server) collectMetricsSnapshot() metricsSnapshot {
 	if counts == nil {
 		counts = make(map[string]int64)
 	}
-	for _, key := range []string{"flow_created", "granted", "throttled", "timeout", "released"} {
+	for _, key := range []string{"flow_created", "granted", "throttled", "timeout", "released", "token_stale", "token_mismatch"} {
 		if _, ok := counts[key]; !ok {
 			counts[key] = 0
 		}
