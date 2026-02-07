@@ -7,6 +7,27 @@ import (
 	"time"
 )
 
+const overloadRetryAfterSeconds = 1
+
+const overloadScopedFallback = "host"
+
+func overloadedResponse(scope string) *AcquireResponse {
+	resolved := strings.TrimSpace(scope)
+	if resolved == "" {
+		resolved = overloadScopedFallback
+	}
+	return &AcquireResponse{
+		Result:     "overloaded",
+		Reason:     "overload_" + resolved,
+		RetryAfter: overloadRetryAfterSeconds,
+	}
+}
+
+func detectOverloadScope(store *flowStore, hostKey, siteBucket, ipBucket string, limits inFlightLimits) string {
+	_, scope := store.overloadScope(hostKey, siteBucket, ipBucket, limits)
+	return scope
+}
+
 // handleAcquireSlotFlow implements token-stable acquire semantics for fair-queue long polling.
 //
 // Key behaviors:
@@ -88,8 +109,8 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 	}
 	createdNew := false
 	if token == "" {
-		if store.isOverloaded(hostKey, req.SiteBucket, req.IPBucket, now, limits) {
-			return &AcquireResponse{Result: "overloaded"}, nil
+		if scope := detectOverloadScope(store, hostKey, req.SiteBucket, req.IPBucket, limits); scope != "" {
+			return overloadedResponse(scope), nil
 		}
 		token = store.newFlow(req.HostnameHash, req.Hostname, req.IPBucket, req.SiteBucket)
 		createdNew = true
@@ -103,7 +124,11 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			if createdNew {
 				store.deleteFlow(token)
 			}
-			return &AcquireResponse{Result: "overloaded"}, nil
+			scope := overloadScopeFromError(err)
+			if scope == "" {
+				scope = detectOverloadScope(store, hostKey, req.SiteBucket, req.IPBucket, limits)
+			}
+			return overloadedResponse(scope), nil
 		}
 		return nil, err
 	}
@@ -113,8 +138,8 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			s.incrementMetric("token_stale")
 			return &AcquireResponse{Result: "timeout", Reason: "query_token_stale"}, nil
 		}
-		if store.isOverloaded(hostKey, req.SiteBucket, req.IPBucket, now, limits) {
-			return &AcquireResponse{Result: "overloaded"}, nil
+		if scope := detectOverloadScope(store, hostKey, req.SiteBucket, req.IPBucket, limits); scope != "" {
+			return overloadedResponse(scope), nil
 		}
 		// Flow was deleted/expired concurrently; treat as a new join.
 		token = store.newFlow(req.HostnameHash, req.Hostname, req.IPBucket, req.SiteBucket)
@@ -123,7 +148,11 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		if _, err := store.attachWaiterWithLimits(token, w, now, limits); err != nil {
 			if errors.Is(err, errWaiterOverloaded) {
 				store.deleteFlow(token)
-				return &AcquireResponse{Result: "overloaded"}, nil
+				scope := overloadScopeFromError(err)
+				if scope == "" {
+					scope = detectOverloadScope(store, hostKey, req.SiteBucket, req.IPBucket, limits)
+				}
+				return overloadedResponse(scope), nil
 			}
 			return nil, err
 		}

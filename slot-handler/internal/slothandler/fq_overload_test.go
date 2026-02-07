@@ -222,6 +222,173 @@ func TestAcquireOverloadedWithExistingToken(t *testing.T) {
 	}
 }
 
+func TestAcquireOverloadedResponseContainsScope(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
+	globalMax := 1
+	cfg.FairQueue.GlobalMaxInFlightFlow = &globalMax
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	now := time.Now()
+	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
+	if _, err := s.flowStore.attachWaiterWithLimits(tok, waiter, now, cfg.FairQueue.inFlightLimits()); err != nil {
+		t.Fatalf("attach waiter: %v", err)
+	}
+
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+	})
+	if err != nil {
+		t.Fatalf("handleAcquireSlot: %v", err)
+	}
+	if resp.Result != "overloaded" {
+		t.Fatalf("expected overloaded, got %s", resp.Result)
+	}
+	if resp.Reason != "overload_global" {
+		t.Fatalf("expected reason overload_global, got %q", resp.Reason)
+	}
+	if resp.RetryAfter <= 0 {
+		t.Fatalf("expected positive retryAfter, got %d", resp.RetryAfter)
+	}
+}
+
+func TestAcquireOverloadedReasonMapping(t *testing.T) {
+	t.Run("fallback_scope_is_scoped_not_global", func(t *testing.T) {
+		resp := overloadedResponse("")
+		if resp.Reason != "overload_host" {
+			t.Fatalf("expected fallback reason overload_host, got %q", resp.Reason)
+		}
+		if resp.RetryAfter <= 0 {
+			t.Fatalf("expected positive retryAfter, got %d", resp.RetryAfter)
+		}
+	})
+
+	testCases := []struct {
+		name       string
+		applyLimit func(*Config)
+		seedIP     string
+		seedSite   string
+		reqIP      string
+		reqSite    string
+		expected   string
+	}{
+		{
+			name: "host",
+			applyLimit: func(cfg *Config) {
+				hostMax := 1
+				cfg.FairQueue.HostMaxInFlightFlow = &hostMax
+			},
+			seedIP:   "ip1",
+			seedSite: "s1",
+			reqIP:    "ip2",
+			reqSite:  "s2",
+			expected: "overload_host",
+		},
+		{
+			name: "site",
+			applyLimit: func(cfg *Config) {
+				siteMax := 1
+				cfg.FairQueue.SiteMaxInFlightFlow = &siteMax
+			},
+			seedIP:   "ip1",
+			seedSite: "s1",
+			reqIP:    "ip2",
+			reqSite:  "s1",
+			expected: "overload_site",
+		},
+		{
+			name: "ip",
+			applyLimit: func(cfg *Config) {
+				ipBucketMax := 1
+				cfg.FairQueue.IPBucketMaxInFlightFlow = &ipBucketMax
+			},
+			seedIP:   "ip1",
+			seedSite: "s1",
+			reqIP:    "ip1",
+			reqSite:  "s1",
+			expected: "overload_ip",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer()
+			cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
+			tc.applyLimit(cfg)
+			s.updateRuntime(cfg, &stubBackend{}, "test", false)
+			s.flowStore.afterFunc = nil
+
+			now := time.Now()
+			tok := s.flowStore.newFlow("h1", "example.com", tc.seedIP, tc.seedSite)
+			waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
+			if _, err := s.flowStore.attachWaiterWithLimits(tok, waiter, now, cfg.FairQueue.inFlightLimits()); err != nil {
+				t.Fatalf("attach waiter: %v", err)
+			}
+
+			resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+				Hostname:     "example.com",
+				HostnameHash: "h1",
+				IPBucket:     tc.reqIP,
+				SiteBucket:   tc.reqSite,
+			})
+			if err != nil {
+				t.Fatalf("handleAcquireSlot: %v", err)
+			}
+			if resp.Result != "overloaded" {
+				t.Fatalf("expected overloaded, got %s", resp.Result)
+			}
+			if resp.Reason != tc.expected {
+				t.Fatalf("expected reason %s, got %q", tc.expected, resp.Reason)
+			}
+			if resp.RetryAfter <= 0 {
+				t.Fatalf("expected positive retryAfter, got %d", resp.RetryAfter)
+			}
+		})
+	}
+}
+
+func TestOverloadScopePriority(t *testing.T) {
+	store := newFlowStore(5 * time.Second)
+	now := time.Unix(0, 0)
+
+	tok := store.newFlow("h1", "example.com", "ip1", "s1")
+	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
+	limits := inFlightLimits{global: 10, host: 10, site: 10, ip: 10}
+	if ok, err := store.attachWaiterWithLimits(tok, waiter, now, limits); !ok || err != nil {
+		t.Fatalf("attach waiter: ok=%t err=%v", ok, err)
+	}
+
+	testCases := []struct {
+		name     string
+		limits   inFlightLimits
+		expected string
+	}{
+		{name: "global over host/site/ip", limits: inFlightLimits{global: 1, host: 1, site: 1, ip: 1}, expected: "global"},
+		{name: "host over site/ip", limits: inFlightLimits{host: 1, site: 1, ip: 1}, expected: "host"},
+		{name: "site over ip", limits: inFlightLimits{site: 1, ip: 1}, expected: "site"},
+		{name: "ip", limits: inFlightLimits{ip: 1}, expected: "ip"},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			overloaded, scope := store.overloadScopeByCounters("h1", "s1", "ip1", tc.limits)
+			if !overloaded {
+				t.Fatalf("expected overloaded")
+			}
+			if scope != tc.expected {
+				t.Fatalf("expected scope %q, got %q", tc.expected, scope)
+			}
+		})
+	}
+}
+
 func TestFlowStoreInFlightCounterConsistency(t *testing.T) {
 	fs := newFlowStore(5 * time.Second)
 	now := time.Unix(0, 0)

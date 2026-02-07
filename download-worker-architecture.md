@@ -118,13 +118,17 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
     - `acquire` 轮询同时受 `maxAttempts` 与 `totalMaxWaitMs` 约束，任一达到即结束等待。
     - 支持 `pending` / `granted` / `throttled` / `overloaded` / `timeout`；节流状态在内存中做短期抑制。
-    - `overloaded` 表示 slot-handler in-flight 超限，worker 内部退避后继续轮询，整体等待不超过 `slotHandlerTimeoutMs`。
+    - `overloaded` 由 slot-handler 返回 `reason=overload_<scope>`（`global|host|site|ip`）与可选 `retryAfter`。
+    - overload 行为矩阵：
+      - `overload_global`：worker 立即 fail-fast 返回 `503`；优先使用 slot-handler 的 `retryAfter`，若缺失/非法则按 worker 默认值回填 `Retry-After`。
+      - `overload_host|overload_site|overload_ip`：worker 继续轮询，使用严格阶梯等待（0.5s 起步、每轮 +0.5s、单次最多 2.0s，不加 jitter）。
+    - scoped overload（host/site/ip）仍受 `slotHandlerTimeoutMs` 总等待上限约束。
     - worker 维护 host 级 overloaded 冷却窗口与本地退避 `delayMs`，在下一次 acquire 前先等待剩余冷却时间，避免对同一 host 高频空转重试。
     - `download.fairQueue.slotHandlerTimeoutMs` 由 controller 下发，worker 内映射为 `slotHandlerConfig.totalMaxWaitMs`，用于总等待上限。
     - `overloaded` 退避 streak 在收到非 overloaded 结果（如 `pending`/`granted`/`throttled`/`409`）时重置。
     - 完成后发送 `/api/v1/fairqueue/release`。
     - 轮询探测受 `utilWindowSec` 与 `maxBatch` / `maxProbeParallel` / `maxProbeQpsPerHost` 控制。
-    - 若 `pgErrorHandle=fail-open` 且 slot-handler 不可用，则跳过排队。
+    - 若 slot-handler 不可用或 fair-queue 接口异常，按 fail-closed 返回 `503`，不绕过排队保护。
     - 多实例 slot-handler 需要 sticky 路由：同一 `queryToken` 的轮询应稳定落到同一实例，否则会出现 `query_token_stale` 并触发重新入队。
 
 11. **上游请求与响应封装**

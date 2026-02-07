@@ -53,6 +53,10 @@ type flowStore struct {
 	grace   time.Duration
 	byToken map[string]*fqFlow
 
+	// Test hook: invoked by deliverToWaiter after waiter lookup and before send,
+	// while flowStore.mu is still held.
+	deliverToWaiterBeforeSendHook func()
+
 	// Injected for testability; defaults to time.AfterFunc/time.Now.
 	afterFunc func(time.Duration, func()) *time.Timer
 	nowFn     func() time.Time
@@ -220,6 +224,26 @@ func (s *flowStore) newFlow(hostHash, host, ip, site string) string {
 var errWaiterAlreadyAttached = errors.New("waiter already attached")
 var errWaiterOverloaded = errors.New("inflight overloaded")
 
+type waiterOverloadedError struct {
+	scope string
+}
+
+func (e *waiterOverloadedError) Error() string {
+	return errWaiterOverloaded.Error()
+}
+
+func (e *waiterOverloadedError) Unwrap() error {
+	return errWaiterOverloaded
+}
+
+func overloadScopeFromError(err error) string {
+	var overloadErr *waiterOverloadedError
+	if errors.As(err, &overloadErr) {
+		return strings.TrimSpace(overloadErr.scope)
+	}
+	return ""
+}
+
 func normalizeSiteBucket(site string) string {
 	if strings.TrimSpace(site) == "" {
 		return "unknown"
@@ -293,27 +317,32 @@ func (s *flowStore) decrementInFlightLocked(f *fqFlow) {
 }
 
 func (s *flowStore) isOverloadedByCounters(hostKey, siteBucket, ipBucket string, limits inFlightLimits) bool {
+	overloaded, _ := s.overloadScopeByCounters(hostKey, siteBucket, ipBucket, limits)
+	return overloaded
+}
+
+func (s *flowStore) overloadScopeByCounters(hostKey, siteBucket, ipBucket string, limits inFlightLimits) (bool, string) {
 	if limits.global > 0 && s.inFlightGlobal >= limits.global {
-		return true
+		return true, "global"
 	}
 	hostKey = strings.TrimSpace(hostKey)
 	if hostKey == "" {
-		return false
+		return false, ""
 	}
 	if limits.host > 0 && s.inFlightByHost[hostKey] >= limits.host {
-		return true
+		return true, "host"
 	}
 	site := normalizeSiteBucket(siteBucket)
 	siteKey := flowSiteKey(hostKey, site)
 	if limits.site > 0 && s.inFlightBySite[siteKey] >= limits.site {
-		return true
+		return true, "site"
 	}
 	ip := normalizeIPBucket(ipBucket)
 	ipKey := flowIPKey(hostKey, site, ip)
 	if limits.ip > 0 && s.inFlightByIP[ipKey] >= limits.ip {
-		return true
+		return true, "ip"
 	}
-	return false
+	return false, ""
 }
 
 func (s *flowStore) removeFlowLocked(f *fqFlow) {
@@ -409,6 +438,18 @@ func (s *flowStore) isOverloadedLocked(hostKey, siteBucket, ipBucket string, now
 	return s.isOverloadedByCounters(hostKey, siteBucket, ipBucket, limits)
 }
 
+func (s *flowStore) overloadScope(hostKey, siteBucket, ipBucket string, limits inFlightLimits) (bool, string) {
+	if s == nil {
+		return false, ""
+	}
+	if limits.global <= 0 && limits.host <= 0 && limits.site <= 0 && limits.ip <= 0 {
+		return false, ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.overloadScopeByCounters(hostKey, siteBucket, ipBucket, limits)
+}
+
 func (s *flowStore) isOverloaded(hostKey, siteBucket, ipBucket string, now time.Time, limits inFlightLimits) bool {
 	if s == nil {
 		return false
@@ -480,8 +521,8 @@ func (s *flowStore) attachWaiterWithLimits(token string, w *fqWaiter, now time.T
 	hostKey := fqHostKey(f.HostnameHash, f.Hostname)
 	siteBucket := normalizeSiteBucket(f.SiteBucket)
 	ipBucket := normalizeIPBucket(f.IPBucket)
-	if s.isOverloadedByCounters(hostKey, siteBucket, ipBucket, limits) {
-		return true, errWaiterOverloaded
+	if overloaded, scope := s.overloadScopeByCounters(hostKey, siteBucket, ipBucket, limits); overloaded {
+		return true, &waiterOverloadedError{scope: scope}
 	}
 
 	// Once a new long-poll is inflight, clear grace expiry.
@@ -579,15 +620,17 @@ func (s *flowStore) deliverToWaiter(token string, resp *AcquireResponse) bool {
 		return false
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	f := s.byToken[token]
 	if f == nil || f.waiter == nil {
-		s.mu.Unlock()
 		return false
 	}
 	ch := f.waiter.resCh
-	s.mu.Unlock()
 	if ch == nil {
 		return false
+	}
+	if s.deliverToWaiterBeforeSendHook != nil {
+		s.deliverToWaiterBeforeSendHook()
 	}
 	select {
 	case ch <- resp:

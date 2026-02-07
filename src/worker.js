@@ -1089,6 +1089,26 @@ function createThrottleProtectedResponse(origin, throttleStatus) {
   );
 }
 
+function createFairQueueOverloadedResponse(origin, retryAfterSeconds) {
+  const retryAfter = normalizePositiveSeconds(retryAfterSeconds, 60);
+  const safeHeaders = new Headers();
+  safeHeaders.set("content-type", "application/json;charset=UTF-8");
+  safeHeaders.set("Access-Control-Allow-Origin", origin);
+  safeHeaders.append("Vary", "Origin");
+  safeHeaders.set("Retry-After", String(retryAfter));
+
+  return new Response(
+    JSON.stringify({
+      code: 503,
+      message: 'Upstream queue overloaded, please retry later'
+    }),
+    {
+      status: 503,
+      headers: safeHeaders
+    }
+  );
+}
+
 const normalizePostgrestBaseUrl = (url) => {
   if (!url || typeof url !== 'string') {
     return '';
@@ -1366,7 +1386,21 @@ const createSlotHandlerClient = (config) => {
             };
           case 'overloaded': {
             pendingStreak = 0;
-            const delayMs = nextOverloadDelayMs(overloadStreak, { hostOverload: true });
+            const reason = typeof data?.reason === 'string' ? data.reason : '';
+            const isGlobalOverload = reason === 'overload_global';
+            if (isGlobalOverload) {
+              const retryAfterRaw = Number(data?.retryAfter);
+              const retryAfter = Number.isFinite(retryAfterRaw) && retryAfterRaw > 0
+                ? Math.ceil(retryAfterRaw)
+                : 60;
+              return {
+                kind: 'overloaded',
+                scope: 'global',
+                retryAfter,
+              };
+            }
+
+            const delayMs = nextOverloadDelayMs(overloadStreak);
             overloadStreak += 1;
             markHostOverloaded(hostKey, delayMs);
             const elapsed = Date.now() - startedAt;
@@ -2136,6 +2170,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
             }
           );
         }
+
+        if (fqResult.kind === 'overloaded' && fqResult.scope === 'global') {
+          return createFairQueueOverloadedResponse(origin, fqResult.retryAfter);
+        }
       } catch (error) {
         if (clientAborted && isAbortError(error)) {
           earlyResponse = createClientAbortResponse(origin);
@@ -2281,6 +2319,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
                     headers: safeHeaders
                   }
                 );
+              }
+
+              if (fqResult.kind === 'overloaded' && fqResult.scope === 'global') {
+                return createFairQueueOverloadedResponse(origin, fqResult.retryAfter);
               }
             }
           }

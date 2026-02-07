@@ -28,6 +28,7 @@ const (
 	defaultMetricsFlushInterval = 60 * time.Second
 	releaseRetryAttempts        = 2
 	releaseRetryBaseDelay       = 25 * time.Millisecond
+	overloadWarnMinInterval     = 5 * time.Second
 )
 
 type Config struct {
@@ -333,6 +334,8 @@ type server struct {
 	metricsCounters  *metricsCounters
 	throttleMu       sync.Mutex
 	throttleHost     map[string]*fqThrottleState
+	overloadLogMu    sync.Mutex
+	overloadLogLast  map[string]time.Time
 }
 
 func (s *server) getConfig() *Config {
@@ -347,6 +350,39 @@ func (s *server) getBackend() queueBackend {
 	backend := s.backend
 	s.mu.RUnlock()
 	return backend
+}
+
+func (s *server) getConfigVersion() string {
+	s.mu.RLock()
+	version := s.configVersion
+	s.mu.RUnlock()
+	return version
+}
+
+func (s *server) getInternalAPIToken() string {
+	s.mu.RLock()
+	token := strings.TrimSpace(s.internalAPIToken)
+	s.mu.RUnlock()
+	return token
+}
+
+func (s *server) setControllerState(controller controllerEnv, internalAPIToken string) {
+	s.mu.Lock()
+	s.controller = &controller
+	s.internalAPIToken = strings.TrimSpace(internalAPIToken)
+	s.mu.Unlock()
+}
+
+func (s *server) getControllerState() (controllerEnv, bool) {
+	s.mu.RLock()
+	controller := s.controller
+	if controller == nil {
+		s.mu.RUnlock()
+		return controllerEnv{}, false
+	}
+	value := *controller
+	s.mu.RUnlock()
+	return value, true
 }
 
 func (s *server) getThrottleState(hostKey string, now time.Time) (bool, int, int) {
@@ -388,19 +424,56 @@ func (s *server) setThrottleState(hostKey string, now time.Time, code, retryAfte
 	}
 }
 
+func (s *server) shouldLogOverloaded(hostnameHash, hostname, scope string, now time.Time) bool {
+	hostKey := strings.TrimSpace(fqHostKey(hostnameHash, hostname))
+	if hostKey == "" {
+		hostKey = "unknown_host"
+	}
+	scopeKey := strings.TrimSpace(scope)
+	if scopeKey == "" {
+		scopeKey = "unknown"
+	}
+
+	key := hostKey + "|" + scopeKey
+	s.overloadLogMu.Lock()
+	defer s.overloadLogMu.Unlock()
+	if s.overloadLogLast == nil {
+		s.overloadLogLast = make(map[string]time.Time)
+	}
+	if last, ok := s.overloadLogLast[key]; ok {
+		if now.Sub(last) < overloadWarnMinInterval {
+			return false
+		}
+	}
+	s.overloadLogLast[key] = now
+	return true
+}
+
 func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion string, resetState bool) {
 	s.mu.Lock()
 	oldBackend := s.backend
 	if resetState {
 		s.stopAllHostProbeRunners()
 		s.flowStore = nil
+
+		s.flowSchedMu.Lock()
 		s.flowSched = nil
-		s.smoothReleasers = nil
+		s.flowSchedMu.Unlock()
+
+		s.throttleMu.Lock()
 		s.throttleHost = nil
+		s.throttleMu.Unlock()
+
+		s.utilMu.Lock()
 		s.utilHost = nil
 		s.utilSite = nil
 		s.utilHostLast = nil
 		s.utilSiteLast = nil
+		s.utilMu.Unlock()
+
+		s.smoothMu.Lock()
+		s.smoothReleasers = nil
+		s.smoothMu.Unlock()
 	}
 	s.cfg = cfg
 	s.backend = backend
@@ -435,7 +508,7 @@ func (s *server) collectMetricsSnapshot() metricsSnapshot {
 	if counts == nil {
 		counts = make(map[string]int64)
 	}
-	for _, key := range []string{"flow_created", "granted", "throttled", "timeout", "released", "token_stale", "token_mismatch"} {
+	for _, key := range []string{"flow_created", "granted", "throttled", "timeout", "released", "token_stale", "token_mismatch", "overloaded", "overloaded_global", "overloaded_host", "overloaded_site", "overloaded_ip", "overloaded_unknown"} {
 		if _, ok := counts[key]; !ok {
 			counts[key] = 0
 		}
@@ -479,7 +552,7 @@ func (s *server) collectMetricsSnapshot() metricsSnapshot {
 
 	return metricsSnapshot{
 		Timestamp:     time.Now().UnixMilli(),
-		ConfigVersion: s.configVersion,
+		ConfigVersion: s.getConfigVersion(),
 		Counts:        counts,
 		Flows:         flows,
 		SmoothHosts:   smoothHosts,
@@ -1038,7 +1111,7 @@ func (s *server) authPassed(r *http.Request) bool {
 }
 
 func (s *server) internalAuthPassed(r *http.Request) bool {
-	token := strings.TrimSpace(s.internalAPIToken)
+	token := s.getInternalAPIToken()
 	if token == "" {
 		return false
 	}
@@ -1070,8 +1143,8 @@ func (s *server) handleInternalHealth(w http.ResponseWriter, r *http.Request) {
 	if s.meta.instanceID != "" {
 		w.Header().Set("X-Instance-Id", s.meta.instanceID)
 	}
-	if s.configVersion != "" {
-		w.Header().Set("X-Config-Version", s.configVersion)
+	if version := s.getConfigVersion(); version != "" {
+		w.Header().Set("X-Config-Version", version)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -1120,13 +1193,13 @@ func (s *server) handleInternalRefresh(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			// Update controller settings from file for subsequent calls
-			s.controller = &meta.Controller
-			s.internalAPIToken = strings.TrimSpace(meta.InternalAPIToken)
+			s.setControllerState(meta.Controller, meta.InternalAPIToken)
 		}
 
-		if s.controller != nil && s.controller.enabled() {
+		controller, hasController := s.getControllerState()
+		if hasController && controller.enabled() {
 			ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-			cfg, version, err = loadConfigFromController(ctx, *s.controller)
+			cfg, version, err = loadConfigFromController(ctx, controller)
 			cancel()
 			sourceDesc = "controller"
 		} else {
@@ -1234,6 +1307,24 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		s.log.Errorf("AcquireSlot failed: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+
+	if strings.EqualFold(resp.Result, "overloaded") {
+		scope := overloadScopeFromReason(resp.Reason)
+		s.incrementMetric("overloaded")
+		s.incrementMetric("overloaded_" + scope)
+		if s.shouldLogOverloaded(req.HostnameHash, req.Hostname, scope, time.Now()) {
+			s.log.Warnf(
+				"fairqueue acquire overloaded scope=%s reason=%s retry_after=%d host=%s host_hash=%s site=%s ip=%s",
+				scope,
+				resp.Reason,
+				resp.RetryAfter,
+				req.Hostname,
+				req.HostnameHash,
+				req.SiteBucket,
+				req.IPBucket,
+			)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -1880,6 +1971,20 @@ func pickInt(input int, fallback int) int {
 		return input
 	}
 	return fallback
+}
+
+func overloadScopeFromReason(reason string) string {
+	value := strings.ToLower(strings.TrimSpace(reason))
+	if !strings.HasPrefix(value, "overload_") {
+		return "unknown"
+	}
+	scope := strings.TrimPrefix(value, "overload_")
+	switch scope {
+	case "global", "host", "site", "ip":
+		return scope
+	default:
+		return "unknown"
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

@@ -3,28 +3,376 @@ import assert from 'node:assert/strict';
 import { nextOverloadDelayMs } from '../src/fairqueue-overload.js';
 import { __fairQueueTestHooks } from '../src/worker.js';
 
-test('overload backoff increases by 500ms up to 4s', () => {
-  assert.equal(nextOverloadDelayMs(0), 1000);
-  assert.equal(nextOverloadDelayMs(1), 1500);
-  assert.equal(nextOverloadDelayMs(2), 2000);
-  assert.equal(nextOverloadDelayMs(6), 4000);
+const SCOPED_OVERLOAD_WAIT_MIN_MS = 350;
+const SCOPED_OVERLOAD_WAIT_MAX_MS = 3000;
+
+test('overload backoff increases by 500ms up to 2s', () => {
+  assert.equal(nextOverloadDelayMs(0), 500);
+  assert.equal(nextOverloadDelayMs(1), 1000);
+  assert.equal(nextOverloadDelayMs(2), 1500);
+  assert.equal(nextOverloadDelayMs(6), 2000);
 });
 
-test('host-level overloaded cooldown avoids tight acquire loops', () => {
-  const HOST_OVERLOAD_STAIRCASE = [
-    { streak: 0, delayMs: 1000 },
-    { streak: 1, delayMs: 2000 },
-    { streak: 2, delayMs: 3000 },
-    { streak: 3, delayMs: 4000 },
-    { streak: 4, delayMs: 4000 },
+test('overload backoff uses 500ms staircase capped at 2s', () => {
+  const OVERLOAD_STAIRCASE = [
+    { streak: 0, delayMs: 500 },
+    { streak: 1, delayMs: 1000 },
+    { streak: 2, delayMs: 1500 },
+    { streak: 3, delayMs: 2000 },
+    { streak: 4, delayMs: 2000 },
   ];
 
-  for (const item of HOST_OVERLOAD_STAIRCASE) {
+  for (const item of OVERLOAD_STAIRCASE) {
     assert.equal(
-      nextOverloadDelayMs(item.streak, { hostOverload: true }),
+      nextOverloadDelayMs(item.streak),
       item.delayMs,
-      `expected host-overload delay for streak ${item.streak}`
+      `expected overload delay for streak ${item.streak}`
     );
+  }
+});
+
+test('overload jitter never exceeds 2s cap', () => {
+  const delay = nextOverloadDelayMs(10, {
+    jitter: true,
+    random: () => 0.999999,
+  });
+  assert.equal(delay, 2000);
+});
+
+test('overload first-step jitter stays near 500ms and never near 2s', () => {
+  const delay = nextOverloadDelayMs(0, {
+    jitter: true,
+    random: () => 0.999999,
+  });
+  assert.ok(delay >= 500, `expected jittered delay >= 500ms, got ${delay}`);
+  assert.ok(delay <= 650, `expected jittered delay to stay close to 500ms, got ${delay}`);
+});
+
+test('overload jitter is bounded by jitterCap when random is 1', () => {
+  const delay = nextOverloadDelayMs(0, {
+    jitter: true,
+    jitterMaxMs: 100,
+    random: () => 1,
+  });
+  assert.equal(delay, 600);
+});
+
+test('global overload should fail fast with Retry-After', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return new Response(JSON.stringify({
+      result: 'overloaded',
+      reason: 'overload_global',
+      retryAfter: 3,
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const startedAt = Date.now();
+    const result = await client.waitForSlot({}, fqContext);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.deepEqual(result, {
+      kind: 'overloaded',
+      scope: 'global',
+      retryAfter: 3,
+    });
+    assert.equal(fetchCalls, 1);
+    assert.ok(elapsedMs < 200, `expected fail-fast global overload, got ${elapsedMs}ms`);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
+test('scoped overload should keep bounded wait loop and then grant', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return new Response(JSON.stringify({
+        result: 'overloaded',
+        reason: 'overload_host',
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const startedAt = Date.now();
+    const result = await client.waitForSlot({}, fqContext);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(result.kind, 'granted');
+    assert.equal(fetchCalls, 2);
+    assert.ok(
+      elapsedMs >= SCOPED_OVERLOAD_WAIT_MIN_MS,
+      `expected bounded wait loop (>=${SCOPED_OVERLOAD_WAIT_MIN_MS}ms), got ${elapsedMs}ms`
+    );
+    assert.ok(
+      elapsedMs <= SCOPED_OVERLOAD_WAIT_MAX_MS,
+      `expected bounded wait (<=${SCOPED_OVERLOAD_WAIT_MAX_MS}ms), got ${elapsedMs}ms`
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
+test('site-scoped overload should keep bounded wait loop and then grant', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return new Response(JSON.stringify({
+        result: 'overloaded',
+        reason: 'overload_site',
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-site-1' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const startedAt = Date.now();
+    const result = await client.waitForSlot({}, fqContext);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(result.kind, 'granted');
+    assert.equal(fetchCalls, 2);
+    assert.ok(
+      elapsedMs >= SCOPED_OVERLOAD_WAIT_MIN_MS,
+      `expected bounded wait loop (>=${SCOPED_OVERLOAD_WAIT_MIN_MS}ms), got ${elapsedMs}ms`
+    );
+    assert.ok(
+      elapsedMs <= SCOPED_OVERLOAD_WAIT_MAX_MS,
+      `expected bounded wait (<=${SCOPED_OVERLOAD_WAIT_MAX_MS}ms), got ${elapsedMs}ms`
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
+test('ip-scoped overload should keep bounded wait loop and then grant', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return new Response(JSON.stringify({
+        result: 'overloaded',
+        reason: 'overload_ip',
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-ip-1' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const startedAt = Date.now();
+    const result = await client.waitForSlot({}, fqContext);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(result.kind, 'granted');
+    assert.equal(fetchCalls, 2);
+    assert.ok(
+      elapsedMs >= SCOPED_OVERLOAD_WAIT_MIN_MS,
+      `expected bounded wait loop (>=${SCOPED_OVERLOAD_WAIT_MIN_MS}ms), got ${elapsedMs}ms`
+    );
+    assert.ok(
+      elapsedMs <= SCOPED_OVERLOAD_WAIT_MAX_MS,
+      `expected bounded wait (<=${SCOPED_OVERLOAD_WAIT_MAX_MS}ms), got ${elapsedMs}ms`
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
+test('scoped overload wait uses strict 500ms staircase contract', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 45000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  const fetchCallTimes = [];
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  const originalMathRandom = Math.random;
+
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    fetchCallTimes.push(Date.now());
+    if (fetchCalls <= 4) {
+      return new Response(JSON.stringify({
+        result: 'overloaded',
+        reason: 'overload_host',
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-host-1' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  Math.random = () => 1;
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.equal(result.kind, 'granted');
+
+    const expectedDelays = [500, 1000, 1500, 2000];
+    const delayToleranceMs = 90;
+    const observedDelays = [];
+    for (let i = 1; i < fetchCallTimes.length; i += 1) {
+      observedDelays.push(fetchCallTimes[i] - fetchCallTimes[i - 1]);
+    }
+
+    assert.equal(observedDelays.length, expectedDelays.length);
+    for (let i = 0; i < expectedDelays.length; i += 1) {
+      const expected = expectedDelays[i];
+      const observed = observedDelays[i];
+      assert.ok(
+        observed >= expected,
+        `expected delay step ${i + 1} >= ${expected}ms, got ${observed}ms`
+      );
+      assert.ok(
+        observed <= expected + delayToleranceMs,
+        `expected delay step ${i + 1} <= ${expected + delayToleranceMs}ms, got ${observed}ms`
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    Math.random = originalMathRandom;
+    clearOverloadedByHost();
   }
 });
 

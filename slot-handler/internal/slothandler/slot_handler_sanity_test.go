@@ -79,3 +79,24 @@ func TestDocsHaveNoLegacyFairQueueEndpoints(t *testing.T) {
 		}
 	}
 }
+
+func TestDocsNoFailOpenWordingForFairQueueAvailability(t *testing.T) {
+	root := moduleRootDir(t)
+	path := filepath.Join(root, "..", "download-worker-architecture.md")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read docs: %v", err)
+	}
+
+	text := strings.ToLower(string(raw))
+	banned := []string{
+		"slot-handler 不可用，则跳过排队",
+		"slot-handler unavailable",
+		"slot-handler unavailable, skip queue",
+	}
+	for _, token := range banned {
+		if strings.Contains(text, token) {
+			t.Fatalf("docs contain fail-open slot-handler availability wording: %s (file=%s)", token, path)
+		}
+	}
+}

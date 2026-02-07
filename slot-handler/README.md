@@ -58,6 +58,8 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - `result`: `pending` / `granted` / `throttled` / `overloaded` / `timeout`
 - `queryToken`
 - `slotToken`（granted 时）
+- `reason`：`overloaded` 时为 `overload_global|overload_host|overload_site|overload_ip`
+- `retryAfter`：`overloaded` 时的建议重试秒数
 
 ### POST /api/v1/fairqueue/release
 
@@ -87,7 +89,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 ## 5. 指标（controller 模式）
 
 周期上报 `slot_handler.snapshot`：
-- `counts`：关键计数（granted/throttled/released/token_stale/token_mismatch 等）
+- `counts`：关键计数（granted/throttled/overloaded、`overloaded_<scope>`、released/token_stale/token_mismatch 等）
 - `flows`：`total/inflight/detached/grace`
 - `smoothHosts`：smooth releaser 的 host 数
 
@@ -130,7 +132,9 @@ slot-handler 依赖以下函数（名称可在配置中改）：
 
 - worker 调用 `acquire/release`；`acquire` 返回 `pending` 时持续轮询。
 - `queryToken` 是排队位置的唯一标识；在 `graceMs` 内重试可延续公平性。
-- `overloaded` 表示 in-flight 超限，worker 需内部退避后继续轮询。
+- `overloaded` 表示 in-flight 超限，worker 按 scope 分流处理：
+  - `overload_global`：fail-fast 返回 `503`，并携带 `Retry-After`。
+  - `overload_host|overload_site|overload_ip`：有界等待后重试（0.5s 递进到 2.0s，单次不超过 2.0s）。
 
 ## 9. 多实例部署注意（sticky 路由）
 
