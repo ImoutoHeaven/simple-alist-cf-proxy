@@ -1394,14 +1394,7 @@ func (s *server) startFairQueueCleanup(ctx context.Context) {
 				}
 			}
 
-			if timer == nil {
-				timer = time.NewTimer(interval)
-			} else {
-				if !timer.Stop() {
-					<-timer.C
-				}
-				timer.Reset(interval)
-			}
+			timer = resetLoopTimer(timer, interval)
 
 			select {
 			case <-ctx.Done():
@@ -1439,14 +1432,7 @@ func (s *server) startActiveLeasePrune(ctx context.Context) {
 				}
 			}
 
-			if timer == nil {
-				timer = time.NewTimer(interval)
-			} else {
-				if !timer.Stop() {
-					<-timer.C
-				}
-				timer.Reset(interval)
-			}
+			timer = resetLoopTimer(timer, interval)
 
 			select {
 			case <-ctx.Done():
@@ -1462,6 +1448,22 @@ func (s *server) startActiveLeasePrune(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func resetLoopTimer(timer *time.Timer, interval time.Duration) *time.Timer {
+	if timer == nil {
+		return time.NewTimer(interval)
+	}
+	if !timer.Stop() {
+		// Timer may have already fired and been consumed by another select branch.
+		// Drain non-blockingly so we never deadlock on an empty channel.
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(interval)
+	return timer
 }
 
 func (s *server) runFairQueueCleanup(ctx context.Context, cfg *Config) error {
