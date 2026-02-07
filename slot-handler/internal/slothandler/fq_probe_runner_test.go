@@ -131,3 +131,66 @@ func TestUpdateRuntimeResetState_NoRaceAcrossOwnedMutexes(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestRuntimeStatePruneRemovesStaleEntries(t *testing.T) {
+	s := newTestServer()
+	now := time.Unix(1_700_000_000, 0)
+
+	staleSiteKey := activeSiteKey("stale-host", "stale-site")
+	freshSiteKey := activeSiteKey("fresh-host", "fresh-site")
+
+	s.utilHost = map[string]*utilWindow{
+		"stale-host": newUtilWindow(2),
+		"fresh-host": newUtilWindow(2),
+	}
+	s.utilHostLast = map[string]int64{
+		"stale-host": now.Add(-12 * time.Second).Unix(),
+		"fresh-host": now.Add(-2 * time.Second).Unix(),
+	}
+	s.utilSite = map[string]*utilWindow{
+		staleSiteKey: newUtilWindow(2),
+		freshSiteKey: newUtilWindow(2),
+	}
+	s.utilSiteLast = map[string]int64{
+		staleSiteKey: now.Add(-12 * time.Second).Unix(),
+		freshSiteKey: now.Add(-2 * time.Second).Unix(),
+	}
+	s.smoothReleasers = map[string]*smoothHostReleaser{
+		"stale-host": {lastAccessAt: now.Add(-12 * time.Second)},
+		"fresh-host": {lastAccessAt: now.Add(-2 * time.Second)},
+	}
+
+	s.pruneRuntimeState(now, 10*time.Second)
+
+	if _, ok := s.utilHost["stale-host"]; ok {
+		t.Fatalf("expected stale utilHost key to be pruned")
+	}
+	if _, ok := s.utilHostLast["stale-host"]; ok {
+		t.Fatalf("expected stale utilHostLast key to be pruned")
+	}
+	if _, ok := s.utilSite[staleSiteKey]; ok {
+		t.Fatalf("expected stale utilSite key to be pruned")
+	}
+	if _, ok := s.utilSiteLast[staleSiteKey]; ok {
+		t.Fatalf("expected stale utilSiteLast key to be pruned")
+	}
+	if _, ok := s.smoothReleasers["stale-host"]; ok {
+		t.Fatalf("expected stale smooth releaser key to be pruned")
+	}
+
+	if _, ok := s.utilHost["fresh-host"]; !ok {
+		t.Fatalf("expected fresh utilHost key to remain")
+	}
+	if _, ok := s.utilHostLast["fresh-host"]; !ok {
+		t.Fatalf("expected fresh utilHostLast key to remain")
+	}
+	if _, ok := s.utilSite[freshSiteKey]; !ok {
+		t.Fatalf("expected fresh utilSite key to remain")
+	}
+	if _, ok := s.utilSiteLast[freshSiteKey]; !ok {
+		t.Fatalf("expected fresh utilSiteLast key to remain")
+	}
+	if _, ok := s.smoothReleasers["fresh-host"]; !ok {
+		t.Fatalf("expected fresh smooth releaser key to remain")
+	}
+}

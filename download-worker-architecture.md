@@ -126,7 +126,9 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
     - worker 维护 host 级 overloaded 冷却窗口与本地退避 `delayMs`，在下一次 acquire 前先等待剩余冷却时间，避免对同一 host 高频空转重试。
     - `download.fairQueue.slotHandlerTimeoutMs` 由 controller 下发，worker 内映射为 `slotHandlerConfig.totalMaxWaitMs`，用于总等待上限。
     - `overloaded` 退避 streak 在收到非 overloaded 结果（如 `pending`/`granted`/`throttled`/`409`）时重置。
-    - 完成后发送 `/api/v1/fairqueue/release`。
+    - 完成后发送 `/api/v1/fairqueue/release`（fire-and-forget，通过 `ctx.waitUntil` 执行）。
+    - release 返回非 `2xx` 视为失败：slot-handler 在 backend release 失败时返回 `502`。
+    - release 重试策略：仅在网络错误、`429` 或 `>=500` 时重试（最多 3 次，指数退避）；非可重试 `4xx` 不重试。
     - 轮询探测受 `utilWindowSec` 与 `maxBatch` / `maxProbeParallel` / `maxProbeQpsPerHost` 控制。
     - 若 slot-handler 不可用或 fair-queue 接口异常，按 fail-closed 返回 `503`，不绕过排队保护。
     - 多实例 slot-handler 需要 sticky 路由：同一 `queryToken` 的轮询应稳定落到同一实例，否则会出现 `query_token_stale` 并触发重新入队。

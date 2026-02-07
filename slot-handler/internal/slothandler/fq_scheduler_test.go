@@ -182,6 +182,67 @@ func TestSchedulerSkipsDeniedBuckets(t *testing.T) {
 	}
 }
 
+func TestSchedulerSkipsDeniedBucketsAcrossSites(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+
+	tokDenied := store.newFlow("h1", "example.com", "ip-denied", "site-denied")
+	tokEligible := store.newFlow("h1", "example.com", "ip-ok", "site-eligible")
+
+	for _, tok := range []string{tokDenied, tokEligible} {
+		if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+			t.Fatalf("expected attach ok: token=%q ok=%t err=%v", tok, ok, err)
+		}
+	}
+
+	sched := newFQHostFlowScheduler()
+	stDenied, btDenied := sched.getOrInitStates("site-denied", "ip-denied")
+	stEligible, _ := sched.getOrInitStates("site-eligible", "ip-ok")
+	if stDenied == nil || btDenied == nil || stEligible == nil {
+		t.Fatalf("expected scheduler site/bucket states")
+	}
+
+	// Denied-only site appears first by VirtualTime but must be skipped.
+	stDenied.VirtualTime = 0
+	stEligible.VirtualTime = 100
+	btDenied.VirtualTime = 0
+	btDenied.DenyUntil = now.Add(10 * time.Second)
+
+	t.Run("single_pick", func(t *testing.T) {
+		chosen, ok := sched.PickNextInFlight(store, "h1", now)
+		if !ok {
+			t.Fatalf("expected a chosen flow")
+		}
+		if chosen.Token != tokEligible {
+			t.Fatalf("expected eligible site flow chosen, got %q want %q", chosen.Token, tokEligible)
+		}
+	})
+
+	t.Run("batch_pick", func(t *testing.T) {
+		schedBatch := newFQHostFlowScheduler()
+		stDeniedBatch, btDeniedBatch := schedBatch.getOrInitStates("site-denied", "ip-denied")
+		stEligibleBatch, _ := schedBatch.getOrInitStates("site-eligible", "ip-ok")
+		if stDeniedBatch == nil || btDeniedBatch == nil || stEligibleBatch == nil {
+			t.Fatalf("expected scheduler site/bucket states")
+		}
+
+		stDeniedBatch.VirtualTime = 0
+		stEligibleBatch.VirtualTime = 100
+		btDeniedBatch.VirtualTime = 0
+		btDeniedBatch.DenyUntil = now.Add(10 * time.Second)
+
+		picks := schedBatch.PickNextInFlightBatch(store, "h1", now, 2)
+		if len(picks) != 1 {
+			t.Fatalf("expected one eligible pick, got %d", len(picks))
+		}
+		if picks[0].Token != tokEligible {
+			t.Fatalf("expected eligible site flow in batch, got %q want %q", picks[0].Token, tokEligible)
+		}
+	})
+}
+
 func TestPickNextInFlightBatchRespectsFairness(t *testing.T) {
 	store := newFlowStore(0)
 	store.afterFunc = nil
@@ -333,4 +394,113 @@ func TestPickNextInFlightBatchSkipsDuplicatesAndContinues(t *testing.T) {
 	if _, ok := seen[tokUnfavored]; !ok {
 		t.Fatalf("expected unfavored token %q in picks", tokUnfavored)
 	}
+}
+
+func TestPickNextInFlightBatchScansOncePerBatch(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+
+	tokens := []string{
+		store.newFlow("h1", "example.com", "ip1", "s1"),
+		store.newFlow("h1", "example.com", "ip2", "s1"),
+		store.newFlow("h1", "example.com", "ip3", "s2"),
+	}
+	for _, tok := range tokens {
+		if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+			t.Fatalf("expected attach ok for token %q: ok=%t err=%v", tok, ok, err)
+		}
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		if hostKey == "h1" {
+			listCalls++
+		}
+	}
+
+	sched := newFQHostFlowScheduler()
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 3)
+	if len(picks) != 3 {
+		t.Fatalf("expected 3 picks, got %d", len(picks))
+	}
+	if listCalls != 1 {
+		t.Fatalf("expected a single in-flight scan per batch, got %d", listCalls)
+	}
+}
+
+func TestSchedulerPrunesIdleStates(t *testing.T) {
+	t.Run("prunes_idle_bucket_when_site_still_active", func(t *testing.T) {
+		store := newFlowStore(0)
+		store.afterFunc = nil
+
+		now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+		tokKeep := store.newFlow("h1", "example.com", "ip-keep", "site-a")
+		tokDrop := store.newFlow("h1", "example.com", "ip-drop", "site-a")
+
+		for _, tok := range []string{tokKeep, tokDrop} {
+			if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+				t.Fatalf("expected attach ok for token %q: ok=%t err=%v", tok, ok, err)
+			}
+		}
+
+		sched := newFQHostFlowScheduler()
+		if _, ok := sched.PickNextInFlight(store, "h1", now); !ok {
+			t.Fatalf("expected first pick to initialize scheduler state")
+		}
+
+		if !store.detachWaiter(tokDrop) {
+			t.Fatalf("expected detach ok for idle bucket flow")
+		}
+		if _, ok := sched.PickNextInFlight(store, "h1", now); !ok {
+			t.Fatalf("expected second pick from remaining in-flight flow")
+		}
+
+		sched.mu.Lock()
+		site := sched.sites["site-a"]
+		if site == nil {
+			sched.mu.Unlock()
+			t.Fatalf("expected active site to remain")
+		}
+		if _, exists := site.Buckets["ip-drop"]; exists {
+			sched.mu.Unlock()
+			t.Fatalf("expected idle bucket to be pruned")
+		}
+		if _, exists := site.Buckets["ip-keep"]; !exists {
+			sched.mu.Unlock()
+			t.Fatalf("expected active bucket to remain")
+		}
+		sched.mu.Unlock()
+	})
+
+	t.Run("prunes_idle_site_when_no_active_buckets", func(t *testing.T) {
+		store := newFlowStore(0)
+		store.afterFunc = nil
+
+		now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+		tok := store.newFlow("h1", "example.com", "ip-only", "site-idle")
+		if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+			t.Fatalf("expected attach ok: ok=%t err=%v", ok, err)
+		}
+
+		sched := newFQHostFlowScheduler()
+		if _, ok := sched.PickNextInFlight(store, "h1", now); !ok {
+			t.Fatalf("expected pick to initialize scheduler state")
+		}
+
+		if !store.detachWaiter(tok) {
+			t.Fatalf("expected detach ok for idle site flow")
+		}
+		if _, ok := sched.PickNextInFlight(store, "h1", now); ok {
+			t.Fatalf("expected no in-flight flow after detach")
+		}
+
+		sched.mu.Lock()
+		_, exists := sched.sites["site-idle"]
+		sched.mu.Unlock()
+		if exists {
+			t.Fatalf("expected idle site to be pruned")
+		}
+	})
 }

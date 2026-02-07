@@ -1348,6 +1348,8 @@ func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.releaseSlot(r.Context(), req); err != nil {
 		s.log.Errorf("ReleaseSlot failed: %v", err)
+		http.Error(w, "release failed", http.StatusBadGateway)
+		return
 	}
 	writeJSON(w, http.StatusOK, ReleaseResponse{Result: "ok"})
 }
@@ -1446,6 +1448,29 @@ func (s *server) startActiveLeasePrune(ctx context.Context) {
 			if s.activeSlots != nil {
 				s.activeSlots.Prune(time.Now())
 			}
+		}
+	}()
+}
+
+func (s *server) startRuntimeStatePrune(ctx context.Context) {
+	go func() {
+		var timer *time.Timer
+		for {
+			cfg := s.getConfig()
+			interval := s.runtimeStatePruneInterval(cfg)
+
+			timer = resetLoopTimer(timer, interval)
+
+			select {
+			case <-ctx.Done():
+				if timer != nil {
+					timer.Stop()
+				}
+				return
+			case <-timer.C:
+			}
+
+			s.pruneRuntimeState(time.Now(), s.runtimeStatePruneTTL(cfg))
 		}
 	}()
 }
@@ -2092,6 +2117,7 @@ func Main() {
 	}
 	s.startFairQueueCleanup(gcCtx)
 	s.startActiveLeasePrune(gcCtx)
+	s.startRuntimeStatePrune(gcCtx)
 	s.startMetricsReporter(gcCtx, defaultMetricsFlushInterval)
 
 	mux := http.NewServeMux()

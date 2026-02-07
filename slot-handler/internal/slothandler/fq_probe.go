@@ -244,6 +244,84 @@ func (s *server) recordUtilizationSample(hostKey, siteKey string, hostActive, ho
 	s.utilMu.Unlock()
 }
 
+func (s *server) runtimeStatePruneTTL(cfg *Config) time.Duration {
+	windowSec := 10
+	if cfg != nil {
+		windowSec = cfg.FairQueue.utilWindowSeconds()
+	}
+	ttl := time.Duration(windowSec*3) * time.Second
+	if ttl < 30*time.Second {
+		ttl = 30 * time.Second
+	}
+	return ttl
+}
+
+func (s *server) runtimeStatePruneInterval(cfg *Config) time.Duration {
+	ttl := s.runtimeStatePruneTTL(cfg)
+	interval := ttl / 2
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+	if interval > time.Minute {
+		interval = time.Minute
+	}
+	return interval
+}
+
+func (s *server) pruneRuntimeState(now time.Time, staleAfter time.Duration) {
+	if s == nil || staleAfter <= 0 {
+		return
+	}
+
+	cutoffSec := now.Add(-staleAfter).Unix()
+	cutoffAt := now.Add(-staleAfter)
+
+	s.utilMu.Lock()
+	for key, last := range s.utilHostLast {
+		if last < cutoffSec {
+			delete(s.utilHostLast, key)
+			delete(s.utilHost, key)
+		}
+	}
+	for key, last := range s.utilSiteLast {
+		if last < cutoffSec {
+			delete(s.utilSiteLast, key)
+			delete(s.utilSite, key)
+		}
+	}
+	if len(s.utilHost) == 0 {
+		s.utilHost = nil
+	}
+	if len(s.utilSite) == 0 {
+		s.utilSite = nil
+	}
+	if len(s.utilHostLast) == 0 {
+		s.utilHostLast = nil
+	}
+	if len(s.utilSiteLast) == 0 {
+		s.utilSiteLast = nil
+	}
+	s.utilMu.Unlock()
+
+	s.smoothMu.Lock()
+	for key, releaser := range s.smoothReleasers {
+		if releaser == nil {
+			delete(s.smoothReleasers, key)
+			continue
+		}
+		releaser.mu.Lock()
+		lastAccess := releaser.lastAccessAt
+		releaser.mu.Unlock()
+		if lastAccess.IsZero() || lastAccess.Before(cutoffAt) {
+			delete(s.smoothReleasers, key)
+		}
+	}
+	if len(s.smoothReleasers) == 0 {
+		s.smoothReleasers = nil
+	}
+	s.smoothMu.Unlock()
+}
+
 func (s *server) computeProbeBudget(cfg *Config, hostKey string, inFlight []fqFlowSnapshot, now time.Time) (int, probeMode) {
 	if s == nil || hostKey == "" || len(inFlight) == 0 {
 		return 0, probeModeSteady

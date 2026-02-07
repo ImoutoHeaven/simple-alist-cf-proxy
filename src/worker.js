@@ -1221,6 +1221,8 @@ const createSlotHandlerClient = (config) => {
     return Math.min(max, base + step * n);
   };
 
+  const isRetryableReleaseStatus = (status) => status === 429 || status >= 500;
+
   const createAbortError = () => {
     const error = new Error('Aborted');
     error.name = 'AbortError';
@@ -1478,6 +1480,10 @@ const createSlotHandlerClient = (config) => {
         return;
       }
 
+      const releaseMaxAttempts = 3;
+      const releaseBaseBackoffMs = 100;
+      const releaseMaxBackoffMs = 500;
+
       const payload = {
         hostname: fqContext.hostname,
         hostnameHash: fqContext.hostnameHash,
@@ -1488,17 +1494,39 @@ const createSlotHandlerClient = (config) => {
         now: Date.now(),
       };
 
-      try {
-        await fetch(releaseUrl, {
-          method: 'POST',
-          headers: buildHeaders(),
-          body: JSON.stringify(payload),
-        });
-        console.log(`[FQ] slot released via slot-handler host=${fqContext.hostname}`);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error('[FQ] releaseSlot error (slot-handler):', message);
+      let lastError = null;
+      for (let attempt = 1; attempt <= releaseMaxAttempts; attempt += 1) {
+        let shouldRetry = false;
+        try {
+          const res = await fetch(releaseUrl, {
+            method: 'POST',
+            headers: buildHeaders(),
+            body: JSON.stringify(payload),
+          });
+
+          if (res.ok) {
+            console.log(`[FQ] slot released via slot-handler host=${fqContext.hostname}`);
+            return;
+          }
+
+          lastError = new Error(`slot-handler release failed: status ${res.status}`);
+          shouldRetry = isRetryableReleaseStatus(res.status);
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error));
+          shouldRetry = true;
+        }
+
+        if (shouldRetry && attempt < releaseMaxAttempts) {
+          const backoffMs = Math.min(releaseMaxBackoffMs, releaseBaseBackoffMs * (2 ** (attempt - 1)));
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          continue;
+        }
+
+        break;
       }
+
+      const message = lastError instanceof Error ? lastError.message : String(lastError || 'unknown error');
+      console.error('[FQ] releaseSlot error (slot-handler):', message);
     },
   };
 };

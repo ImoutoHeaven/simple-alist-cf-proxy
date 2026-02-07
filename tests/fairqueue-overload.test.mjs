@@ -533,3 +533,83 @@ test('abort during host-overload cooldown should stop immediately without acquir
     clearOverloadedByHost();
   }
 });
+
+test('releaseSlot retries on retryable status and network errors', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    slotToken: 'slot-1',
+    nowMs: Date.now(),
+  };
+
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response('rate limited', { status: 429 });
+    }
+    if (calls === 2) {
+      throw new Error('network down');
+    }
+    return new Response(JSON.stringify({ result: 'ok' }), { status: 200 });
+  };
+
+  try {
+    await client.releaseSlot({}, fqContext);
+    assert.equal(calls, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('releaseSlot does not retry on non-retryable 4xx', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    slotToken: 'slot-1',
+    nowMs: Date.now(),
+  };
+
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response('bad request', { status: 400 });
+  };
+
+  try {
+    await client.releaseSlot({}, fqContext);
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

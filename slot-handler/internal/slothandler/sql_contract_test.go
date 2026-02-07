@@ -30,6 +30,17 @@ func batchAcquireFunctionBody(t *testing.T, text string) string {
 	return m[1]
 }
 
+func intFunctionBody(t *testing.T, text string, fnName string) string {
+	t.Helper()
+
+	pattern := `(?s)create\s+or\s+replace\s+function\s+` + regexp.QuoteMeta(fnName) + `\s*\(.*?\)\s*returns\s+int\s+language\s+plpgsql\s+as\s*\$\$(.*?)\$\$\s*;`
+	m := regexp.MustCompile(pattern).FindStringSubmatch(text)
+	if len(m) != 2 {
+		t.Fatalf("unable to locate %s function body in init.sql", fnName)
+	}
+	return m[1]
+}
+
 func mustFindIndex(t *testing.T, text string, pattern string) []int {
 	t.Helper()
 	idx := regexp.MustCompile(pattern).FindStringIndex(text)
@@ -66,4 +77,24 @@ func TestInitSQLBatchAcquireReleasesHostOnSiteQueueSignals(t *testing.T) {
 
 	requireReleaseInBranch(t, body, ipTooManyBranch, queueFullBranch[0], "site-slot IP_TOO_MANY")
 	requireReleaseInBranch(t, body, queueFullBranch, acquiredBranch[0], "site-slot QUEUE_FULL")
+}
+
+func TestInitSQLCooldownConditionIncludesZeroActiveSlots(t *testing.T) {
+	text := readInitSQLNormalized(t)
+
+	hostBody := intFunctionBody(t, text, "func_try_acquire_host_slot")
+	if regexp.MustCompile(`and\s+v_current_ip_slots\s*>\s*0`).MatchString(hostBody) {
+		t.Fatalf("host cooldown predicate must not require v_current_ip_slots > 0")
+	}
+	if !regexp.MustCompile(`and\s+v_current_ip_slots\s*<\s*p_per_ip_limit`).MatchString(hostBody) {
+		t.Fatalf("host cooldown predicate must keep under-limit guard")
+	}
+
+	siteBody := intFunctionBody(t, text, "func_try_acquire_site_slot")
+	if regexp.MustCompile(`and\s+v_current_ip_slots\s*>\s*0`).MatchString(siteBody) {
+		t.Fatalf("site cooldown predicate must not require v_current_ip_slots > 0")
+	}
+	if !regexp.MustCompile(`and\s+v_current_ip_slots\s*<\s*p_per_ip_limit`).MatchString(siteBody) {
+		t.Fatalf("site cooldown predicate must keep under-limit guard")
+	}
 }

@@ -53,6 +53,9 @@ type flowStore struct {
 	grace   time.Duration
 	byToken map[string]*fqFlow
 
+	// Test hook: invoked by listInFlightByHost at function entry.
+	listInFlightByHostHook func(hostKey string)
+
 	// Test hook: invoked by deliverToWaiter after waiter lookup and before send,
 	// while flowStore.mu is still held.
 	deliverToWaiterBeforeSendHook func()
@@ -152,6 +155,9 @@ func (s *flowStore) trySelectInFlight(token string, hostKey string, now time.Tim
 func (s *flowStore) listInFlightByHost(hostKey string, now time.Time) []fqFlowSnapshot {
 	if s == nil || hostKey == "" {
 		return nil
+	}
+	if s.listInFlightByHostHook != nil {
+		s.listInFlightByHostHook(hostKey)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

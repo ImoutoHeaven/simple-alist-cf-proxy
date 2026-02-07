@@ -188,6 +188,23 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		// Avoid leaving a waiter attached; delete immediately (no grace) since the
 		// client aborted the request.
 		store.detachWaiter(token)
+		select {
+		case resp := <-w.resCh:
+			if resp != nil && strings.EqualFold(strings.TrimSpace(resp.Result), "granted") && strings.TrimSpace(resp.SlotToken) != "" {
+				now2 := nowFn()
+				releaseReq := ReleaseRequest{
+					Hostname:      req.Hostname,
+					HostnameHash:  req.HostnameHash,
+					IPBucket:      req.IPBucket,
+					SiteBucket:    req.SiteBucket,
+					SlotToken:     resp.SlotToken,
+					HitUpstreamAt: now2.UnixMilli(),
+					Now:           now2.UnixMilli(),
+				}
+				go s.releaseSlot(context.Background(), releaseReq)
+			}
+		default:
+		}
 		store.deleteFlow(token)
 		return nil, ctx.Err()
 	case resp := <-w.resCh:

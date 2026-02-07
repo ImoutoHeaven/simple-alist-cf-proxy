@@ -64,6 +64,17 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 ### POST /api/v1/fairqueue/release
 
 - 释放 slot（仍支持 `minSlotHoldMs` 和 `smoothReleaseIntervalMs`）。
+- 成功返回 `2xx`（当前为 `200` + `{"result":"ok"}`）。
+- 失败时返回非 `2xx`：
+  - `502`：slot-handler 调用 backend release（`fq_release_dual`）失败（包括 backend error/unavailable）。
+  - `4xx`：请求参数错误或鉴权失败（例如缺失字段、无效 token）。
+  - `5xx`：slot-handler 内部错误。
+- 约定：worker 将 release 视为 fire-and-forget，不影响本次下载响应，但会记录错误日志并按重试策略补偿。
+
+release 重试策略（worker 侧）：
+- 最多重试 3 次（指数退避：100ms、200ms，最大 500ms）。
+- **仅**在网络错误或可重试状态码时重试：`429` 或 `>=500`。
+- 对非可重试 `4xx`（如 `400/401/403/404`）不重试，避免对永久错误放大请求。
 
 ---
 

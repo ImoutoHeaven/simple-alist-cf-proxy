@@ -75,18 +75,70 @@ func (h *fqHostFlowScheduler) PickNextInFlight(store *flowStore, hostKey string,
 // PickNextInFlightBatch selects up to n unique in-flight flows using the same wall-clock now.
 // Virtual time advances per pick.
 func (h *fqHostFlowScheduler) PickNextInFlightBatch(store *flowStore, hostKey string, now time.Time, n int) []fqFlowSnapshot {
-	if n <= 0 {
+	if h == nil || store == nil || n <= 0 {
 		return nil
 	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	cands := store.listInFlightByHost(hostKey, now)
+	h.pruneIdleStatesLocked(cands, now)
+	if len(cands) == 0 {
+		return nil
+	}
+
+	// Ensure site/bucket states exist for all current candidates.
+	for _, f := range cands {
+		site := h.getOrInitSite(f.SiteBucket)
+		_ = h.getOrInitBucket(site, f.IPBucket)
+	}
+
 	res := make([]fqFlowSnapshot, 0, n)
-	seen := map[string]struct{}{}
 	for i := 0; i < n; i++ {
-		snap, ok := h.pickNextInFlightExcluding(store, hostKey, now, seen)
-		if !ok {
+		for len(cands) > 0 {
+			chosenSite, chosenBucket, chosenIdx := h.chooseLocked(cands, now)
+			if chosenIdx < 0 || chosenSite == nil || chosenBucket == nil {
+				return res
+			}
+
+			pick := cands[chosenIdx]
+			selected, ok := store.trySelectInFlight(pick.Token, hostKey, now)
+			if !ok {
+				// Candidate became ineligible; drop it and retry this pick.
+				cands[chosenIdx] = cands[len(cands)-1]
+				cands = cands[:len(cands)-1]
+				continue
+			}
+
+			// Weighted virtual time advancement: higher WaitCount => higher weight => slower VT increase.
+			siteW := 1 + chosenSite.WaitCount
+			if siteW < 1 {
+				siteW = 1
+			}
+			bucketW := 1 + chosenBucket.WaitCount
+			if bucketW < 1 {
+				bucketW = 1
+			}
+			chosenSite.VirtualTime += 1.0 / float64(siteW)
+			chosenBucket.VirtualTime += 1.0 / float64(bucketW)
+
+			if chosenSite.VirtualTime > 1e9 {
+				h.normalizeSitesLocked(cands)
+			}
+			if chosenBucket.VirtualTime > 1e9 {
+				h.normalizeBucketsLocked(chosenSite, cands)
+			}
+
+			// Remove selected candidate so batch picks remain unique.
+			cands[chosenIdx] = cands[len(cands)-1]
+			cands = cands[:len(cands)-1]
+			res = append(res, selected)
 			break
 		}
-		seen[snap.Token] = struct{}{}
-		res = append(res, snap)
+		if len(cands) == 0 {
+			break
+		}
 	}
 	return res
 }
@@ -100,6 +152,7 @@ func (h *fqHostFlowScheduler) pickNextInFlightExcluding(store *flowStore, hostKe
 	defer h.mu.Unlock()
 
 	cands := store.listInFlightByHost(hostKey, now)
+	h.pruneIdleStatesLocked(cands, now)
 	if len(cands) == 0 {
 		return fqFlowSnapshot{}, false
 	}
@@ -167,11 +220,80 @@ func (h *fqHostFlowScheduler) pickNextInFlightExcluding(store *flowStore, hostKe
 	return fqFlowSnapshot{}, false
 }
 
+func (h *fqHostFlowScheduler) pruneIdleStatesLocked(active []fqFlowSnapshot, now time.Time) {
+	if h == nil || len(h.sites) == 0 {
+		return
+	}
+
+	activeBuckets := make(map[string]map[string]struct{}, len(active))
+	for _, f := range active {
+		buckets := activeBuckets[f.SiteBucket]
+		if buckets == nil {
+			buckets = map[string]struct{}{}
+			activeBuckets[f.SiteBucket] = buckets
+		}
+		buckets[f.IPBucket] = struct{}{}
+	}
+
+	for siteKey, st := range h.sites {
+		if st == nil {
+			delete(h.sites, siteKey)
+			continue
+		}
+		siteActiveBuckets := activeBuckets[siteKey]
+		for bucketKey, bt := range st.Buckets {
+			if _, activeBucket := siteActiveBuckets[bucketKey]; activeBucket {
+				continue
+			}
+			if bt != nil {
+				if bt.WaitCount > 0 {
+					continue
+				}
+				if !bt.DenyUntil.IsZero() && now.Before(bt.DenyUntil) {
+					continue
+				}
+			}
+			delete(st.Buckets, bucketKey)
+		}
+
+		if len(siteActiveBuckets) > 0 {
+			continue
+		}
+		if st.WaitCount > 0 {
+			continue
+		}
+		if len(st.Buckets) > 0 {
+			continue
+		}
+		delete(h.sites, siteKey)
+	}
+}
+
 func (h *fqHostFlowScheduler) chooseLocked(cands []fqFlowSnapshot, now time.Time) (*fqSiteFlowState, *fqBucketFlowState, int) {
-	// Choose site with smallest VirtualTime (tie-break by key for determinism).
-	var chosenSite *fqSiteFlowState
+	// Determine eligible buckets per site first so denied-only sites are skipped.
+	siteBuckets := make(map[string]*fqBucketFlowState)
 	for _, f := range cands {
 		st := h.sites[f.SiteBucket]
+		if st == nil {
+			continue
+		}
+		bt := st.Buckets[f.IPBucket]
+		if bt == nil {
+			continue
+		}
+		if !bt.DenyUntil.IsZero() && now.Before(bt.DenyUntil) {
+			continue
+		}
+		cur := siteBuckets[st.Key]
+		if cur == nil || bt.VirtualTime < cur.VirtualTime || (bt.VirtualTime == cur.VirtualTime && bt.Key < cur.Key) {
+			siteBuckets[st.Key] = bt
+		}
+	}
+
+	// Choose eligible site with smallest VirtualTime (tie-break by key for determinism).
+	var chosenSite *fqSiteFlowState
+	for siteKey := range siteBuckets {
+		st := h.sites[siteKey]
 		if st == nil {
 			continue
 		}
@@ -182,24 +304,7 @@ func (h *fqHostFlowScheduler) chooseLocked(cands []fqFlowSnapshot, now time.Time
 	if chosenSite == nil {
 		return nil, nil, -1
 	}
-
-	// Choose bucket with smallest VirtualTime within the chosen site.
-	var chosenBucket *fqBucketFlowState
-	for _, f := range cands {
-		if f.SiteBucket != chosenSite.Key {
-			continue
-		}
-		bt := chosenSite.Buckets[f.IPBucket]
-		if bt == nil {
-			continue
-		}
-		if !bt.DenyUntil.IsZero() && now.Before(bt.DenyUntil) {
-			continue
-		}
-		if chosenBucket == nil || bt.VirtualTime < chosenBucket.VirtualTime || (bt.VirtualTime == chosenBucket.VirtualTime && bt.Key < chosenBucket.Key) {
-			chosenBucket = bt
-		}
-	}
+	chosenBucket := siteBuckets[chosenSite.Key]
 	if chosenBucket == nil {
 		return nil, nil, -1
 	}

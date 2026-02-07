@@ -2,6 +2,10 @@ package slothandler
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -110,5 +114,31 @@ func TestReleaseRetryFailureReturnsError(t *testing.T) {
 	}
 	if s.activeSlots.ActiveHost("h1", now.Add(time.Second)) != 1 {
 		t.Fatalf("expected active lease retained after failure")
+	}
+}
+
+type alwaysFailReleaseBackend struct{}
+
+func (b *alwaysFailReleaseBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+	return nil, nil
+}
+
+func (b *alwaysFailReleaseBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	return errors.New("release backend failed")
+}
+
+func TestHandleReleaseReturnsErrorStatus(t *testing.T) {
+	cfg := &Config{FairQueue: FairQueueConfig{MinSlotHoldMs: 0}}
+	s := newTestServer()
+	s.updateRuntime(cfg, &alwaysFailReleaseBackend{}, "test", true)
+
+	body := `{"hostname":"example.com","hostnameHash":"h1","ipBucket":"ip1","siteBucket":"s1","slotToken":"slot-1","hitUpstreamAtMs":1,"now":1}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/fairqueue/release", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	s.handleRelease(rec, req)
+
+	if rec.Code < 400 {
+		t.Fatalf("expected non-2xx/3xx status when release fails, got %d", rec.Code)
 	}
 }

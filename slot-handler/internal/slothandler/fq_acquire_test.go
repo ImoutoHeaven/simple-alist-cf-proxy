@@ -314,3 +314,94 @@ func TestAcquireStaleTokenReturnsTimeout(t *testing.T) {
 		t.Fatalf("expected timeout for stale token, got %s (queryToken=%q)", resp.Result, resp.QueryToken)
 	}
 }
+
+func TestAcquireCancelAfterGrantedStillReleases(t *testing.T) {
+	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 1)}
+	s := newTestServer()
+	cfg := testConfigForAcquire(200*time.Millisecond, 50*time.Millisecond)
+	s.updateRuntime(cfg, backend, "test", false)
+	s.flowStore.afterFunc = nil
+
+	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	if tok == "" {
+		t.Fatalf("expected token")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	enteredBeforeSend := make(chan struct{})
+	continueSend := make(chan struct{})
+	s.flowStore.deliverToWaiterBeforeSendHook = func() {
+		close(enteredBeforeSend)
+		<-continueSend
+	}
+	defer func() {
+		s.flowStore.deliverToWaiterBeforeSendHook = nil
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := s.handleAcquireSlot(ctx, AcquireRequest{
+			Hostname:     "example.com",
+			HostnameHash: "h1",
+			IPBucket:     "ip1",
+			SiteBucket:   "s1",
+			QueryToken:   tok,
+		})
+		errCh <- err
+	}()
+
+	deadline := time.NewTimer(100 * time.Millisecond)
+	defer deadline.Stop()
+	for {
+		snap, ok := s.flowStore.getSnapshot(tok)
+		if ok && snap.HasWaiter {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("waiter did not attach in time")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	deliverDone := make(chan bool, 1)
+	go func() {
+		deliverDone <- s.flowStore.deliverToWaiter(tok, &AcquireResponse{
+			Result:     "granted",
+			QueryToken: tok,
+			SlotToken:  "slot-cancel-race",
+		})
+	}()
+
+	<-enteredBeforeSend
+	cancel()
+	close(continueSend)
+
+	if delivered := <-deliverDone; !delivered {
+		t.Fatalf("expected granted delivery to succeed")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != context.Canceled {
+			t.Fatalf("expected context canceled, got %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("acquire did not return")
+	}
+
+	select {
+	case req := <-backend.released:
+		if req.SlotToken != "slot-cancel-race" {
+			t.Fatalf("expected compensating release for delivered slot, got %q", req.SlotToken)
+		}
+		if req.Hostname != "example.com" || req.HostnameHash != "h1" || req.IPBucket != "ip1" || req.SiteBucket != "s1" {
+			t.Fatalf("unexpected release request: %+v", req)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected compensating release after cancel")
+	}
+}

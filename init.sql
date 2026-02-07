@@ -779,7 +779,6 @@ BEGIN
   IF v_cooldown_interval IS NOT NULL
      AND p_ip_hash IS NOT NULL
      AND p_ip_hash <> ''
-     AND v_current_ip_slots > 0
      AND p_per_ip_limit > 0
      AND v_current_ip_slots < p_per_ip_limit THEN
     SELECT "last_release_at"
@@ -910,7 +909,6 @@ BEGIN
   IF v_cooldown_interval IS NOT NULL
      AND p_ip_hash IS NOT NULL
      AND p_ip_hash <> ''
-     AND v_current_ip_slots > 0
      AND p_per_ip_limit > 0
      AND v_current_ip_slots < p_per_ip_limit THEN
     SELECT "last_release_at"
