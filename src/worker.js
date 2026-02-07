@@ -29,6 +29,7 @@ const SLOT_HANDLER_LONGPOLL_MS = 6000;
 const FQ_GLOBAL_STATE = {
   throttledByHost: new Map(),
   overloadedByHost: new Map(),
+  overloadedGlobalUntilMs: 0,
 };
 
 // Rate Limit in-memory state (per Worker instance, iprange-level)
@@ -346,6 +347,29 @@ function getHostOverloadedRemainingMs(hostname, now = nowMs()) {
     return 0;
   }
   return Math.max(0, state.untilMs - now);
+}
+
+function markGlobalOverloaded(retryAfterSeconds) {
+  const seconds = normalizePositiveSeconds(retryAfterSeconds, 0);
+  if (!seconds) {
+    return;
+  }
+
+  const until = nowMs() + seconds * 1000;
+  if (!FQ_GLOBAL_STATE.overloadedGlobalUntilMs || until > FQ_GLOBAL_STATE.overloadedGlobalUntilMs) {
+    FQ_GLOBAL_STATE.overloadedGlobalUntilMs = until;
+  }
+}
+
+function getGlobalOverloadedRemainingSeconds(now = nowMs()) {
+  const until = Number(FQ_GLOBAL_STATE.overloadedGlobalUntilMs) || 0;
+  if (!until || until <= now) {
+    if (until && until <= now) {
+      FQ_GLOBAL_STATE.overloadedGlobalUntilMs = 0;
+    }
+    return 0;
+  }
+  return Math.ceil((until - now) / 1000);
 }
 
 const SLOW_FAIL_DELAY_MS = 5000;
@@ -1286,6 +1310,15 @@ const createSlotHandlerClient = (config) => {
           };
         }
 
+        const globalOverloadedRemain = getGlobalOverloadedRemainingSeconds(now);
+        if (globalOverloadedRemain > 0) {
+          return {
+            kind: 'overloaded',
+            scope: 'global',
+            retryAfter: globalOverloadedRemain,
+          };
+        }
+
         const overloadedRemainMs = getHostOverloadedRemainingMs(hostKey, now);
         if (overloadedRemainMs > 0) {
           const delayMs = Math.min(overloadedRemainMs, requestTimeoutMs);
@@ -1393,6 +1426,7 @@ const createSlotHandlerClient = (config) => {
               const retryAfter = Number.isFinite(retryAfterRaw) && retryAfterRaw > 0
                 ? Math.ceil(retryAfterRaw)
                 : 60;
+              markGlobalOverloaded(retryAfter);
               return {
                 kind: 'overloaded',
                 scope: 'global',
@@ -2565,8 +2599,10 @@ export const __fairQueueTestHooks = {
   createSlotHandlerClient,
   markHostOverloaded,
   getHostOverloadedRemainingMs,
+  getGlobalOverloadedRemainingSeconds,
   clearOverloadedByHost: () => {
     FQ_GLOBAL_STATE.overloadedByHost.clear();
+    FQ_GLOBAL_STATE.overloadedGlobalUntilMs = 0;
   },
 };
 

@@ -111,6 +111,71 @@ test('global overload should fail fast with Retry-After', async () => {
   }
 });
 
+test('global overload cooldown should suppress repeated acquire calls', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return new Response(JSON.stringify({
+        result: 'overloaded',
+        reason: 'overload_global',
+        retryAfter: 2,
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const first = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(first, {
+      kind: 'overloaded',
+      scope: 'global',
+      retryAfter: 2,
+    });
+    assert.equal(fetchCalls, 1);
+
+    const startedAt = Date.now();
+    const second = await client.waitForSlot({}, fqContext);
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(second.kind, 'overloaded');
+    assert.equal(second.scope, 'global');
+    assert.ok(second.retryAfter >= 1);
+    assert.equal(fetchCalls, 1);
+    assert.ok(elapsedMs < 200, `expected cached global overload short-circuit, got ${elapsedMs}ms`);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
 test('scoped overload should keep bounded wait loop and then grant', async () => {
   const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
   clearOverloadedByHost();
