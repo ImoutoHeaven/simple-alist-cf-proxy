@@ -492,6 +492,162 @@ test('ip-scoped overload cooldown should not suppress other ip buckets under sam
   }
 });
 
+test('unknown scoped overload reason falls back to host-level cooldown', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 300,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const siteAContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-a',
+    siteBucket: 'site-a',
+  };
+
+  const siteBContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-a',
+    siteBucket: 'site-b',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return new Response(JSON.stringify({
+        result: 'overloaded',
+        reason: 'legacy_overload_scope',
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-2' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const first = await client.waitForSlot({}, siteAContext);
+    assert.equal(first.kind, 'timeout');
+
+    const second = await client.waitForSlot({}, siteBContext);
+
+    assert.equal(second.kind, 'timeout');
+    assert.equal(fetchCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
+test('ip-scoped keys with embedded delimiters do not collide', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 300,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const contextA = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    siteBucket: 'site\x00part',
+    ipBucket: 'ip',
+  };
+
+  const contextB = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    siteBucket: 'site',
+    ipBucket: 'part\x00ip',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return new Response(JSON.stringify({
+        result: 'overloaded',
+        reason: 'overload_ip',
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-safe-key' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const first = await client.waitForSlot({}, contextA);
+    assert.equal(first.kind, 'timeout');
+
+    const second = await client.waitForSlot({}, contextB);
+    assert.equal(second.kind, 'granted');
+    assert.equal(fetchCalls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
+test('scoped overload maps opportunistically clean expired entries', async () => {
+  const {
+    clearOverloadedByHost,
+    markSiteOverloaded,
+    markIpOverloaded,
+    getSiteOverloadedRemainingMs,
+    getIpOverloadedRemainingMs,
+    getOverloadedMapSizes,
+  } = __fairQueueTestHooks;
+
+  clearOverloadedByHost();
+
+  try {
+    for (let i = 0; i < 24; i += 1) {
+      markSiteOverloaded('cleanup.example', `site-${i}`, 1);
+      markIpOverloaded('cleanup.example', `site-${i}`, `ip-${i}`, 1);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const before = getOverloadedMapSizes();
+    getSiteOverloadedRemainingMs('cleanup.example', 'fresh-site');
+    getIpOverloadedRemainingMs('cleanup.example', 'fresh-site', 'fresh-ip');
+    const after = getOverloadedMapSizes();
+
+    assert.ok(before.site > 0 && before.ip > 0);
+    assert.ok(after.site < before.site, `expected site map cleanup: ${before.site} -> ${after.site}`);
+    assert.ok(after.ip < before.ip, `expected ip map cleanup: ${before.ip} -> ${after.ip}`);
+  } finally {
+    clearOverloadedByHost();
+  }
+});
+
 test('scoped overload wait uses strict 500ms staircase contract', async () => {
   const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
   clearOverloadedByHost();

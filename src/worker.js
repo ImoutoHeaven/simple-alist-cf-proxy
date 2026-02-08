@@ -334,12 +334,21 @@ function normalizeOverloadScopeValue(value, fallback = 'unknown') {
   return trimmed.length > 0 ? trimmed : fallback;
 }
 
+const SCOPED_OVERLOAD_SWEEP_STEPS = 6;
+
+function buildScopedOverloadKey(parts) {
+  return JSON.stringify(parts);
+}
+
 function buildSiteOverloadKey(hostname, siteBucket) {
   const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
   if (!hostKey) {
     return '';
   }
-  return `${hostKey}\x00${normalizeOverloadScopeValue(siteBucket, 'unknown')}`;
+  return buildScopedOverloadKey([
+    hostKey,
+    normalizeOverloadScopeValue(siteBucket, 'unknown'),
+  ]);
 }
 
 function buildIpOverloadKey(hostname, siteBucket, ipBucket) {
@@ -347,9 +356,34 @@ function buildIpOverloadKey(hostname, siteBucket, ipBucket) {
   if (!hostKey) {
     return '';
   }
-  const siteKey = normalizeOverloadScopeValue(siteBucket, 'unknown');
-  const ipKey = normalizeOverloadScopeValue(ipBucket, 'unknown');
-  return `${hostKey}\x00${siteKey}\x00${ipKey}`;
+  return buildScopedOverloadKey([
+    hostKey,
+    normalizeOverloadScopeValue(siteBucket, 'unknown'),
+    normalizeOverloadScopeValue(ipBucket, 'unknown'),
+  ]);
+}
+
+function sweepExpiredScopedOverloadEntries(store, now, steps = SCOPED_OVERLOAD_SWEEP_STEPS) {
+  if (!store || store.size === 0) {
+    return;
+  }
+
+  const maxSteps = Number.isFinite(steps) && steps > 0
+    ? Math.max(1, Math.trunc(steps))
+    : SCOPED_OVERLOAD_SWEEP_STEPS;
+
+  for (let i = 0; i < maxSteps; i += 1) {
+    const first = store.entries().next().value;
+    if (!first) {
+      break;
+    }
+    const [entryKey, state] = first;
+    store.delete(entryKey);
+
+    if (state && state.untilMs && state.untilMs > now) {
+      store.set(entryKey, state);
+    }
+  }
 }
 
 function markScopedOverloaded(store, key, retryAfterMs) {
@@ -362,7 +396,9 @@ function markScopedOverloaded(store, key, retryAfterMs) {
     return;
   }
 
-  const until = nowMs() + durationMs;
+  const now = nowMs();
+  sweepExpiredScopedOverloadEntries(store, now);
+  const until = now + durationMs;
   const prev = store.get(key);
   if (!prev || until > prev.untilMs) {
     store.set(key, { untilMs: until });
@@ -414,6 +450,8 @@ function getScopedOverloadedRemainingMs(store, key, now = nowMs()) {
   if (!store || !key) {
     return 0;
   }
+
+  sweepExpiredScopedOverloadEntries(store, now);
 
   const state = store.get(key);
   if (!state || !state.untilMs || state.untilMs <= now) {
@@ -2725,6 +2763,15 @@ export const __fairQueueTestHooks = {
   markHostOverloaded,
   getHostOverloadedRemainingMs,
   getGlobalOverloadedRemainingSeconds,
+  markSiteOverloaded,
+  markIpOverloaded,
+  getSiteOverloadedRemainingMs,
+  getIpOverloadedRemainingMs,
+  getOverloadedMapSizes: () => ({
+    host: FQ_GLOBAL_STATE.overloadedByHost.size,
+    site: FQ_GLOBAL_STATE.overloadedBySite.size,
+    ip: FQ_GLOBAL_STATE.overloadedByIp.size,
+  }),
   clearOverloadedByHost: () => {
     FQ_GLOBAL_STATE.overloadedByHost.clear();
     FQ_GLOBAL_STATE.overloadedBySite.clear();
