@@ -362,6 +362,136 @@ test('ip-scoped overload should keep bounded wait loop and then grant', async ()
   }
 });
 
+test('site-scoped overload cooldown should not suppress other sites under same host', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 300,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const siteAContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-a',
+    siteBucket: 'site-a',
+  };
+
+  const siteBContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-a',
+    siteBucket: 'site-b',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return new Response(JSON.stringify({
+        result: 'overloaded',
+        reason: 'overload_site',
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-site-b-1' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const first = await client.waitForSlot({}, siteAContext);
+    assert.equal(first.kind, 'timeout');
+
+    const startedAt = Date.now();
+    const second = await client.waitForSlot({}, siteBContext);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(second.kind, 'granted');
+    assert.equal(fetchCalls, 2);
+    assert.ok(elapsedMs < 250, `expected no host-wide suppression for other site, got ${elapsedMs}ms`);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
+test('ip-scoped overload cooldown should not suppress other ip buckets under same host/site', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 300,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const ipAContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-a',
+    siteBucket: 'site-a',
+  };
+
+  const ipBContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-b',
+    siteBucket: 'site-a',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return new Response(JSON.stringify({
+        result: 'overloaded',
+        reason: 'overload_ip',
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-ip-b-1' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const first = await client.waitForSlot({}, ipAContext);
+    assert.equal(first.kind, 'timeout');
+
+    const startedAt = Date.now();
+    const second = await client.waitForSlot({}, ipBContext);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(second.kind, 'granted');
+    assert.equal(fetchCalls, 2);
+    assert.ok(elapsedMs < 250, `expected no host-wide suppression for other ip bucket, got ${elapsedMs}ms`);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
 test('scoped overload wait uses strict 500ms staircase contract', async () => {
   const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
   clearOverloadedByHost();

@@ -29,6 +29,8 @@ const SLOT_HANDLER_LONGPOLL_MS = 6000;
 const FQ_GLOBAL_STATE = {
   throttledByHost: new Map(),
   overloadedByHost: new Map(),
+  overloadedBySite: new Map(),
+  overloadedByIp: new Map(),
   overloadedGlobalUntilMs: 0,
 };
 
@@ -321,15 +323,49 @@ function markHostOverloaded(hostname, retryAfterMs) {
     return;
   }
 
+  markScopedOverloaded(FQ_GLOBAL_STATE.overloadedByHost, hostKey, retryAfterMs);
+}
+
+function normalizeOverloadScopeValue(value, fallback = 'unknown') {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+function buildSiteOverloadKey(hostname, siteBucket) {
+  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
+  if (!hostKey) {
+    return '';
+  }
+  return `${hostKey}\x00${normalizeOverloadScopeValue(siteBucket, 'unknown')}`;
+}
+
+function buildIpOverloadKey(hostname, siteBucket, ipBucket) {
+  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
+  if (!hostKey) {
+    return '';
+  }
+  const siteKey = normalizeOverloadScopeValue(siteBucket, 'unknown');
+  const ipKey = normalizeOverloadScopeValue(ipBucket, 'unknown');
+  return `${hostKey}\x00${siteKey}\x00${ipKey}`;
+}
+
+function markScopedOverloaded(store, key, retryAfterMs) {
+  if (!store || !key) {
+    return;
+  }
+
   const durationMs = normalizePositiveMs(retryAfterMs, 0);
   if (!durationMs) {
     return;
   }
 
   const until = nowMs() + durationMs;
-  const prev = FQ_GLOBAL_STATE.overloadedByHost.get(hostKey);
+  const prev = store.get(key);
   if (!prev || until > prev.untilMs) {
-    FQ_GLOBAL_STATE.overloadedByHost.set(hostKey, { untilMs: until });
+    store.set(key, { untilMs: until });
   }
 }
 
@@ -339,14 +375,61 @@ function getHostOverloadedRemainingMs(hostname, now = nowMs()) {
     return 0;
   }
 
-  const state = FQ_GLOBAL_STATE.overloadedByHost.get(hostKey);
+  return getScopedOverloadedRemainingMs(FQ_GLOBAL_STATE.overloadedByHost, hostKey, now);
+}
+
+function markSiteOverloaded(hostname, siteBucket, retryAfterMs) {
+  const key = buildSiteOverloadKey(hostname, siteBucket);
+  if (!key) {
+    return;
+  }
+  markScopedOverloaded(FQ_GLOBAL_STATE.overloadedBySite, key, retryAfterMs);
+}
+
+function getSiteOverloadedRemainingMs(hostname, siteBucket, now = nowMs()) {
+  const key = buildSiteOverloadKey(hostname, siteBucket);
+  if (!key) {
+    return 0;
+  }
+  return getScopedOverloadedRemainingMs(FQ_GLOBAL_STATE.overloadedBySite, key, now);
+}
+
+function markIpOverloaded(hostname, siteBucket, ipBucket, retryAfterMs) {
+  const key = buildIpOverloadKey(hostname, siteBucket, ipBucket);
+  if (!key) {
+    return;
+  }
+  markScopedOverloaded(FQ_GLOBAL_STATE.overloadedByIp, key, retryAfterMs);
+}
+
+function getIpOverloadedRemainingMs(hostname, siteBucket, ipBucket, now = nowMs()) {
+  const key = buildIpOverloadKey(hostname, siteBucket, ipBucket);
+  if (!key) {
+    return 0;
+  }
+  return getScopedOverloadedRemainingMs(FQ_GLOBAL_STATE.overloadedByIp, key, now);
+}
+
+function getScopedOverloadedRemainingMs(store, key, now = nowMs()) {
+  if (!store || !key) {
+    return 0;
+  }
+
+  const state = store.get(key);
   if (!state || !state.untilMs || state.untilMs <= now) {
     if (state && state.untilMs && state.untilMs <= now) {
-      FQ_GLOBAL_STATE.overloadedByHost.delete(hostKey);
+      store.delete(key);
     }
     return 0;
   }
   return Math.max(0, state.untilMs - now);
+}
+
+function getScopedOverloadRemainingMs(hostname, siteBucket, ipBucket, now = nowMs()) {
+  const hostRemain = getHostOverloadedRemainingMs(hostname, now);
+  const siteRemain = getSiteOverloadedRemainingMs(hostname, siteBucket, now);
+  const ipRemain = getIpOverloadedRemainingMs(hostname, siteBucket, ipBucket, now);
+  return Math.max(hostRemain, siteRemain, ipRemain);
 }
 
 function markGlobalOverloaded(retryAfterSeconds) {
@@ -1321,7 +1404,12 @@ const createSlotHandlerClient = (config) => {
           };
         }
 
-        const overloadedRemainMs = getHostOverloadedRemainingMs(hostKey, now);
+        const overloadedRemainMs = getScopedOverloadRemainingMs(
+          hostKey,
+          fqContext?.siteBucket,
+          fqContext?.ipBucket,
+          now,
+        );
         if (overloadedRemainMs > 0) {
           const delayMs = Math.min(overloadedRemainMs, requestTimeoutMs);
           if (Date.now() - startedAt + delayMs >= totalMaxWaitMs) {
@@ -1438,7 +1526,16 @@ const createSlotHandlerClient = (config) => {
 
             const delayMs = nextOverloadDelayMs(overloadStreak);
             overloadStreak += 1;
-            markHostOverloaded(hostKey, delayMs);
+            if (reason === 'overload_host') {
+              markHostOverloaded(hostKey, delayMs);
+            } else if (reason === 'overload_site') {
+              markSiteOverloaded(hostKey, fqContext?.siteBucket, delayMs);
+            } else if (reason === 'overload_ip') {
+              markIpOverloaded(hostKey, fqContext?.siteBucket, fqContext?.ipBucket, delayMs);
+            } else {
+              // Fallback: unknown/legacy scoped reason still degrades to host-level cooling.
+              markHostOverloaded(hostKey, delayMs);
+            }
             const elapsed = Date.now() - startedAt;
             if (elapsed + delayMs >= totalMaxWaitMs) {
               return { kind: 'timeout', reason: 'slot-handler-overloaded' };
@@ -2630,6 +2727,8 @@ export const __fairQueueTestHooks = {
   getGlobalOverloadedRemainingSeconds,
   clearOverloadedByHost: () => {
     FQ_GLOBAL_STATE.overloadedByHost.clear();
+    FQ_GLOBAL_STATE.overloadedBySite.clear();
+    FQ_GLOBAL_STATE.overloadedByIp.clear();
     FQ_GLOBAL_STATE.overloadedGlobalUntilMs = 0;
   },
 };
