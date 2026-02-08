@@ -95,6 +95,158 @@ release 重试策略（worker 侧）：
 - `rpc`：DB 函数名
 - `cleanup`：DB 清理任务节奏
 
+### 4.1 按目标 QPS 反推参数（SharePoint 场景示例）
+
+示例目标：
+
+- `xxx.sharepoint.com`（host 维度）目标上限约 `8 QPS`
+- `xxx.sharepoint.com/sites/yyy`（site 维度）目标上限约 `4 QPS`
+
+建议配置（完整 `config.json`，可直接作为模板）：
+
+```json
+{
+  "controller": {
+    "url": "",
+    "apiPrefix": "/api/v0",
+    "apiToken": "",
+    "env": "",
+    "role": "slot-handler",
+    "instanceId": "",
+    "appName": "slot-handler",
+    "appVersion": ""
+  },
+  "internalApiToken": "change-me",
+  "listen": ":8080",
+  "logLevel": "info",
+  "auth": {
+    "enabled": true,
+    "header": "X-FQ-Auth",
+    "token": "change-me"
+  },
+  "backend": {
+    "mode": "postgrest",
+    "postgrest": {
+      "baseUrl": "https://your-postgrest-endpoint.example.com",
+      "authHeader": "Bearer your-postgrest-token"
+    },
+    "postgres": {
+      "dsn": "postgres://user:pass@host:5432/dbname?sslmode=disable"
+    }
+  },
+  "fairQueue": {
+    "pollIntervalMs": 100,
+    "pollWindowMs": 6000,
+    "graceMs": 4000,
+    "utilWindowSec": 10,
+    "maxBatch": 8,
+    "maxProbeParallel": 8,
+    "maxProbeQpsPerHost": 32,
+    "globalMaxInFlightFlow": 2000,
+    "hostMaxInFlightFlow": 512,
+    "siteMaxInFlightFlow": 256,
+    "ipBucketMaxInFlightFlow": 128,
+    "minSlotHoldMs": 1000,
+    "smoothReleaseIntervalMs": 125,
+    "zombieTimeoutSeconds": 30,
+    "ipCooldownSeconds": 0,
+    "hostCaps": {
+      "maxSlotPerHost": 8,
+      "maxSlotPerIp": 8
+    },
+    "siteCaps": {
+      "maxSlotPerSite": 4,
+      "maxSlotPerIp": 4
+    },
+    "rpc": {
+      "tryAcquireFunc": "fq_try_acquire_batch",
+      "releaseFunc": "fq_release_dual"
+    },
+    "cleanup": {
+      "enabled": true,
+      "intervalSeconds": 1800
+    }
+  }
+}
+```
+
+为什么这组参数可达到目标：
+
+- `hostCaps.maxSlotPerHost=8` + `minSlotHoldMs=1000`：host 同时最多 8 个活跃槽，每个槽最小持有 1 秒，稳态上限约 `8 QPS`。
+- `siteCaps.maxSlotPerSite=4` + `minSlotHoldMs=1000`：同一 site 同时最多 4 个活跃槽，稳态上限约 `4 QPS`。
+- `smoothReleaseIntervalMs=125`：按 host 维度把 release 平滑到约每 125ms 一个节拍（约每秒 8 次），减少瞬时突刺。
+- acquire 路径会同时校验 host-slot 与 site-slot，任一不足都不会返回 `ACQUIRED`，因此 host 与 site 两层约束会同时生效。
+
+> 说明：QPS 是“稳态吞吐上限”而非硬实时秒级整形值。实际观测会受上游响应时延、网络抖动、实例调度与重试行为影响。
+
+配套前提（重要）：
+
+- Worker 侧 `download.fairQueue.siteBucket.mode` 需为 `sharepoint`，确保 `/sites/yyy` 被稳定映射到同一 siteBucket。
+- 多实例 slot-handler 部署需开启 sticky 路由，保证同一 `queryToken` 轮询命中同一实例。
+- 若 `controller.url + controller.apiToken + controller.env` 同时非空，运行时会优先使用 controller 下发配置；本地文件不会作为最终 fair-queue 生效值。
+
+### 4.2 参数逐项说明（public reference）
+
+顶层字段：
+
+- `controller.url`：控制面地址；为空表示不启用控制面拉取。
+- `controller.apiPrefix`：控制面 API 前缀，默认常见值为 `/api/v0`。
+- `controller.apiToken`：控制面鉴权令牌。
+- `controller.env`：环境标识（如 `prod`/`staging`）。
+- `controller.role`：实例角色，slot-handler 场景建议固定 `slot-handler`。
+- `controller.instanceId`：实例唯一标识，用于观测与控制面追踪。
+- `controller.appName`：应用名（指标/日志标签）。
+- `controller.appVersion`：应用版本（指标/日志标签）。
+- `internalApiToken`：内部控制 API（`/api/v0/*`）的 Bearer 鉴权。
+- `listen`：HTTP 服务监听地址。
+- `logLevel`：日志级别（如 `debug`/`info`/`warn`/`error`）。
+
+`auth` 字段：
+
+- `auth.enabled`：是否开启对外接口鉴权。
+- `auth.header`：鉴权请求头名称。
+- `auth.token`：鉴权令牌值。
+
+`backend` 字段：
+
+- `backend.mode`：后端模式，`postgrest` 或 `postgres`。
+- `backend.postgrest.baseUrl`：PostgREST 服务基地址。
+- `backend.postgrest.authHeader`：访问 PostgREST 的鉴权头值。
+- `backend.postgres.dsn`：直连 Postgres 时使用的 DSN。
+
+`fairQueue` 字段：
+
+- `fairQueue.pollIntervalMs`：probe runner 调度周期。
+- `fairQueue.pollWindowMs`：单次 acquire 长轮询窗口。
+- `fairQueue.graceMs`：`pending` 后 token 可续期的 grace 窗口。
+- `fairQueue.utilWindowSec`：利用率统计窗口长度，用于 probe 预算策略。
+- `fairQueue.maxBatch`：每轮 probe 最多尝试的 flow 数。
+- `fairQueue.maxProbeParallel`：每个 host 的 probe 并发上限。
+- `fairQueue.maxProbeQpsPerHost`：每个 host 的 probe 请求速率上限。
+- `fairQueue.globalMaxInFlightFlow`：全局 in-flight waiter 上限。
+- `fairQueue.hostMaxInFlightFlow`：单 host in-flight waiter 上限。
+- `fairQueue.siteMaxInFlightFlow`：单 site in-flight waiter 上限。
+- `fairQueue.ipBucketMaxInFlightFlow`：单 ipBucket in-flight waiter 上限。
+- `fairQueue.minSlotHoldMs`：slot 最小持有时长（吞吐基线关键参数）。
+- `fairQueue.smoothReleaseIntervalMs`：release 平滑间隔；不设时会按 `minSlotHoldMs / hostSlots` 推导。
+- `fairQueue.zombieTimeoutSeconds`：僵尸锁回收阈值。
+- `fairQueue.ipCooldownSeconds`：同 IP cooldown 秒数（大于 0 会更保守）。
+- `fairQueue.hostCaps.maxSlotPerHost`：host 维度并发槽上限。
+- `fairQueue.hostCaps.maxSlotPerIp`：host 维度单 IP 并发槽上限。
+- `fairQueue.siteCaps.maxSlotPerSite`：site 维度并发槽上限。
+- `fairQueue.siteCaps.maxSlotPerIp`：site 维度单 IP 并发槽上限。
+- `fairQueue.rpc.tryAcquireFunc`：批量 acquire RPC 函数名。
+- `fairQueue.rpc.releaseFunc`：release RPC 函数名。
+- `fairQueue.cleanup.enabled`：是否启用后台 DB 清理任务。
+- `fairQueue.cleanup.intervalSeconds`：后台清理执行周期。
+
+调参建议（通用）：
+
+- 先按目标 QPS 反推 `maxSlotPer*` 与 `minSlotHoldMs`，再调 `smoothReleaseIntervalMs` 消峰。
+- `maxProbeQpsPerHost` 只影响“探测速率”，通常应高于业务目标 QPS。
+- `maxSlotPerIp` 需显式给出，避免默认值过小造成单 IP 误限流。
+- in-flight 上限建议按峰值并发留裕量，避免正常高峰误触发 `overloaded`。
+
 ---
 
 ## 5. 指标（controller 模式）
