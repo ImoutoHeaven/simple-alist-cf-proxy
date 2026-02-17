@@ -53,6 +53,8 @@ type flowStore struct {
 	grace   time.Duration
 	byToken map[string]*fqFlow
 
+	hostInFlightTokens map[string]map[string]struct{} // hostKey -> set(token)
+
 	// Test hook: invoked by listInFlightByHost at function entry.
 	listInFlightByHostHook func(hostKey string)
 
@@ -73,13 +75,14 @@ type flowStore struct {
 
 func newFlowStore(grace time.Duration) *flowStore {
 	return &flowStore{
-		grace:          grace,
-		byToken:        map[string]*fqFlow{},
-		afterFunc:      time.AfterFunc,
-		nowFn:          time.Now,
-		inFlightByHost: make(map[string]int),
-		inFlightBySite: make(map[string]int),
-		inFlightByIP:   make(map[string]int),
+		grace:              grace,
+		byToken:            map[string]*fqFlow{},
+		afterFunc:          time.AfterFunc,
+		nowFn:              time.Now,
+		hostInFlightTokens: make(map[string]map[string]struct{}),
+		inFlightByHost:     make(map[string]int),
+		inFlightBySite:     make(map[string]int),
+		inFlightByIP:       make(map[string]int),
 	}
 }
 
@@ -163,23 +166,22 @@ func (s *flowStore) listInFlightByHost(hostKey string, now time.Time) []fqFlowSn
 	defer s.mu.Unlock()
 
 	// Only flows with a live attached waiter are candidates for the in-flight scheduler.
-	res := make([]fqFlowSnapshot, 0)
-	for _, f := range s.byToken {
+	// Iterate host-local tokens and prune stale entries opportunistically.
+	bucket := s.hostInFlightTokens[hostKey]
+	res := make([]fqFlowSnapshot, 0, len(bucket))
+	for token := range bucket {
+		f := s.byToken[token]
 		if f == nil {
+			delete(bucket, token)
 			continue
 		}
 		if isFlowExpiredAt(f, now) {
+			delete(bucket, token)
 			s.removeFlowLocked(f)
 			continue
 		}
-		key := f.HostnameHash
-		if key == "" {
-			key = f.Hostname
-		}
-		if key != hostKey {
-			continue
-		}
-		if f.waiter == nil {
+		if fqHostKey(f.HostnameHash, f.Hostname) != hostKey || f.waiter == nil {
+			delete(bucket, token)
 			continue
 		}
 		res = append(res, fqFlowSnapshot{
@@ -193,6 +195,9 @@ func (s *flowStore) listInFlightByHost(hostKey string, now time.Time) []fqFlowSn
 			HasWaiter:    true,
 			ExpireAt:     f.expireAt,
 		})
+	}
+	if len(bucket) == 0 {
+		delete(s.hostInFlightTokens, hostKey)
 	}
 	return res
 }
@@ -279,6 +284,43 @@ func safeStopTimer(t *time.Timer) {
 	t.Stop()
 }
 
+func (s *flowStore) addHostInFlightTokenLocked(f *fqFlow) {
+	if s == nil || f == nil {
+		return
+	}
+	hostKey := fqHostKey(f.HostnameHash, f.Hostname)
+	if hostKey == "" || f.Token == "" {
+		return
+	}
+	if s.hostInFlightTokens == nil {
+		s.hostInFlightTokens = make(map[string]map[string]struct{})
+	}
+	bucket := s.hostInFlightTokens[hostKey]
+	if bucket == nil {
+		bucket = make(map[string]struct{})
+		s.hostInFlightTokens[hostKey] = bucket
+	}
+	bucket[f.Token] = struct{}{}
+}
+
+func (s *flowStore) removeHostInFlightTokenLocked(f *fqFlow) {
+	if s == nil || f == nil {
+		return
+	}
+	hostKey := fqHostKey(f.HostnameHash, f.Hostname)
+	if hostKey == "" || f.Token == "" {
+		return
+	}
+	bucket := s.hostInFlightTokens[hostKey]
+	if bucket == nil {
+		return
+	}
+	delete(bucket, f.Token)
+	if len(bucket) == 0 {
+		delete(s.hostInFlightTokens, hostKey)
+	}
+}
+
 func (s *flowStore) incrementInFlightLocked(f *fqFlow) {
 	if f == nil {
 		return
@@ -293,6 +335,7 @@ func (s *flowStore) incrementInFlightLocked(f *fqFlow) {
 	s.inFlightBySite[siteKey]++
 	ipKey := flowIPKey(hostKey, site, ip)
 	s.inFlightByIP[ipKey]++
+	s.addHostInFlightTokenLocked(f)
 }
 
 func (s *flowStore) decrementInFlightLocked(f *fqFlow) {
@@ -320,6 +363,7 @@ func (s *flowStore) decrementInFlightLocked(f *fqFlow) {
 	if s.inFlightByIP[ipKey] <= 0 {
 		delete(s.inFlightByIP, ipKey)
 	}
+	s.removeHostInFlightTokenLocked(f)
 }
 
 func (s *flowStore) isOverloadedByCounters(hostKey, siteBucket, ipBucket string, limits inFlightLimits) bool {

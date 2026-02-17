@@ -34,6 +34,8 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - 每个 hostKey 维护一个后台 runner（按 `pollIntervalMs` 周期触发，或被唤醒）。
 - runner 每轮执行一次 `probeOnce(hostKey)`：
   - 仅在 **当前有 in-flight waiter 的 flows** 中做选择（不会考虑 detached/grace-only flows）。
+  - `flowStore` 仍以 `byToken` 作为唯一真源；同时在同一把 `flowStore.mu` 锁内维护派生索引 `hostInFlightTokens(hostKey -> token set)`，用于把 host 维度候选查找从全表扫描降为 host 局部遍历。
+  - `hostInFlightTokens` 只在 waiter 附着状态变更时更新（attach、detach，以及 `removeFlow` 在 waiter 仍附着时触发的移除）；`listInFlightByHost` 遍历 host bucket 时会机会性清理 stale token（例如 flow 已删除、waiter 已解绑、或 flow 过期），保证索引自愈且不引入兼容层。
   - 使用 in-flight scheduler 按 `siteBucket -> ipBucket -> flow(LocalVT)` 的层级做公平选择。
   - 对选中的 flow 调用数据库 `TryAcquire`：
     - `ACQUIRED`：向 waiter 投递 `granted + slotToken`，并删除 flow。
