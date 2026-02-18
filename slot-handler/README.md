@@ -32,16 +32,36 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 ## 2. 调度与探测（probeOnce）
 
 - 每个 hostKey 维护一个后台 runner（按 `pollIntervalMs` 周期触发，或被唤醒）。
-- runner 每轮执行一次 `probeOnce(hostKey)`：
-  - 仅在 **当前有 in-flight waiter 的 flows** 中做选择（不会考虑 detached/grace-only flows）。
-  - `flowStore` 仍以 `byToken` 作为唯一真源；同时在同一把 `flowStore.mu` 锁内维护派生索引 `hostInFlightTokens(hostKey -> token set)`，用于把 host 维度候选查找从全表扫描降为 host 局部遍历。
-  - `hostInFlightTokens` 只在 waiter 附着状态变更时更新（attach、detach，以及 `removeFlow` 在 waiter 仍附着时触发的移除）；`listInFlightByHost` 遍历 host bucket 时会机会性清理 stale token（例如 flow 已删除、waiter 已解绑、或 flow 过期），保证索引自愈且不引入兼容层。
-  - 使用 in-flight scheduler 按 `siteBucket -> ipBucket -> flow(LocalVT)` 的层级做公平选择。
-  - 对选中的 flow 调用数据库 `TryAcquire`：
-    - `ACQUIRED`：向 waiter 投递 `granted + slotToken`，并删除 flow。
-    - `THROTTLED`：写入本地 host throttle cache，并向同 host 的 in-flight flows 快速收敛投递 `throttled`。
-    - `IP_TOO_MANY`：对该 bucket 设置 deny window（基于 `ipCooldownSeconds`）。
-    - `WAIT/QUEUE_FULL/其他`：增加 waitCount，用于后续调度权重（当前实现为轻量化权重）。
+- runner 每轮执行一次 `probeOnce(hostKey)`，仅在 **当前有 in-flight waiter 的 flows** 中做选择（不会考虑 detached/grace-only flows）。
+- `flowStore` 仍以 `byToken` 作为唯一真源；同时在同一把 `flowStore.mu` 锁内维护派生索引 `hostInFlightTokens(hostKey -> token set)`，用于把 host 维度候选查找从全表扫描降为 host 局部遍历。
+- `hostInFlightTokens` 只在 waiter 附着状态变更时更新（attach、detach，以及 `removeFlow` 在 waiter 仍附着时触发的移除）；`listInFlightByHost` 遍历 host bucket 时会机会性清理 stale token（例如 flow 已删除、waiter 已解绑、或 flow 过期），保证索引自愈且不引入兼容层。
+
+### 2.1 单一堆化调度引擎（单选/批选共用）
+
+- 调度器采用单一堆化选择引擎，核心路径为 `pickBatchLocked(...)`，由 `PickNextInFlight(...)` 与 `PickNextInFlightBatch(...)` 共同复用。
+- 层级保持为 `siteBucket -> ipBucket -> flow(LocalVT)`，并且批选内保证不重复 token。
+- flow 级 tie-break 顺序固定为：`LocalVT -> CreatedAt -> Token`。
+- 该重构为 hard cutover：旧选择路径（如 `chooseLocked`、`pickNextInFlightExcluding`）已移除，不存在 fallback/legacy 分支。
+
+### 2.2 有界并发微批探测 + 顺序提交
+
+- `probeOnce` 先批量选出候选，再按 `maxProbeParallel` 切分为多个微批并并发调用 backend `TryAcquireBatch`（`probeBatchesInParallel`）。
+- 结果提交顺序按子批次 `start` 下标严格顺序 apply（即使返回先后不同），确保状态更新与 waiter 投递行为可复现且确定。
+- 子批次失败只惩罚失败子批次（对应 flow 增加 waitCount），不连带惩罚同 tick 内成功子批次。
+- 不再保留“单次串行单大批”旧探测路径。
+
+### 2.3 Probe 调用超时策略（收紧窗口）
+
+- probe 调用超时由 `computeProbeCallTimeout(pollInterval)` 统一计算。
+- 超时窗口被限制在 `[300ms, 900ms]`：低于下界时上调到 300ms，高于上界时下压到 900ms。
+- 该策略替代旧的长阻塞窗口，避免单个慢 probe 长时间占用一个 tick。
+
+### 2.4 可验证性与性能基线
+
+- 调度 clean-cutover 契约由单测覆盖（例如 `TestPickSingleMatchesBatchOfOne`、`TestSchedulerEngineNoDuplicateAcrossBatch`）。
+- 探测并发与顺序提交契约由单测覆盖（例如 `TestProbeOnceParallelMicroBatchReducesHOL`、`TestProbeOnceParallelMicroBatchAppliesSubBatchesInStartOrder`）。
+- 仓库包含高 backlog 调度基准：`BenchmarkPickNextInFlightBatch_HeapEngine_Backlog`（`slot-handler/internal/slothandler/fq_scheduler_benchmark_test.go`）。
+- 复现实测基准命令：`go -C ./slot-handler test ./internal/slothandler -run '^$' -bench 'BenchmarkPickNextInFlightBatch_HeapEngine_Backlog' -benchmem -count=3`。
 
 ---
 

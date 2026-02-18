@@ -2,6 +2,7 @@ package slothandler
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +33,111 @@ type sequenceBackend struct {
 
 type batchBackend struct {
 	called bool
+}
+
+type holBlockingBackend struct {
+	mu          sync.Mutex
+	seenBatches [][]string
+	slowStarted chan struct{}
+	slowDone    chan struct{}
+	slowRelease chan struct{}
+	fastDone    chan struct{}
+	startOnce   sync.Once
+	doneOnce    sync.Once
+	fastOnce    sync.Once
+}
+
+type partialFailureBackend struct{}
+
+func (b *holBlockingBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+	if b != nil {
+		ips := make([]string, 0, len(reqs))
+		for _, req := range reqs {
+			ips = append(ips, req.IPBucket)
+		}
+		b.mu.Lock()
+		b.seenBatches = append(b.seenBatches, ips)
+		b.mu.Unlock()
+	}
+
+	hasSlow := false
+	for _, req := range reqs {
+		if strings.Contains(req.IPBucket, "slow-") {
+			hasSlow = true
+			break
+		}
+	}
+	if hasSlow {
+		b.startOnce.Do(func() {
+			if b.slowStarted != nil {
+				close(b.slowStarted)
+			}
+		})
+		select {
+		case <-ctx.Done():
+			b.doneOnce.Do(func() {
+				if b.slowDone != nil {
+					close(b.slowDone)
+				}
+			})
+			return nil, ctx.Err()
+		case <-b.slowRelease:
+			b.doneOnce.Do(func() {
+				if b.slowDone != nil {
+					close(b.slowDone)
+				}
+			})
+		}
+	}
+
+	if b.fastDone != nil {
+		hasFast := false
+		for _, req := range reqs {
+			if strings.Contains(req.IPBucket, "fast-") {
+				hasFast = true
+				break
+			}
+		}
+		if hasFast && !hasSlow {
+			b.fastOnce.Do(func() {
+				close(b.fastDone)
+			})
+		}
+	}
+
+	results := make([]*tryAcquireResult, len(reqs))
+	for i, req := range reqs {
+		if strings.Contains(req.IPBucket, "fast-") {
+			results[i] = &tryAcquireResult{status: "ACQUIRED", slotToken: "slot-" + req.IPBucket}
+			continue
+		}
+		results[i] = &tryAcquireResult{status: "WAIT"}
+	}
+	return results, nil
+}
+
+func (b *holBlockingBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }
+
+func (b *partialFailureBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+	for _, req := range reqs {
+		if strings.HasPrefix(req.IPBucket, "err-") {
+			return nil, context.DeadlineExceeded
+		}
+	}
+
+	results := make([]*tryAcquireResult, len(reqs))
+	for i, req := range reqs {
+		if strings.HasPrefix(req.IPBucket, "fast-") {
+			results[i] = &tryAcquireResult{status: "ACQUIRED", slotToken: "slot-" + req.IPBucket}
+			continue
+		}
+		results[i] = &tryAcquireResult{status: "WAIT"}
+	}
+	return results, nil
+}
+
+func (b *partialFailureBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	return nil
 }
 
 func (b *batchBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
@@ -479,5 +585,275 @@ func TestTryAcquireBatchUsesBackend(t *testing.T) {
 	}
 	if len(res) != len(reqs) {
 		t.Fatalf("expected %d results, got %d", len(reqs), len(res))
+	}
+}
+
+func TestProbeCallTimeoutUsesTightBoundedWindow(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval time.Duration
+		expect   time.Duration
+	}{
+		{name: "non-positive clamps to lower bound", interval: 0, expect: 300 * time.Millisecond},
+		{name: "negative clamps to lower bound", interval: -100 * time.Millisecond, expect: 300 * time.Millisecond},
+		{name: "below lower bound", interval: 120 * time.Millisecond, expect: 300 * time.Millisecond},
+		{name: "middle follows interval", interval: 500 * time.Millisecond, expect: 500 * time.Millisecond},
+		{name: "upper bound exact", interval: 900 * time.Millisecond, expect: 900 * time.Millisecond},
+		{name: "above upper bound", interval: 2 * time.Second, expect: 900 * time.Millisecond},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := computeProbeCallTimeout(tt.interval)
+			if got != tt.expect {
+				t.Fatalf("computeProbeCallTimeout(%s) = %s, want %s", tt.interval, got, tt.expect)
+			}
+			if got < 300*time.Millisecond || got > 900*time.Millisecond {
+				t.Fatalf("computeProbeCallTimeout(%s) = %s, want bounded in [300ms,900ms]", tt.interval, got)
+			}
+		})
+	}
+}
+
+func TestProbeOnceParallelMicroBatchReducesHOL(t *testing.T) {
+	backend := &holBlockingBackend{
+		slowStarted: make(chan struct{}),
+		slowDone:    make(chan struct{}),
+		slowRelease: make(chan struct{}),
+		fastDone:    make(chan struct{}),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           4,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+	flows := []struct {
+		ip     string
+		respCh chan *AcquireResponse
+	}{
+		{ip: "a-fast-1", respCh: make(chan *AcquireResponse, 1)},
+		{ip: "m-fast-2", respCh: make(chan *AcquireResponse, 1)},
+		{ip: "y-slow-1", respCh: make(chan *AcquireResponse, 1)},
+		{ip: "z-slow-2", respCh: make(chan *AcquireResponse, 1)},
+	}
+
+	for _, f := range flows {
+		tok := store.newFlow("h1", "example.com", f.ip, "s1")
+		if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: f.respCh}, now); !ok || err != nil {
+			t.Fatalf("attachWaiter ip=%q ok=%t err=%v", f.ip, ok, err)
+		}
+	}
+
+	// Keep 4 in-flight waiters but only probe one fast and one slow bucket this tick.
+	sched := s.getOrCreateFlowScheduler("h1")
+	sched.setBucketDenyUntil("s1", "m-fast-2", now.Add(time.Minute))
+	sched.setBucketDenyUntil("s1", "z-slow-2", now.Add(time.Minute))
+
+	inFlight := store.listInFlightByHost("h1", now)
+	if len(inFlight) != 4 {
+		t.Fatalf("expected exactly 4 in-flight waiters for probe, got %d", len(inFlight))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = s.probeOnce(context.Background(), "h1", now)
+		close(done)
+	}()
+
+	select {
+	case <-backend.slowStarted:
+		// expected
+	case <-time.After(time.Second):
+		backend.mu.Lock()
+		seen := append([][]string(nil), backend.seenBatches...)
+		backend.mu.Unlock()
+		t.Fatalf("expected slow micro-batch path to be exercised, seen batches=%v", seen)
+	}
+
+	select {
+	case <-backend.fastDone:
+	case <-time.After(time.Second):
+		t.Fatalf("expected fast micro-batch backend call to finish while slow sibling is blocked")
+	}
+
+	select {
+	case resp := <-flows[0].respCh:
+		if resp == nil || resp.Result != "granted" {
+			t.Fatalf("unexpected fast flow response: %+v", resp)
+		}
+		select {
+		case <-backend.slowDone:
+			t.Fatalf("expected fast micro-batch result before slow sibling completes")
+		default:
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("expected fast micro-batch result before slow sibling completes")
+	}
+
+	select {
+	case <-done:
+		t.Fatalf("expected probeOnce to remain pending until slow sub-batch completes")
+	default:
+	}
+
+	close(backend.slowRelease)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected probeOnce to return after slow release")
+	}
+}
+
+func TestProbeOnceParallelMicroBatchAppliesSubBatchesInStartOrder(t *testing.T) {
+	backend := &holBlockingBackend{
+		slowStarted: make(chan struct{}),
+		slowDone:    make(chan struct{}),
+		slowRelease: make(chan struct{}),
+		fastDone:    make(chan struct{}),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           4,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	deliveryAttempted := make(chan struct{}, 1)
+	store.deliverToWaiterBeforeSendHook = func() {
+		select {
+		case deliveryAttempted <- struct{}{}:
+		default:
+		}
+	}
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	slowTok := store.newFlow("h1", "example.com", "a-slow-1", "s1")
+	slowCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(slowTok, &fqWaiter{resCh: slowCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter slow-flow ok=%t err=%v", ok, err)
+	}
+
+	fastTok := store.newFlow("h1", "example.com", "z-fast-1", "s1")
+	fastCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(fastTok, &fqWaiter{resCh: fastCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter fast-flow ok=%t err=%v", ok, err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = s.probeOnce(context.Background(), "h1", now)
+		close(done)
+	}()
+
+	select {
+	case <-backend.slowStarted:
+	case <-time.After(time.Second):
+		t.Fatalf("expected first sub-batch to block on slow flow")
+	}
+
+	select {
+	case <-backend.fastDone:
+	case <-time.After(time.Second):
+		t.Fatalf("expected later sub-batch backend call to finish before slow release")
+	}
+
+	select {
+	case <-deliveryAttempted:
+		t.Fatalf("expected no waiter delivery attempt before slow sub-batch release")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(backend.slowRelease)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected probeOnce to return after slow release")
+	}
+
+	select {
+	case got := <-fastCh:
+		if got == nil || got.Result != "granted" || got.QueryToken != fastTok {
+			t.Fatalf("unexpected fast flow response after ordered apply: %+v", got)
+		}
+	default:
+		t.Fatalf("expected fast flow to be granted once prior sub-batch completed")
+	}
+}
+
+func TestProbeOncePartialBatchFailureOnlyPenalizesFailedSubBatch(t *testing.T) {
+	backend := &partialFailureBackend{}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           4,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC)
+	store := s.flowStore
+
+	errTok := store.newFlow("h1", "example.com", "err-1", "s1")
+	errCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(errTok, &fqWaiter{resCh: errCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter err-flow ok=%t err=%v", ok, err)
+	}
+
+	fastTok := store.newFlow("h1", "example.com", "fast-1", "s1")
+	fastCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(fastTok, &fqWaiter{resCh: fastCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter fast-flow ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+
+	select {
+	case got := <-fastCh:
+		if got == nil || got.Result != "granted" || got.QueryToken != fastTok {
+			t.Fatalf("unexpected fast flow response: %+v", got)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("expected fast sub-batch to grant despite failed sibling sub-batch")
+	}
+
+	select {
+	case got := <-errCh:
+		t.Fatalf("expected failed sub-batch flow to remain waiting, got %+v", got)
+	default:
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	_, failedBucket := sched.getOrInitStates("s1", "err-1")
+	_, fastBucket := sched.getOrInitStates("s1", "fast-1")
+	if failedBucket.WaitCount != 1 {
+		t.Fatalf("expected failed sub-batch wait count bump to 1, got %d", failedBucket.WaitCount)
+	}
+	if fastBucket.WaitCount != 0 {
+		t.Fatalf("expected successful sub-batch wait count unchanged, got %d", fastBucket.WaitCount)
 	}
 }

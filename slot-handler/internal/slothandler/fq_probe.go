@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -14,6 +15,13 @@ type fqHostProbeRunner struct {
 }
 
 type probeMode string
+
+type probeSubBatchResult struct {
+	start int
+	reqs  int
+	res   []*tryAcquireResult
+	err   error
+}
 
 const (
 	probeModeSteady probeMode = "steady"
@@ -416,6 +424,20 @@ func minInt(values ...int) int {
 	return min
 }
 
+func computeProbeCallTimeout(interval time.Duration) time.Duration {
+	timeout := interval
+	if timeout <= 0 {
+		timeout = 300 * time.Millisecond
+	}
+	if timeout < 300*time.Millisecond {
+		timeout = 300 * time.Millisecond
+	}
+	if timeout > 900*time.Millisecond {
+		timeout = 900 * time.Millisecond
+	}
+	return timeout
+}
+
 func (r *fqHostProbeRunner) run(s *server) {
 	if r == nil || s == nil {
 		return
@@ -468,6 +490,67 @@ func (s *server) tryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]
 		return nil, nil
 	}
 	return backend.TryAcquireBatch(ctx, reqs)
+}
+
+func (s *server) probeBatchesInParallel(ctx context.Context, reqs []AcquireRequest, parallel int, timeout time.Duration) <-chan probeSubBatchResult {
+	if s == nil || len(reqs) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if parallel <= 0 {
+		parallel = 1
+	}
+	if parallel > len(reqs) {
+		parallel = len(reqs)
+	}
+
+	subBatchSize := (len(reqs) + parallel - 1) / parallel
+	if subBatchSize < 1 {
+		subBatchSize = 1
+	}
+
+	batches := (len(reqs) + subBatchSize - 1) / subBatchSize
+	resultCh := make(chan probeSubBatchResult, batches)
+	var wg sync.WaitGroup
+
+	for start := 0; start < len(reqs); start += subBatchSize {
+		end := start + subBatchSize
+		if end > len(reqs) {
+			end = len(reqs)
+		}
+		startIdx := start
+		reqCount := end - start
+		subReqs := reqs[start:end]
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			subCtx := ctx
+			cancel := func() {}
+			if timeout > 0 {
+				subCtx, cancel = context.WithTimeout(ctx, timeout)
+			}
+			defer cancel()
+
+			res, err := s.tryAcquireBatch(subCtx, subReqs)
+			resultCh <- probeSubBatchResult{
+				start: startIdx,
+				reqs:  reqCount,
+				res:   res,
+				err:   err,
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	return resultCh
 }
 
 // probeOnce performs one scheduling decision for the given host.
@@ -542,107 +625,156 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	}
 
 	// Probe backend with bounded runtime. Parent context is canceled when runner stops.
-	interval := cfg.FairQueue.pollInterval()
-	timeout := interval
-	if timeout < 500*time.Millisecond {
-		timeout = 500 * time.Millisecond
-	}
-	if timeout > 3*time.Second {
-		timeout = 3 * time.Second
-	}
-	ctxProbe, cancel := context.WithTimeout(parentCtx, timeout)
-	defer cancel()
-
+	timeout := computeProbeCallTimeout(cfg.FairQueue.pollInterval())
 	reqs := make([]AcquireRequest, 0, len(batch))
 	for _, snap := range batch {
 		req := s.buildAcquireRequest(cfg, snap.Hostname, snap.HostnameHash, snap.IPBucket, snap.SiteBucket, 0, now)
 		reqs = append(reqs, req)
 	}
-	results, err := s.tryAcquireBatch(ctxProbe, reqs)
-	if err != nil || len(results) != len(batch) {
+
+	resultCh := s.probeBatchesInParallel(parentCtx, reqs, cfg.FairQueue.maxProbeParallel(), timeout)
+	if resultCh == nil {
 		for _, snap := range batch {
 			sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
 		}
 		return true
 	}
 
-	for i, snap := range batch {
-		res := results[i]
-		if res == nil {
-			sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
-			continue
+	applySubBatch := func(sub probeSubBatchResult) bool {
+		start := sub.start
+		if start < 0 || start >= len(batch) {
+			return false
 		}
-		status := strings.ToUpper(strings.TrimSpace(res.status))
-		if status == "THROTTLED" {
-			ra := res.throttleRetryAfter
-			if ra <= 0 {
-				ra = 1
-			}
-			s.setThrottleState(hostKey, now, res.throttleCode, ra)
-			// Fast convergence: deliver throttled to all current in-flight waiters.
-			inFlight2 := store.listInFlightByHost(hostKey, now)
-			for _, snap2 := range inFlight2 {
-				tok := snap2.Token
-				if tok == "" {
-					continue
-				}
-				s.incrementMetric("throttled")
-				_ = store.deliverToWaiter(tok, &AcquireResponse{
-					Result:       "throttled",
-					QueryToken:   tok,
-					ThrottleCode: res.throttleCode,
-					ThrottleWait: ra,
-					Reason:       "try_acquire_throttled",
-				})
-				store.deleteFlow(tok)
-			}
-			return true
+		end := start + sub.reqs
+		if end > len(batch) {
+			end = len(batch)
+		}
+		if end <= start {
+			return false
 		}
 
-		switch status {
-		case "ACQUIRED":
-			sched.halveWaitCount(snap.SiteBucket, snap.IPBucket)
-			s.incrementMetric("granted")
-			siteKey := strings.TrimSpace(snap.SiteBucket)
-			if siteKey == "" {
-				siteKey = "unknown"
+		if sub.err != nil || len(sub.res) != (end-start) {
+			for _, snap := range batch[start:end] {
+				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
 			}
-			if s.activeSlots != nil {
-				ttl := time.Duration(cfg.FairQueue.zombieTimeoutSeconds()) * time.Second
-				s.activeSlots.AddLease(res.slotToken, hostKey, siteKey, ttl, now)
-			}
-			delivered := store.deliverToWaiter(snap.Token, &AcquireResponse{
-				Result:     "granted",
-				QueryToken: snap.Token,
-				SlotToken:  res.slotToken,
-			})
-			if !delivered {
-				releaseReq := ReleaseRequest{
-					Hostname:      snap.Hostname,
-					HostnameHash:  snap.HostnameHash,
-					IPBucket:      snap.IPBucket,
-					SiteBucket:    snap.SiteBucket,
-					SlotToken:     res.slotToken,
-					HitUpstreamAt: now.UnixMilli(),
-					Now:           now.UnixMilli(),
-				}
-				go s.releaseSlot(context.Background(), releaseReq)
-			}
-			store.deleteFlow(snap.Token)
-		case "IP_TOO_MANY":
-			// Structural failure: deny + down-weight (do NOT increase WaitCount).
-			sched.halveWaitCount(snap.SiteBucket, snap.IPBucket)
-			denySeconds := cfg.FairQueue.cooldownSeconds()
-			if denySeconds <= 0 {
-				denySeconds = 3
-			}
-			sched.setBucketDenyUntil(snap.SiteBucket, snap.IPBucket, now.Add(time.Duration(denySeconds)*time.Second))
-		case "WAIT", "QUEUE_FULL":
-			sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
-		default:
-			// Treat unknown / non-structural statuses as contention.
-			sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+			return false
 		}
+
+		for i, snap := range batch[start:end] {
+			res := sub.res[i]
+			if res == nil {
+				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+				continue
+			}
+			status := strings.ToUpper(strings.TrimSpace(res.status))
+			if status == "THROTTLED" {
+				ra := res.throttleRetryAfter
+				if ra <= 0 {
+					ra = 1
+				}
+				s.setThrottleState(hostKey, now, res.throttleCode, ra)
+				// Fast convergence: deliver throttled to all current in-flight waiters.
+				inFlight2 := store.listInFlightByHost(hostKey, now)
+				for _, snap2 := range inFlight2 {
+					tok := snap2.Token
+					if tok == "" {
+						continue
+					}
+					s.incrementMetric("throttled")
+					_ = store.deliverToWaiter(tok, &AcquireResponse{
+						Result:       "throttled",
+						QueryToken:   tok,
+						ThrottleCode: res.throttleCode,
+						ThrottleWait: ra,
+						Reason:       "try_acquire_throttled",
+					})
+					store.deleteFlow(tok)
+				}
+				return true
+			}
+
+			switch status {
+			case "ACQUIRED":
+				sched.halveWaitCount(snap.SiteBucket, snap.IPBucket)
+				s.incrementMetric("granted")
+				siteKey := strings.TrimSpace(snap.SiteBucket)
+				if siteKey == "" {
+					siteKey = "unknown"
+				}
+				if s.activeSlots != nil {
+					ttl := time.Duration(cfg.FairQueue.zombieTimeoutSeconds()) * time.Second
+					s.activeSlots.AddLease(res.slotToken, hostKey, siteKey, ttl, now)
+				}
+				delivered := store.deliverToWaiter(snap.Token, &AcquireResponse{
+					Result:     "granted",
+					QueryToken: snap.Token,
+					SlotToken:  res.slotToken,
+				})
+				if !delivered {
+					releaseReq := ReleaseRequest{
+						Hostname:      snap.Hostname,
+						HostnameHash:  snap.HostnameHash,
+						IPBucket:      snap.IPBucket,
+						SiteBucket:    snap.SiteBucket,
+						SlotToken:     res.slotToken,
+						HitUpstreamAt: now.UnixMilli(),
+						Now:           now.UnixMilli(),
+					}
+					go s.releaseSlot(context.Background(), releaseReq)
+				}
+				store.deleteFlow(snap.Token)
+			case "IP_TOO_MANY":
+				// Structural failure: deny + down-weight (do NOT increase WaitCount).
+				sched.halveWaitCount(snap.SiteBucket, snap.IPBucket)
+				denySeconds := cfg.FairQueue.cooldownSeconds()
+				if denySeconds <= 0 {
+					denySeconds = 3
+				}
+				sched.setBucketDenyUntil(snap.SiteBucket, snap.IPBucket, now.Add(time.Duration(denySeconds)*time.Second))
+			case "WAIT", "QUEUE_FULL":
+				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+			default:
+				// Treat unknown / non-structural statuses as contention.
+				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+			}
+		}
+		return false
+	}
+
+	pending := make(map[int]probeSubBatchResult)
+	nextStart := 0
+	for nextStart < len(batch) {
+		if sub, ok := pending[nextStart]; ok {
+			delete(pending, nextStart)
+			if applySubBatch(sub) {
+				return true
+			}
+			step := sub.reqs
+			if step <= 0 {
+				step = 1
+			}
+			nextStart += step
+			if nextStart < 0 || nextStart > len(batch) {
+				nextStart = len(batch)
+			}
+			continue
+		}
+
+		sub, ok := <-resultCh
+		if !ok {
+			// Missing expected sub-batch result: penalize remaining range conservatively.
+			for _, snap := range batch[nextStart:] {
+				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+			}
+			break
+		}
+		if sub.start < 0 || sub.start >= len(batch) {
+			continue
+		}
+		if _, exists := pending[sub.start]; exists {
+			continue
+		}
+		pending[sub.start] = sub
 	}
 
 	hostActive := 0

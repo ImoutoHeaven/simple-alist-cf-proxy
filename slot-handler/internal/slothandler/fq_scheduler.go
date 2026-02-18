@@ -1,13 +1,14 @@
 package slothandler
 
 import (
+	"container/heap"
 	"sync"
 	"time"
 )
 
 // fqHostFlowScheduler keeps per-host scheduling state for flow-based fairness.
 //
-// Task 3 scope:
+// Scheduler scope:
 // - Only choose among flows that currently have an attached in-flight waiter.
 // - Preserve the scheduling hierarchy: siteBucket -> ipBucket -> flow(LocalVT).
 // - Keep VirtualTime advancement skeleton (weights are treated as 1 for now).
@@ -28,6 +29,128 @@ type fqBucketFlowState struct {
 	VirtualTime float64
 	WaitCount   int
 	DenyUntil   time.Time
+}
+
+type flowMinHeap []fqFlowSnapshot
+
+func (h flowMinHeap) Len() int { return len(h) }
+
+func (h flowMinHeap) Less(i, j int) bool {
+	if h[i].LocalVT != h[j].LocalVT {
+		return h[i].LocalVT < h[j].LocalVT
+	}
+	if !h[i].CreatedAt.Equal(h[j].CreatedAt) {
+		return h[i].CreatedAt.Before(h[j].CreatedAt)
+	}
+	return h[i].Token < h[j].Token
+}
+
+func (h flowMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *flowMinHeap) Push(x any) {
+	*h = append(*h, x.(fqFlowSnapshot))
+}
+
+func (h *flowMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+type bucketNode struct {
+	key   string
+	state *fqBucketFlowState
+	flows flowMinHeap
+}
+
+type bucketMinHeap []*bucketNode
+
+func (h bucketMinHeap) Len() int { return len(h) }
+
+func (h bucketMinHeap) Less(i, j int) bool {
+	ivt := 0.0
+	jvt := 0.0
+	if h[i] != nil && h[i].state != nil {
+		ivt = h[i].state.VirtualTime
+	}
+	if h[j] != nil && h[j].state != nil {
+		jvt = h[j].state.VirtualTime
+	}
+	if ivt != jvt {
+		return ivt < jvt
+	}
+	ik := ""
+	jk := ""
+	if h[i] != nil {
+		ik = h[i].key
+	}
+	if h[j] != nil {
+		jk = h[j].key
+	}
+	return ik < jk
+}
+
+func (h bucketMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *bucketMinHeap) Push(x any) {
+	*h = append(*h, x.(*bucketNode))
+}
+
+func (h *bucketMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+type siteNode struct {
+	key     string
+	state   *fqSiteFlowState
+	buckets bucketMinHeap
+}
+
+type siteMinHeap []*siteNode
+
+func (h siteMinHeap) Len() int { return len(h) }
+
+func (h siteMinHeap) Less(i, j int) bool {
+	ivt := 0.0
+	jvt := 0.0
+	if h[i] != nil && h[i].state != nil {
+		ivt = h[i].state.VirtualTime
+	}
+	if h[j] != nil && h[j].state != nil {
+		jvt = h[j].state.VirtualTime
+	}
+	if ivt != jvt {
+		return ivt < jvt
+	}
+	ik := ""
+	jk := ""
+	if h[i] != nil {
+		ik = h[i].key
+	}
+	if h[j] != nil {
+		jk = h[j].key
+	}
+	return ik < jk
+}
+
+func (h siteMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *siteMinHeap) Push(x any) {
+	*h = append(*h, x.(*siteNode))
+}
+
+func (h *siteMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 func newFQHostFlowScheduler() *fqHostFlowScheduler {
@@ -69,7 +192,18 @@ func (h *fqHostFlowScheduler) getOrInitBucket(site *fqSiteFlowState, bucketKey s
 // Selection MUST be based only on the in-flight set (flows with waiter != nil).
 // It does not use time-based heuristics like active windows.
 func (h *fqHostFlowScheduler) PickNextInFlight(store *flowStore, hostKey string, now time.Time) (fqFlowSnapshot, bool) {
-	return h.pickNextInFlightExcluding(store, hostKey, now, nil)
+	if h == nil || store == nil {
+		return fqFlowSnapshot{}, false
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	picks := h.pickBatchLocked(store, hostKey, now, 1)
+	if len(picks) == 0 {
+		return fqFlowSnapshot{}, false
+	}
+	return picks[0], true
 }
 
 // PickNextInFlightBatch selects up to n unique in-flight flows using the same wall-clock now.
@@ -82,142 +216,157 @@ func (h *fqHostFlowScheduler) PickNextInFlightBatch(store *flowStore, hostKey st
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	return h.pickBatchLocked(store, hostKey, now, n)
+}
+
+func (h *fqHostFlowScheduler) pickBatchLocked(store *flowStore, hostKey string, now time.Time, n int) []fqFlowSnapshot {
+	if h == nil || store == nil || n <= 0 {
+		return nil
+	}
+
 	cands := store.listInFlightByHost(hostKey, now)
 	h.pruneIdleStatesLocked(cands, now)
 	if len(cands) == 0 {
 		return nil
 	}
 
-	// Ensure site/bucket states exist for all current candidates.
+	type siteBuildNode struct {
+		site    *siteNode
+		buckets map[string]*bucketNode
+	}
+
+	sitesByKey := make(map[string]*siteBuildNode)
+	active := make(map[string]fqFlowSnapshot, len(cands))
+
 	for _, f := range cands {
-		site := h.getOrInitSite(f.SiteBucket)
-		_ = h.getOrInitBucket(site, f.IPBucket)
-	}
-
-	res := make([]fqFlowSnapshot, 0, n)
-	for i := 0; i < n; i++ {
-		for len(cands) > 0 {
-			chosenSite, chosenBucket, chosenIdx := h.chooseLocked(cands, now)
-			if chosenIdx < 0 || chosenSite == nil || chosenBucket == nil {
-				return res
-			}
-
-			pick := cands[chosenIdx]
-			selected, ok := store.trySelectInFlight(pick.Token, hostKey, now)
-			if !ok {
-				// Candidate became ineligible; drop it and retry this pick.
-				cands[chosenIdx] = cands[len(cands)-1]
-				cands = cands[:len(cands)-1]
-				continue
-			}
-
-			// Weighted virtual time advancement: higher WaitCount => higher weight => slower VT increase.
-			siteW := 1 + chosenSite.WaitCount
-			if siteW < 1 {
-				siteW = 1
-			}
-			bucketW := 1 + chosenBucket.WaitCount
-			if bucketW < 1 {
-				bucketW = 1
-			}
-			chosenSite.VirtualTime += 1.0 / float64(siteW)
-			chosenBucket.VirtualTime += 1.0 / float64(bucketW)
-
-			if chosenSite.VirtualTime > 1e9 {
-				h.normalizeSitesLocked(cands)
-			}
-			if chosenBucket.VirtualTime > 1e9 {
-				h.normalizeBucketsLocked(chosenSite, cands)
-			}
-
-			// Remove selected candidate so batch picks remain unique.
-			cands[chosenIdx] = cands[len(cands)-1]
-			cands = cands[:len(cands)-1]
-			res = append(res, selected)
-			break
+		siteState := h.getOrInitSite(f.SiteBucket)
+		bucketState := h.getOrInitBucket(siteState, f.IPBucket)
+		if siteState == nil || bucketState == nil {
+			continue
 		}
-		if len(cands) == 0 {
-			break
-		}
-	}
-	return res
-}
-
-func (h *fqHostFlowScheduler) pickNextInFlightExcluding(store *flowStore, hostKey string, now time.Time, exclude map[string]struct{}) (fqFlowSnapshot, bool) {
-	if h == nil || store == nil {
-		return fqFlowSnapshot{}, false
-	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	cands := store.listInFlightByHost(hostKey, now)
-	h.pruneIdleStatesLocked(cands, now)
-	if len(cands) == 0 {
-		return fqFlowSnapshot{}, false
-	}
-	if len(exclude) > 0 {
-		filtered := cands[:0]
-		for _, f := range cands {
-			if _, skip := exclude[f.Token]; skip {
-				continue
-			}
-			filtered = append(filtered, f)
-		}
-		cands = filtered
-		if len(cands) == 0 {
-			return fqFlowSnapshot{}, false
-		}
-	}
-
-	// Ensure site/bucket states exist for all current candidates.
-	// We keep VirtualTime state even if a site/bucket becomes temporarily empty.
-	for _, f := range cands {
-		site := h.getOrInitSite(f.SiteBucket)
-		_ = h.getOrInitBucket(site, f.IPBucket)
-	}
-
-	// Selection must be consistent with in-flight reality. We may race with detach/expiry;
-	// retry within this pick without advancing VirtualTime when selection fails.
-	for len(cands) > 0 {
-		chosenSite, chosenBucket, chosenIdx := h.chooseLocked(cands, now)
-		if chosenIdx < 0 || chosenSite == nil || chosenBucket == nil {
-			return fqFlowSnapshot{}, false
-		}
-		pick := cands[chosenIdx]
-
-		// Commit selection atomically in the store.
-		selected, ok := store.trySelectInFlight(pick.Token, hostKey, now)
-		if !ok {
-			// Remove this candidate and retry.
-			cands[chosenIdx] = cands[len(cands)-1]
-			cands = cands[:len(cands)-1]
+		if !bucketState.DenyUntil.IsZero() && now.Before(bucketState.DenyUntil) {
 			continue
 		}
 
-		// Weighted virtual time advancement: higher WaitCount => higher weight => slower VT increase.
-		siteW := 1 + chosenSite.WaitCount
-		if siteW < 1 {
-			siteW = 1
+		sb := sitesByKey[siteState.Key]
+		if sb == nil {
+			sb = &siteBuildNode{
+				site:    &siteNode{key: siteState.Key, state: siteState},
+				buckets: map[string]*bucketNode{},
+			}
+			sitesByKey[siteState.Key] = sb
 		}
-		bucketW := 1 + chosenBucket.WaitCount
-		if bucketW < 1 {
-			bucketW = 1
-		}
-		chosenSite.VirtualTime += 1.0 / float64(siteW)
-		chosenBucket.VirtualTime += 1.0 / float64(bucketW)
 
-		// Prevent pathological float growth; normalize only within active sets.
-		if chosenSite.VirtualTime > 1e9 {
-			h.normalizeSitesLocked(cands)
+		bn := sb.buckets[bucketState.Key]
+		if bn == nil {
+			bn = &bucketNode{key: bucketState.Key, state: bucketState}
+			sb.buckets[bucketState.Key] = bn
 		}
-		if chosenBucket.VirtualTime > 1e9 {
-			h.normalizeBucketsLocked(chosenSite, cands)
-		}
-		return selected, true
+		heap.Push(&bn.flows, f)
+		active[f.Token] = f
 	}
 
-	return fqFlowSnapshot{}, false
+	var sites siteMinHeap
+	for _, sb := range sitesByKey {
+		for _, bn := range sb.buckets {
+			if bn.flows.Len() == 0 {
+				continue
+			}
+			heap.Push(&sb.site.buckets, bn)
+		}
+		if sb.site.buckets.Len() > 0 {
+			heap.Push(&sites, sb.site)
+		}
+	}
+
+	if sites.Len() == 0 {
+		return nil
+	}
+
+	res := make([]fqFlowSnapshot, 0, n)
+	needsSiteNormalization := false
+	bucketNormalizationSites := map[string]*fqSiteFlowState{}
+	activeSnapshots := func() []fqFlowSnapshot {
+		if len(active) == 0 {
+			return nil
+		}
+		out := make([]fqFlowSnapshot, 0, len(active))
+		for _, snap := range active {
+			out = append(out, snap)
+		}
+		return out
+	}
+
+	for len(res) < n && sites.Len() > 0 {
+		sn := heap.Pop(&sites).(*siteNode)
+		if sn == nil || sn.buckets.Len() == 0 {
+			continue
+		}
+
+		bn := heap.Pop(&sn.buckets).(*bucketNode)
+		if bn == nil {
+			if sn.buckets.Len() > 0 {
+				heap.Push(&sites, sn)
+			}
+			continue
+		}
+
+		picked := false
+		for bn.flows.Len() > 0 {
+			pick := heap.Pop(&bn.flows).(fqFlowSnapshot)
+			delete(active, pick.Token)
+
+			selected, ok := store.trySelectInFlight(pick.Token, hostKey, now)
+			if !ok {
+				continue
+			}
+
+			siteW := 1 + sn.state.WaitCount
+			if siteW < 1 {
+				siteW = 1
+			}
+			bucketW := 1 + bn.state.WaitCount
+			if bucketW < 1 {
+				bucketW = 1
+			}
+			sn.state.VirtualTime += 1.0 / float64(siteW)
+			bn.state.VirtualTime += 1.0 / float64(bucketW)
+
+			if sn.state.VirtualTime > 1e9 {
+				needsSiteNormalization = true
+			}
+			if bn.state.VirtualTime > 1e9 {
+				bucketNormalizationSites[sn.key] = sn.state
+			}
+
+			res = append(res, selected)
+			picked = true
+			break
+		}
+
+		if bn.flows.Len() > 0 {
+			heap.Push(&sn.buckets, bn)
+		}
+		if sn.buckets.Len() > 0 {
+			heap.Push(&sites, sn)
+		}
+
+		if !picked {
+			continue
+		}
+	}
+
+	if needsSiteNormalization || len(bucketNormalizationSites) > 0 {
+		remaining := activeSnapshots()
+		if needsSiteNormalization {
+			h.normalizeSitesLocked(remaining)
+		}
+		for _, site := range bucketNormalizationSites {
+			h.normalizeBucketsLocked(site, remaining)
+		}
+	}
+
+	return res
 }
 
 func (h *fqHostFlowScheduler) pruneIdleStatesLocked(active []fqFlowSnapshot, now time.Time) {
@@ -267,76 +416,6 @@ func (h *fqHostFlowScheduler) pruneIdleStatesLocked(active []fqFlowSnapshot, now
 		}
 		delete(h.sites, siteKey)
 	}
-}
-
-func (h *fqHostFlowScheduler) chooseLocked(cands []fqFlowSnapshot, now time.Time) (*fqSiteFlowState, *fqBucketFlowState, int) {
-	// Determine eligible buckets per site first so denied-only sites are skipped.
-	siteBuckets := make(map[string]*fqBucketFlowState)
-	for _, f := range cands {
-		st := h.sites[f.SiteBucket]
-		if st == nil {
-			continue
-		}
-		bt := st.Buckets[f.IPBucket]
-		if bt == nil {
-			continue
-		}
-		if !bt.DenyUntil.IsZero() && now.Before(bt.DenyUntil) {
-			continue
-		}
-		cur := siteBuckets[st.Key]
-		if cur == nil || bt.VirtualTime < cur.VirtualTime || (bt.VirtualTime == cur.VirtualTime && bt.Key < cur.Key) {
-			siteBuckets[st.Key] = bt
-		}
-	}
-
-	// Choose eligible site with smallest VirtualTime (tie-break by key for determinism).
-	var chosenSite *fqSiteFlowState
-	for siteKey := range siteBuckets {
-		st := h.sites[siteKey]
-		if st == nil {
-			continue
-		}
-		if chosenSite == nil || st.VirtualTime < chosenSite.VirtualTime || (st.VirtualTime == chosenSite.VirtualTime && st.Key < chosenSite.Key) {
-			chosenSite = st
-		}
-	}
-	if chosenSite == nil {
-		return nil, nil, -1
-	}
-	chosenBucket := siteBuckets[chosenSite.Key]
-	if chosenBucket == nil {
-		return nil, nil, -1
-	}
-
-	// Choose flow with smallest LocalVT within the chosen bucket (tie-break by CreatedAt).
-	chosenIdx := -1
-	for i := range cands {
-		f := cands[i]
-		if f.SiteBucket != chosenSite.Key || f.IPBucket != chosenBucket.Key {
-			continue
-		}
-		if chosenIdx < 0 {
-			chosenIdx = i
-			continue
-		}
-		cur := cands[chosenIdx]
-		if f.LocalVT < cur.LocalVT {
-			chosenIdx = i
-			continue
-		}
-		if f.LocalVT == cur.LocalVT {
-			if f.CreatedAt.Before(cur.CreatedAt) {
-				chosenIdx = i
-				continue
-			}
-			if f.CreatedAt.Equal(cur.CreatedAt) && f.Token < cur.Token {
-				chosenIdx = i
-				continue
-			}
-		}
-	}
-	return chosenSite, chosenBucket, chosenIdx
 }
 
 func (h *fqHostFlowScheduler) getOrInitStates(siteKey, bucketKey string) (*fqSiteFlowState, *fqBucketFlowState) {
