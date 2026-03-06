@@ -230,6 +230,100 @@ func TestAcquireCachedThrottleValidTokenReturnsThrottledAndDeletesOwnFlow(t *tes
 	}
 }
 
+func TestAcquirePollWindowConvergesToCachedThrottleInsteadOfPending(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(20*time.Millisecond, 40*time.Millisecond)
+	backend := &sequenceBackend{seq: []*tryAcquireResult{{status: "WAIT"}}}
+	s.updateRuntime(cfg, backend, "test", false)
+	s.flowStore.afterFunc = nil
+	defer s.stopAllHostProbeRunners()
+
+	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	if tok == "" {
+		t.Fatalf("expected token")
+	}
+
+	respCh := make(chan *AcquireResponse, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+			Hostname:     "example.com",
+			HostnameHash: "h1",
+			IPBucket:     "ip1",
+			SiteBucket:   "s1",
+			QueryToken:   tok,
+		})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+
+	deadline := time.NewTimer(100 * time.Millisecond)
+	defer deadline.Stop()
+	for {
+		snap, ok := s.flowStore.getSnapshot(tok)
+		if ok && snap.HasWaiter {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("waiter did not attach in time")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	for {
+		backend.mu.Lock()
+		calls := backend.calls
+		backend.mu.Unlock()
+		if calls > 0 {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("probe runner did not observe the waiter in time")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	s.setThrottleState("h1", time.Now(), 429, 15)
+
+	fastResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip-new",
+		SiteBucket:   "s1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fastResp.Result != "throttled" || fastResp.Reason != "throttle_cached" {
+		t.Fatalf("expected new acquire to hit throttle cache, got %+v", fastResp)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case resp := <-respCh:
+		if resp == nil || resp.Result != "throttled" || resp.Reason != "throttle_cached" {
+			t.Fatalf("expected waiting acquire to converge to cached throttle, got %+v", resp)
+		}
+		if resp.QueryToken != tok {
+			t.Fatalf("expected throttled response to retain token %q, got %+v", tok, resp)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("timed out waiting for acquire response")
+	}
+
+	if _, ok := s.flowStore.getSnapshot(tok); ok {
+		t.Fatalf("expected throttled converge path to delete flow")
+	}
+}
+
 func TestAcquireScopedOverloadRefreshesGraceAcrossRetries(t *testing.T) {
 	s := newTestServer()
 	cfg := testConfigForAcquire(2*time.Millisecond, 4*time.Second)

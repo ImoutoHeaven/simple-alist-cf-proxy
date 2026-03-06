@@ -167,6 +167,18 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 	timer := time.NewTimer(pollWindow)
 	defer timer.Stop()
 
+	finalizeCachedThrottle := func(code, retryAfter int) *AcquireResponse {
+		store.detachWaiter(token)
+		store.deleteFlow(token)
+		return &AcquireResponse{
+			Result:       "throttled",
+			QueryToken:   token,
+			ThrottleCode: code,
+			ThrottleWait: retryAfter,
+			Reason:       "throttle_cached",
+		}
+	}
+
 	finalizeDelivered := func(resp *AcquireResponse) *AcquireResponse {
 		if resp == nil {
 			resp = &AcquireResponse{Result: "pending"}
@@ -221,13 +233,17 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			return finalizeDelivered(resp), nil
 		default:
 		}
-		// Pending is the authoritative moment to start grace.
 		now2 := nowFn()
+		// Pending is the authoritative moment to start grace.
 		store.detachWithGrace(token, now2)
 		select {
 		case resp := <-w.resCh:
 			return finalizeDelivered(resp), nil
 		default:
+		}
+		now3 := nowFn()
+		if protected, code, retryAfter := s.getThrottleState(hostKey, now3); protected {
+			return finalizeCachedThrottle(code, retryAfter), nil
 		}
 		return &AcquireResponse{Result: "pending", QueryToken: token}, nil
 	}
