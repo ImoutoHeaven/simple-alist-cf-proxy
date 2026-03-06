@@ -25,6 +25,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - **Grace（宽限窗口）**
   - 当 /acquire 返回 `pending` 时，flow 会从 in-flight 变为 detached，并开始 `graceMs` 倒计时。
   - 客户端在 `graceMs` 内带同一个 `queryToken` 重试，可以延续排队位置。
+  - 若携带有效 `queryToken` 的 resumed acquire 只遇到 scoped overload（`overload_host|overload_site|overload_ip`），slot-handler 会刷新 detached flow 的 grace，避免 token 仅因 worker 退避等待而自然过期。
   - 连接/ctx 取消会立刻删除 flow（no grace）。
 
 ---
@@ -86,10 +87,10 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 ### POST /api/v1/fairqueue/release
 
 - 释放 slot（仍支持 `minSlotHoldMs` 和 `smoothReleaseIntervalMs`）。
-- 成功返回 `2xx`（当前为 `200` + `{"result":"ok"}`）。
+- 成功返回 `200` + `{"result":"ok"}`；若 `slotToken` 语法合法但对应 slot 已未知、已释放，backend 仍按幂等 no-op 处理，HTTP 仍返回 `200`。
 - 失败时返回非 `2xx`：
   - `502`：slot-handler 调用 backend release（`fq_release_dual`）失败（包括 backend error/unavailable）。
-  - `4xx`：请求参数错误或鉴权失败（例如缺失字段、无效 token）。
+  - `4xx`：请求参数错误或鉴权失败；其中缺失/空 `slotToken` 与格式非法的 `slotToken` 当前返回 `400`。
   - `5xx`：slot-handler 内部错误。
 - 约定：worker 将 release 视为 fire-and-forget，不影响本次下载响应，但会记录错误日志并按重试策略补偿。
 
@@ -320,10 +321,11 @@ slot-handler 依赖以下函数（名称可在配置中改）：
 - `overloaded` 表示 in-flight 超限，worker 按 scope 分流处理：
   - `overload_global`：fail-fast 返回 `503`，并携带 `Retry-After`。
   - `overload_host|overload_site|overload_ip`：有界等待后重试（0.5s 递进到 2.0s，单次不超过 2.0s）。
+- sticky miss、token 过期或 token 上下文不匹配仍会退化为 `timeout`；worker 侧表现为 `503`，不保证保留原排队位置。
 
 ## 9. 多实例部署注意（sticky 路由）
 
 - fair-queue flow 状态保存在 slot-handler 进程内存中，`queryToken` 不是跨实例共享。
 - 同一 `queryToken` 的后续 `/acquire` 轮询应尽量命中同一 slot-handler 实例（例如基于 token 的一致性哈希或 LB sticky）。
-- 若未做 sticky，跨实例请求会被判定为 `query_token_stale`/`timeout`，worker 会重新入队，公平性与等待时延会退化。
+- 若未做 sticky，跨实例请求会被判定为 `query_token_stale`/`timeout`；worker 侧会退化为 `503`，公平性与等待时延也会退化。
 - 建议在 LB 层开启健康检查与平滑摘除，减少实例切换导致的 token 失效抖动。

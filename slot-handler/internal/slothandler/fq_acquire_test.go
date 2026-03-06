@@ -124,6 +124,208 @@ func TestAcquireTokenMismatchDoesNotDeleteFlow(t *testing.T) {
 	}
 }
 
+func TestAcquireCachedThrottleStaleTokenReturnsTimeoutAndKeepsForeignFlow(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	now := time.Unix(1_700_000_100, 0)
+	s.flowStore.nowFn = func() time.Time {
+		return now
+	}
+
+	staleTok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	foreignTok := s.flowStore.newFlow("h1", "example.com", "ip-foreign", "s1")
+	s.flowStore.detachWithGrace(staleTok, now)
+	now = now.Add(41 * time.Millisecond)
+	s.setThrottleState("h1", now, 429, 15)
+
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+		QueryToken:   staleTok,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "timeout" || resp.Reason != "query_token_stale" {
+		t.Fatalf("expected stale timeout under cached throttle, got %+v", resp)
+	}
+	if _, ok := s.flowStore.getSnapshot(foreignTok); !ok {
+		t.Fatalf("expected foreign flow to survive stale token check")
+	}
+}
+
+func TestAcquireCachedThrottleMismatchReturnsTimeoutAndKeepsOriginalFlow(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	now := time.Unix(1_700_000_200, 0)
+	s.flowStore.nowFn = func() time.Time {
+		return now
+	}
+
+	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	s.setThrottleState("h1", now, 429, 15)
+
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip-other",
+		SiteBucket:   "s1",
+		QueryToken:   tok,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "timeout" || resp.Reason != "query_token_mismatch" {
+		t.Fatalf("expected mismatch timeout under cached throttle, got %+v", resp)
+	}
+	if _, ok := s.flowStore.getSnapshot(tok); !ok {
+		t.Fatalf("expected original flow to survive cached throttle mismatch")
+	}
+}
+
+func TestAcquireCachedThrottleValidTokenReturnsThrottledAndDeletesOwnFlow(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	now := time.Unix(1_700_000_300, 0)
+	s.flowStore.nowFn = func() time.Time {
+		return now
+	}
+
+	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	foreignTok := s.flowStore.newFlow("h1", "example.com", "ip-foreign", "s1")
+	s.setThrottleState("h1", now, 429, 15)
+
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+		QueryToken:   tok,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "throttled" || resp.Reason != "throttle_cached" {
+		t.Fatalf("expected cached throttled response, got %+v", resp)
+	}
+	if resp.QueryToken != "" {
+		t.Fatalf("expected throttled response shape to stay terminal, got queryToken=%q", resp.QueryToken)
+	}
+	if _, ok := s.flowStore.getSnapshot(tok); ok {
+		t.Fatalf("expected valid token flow deleted after cached throttle")
+	}
+	if _, ok := s.flowStore.getSnapshot(foreignTok); !ok {
+		t.Fatalf("expected foreign flow to survive valid token cleanup")
+	}
+}
+
+func TestAcquireScopedOverloadRefreshesGraceAcrossRetries(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 4*time.Second)
+	hostMax := 1
+	cfg.FairQueue.HostMaxInFlightFlow = &hostMax
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	now := time.Unix(1_700_000_400, 0)
+	s.flowStore.nowFn = func() time.Time {
+		return now
+	}
+
+	blocker := s.flowStore.newFlow("h1", "example.com", "ip-blocker", "s-blocker")
+	blockerWaiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
+	if ok, err := s.flowStore.attachWaiterWithLimits(blocker, blockerWaiter, now, cfg.FairQueue.inFlightLimits()); !ok || err != nil {
+		t.Fatalf("attach blocker waiter: ok=%t err=%v", ok, err)
+	}
+
+	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	s.flowStore.detachWithGrace(tok, now)
+	now = now.Add(3500 * time.Millisecond)
+
+	req := AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+		QueryToken:   tok,
+	}
+
+	resp, err := s.handleAcquireSlot(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "overloaded" || resp.Reason != "overload_host" {
+		t.Fatalf("expected scoped overload on first retry, got %+v", resp)
+	}
+	if !s.flowStore.isAlive(tok, now.Add(900*time.Millisecond)) {
+		t.Fatalf("expected valid resumed token to stay alive through first scoped overload backoff")
+	}
+
+	now = now.Add(900 * time.Millisecond)
+	resp, err = s.handleAcquireSlot(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "overloaded" || resp.Reason != "overload_host" {
+		t.Fatalf("expected scoped overload on second retry, got %+v", resp)
+	}
+	if !s.flowStore.isAlive(tok, now.Add(900*time.Millisecond)) {
+		t.Fatalf("expected valid resumed token to stay alive through repeated scoped overload backoff")
+	}
+}
+
+func TestAcquireGlobalOverloadDoesNotRefreshGrace(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 4*time.Second)
+	globalMax := 1
+	cfg.FairQueue.GlobalMaxInFlightFlow = &globalMax
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	now := time.Unix(1_700_000_500, 0)
+	s.flowStore.nowFn = func() time.Time {
+		return now
+	}
+
+	blocker := s.flowStore.newFlow("h1", "example.com", "ip-blocker", "s-blocker")
+	blockerWaiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
+	if ok, err := s.flowStore.attachWaiterWithLimits(blocker, blockerWaiter, now, cfg.FairQueue.inFlightLimits()); !ok || err != nil {
+		t.Fatalf("attach blocker waiter: ok=%t err=%v", ok, err)
+	}
+
+	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	s.flowStore.detachWithGrace(tok, now)
+	now = now.Add(3500 * time.Millisecond)
+
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+		QueryToken:   tok,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "overloaded" || resp.Reason != "overload_global" {
+		t.Fatalf("expected global overload, got %+v", resp)
+	}
+	if s.flowStore.isAlive(tok, now.Add(900*time.Millisecond)) {
+		t.Fatalf("expected global overload to leave original grace expiry unchanged")
+	}
+}
+
 func TestAcquireTokenMetricsCounts(t *testing.T) {
 	s := newTestServer()
 	cfg := testConfigForAcquire(2*time.Millisecond, 20*time.Millisecond)

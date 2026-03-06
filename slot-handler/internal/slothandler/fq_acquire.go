@@ -70,22 +70,6 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 	}
 	hostKey := fqHostKey(req.HostnameHash, req.Hostname)
 	limits := cfg.FairQueue.inFlightLimits()
-
-	// THROTTLED global convergence: if the host is protected, return immediately.
-	if protected, code, retryAfter := s.getThrottleState(hostKey, now); protected {
-		// Avoid creating a flow token for a terminal throttled response.
-		token := strings.TrimSpace(req.QueryToken)
-		if token != "" {
-			store.deleteFlow(token)
-		}
-		return &AcquireResponse{
-			Result:       "throttled",
-			ThrottleCode: code,
-			ThrottleWait: retryAfter,
-			Reason:       "throttle_cached",
-		}, nil
-	}
-
 	requestedToken := strings.TrimSpace(req.QueryToken)
 	token := requestedToken
 	if token != "" {
@@ -107,6 +91,20 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			return &AcquireResponse{Result: "timeout", Reason: "query_token_mismatch"}, nil
 		}
 	}
+
+	// THROTTLED global convergence: if the host is protected, return immediately.
+	if protected, code, retryAfter := s.getThrottleState(hostKey, now); protected {
+		// Avoid creating a flow token for a terminal throttled response.
+		if token != "" {
+			store.deleteFlow(token)
+		}
+		return &AcquireResponse{
+			Result:       "throttled",
+			ThrottleCode: code,
+			ThrottleWait: retryAfter,
+			Reason:       "throttle_cached",
+		}, nil
+	}
 	createdNew := false
 	if token == "" {
 		if scope := detectOverloadScope(store, hostKey, req.SiteBucket, req.IPBucket, limits); scope != "" {
@@ -121,12 +119,16 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 	ok, err := store.attachWaiterWithLimits(token, w, now, limits)
 	if err != nil {
 		if errors.Is(err, errWaiterOverloaded) {
-			if createdNew {
-				store.deleteFlow(token)
-			}
 			scope := overloadScopeFromError(err)
 			if scope == "" {
 				scope = detectOverloadScope(store, hostKey, req.SiteBucket, req.IPBucket, limits)
+			}
+			if requestedToken != "" {
+				if scope != "global" {
+					store.refreshGrace(token, nowFn())
+				}
+			} else if createdNew {
+				store.deleteFlow(token)
 			}
 			return overloadedResponse(scope), nil
 		}

@@ -57,6 +57,138 @@ test('overload jitter is bounded by jitterCap when random is 1', () => {
   assert.equal(delay, 600);
 });
 
+test('slot-handler client defaults auth header name to X-FQ-Auth', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: 'secret',
+      authHeader: '',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.get('X-FQ-Auth'), 'secret');
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.equal(result.kind, 'granted');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('slot-handler client uses configured auth header name', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: 'secret',
+      authHeader: 'X-Custom-FQ-Auth',
+    },
+    throttleConfig: { throttleTimeWindow: 60 },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.get('X-Custom-FQ-Auth'), 'secret');
+    assert.equal(headers.get('X-FQ-Auth'), null);
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.equal(result.kind, 'granted');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('resolveConfig wires controller slotHandlerAuthHeader into slot-handler requests', async () => {
+  const { resolveConfig, createSlotHandlerClient } = __fairQueueTestHooks;
+  const config = resolveConfig(
+    {},
+    {
+      common: {
+        tokenHmacKey: 'bootstrap-token',
+        workerAddresses: ['https://worker.example.com'],
+        landingWorkerAddresses: ['https://landing.example.com'],
+      },
+      download: {
+        address: 'https://alist.example.com',
+        fairQueue: {
+          enabled: true,
+          hostPatterns: ['example.com'],
+          slotHandlerUrl: 'https://slot-handler.example.com',
+          slotHandlerAuthKey: 'secret',
+          slotHandlerAuthHeader: 'X-Bootstrap-FQ-Auth',
+        },
+      },
+    },
+    { download: {} },
+  );
+
+  assert.equal(config.slotHandlerConfig.authHeader, 'X-Bootstrap-FQ-Auth');
+
+  const client = createSlotHandlerClient(config);
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.get('X-Bootstrap-FQ-Auth'), 'secret');
+    assert.equal(headers.get('X-FQ-Auth'), null);
+    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.equal(result.kind, 'granted');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('global overload should fail fast with Retry-After', async () => {
   const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
   clearOverloadedByHost();

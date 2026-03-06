@@ -663,6 +663,38 @@ func (s *flowStore) detachWithGrace(token string, now time.Time) {
 	s.mu.Unlock()
 }
 
+func (s *flowStore) refreshGrace(token string, now time.Time) bool {
+	if token == "" {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil || f.waiter != nil || isFlowExpiredAt(f, now) || s.grace <= 0 {
+		return false
+	}
+	if f.timer != nil {
+		safeStopTimer(f.timer)
+		f.timer = nil
+	}
+
+	f.expireAt = now.Add(s.grace)
+	after := s.afterFunc
+	grace := s.grace
+	nowFn := s.nowFn
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	if after != nil {
+		f.timer = after(grace, func() {
+			s.deleteIfExpired(token, nowFn())
+		})
+	}
+	return true
+}
+
 // deliverToWaiter sends a result to the currently attached waiter (if any).
 // Intended for tests and the upcoming scheduler.
 func (s *flowStore) deliverToWaiter(token string, resp *AcquireResponse) bool {

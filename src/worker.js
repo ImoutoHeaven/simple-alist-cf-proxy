@@ -875,6 +875,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     : DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS;
   const slotHandlerUrl = normalizeString(fairQueueConfigRaw.slotHandlerUrl);
   const slotHandlerAuthKey = normalizeString(fairQueueConfigRaw.slotHandlerAuthKey);
+  const slotHandlerAuthHeader = normalizeString(fairQueueConfigRaw.slotHandlerAuthHeader) || 'X-FQ-Auth';
   if (fairQueueEnabled && !slotHandlerUrl) {
     throw new Error('controller fairQueue.slotHandlerUrl is required when fairQueue.enabled is true');
   }
@@ -887,6 +888,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     perRequestTimeoutMs,
     maxAttemptsCap,
     authKey: slotHandlerAuthKey,
+    authHeader: slotHandlerAuthHeader,
   };
   const fairQueueContext = {
     fairQueueEnabled,
@@ -1273,6 +1275,7 @@ const createSlotHandlerClient = (config) => {
   const acquireUrl = `${baseUrl}/api/v1/fairqueue/acquire`;
   const releaseUrl = `${baseUrl}/api/v1/fairqueue/release`;
   const authKey = slotCfg.authKey || '';
+  const authHeader = normalizeStringValue(slotCfg.authHeader, 'X-FQ-Auth');
   const throttleTimeWindowSeconds =
     Number(config.throttleConfig?.throttleTimeWindow) > 0
       ? Number(config.throttleConfig.throttleTimeWindow)
@@ -1297,7 +1300,7 @@ const createSlotHandlerClient = (config) => {
   const buildHeaders = () => {
     const headers = { 'Content-Type': 'application/json' };
     if (authKey) {
-      headers['X-FQ-Auth'] = authKey;
+      headers[authHeader] = authKey;
     }
     return headers;
   };
@@ -2760,6 +2763,7 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
 
 export const __fairQueueTestHooks = {
   createSlotHandlerClient,
+  resolveConfig,
   markHostOverloaded,
   getHostOverloadedRemainingMs,
   getGlobalOverloadedRemainingSeconds,

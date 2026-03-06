@@ -10,10 +10,14 @@ import (
 
 type releaseRecordingBackend struct {
 	sequenceBackend
-	released chan ReleaseRequest
+	released     chan ReleaseRequest
+	releaseCalls int
 }
 
 func (b *releaseRecordingBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	b.mu.Lock()
+	b.releaseCalls++
+	b.mu.Unlock()
 	if b.released != nil {
 		select {
 		case b.released <- req:
@@ -45,6 +49,18 @@ type holBlockingBackend struct {
 	startOnce   sync.Once
 	doneOnce    sync.Once
 	fastOnce    sync.Once
+}
+
+type throttledSiblingBackend struct {
+	mu             sync.Mutex
+	slowStarted    chan struct{}
+	slowRelease    chan struct{}
+	releaseStarted chan struct{}
+	releaseBlock   chan struct{}
+	startOnce      sync.Once
+	releaseOnce    sync.Once
+	releaseCalls   int
+	released       []ReleaseRequest
 }
 
 type partialFailureBackend struct{}
@@ -118,6 +134,61 @@ func (b *holBlockingBackend) TryAcquireBatch(ctx context.Context, reqs []Acquire
 
 func (b *holBlockingBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }
 
+func (b *throttledSiblingBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+	hasSlow := false
+	for _, req := range reqs {
+		if strings.Contains(req.IPBucket, "slow-") {
+			hasSlow = true
+			break
+		}
+	}
+	if hasSlow {
+		b.startOnce.Do(func() {
+			if b.slowStarted != nil {
+				close(b.slowStarted)
+			}
+		})
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-b.slowRelease:
+		}
+	}
+
+	results := make([]*tryAcquireResult, len(reqs))
+	for i, req := range reqs {
+		switch {
+		case strings.Contains(req.IPBucket, "slow-"):
+			results[i] = &tryAcquireResult{status: "THROTTLED", throttleCode: 429, throttleRetryAfter: 15}
+		case strings.Contains(req.IPBucket, "fast-"):
+			results[i] = &tryAcquireResult{status: "ACQUIRED", slotToken: "slot-" + req.IPBucket}
+		default:
+			results[i] = &tryAcquireResult{status: "WAIT"}
+		}
+	}
+	return results, nil
+}
+
+func (b *throttledSiblingBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	b.mu.Lock()
+	b.releaseCalls++
+	b.released = append(b.released, req)
+	b.mu.Unlock()
+	if b.releaseStarted != nil {
+		b.releaseOnce.Do(func() {
+			close(b.releaseStarted)
+		})
+	}
+	if b.releaseBlock != nil {
+		select {
+		case <-b.releaseBlock:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 func (b *partialFailureBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
 	for _, req := range reqs {
 		if strings.HasPrefix(req.IPBucket, "err-") {
@@ -189,6 +260,19 @@ func (b *sequenceBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireReq
 }
 
 func (b *sequenceBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }
+
+func expectThrottledResponse(t *testing.T, ch <-chan *AcquireResponse, tok string) {
+	t.Helper()
+
+	select {
+	case got := <-ch:
+		if got == nil || got.Result != "throttled" || got.QueryToken != tok || got.ThrottleCode != 429 || got.ThrottleWait <= 0 {
+			t.Fatalf("unexpected throttled resp: %+v", got)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("expected throttled response for token %q", tok)
+	}
+}
 
 func TestProbeOnceWaitIncreasesWaitCount(t *testing.T) {
 	backend := &sequenceBackend{seq: []*tryAcquireResult{{status: "WAIT"}}}
@@ -386,6 +470,267 @@ func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
 	backend.mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("expected backend calls to remain 1 with cache, got %d", calls)
+	}
+}
+
+func TestProbeOnceThrottledSameSubBatchReleaseCompensatesAcquired(t *testing.T) {
+	backend := &releaseRecordingBackend{
+		sequenceBackend: sequenceBackend{seq: []*tryAcquireResult{{status: "THROTTLED", throttleCode: 429, throttleRetryAfter: 15}, {status: "ACQUIRED", slotToken: "slot-same-sub-batch"}}},
+		released:        make(chan ReleaseRequest, 1),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 20, 9, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	firstTok := store.newFlow("h1", "example.com", "ip1", "s1")
+	firstCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(firstTok, &fqWaiter{resCh: firstCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter first-flow ok=%t err=%v", ok, err)
+	}
+
+	secondTok := store.newFlow("h1", "example.com", "ip1", "s1")
+	secondCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(secondTok, &fqWaiter{resCh: secondCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter second-flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			// Force probeOnce to collapse both requests into one sub-batch so the
+			// current-scan latch path is exercised without changing production code.
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case req := <-backend.released:
+		if req.SlotToken != "slot-same-sub-batch" || req.HostnameHash != "h1" || req.SiteBucket != "s1" || req.IPBucket != "ip1" {
+			t.Fatalf("unexpected compensating release request: %+v", req)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("expected compensating release for same-sub-batch acquired slot")
+	}
+
+	backend.mu.Lock()
+	releaseCalls := backend.releaseCalls
+	backend.mu.Unlock()
+	if releaseCalls != 1 {
+		t.Fatalf("expected exactly one compensating release, got %d", releaseCalls)
+	}
+
+	expectThrottledResponse(t, firstCh, firstTok)
+	expectThrottledResponse(t, secondCh, secondTok)
+
+	if _, ok := store.getSnapshot(firstTok); ok {
+		t.Fatalf("expected first flow deleted after throttled latch")
+	}
+	if _, ok := store.getSnapshot(secondTok); ok {
+		t.Fatalf("expected second flow deleted after throttled latch")
+	}
+}
+
+func TestProbeOnceThrottledSameSubBatchLaterRowBeatsEarlierAcquire(t *testing.T) {
+	backend := &releaseRecordingBackend{
+		sequenceBackend: sequenceBackend{seq: []*tryAcquireResult{{status: "ACQUIRED", slotToken: "slot-earlier-acquire"}, {status: "THROTTLED", throttleCode: 429, throttleRetryAfter: 15}}},
+		released:        make(chan ReleaseRequest, 1),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 21, 9, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	firstTok := store.newFlow("h1", "example.com", "ip1", "s1")
+	firstCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(firstTok, &fqWaiter{resCh: firstCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter first-flow ok=%t err=%v", ok, err)
+	}
+
+	secondTok := store.newFlow("h1", "example.com", "ip1", "s1")
+	secondCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(secondTok, &fqWaiter{resCh: secondCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter second-flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case req := <-backend.released:
+		if req.SlotToken != "slot-earlier-acquire" || req.HostnameHash != "h1" || req.SiteBucket != "s1" || req.IPBucket != "ip1" {
+			t.Fatalf("unexpected compensating release request: %+v", req)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("expected compensating release for earlier acquired slot once later throttled row wins")
+	}
+
+	backend.mu.Lock()
+	releaseCalls := backend.releaseCalls
+	backend.mu.Unlock()
+	if releaseCalls != 1 {
+		t.Fatalf("expected exactly one compensating release, got %d", releaseCalls)
+	}
+
+	expectThrottledResponse(t, firstCh, firstTok)
+	expectThrottledResponse(t, secondCh, secondTok)
+
+	select {
+	case extra := <-firstCh:
+		t.Fatalf("did not expect granted response after later throttled row, got %+v", extra)
+	default:
+	}
+
+	if _, ok := store.getSnapshot(firstTok); ok {
+		t.Fatalf("expected first flow deleted after throttled latch")
+	}
+	if _, ok := store.getSnapshot(secondTok); ok {
+		t.Fatalf("expected second flow deleted after throttled latch")
+	}
+}
+
+func TestProbeOnceParallelMicroBatchThrottledCompensatesSiblingAcquireWithoutBlockingThrottledDelivery(t *testing.T) {
+	backend := &throttledSiblingBackend{
+		slowStarted:    make(chan struct{}),
+		slowRelease:    make(chan struct{}),
+		releaseStarted: make(chan struct{}),
+		releaseBlock:   make(chan struct{}, 1),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 20, 10, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	slowTok := store.newFlow("h1", "example.com", "a-slow-1", "s1")
+	slowCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(slowTok, &fqWaiter{resCh: slowCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter slow-flow ok=%t err=%v", ok, err)
+	}
+
+	fastTok := store.newFlow("h1", "example.com", "z-fast-1", "s1")
+	fastCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(fastTok, &fqWaiter{resCh: fastCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter fast-flow ok=%t err=%v", ok, err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = s.probeOnce(context.Background(), "h1", now)
+		close(done)
+	}()
+
+	select {
+	case <-backend.slowStarted:
+	case <-time.After(time.Second):
+		t.Fatalf("expected first micro-batch to block on slow throttled response")
+	}
+
+	select {
+	case <-done:
+		t.Fatalf("expected probeOnce to wait while first sub-batch is still pending")
+	default:
+	}
+
+	close(backend.slowRelease)
+
+	select {
+	case <-backend.releaseStarted:
+	case <-time.After(time.Second):
+		t.Fatalf("expected sibling acquired slot to start compensating release")
+	}
+
+	expectThrottledResponse(t, slowCh, slowTok)
+	expectThrottledResponse(t, fastCh, fastTok)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("expected probeOnce to return without waiting for compensating release")
+	}
+
+	backend.releaseBlock <- struct{}{}
+
+	backend.mu.Lock()
+	releaseCalls := backend.releaseCalls
+	released := append([]ReleaseRequest(nil), backend.released...)
+	backend.mu.Unlock()
+	if releaseCalls != 1 {
+		t.Fatalf("expected exactly one compensating release, got %d", releaseCalls)
+	}
+	if len(released) != 1 || released[0].SlotToken != "slot-z-fast-1" || released[0].HostnameHash != "h1" || released[0].SiteBucket != "s1" || released[0].IPBucket != "z-fast-1" {
+		t.Fatalf("unexpected compensating release request: %+v", released)
+	}
+
+	select {
+	case extra := <-fastCh:
+		t.Fatalf("did not expect granted response after throttled latch, got %+v", extra)
+	default:
+	}
+
+	if _, ok := store.getSnapshot(slowTok); ok {
+		t.Fatalf("expected slow flow deleted after throttled latch")
+	}
+	if _, ok := store.getSnapshot(fastTok); ok {
+		t.Fatalf("expected fast flow deleted after throttled latch")
 	}
 }
 

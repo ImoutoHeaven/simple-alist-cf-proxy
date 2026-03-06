@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -149,6 +150,11 @@ type ReleaseRequest struct {
 
 type ReleaseResponse struct {
 	Result string `json:"result"`
+}
+
+type releaseSlotTokenPayload struct {
+	Host int `json:"host"`
+	Site int `json:"site"`
 }
 
 type FairQueueCleanupConfig struct {
@@ -1330,6 +1336,28 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func validateReleaseSlotToken(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return errors.New("slotToken is required")
+	}
+
+	payloadBytes, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return errors.New("invalid slotToken")
+	}
+
+	var payload releaseSlotTokenPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		return errors.New("invalid slotToken")
+	}
+	if payload.Host <= 0 && payload.Site <= 0 {
+		return errors.New("invalid slotToken")
+	}
+
+	return nil
+}
+
 func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	if !s.authPassed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -1344,6 +1372,10 @@ func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	var req ReleaseRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if err := validateReleaseSlotToken(req.SlotToken); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := s.releaseSlot(r.Context(), req); err != nil {

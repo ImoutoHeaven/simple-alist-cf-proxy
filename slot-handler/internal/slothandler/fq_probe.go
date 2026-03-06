@@ -23,6 +23,12 @@ type probeSubBatchResult struct {
 	err   error
 }
 
+type throttledLatch struct {
+	hit        bool
+	code       int
+	retryAfter int
+}
+
 const (
 	probeModeSteady probeMode = "steady"
 	probeModeFill   probeMode = "fill"
@@ -632,7 +638,10 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		reqs = append(reqs, req)
 	}
 
-	resultCh := s.probeBatchesInParallel(parentCtx, reqs, cfg.FairQueue.maxProbeParallel(), timeout)
+	probeCtx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	resultCh := s.probeBatchesInParallel(probeCtx, reqs, cfg.FairQueue.maxProbeParallel(), timeout)
 	if resultCh == nil {
 		for _, snap := range batch {
 			sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
@@ -640,57 +649,85 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		return true
 	}
 
-	applySubBatch := func(sub probeSubBatchResult) bool {
+	throttled := throttledLatch{}
+	releaseAsync := func(req ReleaseRequest) {
+		// Compensating cleanup must not delay throttled delivery to waiters.
+		go s.releaseSlot(context.Background(), req)
+	}
+	compensateAcquired := func(snap fqFlowSnapshot, res *tryAcquireResult) {
+		if res == nil || strings.TrimSpace(res.slotToken) == "" {
+			return
+		}
+		releaseReq := ReleaseRequest{
+			Hostname:      snap.Hostname,
+			HostnameHash:  snap.HostnameHash,
+			IPBucket:      snap.IPBucket,
+			SiteBucket:    snap.SiteBucket,
+			SlotToken:     res.slotToken,
+			HitUpstreamAt: now.UnixMilli(),
+			Now:           now.UnixMilli(),
+		}
+		releaseAsync(releaseReq)
+	}
+
+	applySubBatch := func(sub probeSubBatchResult) {
 		start := sub.start
 		if start < 0 || start >= len(batch) {
-			return false
+			return
 		}
 		end := start + sub.reqs
 		if end > len(batch) {
 			end = len(batch)
 		}
 		if end <= start {
-			return false
+			return
 		}
 
 		if sub.err != nil || len(sub.res) != (end-start) {
-			for _, snap := range batch[start:end] {
-				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+			if !throttled.hit {
+				for _, snap := range batch[start:end] {
+					sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+				}
 			}
-			return false
+			return
+		}
+
+		if !throttled.hit {
+			for _, res := range sub.res {
+				if res == nil {
+					continue
+				}
+				if strings.EqualFold(strings.TrimSpace(res.status), "THROTTLED") {
+					ra := res.throttleRetryAfter
+					if ra <= 0 {
+						ra = 1
+					}
+					throttled = throttledLatch{hit: true, code: res.throttleCode, retryAfter: ra}
+					s.setThrottleState(hostKey, now, res.throttleCode, ra)
+					cancel()
+					break
+				}
+			}
 		}
 
 		for i, snap := range batch[start:end] {
 			res := sub.res[i]
 			if res == nil {
-				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+				if !throttled.hit {
+					sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+				}
 				continue
 			}
 			status := strings.ToUpper(strings.TrimSpace(res.status))
 			if status == "THROTTLED" {
-				ra := res.throttleRetryAfter
-				if ra <= 0 {
-					ra = 1
+				continue
+			}
+
+			if throttled.hit {
+				if status == "ACQUIRED" {
+					compensateAcquired(snap, res)
 				}
-				s.setThrottleState(hostKey, now, res.throttleCode, ra)
-				// Fast convergence: deliver throttled to all current in-flight waiters.
-				inFlight2 := store.listInFlightByHost(hostKey, now)
-				for _, snap2 := range inFlight2 {
-					tok := snap2.Token
-					if tok == "" {
-						continue
-					}
-					s.incrementMetric("throttled")
-					_ = store.deliverToWaiter(tok, &AcquireResponse{
-						Result:       "throttled",
-						QueryToken:   tok,
-						ThrottleCode: res.throttleCode,
-						ThrottleWait: ra,
-						Reason:       "try_acquire_throttled",
-					})
-					store.deleteFlow(tok)
-				}
-				return true
+				continue
 			}
 
 			switch status {
@@ -720,7 +757,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 						HitUpstreamAt: now.UnixMilli(),
 						Now:           now.UnixMilli(),
 					}
-					go s.releaseSlot(context.Background(), releaseReq)
+					releaseAsync(releaseReq)
 				}
 				store.deleteFlow(snap.Token)
 			case "IP_TOO_MANY":
@@ -738,7 +775,6 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
 			}
 		}
-		return false
 	}
 
 	pending := make(map[int]probeSubBatchResult)
@@ -746,9 +782,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	for nextStart < len(batch) {
 		if sub, ok := pending[nextStart]; ok {
 			delete(pending, nextStart)
-			if applySubBatch(sub) {
-				return true
-			}
+			applySubBatch(sub)
 			step := sub.reqs
 			if step <= 0 {
 				step = 1
@@ -763,8 +797,10 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		sub, ok := <-resultCh
 		if !ok {
 			// Missing expected sub-batch result: penalize remaining range conservatively.
-			for _, snap := range batch[nextStart:] {
-				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+			if !throttled.hit {
+				for _, snap := range batch[nextStart:] {
+					sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+				}
 			}
 			break
 		}
@@ -775,6 +811,27 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 			continue
 		}
 		pending[sub.start] = sub
+	}
+
+	if throttled.hit {
+		for range resultCh {
+		}
+		inFlight2 := store.listInFlightByHost(hostKey, now)
+		for _, snap := range inFlight2 {
+			tok := snap.Token
+			if tok == "" {
+				continue
+			}
+			s.incrementMetric("throttled")
+			_ = store.deliverToWaiter(tok, &AcquireResponse{
+				Result:       "throttled",
+				QueryToken:   tok,
+				ThrottleCode: throttled.code,
+				ThrottleWait: throttled.retryAfter,
+				Reason:       "try_acquire_throttled",
+			})
+			store.deleteFlow(tok)
+		}
 	}
 
 	hostActive := 0
