@@ -41,6 +41,17 @@ func intFunctionBody(t *testing.T, text string, fnName string) string {
 	return m[1]
 }
 
+func tableFunctionBody(t *testing.T, text string, fnName string) string {
+	t.Helper()
+
+	pattern := `(?s)create\s+or\s+replace\s+function\s+` + regexp.QuoteMeta(fnName) + `\s*\(.*?\)\s*returns\s+table\s*\(.*?\)\s*as\s*\$\$(.*?)\$\$\s*language\s+plpgsql\s*;`
+	m := regexp.MustCompile(pattern).FindStringSubmatch(text)
+	if len(m) != 2 {
+		t.Fatalf("unable to locate %s function body in init.sql", fnName)
+	}
+	return m[1]
+}
+
 func mustFindIndex(t *testing.T, text string, pattern string) []int {
 	t.Helper()
 	idx := regexp.MustCompile(pattern).FindStringIndex(text)

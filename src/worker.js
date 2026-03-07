@@ -26,14 +26,11 @@ const DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT = 20;
 const DEFAULT_THROTTLE_EWMA_SPAN = 8;
 const DEFAULT_THROTTLE_CONSECUTIVE_THRESHOLD = 4;
 const DEFAULT_THROTTLE_PROTECT_HTTP_CODES = [429, 499, 500, 502, 503, 504];
-const VALID_BREAKER_STATES = new Set(['closed', 'open', 'half_open']);
-
 // slot-handler acquire is long-poll based; don't set per-request timeouts below this window.
 const SLOT_HANDLER_LONGPOLL_MS = 6000;
 
 // Fair Queue in-memory state (per Worker instance)
 const FQ_GLOBAL_STATE = {
-  breakerByHost: new Map(),
   overloadedByHost: new Map(),
   overloadedBySite: new Map(),
   overloadedByIp: new Map(),
@@ -187,77 +184,6 @@ const readOpenBreakerSnapshot = (snapshot, fallbackSeconds = 0, nowSeconds = Mat
     errorCode,
     retryAfter,
   };
-};
-
-const parseNullableBreakerInt = (value) => {
-  if (value === null || value === undefined || value === '') {
-    return null;
-  }
-
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
-};
-
-const normalizeBreakerCacheEntry = (snapshot) => {
-  if (!snapshot || typeof snapshot !== 'object') {
-    return null;
-  }
-
-  const rawState = typeof snapshot.state === 'string' ? snapshot.state.trim().toLowerCase() : '';
-  const state = VALID_BREAKER_STATES.has(rawState) ? rawState : '';
-  const openUntil = parseNullableBreakerInt(snapshot.openUntil);
-  const version = parseNullableBreakerInt(snapshot.version);
-  const lastErrorCode = parseNullableBreakerInt(snapshot.lastErrorCode);
-  const reason = typeof snapshot.reason === 'string' && snapshot.reason.trim() !== ''
-    ? snapshot.reason
-    : null;
-
-  if (!state) {
-    return null;
-  }
-
-  return {
-    state,
-    openUntil,
-    reason,
-    version,
-    lastErrorCode,
-  };
-};
-
-const shouldKeepBreakerCacheEntry = (entry, nowSeconds = Math.floor(Date.now() / 1000)) => {
-  if (!entry || entry.state !== 'open') {
-    return false;
-  }
-
-  return Number.isFinite(entry.openUntil) && entry.openUntil > nowSeconds;
-};
-
-const pruneBreakerMirrorCache = (nowSeconds = Math.floor(Date.now() / 1000)) => {
-  for (const [hostKey, entry] of FQ_GLOBAL_STATE.breakerByHost.entries()) {
-    if (!shouldKeepBreakerCacheEntry(entry, nowSeconds)) {
-      FQ_GLOBAL_STATE.breakerByHost.delete(hostKey);
-    }
-  }
-};
-
-const mirrorBreakerSnapshot = (hostname, snapshot, nowSeconds = Math.floor(Date.now() / 1000)) => {
-  const hostKey = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
-  if (!hostKey) {
-    return null;
-  }
-
-  pruneBreakerMirrorCache(nowSeconds);
-
-  const normalized = normalizeBreakerCacheEntry(snapshot);
-  if (!shouldKeepBreakerCacheEntry(normalized, nowSeconds)) {
-    FQ_GLOBAL_STATE.breakerByHost.delete(hostKey);
-    return null;
-  }
-
-  FQ_GLOBAL_STATE.breakerByHost.set(hostKey, normalized);
-
-  return normalized;
 };
 
 const readSlotHandlerBreakerSnapshot = (payload) => {
@@ -1400,10 +1326,6 @@ const applyUnifiedResult = (unifiedResult, options = {}) => {
     return null;
   }
 
-  if (throttleHostname && typeof options.onMirrorBreakerSnapshot === 'function') {
-    options.onMirrorBreakerSnapshot(throttleHostname, unifiedResult.throttle);
-  }
-
   const breakerState = readOpenBreakerSnapshot(
     unifiedResult.throttle,
     options.openCapSeconds || DEFAULT_THROTTLE_OPEN_CAP_SECONDS,
@@ -1700,9 +1622,6 @@ const createSlotHandlerClient = (config) => {
             const openBreaker = breakerSnapshot
               ? readOpenBreakerSnapshot(breakerSnapshot, 0)
               : null;
-            if (breakerSnapshot) {
-              mirrorBreakerSnapshot(hostKey, breakerSnapshot);
-            }
             return {
               kind: 'throttled',
               throttleCode,
@@ -1832,8 +1751,6 @@ const createSlotHandlerClient = (config) => {
 
 // src/handleDownload.ts
 async function handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
-  pruneBreakerMirrorCache();
-
   const originalRequest = request;
   const origin = request.headers.get("origin") ?? "*";
   const url = new URL(request.url);
@@ -2038,7 +1955,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let cacheHit = false;
   let linkData = null;
   let unifiedThrottleHostnameHash = null;
-  const activeProbeHosts = new Set();
+  const activeProbeVersions = new Map();
+  const normalizeProbeVersion = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
+  };
   
   // Use unified check when rate limit is enabled and dbMode is custom-pg-rest
   const supportsUnifiedCheck = config.rateLimitEnabled && config.dbMode === 'custom-pg-rest';
@@ -2160,7 +2081,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       throttleEnabled: config.throttleEnabled,
       throttleHostname: options.throttleHostname,
       throttleHostnamePatterns: config.throttleHostnamePatterns,
-      onMirrorBreakerSnapshot: mirrorBreakerSnapshot,
     });
     if (unifiedResponse) {
       await slowFailDelay();
@@ -2393,6 +2313,23 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const throttleCheckEnabled = config.throttleEnabled && throttleManager;
   const isThrottleManagedHostname = (hostname) => isManagedThrottleHost(hostname, config.throttleHostnamePatterns);
+  const readAuthoritySnapshotForHostname = async (hostname) => {
+    if (!throttleCheckEnabled || !hostname || !isThrottleManagedHostname(hostname)) {
+      return null;
+    }
+
+    try {
+      const snapshot = await throttleManager.getBreakerState(hostname, { ...config.throttleConfig, ctx });
+      if (!snapshot) {
+        console.error('[Throttle] Snapshot read returned no authority state');
+        return createBreakerAuthorityUnavailableResponse(origin, 'snapshot read');
+      }
+      return snapshot;
+    } catch (error) {
+      console.error('[Throttle] Snapshot read failed:', error instanceof Error ? error.message : String(error));
+      return createBreakerAuthorityUnavailableResponse(origin, 'snapshot read');
+    }
+  };
 
   if (throttleCheckEnabled) {
     const throttleHostnameRaw = extractHostname(downloadUrl);
@@ -2409,21 +2346,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (unifiedThrottleUsable) {
       throttleStatus = unifiedResult.throttle;
     } else if (throttleHostname && isThrottleManagedHostname(throttleHostname)) {
-      try {
-        throttleStatus = await throttleManager.getBreakerState(throttleHostname, { ...config.throttleConfig, ctx });
-      } catch (error) {
-        console.error('[Throttle] Snapshot read failed:', error instanceof Error ? error.message : String(error));
-        return createBreakerAuthorityUnavailableResponse(origin, 'snapshot read');
+      throttleStatus = await readAuthoritySnapshotForHostname(throttleHostname);
+      if (throttleStatus instanceof Response) {
+        return throttleStatus;
       }
-
-      if (!throttleStatus) {
-        console.error('[Throttle] Snapshot read returned no authority state');
-        return createBreakerAuthorityUnavailableResponse(origin, 'snapshot read');
-      }
-    }
-
-    if (throttleHostname) {
-      mirrorBreakerSnapshot(throttleHostname, throttleStatus);
     }
 
     if (throttleStatus) {
@@ -2443,7 +2369,51 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return null;
     }
 
-    if (activeProbeHosts.has(hostname)) {
+    const claimNowSeconds = Math.floor(Date.now() / 1000);
+
+    const shouldClaimProbe = (snapshot, nowSeconds) => {
+      if (!snapshot || typeof snapshot !== 'object') return false;
+      if (snapshot.state === 'half_open') return true;
+      return snapshot.state === 'open'
+        && Number.isFinite(snapshot.openUntil)
+        && snapshot.openUntil <= nowSeconds;
+    };
+
+    const authoritySnapshot = await readAuthoritySnapshotForHostname(hostname);
+    if (authoritySnapshot instanceof Response) {
+      return authoritySnapshot;
+    }
+
+    if (activeProbeVersions.has(hostname)) {
+      const activeProbeVersion = normalizeProbeVersion(activeProbeVersions.get(hostname));
+      const authorityProbeVersion = normalizeProbeVersion(authoritySnapshot?.version);
+      const authorityProbeLeaseUntil = normalizeProbeVersion(authoritySnapshot?.probeLeaseUntil);
+      if (
+        authoritySnapshot?.state === 'half_open'
+        && activeProbeVersion !== null
+        && authorityProbeVersion === activeProbeVersion
+        && authorityProbeLeaseUntil !== null
+        && authorityProbeLeaseUntil > claimNowSeconds
+      ) {
+        return null;
+      }
+      activeProbeVersions.delete(hostname);
+    }
+
+    const openBreaker = readOpenBreakerSnapshot(
+      authoritySnapshot,
+      config.throttleConfig?.openCapSeconds || DEFAULT_THROTTLE_OPEN_CAP_SECONDS,
+      claimNowSeconds,
+    );
+    if (openBreaker) {
+      await slowFailDelay();
+      console.log(
+        `[Throttle] Open breaker from fresh authority snapshot: ${hostname}, returning error ${openBreaker.errorCode}, retry after ${openBreaker.retryAfter}s`
+      );
+      return createThrottleProtectedResponse(origin, openBreaker);
+    }
+
+    if (!shouldClaimProbe(authoritySnapshot, claimNowSeconds)) {
       return null;
     }
 
@@ -2454,9 +2424,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         return createBreakerAuthorityUnavailableResponse(origin, 'probe claim');
       }
 
-      mirrorBreakerSnapshot(hostname, claimedSnapshot);
       if (claimedSnapshot.state === 'half_open' && claimedSnapshot.probeGranted === true) {
-        activeProbeHosts.add(hostname);
+        activeProbeVersions.set(hostname, normalizeProbeVersion(claimedSnapshot.version));
       }
 
       const openBreaker = readOpenBreakerSnapshot(
@@ -2512,6 +2481,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const retryAfterSeconds = isProtectedError
         ? deriveOpenSeconds(response.headers.get('Retry-After'), config.throttleConfig?.openCapSeconds || 60)
         : null;
+      const probeVersion = activeProbeVersions.has(hostname)
+        ? normalizeProbeVersion(activeProbeVersions.get(hostname))
+        : null;
 
       if (isProtectedError) {
         console.log(`[Throttle] Error ${statusCode} from ${hostname}, reporting breaker sample`);
@@ -2522,6 +2494,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         {
           sample,
           statusCode,
+          probeVersion,
           retryAfterSeconds,
         },
         { ...config.throttleConfig, ctx }
@@ -2532,9 +2505,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
       }
 
-      mirrorBreakerSnapshot(hostname, snapshot);
-      activeProbeHosts.delete(hostname);
+      activeProbeVersions.delete(hostname);
     } catch (error) {
+      activeProbeVersions.delete(hostname);
       console.error('[Throttle] Sample report failed:', error instanceof Error ? error.message : String(error));
       return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
     }
@@ -3019,9 +2992,6 @@ export const __fairQueueTestHooks = {
   }),
   createSlotHandlerClient,
   deriveOpenSeconds,
-  mirrorBreakerSnapshot,
-  normalizeBreakerCacheEntry,
-  pruneBreakerMirrorCache,
   readOpenBreakerSnapshot,
   resolveConfig,
   markHostOverloaded,
@@ -3036,9 +3006,7 @@ export const __fairQueueTestHooks = {
     site: FQ_GLOBAL_STATE.overloadedBySite.size,
     ip: FQ_GLOBAL_STATE.overloadedByIp.size,
   }),
-  getBreakerMirrorSize: () => FQ_GLOBAL_STATE.breakerByHost.size,
   clearOverloadedByHost: () => {
-    FQ_GLOBAL_STATE.breakerByHost.clear();
     FQ_GLOBAL_STATE.overloadedByHost.clear();
     FQ_GLOBAL_STATE.overloadedBySite.clear();
     FQ_GLOBAL_STATE.overloadedByIp.clear();

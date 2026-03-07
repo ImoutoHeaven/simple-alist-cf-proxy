@@ -230,27 +230,6 @@ func (sr *smoothHostReleaser) nextReleaseAfter(base time.Time, interval time.Dur
 	return next
 }
 
-type fqThrottleState struct {
-	State     string
-	OpenUntil time.Time
-	Code      int
-	Reason    string
-	Version   int64
-}
-
-func shouldKeepThrottleState(state *fqThrottleState, now time.Time) bool {
-	if state == nil {
-		return false
-	}
-	if !strings.EqualFold(strings.TrimSpace(state.State), "open") {
-		return false
-	}
-	if state.OpenUntil.IsZero() {
-		return false
-	}
-	return state.OpenUntil.After(now)
-}
-
 type runtimeMeta struct {
 	appName    string
 	appVersion string
@@ -353,8 +332,6 @@ type server struct {
 	configVersion    string
 	metrics          *metricsReporter
 	metricsCounters  *metricsCounters
-	throttleMu       sync.Mutex
-	throttleHost     map[string]*fqThrottleState
 	overloadLogMu    sync.Mutex
 	overloadLogLast  map[string]time.Time
 }
@@ -406,66 +383,16 @@ func (s *server) getControllerState() (controllerEnv, bool) {
 	return value, true
 }
 
-func (s *server) getThrottleState(hostKey string, now time.Time) *fqThrottleState {
-	s.throttleMu.Lock()
-	defer s.throttleMu.Unlock()
-
-	st := s.throttleHost[hostKey]
-	if st == nil {
-		return nil
-	}
-	if !shouldKeepThrottleState(st, now) {
-		if st != nil {
-			delete(s.throttleHost, hostKey)
-		}
-		return nil
-	}
-	snapshot := *st
-	return &snapshot
-}
-
-func (s *server) setThrottleState(hostKey string, state fqThrottleState) {
-	hostKey = strings.TrimSpace(hostKey)
-	if hostKey == "" {
-		return
-	}
-	state.State = strings.ToLower(strings.TrimSpace(state.State))
-
-	s.throttleMu.Lock()
-	defer s.throttleMu.Unlock()
-	if state.State != "open" || state.OpenUntil.IsZero() {
-		if s.throttleHost != nil {
-			delete(s.throttleHost, hostKey)
-		}
-		return
-	}
-	if s.throttleHost == nil {
-		s.throttleHost = make(map[string]*fqThrottleState)
-	}
-	copy := state
-	s.throttleHost[hostKey] = &copy
-}
-
-func breakerOpenUntilUnix(openUntil time.Time) int {
-	if openUntil.IsZero() {
-		return 0
-	}
-	return int(openUntil.Unix())
-}
-
-func throttledAcquireResponse(queryToken, responseReason string, state *fqThrottleState) *AcquireResponse {
+func throttledAcquireResponse(queryToken, responseReason string, throttleCode, breakerOpenUntil int, breakerReason string, breakerVersion int64) *AcquireResponse {
 	resp := &AcquireResponse{
-		Result:     "throttled",
-		QueryToken: queryToken,
-		Reason:     responseReason,
+		Result:           "throttled",
+		QueryToken:       queryToken,
+		Reason:           responseReason,
+		ThrottleCode:     throttleCode,
+		BreakerOpenUntil: breakerOpenUntil,
+		BreakerReason:    breakerReason,
+		BreakerVersion:   breakerVersion,
 	}
-	if state == nil {
-		return resp
-	}
-	resp.ThrottleCode = state.Code
-	resp.BreakerOpenUntil = breakerOpenUntilUnix(state.OpenUntil)
-	resp.BreakerReason = state.Reason
-	resp.BreakerVersion = state.Version
 	return resp
 }
 
@@ -504,10 +431,6 @@ func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion str
 		s.flowSchedMu.Lock()
 		s.flowSched = nil
 		s.flowSchedMu.Unlock()
-
-		s.throttleMu.Lock()
-		s.throttleHost = nil
-		s.throttleMu.Unlock()
 
 		s.utilMu.Lock()
 		s.utilHost = nil

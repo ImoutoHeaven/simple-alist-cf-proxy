@@ -92,14 +92,6 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		}
 	}
 
-	// THROTTLED global convergence: if the host is protected, return immediately.
-	if state := s.getThrottleState(hostKey, now); state != nil {
-		// Avoid creating a flow token for a terminal throttled response.
-		if token != "" {
-			store.deleteFlow(token)
-		}
-		return throttledAcquireResponse("", "throttle_cached", state), nil
-	}
 	createdNew := false
 	if token == "" {
 		if scope := detectOverloadScope(store, hostKey, req.SiteBucket, req.IPBucket, limits); scope != "" {
@@ -162,12 +154,6 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 	timer := time.NewTimer(pollWindow)
 	defer timer.Stop()
 
-	finalizeCachedThrottle := func(state *fqThrottleState) *AcquireResponse {
-		store.detachWaiter(token)
-		store.deleteFlow(token)
-		return throttledAcquireResponse(token, "throttle_cached", state)
-	}
-
 	finalizeDelivered := func(resp *AcquireResponse) *AcquireResponse {
 		if resp == nil {
 			resp = &AcquireResponse{Result: "pending"}
@@ -229,10 +215,6 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		case resp := <-w.resCh:
 			return finalizeDelivered(resp), nil
 		default:
-		}
-		now3 := nowFn()
-		if state := s.getThrottleState(hostKey, now3); state != nil {
-			return finalizeCachedThrottle(state), nil
 		}
 		return &AcquireResponse{Result: "pending", QueryToken: token}, nil
 	}

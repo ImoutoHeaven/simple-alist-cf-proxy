@@ -104,22 +104,24 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 
 7. **统一检查（custom-pg-rest）**
     - 当 `download.db.mode=custom-pg-rest` 且 rate limit 启用时，调用 PostgREST RPC：`download_unified_check`。
-    - 同时返回缓存命中、限流状态、`THROTTLE_PROTECTION` 里的 breaker 快照与 idle 状态；`pgErrorHandle` 支持 `fail-open`/`fail-closed`。
+    - 同时返回缓存命中、限流状态、`THROTTLE_PROTECTION` 里的 breaker 原始快照与 idle 状态；这一步只读权威状态，不在 worker 侧生成本地 breaker 状态；`pgErrorHandle` 支持 `fail-open`/`fail-closed`。
 
 8. **缓存与 AList 获取**
    - 优先使用 unified-check 或 cacheManager 的缓存；未命中则请求 AList `/api/fs/link`。
    - AList 请求头包含：`Authorization: tokenHmacKey`、`CF-Connecting-IP-WORKERS` 以及 `common.alistAuthHeaders`。
 
 9. **Breaker 保护**
-    - 若 hostname 匹配 `throttleProfiles.*.hostPatterns`，worker 只读取数据库共享 breaker 快照；运行时唯一真源是 `THROTTLE_PROTECTION`。
-    - breaker 状态机只有 `closed/open/half_open` 三态：`open` 立即 fail-fast，`half_open` 通过 `download_claim_breaker_probe` 原子领取单 canary，结果再由 `download_report_breaker_sample` 回写。
+    - 若 hostname 匹配 `throttleProfiles.*.hostPatterns`，worker 只读取数据库权威快照；运行时唯一真源是 `THROTTLE_PROTECTION`，worker 不保留本地 breaker 镜像。
+    - breaker 状态机只有 `closed/open/half_open` 三态：`open` 仅按权威快照立即 fail-fast；`open -> half_open` 只允许 `download_claim_breaker_probe` 原子领取单 canary。
+    - `download_report_breaker_sample` 负责回写样本，但只在 `half_open` 且 `p_probe_version` 命中当前版本时接受该 canary 结果；过期或未领取的响应不会推进恢复流程。
     - 下载后仅按 `protectHttpCodes` 上报 `sample=1`，`2xx/3xx` 上报 `sample=0`；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退。
 
 10. **Fair Queue（slot-handler）**
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
     - acquire / release 请求使用 `download.fairQueue.slotHandlerAuthHeader` 指定的鉴权 header 名发送 `slotHandlerAuthKey`，不再假定 header 名固定写死。
     - `acquire` 轮询同时受 `maxAttempts` 与 `totalMaxWaitMs` 约束，任一达到即结束等待。
-    - 支持 `pending` / `granted` / `throttled` / `overloaded` / `timeout`；节流状态在内存中做短期抑制。
+    - 支持 `pending` / `granted` / `throttled` / `overloaded` / `timeout`；其中 `throttled` 仅表示 slot-handler 透传 backend `THROTTLED` 结果，worker 不把它当作本地 breaker 权威。
+    - scoped overload 与 global overload 退避会在内存中做短期抑制，但这只属于 fair-queue 退避，不参与 breaker 状态机。
     - `overloaded` 由 slot-handler 返回 `reason=overload_<scope>`（`global|host|site|ip`）与可选 `retryAfter`。
     - overload 行为矩阵：
      - `overload_global`：worker 立即 fail-fast 返回 `503`；优先使用 slot-handler 的 `retryAfter`，若缺失/非法则按 worker 默认值回填 `Retry-After`。
@@ -159,7 +161,7 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 - Last Active：`DOWNLOAD_LAST_ACTIVE_TABLE` + `download_update_last_active`
 - 统一检查：`download_unified_check`（直接返回 breaker 原始字段 `state/open_until/reason/version/last_error_code`）
 
-Fair Queue 相关函数由 `slot-handler` 使用（`fq_try_acquire_batch` / `fq_release_dual`）。
+Fair Queue 相关函数由 `slot-handler` 使用（`fq_try_acquire_batch` / `fq_release_dual`）；其中 `fq_try_acquire_batch` 只在 backend 判定 `open` 窗口仍有效时返回 `THROTTLED` 与原始 breaker 元数据，不在 slot-handler 本地保存额外 breaker 状态。
 
 ## 7. 限制与注意事项
 

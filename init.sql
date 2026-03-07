@@ -220,18 +220,18 @@ BEGIN
 
   WHILE NOT v_locked LOOP
     SELECT
-      "HOSTNAME",
-      "STATE",
-      "OPEN_UNTIL",
-      "EWMA_SCORE",
-      "TOTAL_SAMPLES",
-      "CONSECUTIVE_ERROR_COUNT",
-      "SUCCESS_STREAK",
-      "PROBE_LEASE_UNTIL",
-      "LAST_ERROR_CODE",
-      "OPEN_REASON",
-      "LAST_OPEN_SECONDS",
-      "VERSION"
+      tp."HOSTNAME",
+      tp."STATE",
+      tp."OPEN_UNTIL",
+      tp."EWMA_SCORE",
+      tp."TOTAL_SAMPLES",
+      tp."CONSECUTIVE_ERROR_COUNT",
+      tp."SUCCESS_STREAK",
+      tp."PROBE_LEASE_UNTIL",
+      tp."LAST_ERROR_CODE",
+      tp."OPEN_REASON",
+      tp."LAST_OPEN_SECONDS",
+      tp."VERSION"
     INTO
       v_hostname,
       v_state,
@@ -245,8 +245,8 @@ BEGIN
       v_open_reason,
       v_last_open_seconds,
       v_version
-    FROM "THROTTLE_PROTECTION"
-    WHERE "HOSTNAME_HASH" = p_hostname_hash
+    FROM "THROTTLE_PROTECTION" AS tp
+    WHERE tp."HOSTNAME_HASH" = p_hostname_hash
     FOR UPDATE;
 
     GET DIAGNOSTICS v_locked_row_count = ROW_COUNT;
@@ -288,7 +288,7 @@ BEGIN
   END IF;
 
   RETURN QUERY
-  UPDATE "THROTTLE_PROTECTION" SET
+  UPDATE "THROTTLE_PROTECTION" AS tp SET
     "HOSTNAME" = v_hostname,
     "STATE" = v_state,
     "OPEN_UNTIL" = v_open_until,
@@ -301,21 +301,21 @@ BEGIN
     "OPEN_REASON" = v_open_reason,
     "LAST_OPEN_SECONDS" = v_last_open_seconds,
     "VERSION" = v_version
-  WHERE "HOSTNAME_HASH" = p_hostname_hash
+  WHERE tp."HOSTNAME_HASH" = p_hostname_hash
   RETURNING
     p_hostname_hash,
-    "HOSTNAME",
-    "STATE",
-    "OPEN_UNTIL",
-    "EWMA_SCORE",
-    "TOTAL_SAMPLES",
-    "CONSECUTIVE_ERROR_COUNT",
-    "SUCCESS_STREAK",
-    "PROBE_LEASE_UNTIL",
-    "LAST_ERROR_CODE",
-    "OPEN_REASON",
-    "LAST_OPEN_SECONDS",
-    "VERSION",
+    tp."HOSTNAME",
+    tp."STATE",
+    tp."OPEN_UNTIL",
+    tp."EWMA_SCORE",
+    tp."TOTAL_SAMPLES",
+    tp."CONSECUTIVE_ERROR_COUNT",
+    tp."SUCCESS_STREAK",
+    tp."PROBE_LEASE_UNTIL",
+    tp."LAST_ERROR_CODE",
+    tp."OPEN_REASON",
+    tp."LAST_OPEN_SECONDS",
+    tp."VERSION",
     v_probe_granted;
 END;
 $$ LANGUAGE plpgsql;
@@ -334,7 +334,8 @@ CREATE OR REPLACE FUNCTION download_report_breaker_sample(
   p_open_threshold_percent INTEGER,
   p_ewma_span INTEGER,
   p_consecutive_threshold INTEGER,
-  p_retry_after_seconds INTEGER DEFAULT NULL
+  p_retry_after_seconds INTEGER DEFAULT NULL,
+  p_probe_version BIGINT DEFAULT NULL
 )
 RETURNS TABLE(
   "HOSTNAME_HASH" TEXT,
@@ -378,6 +379,7 @@ DECLARE
   v_locked_row_count INTEGER := 0;
   v_should_open BOOLEAN := FALSE;
   v_open_seconds INTEGER := 0;
+  v_probe_version_matches BOOLEAN := FALSE;
 BEGIN
   IF p_hostname_hash IS NULL OR p_hostname_hash = '' THEN
     RETURN;
@@ -385,18 +387,18 @@ BEGIN
 
   WHILE NOT v_locked LOOP
     SELECT
-      "HOSTNAME",
-      "STATE",
-      "OPEN_UNTIL",
-      "EWMA_SCORE",
-      "TOTAL_SAMPLES",
-      "CONSECUTIVE_ERROR_COUNT",
-      "SUCCESS_STREAK",
-      "PROBE_LEASE_UNTIL",
-      "LAST_ERROR_CODE",
-      "OPEN_REASON",
-      "LAST_OPEN_SECONDS",
-      "VERSION"
+      tp."HOSTNAME",
+      tp."STATE",
+      tp."OPEN_UNTIL",
+      tp."EWMA_SCORE",
+      tp."TOTAL_SAMPLES",
+      tp."CONSECUTIVE_ERROR_COUNT",
+      tp."SUCCESS_STREAK",
+      tp."PROBE_LEASE_UNTIL",
+      tp."LAST_ERROR_CODE",
+      tp."OPEN_REASON",
+      tp."LAST_OPEN_SECONDS",
+      tp."VERSION"
     INTO
       v_hostname,
       v_state,
@@ -410,8 +412,8 @@ BEGIN
       v_open_reason,
       v_last_open_seconds,
       v_version
-    FROM "THROTTLE_PROTECTION"
-    WHERE "HOSTNAME_HASH" = p_hostname_hash
+    FROM "THROTTLE_PROTECTION" AS tp
+    WHERE tp."HOSTNAME_HASH" = p_hostname_hash
     FOR UPDATE;
 
     GET DIAGNOSTICS v_locked_row_count = ROW_COUNT;
@@ -431,18 +433,53 @@ BEGIN
   v_consecutive_error_count := COALESCE(v_consecutive_error_count, 0);
   v_success_streak := COALESCE(v_success_streak, 0);
   v_last_open_seconds := COALESCE(v_last_open_seconds, 0);
-  v_version := COALESCE(v_version, 0) + 1;
+  v_version := COALESCE(v_version, 0);
+  v_probe_version_matches := p_probe_version IS NOT NULL AND p_probe_version = v_version;
+
+  IF p_probe_version IS NOT NULL THEN
+    IF v_state <> 'half_open' OR NOT v_probe_version_matches THEN
+      RETURN QUERY SELECT
+        p_hostname_hash,
+        v_hostname,
+        v_state,
+        v_open_until,
+        v_ewma_score,
+        v_total_samples,
+        v_consecutive_error_count,
+        v_success_streak,
+        v_probe_lease_until,
+        v_last_error_code,
+        v_open_reason,
+        v_last_open_seconds,
+        v_version;
+      RETURN;
+    END IF;
+
+    v_version := v_version + 1;
+  ELSIF v_state = 'half_open' THEN
+    RETURN QUERY SELECT
+      p_hostname_hash,
+      v_hostname,
+      v_state,
+      v_open_until,
+      v_ewma_score,
+      v_total_samples,
+      v_consecutive_error_count,
+      v_success_streak,
+      v_probe_lease_until,
+      v_last_error_code,
+      v_open_reason,
+      v_last_open_seconds,
+      v_version;
+    RETURN;
+  END IF;
 
   IF v_state = 'closed' THEN
     v_open_until := NULL;
     v_probe_lease_until := NULL;
     v_success_streak := 0;
   ELSIF v_state = 'open' AND v_open_until IS NOT NULL AND v_open_until <= v_now THEN
-    v_state := 'half_open';
-    v_open_until := NULL;
-    IF v_probe_lease_until IS NOT NULL AND v_probe_lease_until <= v_now THEN
-      v_probe_lease_until := NULL;
-    END IF;
+    NULL;
   END IF;
 
   v_ewma_score := (v_alpha * v_sample) + ((1 - v_alpha) * v_ewma_score);
@@ -508,7 +545,7 @@ BEGIN
   END IF;
 
   RETURN QUERY
-  UPDATE "THROTTLE_PROTECTION" SET
+  UPDATE "THROTTLE_PROTECTION" AS tp SET
     "HOSTNAME" = v_hostname,
     "STATE" = v_state,
     "OPEN_UNTIL" = v_open_until,
@@ -521,21 +558,21 @@ BEGIN
     "OPEN_REASON" = v_open_reason,
     "LAST_OPEN_SECONDS" = v_last_open_seconds,
     "VERSION" = v_version
-  WHERE "HOSTNAME_HASH" = p_hostname_hash
+  WHERE tp."HOSTNAME_HASH" = p_hostname_hash
   RETURNING
     p_hostname_hash,
-    "HOSTNAME",
-    "STATE",
-    "OPEN_UNTIL",
-    "EWMA_SCORE",
-    "TOTAL_SAMPLES",
-    "CONSECUTIVE_ERROR_COUNT",
-    "SUCCESS_STREAK",
-    "PROBE_LEASE_UNTIL",
-    "LAST_ERROR_CODE",
-    "OPEN_REASON",
-    "LAST_OPEN_SECONDS",
-    "VERSION";
+    tp."HOSTNAME",
+    tp."STATE",
+    tp."OPEN_UNTIL",
+    tp."EWMA_SCORE",
+    tp."TOTAL_SAMPLES",
+    tp."CONSECUTIVE_ERROR_COUNT",
+    tp."SUCCESS_STREAK",
+    tp."PROBE_LEASE_UNTIL",
+    tp."LAST_ERROR_CODE",
+    tp."OPEN_REASON",
+    tp."LAST_OPEN_SECONDS",
+    tp."VERSION";
 END;
 $$ LANGUAGE plpgsql;
 

@@ -319,17 +319,6 @@ func (s *server) pruneRuntimeState(now time.Time, staleAfter time.Duration) {
 	}
 	s.utilMu.Unlock()
 
-	s.throttleMu.Lock()
-	for key, state := range s.throttleHost {
-		if !shouldKeepThrottleState(state, now) {
-			delete(s.throttleHost, key)
-		}
-	}
-	if len(s.throttleHost) == 0 {
-		s.throttleHost = nil
-	}
-	s.throttleMu.Unlock()
-
 	s.smoothMu.Lock()
 	for key, releaser := range s.smoothReleasers {
 		if releaser == nil {
@@ -612,21 +601,6 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		return true
 	}
 
-	// THROTTLED global convergence: if cached, deliver throttled without backend calls.
-	if state := s.getThrottleState(hostKey, now); state != nil {
-		// Ignore deny windows while throttled; we want fast convergence.
-		for _, snap := range inFlight {
-			tok := snap.Token
-			if tok == "" {
-				continue
-			}
-			s.incrementMetric("throttled")
-			_ = store.deliverToWaiter(tok, throttledAcquireResponse(tok, "throttle_cached", state))
-			store.deleteFlow(tok)
-		}
-		return true
-	}
-
 	budget, _ := s.computeProbeBudget(cfg, hostKey, inFlight, now)
 	if budget <= 0 {
 		return true
@@ -705,15 +679,6 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 					continue
 				}
 				if strings.EqualFold(strings.TrimSpace(res.status), "THROTTLED") {
-					state := fqThrottleState{
-						State:   "open",
-						Code:    res.throttleCode,
-						Reason:  res.breakerReason,
-						Version: res.breakerVersion,
-					}
-					if res.breakerOpenUntil > 0 {
-						state.OpenUntil = time.Unix(int64(res.breakerOpenUntil), 0).UTC()
-					}
 					throttled = throttledLatch{
 						hit:       true,
 						code:      res.throttleCode,
@@ -721,7 +686,6 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 						reason:    res.breakerReason,
 						version:   res.breakerVersion,
 					}
-					s.setThrottleState(hostKey, state)
 					cancel()
 					break
 				}
@@ -832,15 +796,6 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	}
 
 	if throttled.hit {
-		state := &fqThrottleState{
-			State:   "open",
-			Code:    throttled.code,
-			Reason:  throttled.reason,
-			Version: throttled.version,
-		}
-		if throttled.openUntil > 0 {
-			state.OpenUntil = time.Unix(int64(throttled.openUntil), 0).UTC()
-		}
 		for range resultCh {
 		}
 		inFlight2 := store.listInFlightByHost(hostKey, now)
@@ -850,7 +805,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 				continue
 			}
 			s.incrementMetric("throttled")
-			_ = store.deliverToWaiter(tok, throttledAcquireResponse(tok, "try_acquire_throttled", state))
+			_ = store.deliverToWaiter(tok, throttledAcquireResponse(tok, "try_acquire_throttled", throttled.code, throttled.openUntil, throttled.reason, throttled.version))
 			store.deleteFlow(tok)
 		}
 	}

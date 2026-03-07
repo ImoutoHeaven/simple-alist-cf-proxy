@@ -409,7 +409,7 @@ func TestProbeOnceAcquiredDeliversGrantedAndDownweights(t *testing.T) {
 	}
 }
 
-func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
+func TestProbeRunnerThrottledNextWaiterUsesBackendAuthority(t *testing.T) {
 	if _, ok := reflect.TypeOf(AcquireResponse{}).FieldByName("ThrottleWait"); ok {
 		t.Fatalf("AcquireResponse must not retain synthesized ThrottleWait field")
 	}
@@ -421,7 +421,7 @@ func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
 		breakerOpenUntil: int(now.Add(15 * time.Second).Unix()),
 		breakerReason:    "http_429",
 		breakerVersion:   1,
-	}}}
+	}, {status: "WAIT"}}}
 	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
 	s := newTestServer()
 	s.updateRuntime(cfg, backend, "test", true)
@@ -449,13 +449,6 @@ func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
 		t.Fatalf("expected flow deleted after throttled")
 	}
 
-	state := s.getThrottleState("h1", now.Add(1*time.Second))
-	if state == nil || state.Code != 429 {
-		t.Fatalf("expected throttle cache set, got state=%+v", state)
-	}
-
-	// In cache window, attach a new in-flight waiter and ensure short-circuit deliver
-	// without additional backend calls.
 	newTok := store.newFlow("h1", "example.com", "ip2", "s1")
 	newCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(newTok, &fqWaiter{resCh: newCh}, now.Add(1*time.Second)); !ok || err != nil {
@@ -466,25 +459,22 @@ func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
 	}
 	select {
 	case got := <-newCh:
-		if got == nil || got.Result != "throttled" {
-			t.Fatalf("expected cached throttled resp, got %+v", got)
-		}
+		t.Fatalf("expected next waiter to keep waiting for backend authority, got %+v", got)
 	default:
-		t.Fatalf("expected cached throttled response delivered")
 	}
-	if _, ok := store.getSnapshot(newTok); ok {
-		t.Fatalf("expected flow deleted after cached throttled")
+	if _, ok := store.getSnapshot(newTok); !ok {
+		t.Fatalf("expected next waiter to stay in flow store after backend WAIT")
 	}
 
 	backend.mu.Lock()
 	calls := backend.calls
 	backend.mu.Unlock()
-	if calls != 1 {
-		t.Fatalf("expected backend calls to remain 1 with cache, got %d", calls)
+	if calls != 2 {
+		t.Fatalf("expected backend calls to advance for the next waiter, got %d", calls)
 	}
 }
 
-func TestProbeOnceCachesSharedBreakerState(t *testing.T) {
+func TestProbeOnceThrottledDeliversSharedBreakerMetadata(t *testing.T) {
 	now := time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)
 	breakerOpenUntil := int(now.Add(15 * time.Second).Unix())
 	backend := &sequenceBackend{seq: []*tryAcquireResult{{
@@ -514,75 +504,17 @@ func TestProbeOnceCachesSharedBreakerState(t *testing.T) {
 		if got == nil || got.Result != "throttled" || got.ThrottleCode != 429 {
 			t.Fatalf("unexpected throttled resp: %+v", got)
 		}
-		respValue := reflect.ValueOf(got).Elem()
-		openUntilField := respValue.FieldByName("BreakerOpenUntil")
-		if !openUntilField.IsValid() {
-			t.Fatalf("expected AcquireResponse to carry raw breakerOpenUntil")
+		if got.BreakerOpenUntil != breakerOpenUntil {
+			t.Fatalf("expected breakerOpenUntil=%d, got %d", breakerOpenUntil, got.BreakerOpenUntil)
 		}
-		if gotOpenUntil := int(openUntilField.Int()); gotOpenUntil != breakerOpenUntil {
-			t.Fatalf("expected breakerOpenUntil=%d, got %d", breakerOpenUntil, gotOpenUntil)
+		if got.BreakerReason != "http_429" {
+			t.Fatalf("expected breakerReason http_429, got %q", got.BreakerReason)
 		}
-		reasonField := respValue.FieldByName("BreakerReason")
-		if !reasonField.IsValid() {
-			t.Fatalf("expected AcquireResponse to carry raw breakerReason")
-		}
-		if reasonField.String() != "http_429" {
-			t.Fatalf("expected breakerReason http_429, got %q", reasonField.String())
-		}
-		versionField := respValue.FieldByName("BreakerVersion")
-		if !versionField.IsValid() {
-			t.Fatalf("expected AcquireResponse to carry raw breakerVersion")
-		}
-		if versionField.Int() != 9 {
-			t.Fatalf("expected breakerVersion 9, got %d", versionField.Int())
+		if got.BreakerVersion != 9 {
+			t.Fatalf("expected breakerVersion 9, got %d", got.BreakerVersion)
 		}
 	default:
 		t.Fatalf("expected throttled response delivered")
-	}
-
-	cached := s.throttleHost["h1"]
-	if cached == nil {
-		t.Fatalf("expected throttle cache entry for host")
-	}
-	cacheValue := reflect.ValueOf(cached).Elem()
-	stateField := cacheValue.FieldByName("State")
-	if !stateField.IsValid() {
-		t.Fatalf("expected cached breaker State field")
-	}
-	if stateField.String() != "open" {
-		t.Fatalf("expected cached breaker state=open, got %q", stateField.String())
-	}
-	openUntilField := cacheValue.FieldByName("OpenUntil")
-	if !openUntilField.IsValid() {
-		t.Fatalf("expected cached breaker OpenUntil field")
-	}
-	openUntilTime, ok := openUntilField.Interface().(time.Time)
-	if !ok {
-		t.Fatalf("expected cached OpenUntil to be time.Time, got %T", openUntilField.Interface())
-	}
-	if gotOpenUntil := int(openUntilTime.Unix()); gotOpenUntil != breakerOpenUntil {
-		t.Fatalf("expected cached OpenUntil=%d, got %d", breakerOpenUntil, gotOpenUntil)
-	}
-	codeField := cacheValue.FieldByName("Code")
-	if !codeField.IsValid() {
-		t.Fatalf("expected cached breaker Code field")
-	}
-	if int(codeField.Int()) != 429 {
-		t.Fatalf("expected cached Code=429, got %d", codeField.Int())
-	}
-	reasonField := cacheValue.FieldByName("Reason")
-	if !reasonField.IsValid() {
-		t.Fatalf("expected cached breaker Reason field")
-	}
-	if reasonField.String() != "http_429" {
-		t.Fatalf("expected cached Reason=http_429, got %q", reasonField.String())
-	}
-	versionField := cacheValue.FieldByName("Version")
-	if !versionField.IsValid() {
-		t.Fatalf("expected cached breaker Version field")
-	}
-	if versionField.Int() != 9 {
-		t.Fatalf("expected cached Version=9, got %d", versionField.Int())
 	}
 }
 

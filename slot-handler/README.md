@@ -64,12 +64,12 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - 仓库包含高 backlog 调度基准：`BenchmarkPickNextInFlightBatch_HeapEngine_Backlog`（`slot-handler/internal/slothandler/fq_scheduler_benchmark_test.go`）。
 - 复现实测基准命令：`go -C ./slot-handler test ./internal/slothandler -run '^$' -bench 'BenchmarkPickNextInFlightBatch_HeapEngine_Backlog' -benchmem -count=3`。
 
-### 2.5 Shared breaker mirror（只镜像共享状态）
+### 2.5 Shared breaker 结果透传（无本地权威）
 
-- 共享 breaker 的运行时真源只有数据库 `THROTTLE_PROTECTION`；slot-handler 只缓存数据库返回的原始 breaker 元数据：`state/open_until/reason/version/last_error_code`。
-- state machine 固定为 `closed/open/half_open`；slot-handler 本地短路条件只有一个：共享状态是 `open`，并且 `open_until` 仍然晚于当前时间。
-- acquire/release 只处理公平队列上下文，不携带额外的 breaker 时间窗参数，也不会在本地合成新的 breaker 状态。
-- `half_open` 探针领取权不在 slot-handler；只有 worker 会在真正发起上游请求前调用 `download_claim_breaker_probe`。
+- 共享 breaker 的运行时真源只有数据库 `THROTTLE_PROTECTION`；slot-handler 不维护 breaker 本地权威、镜像或缓存。
+- `probeOnce` 只调用 backend `TryAcquireBatch`；若 backend / `fq_try_acquire_batch` 返回 `THROTTLED`，slot-handler 只把 `throttleCode`、`breakerOpenUntil`、`breakerReason`、`breakerVersion` 原样投递给 waiter。
+- acquire/release 只处理公平队列上下文，不携带额外的 breaker 时间窗参数，也不会在本地推进 `open -> half_open` 或生成 probe lease。
+- `half_open` 探针领取与带版本的 sample 回写只发生在 worker -> `download_claim_breaker_probe` / `download_report_breaker_sample` 路径，slot-handler 不参与该状态机。
 
 ---
 
@@ -88,7 +88,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - `queryToken`
 - `slotToken`（granted 时）
 - `throttleCode`（throttled 时）
-- `breakerOpenUntil` / `breakerReason` / `breakerVersion`（throttled 时，直接镜像共享 breaker 元数据）
+- `breakerOpenUntil` / `breakerReason` / `breakerVersion`（throttled 时，直接透传 backend 返回的共享 breaker 元数据）
 - `reason`：`overloaded` 时为 `overload_global|overload_host|overload_site|overload_ip`
 - `retryAfter`：`overloaded` 时的建议重试秒数
 
@@ -326,6 +326,7 @@ slot-handler 依赖以下函数（名称可在配置中改）：
 
 - worker 调用 `acquire/release`；`acquire` 返回 `pending` 时持续轮询。
 - `queryToken` 是排队位置的唯一标识；在 `graceMs` 内重试可延续公平性。
+- worker 自己处理 breaker 权威路径：读取快照、领取 `half_open` 探针、并在响应后带 `p_probe_version` 回写；slot-handler 不保存任何 breaker 运行时状态。
 - `overloaded` 表示 in-flight 超限，worker 按 scope 分流处理：
   - `overload_global`：fail-fast 返回 `503`，并携带 `Retry-After`。
   - `overload_host|overload_site|overload_ip`：有界等待后重试（0.5s 递进到 2.0s，单次不超过 2.0s）。

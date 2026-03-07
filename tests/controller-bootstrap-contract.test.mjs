@@ -574,6 +574,7 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
     assert.equal(rpcBody.p_open_threshold_percent, 35);
     assert.equal(rpcBody.p_ewma_span, 11);
     assert.equal(rpcBody.p_consecutive_threshold, 6);
+    assert.equal(rpcBody.p_probe_version, null);
     assert.equal(rpcBody.p_retry_after_seconds, null);
     assert.deepEqual(Object.keys(rpcBody).sort(), [
       'p_consecutive_threshold',
@@ -583,6 +584,7 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
       'p_now',
       'p_open_cap_seconds',
       'p_open_threshold_percent',
+      'p_probe_version',
       'p_retry_after_seconds',
       'p_sample',
       'p_status_code',

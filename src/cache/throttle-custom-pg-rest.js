@@ -49,6 +49,7 @@ const emptyBreakerSnapshot = () => ({
   openUntil: null,
   reason: null,
   version: null,
+  probeLeaseUntil: null,
   lastErrorCode: null,
 });
 
@@ -82,11 +83,14 @@ const readBreakerSnapshot = (row, options = {}) => {
     openUntil: parseNullableInt(readBreakerField(row, 'OPEN_UNTIL')),
     reason: normalizeBreakerReason(readBreakerField(row, 'OPEN_REASON')),
     version: parseNullableInt(readBreakerField(row, 'VERSION')),
+    probeLeaseUntil: options.includeProbeLeaseUntil
+      ? parseNullableInt(readBreakerField(row, 'PROBE_LEASE_UNTIL'))
+      : undefined,
     lastErrorCode: parseNullableInt(readBreakerField(row, 'LAST_ERROR_CODE')),
   };
 
-  if (options.includeProbeLeaseUntil) {
-    snapshot.probeLeaseUntil = parseNullableInt(readBreakerField(row, 'PROBE_LEASE_UNTIL'));
+  if (!options.includeProbeLeaseUntil) {
+    delete snapshot.probeLeaseUntil;
   }
 
   if (options.includeProbeGranted) {
@@ -212,7 +216,7 @@ const executeBreakerRpc = async (postgrestUrl, verifyHeader, verifySecret, rpcNa
  * @param {string} config.postgrestUrl - PostgREST API endpoint
  * @param {string|string[]} config.verifyHeader - Authentication header name(s)
  * @param {string|string[]} config.verifySecret - Authentication header value(s)
- * @returns {Promise<{recordExists: boolean, state: string|null, openUntil: number|null, reason: string|null, version: number|null, lastErrorCode: number|null} | null>}
+ * @returns {Promise<{recordExists: boolean, state: string|null, openUntil: number|null, reason: string|null, version: number|null, probeLeaseUntil: number|null, lastErrorCode: number|null} | null>}
  */
 export const getBreakerState = async (hostname, config) => {
   if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
@@ -249,7 +253,7 @@ export const getBreakerState = async (hostname, config) => {
 
   const result = records[0];
 
-  return readBreakerSnapshot(result);
+  return readBreakerSnapshot(result, { includeProbeLeaseUntil: true });
 };
 
 /**
@@ -330,9 +334,13 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
   const retryAfterSecondsRaw = Number.isFinite(updateData?.retryAfterSeconds)
     ? Number(updateData.retryAfterSeconds)
     : Number.parseInt(updateData?.retryAfterSeconds, 10);
+  const probeVersionRaw = Number.isFinite(updateData?.probeVersion)
+    ? Number(updateData.probeVersion)
+    : Number.parseInt(updateData?.probeVersion, 10);
   const retryAfterSeconds = Number.isFinite(retryAfterSecondsRaw) && retryAfterSecondsRaw > 0
     ? Math.max(1, Math.ceil(retryAfterSecondsRaw))
     : null;
+  const probeVersion = Number.isFinite(probeVersionRaw) ? Math.trunc(probeVersionRaw) : null;
 
   if (!Number.isFinite(statusCode)) {
     console.warn('[Throttle] Skip reportBreakerSample: invalid statusCode:', updateData?.statusCode);
@@ -364,6 +372,7 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
       p_open_threshold_percent: thresholds.openThresholdPercent,
       p_ewma_span: thresholds.ewmaSpan,
       p_consecutive_threshold: thresholds.consecutiveThreshold,
+      p_probe_version: probeVersion,
       p_retry_after_seconds: retryAfterSeconds,
     },
   );

@@ -88,9 +88,7 @@ func TestUpdateRuntimeResetState_NoRaceAcrossOwnedMutexes(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < accessLoops; i++ {
-			now := time.Now()
-			s.setThrottleState("h1", fqThrottleState{State: "open", OpenUntil: now.Add(time.Second), Code: 429, Reason: "http_429", Version: 1})
-			_ = s.getThrottleState("h1", now)
+			s.getOrCreateFlowScheduler("h2")
 		}
 	}()
 
@@ -192,45 +190,5 @@ func TestRuntimeStatePruneRemovesStaleEntries(t *testing.T) {
 	}
 	if _, ok := s.smoothReleasers["fresh-host"]; !ok {
 		t.Fatalf("expected fresh smooth releaser key to remain")
-	}
-}
-
-func TestRuntimeStatePruneRemovesExpiredThrottleMirrorEntries(t *testing.T) {
-	s := newTestServer()
-	now := time.Unix(1_700_000_000, 0)
-
-	s.throttleHost = map[string]*fqThrottleState{
-		"stale-host": {
-			State:     "open",
-			OpenUntil: now.Add(-5 * time.Second),
-			Code:      429,
-			Reason:    "http_429",
-			Version:   1,
-		},
-		"closed-host": {
-			State:   "closed",
-			Code:    503,
-			Reason:  "http_503",
-			Version: 2,
-		},
-		"fresh-host": {
-			State:     "open",
-			OpenUntil: now.Add(25 * time.Second),
-			Code:      429,
-			Reason:    "http_429",
-			Version:   3,
-		},
-	}
-
-	s.pruneRuntimeState(now, 10*time.Second)
-
-	if _, ok := s.throttleHost["stale-host"]; ok {
-		t.Fatalf("expected expired throttle cache entry to be pruned")
-	}
-	if _, ok := s.throttleHost["closed-host"]; ok {
-		t.Fatalf("expected non-open throttle cache entry to be pruned")
-	}
-	if _, ok := s.throttleHost["fresh-host"]; !ok {
-		t.Fatalf("expected fresh throttle cache entry to remain")
 	}
 }

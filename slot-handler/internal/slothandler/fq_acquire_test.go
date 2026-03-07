@@ -124,118 +124,84 @@ func TestAcquireTokenMismatchDoesNotDeleteFlow(t *testing.T) {
 	}
 }
 
-func TestAcquireCachedThrottleStaleTokenReturnsTimeoutAndKeepsForeignFlow(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
-	now := time.Unix(1_700_000_100, 0)
-	s.flowStore.nowFn = func() time.Time {
-		return now
-	}
-
-	staleTok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	foreignTok := s.flowStore.newFlow("h1", "example.com", "ip-foreign", "s1")
-	s.flowStore.detachWithGrace(staleTok, now)
-	now = now.Add(41 * time.Millisecond)
-	s.setThrottleState("h1", fqThrottleState{State: "open", OpenUntil: now.Add(15 * time.Second), Code: 429, Reason: "http_429", Version: 1})
-
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip1",
-		SiteBucket:   "s1",
-		QueryToken:   staleTok,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Result != "timeout" || resp.Reason != "query_token_stale" {
-		t.Fatalf("expected stale timeout under cached throttle, got %+v", resp)
-	}
-	if _, ok := s.flowStore.getSnapshot(foreignTok); !ok {
-		t.Fatalf("expected foreign flow to survive stale token check")
-	}
-}
-
-func TestAcquireCachedThrottleMismatchReturnsTimeoutAndKeepsOriginalFlow(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
-	now := time.Unix(1_700_000_200, 0)
-	s.flowStore.nowFn = func() time.Time {
-		return now
-	}
-
-	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	s.setThrottleState("h1", fqThrottleState{State: "open", OpenUntil: now.Add(15 * time.Second), Code: 429, Reason: "http_429", Version: 1})
-
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip-other",
-		SiteBucket:   "s1",
-		QueryToken:   tok,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Result != "timeout" || resp.Reason != "query_token_mismatch" {
-		t.Fatalf("expected mismatch timeout under cached throttle, got %+v", resp)
-	}
-	if _, ok := s.flowStore.getSnapshot(tok); !ok {
-		t.Fatalf("expected original flow to survive cached throttle mismatch")
-	}
-}
-
-func TestAcquireCachedThrottleValidTokenReturnsThrottledAndDeletesOwnFlow(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
+func TestAcquireBackendThrottledResponseDeletesOwnFlow(t *testing.T) {
 	now := time.Unix(1_700_000_300, 0)
-	s.flowStore.nowFn = func() time.Time {
-		return now
-	}
-
-	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	foreignTok := s.flowStore.newFlow("h1", "example.com", "ip-foreign", "s1")
-	s.setThrottleState("h1", fqThrottleState{State: "open", OpenUntil: now.Add(15 * time.Second), Code: 429, Reason: "http_429", Version: 1})
-
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip1",
-		SiteBucket:   "s1",
-		QueryToken:   tok,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Result != "throttled" || resp.Reason != "throttle_cached" {
-		t.Fatalf("expected cached throttled response, got %+v", resp)
-	}
-	if resp.QueryToken != "" {
-		t.Fatalf("expected throttled response shape to stay terminal, got queryToken=%q", resp.QueryToken)
-	}
-	if _, ok := s.flowStore.getSnapshot(tok); ok {
-		t.Fatalf("expected valid token flow deleted after cached throttle")
-	}
-	if _, ok := s.flowStore.getSnapshot(foreignTok); !ok {
-		t.Fatalf("expected foreign flow to survive valid token cleanup")
-	}
-}
-
-func TestAcquirePollWindowConvergesToCachedThrottleInsteadOfPending(t *testing.T) {
+	breakerOpenUntil := int(now.Add(15 * time.Second).Unix())
+	backend := &sequenceBackend{seq: []*tryAcquireResult{{
+		status:           "THROTTLED",
+		throttleCode:     429,
+		breakerOpenUntil: breakerOpenUntil,
+		breakerReason:    "http_429",
+		breakerVersion:   1,
+	}, {status: "WAIT"}}}
 	s := newTestServer()
-	cfg := testConfigForAcquire(20*time.Millisecond, 40*time.Millisecond)
-	backend := &sequenceBackend{seq: []*tryAcquireResult{{status: "WAIT"}}}
+	cfg := testConfigForAcquire(5*time.Millisecond, 40*time.Millisecond)
 	s.updateRuntime(cfg, backend, "test", false)
 	s.flowStore.afterFunc = nil
+	s.flowStore.nowFn = func() time.Time { return now }
+	defer s.stopAllHostProbeRunners()
+
+	throttledResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if throttledResp.Result != "throttled" || throttledResp.Reason != "try_acquire_throttled" {
+		t.Fatalf("expected backend throttled response, got %+v", throttledResp)
+	}
+	if throttledResp.QueryToken == "" {
+		t.Fatalf("expected backend throttled response to carry its flow token")
+	}
+	if throttledResp.ThrottleCode != 429 || throttledResp.BreakerOpenUntil != breakerOpenUntil || throttledResp.BreakerReason != "http_429" || throttledResp.BreakerVersion != 1 {
+		t.Fatalf("expected breaker metadata copied from backend, got %+v", throttledResp)
+	}
+	if _, ok := s.flowStore.getSnapshot(throttledResp.QueryToken); ok {
+		t.Fatalf("expected backend throttled flow deleted after terminal delivery")
+	}
+
+	pendingResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip2",
+		SiteBucket:   "s1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pendingResp.Result != "pending" {
+		t.Fatalf("expected later acquire to re-enter backend authority, got %+v", pendingResp)
+	}
+	if pendingResp.QueryToken == "" {
+		t.Fatalf("expected later acquire to create a new query token")
+	}
+
+	backend.mu.Lock()
+	calls := backend.calls
+	backend.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("expected backend to be consulted twice, got %d calls", calls)
+	}
+}
+
+func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(50*time.Millisecond, 40*time.Millisecond)
+	now := time.Unix(1_700_000_600, 0)
+	breakerOpenUntil := int(now.Add(15 * time.Second).Unix())
+	backend := &sequenceBackend{seq: []*tryAcquireResult{{status: "WAIT"}, {
+		status:           "THROTTLED",
+		throttleCode:     429,
+		breakerOpenUntil: breakerOpenUntil,
+		breakerReason:    "http_429",
+		breakerVersion:   7,
+	}, {status: "WAIT"}}}
+	s.updateRuntime(cfg, backend, "test", false)
+	s.flowStore.afterFunc = nil
+	s.flowStore.nowFn = func() time.Time { return now }
 	defer s.stopAllHostProbeRunners()
 
 	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
@@ -290,10 +256,7 @@ func TestAcquirePollWindowConvergesToCachedThrottleInsteadOfPending(t *testing.T
 		}
 	}
 
-	now := time.Now()
-	s.setThrottleState("h1", fqThrottleState{State: "open", OpenUntil: now.Add(15 * time.Second), Code: 429, Reason: "http_429", Version: 1})
-
-	fastResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+	secondResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
 		Hostname:     "example.com",
 		HostnameHash: "h1",
 		IPBucket:     "ip-new",
@@ -302,16 +265,16 @@ func TestAcquirePollWindowConvergesToCachedThrottleInsteadOfPending(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fastResp.Result != "throttled" || fastResp.Reason != "throttle_cached" {
-		t.Fatalf("expected new acquire to hit throttle cache, got %+v", fastResp)
+	if secondResp.Result != "throttled" || secondResp.Reason != "try_acquire_throttled" {
+		t.Fatalf("expected second acquire to converge from backend throttled row, got %+v", secondResp)
 	}
 
 	select {
 	case err := <-errCh:
 		t.Fatal(err)
 	case resp := <-respCh:
-		if resp == nil || resp.Result != "throttled" || resp.Reason != "throttle_cached" {
-			t.Fatalf("expected waiting acquire to converge to cached throttle, got %+v", resp)
+		if resp == nil || resp.Result != "throttled" || resp.Reason != "try_acquire_throttled" {
+			t.Fatalf("expected waiting acquire to converge from backend throttled row, got %+v", resp)
 		}
 		if resp.QueryToken != tok {
 			t.Fatalf("expected throttled response to retain token %q, got %+v", tok, resp)
@@ -321,7 +284,36 @@ func TestAcquirePollWindowConvergesToCachedThrottleInsteadOfPending(t *testing.T
 	}
 
 	if _, ok := s.flowStore.getSnapshot(tok); ok {
-		t.Fatalf("expected throttled converge path to delete flow")
+		t.Fatalf("expected backend throttled converge path to delete first flow")
+	}
+	if secondResp.QueryToken == "" {
+		t.Fatalf("expected second acquire throttled response to retain its flow token")
+	}
+	if _, ok := s.flowStore.getSnapshot(secondResp.QueryToken); ok {
+		t.Fatalf("expected backend throttled converge path to delete second flow")
+	}
+
+	thirdResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip-third",
+		SiteBucket:   "s1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thirdResp.Result != "pending" {
+		t.Fatalf("expected acquire after backend convergence to stay on backend authority, got %+v", thirdResp)
+	}
+	if thirdResp.QueryToken == "" {
+		t.Fatalf("expected acquire after backend convergence to create a new token")
+	}
+
+	backend.mu.Lock()
+	calls := backend.calls
+	backend.mu.Unlock()
+	if calls != 4 {
+		t.Fatalf("expected backend sequence to consume four per-request calls (1+2+1), got %d", calls)
 	}
 }
 
