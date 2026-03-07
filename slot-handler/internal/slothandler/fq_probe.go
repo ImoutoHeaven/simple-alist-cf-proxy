@@ -24,9 +24,11 @@ type probeSubBatchResult struct {
 }
 
 type throttledLatch struct {
-	hit        bool
-	code       int
-	retryAfter int
+	hit       bool
+	code      int
+	openUntil int
+	reason    string
+	version   int64
 }
 
 const (
@@ -317,6 +319,17 @@ func (s *server) pruneRuntimeState(now time.Time, staleAfter time.Duration) {
 	}
 	s.utilMu.Unlock()
 
+	s.throttleMu.Lock()
+	for key, state := range s.throttleHost {
+		if !shouldKeepThrottleState(state, now) {
+			delete(s.throttleHost, key)
+		}
+	}
+	if len(s.throttleHost) == 0 {
+		s.throttleHost = nil
+	}
+	s.throttleMu.Unlock()
+
 	s.smoothMu.Lock()
 	for key, releaser := range s.smoothReleasers {
 		if releaser == nil {
@@ -600,7 +613,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	}
 
 	// THROTTLED global convergence: if cached, deliver throttled without backend calls.
-	if protected, code, retryAfter := s.getThrottleState(hostKey, now); protected {
+	if state := s.getThrottleState(hostKey, now); state != nil {
 		// Ignore deny windows while throttled; we want fast convergence.
 		for _, snap := range inFlight {
 			tok := snap.Token
@@ -608,13 +621,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 				continue
 			}
 			s.incrementMetric("throttled")
-			_ = store.deliverToWaiter(tok, &AcquireResponse{
-				Result:       "throttled",
-				QueryToken:   tok,
-				ThrottleCode: code,
-				ThrottleWait: retryAfter,
-				Reason:       "throttle_cached",
-			})
+			_ = store.deliverToWaiter(tok, throttledAcquireResponse(tok, "throttle_cached", state))
 			store.deleteFlow(tok)
 		}
 		return true
@@ -634,7 +641,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	timeout := computeProbeCallTimeout(cfg.FairQueue.pollInterval())
 	reqs := make([]AcquireRequest, 0, len(batch))
 	for _, snap := range batch {
-		req := s.buildAcquireRequest(cfg, snap.Hostname, snap.HostnameHash, snap.IPBucket, snap.SiteBucket, 0, now)
+		req := s.buildAcquireRequest(cfg, snap.Hostname, snap.HostnameHash, snap.IPBucket, snap.SiteBucket, now)
 		reqs = append(reqs, req)
 	}
 
@@ -698,12 +705,23 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 					continue
 				}
 				if strings.EqualFold(strings.TrimSpace(res.status), "THROTTLED") {
-					ra := res.throttleRetryAfter
-					if ra <= 0 {
-						ra = 1
+					state := fqThrottleState{
+						State:   "open",
+						Code:    res.throttleCode,
+						Reason:  res.breakerReason,
+						Version: res.breakerVersion,
 					}
-					throttled = throttledLatch{hit: true, code: res.throttleCode, retryAfter: ra}
-					s.setThrottleState(hostKey, now, res.throttleCode, ra)
+					if res.breakerOpenUntil > 0 {
+						state.OpenUntil = time.Unix(int64(res.breakerOpenUntil), 0).UTC()
+					}
+					throttled = throttledLatch{
+						hit:       true,
+						code:      res.throttleCode,
+						openUntil: res.breakerOpenUntil,
+						reason:    res.breakerReason,
+						version:   res.breakerVersion,
+					}
+					s.setThrottleState(hostKey, state)
 					cancel()
 					break
 				}
@@ -814,6 +832,15 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	}
 
 	if throttled.hit {
+		state := &fqThrottleState{
+			State:   "open",
+			Code:    throttled.code,
+			Reason:  throttled.reason,
+			Version: throttled.version,
+		}
+		if throttled.openUntil > 0 {
+			state.OpenUntil = time.Unix(int64(throttled.openUntil), 0).UTC()
+		}
 		for range resultCh {
 		}
 		inFlight2 := store.listInFlightByHost(hostKey, now)
@@ -823,13 +850,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 				continue
 			}
 			s.incrementMetric("throttled")
-			_ = store.deliverToWaiter(tok, &AcquireResponse{
-				Result:       "throttled",
-				QueryToken:   tok,
-				ThrottleCode: throttled.code,
-				ThrottleWait: throttled.retryAfter,
-				Reason:       "try_acquire_throttled",
-			})
+			_ = store.deliverToWaiter(tok, throttledAcquireResponse(tok, "try_acquire_throttled", state))
 			store.deleteFlow(tok)
 		}
 	}

@@ -2,6 +2,7 @@ package slothandler
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -159,7 +160,7 @@ func (b *throttledSiblingBackend) TryAcquireBatch(ctx context.Context, reqs []Ac
 	for i, req := range reqs {
 		switch {
 		case strings.Contains(req.IPBucket, "slow-"):
-			results[i] = &tryAcquireResult{status: "THROTTLED", throttleCode: 429, throttleRetryAfter: 15}
+			results[i] = &tryAcquireResult{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Now().Add(15 * time.Second).Unix()), breakerReason: "http_429", breakerVersion: 1}
 		case strings.Contains(req.IPBucket, "fast-"):
 			results[i] = &tryAcquireResult{status: "ACQUIRED", slotToken: "slot-" + req.IPBucket}
 		default:
@@ -266,7 +267,7 @@ func expectThrottledResponse(t *testing.T, ch <-chan *AcquireResponse, tok strin
 
 	select {
 	case got := <-ch:
-		if got == nil || got.Result != "throttled" || got.QueryToken != tok || got.ThrottleCode != 429 || got.ThrottleWait <= 0 {
+		if got == nil || got.Result != "throttled" || got.QueryToken != tok || got.ThrottleCode != 429 || got.BreakerOpenUntil <= 0 {
 			t.Fatalf("unexpected throttled resp: %+v", got)
 		}
 	case <-time.After(250 * time.Millisecond):
@@ -409,12 +410,22 @@ func TestProbeOnceAcquiredDeliversGrantedAndDownweights(t *testing.T) {
 }
 
 func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
-	backend := &sequenceBackend{seq: []*tryAcquireResult{{status: "THROTTLED", throttleCode: 429, throttleRetryAfter: 15}}}
+	if _, ok := reflect.TypeOf(AcquireResponse{}).FieldByName("ThrottleWait"); ok {
+		t.Fatalf("AcquireResponse must not retain synthesized ThrottleWait field")
+	}
+
+	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+	backend := &sequenceBackend{seq: []*tryAcquireResult{{
+		status:           "THROTTLED",
+		throttleCode:     429,
+		breakerOpenUntil: int(now.Add(15 * time.Second).Unix()),
+		breakerReason:    "http_429",
+		breakerVersion:   1,
+	}}}
 	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
 	s := newTestServer()
 	s.updateRuntime(cfg, backend, "test", true)
 
-	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
 	store := s.flowStore
 	tok := store.newFlow("h1", "example.com", "ip1", "s1")
 	respCh := make(chan *AcquireResponse, 2)
@@ -427,7 +438,7 @@ func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
 	}
 	select {
 	case got := <-respCh:
-		if got == nil || got.Result != "throttled" || got.ThrottleCode != 429 || got.ThrottleWait <= 0 {
+		if got == nil || got.Result != "throttled" || got.ThrottleCode != 429 || got.BreakerOpenUntil <= 0 {
 			t.Fatalf("unexpected throttled resp: %+v", got)
 		}
 	default:
@@ -438,9 +449,9 @@ func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
 		t.Fatalf("expected flow deleted after throttled")
 	}
 
-	protected, code, retry := s.getThrottleState("h1", now.Add(1*time.Second))
-	if !protected || code != 429 || retry <= 0 {
-		t.Fatalf("expected throttle cache set, got protected=%v code=%d retry=%d", protected, code, retry)
+	state := s.getThrottleState("h1", now.Add(1*time.Second))
+	if state == nil || state.Code != 429 {
+		t.Fatalf("expected throttle cache set, got state=%+v", state)
 	}
 
 	// In cache window, attach a new in-flight waiter and ensure short-circuit deliver
@@ -473,9 +484,111 @@ func TestProbeOnceThrottledCachesAndDeliversThrottled(t *testing.T) {
 	}
 }
 
+func TestProbeOnceCachesSharedBreakerState(t *testing.T) {
+	now := time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)
+	breakerOpenUntil := int(now.Add(15 * time.Second).Unix())
+	backend := &sequenceBackend{seq: []*tryAcquireResult{{
+		status:           "THROTTLED",
+		throttleCode:     429,
+		breakerOpenUntil: breakerOpenUntil,
+		breakerReason:    "http_429",
+		breakerVersion:   9,
+	}}}
+	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	store := s.flowStore
+	tok := store.newFlow("h1", "example.com", "ip1", "s1")
+	respCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiter")
+	}
+
+	select {
+	case got := <-respCh:
+		if got == nil || got.Result != "throttled" || got.ThrottleCode != 429 {
+			t.Fatalf("unexpected throttled resp: %+v", got)
+		}
+		respValue := reflect.ValueOf(got).Elem()
+		openUntilField := respValue.FieldByName("BreakerOpenUntil")
+		if !openUntilField.IsValid() {
+			t.Fatalf("expected AcquireResponse to carry raw breakerOpenUntil")
+		}
+		if gotOpenUntil := int(openUntilField.Int()); gotOpenUntil != breakerOpenUntil {
+			t.Fatalf("expected breakerOpenUntil=%d, got %d", breakerOpenUntil, gotOpenUntil)
+		}
+		reasonField := respValue.FieldByName("BreakerReason")
+		if !reasonField.IsValid() {
+			t.Fatalf("expected AcquireResponse to carry raw breakerReason")
+		}
+		if reasonField.String() != "http_429" {
+			t.Fatalf("expected breakerReason http_429, got %q", reasonField.String())
+		}
+		versionField := respValue.FieldByName("BreakerVersion")
+		if !versionField.IsValid() {
+			t.Fatalf("expected AcquireResponse to carry raw breakerVersion")
+		}
+		if versionField.Int() != 9 {
+			t.Fatalf("expected breakerVersion 9, got %d", versionField.Int())
+		}
+	default:
+		t.Fatalf("expected throttled response delivered")
+	}
+
+	cached := s.throttleHost["h1"]
+	if cached == nil {
+		t.Fatalf("expected throttle cache entry for host")
+	}
+	cacheValue := reflect.ValueOf(cached).Elem()
+	stateField := cacheValue.FieldByName("State")
+	if !stateField.IsValid() {
+		t.Fatalf("expected cached breaker State field")
+	}
+	if stateField.String() != "open" {
+		t.Fatalf("expected cached breaker state=open, got %q", stateField.String())
+	}
+	openUntilField := cacheValue.FieldByName("OpenUntil")
+	if !openUntilField.IsValid() {
+		t.Fatalf("expected cached breaker OpenUntil field")
+	}
+	openUntilTime, ok := openUntilField.Interface().(time.Time)
+	if !ok {
+		t.Fatalf("expected cached OpenUntil to be time.Time, got %T", openUntilField.Interface())
+	}
+	if gotOpenUntil := int(openUntilTime.Unix()); gotOpenUntil != breakerOpenUntil {
+		t.Fatalf("expected cached OpenUntil=%d, got %d", breakerOpenUntil, gotOpenUntil)
+	}
+	codeField := cacheValue.FieldByName("Code")
+	if !codeField.IsValid() {
+		t.Fatalf("expected cached breaker Code field")
+	}
+	if int(codeField.Int()) != 429 {
+		t.Fatalf("expected cached Code=429, got %d", codeField.Int())
+	}
+	reasonField := cacheValue.FieldByName("Reason")
+	if !reasonField.IsValid() {
+		t.Fatalf("expected cached breaker Reason field")
+	}
+	if reasonField.String() != "http_429" {
+		t.Fatalf("expected cached Reason=http_429, got %q", reasonField.String())
+	}
+	versionField := cacheValue.FieldByName("Version")
+	if !versionField.IsValid() {
+		t.Fatalf("expected cached breaker Version field")
+	}
+	if versionField.Int() != 9 {
+		t.Fatalf("expected cached Version=9, got %d", versionField.Int())
+	}
+}
+
 func TestProbeOnceThrottledSameSubBatchReleaseCompensatesAcquired(t *testing.T) {
 	backend := &releaseRecordingBackend{
-		sequenceBackend: sequenceBackend{seq: []*tryAcquireResult{{status: "THROTTLED", throttleCode: 429, throttleRetryAfter: 15}, {status: "ACQUIRED", slotToken: "slot-same-sub-batch"}}},
+		sequenceBackend: sequenceBackend{seq: []*tryAcquireResult{{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Date(2026, 2, 20, 9, 0, 15, 0, time.UTC).Unix()), breakerReason: "http_429", breakerVersion: 1}, {status: "ACQUIRED", slotToken: "slot-same-sub-batch"}}},
 		released:        make(chan ReleaseRequest, 1),
 	}
 	cfg := &Config{FairQueue: FairQueueConfig{
@@ -554,7 +667,7 @@ func TestProbeOnceThrottledSameSubBatchReleaseCompensatesAcquired(t *testing.T) 
 
 func TestProbeOnceThrottledSameSubBatchLaterRowBeatsEarlierAcquire(t *testing.T) {
 	backend := &releaseRecordingBackend{
-		sequenceBackend: sequenceBackend{seq: []*tryAcquireResult{{status: "ACQUIRED", slotToken: "slot-earlier-acquire"}, {status: "THROTTLED", throttleCode: 429, throttleRetryAfter: 15}}},
+		sequenceBackend: sequenceBackend{seq: []*tryAcquireResult{{status: "ACQUIRED", slotToken: "slot-earlier-acquire"}, {status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Date(2026, 2, 20, 9, 10, 15, 0, time.UTC).Unix()), breakerReason: "http_429", breakerVersion: 1}}},
 		released:        make(chan ReleaseRequest, 1),
 	}
 	cfg := &Config{FairQueue: FairQueueConfig{

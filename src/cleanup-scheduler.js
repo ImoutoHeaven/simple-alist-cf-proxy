@@ -16,7 +16,6 @@ const deriveCleanupProbability = (config) => {
   const candidates = [
     config?.cacheConfig?.cleanupProbability,
     config?.rateLimitConfig?.cleanupProbability,
-    config?.throttleConfig?.cleanupProbability,
   ];
 
   for (const candidate of candidates) {
@@ -102,37 +101,6 @@ const executePostgrestDelete = async (postgrestUrl, verifyHeader, verifySecret, 
   return Array.isArray(payload) ? payload.length : 0;
 };
 
-const executePostgrestRpc = async (postgrestUrl, verifyHeader, verifySecret, functionName, body) => {
-  const baseUrl = normalizePostgrestUrl(postgrestUrl);
-  const targetUrl = `${baseUrl}/rpc/${functionName}`;
-
-  const headers = {
-    'Content-Type': 'application/json',
-  };
-  applyVerifyHeaders(headers, verifyHeader, verifySecret);
-
-  const response = await fetch(targetUrl, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`PostgREST RPC cleanup failed (${response.status}): ${errorText}`);
-  }
-
-  const contentType = response.headers.get('content-type');
-  if (contentType && contentType.includes('application/json')) {
-    const payload = await response.json();
-    if (typeof payload === 'number') {
-      return payload;
-    }
-  }
-
-  return 0;
-};
-
 const buildCustomPgRestCleanupTasks = (config) => {
   const tasks = [];
 
@@ -173,27 +141,6 @@ const buildCustomPgRestCleanupTasks = (config) => {
           table,
           filters,
           { Prefer: 'return=representation' }
-        );
-      },
-    });
-  }
-
-  if (config.throttleEnabled && config.throttleConfig) {
-    const throttleConfig = config.throttleConfig;
-    tasks.push({
-      name: 'Throttle',
-      fn: async () => {
-        const table = throttleConfig.tableName || 'THROTTLE_PROTECTION';
-        const ttlSeconds = throttleConfig.throttleTimeWindow * 2;
-        return executePostgrestRpc(
-          throttleConfig.postgrestUrl,
-          throttleConfig.verifyHeader,
-          throttleConfig.verifySecret,
-          'download_cleanup_throttle_protection',
-          {
-            p_ttl_seconds: ttlSeconds,
-            p_table_name: table,
-          }
         );
       },
     });
@@ -244,19 +191,6 @@ export async function scheduleAllCleanups(config, env, ctx) {
     return;
   }
 
-  const cleanupProbability = deriveCleanupProbability(config);
-  if (cleanupProbability <= 0) {
-    return;
-  }
-
-  if (Math.random() >= cleanupProbability) {
-    return;
-  }
-
-  console.log(
-    `[Cleanup Scheduler] Triggered (${formatPercentageLabel(cleanupProbability)}% probability)`
-  );
-
   const cleanupTasks = buildCustomPgRestCleanupTasks(config);
 
   if (
@@ -275,9 +209,21 @@ export async function scheduleAllCleanups(config, env, ctx) {
   }
 
   if (cleanupTasks.length === 0) {
-    console.warn('[Cleanup Scheduler] No cleanup tasks scheduled (features disabled or misconfigured)');
     return;
   }
+
+  const cleanupProbability = deriveCleanupProbability(config);
+  if (cleanupProbability <= 0) {
+    return;
+  }
+
+  if (Math.random() >= cleanupProbability) {
+    return;
+  }
+
+  console.log(
+    `[Cleanup Scheduler] Triggered (${formatPercentageLabel(cleanupProbability)}% probability)`
+  );
 
   const cleanupPromise = Promise.allSettled(
     cleanupTasks.map((task) =>

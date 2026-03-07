@@ -1,4 +1,7 @@
 import { sha256Hash, applyVerifyHeaders, hasVerifyCredentials } from '../utils.js';
+const BREAKER_TABLE = 'THROTTLE_PROTECTION';
+const DEFAULT_PROBE_LEASE_SECONDS = 15;
+const VALID_BREAKER_STATES = new Set(['closed', 'open', 'half_open']);
 
 const sanitizeThresholds = (config) => {
   const toInt = (value, fallback) => {
@@ -6,21 +9,91 @@ const sanitizeThresholds = (config) => {
     return Number.isFinite(parsed) ? parsed : fallback;
   };
 
-  const baseMinSample = Math.max(1, toInt(config.minSampleCount, 8));
-  const baseErrorRatio = Math.max(0, toInt(config.errorRatioPercent, 20));
-  const fastMinSampleRaw = toInt(config.fastMinSampleCount, 4);
-  const fastMinSample = fastMinSampleRaw <= 0 ? 0 : Math.max(1, fastMinSampleRaw);
-  const fastErrorRatio = Math.max(0, toInt(config.fastErrorRatioPercent, 60));
-
   return {
-    throttleTimeWindow: Math.max(1, toInt(config.throttleTimeWindow, 60)),
-    observeWindowSeconds: Math.max(1, toInt(config.observeWindowSeconds, 60)),
-    errorRatioPercent: baseErrorRatio,
+    openCapSeconds: Math.max(1, toInt(config.openCapSeconds, 60)),
+    openThresholdPercent: Math.max(0, toInt(config.openThresholdPercent, 20)),
+    ewmaSpan: Math.max(1, toInt(config.ewmaSpan, 8)),
     consecutiveThreshold: Math.max(1, toInt(config.consecutiveThreshold, 4)),
-    minSampleCount: baseMinSample,
-    fastErrorRatioPercent: Math.max(baseErrorRatio, fastErrorRatio),
-    fastMinSampleCount: fastMinSample === 0 ? 0 : Math.min(baseMinSample, fastMinSample),
   };
+};
+
+const readBreakerField = (row, upperKey, lowerKey = upperKey.toLowerCase()) => {
+  if (!row || typeof row !== 'object') {
+    return undefined;
+  }
+  if (Object.prototype.hasOwnProperty.call(row, upperKey)) {
+    return row[upperKey];
+  }
+  return row[lowerKey];
+};
+
+const parseNullableInt = (value) => {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isNaN(parsed) ? null : parsed;
+};
+
+const normalizeBreakerState = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  return VALID_BREAKER_STATES.has(normalized) ? normalized : null;
+};
+
+const emptyBreakerSnapshot = () => ({
+  recordExists: false,
+  state: null,
+  openUntil: null,
+  reason: null,
+  version: null,
+  lastErrorCode: null,
+});
+
+const normalizeBreakerReason = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
+};
+
+const parseBoolean = (value) => {
+  if (value === true || value === 1 || value === '1') {
+    return true;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return normalized === 'true' || normalized === 't';
+  }
+  return false;
+};
+
+const readBreakerSnapshot = (row, options = {}) => {
+  if (!row || typeof row !== 'object') {
+    return emptyBreakerSnapshot();
+  }
+
+  const snapshot = {
+    recordExists: true,
+    state: normalizeBreakerState(readBreakerField(row, 'STATE')),
+    openUntil: parseNullableInt(readBreakerField(row, 'OPEN_UNTIL')),
+    reason: normalizeBreakerReason(readBreakerField(row, 'OPEN_REASON')),
+    version: parseNullableInt(readBreakerField(row, 'VERSION')),
+    lastErrorCode: parseNullableInt(readBreakerField(row, 'LAST_ERROR_CODE')),
+  };
+
+  if (options.includeProbeLeaseUntil) {
+    snapshot.probeLeaseUntil = parseNullableInt(readBreakerField(row, 'PROBE_LEASE_UNTIL'));
+  }
+
+  if (options.includeProbeGranted) {
+    snapshot.probeGranted = parseBoolean(readBreakerField(row, 'PROBE_GRANTED'));
+  }
+
+  return snapshot;
 };
 
 /**
@@ -60,16 +133,14 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
 
     // Check if table doesn't exist (PGRST205 error)
     if (response.status === 404 && errorText.includes('PGRST205')) {
-      console.error(
-        `[Throttle] PostgREST table not found: "${tableName}". ` +
+      throw new Error(
+        `PostgREST table not found: "${tableName}". ` +
         `Please create the table manually using init.sql. ` +
         `CREATE TABLE ${tableName} (...) (see init.sql for full schema)`
       );
-      return { data: [], affectedRows: 0 };
     }
 
-    console.error(`[Throttle] PostgREST API error (${response.status}): ${errorText}`);
-    return { data: [], affectedRows: 0 };
+    throw new Error(`PostgREST API error (${response.status}): ${errorText}`);
   }
 
   // For POST/PATCH/DELETE, PostgREST returns the affected rows or empty
@@ -110,19 +181,41 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
   };
 };
 
+const executeBreakerRpc = async (postgrestUrl, verifyHeader, verifySecret, rpcName, body) => {
+  const rpcUrl = `${postgrestUrl}/rpc/${rpcName}`;
+  const rpcHeaders = { 'Content-Type': 'application/json' };
+  applyVerifyHeaders(rpcHeaders, verifyHeader, verifySecret);
+
+  const rpcResponse = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: rpcHeaders,
+    body: JSON.stringify(body),
+  });
+
+  if (!rpcResponse.ok) {
+    const errorText = await rpcResponse.text();
+    throw new Error(`PostgREST RPC ${rpcName} failed (${rpcResponse.status}): ${errorText}`);
+  }
+
+  const rpcResult = await rpcResponse.json();
+  if (!Array.isArray(rpcResult) || rpcResult.length === 0) {
+    throw new Error(`PostgREST RPC ${rpcName} returned no rows`);
+  }
+
+  return rpcResult[0];
+};
+
 /**
- * Check throttle protection status for a hostname
+ * Read the raw breaker snapshot for a hostname
  * @param {string} hostname - Hostname to check
  * @param {Object} config - Throttle configuration
  * @param {string} config.postgrestUrl - PostgREST API endpoint
  * @param {string|string[]} config.verifyHeader - Authentication header name(s)
  * @param {string|string[]} config.verifySecret - Authentication header value(s)
- * @param {string} config.tableName - Table name (defaults to 'THROTTLE_PROTECTION')
- * @param {number} config.throttleTimeWindow - Time window in seconds
- * @returns {Promise<{status: 'normal_operation'|'resume_operation'|'protected', recordExists: boolean, errorCode?: number, retryAfter?: number} | null>}
+ * @returns {Promise<{recordExists: boolean, state: string|null, openUntil: number|null, reason: string|null, version: number|null, lastErrorCode: number|null} | null>}
  */
-export const checkThrottle = async (hostname, config) => {
-  if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret) || !config.throttleTimeWindow) {
+export const getBreakerState = async (hostname, config) => {
+  if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
     return null;
   }
 
@@ -130,253 +223,154 @@ export const checkThrottle = async (hostname, config) => {
     return null;
   }
 
-  try {
-    const { postgrestUrl, verifyHeader, verifySecret } = config;
-    const tableName = config.tableName || 'THROTTLE_PROTECTION';
+  const { postgrestUrl, verifyHeader, verifySecret } = config;
 
-    // Calculate hostname hash
-    const hostnameHash = await sha256Hash(hostname);
-    if (!hostnameHash) {
-      console.error('[Throttle] Failed to calculate hostname hash');
-      return null;
-    }
-
-    // Query throttle protection status using PostgREST filter
-    const filters = `HOSTNAME_HASH=eq.${hostnameHash}`;
-    const queryResult = await executeQuery(
-      postgrestUrl,
-      verifyHeader,
-      verifySecret,
-      tableName,
-      'GET',
-      filters
-    );
-
-    const records = queryResult.data || [];
-
-    if (!records || records.length === 0) {
-      // No record found - normal operation (first time)
-      return { status: 'normal_operation', recordExists: false };
-    }
-
-    const result = records[0];
-
-    // BREAKING CHANGE: IS_PROTECTED semantics
-    //   1 = protected (error detected)
-    //   0 = normal operation (initialized or recovered)
-    //   NULL = invalid state (should not exist in valid records)
-    // Check protection status
-    if (result.IS_PROTECTED === 0) {
-      // Normal operation (record exists with IS_PROTECTED = 0)
-      return { status: 'normal_operation', recordExists: true };
-    } else if (result.IS_PROTECTED !== 1) {
-      // IS_PROTECTED is NULL or other invalid value - treat as normal but log warning
-      console.warn('[Throttle] Invalid IS_PROTECTED value:', result.IS_PROTECTED, 'for hostname:', hostname);
-      return { status: 'normal_operation', recordExists: true };
-    }
-
-    // Protected - check time window
-    const now = Math.floor(Date.now() / 1000);
-    const errorTimestamp = Number.parseInt(result.ERROR_TIMESTAMP, 10);
-    const timeSinceError = now - errorTimestamp;
-
-    if (timeSinceError >= config.throttleTimeWindow) {
-      // Time window expired - resume operation
-      return { status: 'resume_operation', recordExists: true };
-    } else {
-      // Still within time window - protected
-      const retryAfter = config.throttleTimeWindow - timeSinceError;
-      return {
-        status: 'protected',
-        recordExists: true,
-        errorCode: result.LAST_ERROR_CODE || 503,
-        retryAfter,
-      };
-    }
-  } catch (error) {
-    console.error('[Throttle] Check failed:', error.message);
-    return null;
+  // Calculate hostname hash
+  const hostnameHash = await sha256Hash(hostname);
+  if (!hostnameHash) {
+    throw new Error('Failed to calculate hostname hash');
   }
+
+  const filters = `HOSTNAME_HASH=eq.${hostnameHash}`;
+  const queryResult = await executeQuery(
+    postgrestUrl,
+    verifyHeader,
+    verifySecret,
+    BREAKER_TABLE,
+    'GET',
+    filters
+  );
+
+  const records = queryResult.data || [];
+
+  if (!records || records.length === 0) {
+    return emptyBreakerSnapshot();
+  }
+
+  const result = records[0];
+
+  return readBreakerSnapshot(result);
 };
 
 /**
- * Update throttle protection status for a hostname using RPC stored procedure
+ * Claim the single half-open breaker probe lease for a hostname
  * @param {string} hostname - Hostname
- * @param {Object} updateData - Update data
- * @param {'error'|'success'} updateData.eventType - Event type
- * @param {number} updateData.statusCode - HTTP status code for this event
  * @param {Object} config - Throttle configuration
- * @returns {Promise<void>}
+ * @returns {Promise<{recordExists: boolean, state: string|null, openUntil: number|null, reason: string|null, version: number|null, lastErrorCode: number|null, probeLeaseUntil?: number|null, probeGranted?: boolean} | null>}
  */
-export const updateThrottle = async (hostname, updateData, config) => {
+export const claimBreakerProbe = async (hostname, config) => {
   if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
-    return;
+    return null;
   }
 
   if (!hostname || typeof hostname !== 'string') {
-    return;
+    return null;
   }
 
-  const eventType = updateData?.eventType;
-  const isError = eventType === 'error';
-  const isSuccess = eventType === 'success';
+  const { postgrestUrl, verifyHeader, verifySecret } = config;
+  const hostnameHash = await sha256Hash(hostname);
+  if (!hostnameHash) {
+    throw new Error('Failed to calculate hostname hash');
+  }
 
-  if (!isError && !isSuccess) {
-    console.warn('[Throttle] Skipping updateThrottle due to invalid eventType:', eventType);
-    return;
+  const now = Math.floor(Date.now() / 1000);
+  const probeLeaseSeconds = Math.max(
+    1,
+    Number.parseInt(config?.probeLeaseSeconds, 10) || DEFAULT_PROBE_LEASE_SECONDS,
+  );
+
+  const row = await executeBreakerRpc(
+    postgrestUrl,
+    verifyHeader,
+    verifySecret,
+    'download_claim_breaker_probe',
+    {
+      p_hostname_hash: hostnameHash,
+      p_hostname: hostname,
+      p_now: now,
+      p_probe_lease_seconds: probeLeaseSeconds,
+    },
+  );
+
+  return readBreakerSnapshot(row, {
+    includeProbeLeaseUntil: true,
+    includeProbeGranted: true,
+  });
+};
+
+/**
+ * Report a breaker sample for a hostname using the breaker report RPC
+ * @param {string} hostname - Hostname
+ * @param {Object} updateData - Update data
+ * @param {number} updateData.sample - 1 for protectable error, 0 for success
+ * @param {number} updateData.statusCode - HTTP status code for this event
+ * @param {number|null} updateData.retryAfterSeconds - Parsed numeric Retry-After reopen duration
+ * @param {Object} config - Throttle configuration
+ * @returns {Promise<{recordExists: boolean, state: string|null, openUntil: number|null, reason: string|null, version: number|null, lastErrorCode: number|null} | null>}
+ */
+export const reportBreakerSample = async (hostname, updateData, config) => {
+  if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
+    return null;
+  }
+
+  if (!hostname || typeof hostname !== 'string') {
+    return null;
+  }
+
+  const sampleValue = Number(updateData?.sample);
+  const sample = sampleValue >= 1 ? 1 : 0;
+  if (!Number.isFinite(sampleValue)) {
+    console.warn('[Throttle] Skip reportBreakerSample: invalid sample:', updateData?.sample);
+    return null;
   }
 
   const statusCode = Number.isFinite(updateData?.statusCode)
     ? Number(updateData.statusCode)
     : Number.parseInt(updateData?.statusCode, 10);
+  const retryAfterSecondsRaw = Number.isFinite(updateData?.retryAfterSeconds)
+    ? Number(updateData.retryAfterSeconds)
+    : Number.parseInt(updateData?.retryAfterSeconds, 10);
+  const retryAfterSeconds = Number.isFinite(retryAfterSecondsRaw) && retryAfterSecondsRaw > 0
+    ? Math.max(1, Math.ceil(retryAfterSecondsRaw))
+    : null;
 
   if (!Number.isFinite(statusCode)) {
-    console.warn('[Throttle] Skip updateThrottle: invalid statusCode:', updateData?.statusCode);
-    return;
+    console.warn('[Throttle] Skip reportBreakerSample: invalid statusCode:', updateData?.statusCode);
+    return null;
   }
 
-  try {
-    const { postgrestUrl, verifyHeader, verifySecret } = config;
-    const tableName = config.tableName || 'THROTTLE_PROTECTION';
-    const thresholds = sanitizeThresholds(config);
-    const now = Math.floor(Date.now() / 1000);
+  const { postgrestUrl, verifyHeader, verifySecret } = config;
+  const thresholds = sanitizeThresholds(config);
+  const now = Math.floor(Date.now() / 1000);
 
-    // Calculate hostname hash
-    const hostnameHash = await sha256Hash(hostname);
-    if (!hostnameHash) {
-      console.error('[Throttle] Failed to calculate hostname hash');
-      return;
-    }
+  // Calculate hostname hash
+  const hostnameHash = await sha256Hash(hostname);
+  if (!hostnameHash) {
+    throw new Error('Failed to calculate hostname hash');
+  }
 
-    // Probabilistic cleanup helper
-    const triggerCleanup = () => {
-      const probability = config.cleanupProbability || 0.01;
-      if (Math.random() < probability) {
-        console.log(`[Throttle Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
-
-        const cleanupPromise = cleanupExpiredThrottle(
-          postgrestUrl,
-          verifyHeader,
-          verifySecret,
-          tableName,
-          thresholds.throttleTimeWindow
-        )
-          .then((deletedCount) => {
-            console.log(`[Throttle Cleanup] Background cleanup finished: ${deletedCount} records deleted`);
-            return deletedCount;
-          })
-          .catch((error) => {
-            console.error('[Throttle Cleanup] Background cleanup failed:', error instanceof Error ? error.message : String(error));
-          });
-
-        if (config.ctx && config.ctx.waitUntil) {
-          config.ctx.waitUntil(cleanupPromise);
-          console.log(`[Throttle Cleanup] Cleanup scheduled in background (using ctx.waitUntil)`);
-        } else {
-          console.warn(`[Throttle Cleanup] No ctx.waitUntil available, cleanup may be interrupted`);
-        }
-      }
-    };
-
-    // Call atomic RPC stored procedure
-    const rpcUrl = `${postgrestUrl}/rpc/download_upsert_throttle_protection`;
-    const rpcBody = {
+  const row = await executeBreakerRpc(
+    postgrestUrl,
+    verifyHeader,
+    verifySecret,
+    'download_report_breaker_sample',
+    {
       p_hostname_hash: hostnameHash,
       p_hostname: hostname,
       p_now: now,
-      p_is_error: isError,
+      p_sample: sample,
       p_status_code: statusCode,
-      p_throttle_time_window: thresholds.throttleTimeWindow,
-      p_observe_window_seconds: thresholds.observeWindowSeconds,
-      p_error_ratio_percent: thresholds.errorRatioPercent,
+      p_open_cap_seconds: thresholds.openCapSeconds,
+      p_open_threshold_percent: thresholds.openThresholdPercent,
+      p_ewma_span: thresholds.ewmaSpan,
       p_consecutive_threshold: thresholds.consecutiveThreshold,
-      p_min_sample_count: thresholds.minSampleCount,
-      p_fast_error_ratio_percent: thresholds.fastErrorRatioPercent,
-      p_fast_min_sample_count: thresholds.fastMinSampleCount,
-      p_table_name: tableName,
-    };
+      p_retry_after_seconds: retryAfterSeconds,
+    },
+  );
 
-    const rpcHeaders = { 'Content-Type': 'application/json' };
-    applyVerifyHeaders(rpcHeaders, verifyHeader, verifySecret);
+  console.log(
+    `[Throttle] Updated breaker for ${hostname}: state=${readBreakerField(row, 'STATE')}, openUntil=${readBreakerField(row, 'OPEN_UNTIL')}, reason=${readBreakerField(row, 'OPEN_REASON')}, version=${readBreakerField(row, 'VERSION')}, code=${readBreakerField(row, 'LAST_ERROR_CODE')}`
+  );
 
-    const rpcResponse = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: rpcHeaders,
-      body: JSON.stringify(rpcBody),
-    });
-
-    if (!rpcResponse.ok) {
-      const errorText = await rpcResponse.text();
-      console.error(`[Throttle] PostgREST RPC error (${rpcResponse.status}): ${errorText}`);
-      return;
-    }
-
-    // Parse RPC result (returns array with single row)
-    const rpcResult = await rpcResponse.json();
-    if (!rpcResult || rpcResult.length === 0) {
-      console.error('[Throttle] RPC download_upsert_throttle_protection returned no rows');
-      return;
-    }
-
-    const row = rpcResult[0];
-    console.log(
-      `[Throttle] Updated protection for ${hostname}: isProtected=${row.IS_PROTECTED}, errorCode=${row.LAST_ERROR_CODE}, ratioObs=${row.OBS_ERROR_COUNT}/${row.OBS_SUCCESS_COUNT} (consecutive=${row.CONSECUTIVE_ERROR_COUNT})`
-    );
-
-    // Trigger cleanup probabilistically
-    triggerCleanup();
-  } catch (error) {
-    console.error('[Throttle] Update failed:', error.message);
-    // Don't propagate error - throttle failure should not block downloads
-  }
-};
-
-/**
- * Clean up expired records from the database
- * Removes records where IS_PROTECTED IS NULL and ERROR_TIMESTAMP is older than throttleTimeWindow * 2
- * @param {string} postgrestUrl - PostgREST API base URL
- * @param {string|string[]} verifyHeader - Authentication header name(s)
- * @param {string|string[]} verifySecret - Authentication header value(s)
- * @param {string} tableName - Table name
- * @param {number} throttleTimeWindow - Time window in seconds
- * @returns {Promise<number>} - Number of deleted records
- */
-const cleanupExpiredThrottle = async (postgrestUrl, verifyHeader, verifySecret, tableName, throttleTimeWindow) => {
-  const now = Math.floor(Date.now() / 1000);
-  const cutoffTime = now - (throttleTimeWindow * 2);
-
-  try {
-    console.log(`[Throttle Cleanup] Executing DELETE query (cutoff: ${cutoffTime}, timeWindow: ${throttleTimeWindow}s)`);
-
-    // Use RPC function for cleanup to ensure proper NULL handling
-    const rpcUrl = `${postgrestUrl}/rpc/download_cleanup_throttle_protection`;
-    const rpcBody = {
-      p_ttl_seconds: throttleTimeWindow * 2,
-      p_table_name: tableName,
-    };
-
-    const rpcHeaders = { 'Content-Type': 'application/json' };
-    applyVerifyHeaders(rpcHeaders, verifyHeader, verifySecret);
-
-    const rpcResponse = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: rpcHeaders,
-      body: JSON.stringify(rpcBody),
-    });
-
-    if (!rpcResponse.ok) {
-      const errorText = await rpcResponse.text();
-      console.error(`[Throttle Cleanup] PostgREST RPC error (${rpcResponse.status}): ${errorText}`);
-      return 0;
-    }
-
-    const deletedCount = await rpcResponse.json();
-    console.log(`[Throttle Cleanup] DELETE completed: ${deletedCount} expired records deleted (older than ${throttleTimeWindow * 2}s)`);
-
-    return deletedCount;
-  } catch (error) {
-    // Log error but don't propagate (cleanup failure shouldn't block requests)
-    console.error('[Throttle Cleanup] DELETE failed:', error instanceof Error ? error.message : String(error));
-    return 0;
-  }
+  return readBreakerSnapshot(row);
 };

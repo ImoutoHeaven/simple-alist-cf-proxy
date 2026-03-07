@@ -1,13 +1,13 @@
 # simple-alist-cf-proxy
 
-simple-alist-cf-proxy 是 AList 下载体系里的 Cloudflare Worker 下载代理（download worker）。Worker 不再从环境变量读取业务策略，运行时完全依赖控制面下发的 bootstrap/decision，并与 landing worker 协作完成票据校验、origin 绑定、缓存/限流/Throttle 与公平排队等能力。
+simple-alist-cf-proxy 是 AList 下载体系里的 Cloudflare Worker 下载代理（download worker）。Worker 不再从环境变量读取业务策略，运行时完全依赖控制面下发的 bootstrap/decision，并与 landing worker 协作完成票据校验、origin 绑定、缓存/限流/Breaker 与公平排队等能力。
 
 ## 主要能力
 
 - `payload` / `payloadSign` 校验（HMAC + expire）
 - Origin 绑定：解密 `payload.encrypt` 并重算 `bindingStr`（ip/iprange/Geo/ASN/TLS/path）
-- PostgREST 模式缓存与限流：`download_unified_check` 一次 RTT 统一检查
-- Throttle 保护与 Fair Queue：针对指定 hostname 限速与公平排队
+- PostgREST 模式缓存、限流与 Breaker 快照：`download_unified_check` 一次 RTT 统一检查
+- SharePoint Breaker 与 Fair Queue：针对指定 hostname 做共享熔断与公平排队
 - 可选 Cloudflare 原生 Rate Limiter
 - 安全响应封装：精简 headers + 统一 CORS + 小文件 Cache-Control 覆盖
 - IPv4-only 模式（`download.auth.ipv4Only`）
@@ -100,10 +100,10 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - `download.db.mode=custom-pg-rest` 时：
   - `download.db.postgrestUrl`
   - `download.db.verifyHeader` / `download.db.verifySecret`
-  - `download.db.linkTTLSeconds` / `download.db.idleTimeoutSeconds` / `download.db.cleanupPercentage`
+  - `download.db.linkTTLSeconds` / `download.db.idleTimeoutSeconds`
   - `download.db.cacheTable` / `download.db.lastActiveTable`
   - `download.db.rateLimit.*`（`windowSeconds` / `limit` / `blockSeconds` / `pgErrorHandle` 等）
-- `download.throttleProfiles` + `decision.download.throttleProfile`：上游错误保护策略
+- `download.throttleProfiles` + `decision.download.throttleProfile`：SharePoint breaker profile 与 selector；profile 只包含 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`protectHttpCodes`，运行时状态固定落在 `THROTTLE_PROTECTION`，未知 selector 直接报错
 - `download.fairQueue.*`：公平排队开关与等待策略（含 siteBucket 计算）
 - `decision.download.pathAction` / `decision.download.checkOriginMode`：单路径策略与 bindingStr 绑定字段
 
@@ -113,7 +113,7 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - 从控制面拉取 bootstrap/decision，解析为运行配置
 - 依据 `decision.pathAction` 执行阻断或跳过某些校验
 - 校验 `payloadSign` 与 `payload.expireTime`，解密 `payload.encrypt` 并重算 `bindingStr`
-- 可选 CF Rate Limiter；可选 PostgREST 限流/缓存/Throttle（统一检查）
+- 可选 CF Rate Limiter；可选 PostgREST 限流/缓存/Breaker 快照（统一检查）
 - 访问 AList `/api/fs/link` 获取真实下载链接（带鉴权 header）
 - 可选 Fair Queue（slot-handler）获取 slot
 - 转发上游响应，裁剪/补充 headers 并返回

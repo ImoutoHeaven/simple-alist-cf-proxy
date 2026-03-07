@@ -2,8 +2,15 @@ package slothandler
 
 import (
 	"context"
+	"reflect"
 	"testing"
 )
+
+func TestPostgresTryAcquireBatchNoLongerCarriesSynthesizedRetryAfterField(t *testing.T) {
+	if _, ok := reflect.TypeOf(tryAcquireResult{}).FieldByName("throttleRetryAfter"); ok {
+		t.Fatalf("tryAcquireResult must not retain synthesized throttleRetryAfter field")
+	}
+}
 
 func TestPostgresTryAcquireBatchRejectsMixedInputs(t *testing.T) {
 	defer func() {

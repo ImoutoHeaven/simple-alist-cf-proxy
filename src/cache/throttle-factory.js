@@ -3,7 +3,7 @@ import * as throttleCustomPgRest from './throttle-custom-pg-rest.js';
 /**
  * Create throttle manager instance based on DB mode
  * @param {string} dbMode - Database mode ('custom-pg-rest')
- * @returns {Object} - Throttle manager with checkThrottle and updateThrottle methods
+ * @returns {Object} - Throttle manager with snapshot/claim/report breaker helpers
  * @throws {Error} - If dbMode is invalid
  */
 export const createThrottleManager = (dbMode) => {

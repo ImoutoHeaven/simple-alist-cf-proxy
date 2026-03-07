@@ -1,6 +1,7 @@
 const DEFAULT_BOOTSTRAP_CACHE_MODE = 'd1';
 const CONTROL_PREFIX_DEFAULT = '/api/v0';
 const BOOTSTRAP_TTL_FALLBACK = 300;
+export const CONTROLLER_BOOTSTRAP_SCHEMA_EPOCH = 2;
 
 const getApiBase = (env) => {
   if (!env?.CONTROLLER_URL) {
@@ -59,6 +60,28 @@ const parseNumber = (value) => {
   return Number.isFinite(num) ? num : null;
 };
 
+export const wrapBootstrapForCache = (
+  data,
+  schemaEpoch = CONTROLLER_BOOTSTRAP_SCHEMA_EPOCH,
+) => ({
+  schemaEpoch,
+  data,
+});
+
+export const readCachedBootstrap = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  if (parseNumber(payload.schemaEpoch) !== CONTROLLER_BOOTSTRAP_SCHEMA_EPOCH) {
+    return null;
+  }
+
+  return payload.data && typeof payload.data === 'object'
+    ? payload.data
+    : null;
+};
+
 const safeJsonParse = (value) => {
   if (typeof value !== 'string') {
     return null;
@@ -103,7 +126,7 @@ const rememberBootstrapInMemory = (data, expAtOverride) => {
   const expAt = Number.isFinite(expAtOverride) ? expAtOverride : Date.now() + ttlMs;
   globalThis.bootstrapCache = {
     expAt,
-    data,
+    data: wrapBootstrapForCache(data),
   };
 };
 
@@ -112,7 +135,7 @@ const getBootstrapCache = () => {
     return null;
   }
   if (globalThis.bootstrapCache.expAt > Date.now()) {
-    return globalThis.bootstrapCache.data;
+    return readCachedBootstrap(globalThis.bootstrapCache.data);
   }
   return null;
 };
@@ -145,8 +168,13 @@ const readBootstrapFromD1 = async (env, envName, role) => {
     return null;
   }
 
-  rememberBootstrapInMemory(payload, expAt);
-  return payload;
+  const cached = readCachedBootstrap(payload);
+  if (!cached) {
+    return null;
+  }
+
+  rememberBootstrapInMemory(cached, expAt);
+  return cached;
 };
 
 const writeBootstrapToD1 = async (env, envName, role, data, expAtOverride) => {
@@ -167,7 +195,15 @@ const writeBootstrapToD1 = async (env, envName, role, data, expAtOverride) => {
         env, role, config_version, ttl_seconds, expires_at, payload_json, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?);`
     )
-    .bind(envName, role, data?.configVersion || '', ttlSeconds, expAt, JSON.stringify(data), Date.now())
+    .bind(
+      envName,
+      role,
+      data?.configVersion || '',
+      ttlSeconds,
+      expAt,
+      JSON.stringify(wrapBootstrapForCache(data)),
+      Date.now(),
+    )
     .run();
 
   rememberBootstrapInMemory(data, expAt);

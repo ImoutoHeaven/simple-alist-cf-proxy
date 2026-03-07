@@ -68,7 +68,6 @@ test('slot-handler client defaults auth header name to X-FQ-Auth', async () => {
       authKey: 'secret',
       authHeader: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -107,7 +106,6 @@ test('slot-handler client uses configured auth header name', async () => {
       authKey: 'secret',
       authHeader: 'X-Custom-FQ-Auth',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -148,6 +146,16 @@ test('resolveConfig wires controller slotHandlerAuthHeader into slot-handler req
       },
       download: {
         address: 'https://alist.example.com',
+        throttleProfiles: {
+          default: {
+            hostPatterns: [],
+            openCapSeconds: 60,
+            openThresholdPercent: 20,
+            ewmaSpan: 8,
+            consecutiveThreshold: 4,
+            protectHttpCodes: [429, 499, 500, 502, 503, 504],
+          },
+        },
         fairQueue: {
           enabled: true,
           hostPatterns: ['example.com'],
@@ -201,7 +209,6 @@ test('global overload should fail fast with Retry-After', async () => {
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -255,7 +262,6 @@ test('global overload cooldown should suppress repeated acquire calls', async ()
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -320,7 +326,6 @@ test('scoped overload should keep bounded wait loop and then grant', async () =>
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -382,7 +387,6 @@ test('site-scoped overload should keep bounded wait loop and then grant', async 
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -444,7 +448,6 @@ test('ip-scoped overload should keep bounded wait loop and then grant', async ()
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -506,7 +509,6 @@ test('site-scoped overload cooldown should not suppress other sites under same h
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const siteAContext = {
@@ -571,7 +573,6 @@ test('ip-scoped overload cooldown should not suppress other ip buckets under sam
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const ipAContext = {
@@ -636,7 +637,6 @@ test('unknown scoped overload reason falls back to host-level cooldown', async (
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const siteAContext = {
@@ -660,7 +660,7 @@ test('unknown scoped overload reason falls back to host-level cooldown', async (
     if (fetchCalls === 1) {
       return new Response(JSON.stringify({
         result: 'overloaded',
-        reason: 'legacy_overload_scope',
+        reason: 'unexpected_overload_scope',
       }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
@@ -698,7 +698,6 @@ test('ip-scoped keys with embedded delimiters do not collide', async () => {
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const contextA = {
@@ -792,7 +791,6 @@ test('scoped overload wait uses strict 500ms staircase contract', async () => {
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -871,7 +869,6 @@ test('near-expiry host-overload cooldown should not be inflated to extra long sl
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -918,7 +915,6 @@ test('abort during host-overload cooldown should stop immediately without acquir
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -962,7 +958,6 @@ test('releaseSlot retries on retryable status and network errors', async () => {
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {
@@ -1005,7 +1000,6 @@ test('releaseSlot does not retry on non-retryable 4xx', async () => {
       maxAttemptsCap: 8,
       authKey: '',
     },
-    throttleConfig: { throttleTimeWindow: 60 },
   });
 
   const fqContext = {

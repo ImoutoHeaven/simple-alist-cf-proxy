@@ -104,7 +104,6 @@ type AcquireRequest struct {
 	IPBucket             string `json:"ipBucket"`
 	SiteBucket           string `json:"siteBucket"`
 	Now                  int64  `json:"now"`
-	ThrottleTimeWindow   int    `json:"throttleTimeWindowSeconds,omitempty"`
 	HostMaxSlotPerHost   int    `json:"hostMaxSlotPerHost,omitempty"`
 	HostMaxSlotPerIP     int    `json:"hostMaxSlotPerIp,omitempty"`
 	SiteMaxSlotPerSite   int    `json:"siteMaxSlotPerSite,omitempty"`
@@ -116,25 +115,26 @@ type AcquireRequest struct {
 }
 
 type AcquirePayload struct {
-	Hostname           string `json:"hostname"`
-	HostnameHash       string `json:"hostnameHash"`
-	IPBucket           string `json:"ipBucket"`
-	SiteBucket         string `json:"siteBucket"`
-	Now                int64  `json:"now"`
-	ThrottleTimeWindow int    `json:"throttleTimeWindowSeconds,omitempty"`
-	QueryToken         string `json:"queryToken,omitempty"`
+	Hostname     string `json:"hostname"`
+	HostnameHash string `json:"hostnameHash"`
+	IPBucket     string `json:"ipBucket"`
+	SiteBucket   string `json:"siteBucket"`
+	Now          int64  `json:"now"`
+	QueryToken   string `json:"queryToken,omitempty"`
 }
 
 type AcquireResponse struct {
-	Result       string                 `json:"result"`
-	QueryToken   string                 `json:"queryToken,omitempty"`
-	SlotToken    string                 `json:"slotToken,omitempty"`
-	HoldMs       int64                  `json:"holdMs,omitempty"`
-	ThrottleCode int                    `json:"throttleCode,omitempty"`
-	ThrottleWait int                    `json:"throttleRetryAfter,omitempty"`
-	RetryAfter   int                    `json:"retryAfter,omitempty"`
-	Reason       string                 `json:"reason,omitempty"`
-	Meta         map[string]interface{} `json:"meta,omitempty"`
+	Result           string                 `json:"result"`
+	QueryToken       string                 `json:"queryToken,omitempty"`
+	SlotToken        string                 `json:"slotToken,omitempty"`
+	HoldMs           int64                  `json:"holdMs,omitempty"`
+	ThrottleCode     int                    `json:"throttleCode,omitempty"`
+	BreakerOpenUntil int                    `json:"breakerOpenUntil,omitempty"`
+	BreakerReason    string                 `json:"breakerReason,omitempty"`
+	BreakerVersion   int64                  `json:"breakerVersion,omitempty"`
+	RetryAfter       int                    `json:"retryAfter,omitempty"`
+	Reason           string                 `json:"reason,omitempty"`
+	Meta             map[string]interface{} `json:"meta,omitempty"`
 }
 
 type ReleaseRequest struct {
@@ -163,10 +163,12 @@ type FairQueueCleanupConfig struct {
 }
 
 type tryAcquireResult struct {
-	status             string
-	slotToken          string
-	throttleCode       int
-	throttleRetryAfter int
+	status           string
+	slotToken        string
+	throttleCode     int
+	breakerOpenUntil int
+	breakerReason    string
+	breakerVersion   int64
 }
 
 func validateAcquireBatchInputs(reqs []AcquireRequest) error {
@@ -187,9 +189,6 @@ func validateAcquireBatchInputs(reqs []AcquireRequest) error {
 		}
 		if req.ZombieTimeoutSeconds != first.ZombieTimeoutSeconds || req.CooldownSeconds != first.CooldownSeconds {
 			return fmt.Errorf("tryAcquire batch inputs must match timeouts (index=%d)", i)
-		}
-		if req.ThrottleTimeWindow != first.ThrottleTimeWindow {
-			return fmt.Errorf("tryAcquire batch inputs must match throttle window (index=%d)", i)
 		}
 	}
 	return nil
@@ -232,8 +231,24 @@ func (sr *smoothHostReleaser) nextReleaseAfter(base time.Time, interval time.Dur
 }
 
 type fqThrottleState struct {
-	ProtectedUntil time.Time
-	Code           int
+	State     string
+	OpenUntil time.Time
+	Code      int
+	Reason    string
+	Version   int64
+}
+
+func shouldKeepThrottleState(state *fqThrottleState, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(state.State), "open") {
+		return false
+	}
+	if state.OpenUntil.IsZero() {
+		return false
+	}
+	return state.OpenUntil.After(now)
 }
 
 type runtimeMeta struct {
@@ -391,43 +406,67 @@ func (s *server) getControllerState() (controllerEnv, bool) {
 	return value, true
 }
 
-func (s *server) getThrottleState(hostKey string, now time.Time) (bool, int, int) {
+func (s *server) getThrottleState(hostKey string, now time.Time) *fqThrottleState {
 	s.throttleMu.Lock()
 	defer s.throttleMu.Unlock()
 
 	st := s.throttleHost[hostKey]
-	if st == nil || st.ProtectedUntil.IsZero() || now.After(st.ProtectedUntil) {
-		if st != nil && (st.ProtectedUntil.IsZero() || now.After(st.ProtectedUntil)) {
+	if st == nil {
+		return nil
+	}
+	if !shouldKeepThrottleState(st, now) {
+		if st != nil {
 			delete(s.throttleHost, hostKey)
 		}
-		return false, 0, 0
+		return nil
 	}
-	remaining := int(st.ProtectedUntil.Sub(now).Seconds())
-	if remaining < 0 {
-		remaining = 0
-	}
-	return true, st.Code, remaining
+	snapshot := *st
+	return &snapshot
 }
 
-func (s *server) setThrottleState(hostKey string, now time.Time, code, retryAfter int) {
-	if retryAfter <= 0 {
+func (s *server) setThrottleState(hostKey string, state fqThrottleState) {
+	hostKey = strings.TrimSpace(hostKey)
+	if hostKey == "" {
 		return
 	}
-	ra := retryAfter
-	const maxCacheSeconds = 600
-	if ra > maxCacheSeconds {
-		ra = maxCacheSeconds
-	}
+	state.State = strings.ToLower(strings.TrimSpace(state.State))
 
 	s.throttleMu.Lock()
 	defer s.throttleMu.Unlock()
+	if state.State != "open" || state.OpenUntil.IsZero() {
+		if s.throttleHost != nil {
+			delete(s.throttleHost, hostKey)
+		}
+		return
+	}
 	if s.throttleHost == nil {
 		s.throttleHost = make(map[string]*fqThrottleState)
 	}
-	s.throttleHost[hostKey] = &fqThrottleState{
-		ProtectedUntil: now.Add(time.Duration(ra) * time.Second),
-		Code:           code,
+	copy := state
+	s.throttleHost[hostKey] = &copy
+}
+
+func breakerOpenUntilUnix(openUntil time.Time) int {
+	if openUntil.IsZero() {
+		return 0
 	}
+	return int(openUntil.Unix())
+}
+
+func throttledAcquireResponse(queryToken, responseReason string, state *fqThrottleState) *AcquireResponse {
+	resp := &AcquireResponse{
+		Result:     "throttled",
+		QueryToken: queryToken,
+		Reason:     responseReason,
+	}
+	if state == nil {
+		return resp
+	}
+	resp.ThrottleCode = state.Code
+	resp.BreakerOpenUntil = breakerOpenUntilUnix(state.OpenUntil)
+	resp.BreakerReason = state.Reason
+	resp.BreakerVersion = state.Version
+	return resp
 }
 
 func (s *server) shouldLogOverloaded(hostnameHash, hostname, scope string, now time.Time) bool {
@@ -802,13 +841,6 @@ func (c FairQueueConfig) cleanupInterval() time.Duration {
 		return 0
 	}
 	return time.Duration(c.Cleanup.IntervalSeconds) * time.Second
-}
-
-func sanitizeThrottleWindowSeconds(v int) int {
-	if v > 0 {
-		return v
-	}
-	return 60
 }
 
 type controllerEnv struct {
@@ -1287,13 +1319,12 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := AcquireRequest{
-		Hostname:           payload.Hostname,
-		HostnameHash:       payload.HostnameHash,
-		IPBucket:           payload.IPBucket,
-		SiteBucket:         payload.SiteBucket,
-		Now:                payload.Now,
-		ThrottleTimeWindow: payload.ThrottleTimeWindow,
-		QueryToken:         payload.QueryToken,
+		Hostname:     payload.Hostname,
+		HostnameHash: payload.HostnameHash,
+		IPBucket:     payload.IPBucket,
+		SiteBucket:   payload.SiteBucket,
+		Now:          payload.Now,
+		QueryToken:   payload.QueryToken,
 	}
 
 	resp, err := s.handleAcquireSlot(r.Context(), req)
@@ -1390,7 +1421,7 @@ func (s *server) handleAcquireSlot(ctx context.Context, req AcquireRequest) (*Ac
 	return s.handleAcquireSlotFlow(ctx, req)
 }
 
-func (s *server) buildAcquireRequest(cfg *Config, hostname, hostnameHash, ipBucket, siteBucket string, throttleTimeWindow int, now time.Time) AcquireRequest {
+func (s *server) buildAcquireRequest(cfg *Config, hostname, hostnameHash, ipBucket, siteBucket string, now time.Time) AcquireRequest {
 	if cfg == nil {
 		cfg = &Config{}
 	}
@@ -1406,7 +1437,6 @@ func (s *server) buildAcquireRequest(cfg *Config, hostname, hostnameHash, ipBuck
 		IPBucket:             ipBucket,
 		SiteBucket:           siteBucket,
 		Now:                  now.UnixMilli(),
-		ThrottleTimeWindow:   sanitizeThrottleWindowSeconds(throttleTimeWindow),
 		HostMaxSlotPerHost:   fq.hostMaxSlotPerHost(),
 		HostMaxSlotPerIP:     fq.hostMaxSlotPerIP(),
 		SiteMaxSlotPerSite:   fq.siteMaxSlotPerSite(),
@@ -1820,7 +1850,6 @@ func (b *postgrestBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRe
 		return nil, errors.New("tryAcquire batch function not configured")
 	}
 	first := reqs[0]
-	window := pickInt(first.ThrottleTimeWindow, 60)
 	siteBuckets := make([]string, len(reqs))
 	ipBuckets := make([]string, len(reqs))
 	for i, req := range reqs {
@@ -1839,13 +1868,14 @@ func (b *postgrestBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRe
 		"p_site_max_slot_per_ip":   first.SiteMaxSlotPerIP,
 		"p_zombie_timeout":         first.ZombieTimeoutSeconds,
 		"p_cooldown_seconds":       first.CooldownSeconds,
-		"p_throttle_time_window":   window,
 	}
 	var resp []struct {
-		Status             string `json:"status"`
-		SlotToken          string `json:"slot_token"`
-		ThrottleCode       int    `json:"throttle_code"`
-		ThrottleRetryAfter int    `json:"throttle_retry_after"`
+		Status           string `json:"status"`
+		SlotToken        string `json:"slot_token"`
+		ThrottleCode     int    `json:"throttle_code"`
+		BreakerOpenUntil int    `json:"breaker_open_until"`
+		BreakerReason    string `json:"breaker_reason"`
+		BreakerVersion   int64  `json:"breaker_version"`
 	}
 	if err := b.doRPC(ctx, fn, body, &resp); err != nil {
 		return nil, err
@@ -1856,10 +1886,12 @@ func (b *postgrestBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRe
 	results := make([]*tryAcquireResult, len(resp))
 	for i, item := range resp {
 		results[i] = &tryAcquireResult{
-			status:             item.Status,
-			slotToken:          item.SlotToken,
-			throttleCode:       item.ThrottleCode,
-			throttleRetryAfter: item.ThrottleRetryAfter,
+			status:           item.Status,
+			slotToken:        item.SlotToken,
+			throttleCode:     item.ThrottleCode,
+			breakerOpenUntil: item.BreakerOpenUntil,
+			breakerReason:    item.BreakerReason,
+			breakerVersion:   item.BreakerVersion,
 		}
 	}
 	return results, nil
@@ -1947,33 +1979,34 @@ func (p *postgresBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireReq
 		return nil, errors.New("tryAcquire batch function not configured")
 	}
 	first := reqs[0]
-	window := pickInt(first.ThrottleTimeWindow, 60)
 	siteBuckets := make([]string, len(reqs))
 	ipBuckets := make([]string, len(reqs))
 	for i, req := range reqs {
 		siteBuckets[i] = req.SiteBucket
 		ipBuckets[i] = req.IPBucket
 	}
-	rows, err := p.db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)", fn),
+	rows, err := p.db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", fn),
 		first.HostnameHash, first.Hostname, siteBuckets, ipBuckets, first.Now,
 		first.HostMaxSlotPerHost, first.HostMaxSlotPerIP, first.SiteMaxSlotPerSite, first.SiteMaxSlotPerIP,
-		first.ZombieTimeoutSeconds, first.CooldownSeconds, window)
+		first.ZombieTimeoutSeconds, first.CooldownSeconds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	results := make([]*tryAcquireResult, 0, len(reqs))
 	for rows.Next() {
-		var status, slotToken sql.NullString
-		var throttleCode, throttleRetryAfter sql.NullInt64
-		if err := rows.Scan(&status, &slotToken, &throttleCode, &throttleRetryAfter); err != nil {
+		var status, slotToken, breakerReason sql.NullString
+		var throttleCode, breakerOpenUntil, breakerVersion sql.NullInt64
+		if err := rows.Scan(&status, &slotToken, &throttleCode, &breakerOpenUntil, &breakerReason, &breakerVersion); err != nil {
 			return nil, err
 		}
 		results = append(results, &tryAcquireResult{
-			status:             status.String,
-			slotToken:          slotToken.String,
-			throttleCode:       int(throttleCode.Int64),
-			throttleRetryAfter: int(throttleRetryAfter.Int64),
+			status:           status.String,
+			slotToken:        slotToken.String,
+			throttleCode:     int(throttleCode.Int64),
+			breakerOpenUntil: int(breakerOpenUntil.Int64),
+			breakerReason:    breakerReason.String,
+			breakerVersion:   breakerVersion.Int64,
 		})
 	}
 	if err := rows.Err(); err != nil {
