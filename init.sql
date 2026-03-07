@@ -3,10 +3,10 @@
 -- ========================================
 -- Default table names align with environment variable defaults:
 --   DOWNLOAD_CACHE_TABLE           (env: DOWNLOAD_CACHE_TABLE)
---   THROTTLE_PROTECTION            (env: THROTTLE_PROTECTION_TABLE)
+--   THROTTLE_PROTECTION            (canonical breaker runtime table)
 --   DOWNLOAD_IP_RATELIMIT_TABLE    (env: DOWNLOAD_IP_RATELIMIT_TABLE)
 --
--- If you override the environment variables, adjust the CREATE TABLE
+-- If you override the configurable environment variables, adjust the CREATE TABLE
 -- statements accordingly before applying this script.
 
 
@@ -149,240 +149,393 @@ $$ LANGUAGE plpgsql;
 CREATE TABLE IF NOT EXISTS "THROTTLE_PROTECTION" (
   "HOSTNAME_HASH" TEXT PRIMARY KEY,
   "HOSTNAME" TEXT NOT NULL,
-  "ERROR_TIMESTAMP" INTEGER,
-  "IS_PROTECTED" INTEGER,
+  "STATE" TEXT NOT NULL CHECK ("STATE" IN ('closed', 'open', 'half_open')),
+  "OPEN_UNTIL" INTEGER,
+  "EWMA_SCORE" NUMERIC NOT NULL DEFAULT 0,
+  "TOTAL_SAMPLES" INTEGER NOT NULL DEFAULT 0,
+  "CONSECUTIVE_ERROR_COUNT" INTEGER NOT NULL DEFAULT 0,
+  "SUCCESS_STREAK" INTEGER NOT NULL DEFAULT 0,
+  "PROBE_LEASE_UNTIL" INTEGER,
   "LAST_ERROR_CODE" INTEGER,
-  "OBS_WINDOW_START" INTEGER,
-  "OBS_ERROR_COUNT" INTEGER NOT NULL DEFAULT 0,
-  "OBS_SUCCESS_COUNT" INTEGER NOT NULL DEFAULT 0,
-  "CONSECUTIVE_ERROR_COUNT" INTEGER NOT NULL DEFAULT 0
+  "OPEN_REASON" TEXT,
+  "LAST_OPEN_SECONDS" INTEGER NOT NULL DEFAULT 0,
+  "VERSION" BIGINT NOT NULL DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_throttle_timestamp
-  ON "THROTTLE_PROTECTION"("ERROR_TIMESTAMP");
+CREATE INDEX IF NOT EXISTS idx_throttle_open_until
+  ON "THROTTLE_PROTECTION"("OPEN_UNTIL");
+
+CREATE INDEX IF NOT EXISTS idx_throttle_state
+  ON "THROTTLE_PROTECTION"("STATE");
 
 
 -- ========================================
--- PostgreSQL Stored Procedure: Atomic UPSERT (Throttle)
+-- PostgreSQL Stored Procedure: Claim Breaker Probe
 -- ========================================
-CREATE OR REPLACE FUNCTION download_upsert_throttle_protection(
+CREATE OR REPLACE FUNCTION download_claim_breaker_probe(
   p_hostname_hash TEXT,
   p_hostname TEXT,
-  p_now INTEGER,
-  p_is_error BOOLEAN,
-  p_status_code INTEGER,
-  p_throttle_time_window INTEGER,
-  p_observe_window_seconds INTEGER,
-  p_error_ratio_percent INTEGER,
-  p_consecutive_threshold INTEGER,
-  p_min_sample_count INTEGER,
-  p_fast_error_ratio_percent INTEGER DEFAULT NULL,
-  p_fast_min_sample_count INTEGER DEFAULT NULL,
-  p_table_name TEXT DEFAULT 'THROTTLE_PROTECTION'
+  p_now INTEGER DEFAULT NULL,
+  p_probe_lease_seconds INTEGER DEFAULT 15
 )
 RETURNS TABLE(
   "HOSTNAME_HASH" TEXT,
   "HOSTNAME" TEXT,
-  "ERROR_TIMESTAMP" INTEGER,
-  "IS_PROTECTED" INTEGER,
+  "STATE" TEXT,
+  "OPEN_UNTIL" INTEGER,
+  "EWMA_SCORE" NUMERIC,
+  "TOTAL_SAMPLES" INTEGER,
+  "CONSECUTIVE_ERROR_COUNT" INTEGER,
+  "SUCCESS_STREAK" INTEGER,
+  "PROBE_LEASE_UNTIL" INTEGER,
   "LAST_ERROR_CODE" INTEGER,
-  "OBS_WINDOW_START" INTEGER,
-  "OBS_ERROR_COUNT" INTEGER,
-  "OBS_SUCCESS_COUNT" INTEGER,
-  "CONSECUTIVE_ERROR_COUNT" INTEGER
+  "OPEN_REASON" TEXT,
+  "LAST_OPEN_SECONDS" INTEGER,
+  "VERSION" BIGINT,
+  "PROBE_GRANTED" BOOLEAN
 ) AS $$
 DECLARE
-  sql TEXT;
   v_now INTEGER := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::INTEGER);
-  v_table_name TEXT := COALESCE(NULLIF(p_table_name, ''), 'THROTTLE_PROTECTION');
-  v_observe_window_seconds INTEGER := GREATEST(1, COALESCE(p_observe_window_seconds, 60));
-  v_error_ratio_percent INTEGER := GREATEST(0, COALESCE(p_error_ratio_percent, 0));
-  v_consecutive_threshold INTEGER := GREATEST(1, COALESCE(p_consecutive_threshold, 1));
-  v_min_sample_count INTEGER := GREATEST(1, COALESCE(p_min_sample_count, 1));
-  v_throttle_time_window INTEGER := GREATEST(1, COALESCE(p_throttle_time_window, 1));
-  v_fast_error_ratio_percent INTEGER := NULL;
-  v_fast_min_sample_count INTEGER := NULL;
+  v_probe_lease_seconds INTEGER := GREATEST(1, COALESCE(p_probe_lease_seconds, 15));
 
   v_hostname TEXT := p_hostname;
-  v_error_timestamp INTEGER := NULL;
-  v_is_protected INTEGER := 0;
-  v_last_error_code INTEGER := NULL;
-  v_obs_window_start INTEGER := NULL;
-  v_obs_error_count INTEGER := 0;
-  v_obs_success_count INTEGER := 0;
+  v_state TEXT := 'closed';
+  v_open_until INTEGER := NULL;
+  v_ewma_score NUMERIC := 0;
+  v_total_samples INTEGER := 0;
   v_consecutive_error_count INTEGER := 0;
-  v_ratio_trigger BOOLEAN := FALSE;
-  v_fast_ratio_trigger BOOLEAN := FALSE;
-  v_consecutive_trigger BOOLEAN := FALSE;
-  v_should_protect BOOLEAN := FALSE;
+  v_success_streak INTEGER := 0;
+  v_probe_lease_until INTEGER := NULL;
+  v_last_error_code INTEGER := NULL;
+  v_open_reason TEXT := NULL;
+  v_last_open_seconds INTEGER := 0;
+  v_version BIGINT := 0;
+  v_probe_granted BOOLEAN := FALSE;
   v_locked BOOLEAN := FALSE;
   v_locked_row_count INTEGER := 0;
-  v_total INTEGER := 0;
 BEGIN
-  v_fast_error_ratio_percent := GREATEST(
-    v_error_ratio_percent,
-    COALESCE(p_fast_error_ratio_percent, v_error_ratio_percent)
-  );
-  v_fast_min_sample_count := COALESCE(p_fast_min_sample_count, 4);
-  IF v_fast_min_sample_count <= 0 THEN
-    v_fast_min_sample_count := 0;
-  ELSE
-    v_fast_min_sample_count := LEAST(
-      v_min_sample_count,
-      GREATEST(1, v_fast_min_sample_count)
-    );
+  IF p_hostname_hash IS NULL OR p_hostname_hash = '' THEN
+    RETURN;
   END IF;
 
-  -- Lock row to avoid lost updates under concurrency
   WHILE NOT v_locked LOOP
-    v_hostname := NULL;
-    v_error_timestamp := NULL;
-    v_is_protected := NULL;
-    v_last_error_code := NULL;
-    v_obs_window_start := NULL;
-    v_obs_error_count := 0;
-    v_obs_success_count := 0;
-    v_consecutive_error_count := 0;
-
-    EXECUTE format(
-      'SELECT "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT"
-         FROM %1$I WHERE "HOSTNAME_HASH" = $1
-         FOR UPDATE',
-      v_table_name
-    )
-    INTO v_hostname, v_error_timestamp, v_is_protected, v_last_error_code, v_obs_window_start, v_obs_error_count, v_obs_success_count, v_consecutive_error_count
-    USING p_hostname_hash;
+    SELECT
+      "HOSTNAME",
+      "STATE",
+      "OPEN_UNTIL",
+      "EWMA_SCORE",
+      "TOTAL_SAMPLES",
+      "CONSECUTIVE_ERROR_COUNT",
+      "SUCCESS_STREAK",
+      "PROBE_LEASE_UNTIL",
+      "LAST_ERROR_CODE",
+      "OPEN_REASON",
+      "LAST_OPEN_SECONDS",
+      "VERSION"
+    INTO
+      v_hostname,
+      v_state,
+      v_open_until,
+      v_ewma_score,
+      v_total_samples,
+      v_consecutive_error_count,
+      v_success_streak,
+      v_probe_lease_until,
+      v_last_error_code,
+      v_open_reason,
+      v_last_open_seconds,
+      v_version
+    FROM "THROTTLE_PROTECTION"
+    WHERE "HOSTNAME_HASH" = p_hostname_hash
+    FOR UPDATE;
 
     GET DIAGNOSTICS v_locked_row_count = ROW_COUNT;
     v_locked := v_locked_row_count > 0;
 
     IF NOT v_locked THEN
-      EXECUTE format(
-        'INSERT INTO %1$I ("HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT")
-         VALUES ($1, $2, NULL, 0, NULL, $3, 0, 0, 0)
-         ON CONFLICT ("HOSTNAME_HASH") DO NOTHING',
-        v_table_name
-      ) USING p_hostname_hash, COALESCE(p_hostname, p_hostname_hash), v_now;
+      INSERT INTO "THROTTLE_PROTECTION" ("HOSTNAME_HASH", "HOSTNAME", "STATE")
+      VALUES (p_hostname_hash, COALESCE(NULLIF(p_hostname, ''), p_hostname_hash), 'closed')
+      ON CONFLICT ("HOSTNAME_HASH") DO NOTHING;
     END IF;
   END LOOP;
 
-  v_hostname := COALESCE(p_hostname, v_hostname);
-  v_is_protected := COALESCE(v_is_protected, 0);
-  v_obs_error_count := COALESCE(v_obs_error_count, 0);
-  v_obs_success_count := COALESCE(v_obs_success_count, 0);
+  v_hostname := COALESCE(NULLIF(p_hostname, ''), v_hostname, p_hostname_hash);
+  v_state := COALESCE(NULLIF(v_state, ''), 'closed');
+  v_ewma_score := COALESCE(v_ewma_score, 0);
+  v_total_samples := COALESCE(v_total_samples, 0);
   v_consecutive_error_count := COALESCE(v_consecutive_error_count, 0);
+  v_success_streak := COALESCE(v_success_streak, 0);
+  v_last_open_seconds := COALESCE(v_last_open_seconds, 0);
+  v_version := COALESCE(v_version, 0);
 
-  IF v_obs_window_start IS NULL OR (v_now - v_obs_window_start) >= v_observe_window_seconds THEN
-    v_obs_window_start := v_now;
-    v_obs_error_count := 0;
-    v_obs_success_count := 0;
-    -- 连续错误计数在观察窗口重置时不会被重置，只有成功事件清零
-  END IF;
-
-  IF COALESCE(p_is_error, FALSE) THEN
-    v_obs_error_count := v_obs_error_count + 1;
-    v_consecutive_error_count := v_consecutive_error_count + 1;
-  ELSE
-    v_obs_success_count := v_obs_success_count + 1;
-    v_consecutive_error_count := 0;
-  END IF;
-
-  IF COALESCE(p_is_error, FALSE) THEN
-    v_total := v_obs_error_count + v_obs_success_count;
-
-    IF v_total >= v_min_sample_count THEN
-      v_ratio_trigger := (v_obs_error_count * 100) >= (v_error_ratio_percent * v_total);
+  IF v_state = 'open' AND (v_open_until IS NULL OR v_open_until <= v_now) THEN
+    v_state := 'half_open';
+    v_open_until := NULL;
+    v_success_streak := 0;
+    IF v_probe_lease_until IS NULL OR v_probe_lease_until <= v_now THEN
+      v_probe_lease_until := v_now + v_probe_lease_seconds;
+      v_probe_granted := TRUE;
     END IF;
-
-    IF v_fast_min_sample_count > 0 AND v_total >= v_fast_min_sample_count THEN
-      v_fast_ratio_trigger := (v_obs_error_count * 100) >= (v_fast_error_ratio_percent * v_total);
-    END IF;
-
-    v_consecutive_trigger := v_consecutive_error_count >= v_consecutive_threshold;
-    v_should_protect := v_ratio_trigger OR v_fast_ratio_trigger OR v_consecutive_trigger;
+    v_version := v_version + 1;
+  ELSIF v_state = 'half_open' AND (v_probe_lease_until IS NULL OR v_probe_lease_until <= v_now) THEN
+    v_probe_lease_until := v_now + v_probe_lease_seconds;
+    v_probe_granted := TRUE;
+    v_version := v_version + 1;
+  ELSIF v_state = 'closed' THEN
+    v_open_until := NULL;
+    v_probe_lease_until := NULL;
+    v_success_streak := 0;
   END IF;
 
-  IF v_should_protect THEN
-    v_is_protected := 1;
-    v_error_timestamp := v_now;
-    v_last_error_code := p_status_code;
-  ELSE
-    IF v_is_protected = 1 AND v_error_timestamp IS NOT NULL THEN
-      IF (v_now - v_error_timestamp) >= v_throttle_time_window THEN
-        v_is_protected := 0;
-        v_error_timestamp := NULL;
-        v_last_error_code := NULL;
-        v_obs_window_start := v_now;
-        v_obs_error_count := 0;
-        v_obs_success_count := 0;
-      ELSE
-        v_is_protected := 1;
-      END IF;
-    ELSE
-      v_is_protected := 0;
-      IF COALESCE(p_is_error, FALSE) THEN
-        v_last_error_code := p_status_code;
-      END IF;
-    END IF;
-  END IF;
-
-  sql := format(
-    'UPDATE %1$I SET
-       "HOSTNAME" = $2,
-       "ERROR_TIMESTAMP" = $3,
-       "IS_PROTECTED" = $4,
-       "LAST_ERROR_CODE" = $5,
-       "OBS_WINDOW_START" = $6,
-       "OBS_ERROR_COUNT" = $7,
-       "OBS_SUCCESS_COUNT" = $8,
-       "CONSECUTIVE_ERROR_COUNT" = $9
-     WHERE "HOSTNAME_HASH" = $1
-     RETURNING "HOSTNAME_HASH", "HOSTNAME", "ERROR_TIMESTAMP", "IS_PROTECTED", "LAST_ERROR_CODE", "OBS_WINDOW_START", "OBS_ERROR_COUNT", "OBS_SUCCESS_COUNT", "CONSECUTIVE_ERROR_COUNT"',
-    v_table_name
-  );
-
-  RETURN QUERY EXECUTE sql USING
+  RETURN QUERY
+  UPDATE "THROTTLE_PROTECTION" SET
+    "HOSTNAME" = v_hostname,
+    "STATE" = v_state,
+    "OPEN_UNTIL" = v_open_until,
+    "EWMA_SCORE" = v_ewma_score,
+    "TOTAL_SAMPLES" = v_total_samples,
+    "CONSECUTIVE_ERROR_COUNT" = v_consecutive_error_count,
+    "SUCCESS_STREAK" = v_success_streak,
+    "PROBE_LEASE_UNTIL" = v_probe_lease_until,
+    "LAST_ERROR_CODE" = v_last_error_code,
+    "OPEN_REASON" = v_open_reason,
+    "LAST_OPEN_SECONDS" = v_last_open_seconds,
+    "VERSION" = v_version
+  WHERE "HOSTNAME_HASH" = p_hostname_hash
+  RETURNING
     p_hostname_hash,
-    v_hostname,
-    v_error_timestamp,
-    v_is_protected,
-    v_last_error_code,
-    v_obs_window_start,
-    v_obs_error_count,
-    v_obs_success_count,
-    v_consecutive_error_count;
+    "HOSTNAME",
+    "STATE",
+    "OPEN_UNTIL",
+    "EWMA_SCORE",
+    "TOTAL_SAMPLES",
+    "CONSECUTIVE_ERROR_COUNT",
+    "SUCCESS_STREAK",
+    "PROBE_LEASE_UNTIL",
+    "LAST_ERROR_CODE",
+    "OPEN_REASON",
+    "LAST_OPEN_SECONDS",
+    "VERSION",
+    v_probe_granted;
 END;
 $$ LANGUAGE plpgsql;
 
 
 -- ========================================
--- Optional: Throttle Cleanup Function (PostgreSQL)
+-- PostgreSQL Stored Procedure: Report Breaker Sample
 -- ========================================
--- BREAKING CHANGE: IS_PROTECTED semantics changed
---   1 = protected (error detected)
---   0 = normal operation (initialized or recovered)
---   NULL = record does not exist (query result only)
--- Cleanup: Delete records with IS_PROTECTED = 0 and expired ERROR_TIMESTAMP
-CREATE OR REPLACE FUNCTION download_cleanup_throttle_protection(
-  p_ttl_seconds INTEGER,
-  p_table_name TEXT DEFAULT 'THROTTLE_PROTECTION'
+CREATE OR REPLACE FUNCTION download_report_breaker_sample(
+  p_hostname_hash TEXT,
+  p_hostname TEXT,
+  p_now INTEGER,
+  p_sample NUMERIC,
+  p_status_code INTEGER,
+  p_open_cap_seconds INTEGER,
+  p_open_threshold_percent INTEGER,
+  p_ewma_span INTEGER,
+  p_consecutive_threshold INTEGER,
+  p_retry_after_seconds INTEGER DEFAULT NULL
 )
-RETURNS INTEGER AS $$
+RETURNS TABLE(
+  "HOSTNAME_HASH" TEXT,
+  "HOSTNAME" TEXT,
+  "STATE" TEXT,
+  "OPEN_UNTIL" INTEGER,
+  "EWMA_SCORE" NUMERIC,
+  "TOTAL_SAMPLES" INTEGER,
+  "CONSECUTIVE_ERROR_COUNT" INTEGER,
+  "SUCCESS_STREAK" INTEGER,
+  "PROBE_LEASE_UNTIL" INTEGER,
+  "LAST_ERROR_CODE" INTEGER,
+  "OPEN_REASON" TEXT,
+  "LAST_OPEN_SECONDS" INTEGER,
+  "VERSION" BIGINT
+) AS $$
 DECLARE
-  deleted_count INTEGER;
-  sql TEXT;
+  v_now INTEGER := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::INTEGER);
+  v_sample NUMERIC := CASE WHEN COALESCE(p_sample, 0) >= 1 THEN 1 ELSE 0 END;
+  v_open_cap_seconds INTEGER := GREATEST(1, COALESCE(p_open_cap_seconds, 60));
+  v_open_threshold NUMERIC := GREATEST(0, COALESCE(p_open_threshold_percent, 20)) / 100.0;
+  v_close_threshold NUMERIC := v_open_threshold / 2.0;
+  v_ewma_span INTEGER := GREATEST(1, COALESCE(p_ewma_span, 8));
+  v_alpha NUMERIC := 2.0 / (GREATEST(1, COALESCE(p_ewma_span, 8)) + 1.0);
+  v_consecutive_threshold INTEGER := GREATEST(1, COALESCE(p_consecutive_threshold, 4));
+
+  v_hostname TEXT := p_hostname;
+  v_state TEXT := 'closed';
+  v_open_until INTEGER := NULL;
+  v_ewma_score NUMERIC := 0;
+  v_total_samples INTEGER := 0;
+  v_consecutive_error_count INTEGER := 0;
+  v_success_streak INTEGER := 0;
+  v_probe_lease_until INTEGER := NULL;
+  v_last_error_code INTEGER := NULL;
+  v_open_reason TEXT := NULL;
+  v_last_open_seconds INTEGER := 0;
+  v_version BIGINT := 0;
+
+  v_locked BOOLEAN := FALSE;
+  v_locked_row_count INTEGER := 0;
+  v_should_open BOOLEAN := FALSE;
+  v_open_seconds INTEGER := 0;
 BEGIN
-  sql := format(
-    'DELETE FROM %1$I
-     WHERE "IS_PROTECTED" = 0
-       AND ("ERROR_TIMESTAMP" IS NULL OR EXTRACT(EPOCH FROM NOW())::INTEGER - "ERROR_TIMESTAMP" > $1)',
-    p_table_name
-  );
+  IF p_hostname_hash IS NULL OR p_hostname_hash = '' THEN
+    RETURN;
+  END IF;
 
-  EXECUTE sql USING p_ttl_seconds;
-  GET DIAGNOSTICS deleted_count = ROW_COUNT;
+  WHILE NOT v_locked LOOP
+    SELECT
+      "HOSTNAME",
+      "STATE",
+      "OPEN_UNTIL",
+      "EWMA_SCORE",
+      "TOTAL_SAMPLES",
+      "CONSECUTIVE_ERROR_COUNT",
+      "SUCCESS_STREAK",
+      "PROBE_LEASE_UNTIL",
+      "LAST_ERROR_CODE",
+      "OPEN_REASON",
+      "LAST_OPEN_SECONDS",
+      "VERSION"
+    INTO
+      v_hostname,
+      v_state,
+      v_open_until,
+      v_ewma_score,
+      v_total_samples,
+      v_consecutive_error_count,
+      v_success_streak,
+      v_probe_lease_until,
+      v_last_error_code,
+      v_open_reason,
+      v_last_open_seconds,
+      v_version
+    FROM "THROTTLE_PROTECTION"
+    WHERE "HOSTNAME_HASH" = p_hostname_hash
+    FOR UPDATE;
 
-  RETURN deleted_count;
+    GET DIAGNOSTICS v_locked_row_count = ROW_COUNT;
+    v_locked := v_locked_row_count > 0;
+
+    IF NOT v_locked THEN
+      INSERT INTO "THROTTLE_PROTECTION" ("HOSTNAME_HASH", "HOSTNAME", "STATE")
+      VALUES (p_hostname_hash, COALESCE(NULLIF(p_hostname, ''), p_hostname_hash), 'closed')
+      ON CONFLICT ("HOSTNAME_HASH") DO NOTHING;
+    END IF;
+  END LOOP;
+
+  v_hostname := COALESCE(NULLIF(p_hostname, ''), v_hostname, p_hostname_hash);
+  v_state := COALESCE(NULLIF(v_state, ''), 'closed');
+  v_ewma_score := COALESCE(v_ewma_score, 0);
+  v_total_samples := COALESCE(v_total_samples, 0);
+  v_consecutive_error_count := COALESCE(v_consecutive_error_count, 0);
+  v_success_streak := COALESCE(v_success_streak, 0);
+  v_last_open_seconds := COALESCE(v_last_open_seconds, 0);
+  v_version := COALESCE(v_version, 0) + 1;
+
+  IF v_state = 'closed' THEN
+    v_open_until := NULL;
+    v_probe_lease_until := NULL;
+    v_success_streak := 0;
+  ELSIF v_state = 'open' AND v_open_until IS NOT NULL AND v_open_until <= v_now THEN
+    v_state := 'half_open';
+    v_open_until := NULL;
+    IF v_probe_lease_until IS NOT NULL AND v_probe_lease_until <= v_now THEN
+      v_probe_lease_until := NULL;
+    END IF;
+  END IF;
+
+  v_ewma_score := (v_alpha * v_sample) + ((1 - v_alpha) * v_ewma_score);
+  v_total_samples := v_total_samples + 1;
+
+  IF v_sample = 1 THEN
+    v_consecutive_error_count := v_consecutive_error_count + 1;
+    v_success_streak := 0;
+    v_last_error_code := p_status_code;
+    v_should_open := v_state IN ('open', 'half_open')
+      OR v_consecutive_error_count >= v_consecutive_threshold
+      OR v_ewma_score >= v_open_threshold;
+
+    IF v_should_open THEN
+      IF p_retry_after_seconds IS NOT NULL AND p_retry_after_seconds > 0 THEN
+        v_open_seconds := LEAST(v_open_cap_seconds, GREATEST(1, p_retry_after_seconds));
+      ELSIF v_last_open_seconds > 0 THEN
+        v_open_seconds := LEAST(v_open_cap_seconds, v_last_open_seconds * 2);
+      ELSE
+        v_open_seconds := 1;
+      END IF;
+
+      v_state := 'open';
+      v_open_until := v_now + v_open_seconds;
+      v_probe_lease_until := NULL;
+      v_open_reason := CASE
+        WHEN p_status_code IS NOT NULL THEN 'http_' || p_status_code::TEXT
+        ELSE 'error_sample'
+      END;
+      v_last_open_seconds := v_open_seconds;
+    ELSIF v_state = 'closed' THEN
+      v_open_until := NULL;
+      v_probe_lease_until := NULL;
+      v_open_reason := NULL;
+    END IF;
+  ELSE
+    v_consecutive_error_count := 0;
+
+    IF v_state = 'half_open' THEN
+      v_success_streak := v_success_streak + 1;
+      v_probe_lease_until := NULL;
+
+      IF v_success_streak >= 2 AND v_ewma_score <= v_close_threshold THEN
+        v_state := 'closed';
+        v_open_until := NULL;
+        v_probe_lease_until := NULL;
+        v_success_streak := 0;
+        v_last_error_code := NULL;
+        v_open_reason := NULL;
+        v_last_open_seconds := 0;
+      END IF;
+    ELSIF v_state = 'closed' THEN
+      v_open_until := NULL;
+      v_probe_lease_until := NULL;
+      v_success_streak := 0;
+      IF v_ewma_score <= v_close_threshold THEN
+        v_open_reason := NULL;
+      END IF;
+      IF v_ewma_score = 0 THEN
+        v_last_error_code := NULL;
+      END IF;
+    END IF;
+  END IF;
+
+  RETURN QUERY
+  UPDATE "THROTTLE_PROTECTION" SET
+    "HOSTNAME" = v_hostname,
+    "STATE" = v_state,
+    "OPEN_UNTIL" = v_open_until,
+    "EWMA_SCORE" = v_ewma_score,
+    "TOTAL_SAMPLES" = v_total_samples,
+    "CONSECUTIVE_ERROR_COUNT" = v_consecutive_error_count,
+    "SUCCESS_STREAK" = v_success_streak,
+    "PROBE_LEASE_UNTIL" = v_probe_lease_until,
+    "LAST_ERROR_CODE" = v_last_error_code,
+    "OPEN_REASON" = v_open_reason,
+    "LAST_OPEN_SECONDS" = v_last_open_seconds,
+    "VERSION" = v_version
+  WHERE "HOSTNAME_HASH" = p_hostname_hash
+  RETURNING
+    p_hostname_hash,
+    "HOSTNAME",
+    "STATE",
+    "OPEN_UNTIL",
+    "EWMA_SCORE",
+    "TOTAL_SAMPLES",
+    "CONSECUTIVE_ERROR_COUNT",
+    "SUCCESS_STREAK",
+    "PROBE_LEASE_UNTIL",
+    "LAST_ERROR_CODE",
+    "OPEN_REASON",
+    "LAST_OPEN_SECONDS",
+    "VERSION";
 END;
 $$ LANGUAGE plpgsql;
 
@@ -519,8 +672,6 @@ CREATE OR REPLACE FUNCTION download_unified_check(
   p_ratelimit_table_name TEXT,
 
   -- Throttle parameters
-  p_throttle_time_window INTEGER,
-  p_throttle_table_name TEXT,
   p_throttle_hostname_hash TEXT,
 
   -- General parameters
@@ -543,9 +694,11 @@ RETURNS TABLE(
 
   -- Throttle result
   throttle_record_exists BOOLEAN,
-  throttle_is_protected INTEGER,
-  throttle_error_timestamp INTEGER,
-  throttle_error_code INTEGER,
+  throttle_state TEXT,
+  throttle_open_until INTEGER,
+  throttle_reason TEXT,
+  throttle_version BIGINT,
+  throttle_last_error_code INTEGER,
 
   -- Last active result
   active_last_access_time INTEGER,
@@ -568,9 +721,12 @@ DECLARE
   v_rate_block_until INTEGER := NULL;
 
   v_throttle_record_exists BOOLEAN := FALSE;
-  v_throttle_is_protected INTEGER := NULL;
-  v_throttle_error_timestamp INTEGER := NULL;
-  v_throttle_error_code INTEGER := NULL;
+  v_throttle_state TEXT := NULL;
+  v_throttle_open_until INTEGER := NULL;
+  v_throttle_reason TEXT := NULL;
+  v_throttle_version BIGINT := NULL;
+  v_throttle_last_error_code INTEGER := NULL;
+  v_throttle_row_count INTEGER := 0;
 
   v_active_last_access_time INTEGER := NULL;
   v_active_total_access_count INTEGER := NULL;
@@ -617,26 +773,34 @@ BEGIN
   -- Step 3: Throttle lookup (provided hostname hash or cache hostname)
   v_throttle_hostname_hash := COALESCE(p_throttle_hostname_hash, v_cache_hostname_hash);
   IF v_throttle_hostname_hash IS NOT NULL THEN
-    EXECUTE format('SELECT "IS_PROTECTED", "ERROR_TIMESTAMP", "LAST_ERROR_CODE" FROM %1$I WHERE "HOSTNAME_HASH" = $1', p_throttle_table_name)
+    SELECT "STATE", "OPEN_UNTIL", "OPEN_REASON", "VERSION", "LAST_ERROR_CODE"
       INTO v_throttle_record
-      USING v_throttle_hostname_hash;
+    FROM "THROTTLE_PROTECTION"
+    WHERE "HOSTNAME_HASH" = v_throttle_hostname_hash;
 
-    IF v_throttle_record."IS_PROTECTED" IS NOT NULL THEN
+    GET DIAGNOSTICS v_throttle_row_count = ROW_COUNT;
+    IF v_throttle_row_count > 0 THEN
       v_throttle_record_exists := TRUE;
-      v_throttle_is_protected := v_throttle_record."IS_PROTECTED";
-      v_throttle_error_timestamp := v_throttle_record."ERROR_TIMESTAMP";
-      v_throttle_error_code := v_throttle_record."LAST_ERROR_CODE";
+      v_throttle_state := v_throttle_record."STATE";
+      v_throttle_open_until := v_throttle_record."OPEN_UNTIL";
+      v_throttle_reason := v_throttle_record."OPEN_REASON";
+      v_throttle_version := v_throttle_record."VERSION";
+      v_throttle_last_error_code := v_throttle_record."LAST_ERROR_CODE";
     ELSE
       v_throttle_record_exists := FALSE;
-      v_throttle_is_protected := NULL;
-      v_throttle_error_timestamp := NULL;
-      v_throttle_error_code := NULL;
+      v_throttle_state := NULL;
+      v_throttle_open_until := NULL;
+      v_throttle_reason := NULL;
+      v_throttle_version := NULL;
+      v_throttle_last_error_code := NULL;
     END IF;
   ELSE
     v_throttle_record_exists := FALSE;
-    v_throttle_is_protected := NULL;
-    v_throttle_error_timestamp := NULL;
-    v_throttle_error_code := NULL;
+    v_throttle_state := NULL;
+    v_throttle_open_until := NULL;
+    v_throttle_reason := NULL;
+    v_throttle_version := NULL;
+    v_throttle_last_error_code := NULL;
   END IF;
 
   -- Step 4: Last active lookup
@@ -657,9 +821,11 @@ BEGIN
     v_rate_last_window_time,
     v_rate_block_until,
     v_throttle_record_exists,
-    v_throttle_is_protected,
-    v_throttle_error_timestamp,
-    v_throttle_error_code,
+    v_throttle_state,
+    v_throttle_open_until,
+    v_throttle_reason,
+    v_throttle_version,
+    v_throttle_last_error_code,
     v_active_last_access_time,
     v_active_total_access_count;
 END;
@@ -1172,66 +1338,6 @@ $$;
 -- ========================================
 -- Slot-Handler Friendly Fair Queue RPCs
 -- ========================================
-CREATE OR REPLACE FUNCTION fq_check_throttle(
-  p_hostname_hash TEXT,
-  p_hostname TEXT,
-  p_throttle_time_window INTEGER DEFAULT 60
-)
-RETURNS TABLE(
-  is_protected BOOLEAN,
-  error_code INTEGER,
-  retry_after INTEGER
-) AS $$
-DECLARE
-  v_window INTEGER := GREATEST(1, COALESCE(p_throttle_time_window, 60));
-  v_now INTEGER := EXTRACT(EPOCH FROM NOW())::INTEGER;
-  v_error_timestamp INTEGER;
-  v_error_code INTEGER;
-  v_is_protected INTEGER;
-  v_retry_after INTEGER := NULL;
-  v_rows INTEGER := 0;
-BEGIN
-  IF p_hostname_hash IS NULL OR p_hostname_hash = '' THEN
-    RETURN QUERY SELECT FALSE, NULL::INTEGER, NULL::INTEGER;
-    RETURN;
-  END IF;
-
-  IF p_hostname IS NULL OR p_hostname = '' THEN
-    p_hostname := p_hostname_hash;
-  END IF;
-
-  BEGIN
-    INSERT INTO "THROTTLE_PROTECTION" ("HOSTNAME_HASH", "HOSTNAME", "IS_PROTECTED", "LAST_ERROR_CODE")
-    VALUES (p_hostname_hash, p_hostname, 0, NULL)
-    ON CONFLICT ("HOSTNAME_HASH") DO NOTHING;
-  EXCEPTION
-    WHEN others THEN
-      NULL;
-  END;
-
-  SELECT "IS_PROTECTED", "LAST_ERROR_CODE", "ERROR_TIMESTAMP"
-  INTO v_is_protected, v_error_code, v_error_timestamp
-  FROM "THROTTLE_PROTECTION"
-  WHERE "HOSTNAME_HASH" = p_hostname_hash;
-
-  GET DIAGNOSTICS v_rows = ROW_COUNT;
-  IF v_rows = 0 THEN
-    RETURN QUERY SELECT FALSE, NULL::INTEGER, NULL::INTEGER;
-    RETURN;
-  END IF;
-
-  IF COALESCE(v_is_protected, 0) = 1 AND v_error_timestamp IS NOT NULL THEN
-    IF (v_now - v_error_timestamp) < v_window THEN
-      v_retry_after := GREATEST(v_window - (v_now - v_error_timestamp), 0);
-      RETURN QUERY SELECT TRUE, v_error_code, v_retry_after;
-      RETURN;
-    END IF;
-  END IF;
-
-  RETURN QUERY SELECT FALSE, NULL::INTEGER, NULL::INTEGER;
-END;
-$$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION fq_try_acquire_batch(
   p_hostname_hash TEXT,
   p_hostname TEXT,
@@ -1243,22 +1349,28 @@ CREATE OR REPLACE FUNCTION fq_try_acquire_batch(
   p_site_max_slot_per_site INT,
   p_site_max_slot_per_ip INT,
   p_zombie_timeout INT DEFAULT 30,
-  p_cooldown_seconds INT DEFAULT 0,
-  p_throttle_time_window INT DEFAULT 60
+  p_cooldown_seconds INT DEFAULT 0
 )
 RETURNS TABLE(
   status TEXT,
   slot_token TEXT,
   throttle_code INT,
-  throttle_retry_after INT
+  breaker_open_until INT,
+  breaker_reason TEXT,
+  breaker_version BIGINT
 ) AS $$
 DECLARE
   v_hostname TEXT;
   v_site_bucket TEXT;
   v_ip_bucket TEXT;
+  v_now INTEGER := COALESCE((p_now_ms / 1000)::INTEGER, EXTRACT(EPOCH FROM NOW())::INTEGER);
   v_throttled BOOLEAN := FALSE;
   v_throttle_code INTEGER := NULL;
-  v_throttle_retry_after INTEGER := NULL;
+  v_breaker_state TEXT := NULL;
+  v_breaker_open_until INTEGER := NULL;
+  v_breaker_reason TEXT := NULL;
+  v_breaker_version BIGINT := NULL;
+  v_breaker_row_count INTEGER := 0;
   v_host_slot_id INT;
   v_site_slot_id INT;
   v_site_len INT;
@@ -1273,9 +1385,16 @@ BEGIN
   END IF;
 
   IF p_hostname_hash IS NOT NULL AND p_hostname_hash <> '' THEN
-    SELECT t.is_protected, t.error_code, t.retry_after
-    INTO v_throttled, v_throttle_code, v_throttle_retry_after
-    FROM fq_check_throttle(p_hostname_hash, v_hostname, p_throttle_time_window) AS t;
+    SELECT "STATE", "OPEN_UNTIL", "OPEN_REASON", "VERSION", "LAST_ERROR_CODE"
+    INTO v_breaker_state, v_breaker_open_until, v_breaker_reason, v_breaker_version, v_throttle_code
+    FROM "THROTTLE_PROTECTION"
+    WHERE "HOSTNAME_HASH" = p_hostname_hash;
+
+    GET DIAGNOSTICS v_breaker_row_count = ROW_COUNT;
+    v_throttled := v_breaker_row_count > 0
+      AND v_breaker_state = 'open'
+      AND v_breaker_open_until IS NOT NULL
+      AND v_breaker_open_until > v_now;
   END IF;
 
   IF v_hostname IS NULL THEN
@@ -1283,7 +1402,9 @@ BEGIN
       status := 'WAIT';
       slot_token := NULL::TEXT;
       throttle_code := NULL::INTEGER;
-      throttle_retry_after := NULL::INTEGER;
+      breaker_open_until := NULL::INTEGER;
+      breaker_reason := NULL::TEXT;
+      breaker_version := NULL::BIGINT;
       RETURN NEXT;
     END LOOP;
     RETURN;
@@ -1294,7 +1415,9 @@ BEGIN
       status := 'THROTTLED';
       slot_token := NULL::TEXT;
       throttle_code := v_throttle_code;
-      throttle_retry_after := v_throttle_retry_after;
+      breaker_open_until := v_breaker_open_until;
+      breaker_reason := v_breaker_reason;
+      breaker_version := v_breaker_version;
       RETURN NEXT;
     END LOOP;
     RETURN;
@@ -1322,7 +1445,9 @@ BEGIN
       status := 'WAIT';
       slot_token := NULL::TEXT;
       throttle_code := v_throttle_code;
-      throttle_retry_after := v_throttle_retry_after;
+      breaker_open_until := v_breaker_open_until;
+      breaker_reason := v_breaker_reason;
+      breaker_version := v_breaker_version;
       RETURN NEXT;
       CONTINUE;
     END IF;
@@ -1331,14 +1456,18 @@ BEGIN
       status := 'IP_TOO_MANY';
       slot_token := NULL::TEXT;
       throttle_code := v_throttle_code;
-      throttle_retry_after := v_throttle_retry_after;
+      breaker_open_until := v_breaker_open_until;
+      breaker_reason := v_breaker_reason;
+      breaker_version := v_breaker_version;
       RETURN NEXT;
       CONTINUE;
     ELSIF v_host_slot_id < 0 THEN
       status := 'QUEUE_FULL';
       slot_token := NULL::TEXT;
       throttle_code := v_throttle_code;
-      throttle_retry_after := v_throttle_retry_after;
+      breaker_open_until := v_breaker_open_until;
+      breaker_reason := v_breaker_reason;
+      breaker_version := v_breaker_version;
       RETURN NEXT;
       CONTINUE;
     END IF;
@@ -1363,7 +1492,9 @@ BEGIN
       status := 'WAIT';
       slot_token := NULL::TEXT;
       throttle_code := v_throttle_code;
-      throttle_retry_after := v_throttle_retry_after;
+      breaker_open_until := v_breaker_open_until;
+      breaker_reason := v_breaker_reason;
+      breaker_version := v_breaker_version;
       RETURN NEXT;
       CONTINUE;
     END IF;
@@ -1373,7 +1504,9 @@ BEGIN
       status := 'IP_TOO_MANY';
       slot_token := NULL::TEXT;
       throttle_code := v_throttle_code;
-      throttle_retry_after := v_throttle_retry_after;
+      breaker_open_until := v_breaker_open_until;
+      breaker_reason := v_breaker_reason;
+      breaker_version := v_breaker_version;
       RETURN NEXT;
       CONTINUE;
     ELSIF v_site_slot_id < 0 THEN
@@ -1381,7 +1514,9 @@ BEGIN
       status := 'QUEUE_FULL';
       slot_token := NULL::TEXT;
       throttle_code := v_throttle_code;
-      throttle_retry_after := v_throttle_retry_after;
+      breaker_open_until := v_breaker_open_until;
+      breaker_reason := v_breaker_reason;
+      breaker_version := v_breaker_version;
       RETURN NEXT;
       CONTINUE;
     END IF;
@@ -1389,7 +1524,9 @@ BEGIN
     status := 'ACQUIRED';
     slot_token := encode(convert_to(jsonb_build_object('host', v_host_slot_id, 'site', v_site_slot_id)::text, 'UTF8'), 'base64');
     throttle_code := v_throttle_code;
-    throttle_retry_after := v_throttle_retry_after;
+    breaker_open_until := v_breaker_open_until;
+    breaker_reason := v_breaker_reason;
+    breaker_version := v_breaker_version;
     RETURN NEXT;
   END LOOP;
 END;

@@ -1,7 +1,9 @@
 import { sha256Hash, calculateIPSubnet, applyVerifyHeaders, hasVerifyCredentials } from './utils.js';
 
+const VALID_BREAKER_STATES = new Set(['closed', 'open', 'half_open']);
+
 /**
- * Unified check that performs rate limit + cache + throttle in a single database RTT
+ * Unified check that performs rate limit + cache + breaker snapshot lookup in one database RTT
  * @param {string} path - File path
  * @param {string} clientIP - Client IP address
  * @param {Object} config - Configuration object
@@ -16,14 +18,12 @@ export const unifiedCheck = async (path, clientIP, config) => {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const throttleWindow = config.throttleTimeWindow ?? 60;
   const cacheTTL = config.linkTTL ?? 1800;
   const windowSeconds = config.windowTimeSeconds ?? 86400;
   const limit = config.limit ?? 100;
   const blockSeconds = config.blockTimeSeconds ?? 600;
   const cacheTableName = config.cacheTableName || 'DOWNLOAD_CACHE_TABLE';
   const rateLimitTableName = config.rateLimitTableName || 'DOWNLOAD_IP_RATELIMIT_TABLE';
-  const throttleTableName = config.throttleTableName || 'THROTTLE_PROTECTION';
   const lastActiveTableName = config.lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
@@ -63,8 +63,6 @@ export const unifiedCheck = async (path, clientIP, config) => {
     p_block_seconds: blockSeconds,
     p_ratelimit_table_name: rateLimitTableName,
 
-    p_throttle_time_window: throttleWindow,
-    p_throttle_table_name: throttleTableName,
     p_throttle_hostname_hash: config.throttleHostnameHash ?? null,
 
     p_now: now,
@@ -156,13 +154,7 @@ export const unifiedCheck = async (path, clientIP, config) => {
     ipSubnet,
   };
   
-  // Parse throttle result
-  // BREAKING CHANGE: IS_PROTECTED semantics
-  //   1 = protected (error detected)
-  //   0 = normal operation (initialized or recovered)
-  //   NULL = record does not exist
-
-  const normalizeThrottleRecordExists = (value) => {
+  const normalizeBreakerRecordExists = (value) => {
     if (value === true || value === 1 || value === '1') return true;
     if (typeof value === 'string') {
       const lowered = value.trim().toLowerCase();
@@ -172,45 +164,39 @@ export const unifiedCheck = async (path, clientIP, config) => {
     return false;
   };
 
-  const normalizeThrottleProtected = (value) => {
-    if (value === 1 || value === '1' || value === true) return 1;
-    if (value === 0 || value === '0' || value === false) return 0;
-    return null;
-  };
-
-  const throttleIsProtected = normalizeThrottleProtected(row.throttle_is_protected);
-
-  let throttleResult = {
-    status: 'normal_operation',
-    recordExists: normalizeThrottleRecordExists(row.throttle_record_exists),
-    isProtected: throttleIsProtected,
-    errorTimestamp: row.throttle_error_timestamp,
-    errorCode: row.throttle_error_code,
-    retryAfter: 0,
-  };
-
-  if (throttleIsProtected === 1) {
-    const errorTimestamp = parseInt(row.throttle_error_timestamp, 10);
-    if (Number.isNaN(errorTimestamp)) {
-      throttleResult.status = 'protected';
-      throttleResult.retryAfter = throttleWindow;
-      console.log('[Unified Check] Throttle PROTECTED with unknown timestamp, default retry after:', throttleResult.retryAfter);
-    } else {
-      const timeSinceError = now - errorTimestamp;
-
-      if (timeSinceError < throttleWindow) {
-        throttleResult.status = 'protected';
-        throttleResult.retryAfter = throttleWindow - timeSinceError;
-        console.log('[Unified Check] Throttle PROTECTED, retry after:', throttleResult.retryAfter);
-      } else {
-        throttleResult.status = 'resume_operation';
-        console.log('[Unified Check] Throttle resume_operation (time window expired)');
-      }
+  const normalizeBreakerState = (value) => {
+    if (typeof value !== 'string') {
+      return null;
     }
-  } else if (throttleIsProtected === 0) {
-    console.log('[Unified Check] Throttle normal_operation (IS_PROTECTED = 0)');
+    const state = value.trim().toLowerCase();
+    return VALID_BREAKER_STATES.has(state) ? state : null;
+  };
+
+  const parseNullableInt = (value) => {
+    if (value === null || value === undefined || value === '') {
+      return null;
+    }
+    const parsed = Number.parseInt(value, 10);
+    return Number.isNaN(parsed) ? null : parsed;
+  };
+
+  const throttleState = normalizeBreakerState(row.throttle_state);
+
+  const throttleResult = {
+    recordExists: normalizeBreakerRecordExists(row.throttle_record_exists),
+    state: throttleState,
+    openUntil: parseNullableInt(row.throttle_open_until),
+    reason: typeof row.throttle_reason === 'string' && row.throttle_reason.trim() !== ''
+      ? row.throttle_reason
+      : null,
+    version: parseNullableInt(row.throttle_version),
+    lastErrorCode: parseNullableInt(row.throttle_last_error_code),
+  };
+
+  if (throttleResult.recordExists) {
+    console.log('[Unified Check] Breaker snapshot:', JSON.stringify(throttleResult));
   } else {
-    console.log('[Unified Check] Throttle normal_operation (no record)');
+    console.log('[Unified Check] Breaker snapshot unavailable (no record)');
   }
 
   let activeLastAccessTime = null;
@@ -256,13 +242,18 @@ export const unifiedCheck = async (path, clientIP, config) => {
         hostnameHash: null,
       };
 
-      throttleResult = {
-        status: 'normal_operation',
-        recordExists: false,
-        isProtected: null,
-        errorTimestamp: null,
-        errorCode: null,
-        retryAfter: 0,
+      return {
+        cache: cacheResult,
+        rateLimit: rateLimitResult,
+        throttle: {
+          recordExists: false,
+          state: null,
+          openUntil: null,
+          reason: null,
+          version: null,
+          lastErrorCode: null,
+        },
+        idle: idleInfo,
       };
     }
   }

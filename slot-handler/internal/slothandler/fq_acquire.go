@@ -93,17 +93,12 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 	}
 
 	// THROTTLED global convergence: if the host is protected, return immediately.
-	if protected, code, retryAfter := s.getThrottleState(hostKey, now); protected {
+	if state := s.getThrottleState(hostKey, now); state != nil {
 		// Avoid creating a flow token for a terminal throttled response.
 		if token != "" {
 			store.deleteFlow(token)
 		}
-		return &AcquireResponse{
-			Result:       "throttled",
-			ThrottleCode: code,
-			ThrottleWait: retryAfter,
-			Reason:       "throttle_cached",
-		}, nil
+		return throttledAcquireResponse("", "throttle_cached", state), nil
 	}
 	createdNew := false
 	if token == "" {
@@ -167,16 +162,10 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 	timer := time.NewTimer(pollWindow)
 	defer timer.Stop()
 
-	finalizeCachedThrottle := func(code, retryAfter int) *AcquireResponse {
+	finalizeCachedThrottle := func(state *fqThrottleState) *AcquireResponse {
 		store.detachWaiter(token)
 		store.deleteFlow(token)
-		return &AcquireResponse{
-			Result:       "throttled",
-			QueryToken:   token,
-			ThrottleCode: code,
-			ThrottleWait: retryAfter,
-			Reason:       "throttle_cached",
-		}
+		return throttledAcquireResponse(token, "throttle_cached", state)
 	}
 
 	finalizeDelivered := func(resp *AcquireResponse) *AcquireResponse {
@@ -242,8 +231,8 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		default:
 		}
 		now3 := nowFn()
-		if protected, code, retryAfter := s.getThrottleState(hostKey, now3); protected {
-			return finalizeCachedThrottle(code, retryAfter), nil
+		if state := s.getThrottleState(hostKey, now3); state != nil {
+			return finalizeCachedThrottle(state), nil
 		}
 		return &AcquireResponse{Result: "pending", QueryToken: token}, nil
 	}

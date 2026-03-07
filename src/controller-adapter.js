@@ -41,61 +41,8 @@ const matchPattern = (pattern, filepath) => {
   return regex.test(filepath);
 };
 
-const pathHasPrefix = (path, prefixes) => {
-  if (!Array.isArray(prefixes) || prefixes.length === 0) {
-    return true;
-  }
-  return prefixes.some((prefix) => typeof prefix === 'string' && path.startsWith(prefix));
-};
-
-const pathContainsAnyDir = (path, includes) => {
-  if (!Array.isArray(includes) || includes.length === 0) {
-    return true;
-  }
-  const trimmed = path.replace(/^\/+|\/+$/g, '');
-  if (!trimmed) return false;
-  const parts = trimmed.split('/');
-  if (parts.length <= 1) return false;
-  const dirs = parts.slice(0, -1);
-  return dirs.some((dir) => includes.some((inc) => typeof inc === 'string' && dir.includes(inc)));
-};
-
-const pathContainsAnyName = (path, includes) => {
-  if (!Array.isArray(includes) || includes.length === 0) {
-    return true;
-  }
-  const trimmed = path.replace(/^\/+|\/+$/g, '');
-  if (!trimmed) return false;
-  const parts = trimmed.split('/');
-  const name = parts[parts.length - 1];
-  return includes.some((inc) => typeof inc === 'string' && name.includes(inc));
-};
-
-const pathContainsAny = (path, includes) => {
-  if (!Array.isArray(includes) || includes.length === 0) {
-    return true;
-  }
-  return includes.some((inc) => typeof inc === 'string' && path.includes(inc));
-};
-
 const ruleMatches = (rule, filepath) => {
   if (!rule) return false;
-  const hasLegacyFields =
-    (Array.isArray(rule.prefix) && rule.prefix.length > 0)
-    || (Array.isArray(rule.dirIncludes) && rule.dirIncludes.length > 0)
-    || (Array.isArray(rule.nameIncludes) && rule.nameIncludes.length > 0)
-    || (Array.isArray(rule.pathIncludes) && rule.pathIncludes.length > 0);
-
-  if (hasLegacyFields) {
-    // Controller-overhaul no longer emits legacy prefix/includes; keep parsing only
-    // to tolerate stale bootstrap payloads.
-    return (
-      pathHasPrefix(filepath, rule.prefix)
-      && pathContainsAnyDir(filepath, rule.dirIncludes)
-      && pathContainsAnyName(filepath, rule.nameIncludes)
-      && pathContainsAny(filepath, rule.pathIncludes)
-    );
-  }
 
   if (typeof rule.pattern === 'string' && rule.pattern.length > 0) {
     return matchPattern(rule.pattern, filepath);
@@ -110,7 +57,7 @@ const matchPathRule = (pathRules, filepath) => {
   }
   let best = null;
   for (const rule of pathRules) {
-    if (!rule || typeof rule.profileId !== 'string') {
+    if (!rule) {
       continue;
     }
     if (!ruleMatches(rule, filepath)) {
@@ -157,16 +104,16 @@ const findProfileById = (profiles, profileId) => {
   if (!Array.isArray(profiles) || profiles.length === 0) {
     return null;
   }
-  const target = (profileId || '').trim();
+  const target = typeof profileId === 'string' ? profileId.trim() : '';
   if (!target) {
-    return profiles[0] || null;
+    return null;
   }
   for (const profile of profiles) {
     if (profile && typeof profile.id === 'string' && profile.id === target) {
       return profile;
     }
   }
-  return profiles[0] || null;
+  return null;
 };
 
 const normalizeStringArray = (value) => {
@@ -197,8 +144,8 @@ const mergeDownloadDecision = (base, dynamic) => {
   if (dynamic.checkOriginMode) {
     merged.checkOriginMode = pickString(dynamic.checkOriginMode, merged.checkOriginMode);
   }
-  if (dynamic.throttleProfile) {
-    merged.throttleProfile = pickString(dynamic.throttleProfile, merged.throttleProfile);
+  if (Object.prototype.hasOwnProperty.call(dynamic, 'throttleProfile')) {
+    merged.throttleProfile = dynamic.throttleProfile;
   }
   if (dynamic.blockReason) {
     merged.blockReason = dynamic.blockReason;
@@ -211,15 +158,19 @@ const buildStaticDownloadDecision = (profile, bootstrap) => {
   const downloadBootstrap = bootstrap?.download || {};
   const pathAction = normalizeStringArray(actions.pathAction);
   const checkOriginMode = pickString(actions.checkOriginMode, downloadBootstrap.originBindingDefault || '');
-  const throttleProfile = pickString(actions.throttleProfile, 'default');
   const blockReason = pickString(actions.blockReason, '');
 
-  return {
+  const decision = {
     pathAction,
     checkOriginMode,
-    throttleProfile,
     blockReason: blockReason || undefined,
   };
+
+  if (Object.prototype.hasOwnProperty.call(actions, 'throttleProfile')) {
+    decision.throttleProfile = actions.throttleProfile;
+  }
+
+  return decision;
 };
 
 export async function fetchControllerState(request, env) {
@@ -232,11 +183,18 @@ export async function fetchControllerState(request, env) {
     const ctx = buildDecisionContext(request);
     const filepath = normalizePath(ctx.path || '/');
     const rule = matchPathRule(bootstrap?.pathRules || [], filepath);
-    const defaultProfileId = pickString(bootstrap?.global?.defaultProfileId, 'default');
-    const profileId = pickString(rule?.profileId, defaultProfileId);
+    const matchedProfileId = pickString(rule?.profileId, '');
+    if (rule && !matchedProfileId) {
+      throw new Error('controller pathRules.profileId is required');
+    }
+    const defaultProfileId = pickString(bootstrap?.global?.defaultProfileId, '');
+    const profileId = matchedProfileId || defaultProfileId;
+    if (!profileId) {
+      throw new Error('controller global.defaultProfileId is required');
+    }
     const profile = findProfileById(bootstrap?.pathProfiles || [], profileId);
     if (!profile) {
-      return null;
+      throw new Error(`Unknown path profile from controller bootstrap: ${profileId}`);
     }
 
     let decisionPayload = null;

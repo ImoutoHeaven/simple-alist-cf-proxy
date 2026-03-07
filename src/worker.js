@@ -21,13 +21,19 @@ const DEFAULT_RATE_LIMIT_IPV6_SUFFIX = '/60';
 const DEFAULT_SLOT_HANDLER_TIMEOUT_MS = 20000;
 const DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = 8000;
 const DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS = 35;
+const DEFAULT_THROTTLE_OPEN_CAP_SECONDS = 60;
+const DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT = 20;
+const DEFAULT_THROTTLE_EWMA_SPAN = 8;
+const DEFAULT_THROTTLE_CONSECUTIVE_THRESHOLD = 4;
+const DEFAULT_THROTTLE_PROTECT_HTTP_CODES = [429, 499, 500, 502, 503, 504];
+const VALID_BREAKER_STATES = new Set(['closed', 'open', 'half_open']);
 
 // slot-handler acquire is long-poll based; don't set per-request timeouts below this window.
 const SLOT_HANDLER_LONGPOLL_MS = 6000;
 
 // Fair Queue in-memory state (per Worker instance)
 const FQ_GLOBAL_STATE = {
-  throttledByHost: new Map(),
+  breakerByHost: new Map(),
   overloadedByHost: new Map(),
   overloadedBySite: new Map(),
   overloadedByIp: new Map(),
@@ -103,6 +109,192 @@ const normalizePositiveSeconds = (value, fallback) => {
   }
   const fb = Number(fallback);
   return Number.isFinite(fb) && fb > 0 ? fb : 0;
+};
+
+const normalizeProtectHttpCodes = (value) => {
+  if (value === undefined || value === null) {
+    return [...DEFAULT_THROTTLE_PROTECT_HTTP_CODES];
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error('Invalid protectHttpCodes from controller: expected array');
+  }
+
+  if (value.length === 0) {
+    return [...DEFAULT_THROTTLE_PROTECT_HTTP_CODES];
+  }
+
+  return value.map((code, index) => {
+    const normalized = Number(code);
+    if (!Number.isInteger(normalized) || normalized < 100 || normalized > 599) {
+      throw new Error(`Invalid protectHttpCodes[${index}] from controller: ${code}`);
+    }
+    return normalized;
+  });
+};
+
+const deriveOpenSeconds = (retryAfterValue, openCapSeconds) => {
+  const cap = normalizePositiveSeconds(openCapSeconds, DEFAULT_THROTTLE_OPEN_CAP_SECONDS);
+  const raw = typeof retryAfterValue === 'string' ? retryAfterValue.trim() : retryAfterValue;
+
+  let parsed = null;
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    parsed = Math.floor(raw);
+  } else if (typeof raw === 'string' && /^\d+$/.test(raw)) {
+    parsed = Number.parseInt(raw, 10);
+  }
+
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+
+  return Math.max(1, Math.min(cap, parsed + 1));
+};
+
+const isManagedThrottleHost = (hostname, throttleHostnamePatterns = []) => {
+  const hostKey = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+  return Boolean(hostKey)
+    && Array.isArray(throttleHostnamePatterns)
+    && throttleHostnamePatterns.some((pattern) => matchHostnamePattern(hostKey, pattern));
+};
+
+const readOpenBreakerSnapshot = (snapshot, fallbackSeconds = 0, nowSeconds = Math.floor(Date.now() / 1000)) => {
+  if (!snapshot || snapshot.state !== 'open') {
+    return null;
+  }
+
+  const rawOpenUntil = Number(snapshot.openUntil);
+  const openUntil = Number.isFinite(rawOpenUntil) ? Math.trunc(rawOpenUntil) : null;
+  if (openUntil !== null && openUntil <= nowSeconds) {
+    return null;
+  }
+
+  const rawVersion = Number(snapshot.version);
+  const version = Number.isFinite(rawVersion) ? Math.trunc(rawVersion) : null;
+  const lastErrorCode = Number(snapshot.lastErrorCode);
+  const errorCode = Number.isFinite(lastErrorCode) && lastErrorCode >= 100 ? Math.trunc(lastErrorCode) : 503;
+  const retryAfterBase = openUntil !== null ? (openUntil - nowSeconds) : 0;
+  const retryAfter = normalizePositiveSeconds(retryAfterBase, fallbackSeconds);
+  if (!retryAfter) {
+    return null;
+  }
+
+  return {
+    state: 'open',
+    openUntil,
+    reason: typeof snapshot.reason === 'string' && snapshot.reason.trim() !== '' ? snapshot.reason : null,
+    version,
+    errorCode,
+    retryAfter,
+  };
+};
+
+const parseNullableBreakerInt = (value) => {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
+};
+
+const normalizeBreakerCacheEntry = (snapshot) => {
+  if (!snapshot || typeof snapshot !== 'object') {
+    return null;
+  }
+
+  const rawState = typeof snapshot.state === 'string' ? snapshot.state.trim().toLowerCase() : '';
+  const state = VALID_BREAKER_STATES.has(rawState) ? rawState : '';
+  const openUntil = parseNullableBreakerInt(snapshot.openUntil);
+  const version = parseNullableBreakerInt(snapshot.version);
+  const lastErrorCode = parseNullableBreakerInt(snapshot.lastErrorCode);
+  const reason = typeof snapshot.reason === 'string' && snapshot.reason.trim() !== ''
+    ? snapshot.reason
+    : null;
+
+  if (!state) {
+    return null;
+  }
+
+  return {
+    state,
+    openUntil,
+    reason,
+    version,
+    lastErrorCode,
+  };
+};
+
+const shouldKeepBreakerCacheEntry = (entry, nowSeconds = Math.floor(Date.now() / 1000)) => {
+  if (!entry || entry.state !== 'open') {
+    return false;
+  }
+
+  return Number.isFinite(entry.openUntil) && entry.openUntil > nowSeconds;
+};
+
+const pruneBreakerMirrorCache = (nowSeconds = Math.floor(Date.now() / 1000)) => {
+  for (const [hostKey, entry] of FQ_GLOBAL_STATE.breakerByHost.entries()) {
+    if (!shouldKeepBreakerCacheEntry(entry, nowSeconds)) {
+      FQ_GLOBAL_STATE.breakerByHost.delete(hostKey);
+    }
+  }
+};
+
+const mirrorBreakerSnapshot = (hostname, snapshot, nowSeconds = Math.floor(Date.now() / 1000)) => {
+  const hostKey = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+  if (!hostKey) {
+    return null;
+  }
+
+  pruneBreakerMirrorCache(nowSeconds);
+
+  const normalized = normalizeBreakerCacheEntry(snapshot);
+  if (!shouldKeepBreakerCacheEntry(normalized, nowSeconds)) {
+    FQ_GLOBAL_STATE.breakerByHost.delete(hostKey);
+    return null;
+  }
+
+  FQ_GLOBAL_STATE.breakerByHost.set(hostKey, normalized);
+
+  return normalized;
+};
+
+const readSlotHandlerBreakerSnapshot = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const rawOpenUntil = Number(payload.breakerOpenUntil);
+  const openUntil = Number.isFinite(rawOpenUntil) ? Math.trunc(rawOpenUntil) : null;
+  const rawVersion = Number(payload.breakerVersion);
+  const version = Number.isFinite(rawVersion) ? Math.trunc(rawVersion) : null;
+  const throttleCode = Number(payload.throttleCode);
+  const lastErrorCode = Number.isFinite(throttleCode) && throttleCode >= 100 ? Math.trunc(throttleCode) : null;
+  const reason = typeof payload.breakerReason === 'string' && payload.breakerReason.trim() !== ''
+    ? payload.breakerReason
+    : null;
+
+  if (openUntil === null && version === null && reason === null && lastErrorCode === null) {
+    return null;
+  }
+
+  return {
+    state: 'open',
+    openUntil,
+    reason,
+    version,
+    lastErrorCode,
+  };
+};
+
+const readProbeLeaseRetryAfter = (snapshot, fallbackSeconds = 1, nowSeconds = Math.floor(Date.now() / 1000)) => {
+  const rawProbeLeaseUntil = Number(snapshot?.probeLeaseUntil);
+  const probeLeaseUntil = Number.isFinite(rawProbeLeaseUntil) ? Math.trunc(rawProbeLeaseUntil) : null;
+  if (probeLeaseUntil !== null && probeLeaseUntil > nowSeconds) {
+    return Math.max(1, probeLeaseUntil - nowSeconds);
+  }
+  return normalizePositiveSeconds(fallbackSeconds, 1) || 1;
 };
 
 const normalizePositiveMs = (value, fallback) => {
@@ -277,45 +469,6 @@ const normalizeHeaderMap = (value) => {
   }
   return normalized;
 };
-
-function markThrottled(hostname, code, retryAfterSeconds) {
-  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
-  if (!hostKey) {
-    return;
-  }
-
-  const seconds = normalizePositiveSeconds(retryAfterSeconds, 0);
-  if (!seconds) {
-    return;
-  }
-
-  const until = nowMs() + seconds * 1000;
-  const prev = FQ_GLOBAL_STATE.throttledByHost.get(hostKey);
-  const codeNumber = Number(code);
-  const normalizedCode = Number.isFinite(codeNumber) ? codeNumber : 503;
-  if (!prev || until > prev.untilMs) {
-    FQ_GLOBAL_STATE.throttledByHost.set(hostKey, {
-      untilMs: until,
-      code: normalizedCode,
-    });
-  }
-}
-
-function getHostThrottledRemainingSeconds(hostname, now = nowMs()) {
-  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
-  if (!hostKey) {
-    return 0;
-  }
-
-  const state = FQ_GLOBAL_STATE.throttledByHost.get(hostKey);
-  if (!state || !state.untilMs || state.untilMs <= now) {
-    if (state && state.untilMs && state.untilMs <= now) {
-      FQ_GLOBAL_STATE.throttledByHost.delete(hostKey);
-    }
-    return 0;
-  }
-  return Math.ceil((state.untilMs - now) / 1000);
-}
 
 function markHostOverloaded(hostname, retryAfterMs) {
   const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
@@ -811,47 +964,40 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   const throttleProfiles = downloadBootstrap.throttleProfiles && typeof downloadBootstrap.throttleProfiles === 'object'
     ? downloadBootstrap.throttleProfiles
     : {};
-  const throttleProfileName = typeof downloadDecision?.throttleProfile === 'string' && downloadDecision.throttleProfile.trim() !== ''
-    ? downloadDecision.throttleProfile.trim()
-    : 'default';
-  const throttleProfile = throttleProfiles[throttleProfileName] || throttleProfiles.default || {};
+  const hasThrottleProfileField = Boolean(downloadDecision)
+    && Object.prototype.hasOwnProperty.call(downloadDecision, 'throttleProfile');
+  let throttleProfileName = 'default';
+  if (hasThrottleProfileField) {
+    if (typeof downloadDecision.throttleProfile !== 'string' || downloadDecision.throttleProfile.trim() === '') {
+      throw new Error('Invalid throttleProfile from controller: expected non-empty string');
+    }
+    throttleProfileName = downloadDecision.throttleProfile.trim();
+  }
+  const throttleProfile = throttleProfiles[throttleProfileName];
+  if (!throttleProfile) {
+    throw new Error(`Unknown throttleProfile from controller: ${throttleProfileName}`);
+  }
   const throttleHostnamePatterns = Array.isArray(throttleProfile.hostPatterns)
     ? throttleProfile.hostPatterns.map((p) => normalizeString(p)).filter((p) => p.length > 0)
     : [];
-  const throttleCleanupPercentRaw = Number.parseFloat(throttleProfile.cleanupPercentage);
-  const throttleCleanupProbability = Number.isFinite(throttleCleanupPercentRaw) && throttleCleanupPercentRaw >= 0
-    ? Math.min(100, throttleCleanupPercentRaw) / 100
-    : cleanupProbability;
+  const protectHttpCodes = normalizeProtectHttpCodes(throttleProfile.protectHttpCodes);
   const throttleEnabled = isCustomDb && throttleHostnamePatterns.length > 0;
   const throttleConfig = {
     postgrestUrl,
     verifyHeader,
     verifySecret,
-    tableName: normalizeString(throttleProfile.tableName, 'download_throttle'),
-    throttleTimeWindow: Number(throttleProfile.windowSeconds) > 0 ? Number(throttleProfile.windowSeconds) : 60,
-    observeWindowSeconds: Number(throttleProfile.observeWindowSeconds) > 0 ? Number(throttleProfile.observeWindowSeconds) : 60,
-    errorRatioPercent: Number(throttleProfile.errorRatioPercent) > 0 ? Number(throttleProfile.errorRatioPercent) : 20,
-    consecutiveThreshold: Number.isFinite(Number(throttleProfile.consecutiveThreshold)) && Number(throttleProfile.consecutiveThreshold) > 0
-      ? Number(throttleProfile.consecutiveThreshold)
-      : 4,
-    minSampleCount: Number.isFinite(Number(throttleProfile.minSampleCount)) && Number(throttleProfile.minSampleCount) > 0
-      ? Number(throttleProfile.minSampleCount)
-      : 8,
-    fastErrorRatioPercent: Number(throttleProfile.fastErrorRatioPercent) > 0
-      ? Number(throttleProfile.fastErrorRatioPercent)
-      : undefined,
-    fastMinSampleCount: Number.isFinite(Number(throttleProfile.fastMinSampleCount)) && Number(throttleProfile.fastMinSampleCount) >= 0
-      ? Number(throttleProfile.fastMinSampleCount)
-      : 4,
-    cleanupProbability: throttleCleanupProbability,
-    protectedHttpCodes: Array.isArray(throttleProfile.protectHttpCodes)
-      ? throttleProfile.protectHttpCodes
-          .map((code) => Number(code))
-          .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
-      : [],
+    openCapSeconds: normalizePositiveSeconds(throttleProfile.openCapSeconds, DEFAULT_THROTTLE_OPEN_CAP_SECONDS),
+    openThresholdPercent: normalizePositiveSeconds(
+      throttleProfile.openThresholdPercent,
+      DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT,
+    ),
+    ewmaSpan: normalizePositiveSeconds(throttleProfile.ewmaSpan, DEFAULT_THROTTLE_EWMA_SPAN),
+    consecutiveThreshold: normalizePositiveSeconds(
+      throttleProfile.consecutiveThreshold,
+      DEFAULT_THROTTLE_CONSECUTIVE_THRESHOLD,
+    ),
+    protectHttpCodes,
   };
-  throttleConfig.fastErrorRatioPercent = throttleConfig.fastErrorRatioPercent
-    || throttleConfig.errorRatioPercent;
 
   // fair queue from controller + decision
   const fairQueueConfigRaw = downloadBootstrap.fairQueue && typeof downloadBootstrap.fairQueue === 'object'
@@ -1236,6 +1382,39 @@ function createThrottleProtectedResponse(origin, throttleStatus) {
   );
 }
 
+function createBreakerAuthorityUnavailableResponse(origin, phase) {
+  const suffix = typeof phase === 'string' && phase.trim() !== '' ? ` during ${phase}` : '';
+  return createErrorResponse(origin, 503, `Throttle breaker authority unavailable${suffix}`);
+}
+
+const applyUnifiedResult = (unifiedResult, options = {}) => {
+  if (!unifiedResult || !options.throttleEnabled) {
+    return null;
+  }
+
+  const throttleHostnameRaw = extractHostname(unifiedResult?.cache?.linkData?.url || '');
+  const throttleHostnameFromCache = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : '';
+  const throttleHostnameOverride = options.throttleHostname || '';
+  const throttleHostname = (throttleHostnameOverride || throttleHostnameFromCache).toLowerCase();
+  if (!isManagedThrottleHost(throttleHostname, options.throttleHostnamePatterns)) {
+    return null;
+  }
+
+  if (throttleHostname && typeof options.onMirrorBreakerSnapshot === 'function') {
+    options.onMirrorBreakerSnapshot(throttleHostname, unifiedResult.throttle);
+  }
+
+  const breakerState = readOpenBreakerSnapshot(
+    unifiedResult.throttle,
+    options.openCapSeconds || DEFAULT_THROTTLE_OPEN_CAP_SECONDS,
+  );
+  if (!breakerState) {
+    return null;
+  }
+
+  return createThrottleProtectedResponse(options.origin || '*', breakerState);
+};
+
 function createFairQueueOverloadedResponse(origin, retryAfterSeconds) {
   const retryAfter = normalizePositiveSeconds(retryAfterSeconds, 60);
   const safeHeaders = new Headers();
@@ -1276,10 +1455,6 @@ const createSlotHandlerClient = (config) => {
   const releaseUrl = `${baseUrl}/api/v1/fairqueue/release`;
   const authKey = slotCfg.authKey || '';
   const authHeader = normalizeStringValue(slotCfg.authHeader, 'X-FQ-Auth');
-  const throttleTimeWindowSeconds =
-    Number(config.throttleConfig?.throttleTimeWindow) > 0
-      ? Number(config.throttleConfig.throttleTimeWindow)
-      : 60;
   const perRequestTimeoutMsRaw = Number(slotCfg.perRequestTimeoutMs);
   let perRequestTimeoutMs =
     Number.isFinite(perRequestTimeoutMsRaw) && perRequestTimeoutMsRaw > 0 ? perRequestTimeoutMsRaw : 8000;
@@ -1423,19 +1598,6 @@ const createSlotHandlerClient = (config) => {
         const requestTimeoutMs = Math.min(perRequestTimeoutMs, remainingMs);
         const now = requestStart;
 
-        const throttledRemain = getHostThrottledRemainingSeconds(hostKey, now);
-        if (throttledRemain > 0) {
-          const cachedState = FQ_GLOBAL_STATE.throttledByHost.get(hostKey);
-          console.warn(
-            `[FQ] slot-handler throttled (cached), skip acquire host=${hostKey}, retryAfter=${throttledRemain}s`
-          );
-          return {
-            kind: 'throttled',
-            throttleCode: cachedState?.code || 503,
-            retryAfter: throttledRemain,
-          };
-        }
-
         const globalOverloadedRemain = getGlobalOverloadedRemainingSeconds(now);
         if (globalOverloadedRemain > 0) {
           return {
@@ -1467,7 +1629,6 @@ const createSlotHandlerClient = (config) => {
           ipBucket: fqContext.ipBucket,
           siteBucket: fqContext.siteBucket,
           now,
-          throttleTimeWindowSeconds,
           ...(queryToken ? { queryToken } : {}),
         };
 
@@ -1534,19 +1695,19 @@ const createSlotHandlerClient = (config) => {
           case 'throttled':
             pendingStreak = 0;
             overloadStreak = 0;
-            const retryAfterRaw =
-              Number.isFinite(data?.throttleRetryAfter) && data.throttleRetryAfter > 0
-                ? data.throttleRetryAfter
-                : (Number.isFinite(data?.retryAfter) && data.retryAfter > 0 ? data.retryAfter : null);
-            const retryAfter = retryAfterRaw && retryAfterRaw > 0
-              ? retryAfterRaw
-              : throttleTimeWindowSeconds;
             const throttleCode = Number.isFinite(data?.throttleCode) ? data.throttleCode : 503;
-            markThrottled(hostKey, throttleCode, retryAfter);
+            const breakerSnapshot = readSlotHandlerBreakerSnapshot(data);
+            const openBreaker = breakerSnapshot
+              ? readOpenBreakerSnapshot(breakerSnapshot, 0)
+              : null;
+            if (breakerSnapshot) {
+              mirrorBreakerSnapshot(hostKey, breakerSnapshot);
+            }
             return {
               kind: 'throttled',
               throttleCode,
-              retryAfter: retryAfter ?? undefined,
+              retryAfter: openBreaker?.retryAfter,
+              breakerSnapshot,
             };
           case 'overloaded': {
             pendingStreak = 0;
@@ -1671,6 +1832,8 @@ const createSlotHandlerClient = (config) => {
 
 // src/handleDownload.ts
 async function handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx) {
+  pruneBreakerMirrorCache();
+
   const originalRequest = request;
   const origin = request.headers.get("origin") ?? "*";
   const url = new URL(request.url);
@@ -1875,6 +2038,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let cacheHit = false;
   let linkData = null;
   let unifiedThrottleHostnameHash = null;
+  const activeProbeHosts = new Set();
   
   // Use unified check when rate limit is enabled and dbMode is custom-pg-rest
   const supportsUnifiedCheck = config.rateLimitEnabled && config.dbMode === 'custom-pg-rest';
@@ -1901,8 +2065,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
         ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
         rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
-        throttleTimeWindow: throttleConfig.throttleTimeWindow ?? 60,
-        throttleTableName: throttleConfig.tableName || 'THROTTLE_PROTECTION',
         lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
         cacheEnabled: config.cacheEnabled,
         throttleHostnameHash,
@@ -1927,7 +2089,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   };
 
-  const applyUnifiedResult = async (options = {}) => {
+  const applyUnifiedCheckResult = async (options = {}) => {
     if (!unifiedResult) {
       return null;
     }
@@ -1989,31 +2151,25 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       }
     }
 
-    if (config.throttleEnabled && unifiedResult.throttle.status === 'protected') {
-      const throttleInfo = unifiedResult.throttle || {};
-      const retryAfter = normalizePositiveSeconds(
-        throttleInfo.retryAfter,
-        config.throttleConfig?.throttleTimeWindow || 60
-      );
-      const throttleHostnameRaw = extractHostname(unifiedResult?.cache?.linkData?.url || '');
-      const throttleHostnameFromCache = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : '';
-      const throttleHostnameOverride = options.throttleHostname || '';
-      const throttleHostname = (throttleHostnameOverride || throttleHostnameFromCache).toLowerCase();
-
-      if (throttleHostname) {
-        markThrottled(throttleHostname, throttleInfo.errorCode || 503, retryAfter);
-      }
-
+    const unifiedBreaker = config.throttleEnabled
+      ? readOpenBreakerSnapshot(unifiedResult.throttle, config.throttleConfig?.openCapSeconds || 60)
+      : null;
+    const unifiedResponse = applyUnifiedResult(unifiedResult, {
+      origin,
+      openCapSeconds: config.throttleConfig?.openCapSeconds || 60,
+      throttleEnabled: config.throttleEnabled,
+      throttleHostname: options.throttleHostname,
+      throttleHostnamePatterns: config.throttleHostnamePatterns,
+      onMirrorBreakerSnapshot: mirrorBreakerSnapshot,
+    });
+    if (unifiedResponse) {
       await slowFailDelay();
 
       console.log(
-        `[Throttle] Protected from unified check, returning error ${throttleInfo.errorCode}, retry after ${retryAfter}s`
+        `[Throttle] Open breaker from unified check, returning error ${unifiedBreaker.errorCode}, retry after ${unifiedBreaker.retryAfter}s`
       );
 
-      return createThrottleProtectedResponse(origin, {
-        ...throttleInfo,
-        retryAfter,
-      });
+      return unifiedResponse;
     }
 
     if (rateLimiter && config.rateLimitConfig) {
@@ -2047,7 +2203,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return errorResponse;
     }
     unifiedResult = result;
-    const unifiedResponse = await applyUnifiedResult();
+    const unifiedResponse = await applyUnifiedCheckResult();
     if (unifiedResponse) {
       return unifiedResponse;
     }
@@ -2224,7 +2380,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return errorResponse;
     }
     unifiedResult = result;
-    const unifiedResponse = await applyUnifiedResult({ throttleHostname: unifiedThrottleHostname });
+    const unifiedResponse = await applyUnifiedCheckResult({ throttleHostname: unifiedThrottleHostname });
     if (unifiedResponse) {
       return unifiedResponse;
     }
@@ -2236,57 +2392,155 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let throttleHostname = null;
 
   const throttleCheckEnabled = config.throttleEnabled && throttleManager;
+  const isThrottleManagedHostname = (hostname) => isManagedThrottleHost(hostname, config.throttleHostnamePatterns);
+
   if (throttleCheckEnabled) {
     const throttleHostnameRaw = extractHostname(downloadUrl);
     throttleHostname = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : null;
 
     const unifiedThrottleUsable = Boolean(
-      unifiedResult && unifiedResult.throttle && unifiedThrottleHostnameHash
+      unifiedResult
+      && unifiedResult.throttle
+      && unifiedThrottleHostnameHash
+      && throttleHostname
+      && isThrottleManagedHostname(throttleHostname)
     );
 
     if (unifiedThrottleUsable) {
       throttleStatus = unifiedResult.throttle;
-    } else if (throttleHostname) {
-      let hostnameMatched = false;
-      for (const pattern of config.throttleHostnamePatterns) {
-        if (matchHostnamePattern(throttleHostname, pattern)) {
-          hostnameMatched = true;
-          break;
-        }
+    } else if (throttleHostname && isThrottleManagedHostname(throttleHostname)) {
+      try {
+        throttleStatus = await throttleManager.getBreakerState(throttleHostname, { ...config.throttleConfig, ctx });
+      } catch (error) {
+        console.error('[Throttle] Snapshot read failed:', error instanceof Error ? error.message : String(error));
+        return createBreakerAuthorityUnavailableResponse(origin, 'snapshot read');
       }
 
-      if (hostnameMatched) {
-        try {
-          throttleStatus = await throttleManager.checkThrottle(throttleHostname, { ...config.throttleConfig, ctx });
-        } catch (error) {
-          // Throttle check failure should not block downloads
-          console.error('[Throttle] Check failed, proceeding with download:', error instanceof Error ? error.message : String(error));
-        }
+      if (!throttleStatus) {
+        console.error('[Throttle] Snapshot read returned no authority state');
+        return createBreakerAuthorityUnavailableResponse(origin, 'snapshot read');
       }
+    }
+
+    if (throttleHostname) {
+      mirrorBreakerSnapshot(throttleHostname, throttleStatus);
     }
 
     if (throttleStatus) {
-      if (throttleStatus.status === 'protected') {
-        const retryAfter = normalizePositiveSeconds(
-          throttleStatus.retryAfter,
-          config.throttleConfig?.throttleTimeWindow || 60
-        );
-        if (throttleHostname) {
-          markThrottled(throttleHostname, throttleStatus.errorCode || 503, retryAfter);
-        }
+      const breakerState = readOpenBreakerSnapshot(throttleStatus, config.throttleConfig?.openCapSeconds || 60);
+      if (breakerState) {
         await slowFailDelay();
         console.log(
-          `[Throttle] Protected: ${throttleHostname}, returning error ${throttleStatus.errorCode}, retry after ${retryAfter}s`
+          `[Throttle] Open breaker: ${throttleHostname}, returning error ${breakerState.errorCode}, retry after ${breakerState.retryAfter}s`
         );
-        return createThrottleProtectedResponse(origin, {
-          ...throttleStatus,
-          retryAfter,
-        });
-      } else if (throttleStatus.status === 'resume_operation') {
-        console.log(`[Throttle] Resume operation: ${throttleHostname}`);
+        return createThrottleProtectedResponse(origin, breakerState);
       }
     }
   }
+
+  const claimBreakerProbeIfNeeded = async (hostname) => {
+    if (!throttleCheckEnabled || !hostname || !isThrottleManagedHostname(hostname)) {
+      return null;
+    }
+
+    if (activeProbeHosts.has(hostname)) {
+      return null;
+    }
+
+    try {
+      const claimedSnapshot = await throttleManager.claimBreakerProbe(hostname, { ...config.throttleConfig, ctx });
+      if (!claimedSnapshot) {
+        console.error('[Throttle] Probe claim returned no authority state');
+        return createBreakerAuthorityUnavailableResponse(origin, 'probe claim');
+      }
+
+      mirrorBreakerSnapshot(hostname, claimedSnapshot);
+      if (claimedSnapshot.state === 'half_open' && claimedSnapshot.probeGranted === true) {
+        activeProbeHosts.add(hostname);
+      }
+
+      const openBreaker = readOpenBreakerSnapshot(
+        claimedSnapshot,
+        config.throttleConfig?.openCapSeconds || DEFAULT_THROTTLE_OPEN_CAP_SECONDS,
+      );
+      if (openBreaker) {
+        await slowFailDelay();
+        console.log(
+          `[Throttle] Open breaker after probe claim: ${hostname}, returning error ${openBreaker.errorCode}, retry after ${openBreaker.retryAfter}s`
+        );
+        return createThrottleProtectedResponse(origin, openBreaker);
+      }
+
+      if (claimedSnapshot.state === 'half_open' && claimedSnapshot.probeGranted !== true) {
+        const retryAfter = readProbeLeaseRetryAfter(claimedSnapshot, 1);
+        await slowFailDelay();
+        console.log(
+          `[Throttle] Half-open probe already leased for ${hostname}, retry after ${retryAfter}s`
+        );
+        return createThrottleProtectedResponse(origin, {
+          errorCode: claimedSnapshot.lastErrorCode || 503,
+          retryAfter,
+          message: `Service temporarily unavailable (breaker probe already in flight, retry after ${retryAfter}s)`,
+        });
+      }
+    } catch (error) {
+      console.error('[Throttle] Probe claim failed:', error instanceof Error ? error.message : String(error));
+      return createBreakerAuthorityUnavailableResponse(origin, 'probe claim');
+    }
+
+    return null;
+  };
+
+  const reportBreakerResponseIfNeeded = async (hostname, response) => {
+    if (!throttleCheckEnabled || !hostname || !response || !isThrottleManagedHostname(hostname)) {
+      return;
+    }
+
+    try {
+      const statusCode = response.status;
+      const protectedHttpCodes = Array.isArray(config.throttleConfig?.protectHttpCodes)
+        ? config.throttleConfig.protectHttpCodes
+        : [];
+
+      const isProtectedError = protectedHttpCodes.includes(statusCode);
+      const isSuccessStatus = statusCode >= 200 && statusCode < 400;
+      if (!isProtectedError && !isSuccessStatus) {
+        return;
+      }
+
+      const sample = isProtectedError ? 1 : 0;
+      const retryAfterSeconds = isProtectedError
+        ? deriveOpenSeconds(response.headers.get('Retry-After'), config.throttleConfig?.openCapSeconds || 60)
+        : null;
+
+      if (isProtectedError) {
+        console.log(`[Throttle] Error ${statusCode} from ${hostname}, reporting breaker sample`);
+      }
+
+      const snapshot = await throttleManager.reportBreakerSample(
+        hostname,
+        {
+          sample,
+          statusCode,
+          retryAfterSeconds,
+        },
+        { ...config.throttleConfig, ctx }
+      );
+
+      if (!snapshot) {
+        console.error('[Throttle] Sample report returned no authority state');
+        return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
+      }
+
+      mirrorBreakerSnapshot(hostname, snapshot);
+      activeProbeHosts.delete(hostname);
+    } catch (error) {
+      console.error('[Throttle] Sample report failed:', error instanceof Error ? error.message : String(error));
+      return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
+    }
+
+    return null;
+  };
 
   // ========================================
   // Fair Upstream Queue Integration
@@ -2337,18 +2591,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       try {
         const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, clientSignal);
         if (fqResult.kind === 'throttled') {
-          const retryAfter = normalizePositiveSeconds(
-            fqResult.retryAfter,
-            config.throttleConfig?.throttleTimeWindow || 60
-          );
-          if (upstreamHostname) {
-            markThrottled(upstreamHostname, fqResult.throttleCode || 503, retryAfter);
-          }
+          const breakerState = fqResult.breakerSnapshot
+            ? readOpenBreakerSnapshot(fqResult.breakerSnapshot, 0)
+            : null;
           await slowFailDelay();
           return createThrottleProtectedResponse(origin, {
-            status: 'protected',
-            errorCode: fqResult.throttleCode || 503,
-            retryAfter,
+            errorCode: breakerState?.errorCode || fqResult.throttleCode || 503,
+            retryAfter: breakerState?.retryAfter,
           });
         }
 
@@ -2400,6 +2649,31 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
     return upstreamRequest;
   };
+
+  const fetchUpstreamWithBreakerClaim = async (requestToFetch) => {
+    const requestHostnameRaw = extractHostname(requestToFetch?.url || '');
+    const requestHostname = requestHostnameRaw ? requestHostnameRaw.toLowerCase() : null;
+    const blockedResponse = await claimBreakerProbeIfNeeded(requestHostname);
+    if (blockedResponse) {
+      return { blockedResponse, response: null };
+    }
+
+    if (fqContext && !fqContext.hitUpstreamAtMs) {
+      fqContext.hitUpstreamAtMs = Date.now();
+    }
+
+    return {
+      blockedResponse: null,
+      response: await (async () => {
+        const upstreamResponse = await fetch(requestToFetch);
+        const reportFailureResponse = await reportBreakerResponseIfNeeded(requestHostname, upstreamResponse);
+        if (reportFailureResponse) {
+          throw reportFailureResponse;
+        }
+        return upstreamResponse;
+      })(),
+    };
+  };
   const shouldRetryAuthError = (status) => status === 401 || status === 410;
 
   let retriedWithFreshLink = false;
@@ -2411,10 +2685,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     request = buildUpstreamRequest(downloadUrl, res.data.header);
-    if (fqContext && !fqContext.hitUpstreamAtMs) {
-      fqContext.hitUpstreamAtMs = Date.now();
+    let { blockedResponse, response } = await fetchUpstreamWithBreakerClaim(request);
+    if (blockedResponse) {
+      return blockedResponse;
     }
-    let response = await fetch(request);
     while (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("Location");
       if (location) {
@@ -2424,7 +2698,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
         } else {
           request = new Request(location, request);
-          response = await fetch(request);
+          ({ blockedResponse, response } = await fetchUpstreamWithBreakerClaim(request));
+          if (blockedResponse) {
+            return blockedResponse;
+          }
         }
       } else {
         break;
@@ -2487,18 +2764,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
               const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, clientSignal);
               if (fqResult.kind === 'throttled') {
-                const retryAfter = normalizePositiveSeconds(
-                  fqResult.retryAfter,
-                  config.throttleConfig?.throttleTimeWindow || 60
-                );
-                if (updatedHostname) {
-                  markThrottled(updatedHostname, fqResult.throttleCode || 503, retryAfter);
-                }
+                const breakerState = fqResult.breakerSnapshot
+                  ? readOpenBreakerSnapshot(fqResult.breakerSnapshot, 0)
+                  : null;
                 await slowFailDelay();
                 return createThrottleProtectedResponse(origin, {
-                  status: 'protected',
-                  errorCode: fqResult.throttleCode || 503,
-                  retryAfter,
+                  errorCode: breakerState?.errorCode || fqResult.throttleCode || 503,
+                  retryAfter: breakerState?.retryAfter,
                 });
               }
 
@@ -2528,7 +2800,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           }
         }
         request = buildUpstreamRequest(downloadUrl, res.data.header);
-        response = await fetch(request);
+        ({ blockedResponse, response } = await fetchUpstreamWithBreakerClaim(request));
+        if (blockedResponse) {
+          return blockedResponse;
+        }
         while (response.status >= 300 && response.status < 400) {
           const location = response.headers.get("Location");
           if (location) {
@@ -2538,7 +2813,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
               return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
             } else {
               request = new Request(location, request);
-              response = await fetch(request);
+              ({ blockedResponse, response } = await fetchUpstreamWithBreakerClaim(request));
+              if (blockedResponse) {
+                return blockedResponse;
+              }
             }
           } else {
             break;
@@ -2553,42 +2831,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       );
     }
     
-    // Update throttle protection status based on fetch result
-    if (config.throttleEnabled && throttleManager && throttleHostname) {
-      try {
-        const statusCode = response.status;
-        const protectedHttpCodes = Array.isArray(config.throttleConfig?.protectedHttpCodes)
-          ? config.throttleConfig.protectedHttpCodes
-          : [];
-
-        const isProtectedError = protectedHttpCodes.includes(statusCode);
-        const isSuccessStatus = statusCode >= 200 && statusCode < 400;
-
-        if (isProtectedError || isSuccessStatus) {
-          const eventType = isProtectedError ? 'error' : 'success';
-          if (isProtectedError) {
-            console.log(`[Throttle] Error ${statusCode} from ${throttleHostname}, reporting to throttle window`);
-          }
-
-          const updatePromise = throttleManager.updateThrottle(
-            throttleHostname,
-            {
-              eventType,
-              statusCode,
-            },
-            { ...config.throttleConfig, ctx }
-          );
-
-          if (ctx && ctx.waitUntil) {
-            ctx.waitUntil(updatePromise);
-          }
-        }
-      } catch (error) {
-        // Throttle update failure should not block downloads
-        console.error('[Throttle] Update failed:', error instanceof Error ? error.message : String(error));
-      }
-    }
-
     // 创建仅包含安全必要headers的响应
     const safeHeaders = new Headers();
     const isCryptedDownload = payloadData?.isCrypted === true;
@@ -2692,6 +2934,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     return safeResponse;
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
   } finally {
     if (fairQueueClient && fqContext && fqContext.slotToken) {
       const releasePromise = fairQueueClient.releaseSlot(ctx, fqContext);
@@ -2762,7 +3009,20 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
 }
 
 export const __fairQueueTestHooks = {
+  applyUnifiedResult: (unifiedResult, options = {}) => applyUnifiedResult(unifiedResult, {
+    origin: '*',
+    throttleEnabled: true,
+    throttleHostname: 'tenant.sharepoint.com',
+    throttleHostnamePatterns: ['*.sharepoint.com'],
+    openCapSeconds: DEFAULT_THROTTLE_OPEN_CAP_SECONDS,
+    ...options,
+  }),
   createSlotHandlerClient,
+  deriveOpenSeconds,
+  mirrorBreakerSnapshot,
+  normalizeBreakerCacheEntry,
+  pruneBreakerMirrorCache,
+  readOpenBreakerSnapshot,
   resolveConfig,
   markHostOverloaded,
   getHostOverloadedRemainingMs,
@@ -2776,7 +3036,9 @@ export const __fairQueueTestHooks = {
     site: FQ_GLOBAL_STATE.overloadedBySite.size,
     ip: FQ_GLOBAL_STATE.overloadedByIp.size,
   }),
+  getBreakerMirrorSize: () => FQ_GLOBAL_STATE.breakerByHost.size,
   clearOverloadedByHost: () => {
+    FQ_GLOBAL_STATE.breakerByHost.clear();
     FQ_GLOBAL_STATE.overloadedByHost.clear();
     FQ_GLOBAL_STATE.overloadedBySite.clear();
     FQ_GLOBAL_STATE.overloadedByIp.clear();

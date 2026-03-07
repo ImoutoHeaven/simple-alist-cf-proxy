@@ -139,7 +139,7 @@ func TestAcquireCachedThrottleStaleTokenReturnsTimeoutAndKeepsForeignFlow(t *tes
 	foreignTok := s.flowStore.newFlow("h1", "example.com", "ip-foreign", "s1")
 	s.flowStore.detachWithGrace(staleTok, now)
 	now = now.Add(41 * time.Millisecond)
-	s.setThrottleState("h1", now, 429, 15)
+	s.setThrottleState("h1", fqThrottleState{State: "open", OpenUntil: now.Add(15 * time.Second), Code: 429, Reason: "http_429", Version: 1})
 
 	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
 		Hostname:     "example.com",
@@ -171,7 +171,7 @@ func TestAcquireCachedThrottleMismatchReturnsTimeoutAndKeepsOriginalFlow(t *test
 	}
 
 	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	s.setThrottleState("h1", now, 429, 15)
+	s.setThrottleState("h1", fqThrottleState{State: "open", OpenUntil: now.Add(15 * time.Second), Code: 429, Reason: "http_429", Version: 1})
 
 	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
 		Hostname:     "example.com",
@@ -204,7 +204,7 @@ func TestAcquireCachedThrottleValidTokenReturnsThrottledAndDeletesOwnFlow(t *tes
 
 	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
 	foreignTok := s.flowStore.newFlow("h1", "example.com", "ip-foreign", "s1")
-	s.setThrottleState("h1", now, 429, 15)
+	s.setThrottleState("h1", fqThrottleState{State: "open", OpenUntil: now.Add(15 * time.Second), Code: 429, Reason: "http_429", Version: 1})
 
 	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
 		Hostname:     "example.com",
@@ -290,7 +290,8 @@ func TestAcquirePollWindowConvergesToCachedThrottleInsteadOfPending(t *testing.T
 		}
 	}
 
-	s.setThrottleState("h1", time.Now(), 429, 15)
+	now := time.Now()
+	s.setThrottleState("h1", fqThrottleState{State: "open", OpenUntil: now.Add(15 * time.Second), Code: 429, Reason: "http_429", Version: 1})
 
 	fastResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
 		Hostname:     "example.com",

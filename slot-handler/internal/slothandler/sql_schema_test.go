@@ -1,20 +1,13 @@
 package slothandler
 
 import (
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
 
 func TestInitSQLHasNoQueueDepthOrWaiterDeadCode(t *testing.T) {
-	path := filepath.Join(moduleRootDir(t), "..", "init.sql")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read init.sql: %v", err)
-	}
-	text := strings.ToLower(string(raw))
+	text := readInitSQLNormalized(t)
 	if found, token := containsBannedToken(text); found {
 		t.Fatalf("init.sql contains banned token: %s", token)
 	}
@@ -55,23 +48,13 @@ func containsBannedToken(text string) (bool, string) {
 }
 
 func TestInitSQLHasNoFoundUsage(t *testing.T) {
-	path := filepath.Join(moduleRootDir(t), "..", "init.sql")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read init.sql: %v", err)
-	}
-	if regexp.MustCompile(`(?i)\bfound\b`).Match(raw) {
+	if regexp.MustCompile(`\bfound\b`).MatchString(readInitSQLNormalized(t)) {
 		t.Fatalf("init.sql must not use plpgsql FOUND")
 	}
 }
 
 func TestInitSQLHasBatchTryAcquireFunction(t *testing.T) {
-	path := filepath.Join(moduleRootDir(t), "..", "init.sql")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read init.sql: %v", err)
-	}
-	text := strings.ToLower(string(raw))
+	text := readInitSQLNormalized(t)
 	if !strings.Contains(text, "fq_try_acquire_batch") {
 		t.Fatalf("init.sql missing fq_try_acquire_batch")
 	}

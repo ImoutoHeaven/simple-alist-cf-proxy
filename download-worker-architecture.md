@@ -7,7 +7,7 @@
 - Cloudflare Worker：`simple-alist-cf-proxy`（主入口 `src/worker.js`）
 - 控制面（controller）：下发 bootstrap/decision
 - AList：通过 `/api/fs/link` 获取真实下载地址
-- 可选：PostgREST + PostgreSQL（缓存/限流/Throttle/Idle）
+- 可选：PostgREST + PostgreSQL（缓存/限流/Breaker/Idle）
 - 可选：`slot-handler`（公平队列服务）
 - 可选：Pages Entrance（透明转发入口，Service Binding → Worker；入口域名需加入 `common.workerAddresses` allowlist）
 
@@ -59,14 +59,14 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 - `download.db.mode` 仅支持 `""` 或 `custom-pg-rest`
 - `download.db.*`：PostgREST 地址、校验 header/secret、缓存表/last-active 表、TTL/idle 等
 - `download.db.rateLimit.*`：窗口、限额、block 时间、`pgErrorHandle` 等
-- `download.throttleProfiles.*`
+- `download.throttleProfiles.<name>`：只定义 breaker profile，字段固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`protectHttpCodes`
 - `download.fairQueue.*`：slot-handler 地址、鉴权 key、鉴权 header 名、等待超时、轮询策略、siteBucket 计算方式等（worker 侧解析字段）；其中 `slotHandlerAuthHeader` 由 controller 同步下发，默认值为 `X-FQ-Auth`
 - slot-handler in-flight limits（slot-handler 配置项，写在 slot-handler 的 config 中，worker 不解析）：
   - `globalMaxInFlightFlow`：slot-handler 全局 in-flight 上限，超过则返回 `overloaded`
   - `hostMaxInFlightFlow`：按 hostname 维度的 in-flight 上限
   - `siteMaxInFlightFlow`：按 siteBucket 维度的 in-flight 上限
   - `ipBucketMaxInFlightFlow`：按 ipBucket 维度的 in-flight 上限
-- `decision.download.*`：`pathAction` / `checkOriginMode` / `throttleProfile`
+- `decision.download.*`：`pathAction` / `checkOriginMode` / `throttleProfile`；worker 仅在字段缺失时使用 `default`，若命中的 selector 不存在则直接报错，不做静默 fallback
 
 ## 5. 请求处理流程
 
@@ -103,16 +103,17 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
    - 若本机记录了当前 IP 子网的 block 窗口，直接返回 429。
 
 7. **统一检查（custom-pg-rest）**
-   - 当 `download.db.mode=custom-pg-rest` 且 rate limit 启用时，调用 PostgREST RPC：`download_unified_check`。
-   - 同时返回缓存命中、限流状态、Throttle 保护与 idle 状态；`pgErrorHandle` 支持 `fail-open`/`fail-closed`。
+    - 当 `download.db.mode=custom-pg-rest` 且 rate limit 启用时，调用 PostgREST RPC：`download_unified_check`。
+    - 同时返回缓存命中、限流状态、`THROTTLE_PROTECTION` 里的 breaker 快照与 idle 状态；`pgErrorHandle` 支持 `fail-open`/`fail-closed`。
 
 8. **缓存与 AList 获取**
    - 优先使用 unified-check 或 cacheManager 的缓存；未命中则请求 AList `/api/fs/link`。
    - AList 请求头包含：`Authorization: tokenHmacKey`、`CF-Connecting-IP-WORKERS` 以及 `common.alistAuthHeaders`。
 
-9. **Throttle 保护**
-   - 若 hostname 匹配 `throttleProfiles.*.hostPatterns`，在下载前检查保护状态；命中则返回 503。
-   - 下载后按 `protectedHttpCodes` 上报成功或错误，用于后续保护判断。
+9. **Breaker 保护**
+    - 若 hostname 匹配 `throttleProfiles.*.hostPatterns`，worker 只读取数据库共享 breaker 快照；运行时唯一真源是 `THROTTLE_PROTECTION`。
+    - breaker 状态机只有 `closed/open/half_open` 三态：`open` 立即 fail-fast，`half_open` 通过 `download_claim_breaker_probe` 原子领取单 canary，结果再由 `download_report_breaker_sample` 回写。
+    - 下载后仅按 `protectHttpCodes` 上报 `sample=1`，`2xx/3xx` 上报 `sample=0`；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退。
 
 10. **Fair Queue（slot-handler）**
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
@@ -146,7 +147,7 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 
 12. **Last Active 更新与清理**
     - `idleTimeoutSeconds > 0` 时更新 `DOWNLOAD_LAST_ACTIVE_TABLE`（后台 `waitUntil`）。
-    - `scheduleAllCleanups` 按概率清理缓存/限流/Throttle/Last Active。
+    - `scheduleAllCleanups` 按概率清理缓存/限流/Last Active。
 
 ## 6. 数据库与 RPC（custom-pg-rest）
 
@@ -154,13 +155,13 @@ Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
 
 - 下载缓存：`DOWNLOAD_CACHE_TABLE` + `download_upsert_download_cache`
 - IP 限流：`DOWNLOAD_IP_RATELIMIT_TABLE` + `download_upsert_rate_limit`
-- Throttle：`THROTTLE_PROTECTION` + `download_upsert_throttle_protection`
+- Breaker：`THROTTLE_PROTECTION` + `download_claim_breaker_probe` + `download_report_breaker_sample`
 - Last Active：`DOWNLOAD_LAST_ACTIVE_TABLE` + `download_update_last_active`
-- 统一检查：`download_unified_check`
+- 统一检查：`download_unified_check`（直接返回 breaker 原始字段 `state/open_until/reason/version/last_error_code`）
 
 Fair Queue 相关函数由 `slot-handler` 使用（`fq_try_acquire_batch` / `fq_release_dual`）。
 
 ## 7. 限制与注意事项
 
 - 业务策略**只能**来自控制面；本仓库不再支持通过环境变量设置策略。
-- 缓存/限流/Throttle 仅支持 `custom-pg-rest` 模式；D1 仅用于 bootstrap 缓存。
+- 缓存/限流/Breaker 仅支持 `custom-pg-rest` 模式；D1 仅用于 bootstrap 缓存。

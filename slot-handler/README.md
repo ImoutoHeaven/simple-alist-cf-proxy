@@ -64,6 +64,13 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - 仓库包含高 backlog 调度基准：`BenchmarkPickNextInFlightBatch_HeapEngine_Backlog`（`slot-handler/internal/slothandler/fq_scheduler_benchmark_test.go`）。
 - 复现实测基准命令：`go -C ./slot-handler test ./internal/slothandler -run '^$' -bench 'BenchmarkPickNextInFlightBatch_HeapEngine_Backlog' -benchmem -count=3`。
 
+### 2.5 Shared breaker mirror（只镜像共享状态）
+
+- 共享 breaker 的运行时真源只有数据库 `THROTTLE_PROTECTION`；slot-handler 只缓存数据库返回的原始 breaker 元数据：`state/open_until/reason/version/last_error_code`。
+- state machine 固定为 `closed/open/half_open`；slot-handler 本地短路条件只有一个：共享状态是 `open`，并且 `open_until` 仍然晚于当前时间。
+- acquire/release 只处理公平队列上下文，不携带额外的 breaker 时间窗参数，也不会在本地合成新的 breaker 状态。
+- `half_open` 探针领取权不在 slot-handler；只有 worker 会在真正发起上游请求前调用 `download_claim_breaker_probe`。
+
 ---
 
 ## 3. HTTP API
@@ -74,13 +81,14 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - `hostname` / `hostnameHash`
 - `ipBucket` / `siteBucket`
 - `now`
-- `throttleTimeWindowSeconds`
 - `queryToken`（首次可不传；轮询时传回上一次返回的 token）
 
 响应字段：
 - `result`: `pending` / `granted` / `throttled` / `overloaded` / `timeout`
 - `queryToken`
 - `slotToken`（granted 时）
+- `throttleCode`（throttled 时）
+- `breakerOpenUntil` / `breakerReason` / `breakerVersion`（throttled 时，直接镜像共享 breaker 元数据）
 - `reason`：`overloaded` 时为 `overload_global|overload_host|overload_site|overload_ip`
 - `retryAfter`：`overloaded` 时的建议重试秒数
 
