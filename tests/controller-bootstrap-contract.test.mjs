@@ -147,9 +147,27 @@ test('resolveConfig rejects unknown throttleProfile instead of falling back to d
   );
 });
 
-test('resolveConfig requires the canonical default throttleProfile when selector is omitted', () => {
+test('resolveConfig skips the implicit default throttleProfile when breaker storage is disabled', () => {
   const bootstrap = buildBootstrap();
   delete bootstrap.download.throttleProfiles.default;
+
+  const config = resolveConfig({}, bootstrap, { download: {} });
+
+  assert.equal(config.dbMode, '');
+  assert.equal(config.throttleEnabled, false);
+  assert.deepEqual(config.throttleHostnamePatterns, []);
+});
+
+test('resolveConfig still requires the canonical default throttleProfile when custom-pg-rest is enabled', () => {
+  const bootstrap = buildBootstrap();
+  delete bootstrap.download.throttleProfiles.default;
+  bootstrap.download.db = {
+    mode: 'custom-pg-rest',
+    postgrestUrl: 'https://postgrest.example.test',
+    verifyHeader: ['X-Verify'],
+    verifySecret: ['secret'],
+    cacheEnabled: false,
+  };
 
   assert.throws(
     () => resolveConfig({}, bootstrap, { download: {} }),
@@ -157,20 +175,31 @@ test('resolveConfig requires the canonical default throttleProfile when selector
   );
 });
 
-test('resolveConfig keeps implicit default only when decision omits throttleProfile', () => {
+test('resolveConfig skips implicit default throttleProfile validation when decision omits the selector', () => {
   const config = resolveConfig({}, buildBootstrap(), { download: {} });
 
-  assert.deepEqual(config.throttleHostnamePatterns, ['*.default.example']);
-  assert.equal(config.throttleConfig.openCapSeconds, 60);
+  assert.equal(config.throttleEnabled, false);
+  assert.deepEqual(config.throttleHostnamePatterns, []);
   assert.deepEqual(config.throttleConfig.protectHttpCodes, [429, 499, 500, 502, 503, 504]);
 });
 
-test('resolveConfig rejects invalid protectHttpCodes from controller', () => {
+test('resolveConfig ignores invalid implicit default protectHttpCodes when breaker storage is disabled', () => {
+  const bootstrap = buildBootstrap();
+  bootstrap.download.throttleProfiles.default.protectHttpCodes = [429, 700];
+
+  const config = resolveConfig({}, bootstrap, { download: {} });
+
+  assert.equal(config.throttleEnabled, false);
+  assert.deepEqual(config.throttleHostnamePatterns, []);
+  assert.deepEqual(config.throttleConfig.protectHttpCodes, [429, 499, 500, 502, 503, 504]);
+});
+
+test('resolveConfig rejects invalid protectHttpCodes from an explicit throttleProfile', () => {
   const bootstrap = buildBootstrap();
   bootstrap.download.throttleProfiles.default.protectHttpCodes = [429, 700];
 
   assert.throws(
-    () => resolveConfig({}, bootstrap, { download: {} }),
+    () => resolveConfig({}, bootstrap, { download: { throttleProfile: 'default' } }),
     /protectHttpCodes/
   );
 });
@@ -273,7 +302,7 @@ test('fetchControllerState preserves non-string static throttleProfile for stric
   }
 });
 
-test('fetchControllerState preserves omitted static throttleProfile instead of materializing default', async () => {
+test('fetchControllerState preserves omitted static throttleProfile without forcing implicit default validation', async () => {
   resetBootstrapClientState();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
@@ -292,8 +321,8 @@ test('fetchControllerState preserves omitted static throttleProfile instead of m
     assert.equal(Object.prototype.hasOwnProperty.call(state.decision.download, 'throttleProfile'), false);
 
     const config = resolveConfig({}, state.bootstrap, state.decision);
-    assert.deepEqual(config.throttleHostnamePatterns, ['*.default.example']);
-    assert.equal(config.throttleConfig.openCapSeconds, 60);
+    assert.equal(config.throttleEnabled, false);
+    assert.deepEqual(config.throttleHostnamePatterns, []);
   } finally {
     globalThis.fetch = originalFetch;
     resetBootstrapClientState();

@@ -899,27 +899,31 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     }
     throttleProfileName = downloadDecision.throttleProfile.trim();
   }
-  const throttleProfile = throttleProfiles[throttleProfileName];
-  if (!throttleProfile) {
+  const shouldRequireThrottleProfile = isCustomDb || hasThrottleProfileField;
+  const throttleProfile = shouldRequireThrottleProfile
+    ? throttleProfiles[throttleProfileName]
+    : null;
+  if (shouldRequireThrottleProfile && !throttleProfile) {
     throw new Error(`Unknown throttleProfile from controller: ${throttleProfileName}`);
   }
-  const throttleHostnamePatterns = Array.isArray(throttleProfile.hostPatterns)
-    ? throttleProfile.hostPatterns.map((p) => normalizeString(p)).filter((p) => p.length > 0)
+  const throttleProfileConfig = throttleProfile || {};
+  const throttleHostnamePatterns = Array.isArray(throttleProfileConfig.hostPatterns)
+    ? throttleProfileConfig.hostPatterns.map((p) => normalizeString(p)).filter((p) => p.length > 0)
     : [];
-  const protectHttpCodes = normalizeProtectHttpCodes(throttleProfile.protectHttpCodes);
+  const protectHttpCodes = normalizeProtectHttpCodes(throttleProfileConfig.protectHttpCodes);
   const throttleEnabled = isCustomDb && throttleHostnamePatterns.length > 0;
   const throttleConfig = {
     postgrestUrl,
     verifyHeader,
     verifySecret,
-    openCapSeconds: normalizePositiveSeconds(throttleProfile.openCapSeconds, DEFAULT_THROTTLE_OPEN_CAP_SECONDS),
+    openCapSeconds: normalizePositiveSeconds(throttleProfileConfig.openCapSeconds, DEFAULT_THROTTLE_OPEN_CAP_SECONDS),
     openThresholdPercent: normalizePositiveSeconds(
-      throttleProfile.openThresholdPercent,
+      throttleProfileConfig.openThresholdPercent,
       DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT,
     ),
-    ewmaSpan: normalizePositiveSeconds(throttleProfile.ewmaSpan, DEFAULT_THROTTLE_EWMA_SPAN),
+    ewmaSpan: normalizePositiveSeconds(throttleProfileConfig.ewmaSpan, DEFAULT_THROTTLE_EWMA_SPAN),
     consecutiveThreshold: normalizePositiveSeconds(
-      throttleProfile.consecutiveThreshold,
+      throttleProfileConfig.consecutiveThreshold,
       DEFAULT_THROTTLE_CONSECUTIVE_THRESHOLD,
     ),
     protectHttpCodes,
