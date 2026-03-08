@@ -7,7 +7,11 @@
   "scripts": {
     "build": "node build.mjs",
     "dev": "wrangler dev",
-    "deploy": "npm run build && wrangler deploy"
+    "deploy": "npm run build && wrangler deploy",
+    "test": "npm run test:vitest && npm run test:node",
+    "test:vitest": "vitest run init.sql.test.js",
+    "test:node": "node --test tests/*.test.mjs",
+    "test:watch": "vitest init.sql.test.js"
   },
   "keywords": [
     "cloudflare",
@@ -21,6 +25,7 @@
   "dependencies": {},
   "devDependencies": {
     "esbuild": "^0.23.0",
+    "vitest": "^4.0.18",
     "wrangler": "^3.0.0"
   }
 }

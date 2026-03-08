@@ -255,7 +255,7 @@ BEGIN
     IF NOT v_locked THEN
       INSERT INTO "THROTTLE_PROTECTION" ("HOSTNAME_HASH", "HOSTNAME", "STATE")
       VALUES (p_hostname_hash, COALESCE(NULLIF(p_hostname, ''), p_hostname_hash), 'closed')
-      ON CONFLICT ("HOSTNAME_HASH") DO NOTHING;
+      ON CONFLICT ON CONSTRAINT "THROTTLE_PROTECTION_pkey" DO NOTHING;
     END IF;
   END LOOP;
 
@@ -422,7 +422,7 @@ BEGIN
     IF NOT v_locked THEN
       INSERT INTO "THROTTLE_PROTECTION" ("HOSTNAME_HASH", "HOSTNAME", "STATE")
       VALUES (p_hostname_hash, COALESCE(NULLIF(p_hostname, ''), p_hostname_hash), 'closed')
-      ON CONFLICT ("HOSTNAME_HASH") DO NOTHING;
+      ON CONFLICT ON CONSTRAINT "THROTTLE_PROTECTION_pkey" DO NOTHING;
     END IF;
   END LOOP;
 
