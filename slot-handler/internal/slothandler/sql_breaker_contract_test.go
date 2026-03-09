@@ -11,6 +11,8 @@ func TestInitSQLThrottleProtectionUsesBreakerStateColumns(t *testing.T) {
 		`"state"\s+text`,
 		`"open_until"\s+integer`,
 		`"ewma_score"\s+numeric`,
+		`"samples_since_reset"\s+integer`,
+		`"last_sample_at"\s+integer`,
 		`"success_streak"\s+integer`,
 		`"probe_lease_until"\s+integer`,
 		`"version"\s+bigint`,
@@ -39,10 +41,10 @@ func TestInitSQLDefinesClaimAndReportBreakerFunctions(t *testing.T) {
 	}
 }
 
-func TestInitSQLReportBreakerSampleAcceptsProbeVersion(t *testing.T) {
+func TestInitSQLReportBreakerSampleAcceptsWarmupAndProbeParameters(t *testing.T) {
 	text := readInitSQLNormalized(t)
-	if !regexp.MustCompile(`download_report_breaker_sample\s*\([^)]*p_probe_version\s+bigint`).MatchString(text) {
-		t.Fatalf("download_report_breaker_sample must accept p_probe_version")
+	if !regexp.MustCompile(`download_report_breaker_sample\s*\([^)]*p_min_samples_before_ewma_open\s+integer[^)]*p_idle_reset_seconds\s+integer[^)]*p_probe_version\s+bigint`).MatchString(text) {
+		t.Fatalf("download_report_breaker_sample must accept warmup, idle reset, and probe version parameters")
 	}
 }
 
@@ -77,6 +79,39 @@ func TestInitSQLReportBreakerSampleConsumesAcceptedProbeVersion(t *testing.T) {
 	}
 	if !regexp.MustCompile(`if\s+p_probe_version\s+is\s+not\s+null\s+then(?s:.*?)v_version\s*:=\s*v_version\s*\+\s*1`).MatchString(body) {
 		t.Fatalf("download_report_breaker_sample must retire an accepted probe version after one use")
+	}
+}
+
+func TestInitSQLReportBreakerSampleUsesSamplesSinceResetForTrendGate(t *testing.T) {
+	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_report_breaker_sample")
+	if !regexp.MustCompile(`v_samples_since_reset\s*>=\s*v_min_samples_before_ewma_open`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must gate ewma opens with samples_since_reset")
+	}
+	if regexp.MustCompile(`v_total_samples\s*>=\s*v_min_samples_before_ewma_open`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must not use total_samples as the ewma warmup gate")
+	}
+}
+
+func TestInitSQLReportBreakerSampleKeepsHalfOpenProtectedSamplesAsImmediateReopens(t *testing.T) {
+	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_report_breaker_sample")
+	if !regexp.MustCompile(`v_should_open\s*:=\s*v_state\s*=\s*'half_open'\s+or`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must reopen protected half_open samples immediately")
+	}
+}
+
+func TestInitSQLReportBreakerSampleSoftResetsClosedIdleRows(t *testing.T) {
+	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_report_breaker_sample")
+	pattern := `if\s+v_state\s*=\s*'closed'\s+and\s+v_idle_reset_seconds\s*>\s*0\s+and\s+v_last_sample_at\s+is\s+not\s+null\s+and\s+\(v_now\s*-\s*v_last_sample_at\)\s*>=\s*v_idle_reset_seconds\s+then(?s:.*?)v_ewma_score\s*:=\s*0(?s:.*?)v_consecutive_error_count\s*:=\s*0(?s:.*?)v_success_streak\s*:=\s*0(?s:.*?)v_samples_since_reset\s*:=\s*0(?s:.*?)v_last_error_code\s*:=\s*null(?s:.*?)v_open_reason\s*:=\s*null(?s:.*?)v_last_open_seconds\s*:=\s*0`
+	if !regexp.MustCompile(pattern).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must soft-reset stale closed rows before evaluating new samples")
+	}
+}
+
+func TestInitSQLReportBreakerSampleResetsBaselineAfterHalfOpenCloses(t *testing.T) {
+	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_report_breaker_sample")
+	pattern := `if\s+v_success_streak\s*>=\s*2\s+and\s+v_ewma_score\s*<=\s*v_close_threshold\s+then(?s:.*?)v_state\s*:=\s*'closed'(?s:.*?)v_ewma_score\s*:=\s*0(?s:.*?)v_consecutive_error_count\s*:=\s*0(?s:.*?)v_success_streak\s*:=\s*0(?s:.*?)v_samples_since_reset\s*:=\s*0`
+	if !regexp.MustCompile(pattern).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must reset breaker baseline after half_open closes")
 	}
 }
 

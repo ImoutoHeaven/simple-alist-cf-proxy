@@ -88,9 +88,11 @@ const buildRuntimeBootstrap = (options = {}) => ({
       default: {
         hostPatterns: options.hostPatterns || ['*.sharepoint.com'],
         openCapSeconds: 60,
-        openThresholdPercent: 20,
+        openThresholdPercent: 30,
         ewmaSpan: 8,
         consecutiveThreshold: 4,
+        minSamplesBeforeEwmaOpen: 8,
+        idleResetSeconds: 900,
         protectHttpCodes: [429, 499, 500, 502, 503, 504],
       },
     },
@@ -141,9 +143,11 @@ const buildBootstrap = () => ({
       default: {
         hostPatterns: ['*.sharepoint.com'],
         openCapSeconds: 60,
-        openThresholdPercent: 20,
+        openThresholdPercent: 30,
         ewmaSpan: 8,
         consecutiveThreshold: 4,
+        minSamplesBeforeEwmaOpen: 8,
+        idleResetSeconds: 900,
         protectHttpCodes: [429, 499, 500, 502, 503, 504],
       },
     },
@@ -160,9 +164,11 @@ test('resolveConfig returns the canonical breaker runtime config', () => {
     verifyHeader: ['X-Verify'],
     verifySecret: ['secret'],
     openCapSeconds: 60,
-    openThresholdPercent: 20,
+    openThresholdPercent: 30,
     ewmaSpan: 8,
     consecutiveThreshold: 4,
+    minSamplesBeforeEwmaOpen: 8,
+    idleResetSeconds: 900,
     protectHttpCodes: [429, 499, 500, 502, 503, 504],
   });
 });
@@ -915,6 +921,8 @@ test('reportBreakerSample sends the canonical breaker report payload', async () 
       openThresholdPercent: 35,
       ewmaSpan: 11,
       consecutiveThreshold: 6,
+      minSamplesBeforeEwmaOpen: 8,
+      idleResetSeconds: 900,
       protectHttpCodes: [429, 503],
     });
 
@@ -925,6 +933,8 @@ test('reportBreakerSample sends the canonical breaker report payload', async () 
     assert.equal(rpcBody.p_open_threshold_percent, 35);
     assert.equal(rpcBody.p_ewma_span, 11);
     assert.equal(rpcBody.p_consecutive_threshold, 6);
+    assert.equal(rpcBody.p_min_samples_before_ewma_open, 8);
+    assert.equal(rpcBody.p_idle_reset_seconds, 900);
     assert.equal(rpcBody.p_probe_version, null);
     assert.equal(rpcBody.p_retry_after_seconds, 9);
     assert.deepEqual(Object.keys(rpcBody).sort(), [
@@ -932,6 +942,8 @@ test('reportBreakerSample sends the canonical breaker report payload', async () 
       'p_ewma_span',
       'p_hostname',
       'p_hostname_hash',
+      'p_idle_reset_seconds',
+      'p_min_samples_before_ewma_open',
       'p_now',
       'p_open_cap_seconds',
       'p_open_threshold_percent',

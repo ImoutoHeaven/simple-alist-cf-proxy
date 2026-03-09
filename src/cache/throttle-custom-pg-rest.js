@@ -11,9 +11,11 @@ const sanitizeThresholds = (config) => {
 
   return {
     openCapSeconds: Math.max(1, toInt(config.openCapSeconds, 60)),
-    openThresholdPercent: Math.max(0, toInt(config.openThresholdPercent, 20)),
+    openThresholdPercent: Math.max(0, toInt(config.openThresholdPercent, 30)),
     ewmaSpan: Math.max(1, toInt(config.ewmaSpan, 8)),
     consecutiveThreshold: Math.max(1, toInt(config.consecutiveThreshold, 4)),
+    minSamplesBeforeEwmaOpen: Math.max(1, toInt(config.minSamplesBeforeEwmaOpen, 8)),
+    idleResetSeconds: Math.max(0, toInt(config.idleResetSeconds, 900)),
   };
 };
 
@@ -372,6 +374,8 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
       p_open_threshold_percent: thresholds.openThresholdPercent,
       p_ewma_span: thresholds.ewmaSpan,
       p_consecutive_threshold: thresholds.consecutiveThreshold,
+      p_min_samples_before_ewma_open: thresholds.minSamplesBeforeEwmaOpen,
+      p_idle_reset_seconds: thresholds.idleResetSeconds,
       p_probe_version: probeVersion,
       p_retry_after_seconds: retryAfterSeconds,
     },

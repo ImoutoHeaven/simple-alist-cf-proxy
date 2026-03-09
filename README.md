@@ -7,7 +7,7 @@ simple-alist-cf-proxy 是 AList 下载体系里的 Cloudflare Worker 下载代�
 - `payload` / `payloadSign` 校验（HMAC + expire）
 - Origin 绑定：解密 `payload.encrypt` 并重算 `bindingStr`（ip/iprange/Geo/ASN/TLS/path）
 - PostgREST 模式缓存、限流与 Breaker 权威快照：`download_unified_check` 一次 RTT 统一检查
-- SharePoint Breaker 与 Fair Queue：Breaker 由 `THROTTLE_PROTECTION` + claim/report RPC 统一裁决，slot-handler 只转发 fair-queue 结果与 backend `THROTTLED` 元数据
+- SharePoint Breaker 与 Fair Queue：Breaker 由 `THROTTLE_PROTECTION` + claim/report RPC 统一裁决，支持 warm-up 与 closed-idle soft reset；slot-handler 只转发 fair-queue 结果与 backend `THROTTLED` 元数据
 - 可选 Cloudflare 原生 Rate Limiter
 - 安全响应封装：精简 headers + 统一 CORS + 小文件 Cache-Control 覆盖
 - IPv4-only 模式（`download.auth.ipv4Only`）
@@ -102,7 +102,7 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
   - `download.db.linkTTLSeconds` / `download.db.idleTimeoutSeconds`
   - `download.db.cacheTable` / `download.db.lastActiveTable`
   - `download.db.rateLimit.*`（`windowSeconds` / `limit` / `blockSeconds` / `pgErrorHandle` 等）
-- `download.throttleProfiles` + `decision.download.throttleProfile`：SharePoint breaker profile 与 selector；profile 只包含 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`protectHttpCodes`，运行时状态固定落在 `THROTTLE_PROTECTION`，worker/slot-handler 都不保留本地 breaker 权威，未知 selector 直接报错
+- `download.throttleProfiles` + `decision.download.throttleProfile`：SharePoint breaker profile 与 selector；profile 只包含 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`protectHttpCodes`，运行时状态固定落在 `THROTTLE_PROTECTION`，worker/slot-handler 都不保留本地 breaker 权威，未知 selector 直接报错
 - `download.fairQueue.*`：公平排队开关与等待策略（含 siteBucket 计算）
 - `decision.download.pathAction` / `decision.download.checkOriginMode`：单路径策略与 bindingStr 绑定字段
 
@@ -114,7 +114,7 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - 校验 `payloadSign` 与 `payload.expireTime`，解密 `payload.encrypt` 并重算 `bindingStr`
 - 可选 CF Rate Limiter；可选 PostgREST 限流/缓存/Breaker 快照（统一检查，Breaker 权威只在 `THROTTLE_PROTECTION`）
 - 访问 AList `/api/fs/link` 获取真实下载链接（带鉴权 header）
-- 命中托管 breaker hostname 时，worker 只按权威快照 fail-fast；需要半开探针时仅调用 `download_claim_breaker_probe` 领取，并在响应后带 `p_probe_version` 回写 sample
+- 命中托管 breaker hostname 时，worker 只按权威快照 fail-fast；需要半开探针时仅调用 `download_claim_breaker_probe` 领取，并在响应后带 `p_probe_version` 回写二值 sample；SQL 只用 `SAMPLES_SINCE_RESET` 做 EWMA warm-up gate，并用 `LAST_SAMPLE_AT` + `idleResetSeconds` 在 closed 态空闲过久后软重置 breaker 记忆
 - 可选 Fair Queue（slot-handler）获取 slot；slot-handler 只透传 backend `THROTTLED` 元数据，不在本地维护 breaker 状态
 - 转发上游响应，裁剪/补充 headers 并返回
 

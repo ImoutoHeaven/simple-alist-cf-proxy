@@ -7,7 +7,7 @@ import { __fairQueueTestHooks } from '../src/worker.js';
 
 const { resolveConfig } = __fairQueueTestHooks;
 
-const CURRENT_SCHEMA_EPOCH = 2;
+const CURRENT_SCHEMA_EPOCH = 3;
 
 const buildBootstrap = () => ({
   common: {
@@ -21,9 +21,11 @@ const buildBootstrap = () => ({
       default: {
         hostPatterns: ['*.default.example'],
         openCapSeconds: 60,
-        openThresholdPercent: 20,
+        openThresholdPercent: 30,
         ewmaSpan: 8,
         consecutiveThreshold: 4,
+        minSamplesBeforeEwmaOpen: 8,
+        idleResetSeconds: 900,
         protectHttpCodes: [429, 499, 500, 502, 503, 504],
       },
       sharepoint: {
@@ -32,6 +34,8 @@ const buildBootstrap = () => ({
         openThresholdPercent: 35,
         ewmaSpan: 11,
         consecutiveThreshold: 6,
+        minSamplesBeforeEwmaOpen: 8,
+        idleResetSeconds: 900,
         protectHttpCodes: [429, 503],
       },
     },
@@ -530,15 +534,20 @@ test('resolveConfig returns the canonical breaker profile shape', () => {
     openThresholdPercent: 35,
     ewmaSpan: 11,
     consecutiveThreshold: 6,
+    minSamplesBeforeEwmaOpen: 8,
+    idleResetSeconds: 900,
     protectHttpCodes: [429, 503],
   });
 });
 
-test('getBootstrapConfig ignores stale in-memory payloads without schema epoch', async () => {
+test('getBootstrapConfig ignores stale in-memory payloads from the prior schema epoch', async () => {
   resetBootstrapClientState();
   globalThis.bootstrapCache = {
     expAt: Date.now() + 60_000,
-    data: { configVersion: 'stale-memory' },
+    data: {
+      schemaEpoch: CURRENT_SCHEMA_EPOCH - 1,
+      data: { configVersion: 'stale-memory' },
+    },
   };
 
   const freshPayload = { configVersion: 'fresh-memory', ttlSeconds: 120 };
@@ -592,6 +601,8 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
       openThresholdPercent: 35,
       ewmaSpan: 11,
       consecutiveThreshold: 6,
+      minSamplesBeforeEwmaOpen: 8,
+      idleResetSeconds: 900,
     });
 
     assert.equal(rpcUrl, 'https://postgrest.example.test/rpc/download_report_breaker_sample');
@@ -603,6 +614,8 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
     assert.equal(rpcBody.p_open_threshold_percent, 35);
     assert.equal(rpcBody.p_ewma_span, 11);
     assert.equal(rpcBody.p_consecutive_threshold, 6);
+    assert.equal(rpcBody.p_min_samples_before_ewma_open, 8);
+    assert.equal(rpcBody.p_idle_reset_seconds, 900);
     assert.equal(rpcBody.p_probe_version, null);
     assert.equal(rpcBody.p_retry_after_seconds, null);
     assert.deepEqual(Object.keys(rpcBody).sort(), [
@@ -610,6 +623,8 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
       'p_ewma_span',
       'p_hostname',
       'p_hostname_hash',
+      'p_idle_reset_seconds',
+      'p_min_samples_before_ewma_open',
       'p_now',
       'p_open_cap_seconds',
       'p_open_threshold_percent',
@@ -624,10 +639,13 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
   }
 });
 
-test('getBootstrapConfig ignores stale D1 payloads without schema epoch and rewrites cache', async () => {
+test('getBootstrapConfig ignores stale D1 payloads from the prior schema epoch and rewrites cache', async () => {
   resetBootstrapClientState();
   const cacheDb = createCacheD1Mock({
-    payload_json: JSON.stringify({ configVersion: 'stale-d1' }),
+    payload_json: JSON.stringify({
+      schemaEpoch: CURRENT_SCHEMA_EPOCH - 1,
+      data: { configVersion: 'stale-d1' },
+    }),
     expires_at: Date.now() + 60_000,
   });
 

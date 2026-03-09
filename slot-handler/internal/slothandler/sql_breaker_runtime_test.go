@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -231,8 +232,8 @@ func TestInitSQLRuntimeClaimAndReportRequireMatchingProbeVersion(t *testing.T) {
 	)
 	err = db.QueryRowContext(ctx, `
 		SELECT "STATE", "TOTAL_SAMPLES", "SUCCESS_STREAK", "VERSION"
-		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-	`, hostnameHash, hostname, now, 0, 200, 60, 20, 8, 4, nil, 7).Scan(
+		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`, hostnameHash, hostname, now, 0, 200, 60, 20, 8, 4, 8, 900, nil, 7).Scan(
 		&staleState,
 		&staleTotalSamples,
 		&staleSuccesses,
@@ -253,8 +254,8 @@ func TestInitSQLRuntimeClaimAndReportRequireMatchingProbeVersion(t *testing.T) {
 	)
 	err = db.QueryRowContext(ctx, `
 		SELECT "STATE", "TOTAL_SAMPLES", "SUCCESS_STREAK", "VERSION"
-		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-	`, hostnameHash, hostname, now, 0, 200, 60, 20, 8, 4, nil, 8).Scan(
+		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`, hostnameHash, hostname, now, 0, 200, 60, 20, 8, 4, 8, 900, nil, 8).Scan(
 		&acceptedState,
 		&acceptedTotalSamples,
 		&acceptedSuccesses,
@@ -294,8 +295,8 @@ func TestInitSQLRuntimeReportDoesNotPromoteExpiredOpenRow(t *testing.T) {
 	)
 	err = db.QueryRowContext(ctx, `
 		SELECT "STATE", "OPEN_UNTIL", "TOTAL_SAMPLES", "VERSION"
-		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-	`, hostnameHash, hostname, now, 0, 200, 60, 20, 8, 4, nil, nil).Scan(
+		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`, hostnameHash, hostname, now, 0, 200, 60, 20, 8, 4, 8, 900, nil, nil).Scan(
 		&reportState,
 		&reportOpenUntil,
 		&reportTotalSamples,
@@ -398,5 +399,402 @@ func TestInitSQLRuntimeClaimRemintsExpiredHalfOpenLease(t *testing.T) {
 	}
 	if !probeGranted {
 		t.Fatalf("expected expired half_open lease remint to grant probe")
+	}
+}
+
+func TestInitSQLRuntimeReportRejectsMissingRequiredThresholds(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+	const (
+		hostnameHash = "runtime-missing-thresholds-host"
+		hostname     = "missing.sharepoint.com"
+		now          = 1_700_000_250
+	)
+
+	var state string
+	err := db.QueryRowContext(ctx, `
+		SELECT "STATE"
+		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`, hostnameHash, hostname, now, 1, 429, nil, nil, nil, nil, nil, nil, nil, nil).Scan(&state)
+	if err == nil {
+		t.Fatalf("expected missing required thresholds to fail, got state %q", state)
+	}
+	if !strings.Contains(err.Error(), "requires non-null breaker thresholds") {
+		t.Fatalf("expected missing-threshold error, got %v", err)
+	}
+}
+
+func TestInitSQLRuntimeWarmupUsesSamplesSinceResetInsteadOfLifetimeTotals(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+	const (
+		hostnameHash = "runtime-warmup-host"
+		hostname     = "warmup.sharepoint.com"
+		now          = 1_700_000_300
+	)
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO "THROTTLE_PROTECTION" (
+			"HOSTNAME_HASH", "HOSTNAME", "STATE", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
+			"CONSECUTIVE_ERROR_COUNT", "LAST_SAMPLE_AT", "VERSION"
+		) VALUES ($1, $2, 'closed', $3, 50, 6, 0, $4, 0)
+	`, hostnameHash, hostname, 0.2, now-30)
+	if err != nil {
+		t.Fatalf("seed warmup row: %v", err)
+	}
+
+	var (
+		state                 string
+		ewma                  float64
+		totalSamples          int
+		samplesSinceReset     int
+		consecutiveErrorCount int
+		lastSampleAt          sql.NullInt64
+	)
+	err = db.QueryRowContext(ctx, `
+		SELECT "STATE", "EWMA_SCORE"::double precision, "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET", "CONSECUTIVE_ERROR_COUNT", "LAST_SAMPLE_AT"
+		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`, hostnameHash, hostname, now, 1, 429, 60, 30, 8, 4, 8, 900, nil, nil).Scan(
+		&state,
+		&ewma,
+		&totalSamples,
+		&samplesSinceReset,
+		&consecutiveErrorCount,
+		&lastSampleAt,
+	)
+	if err != nil {
+		t.Fatalf("report warmup-gated sample: %v", err)
+	}
+	if state != "closed" {
+		t.Fatalf("expected warmup gate to keep state closed, got %q", state)
+	}
+	if math.Abs(ewma-0.3777777778) > 0.000001 {
+		t.Fatalf("expected ewma 0.377778 after sample, got %.6f", ewma)
+	}
+	if totalSamples != 51 {
+		t.Fatalf("expected total_samples to remain lifetime count 51, got %d", totalSamples)
+	}
+	if samplesSinceReset != 7 {
+		t.Fatalf("expected samples_since_reset to advance to 7, got %d", samplesSinceReset)
+	}
+	if consecutiveErrorCount != 1 {
+		t.Fatalf("expected consecutive_error_count 1, got %d", consecutiveErrorCount)
+	}
+	if !lastSampleAt.Valid || lastSampleAt.Int64 != now {
+		t.Fatalf("expected last_sample_at %d, got %v", now, lastSampleAt)
+	}
+}
+
+func TestInitSQLRuntimeWarmupTrendOpensAtExactBoundary(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+	const (
+		hostnameHash = "runtime-warmup-boundary-host"
+		hostname     = "boundary.sharepoint.com"
+		now          = 1_700_000_350
+	)
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO "THROTTLE_PROTECTION" (
+			"HOSTNAME_HASH", "HOSTNAME", "STATE", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
+			"CONSECUTIVE_ERROR_COUNT", "LAST_SAMPLE_AT", "VERSION"
+		) VALUES ($1, $2, 'closed', $3, 51, 7, 0, $4, 0)
+	`, hostnameHash, hostname, 0.2, now-30)
+	if err != nil {
+		t.Fatalf("seed warmup-boundary row: %v", err)
+	}
+
+	var (
+		state                 string
+		openUntil             sql.NullInt64
+		ewma                  float64
+		totalSamples          int
+		samplesSinceReset     int
+		consecutiveErrorCount int
+		lastSampleAt          sql.NullInt64
+		lastErrorCode         sql.NullInt64
+		openReason            sql.NullString
+		lastOpenSeconds       int
+	)
+	err = db.QueryRowContext(ctx, `
+		SELECT "STATE", "OPEN_UNTIL", "EWMA_SCORE"::double precision, "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET", "CONSECUTIVE_ERROR_COUNT", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS"
+		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`, hostnameHash, hostname, now, 1, 429, 60, 30, 8, 4, 8, 900, nil, nil).Scan(
+		&state,
+		&openUntil,
+		&ewma,
+		&totalSamples,
+		&samplesSinceReset,
+		&consecutiveErrorCount,
+		&lastSampleAt,
+		&lastErrorCode,
+		&openReason,
+		&lastOpenSeconds,
+	)
+	if err != nil {
+		t.Fatalf("report warmup-boundary sample: %v", err)
+	}
+	if state != "open" {
+		t.Fatalf("expected warmup boundary to open breaker, got %q", state)
+	}
+	if !openUntil.Valid || openUntil.Int64 != now+1 {
+		t.Fatalf("expected open_until %d at warmup boundary, got %v", now+1, openUntil)
+	}
+	if math.Abs(ewma-0.3777777778) > 0.000001 {
+		t.Fatalf("expected ewma 0.377778 at warmup boundary, got %.6f", ewma)
+	}
+	if totalSamples != 52 {
+		t.Fatalf("expected total_samples lifetime count 52, got %d", totalSamples)
+	}
+	if samplesSinceReset != 8 {
+		t.Fatalf("expected samples_since_reset to reach boundary 8, got %d", samplesSinceReset)
+	}
+	if consecutiveErrorCount != 1 {
+		t.Fatalf("expected consecutive_error_count 1 at warmup boundary, got %d", consecutiveErrorCount)
+	}
+	if !lastSampleAt.Valid || lastSampleAt.Int64 != now {
+		t.Fatalf("expected last_sample_at %d, got %v", now, lastSampleAt)
+	}
+	if !lastErrorCode.Valid || lastErrorCode.Int64 != 429 {
+		t.Fatalf("expected last_error_code 429, got %v", lastErrorCode)
+	}
+	if !openReason.Valid || openReason.String != "http_429" {
+		t.Fatalf("expected open_reason http_429 at warmup boundary, got %v", openReason)
+	}
+	if lastOpenSeconds != 1 {
+		t.Fatalf("expected last_open_seconds 1 at warmup boundary, got %d", lastOpenSeconds)
+	}
+}
+
+func TestInitSQLRuntimeClosedIdleGapSoftResetsBreakerMemory(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+	const (
+		hostnameHash = "runtime-idle-reset-host"
+		hostname     = "idle.sharepoint.com"
+		now          = 1_700_000_400
+	)
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO "THROTTLE_PROTECTION" (
+			"HOSTNAME_HASH", "HOSTNAME", "STATE", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
+			"CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
+		) VALUES ($1, $2, 'closed', $3, 42, 7, 3, 2, $4, 503, 'http_503', 16, 0)
+	`, hostnameHash, hostname, 0.95, now-901)
+	if err != nil {
+		t.Fatalf("seed stale closed row: %v", err)
+	}
+
+	var (
+		state                 string
+		ewma                  float64
+		totalSamples          int
+		samplesSinceReset     int
+		consecutiveErrorCount int
+		successStreak         int
+		lastSampleAt          sql.NullInt64
+		lastErrorCode         sql.NullInt64
+		openReason            sql.NullString
+		lastOpenSeconds       int
+	)
+	err = db.QueryRowContext(ctx, `
+		SELECT "STATE", "EWMA_SCORE"::double precision, "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET", "CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS"
+		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`, hostnameHash, hostname, now, 1, 429, 60, 30, 8, 4, 8, 900, nil, nil).Scan(
+		&state,
+		&ewma,
+		&totalSamples,
+		&samplesSinceReset,
+		&consecutiveErrorCount,
+		&successStreak,
+		&lastSampleAt,
+		&lastErrorCode,
+		&openReason,
+		&lastOpenSeconds,
+	)
+	if err != nil {
+		t.Fatalf("report sample after stale idle gap: %v", err)
+	}
+	if state != "closed" {
+		t.Fatalf("expected stale closed row to soft-reset and stay closed, got %q", state)
+	}
+	if math.Abs(ewma-0.2222222222) > 0.000001 {
+		t.Fatalf("expected ewma 0.222222 after idle reset, got %.6f", ewma)
+	}
+	if totalSamples != 43 {
+		t.Fatalf("expected total_samples lifetime count 43, got %d", totalSamples)
+	}
+	if samplesSinceReset != 1 {
+		t.Fatalf("expected samples_since_reset to restart at 1, got %d", samplesSinceReset)
+	}
+	if consecutiveErrorCount != 1 {
+		t.Fatalf("expected consecutive_error_count 1 after reset, got %d", consecutiveErrorCount)
+	}
+	if successStreak != 0 {
+		t.Fatalf("expected success_streak reset to 0, got %d", successStreak)
+	}
+	if !lastSampleAt.Valid || lastSampleAt.Int64 != now {
+		t.Fatalf("expected last_sample_at %d, got %v", now, lastSampleAt)
+	}
+	if !lastErrorCode.Valid || lastErrorCode.Int64 != 429 {
+		t.Fatalf("expected last_error_code 429, got %v", lastErrorCode)
+	}
+	if openReason.Valid {
+		t.Fatalf("expected idle-reset closed sample to keep open_reason null, got %q", openReason.String)
+	}
+	if lastOpenSeconds != 0 {
+		t.Fatalf("expected idle-reset closed sample to clear last_open_seconds, got %d", lastOpenSeconds)
+	}
+}
+
+func TestInitSQLRuntimeHalfOpenProtectedSampleReopensImmediately(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+	const (
+		hostnameHash = "runtime-half-open-reopen-host"
+		hostname     = "probe.sharepoint.com"
+		now          = 1_700_000_500
+	)
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO "THROTTLE_PROTECTION" (
+			"HOSTNAME_HASH", "HOSTNAME", "STATE", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
+			"CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "PROBE_LEASE_UNTIL", "LAST_SAMPLE_AT", "VERSION"
+		) VALUES ($1, $2, 'half_open', 0, 12, 0, 0, 0, $3, $4, 11)
+	`, hostnameHash, hostname, now+15, now-30)
+	if err != nil {
+		t.Fatalf("seed half_open row: %v", err)
+	}
+
+	var (
+		state             string
+		openUntil         sql.NullInt64
+		samplesSinceReset int
+		version           int64
+		lastErrorCode     sql.NullInt64
+		openReason        sql.NullString
+	)
+	err = db.QueryRowContext(ctx, `
+		SELECT "STATE", "OPEN_UNTIL", "SAMPLES_SINCE_RESET", "VERSION", "LAST_ERROR_CODE", "OPEN_REASON"
+		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`, hostnameHash, hostname, now, 1, 429, 60, 30, 8, 4, 8, 900, nil, 11).Scan(
+		&state,
+		&openUntil,
+		&samplesSinceReset,
+		&version,
+		&lastErrorCode,
+		&openReason,
+	)
+	if err != nil {
+		t.Fatalf("report protected half_open sample: %v", err)
+	}
+	if state != "open" {
+		t.Fatalf("expected protected half_open sample to reopen breaker, got %q", state)
+	}
+	if !openUntil.Valid || openUntil.Int64 != now+1 {
+		t.Fatalf("expected reopened breaker open_until %d, got %v", now+1, openUntil)
+	}
+	if samplesSinceReset != 1 {
+		t.Fatalf("expected samples_since_reset to advance to 1, got %d", samplesSinceReset)
+	}
+	if version != 12 {
+		t.Fatalf("expected accepted probe version to advance to 12, got %d", version)
+	}
+	if !lastErrorCode.Valid || lastErrorCode.Int64 != 429 {
+		t.Fatalf("expected last_error_code 429, got %v", lastErrorCode)
+	}
+	if !openReason.Valid || openReason.String != "http_429" {
+		t.Fatalf("expected open_reason http_429, got %v", openReason)
+	}
+}
+
+func TestInitSQLRuntimeHalfOpenCloseResetsBreakerBaseline(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+	const (
+		hostnameHash = "runtime-half-open-close-host"
+		hostname     = "recovery.sharepoint.com"
+		now          = 1_700_000_600
+	)
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO "THROTTLE_PROTECTION" (
+			"HOSTNAME_HASH", "HOSTNAME", "STATE", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
+			"CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "PROBE_LEASE_UNTIL", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
+		) VALUES ($1, $2, 'half_open', $3, 25, 5, 2, 1, $4, $5, 429, 'http_429', 8, 20)
+	`, hostnameHash, hostname, 0.01, now+15, now-30)
+	if err != nil {
+		t.Fatalf("seed closing half_open row: %v", err)
+	}
+
+	var (
+		state                 string
+		openUntil             sql.NullInt64
+		ewma                  float64
+		totalSamples          int
+		samplesSinceReset     int
+		consecutiveErrorCount int
+		successStreak         int
+		lastSampleAt          sql.NullInt64
+		lastErrorCode         sql.NullInt64
+		openReason            sql.NullString
+		lastOpenSeconds       int
+		version               int64
+	)
+	err = db.QueryRowContext(ctx, `
+		SELECT "STATE", "OPEN_UNTIL", "EWMA_SCORE"::double precision, "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET", "CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
+		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`, hostnameHash, hostname, now, 0, 200, 60, 30, 8, 4, 8, 900, nil, 20).Scan(
+		&state,
+		&openUntil,
+		&ewma,
+		&totalSamples,
+		&samplesSinceReset,
+		&consecutiveErrorCount,
+		&successStreak,
+		&lastSampleAt,
+		&lastErrorCode,
+		&openReason,
+		&lastOpenSeconds,
+		&version,
+	)
+	if err != nil {
+		t.Fatalf("report successful half_open sample: %v", err)
+	}
+	if state != "closed" {
+		t.Fatalf("expected half_open recovery to close breaker, got %q", state)
+	}
+	if openUntil.Valid {
+		t.Fatalf("expected recovered breaker to clear open_until, got %v", openUntil.Int64)
+	}
+	if ewma != 0 {
+		t.Fatalf("expected recovered breaker ewma baseline 0, got %.6f", ewma)
+	}
+	if totalSamples != 26 {
+		t.Fatalf("expected total_samples lifetime count 26, got %d", totalSamples)
+	}
+	if samplesSinceReset != 0 {
+		t.Fatalf("expected recovered breaker samples_since_reset 0, got %d", samplesSinceReset)
+	}
+	if consecutiveErrorCount != 0 {
+		t.Fatalf("expected recovered breaker consecutive_error_count 0, got %d", consecutiveErrorCount)
+	}
+	if successStreak != 0 {
+		t.Fatalf("expected recovered breaker success_streak 0, got %d", successStreak)
+	}
+	if !lastSampleAt.Valid || lastSampleAt.Int64 != now {
+		t.Fatalf("expected last_sample_at %d, got %v", now, lastSampleAt)
+	}
+	if lastErrorCode.Valid {
+		t.Fatalf("expected recovered breaker to clear last_error_code, got %v", lastErrorCode)
+	}
+	if openReason.Valid {
+		t.Fatalf("expected recovered breaker to clear open_reason, got %q", openReason.String)
+	}
+	if lastOpenSeconds != 0 {
+		t.Fatalf("expected recovered breaker last_open_seconds 0, got %d", lastOpenSeconds)
+	}
+	if version != 21 {
+		t.Fatalf("expected accepted probe version to advance to 21, got %d", version)
 	}
 }

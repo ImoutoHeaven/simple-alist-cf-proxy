@@ -22,9 +22,11 @@ const DEFAULT_SLOT_HANDLER_TIMEOUT_MS = 20000;
 const DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = 8000;
 const DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS = 35;
 const DEFAULT_THROTTLE_OPEN_CAP_SECONDS = 60;
-const DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT = 20;
+const DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT = 30;
 const DEFAULT_THROTTLE_EWMA_SPAN = 8;
 const DEFAULT_THROTTLE_CONSECUTIVE_THRESHOLD = 4;
+const DEFAULT_THROTTLE_MIN_SAMPLES_BEFORE_EWMA_OPEN = 8;
+const DEFAULT_THROTTLE_IDLE_RESET_SECONDS = 900;
 const DEFAULT_THROTTLE_PROTECT_HTTP_CODES = [429, 499, 500, 502, 503, 504];
 // slot-handler acquire is long-poll based; don't set per-request timeouts below this window.
 const SLOT_HANDLER_LONGPOLL_MS = 6000;
@@ -106,6 +108,15 @@ const normalizePositiveSeconds = (value, fallback) => {
   }
   const fb = Number(fallback);
   return Number.isFinite(fb) && fb > 0 ? fb : 0;
+};
+
+const normalizeNonNegativeInt = (value, fallback) => {
+  const num = Number(value);
+  if (Number.isFinite(num) && num >= 0) {
+    return Math.trunc(num);
+  }
+  const fb = Number(fallback);
+  return Number.isFinite(fb) && fb >= 0 ? Math.trunc(fb) : 0;
 };
 
 const normalizeProtectHttpCodes = (value) => {
@@ -925,6 +936,14 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     consecutiveThreshold: normalizePositiveSeconds(
       throttleProfileConfig.consecutiveThreshold,
       DEFAULT_THROTTLE_CONSECUTIVE_THRESHOLD,
+    ),
+    minSamplesBeforeEwmaOpen: normalizePositiveSeconds(
+      throttleProfileConfig.minSamplesBeforeEwmaOpen,
+      DEFAULT_THROTTLE_MIN_SAMPLES_BEFORE_EWMA_OPEN,
+    ),
+    idleResetSeconds: normalizeNonNegativeInt(
+      throttleProfileConfig.idleResetSeconds,
+      DEFAULT_THROTTLE_IDLE_RESET_SECONDS,
     ),
     protectHttpCodes,
   };

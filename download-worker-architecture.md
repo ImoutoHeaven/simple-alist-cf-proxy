@@ -59,7 +59,7 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 - `download.db.mode` 仅支持 `""` 或 `custom-pg-rest`
 - `download.db.*`：PostgREST 地址、校验 header/secret、缓存表/last-active 表、TTL/idle 等
 - `download.db.rateLimit.*`：窗口、限额、block 时间、`pgErrorHandle` 等
-- `download.throttleProfiles.<name>`：只定义 breaker profile，字段固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`protectHttpCodes`
+- `download.throttleProfiles.<name>`：只定义 breaker profile，字段固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`protectHttpCodes`
 - `download.fairQueue.*`：slot-handler 地址、鉴权 key、鉴权 header 名、等待超时、轮询策略、siteBucket 计算方式等（worker 侧解析字段）；其中 `slotHandlerAuthHeader` 由 controller 同步下发，默认值为 `X-FQ-Auth`
 - slot-handler in-flight limits（slot-handler 配置项，写在 slot-handler 的 config 中，worker 不解析）：
   - `globalMaxInFlightFlow`：slot-handler 全局 in-flight 上限，超过则返回 `overloaded`
@@ -114,7 +114,9 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
     - 若 hostname 匹配 `throttleProfiles.*.hostPatterns`，worker 只读取数据库权威快照；运行时唯一真源是 `THROTTLE_PROTECTION`，worker 不保留本地 breaker 镜像。
     - breaker 状态机只有 `closed/open/half_open` 三态：`open` 仅按权威快照立即 fail-fast；`open -> half_open` 只允许 `download_claim_breaker_probe` 原子领取单 canary。
     - `download_report_breaker_sample` 负责回写样本，但只在 `half_open` 且 `p_probe_version` 命中当前版本时接受该 canary 结果；过期或未领取的响应不会推进恢复流程。
-    - 下载后仅按 `protectHttpCodes` 上报 `sample=1`，`2xx/3xx` 上报 `sample=0`；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退。
+    - worker 只透传 controller breaker profile：默认 `openThresholdPercent=30`、`minSamplesBeforeEwmaOpen=8`、`idleResetSeconds=900`，并把两项新参数写入 RPC `p_min_samples_before_ewma_open` / `p_idle_reset_seconds`。
+    - SQL 里 `TOTAL_SAMPLES` 只保留 lifetime observability；EWMA warm-up 只看 `SAMPLES_SINCE_RESET`，并用 `LAST_SAMPLE_AT` + `idleResetSeconds` 在 `closed` 态空闲过久后先软重置 breaker 记忆再评估新样本。
+    - 下载后仅按 `protectHttpCodes` 上报二值 `sample=1`，`2xx/3xx` 上报 `sample=0`；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退；受保护的 `half_open` canary 仍会立即重新 `open`。
 
 10. **Fair Queue（slot-handler）**
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
@@ -157,7 +159,7 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 
 - 下载缓存：`DOWNLOAD_CACHE_TABLE` + `download_upsert_download_cache`
 - IP 限流：`DOWNLOAD_IP_RATELIMIT_TABLE` + `download_upsert_rate_limit`
-- Breaker：`THROTTLE_PROTECTION` + `download_claim_breaker_probe` + `download_report_breaker_sample`
+- Breaker：`THROTTLE_PROTECTION` + `download_claim_breaker_probe` + `download_report_breaker_sample`（worker 当前会透传 `p_open_threshold_percent`、`p_min_samples_before_ewma_open`、`p_idle_reset_seconds`；SQL 用 `SAMPLES_SINCE_RESET` / `LAST_SAMPLE_AT` 管 warm-up 与 idle reset，`TOTAL_SAMPLES` 仅保留累计观测）
 - Last Active：`DOWNLOAD_LAST_ACTIVE_TABLE` + `download_update_last_active`
 - 统一检查：`download_unified_check`（直接返回 breaker 原始字段 `state/open_until/reason/version/last_error_code`）
 
