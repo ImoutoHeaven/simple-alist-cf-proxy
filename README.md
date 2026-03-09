@@ -43,7 +43,6 @@ CONTROLLER_API_TOKEN="replace-with-token"
 
 # bootstrap 缓存：direct 或 d1
 BOOTSTRAP_CACHE_MODE="d1"
-CACHE_D1="CACHE_D1"
 INIT_TABLES="false"
 
 # 内部控制 API
@@ -61,8 +60,8 @@ CF_RATELIMITER_BINDING="CF_RATE_LIMITER"
 说明：
 
 - 未配置控制面时，Worker 会返回 `503 controller state unavailable`。
-- `BOOTSTRAP_CACHE_MODE=d1` 需要配置 D1 绑定 `CACHE_D1`，并可用 `INIT_TABLES=true` 自动建表。
-- 若启用 `ENABLE_CF_RATELIMITER`，需要在 `wrangler.toml` 配置同名 `[[rate_limit]]` binding。
+- `BOOTSTRAP_CACHE_MODE=d1` 需要在 `wrangler.toml` 配置 D1 绑定 `CACHE_D1`，并可用 `INIT_TABLES=true` 自动建表。
+- 若启用 `ENABLE_CF_RATELIMITER`，需要在 `wrangler.toml` 配置同名 `[[ratelimits]]` binding。
 
 3. 本地开发
 

@@ -1,8 +1,4 @@
 {
-  "name": "simple-alist-cf-proxy",
-  "version": "1.0.0",
-  "description": "AList download proxy worker with signature verification and link caching",
-  "main": "src/worker.js",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
@@ -13,16 +9,6 @@
     "test:node": "node --test tests/*.test.mjs",
     "test:watch": "vitest init.sql.test.js"
   },
-  "keywords": [
-    "cloudflare",
-    "workers",
-    "alist",
-    "download",
-    "proxy"
-  ],
-  "author": "",
-  "license": "MIT",
-  "dependencies": {},
   "devDependencies": {
     "esbuild": "^0.23.0",
     "vitest": "^4.0.18",

@@ -979,7 +979,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     const ratelimiter = env[cfRatelimiterBinding];
     if (!ratelimiter || typeof ratelimiter.limit !== 'function') {
       throw new Error(
-        `ENABLE_CF_RATELIMITER is true but binding "${cfRatelimiterBinding}" not found or invalid. Please configure [[rate_limit]] binding in wrangler.toml with name="${cfRatelimiterBinding}".`
+        `ENABLE_CF_RATELIMITER is true but binding "${cfRatelimiterBinding}" not found or invalid. Please configure [[ratelimits]] binding in wrangler.toml with name="${cfRatelimiterBinding}".`
       );
     }
   }

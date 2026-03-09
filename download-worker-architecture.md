@@ -13,10 +13,10 @@
 
 ## 2. 配置与决策来源
 
-Worker 只保留 infra 级环境变量，所有业务策略由控制面下发：
+Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还需 D1 绑定），所有业务策略由控制面下发：
 
 - 必需环境变量（控制面）：`CONTROLLER_URL`、`CONTROLLER_API_TOKEN`、`ENV`、`ROLE`、`INSTANCE_ID`
-- bootstrap 缓存：`BOOTSTRAP_CACHE_MODE=direct|d1`，`CACHE_D1`（可选）、`INIT_TABLES`（可选）
+- bootstrap 缓存：`BOOTSTRAP_CACHE_MODE=direct|d1`、`INIT_TABLES`；使用 `d1` 模式时需提供 D1 绑定 `CACHE_D1`
 - 内部控制 API：`INTERNAL_API_TOKEN`
 - 入口内网鉴权（可选）：`INNER_AUTH_HEADER` / `INNER_AUTH_SECRET`
 - CF 原生限流（可选）：`ENABLE_CF_RATELIMITER` / `CF_RATELIMITER_BINDING`
