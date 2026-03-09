@@ -14,6 +14,7 @@ func TestInitSQLThrottleProtectionUsesBreakerStateColumns(t *testing.T) {
 		`"samples_since_reset"\s+integer`,
 		`"last_sample_at"\s+integer`,
 		`"success_streak"\s+integer`,
+		`"half_open_since"\s+integer`,
 		`"probe_lease_until"\s+integer`,
 		`"version"\s+bigint`,
 	} {
@@ -109,9 +110,22 @@ func TestInitSQLReportBreakerSampleSoftResetsClosedIdleRows(t *testing.T) {
 
 func TestInitSQLReportBreakerSampleResetsBaselineAfterHalfOpenCloses(t *testing.T) {
 	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_report_breaker_sample")
-	pattern := `if\s+v_success_streak\s*>=\s*2\s+and\s+v_ewma_score\s*<=\s*v_close_threshold\s+then(?s:.*?)v_state\s*:=\s*'closed'(?s:.*?)v_ewma_score\s*:=\s*0(?s:.*?)v_consecutive_error_count\s*:=\s*0(?s:.*?)v_success_streak\s*:=\s*0(?s:.*?)v_samples_since_reset\s*:=\s*0`
+	pattern := `if\s+v_should_close\s+then(?s:.*?)v_state\s*:=\s*'closed'(?s:.*?)v_ewma_score\s*:=\s*0(?s:.*?)v_consecutive_error_count\s*:=\s*0(?s:.*?)v_success_streak\s*:=\s*0(?s:.*?)v_samples_since_reset\s*:=\s*0(?s:.*?)v_half_open_since\s*:=\s*null`
 	if !regexp.MustCompile(pattern).MatchString(body) {
 		t.Fatalf("download_report_breaker_sample must reset breaker baseline after half_open closes")
+	}
+}
+
+func TestInitSQLReportBreakerSampleParameterizesHalfOpenCloseRule(t *testing.T) {
+	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_report_breaker_sample")
+	if regexp.MustCompile(`v_success_streak\s*>=\s*2\s+and\s+v_ewma_score\s*<=\s*v_close_threshold`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample close rule must be parameterized")
+	}
+	if !regexp.MustCompile(`v_should_close\s*:=\s*case\s+when\s+v_half_open_close_mode\s*=\s*'or'\s+then`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must branch close behavior on half_open_close_mode")
+	}
+	if !regexp.MustCompile(`v_success_streak\s*>=\s*v_half_open_success_threshold`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must use half_open_success_threshold")
 	}
 }
 

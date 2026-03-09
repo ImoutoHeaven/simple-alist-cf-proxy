@@ -1,7 +1,7 @@
 const DEFAULT_BOOTSTRAP_CACHE_MODE = 'd1';
 const CONTROL_PREFIX_DEFAULT = '/api/v0';
 const BOOTSTRAP_TTL_FALLBACK = 300;
-export const CONTROLLER_BOOTSTRAP_SCHEMA_EPOCH = 3;
+export const CONTROLLER_BOOTSTRAP_SCHEMA_EPOCH = 4;
 
 const getApiBase = (env) => {
   if (!env?.CONTROLLER_URL) {

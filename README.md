@@ -102,7 +102,7 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
   - `download.db.linkTTLSeconds` / `download.db.idleTimeoutSeconds`
   - `download.db.cacheTable` / `download.db.lastActiveTable`
   - `download.db.rateLimit.*`（`windowSeconds` / `limit` / `blockSeconds` / `pgErrorHandle` 等）
-- `download.throttleProfiles` + `decision.download.throttleProfile`：SharePoint breaker profile 与 selector；profile 只包含 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`protectHttpCodes`，运行时状态固定落在 `THROTTLE_PROTECTION`，worker/slot-handler 都不保留本地 breaker 权威，未知 selector 直接报错
+- `download.throttleProfiles` + `decision.download.throttleProfile`：SharePoint breaker profile 与 selector；canonical Stage 1 字段固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`closeThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`probeLeaseSeconds`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`、`protectHttpCodes`。其中 `halfOpenCloseMode=and|or` 控制 half-open 关闭条件按“成功次数 + EWMA 阈值”取交集或并集，`halfOpenTimeoutMode=open|close|partial-close` 控制 half-open 超时后的终态，`halfOpenMaxSeconds=0` 表示禁用 timeout cap，`partial-close` 只依赖已有 half-open 成功证据（`SUCCESS_STREAK > 0`）决定关闭；运行时状态固定落在 `THROTTLE_PROTECTION`，worker/slot-handler 都不保留本地 breaker 权威，未知 selector 直接报错
 - `download.fairQueue.*`：公平排队开关与等待策略（含 siteBucket 计算）
 - `decision.download.pathAction` / `decision.download.checkOriginMode`：单路径策略与 bindingStr 绑定字段
 
@@ -114,8 +114,8 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - 校验 `payloadSign` 与 `payload.expireTime`，解密 `payload.encrypt` 并重算 `bindingStr`
 - 可选 CF Rate Limiter；可选 PostgREST 限流/缓存/Breaker 快照（统一检查，Breaker 权威只在 `THROTTLE_PROTECTION`）
 - 访问 AList `/api/fs/link` 获取真实下载链接（带鉴权 header）
-- 命中托管 breaker hostname 时，worker 只按权威快照 fail-fast；需要半开探针时仅调用 `download_claim_breaker_probe` 领取，并在响应后带 `p_probe_version` 回写二值 sample；SQL 只用 `SAMPLES_SINCE_RESET` 做 EWMA warm-up gate，并用 `LAST_SAMPLE_AT` + `idleResetSeconds` 在 closed 态空闲过久后软重置 breaker 记忆
-- 可选 Fair Queue（slot-handler）获取 slot；slot-handler 只透传 backend `THROTTLED` 元数据，不在本地维护 breaker 状态
+- 命中托管 breaker hostname 时，worker 只按权威快照 fail-fast；需要 half-open canary 时仅调用 `download_claim_breaker_probe` 领取单探针，并在响应后带 `p_probe_version` 回写二值 sample；SQL 继续只用 `SAMPLES_SINCE_RESET` 做 EWMA warm-up gate、用 `LAST_SAMPLE_AT` + `idleResetSeconds` 在 closed 态空闲过久后软重置 breaker 记忆，同时按 `halfOpenCloseMode` 计算 half-open 关闭条件，按 `halfOpenMaxSeconds` + `halfOpenTimeoutMode` 处理 half-open timeout，其中 `halfOpenMaxSeconds=0` 表示禁用 timeout cap，`partial-close` 只在已有 half-open 成功证据时关闭，否则重新 `open`
+- 可选 Fair Queue（slot-handler）获取 slot；slot-handler 只透传 backend `THROTTLED` 元数据，不在本地维护 breaker 状态；当前只覆盖 Stage 1 breaker recovery，不包含 queue-driven active recovery，也不包含 Stage 2 / slot-handler recovery 行为
 - 转发上游响应，裁剪/补充 headers 并返回
 
 ## 内部控制接口

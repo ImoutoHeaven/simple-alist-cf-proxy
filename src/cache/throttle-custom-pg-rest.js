@@ -1,9 +1,16 @@
 import { sha256Hash, applyVerifyHeaders, hasVerifyCredentials } from '../utils.js';
 const BREAKER_TABLE = 'THROTTLE_PROTECTION';
+const DEFAULT_CLOSE_THRESHOLD_PERCENT = 15;
+const DEFAULT_HALF_OPEN_SUCCESS_THRESHOLD = 2;
+const DEFAULT_HALF_OPEN_CLOSE_MODE = 'and';
 const DEFAULT_PROBE_LEASE_SECONDS = 15;
+const DEFAULT_HALF_OPEN_MAX_SECONDS = 0;
+const DEFAULT_HALF_OPEN_TIMEOUT_MODE = 'partial-close';
 const VALID_BREAKER_STATES = new Set(['closed', 'open', 'half_open']);
+const VALID_HALF_OPEN_CLOSE_MODES = new Set(['and', 'or']);
+const VALID_HALF_OPEN_TIMEOUT_MODES = new Set(['open', 'close', 'partial-close']);
 
-const sanitizeThresholds = (config) => {
+const sanitizeThresholds = (config = {}) => {
   const toInt = (value, fallback) => {
     const parsed = Number.parseInt(value, 10);
     return Number.isFinite(parsed) ? parsed : fallback;
@@ -12,11 +19,23 @@ const sanitizeThresholds = (config) => {
   return {
     openCapSeconds: Math.max(1, toInt(config.openCapSeconds, 60)),
     openThresholdPercent: Math.max(0, toInt(config.openThresholdPercent, 30)),
+    closeThresholdPercent: Math.max(0, toInt(config.closeThresholdPercent, DEFAULT_CLOSE_THRESHOLD_PERCENT)),
     ewmaSpan: Math.max(1, toInt(config.ewmaSpan, 8)),
     consecutiveThreshold: Math.max(1, toInt(config.consecutiveThreshold, 4)),
     minSamplesBeforeEwmaOpen: Math.max(1, toInt(config.minSamplesBeforeEwmaOpen, 8)),
     idleResetSeconds: Math.max(0, toInt(config.idleResetSeconds, 900)),
+    halfOpenSuccessThreshold: Math.max(1, toInt(config.halfOpenSuccessThreshold, DEFAULT_HALF_OPEN_SUCCESS_THRESHOLD)),
+    probeLeaseSeconds: Math.max(1, toInt(config.probeLeaseSeconds, DEFAULT_PROBE_LEASE_SECONDS)),
+    halfOpenMaxSeconds: Math.max(0, toInt(config.halfOpenMaxSeconds, DEFAULT_HALF_OPEN_MAX_SECONDS)),
   };
+};
+
+const normalizeEnum = (value, validValues, fallback) => {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const normalized = value.trim().toLowerCase();
+  return validValues.has(normalized) ? normalized : fallback;
 };
 
 const readBreakerField = (row, upperKey, lowerKey = upperKey.toLowerCase()) => {
@@ -274,15 +293,17 @@ export const claimBreakerProbe = async (hostname, config) => {
   }
 
   const { postgrestUrl, verifyHeader, verifySecret } = config;
+  const thresholds = sanitizeThresholds(config);
   const hostnameHash = await sha256Hash(hostname);
   if (!hostnameHash) {
     throw new Error('Failed to calculate hostname hash');
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const probeLeaseSeconds = Math.max(
-    1,
-    Number.parseInt(config?.probeLeaseSeconds, 10) || DEFAULT_PROBE_LEASE_SECONDS,
+  const halfOpenTimeoutMode = normalizeEnum(
+    config?.halfOpenTimeoutMode,
+    VALID_HALF_OPEN_TIMEOUT_MODES,
+    DEFAULT_HALF_OPEN_TIMEOUT_MODE,
   );
 
   const row = await executeBreakerRpc(
@@ -294,7 +315,9 @@ export const claimBreakerProbe = async (hostname, config) => {
       p_hostname_hash: hostnameHash,
       p_hostname: hostname,
       p_now: now,
-      p_probe_lease_seconds: probeLeaseSeconds,
+      p_probe_lease_seconds: thresholds.probeLeaseSeconds,
+      p_half_open_max_seconds: thresholds.halfOpenMaxSeconds,
+      p_half_open_timeout_mode: halfOpenTimeoutMode,
     },
   );
 
@@ -352,6 +375,16 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
   const { postgrestUrl, verifyHeader, verifySecret } = config;
   const thresholds = sanitizeThresholds(config);
   const now = Math.floor(Date.now() / 1000);
+  const halfOpenCloseMode = normalizeEnum(
+    config?.halfOpenCloseMode,
+    VALID_HALF_OPEN_CLOSE_MODES,
+    DEFAULT_HALF_OPEN_CLOSE_MODE,
+  );
+  const halfOpenTimeoutMode = normalizeEnum(
+    config?.halfOpenTimeoutMode,
+    VALID_HALF_OPEN_TIMEOUT_MODES,
+    DEFAULT_HALF_OPEN_TIMEOUT_MODE,
+  );
 
   // Calculate hostname hash
   const hostnameHash = await sha256Hash(hostname);
@@ -372,10 +405,15 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
       p_status_code: statusCode,
       p_open_cap_seconds: thresholds.openCapSeconds,
       p_open_threshold_percent: thresholds.openThresholdPercent,
+      p_close_threshold_percent: thresholds.closeThresholdPercent,
       p_ewma_span: thresholds.ewmaSpan,
       p_consecutive_threshold: thresholds.consecutiveThreshold,
       p_min_samples_before_ewma_open: thresholds.minSamplesBeforeEwmaOpen,
       p_idle_reset_seconds: thresholds.idleResetSeconds,
+      p_half_open_success_threshold: thresholds.halfOpenSuccessThreshold,
+      p_half_open_close_mode: halfOpenCloseMode,
+      p_half_open_max_seconds: thresholds.halfOpenMaxSeconds,
+      p_half_open_timeout_mode: halfOpenTimeoutMode,
       p_probe_version: probeVersion,
       p_retry_after_seconds: retryAfterSeconds,
     },

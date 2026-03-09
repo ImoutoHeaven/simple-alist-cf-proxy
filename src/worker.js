@@ -23,10 +23,16 @@ const DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = 8000;
 const DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS = 35;
 const DEFAULT_THROTTLE_OPEN_CAP_SECONDS = 60;
 const DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT = 30;
+const DEFAULT_THROTTLE_CLOSE_THRESHOLD_PERCENT = 15;
 const DEFAULT_THROTTLE_EWMA_SPAN = 8;
 const DEFAULT_THROTTLE_CONSECUTIVE_THRESHOLD = 4;
 const DEFAULT_THROTTLE_MIN_SAMPLES_BEFORE_EWMA_OPEN = 8;
 const DEFAULT_THROTTLE_IDLE_RESET_SECONDS = 900;
+const DEFAULT_THROTTLE_HALF_OPEN_SUCCESS_THRESHOLD = 2;
+const DEFAULT_THROTTLE_HALF_OPEN_CLOSE_MODE = 'and';
+const DEFAULT_THROTTLE_PROBE_LEASE_SECONDS = 15;
+const DEFAULT_THROTTLE_HALF_OPEN_MAX_SECONDS = 0;
+const DEFAULT_THROTTLE_HALF_OPEN_TIMEOUT_MODE = 'partial-close';
 const DEFAULT_THROTTLE_PROTECT_HTTP_CODES = [429, 499, 500, 502, 503, 504];
 // slot-handler acquire is long-poll based; don't set per-request timeouts below this window.
 const SLOT_HANDLER_LONGPOLL_MS = 6000;
@@ -140,6 +146,40 @@ const normalizeProtectHttpCodes = (value) => {
     return normalized;
   });
 };
+
+const HALF_OPEN_CLOSE_MODES = new Set(['and', 'or']);
+const HALF_OPEN_TIMEOUT_MODES = new Set(['open', 'close', 'partial-close']);
+
+const normalizeThrottleEnum = (value, fallback, validValues, fieldName) => {
+  if (value === undefined || value === null) {
+    return fallback;
+  }
+  if (typeof value !== 'string') {
+    throw new Error(`Invalid ${fieldName} from controller: expected string`);
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (!validValues.has(normalized)) {
+    throw new Error(`Invalid ${fieldName} from controller: ${value}`);
+  }
+  return normalized;
+};
+
+const normalizeHalfOpenCloseMode = (value) => normalizeThrottleEnum(
+  value,
+  DEFAULT_THROTTLE_HALF_OPEN_CLOSE_MODE,
+  HALF_OPEN_CLOSE_MODES,
+  'halfOpenCloseMode',
+);
+
+const normalizeHalfOpenTimeoutMode = (value) => normalizeThrottleEnum(
+  value,
+  DEFAULT_THROTTLE_HALF_OPEN_TIMEOUT_MODE,
+  HALF_OPEN_TIMEOUT_MODES,
+  'halfOpenTimeoutMode',
+);
 
 const deriveOpenSeconds = (retryAfterValue, openCapSeconds) => {
   const cap = normalizePositiveSeconds(openCapSeconds, DEFAULT_THROTTLE_OPEN_CAP_SECONDS);
@@ -932,6 +972,10 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
       throttleProfileConfig.openThresholdPercent,
       DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT,
     ),
+    closeThresholdPercent: normalizePositiveSeconds(
+      throttleProfileConfig.closeThresholdPercent,
+      DEFAULT_THROTTLE_CLOSE_THRESHOLD_PERCENT,
+    ),
     ewmaSpan: normalizePositiveSeconds(throttleProfileConfig.ewmaSpan, DEFAULT_THROTTLE_EWMA_SPAN),
     consecutiveThreshold: normalizePositiveSeconds(
       throttleProfileConfig.consecutiveThreshold,
@@ -945,6 +989,20 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
       throttleProfileConfig.idleResetSeconds,
       DEFAULT_THROTTLE_IDLE_RESET_SECONDS,
     ),
+    halfOpenSuccessThreshold: normalizePositiveSeconds(
+      throttleProfileConfig.halfOpenSuccessThreshold,
+      DEFAULT_THROTTLE_HALF_OPEN_SUCCESS_THRESHOLD,
+    ),
+    halfOpenCloseMode: normalizeHalfOpenCloseMode(throttleProfileConfig.halfOpenCloseMode),
+    probeLeaseSeconds: normalizePositiveSeconds(
+      throttleProfileConfig.probeLeaseSeconds,
+      DEFAULT_THROTTLE_PROBE_LEASE_SECONDS,
+    ),
+    halfOpenMaxSeconds: normalizeNonNegativeInt(
+      throttleProfileConfig.halfOpenMaxSeconds,
+      DEFAULT_THROTTLE_HALF_OPEN_MAX_SECONDS,
+    ),
+    halfOpenTimeoutMode: normalizeHalfOpenTimeoutMode(throttleProfileConfig.halfOpenTimeoutMode),
     protectHttpCodes,
   };
 

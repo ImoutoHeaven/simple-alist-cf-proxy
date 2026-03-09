@@ -7,7 +7,7 @@ import { __fairQueueTestHooks } from '../src/worker.js';
 
 const { resolveConfig } = __fairQueueTestHooks;
 
-const CURRENT_SCHEMA_EPOCH = 3;
+const CURRENT_SCHEMA_EPOCH = 4;
 
 const buildBootstrap = () => ({
   common: {
@@ -22,20 +22,32 @@ const buildBootstrap = () => ({
         hostPatterns: ['*.default.example'],
         openCapSeconds: 60,
         openThresholdPercent: 30,
+        closeThresholdPercent: 15,
         ewmaSpan: 8,
         consecutiveThreshold: 4,
         minSamplesBeforeEwmaOpen: 8,
         idleResetSeconds: 900,
+        halfOpenSuccessThreshold: 2,
+        halfOpenCloseMode: 'and',
+        probeLeaseSeconds: 15,
+        halfOpenMaxSeconds: 0,
+        halfOpenTimeoutMode: 'partial-close',
         protectHttpCodes: [429, 499, 500, 502, 503, 504],
       },
       sharepoint: {
         hostPatterns: ['*.sharepoint.com'],
         openCapSeconds: 75,
         openThresholdPercent: 35,
+        closeThresholdPercent: 15,
         ewmaSpan: 11,
         consecutiveThreshold: 6,
         minSamplesBeforeEwmaOpen: 8,
         idleResetSeconds: 900,
+        halfOpenSuccessThreshold: 2,
+        halfOpenCloseMode: 'and',
+        probeLeaseSeconds: 15,
+        halfOpenMaxSeconds: 0,
+        halfOpenTimeoutMode: 'partial-close',
         protectHttpCodes: [429, 503],
       },
     },
@@ -205,6 +217,26 @@ test('resolveConfig rejects invalid protectHttpCodes from an explicit throttlePr
   assert.throws(
     () => resolveConfig({}, bootstrap, { download: { throttleProfile: 'default' } }),
     /protectHttpCodes/
+  );
+});
+
+test('resolveConfig rejects invalid halfOpenCloseMode from an explicit throttleProfile', () => {
+  const bootstrap = buildBootstrap();
+  bootstrap.download.throttleProfiles.default.halfOpenCloseMode = 'xor';
+
+  assert.throws(
+    () => resolveConfig({}, bootstrap, { download: { throttleProfile: 'default' } }),
+    /halfOpenCloseMode/
+  );
+});
+
+test('resolveConfig rejects invalid halfOpenTimeoutMode from an explicit throttleProfile', () => {
+  const bootstrap = buildBootstrap();
+  bootstrap.download.throttleProfiles.default.halfOpenTimeoutMode = 'linger';
+
+  assert.throws(
+    () => resolveConfig({}, bootstrap, { download: { throttleProfile: 'default' } }),
+    /halfOpenTimeoutMode/
   );
 });
 
@@ -532,10 +564,16 @@ test('resolveConfig returns the canonical breaker profile shape', () => {
     verifySecret: [],
     openCapSeconds: 75,
     openThresholdPercent: 35,
+    closeThresholdPercent: 15,
     ewmaSpan: 11,
     consecutiveThreshold: 6,
     minSamplesBeforeEwmaOpen: 8,
     idleResetSeconds: 900,
+    halfOpenSuccessThreshold: 2,
+    halfOpenCloseMode: 'and',
+    probeLeaseSeconds: 15,
+    halfOpenMaxSeconds: 0,
+    halfOpenTimeoutMode: 'partial-close',
     protectHttpCodes: [429, 503],
   });
 });
@@ -599,10 +637,16 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
       verifySecret: ['secret'],
       openCapSeconds: 75,
       openThresholdPercent: 35,
+      closeThresholdPercent: 15,
       ewmaSpan: 11,
       consecutiveThreshold: 6,
       minSamplesBeforeEwmaOpen: 8,
       idleResetSeconds: 900,
+      halfOpenSuccessThreshold: 2,
+      halfOpenCloseMode: 'and',
+      probeLeaseSeconds: 15,
+      halfOpenMaxSeconds: 0,
+      halfOpenTimeoutMode: 'partial-close',
     });
 
     assert.equal(rpcUrl, 'https://postgrest.example.test/rpc/download_report_breaker_sample');
@@ -612,15 +656,25 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
     assert.equal(rpcBody.p_status_code, 503);
     assert.equal(rpcBody.p_open_cap_seconds, 75);
     assert.equal(rpcBody.p_open_threshold_percent, 35);
+    assert.equal(rpcBody.p_close_threshold_percent, 15);
     assert.equal(rpcBody.p_ewma_span, 11);
     assert.equal(rpcBody.p_consecutive_threshold, 6);
     assert.equal(rpcBody.p_min_samples_before_ewma_open, 8);
     assert.equal(rpcBody.p_idle_reset_seconds, 900);
+    assert.equal(rpcBody.p_half_open_success_threshold, 2);
+    assert.equal(rpcBody.p_half_open_close_mode, 'and');
+    assert.equal(rpcBody.p_half_open_max_seconds, 0);
+    assert.equal(rpcBody.p_half_open_timeout_mode, 'partial-close');
     assert.equal(rpcBody.p_probe_version, null);
     assert.equal(rpcBody.p_retry_after_seconds, null);
     assert.deepEqual(Object.keys(rpcBody).sort(), [
+      'p_close_threshold_percent',
       'p_consecutive_threshold',
       'p_ewma_span',
+      'p_half_open_close_mode',
+      'p_half_open_max_seconds',
+      'p_half_open_success_threshold',
+      'p_half_open_timeout_mode',
       'p_hostname',
       'p_hostname_hash',
       'p_idle_reset_seconds',

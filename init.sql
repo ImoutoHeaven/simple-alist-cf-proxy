@@ -157,6 +157,7 @@ CREATE TABLE IF NOT EXISTS "THROTTLE_PROTECTION" (
   "LAST_SAMPLE_AT" INTEGER,
   "CONSECUTIVE_ERROR_COUNT" INTEGER NOT NULL DEFAULT 0,
   "SUCCESS_STREAK" INTEGER NOT NULL DEFAULT 0,
+  "HALF_OPEN_SINCE" INTEGER,
   "PROBE_LEASE_UNTIL" INTEGER,
   "LAST_ERROR_CODE" INTEGER,
   "OPEN_REASON" TEXT,
@@ -177,8 +178,10 @@ CREATE INDEX IF NOT EXISTS idx_throttle_state
 CREATE OR REPLACE FUNCTION download_claim_breaker_probe(
   p_hostname_hash TEXT,
   p_hostname TEXT,
-  p_now INTEGER DEFAULT NULL,
-  p_probe_lease_seconds INTEGER DEFAULT 15
+  p_now INTEGER,
+  p_probe_lease_seconds INTEGER,
+  p_half_open_max_seconds INTEGER,
+  p_half_open_timeout_mode TEXT
 )
 RETURNS TABLE(
   "HOSTNAME_HASH" TEXT,
@@ -198,15 +201,21 @@ RETURNS TABLE(
 ) AS $$
 DECLARE
   v_now INTEGER := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::INTEGER);
-  v_probe_lease_seconds INTEGER := GREATEST(1, COALESCE(p_probe_lease_seconds, 15));
+  v_probe_lease_seconds INTEGER;
+  v_half_open_max_seconds INTEGER;
+  v_half_open_timeout_mode TEXT;
+  v_half_open_timed_out BOOLEAN := FALSE;
+  v_timeout_open_seconds INTEGER := 0;
 
   v_hostname TEXT := p_hostname;
   v_state TEXT := 'closed';
   v_open_until INTEGER := NULL;
   v_ewma_score NUMERIC := 0;
   v_total_samples INTEGER := 0;
+  v_samples_since_reset INTEGER := 0;
   v_consecutive_error_count INTEGER := 0;
   v_success_streak INTEGER := 0;
+  v_half_open_since INTEGER := NULL;
   v_probe_lease_until INTEGER := NULL;
   v_last_error_code INTEGER := NULL;
   v_open_reason TEXT := NULL;
@@ -220,6 +229,20 @@ BEGIN
     RETURN;
   END IF;
 
+  IF p_probe_lease_seconds IS NULL
+    OR p_half_open_max_seconds IS NULL
+    OR p_half_open_timeout_mode IS NULL
+    OR BTRIM(p_half_open_timeout_mode) = '' THEN
+    RAISE EXCEPTION 'download_claim_breaker_probe requires non-null probe settings';
+  END IF;
+
+  v_probe_lease_seconds := GREATEST(1, p_probe_lease_seconds);
+  v_half_open_max_seconds := GREATEST(0, p_half_open_max_seconds);
+  v_half_open_timeout_mode := LOWER(BTRIM(p_half_open_timeout_mode));
+  IF v_half_open_timeout_mode NOT IN ('open', 'close', 'partial-close') THEN
+    RAISE EXCEPTION 'download_claim_breaker_probe invalid p_half_open_timeout_mode: %', p_half_open_timeout_mode;
+  END IF;
+
   WHILE NOT v_locked LOOP
     SELECT
       tp."HOSTNAME",
@@ -227,8 +250,10 @@ BEGIN
       tp."OPEN_UNTIL",
       tp."EWMA_SCORE",
       tp."TOTAL_SAMPLES",
+      tp."SAMPLES_SINCE_RESET",
       tp."CONSECUTIVE_ERROR_COUNT",
       tp."SUCCESS_STREAK",
+      tp."HALF_OPEN_SINCE",
       tp."PROBE_LEASE_UNTIL",
       tp."LAST_ERROR_CODE",
       tp."OPEN_REASON",
@@ -240,8 +265,10 @@ BEGIN
       v_open_until,
       v_ewma_score,
       v_total_samples,
+      v_samples_since_reset,
       v_consecutive_error_count,
       v_success_streak,
+      v_half_open_since,
       v_probe_lease_until,
       v_last_error_code,
       v_open_reason,
@@ -265,6 +292,7 @@ BEGIN
   v_state := COALESCE(NULLIF(v_state, ''), 'closed');
   v_ewma_score := COALESCE(v_ewma_score, 0);
   v_total_samples := COALESCE(v_total_samples, 0);
+  v_samples_since_reset := COALESCE(v_samples_since_reset, 0);
   v_consecutive_error_count := COALESCE(v_consecutive_error_count, 0);
   v_success_streak := COALESCE(v_success_streak, 0);
   v_last_open_seconds := COALESCE(v_last_open_seconds, 0);
@@ -274,10 +302,64 @@ BEGIN
     v_state := 'half_open';
     v_open_until := NULL;
     v_success_streak := 0;
+    v_half_open_since := COALESCE(v_half_open_since, v_now);
     IF v_probe_lease_until IS NULL OR v_probe_lease_until <= v_now THEN
       v_probe_lease_until := v_now + v_probe_lease_seconds;
       v_probe_granted := TRUE;
     END IF;
+    v_version := v_version + 1;
+  END IF;
+
+  v_half_open_timed_out := v_half_open_max_seconds > 0
+    AND v_half_open_since IS NOT NULL
+    AND (v_now - v_half_open_since) >= v_half_open_max_seconds;
+
+  IF v_state = 'half_open' AND v_half_open_timed_out THEN
+    v_timeout_open_seconds := CASE
+      WHEN v_last_open_seconds > 0 THEN v_last_open_seconds
+      ELSE 1
+    END;
+
+    IF v_half_open_timeout_mode = 'open' THEN
+      v_state := 'open';
+      v_open_until := v_now + v_timeout_open_seconds;
+      v_probe_lease_until := NULL;
+      v_half_open_since := NULL;
+      v_last_open_seconds := v_timeout_open_seconds;
+    ELSIF v_half_open_timeout_mode = 'close' THEN
+      v_state := 'closed';
+      v_open_until := NULL;
+      v_probe_lease_until := NULL;
+      v_ewma_score := 0;
+      v_consecutive_error_count := 0;
+      v_success_streak := 0;
+      v_samples_since_reset := 0;
+      v_last_error_code := NULL;
+      v_open_reason := NULL;
+      v_last_open_seconds := 0;
+      v_half_open_since := NULL;
+    ELSE
+      IF v_success_streak > 0 THEN
+        v_state := 'closed';
+        v_open_until := NULL;
+        v_probe_lease_until := NULL;
+        v_ewma_score := 0;
+        v_consecutive_error_count := 0;
+        v_success_streak := 0;
+        v_samples_since_reset := 0;
+        v_last_error_code := NULL;
+        v_open_reason := NULL;
+        v_last_open_seconds := 0;
+        v_half_open_since := NULL;
+      ELSE
+        v_state := 'open';
+        v_open_until := v_now + v_timeout_open_seconds;
+        v_probe_lease_until := NULL;
+        v_half_open_since := NULL;
+        v_last_open_seconds := v_timeout_open_seconds;
+      END IF;
+    END IF;
+    v_probe_granted := FALSE;
     v_version := v_version + 1;
   ELSIF v_state = 'half_open' AND (v_probe_lease_until IS NULL OR v_probe_lease_until <= v_now) THEN
     v_probe_lease_until := v_now + v_probe_lease_seconds;
@@ -287,6 +369,11 @@ BEGIN
     v_open_until := NULL;
     v_probe_lease_until := NULL;
     v_success_streak := 0;
+    v_half_open_since := NULL;
+  END IF;
+
+  IF v_state = 'open' OR v_state = 'closed' THEN
+    v_half_open_since := NULL;
   END IF;
 
   RETURN QUERY
@@ -296,8 +383,10 @@ BEGIN
     "OPEN_UNTIL" = v_open_until,
     "EWMA_SCORE" = v_ewma_score,
     "TOTAL_SAMPLES" = v_total_samples,
+    "SAMPLES_SINCE_RESET" = v_samples_since_reset,
     "CONSECUTIVE_ERROR_COUNT" = v_consecutive_error_count,
     "SUCCESS_STREAK" = v_success_streak,
+    "HALF_OPEN_SINCE" = v_half_open_since,
     "PROBE_LEASE_UNTIL" = v_probe_lease_until,
     "LAST_ERROR_CODE" = v_last_error_code,
     "OPEN_REASON" = v_open_reason,
@@ -334,10 +423,15 @@ CREATE OR REPLACE FUNCTION download_report_breaker_sample(
   p_status_code INTEGER,
   p_open_cap_seconds INTEGER,
   p_open_threshold_percent INTEGER,
+  p_close_threshold_percent INTEGER,
   p_ewma_span INTEGER,
   p_consecutive_threshold INTEGER,
   p_min_samples_before_ewma_open INTEGER,
   p_idle_reset_seconds INTEGER,
+  p_half_open_success_threshold INTEGER,
+  p_half_open_close_mode TEXT,
+  p_half_open_max_seconds INTEGER,
+  p_half_open_timeout_mode TEXT,
   p_retry_after_seconds INTEGER DEFAULT NULL,
   p_probe_version BIGINT DEFAULT NULL
 )
@@ -369,6 +463,10 @@ DECLARE
   v_consecutive_threshold INTEGER;
   v_min_samples_before_ewma_open INTEGER;
   v_idle_reset_seconds INTEGER;
+  v_half_open_success_threshold INTEGER;
+  v_half_open_close_mode TEXT;
+  v_half_open_max_seconds INTEGER;
+  v_half_open_timeout_mode TEXT;
 
   v_hostname TEXT := p_hostname;
   v_state TEXT := 'closed';
@@ -379,6 +477,7 @@ DECLARE
   v_consecutive_error_count INTEGER := 0;
   v_success_streak INTEGER := 0;
   v_probe_lease_until INTEGER := NULL;
+  v_half_open_since INTEGER := NULL;
   v_last_sample_at INTEGER := NULL;
   v_last_error_code INTEGER := NULL;
   v_open_reason TEXT := NULL;
@@ -388,7 +487,10 @@ DECLARE
   v_locked BOOLEAN := FALSE;
   v_locked_row_count INTEGER := 0;
   v_should_open BOOLEAN := FALSE;
+  v_should_close BOOLEAN := FALSE;
+  v_half_open_timed_out BOOLEAN := FALSE;
   v_open_seconds INTEGER := 0;
+  v_timeout_open_seconds INTEGER := 0;
   v_probe_version_matches BOOLEAN := FALSE;
 BEGIN
   IF p_hostname_hash IS NULL OR p_hostname_hash = '' THEN
@@ -397,21 +499,38 @@ BEGIN
 
   IF p_open_cap_seconds IS NULL
     OR p_open_threshold_percent IS NULL
+    OR p_close_threshold_percent IS NULL
     OR p_ewma_span IS NULL
     OR p_consecutive_threshold IS NULL
     OR p_min_samples_before_ewma_open IS NULL
-    OR p_idle_reset_seconds IS NULL THEN
+    OR p_idle_reset_seconds IS NULL
+    OR p_half_open_success_threshold IS NULL
+    OR p_half_open_close_mode IS NULL
+    OR BTRIM(p_half_open_close_mode) = ''
+    OR p_half_open_max_seconds IS NULL
+    OR p_half_open_timeout_mode IS NULL
+    OR BTRIM(p_half_open_timeout_mode) = '' THEN
     RAISE EXCEPTION 'download_report_breaker_sample requires non-null breaker thresholds';
   END IF;
 
   v_open_cap_seconds := GREATEST(1, p_open_cap_seconds);
   v_open_threshold := GREATEST(0, p_open_threshold_percent) / 100.0;
-  v_close_threshold := v_open_threshold / 2.0;
+  v_close_threshold := GREATEST(0, p_close_threshold_percent) / 100.0;
   v_ewma_span := GREATEST(1, p_ewma_span);
   v_alpha := 2.0 / (v_ewma_span + 1.0);
   v_consecutive_threshold := GREATEST(1, p_consecutive_threshold);
   v_min_samples_before_ewma_open := GREATEST(1, p_min_samples_before_ewma_open);
   v_idle_reset_seconds := GREATEST(0, p_idle_reset_seconds);
+  v_half_open_success_threshold := GREATEST(1, p_half_open_success_threshold);
+  v_half_open_close_mode := LOWER(BTRIM(p_half_open_close_mode));
+  v_half_open_max_seconds := GREATEST(0, p_half_open_max_seconds);
+  v_half_open_timeout_mode := LOWER(BTRIM(p_half_open_timeout_mode));
+  IF v_half_open_close_mode NOT IN ('and', 'or') THEN
+    RAISE EXCEPTION 'download_report_breaker_sample invalid p_half_open_close_mode: %', p_half_open_close_mode;
+  END IF;
+  IF v_half_open_timeout_mode NOT IN ('open', 'close', 'partial-close') THEN
+    RAISE EXCEPTION 'download_report_breaker_sample invalid p_half_open_timeout_mode: %', p_half_open_timeout_mode;
+  END IF;
 
   WHILE NOT v_locked LOOP
     SELECT
@@ -424,6 +543,7 @@ BEGIN
       tp."CONSECUTIVE_ERROR_COUNT",
       tp."SUCCESS_STREAK",
       tp."PROBE_LEASE_UNTIL",
+      tp."HALF_OPEN_SINCE",
       tp."LAST_SAMPLE_AT",
       tp."LAST_ERROR_CODE",
       tp."OPEN_REASON",
@@ -439,6 +559,7 @@ BEGIN
       v_consecutive_error_count,
       v_success_streak,
       v_probe_lease_until,
+      v_half_open_since,
       v_last_sample_at,
       v_last_error_code,
       v_open_reason,
@@ -525,57 +646,41 @@ BEGIN
     v_open_until := NULL;
     v_probe_lease_until := NULL;
     v_success_streak := 0;
+    v_half_open_since := NULL;
   ELSIF v_state = 'open' AND v_open_until IS NOT NULL AND v_open_until <= v_now THEN
     NULL;
   END IF;
 
-  v_ewma_score := (v_alpha * v_sample) + ((1 - v_alpha) * v_ewma_score);
-  v_total_samples := v_total_samples + 1;
-  v_samples_since_reset := v_samples_since_reset + 1;
-  v_last_sample_at := v_now;
+  v_half_open_timed_out := v_half_open_max_seconds > 0
+    AND v_half_open_since IS NOT NULL
+    AND (v_now - v_half_open_since) >= v_half_open_max_seconds;
 
-  IF v_sample = 1 THEN
-    v_consecutive_error_count := v_consecutive_error_count + 1;
-    v_success_streak := 0;
-    v_last_error_code := p_status_code;
-    v_should_open := v_state = 'half_open'
-      OR v_state = 'open'
-      OR v_consecutive_error_count >= v_consecutive_threshold
-      OR (
-        v_samples_since_reset >= v_min_samples_before_ewma_open
-        AND v_ewma_score >= v_open_threshold
-      );
+  IF v_state = 'half_open' AND v_half_open_timed_out THEN
+    v_timeout_open_seconds := CASE
+      WHEN v_last_open_seconds > 0 THEN v_last_open_seconds
+      ELSE 1
+    END;
 
-    IF v_should_open THEN
-      IF p_retry_after_seconds IS NOT NULL AND p_retry_after_seconds > 0 THEN
-        v_open_seconds := LEAST(v_open_cap_seconds, GREATEST(1, p_retry_after_seconds));
-      ELSIF v_last_open_seconds > 0 THEN
-        v_open_seconds := LEAST(v_open_cap_seconds, v_last_open_seconds * 2);
-      ELSE
-        v_open_seconds := 1;
-      END IF;
-
+    IF v_half_open_timeout_mode = 'open' THEN
       v_state := 'open';
-      v_open_until := v_now + v_open_seconds;
+      v_open_until := v_now + v_timeout_open_seconds;
       v_probe_lease_until := NULL;
-      v_open_reason := CASE
-        WHEN p_status_code IS NOT NULL THEN 'http_' || p_status_code::TEXT
-        ELSE 'error_sample'
-      END;
-      v_last_open_seconds := v_open_seconds;
-    ELSIF v_state = 'closed' THEN
+      v_half_open_since := NULL;
+      v_last_open_seconds := v_timeout_open_seconds;
+    ELSIF v_half_open_timeout_mode = 'close' THEN
+      v_state := 'closed';
       v_open_until := NULL;
       v_probe_lease_until := NULL;
+      v_ewma_score := 0;
+      v_consecutive_error_count := 0;
+      v_success_streak := 0;
+      v_samples_since_reset := 0;
+      v_last_error_code := NULL;
       v_open_reason := NULL;
-    END IF;
-  ELSE
-    v_consecutive_error_count := 0;
-
-    IF v_state = 'half_open' THEN
-      v_success_streak := v_success_streak + 1;
-      v_probe_lease_until := NULL;
-
-      IF v_success_streak >= 2 AND v_ewma_score <= v_close_threshold THEN
+      v_last_open_seconds := 0;
+      v_half_open_since := NULL;
+    ELSE
+      IF v_success_streak > 0 THEN
         v_state := 'closed';
         v_open_until := NULL;
         v_probe_lease_until := NULL;
@@ -586,18 +691,99 @@ BEGIN
         v_last_error_code := NULL;
         v_open_reason := NULL;
         v_last_open_seconds := 0;
-      END IF;
-    ELSIF v_state = 'closed' THEN
-      v_open_until := NULL;
-      v_probe_lease_until := NULL;
-      v_success_streak := 0;
-      IF v_ewma_score <= v_close_threshold THEN
-        v_open_reason := NULL;
-      END IF;
-      IF v_ewma_score = 0 THEN
-        v_last_error_code := NULL;
+        v_half_open_since := NULL;
+      ELSE
+        v_state := 'open';
+        v_open_until := v_now + v_timeout_open_seconds;
+        v_probe_lease_until := NULL;
+        v_half_open_since := NULL;
+        v_last_open_seconds := v_timeout_open_seconds;
       END IF;
     END IF;
+  ELSE
+    v_ewma_score := (v_alpha * v_sample) + ((1 - v_alpha) * v_ewma_score);
+    v_total_samples := v_total_samples + 1;
+    v_samples_since_reset := v_samples_since_reset + 1;
+    v_last_sample_at := v_now;
+
+    IF v_sample = 1 THEN
+      v_consecutive_error_count := v_consecutive_error_count + 1;
+      v_success_streak := 0;
+      v_last_error_code := p_status_code;
+      v_should_open := v_state = 'half_open'
+        OR v_state = 'open'
+        OR v_consecutive_error_count >= v_consecutive_threshold
+        OR (
+          v_samples_since_reset >= v_min_samples_before_ewma_open
+          AND v_ewma_score >= v_open_threshold
+        );
+
+      IF v_should_open THEN
+        IF p_retry_after_seconds IS NOT NULL AND p_retry_after_seconds > 0 THEN
+          v_open_seconds := LEAST(v_open_cap_seconds, GREATEST(1, p_retry_after_seconds));
+        ELSIF v_last_open_seconds > 0 THEN
+          v_open_seconds := LEAST(v_open_cap_seconds, v_last_open_seconds * 2);
+        ELSE
+          v_open_seconds := 1;
+        END IF;
+
+        v_state := 'open';
+        v_open_until := v_now + v_open_seconds;
+        v_probe_lease_until := NULL;
+        v_open_reason := CASE
+          WHEN p_status_code IS NOT NULL THEN 'http_' || p_status_code::TEXT
+          ELSE 'error_sample'
+        END;
+        v_last_open_seconds := v_open_seconds;
+      ELSIF v_state = 'closed' THEN
+        v_open_until := NULL;
+        v_probe_lease_until := NULL;
+        v_open_reason := NULL;
+      END IF;
+    ELSE
+      v_consecutive_error_count := 0;
+
+      IF v_state = 'half_open' THEN
+        v_success_streak := v_success_streak + 1;
+        v_probe_lease_until := NULL;
+        v_should_close := CASE
+          WHEN v_half_open_close_mode = 'or' THEN
+            v_success_streak >= v_half_open_success_threshold
+            OR v_ewma_score <= v_close_threshold
+          ELSE
+            v_success_streak >= v_half_open_success_threshold
+            AND v_ewma_score <= v_close_threshold
+        END;
+
+        IF v_should_close THEN
+          v_state := 'closed';
+          v_open_until := NULL;
+          v_probe_lease_until := NULL;
+          v_ewma_score := 0;
+          v_consecutive_error_count := 0;
+          v_success_streak := 0;
+          v_samples_since_reset := 0;
+          v_last_error_code := NULL;
+          v_open_reason := NULL;
+          v_last_open_seconds := 0;
+          v_half_open_since := NULL;
+        END IF;
+      ELSIF v_state = 'closed' THEN
+        v_open_until := NULL;
+        v_probe_lease_until := NULL;
+        v_success_streak := 0;
+        IF v_ewma_score <= v_close_threshold THEN
+          v_open_reason := NULL;
+        END IF;
+        IF v_ewma_score = 0 THEN
+          v_last_error_code := NULL;
+        END IF;
+      END IF;
+    END IF;
+  END IF;
+
+  IF v_state = 'open' OR v_state = 'closed' THEN
+    v_half_open_since := NULL;
   END IF;
 
   RETURN QUERY
@@ -611,6 +797,7 @@ BEGIN
     "CONSECUTIVE_ERROR_COUNT" = v_consecutive_error_count,
     "SUCCESS_STREAK" = v_success_streak,
     "PROBE_LEASE_UNTIL" = v_probe_lease_until,
+    "HALF_OPEN_SINCE" = v_half_open_since,
     "LAST_SAMPLE_AT" = v_last_sample_at,
     "LAST_ERROR_CODE" = v_last_error_code,
     "OPEN_REASON" = v_open_reason,
