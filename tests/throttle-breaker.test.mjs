@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getBreakerState, claimBreakerProbe, reportBreakerSample } from '../src/cache/throttle-custom-pg-rest.js';
+import { getBreakerState, reportBreakerSample } from '../src/cache/throttle-custom-pg-rest.js';
 import { scheduleAllCleanups } from '../src/cleanup-scheduler.js';
 import { encryptBindingPayload } from '../src/origin-binding.js';
 import worker from '../src/worker.js';
@@ -96,8 +96,8 @@ const buildRuntimeBootstrap = (options = {}) => ({
         idleResetSeconds: 900,
         halfOpenSuccessThreshold: 2,
         halfOpenCloseMode: 'and',
-        probeLeaseSeconds: 15,
-        halfOpenMaxSeconds: 0,
+        halfOpenMaxProbeCount: 4,
+        halfOpenMaxSeconds: 15,
         halfOpenTimeoutMode: 'partial-close',
         protectHttpCodes: [429, 499, 500, 502, 503, 504],
       },
@@ -157,8 +157,8 @@ const buildBootstrap = () => ({
         idleResetSeconds: 900,
         halfOpenSuccessThreshold: 2,
         halfOpenCloseMode: 'and',
-        probeLeaseSeconds: 15,
-        halfOpenMaxSeconds: 0,
+        halfOpenMaxProbeCount: 4,
+        halfOpenMaxSeconds: 15,
         halfOpenTimeoutMode: 'partial-close',
         protectHttpCodes: [429, 499, 500, 502, 503, 504],
       },
@@ -184,11 +184,12 @@ test('resolveConfig returns the canonical breaker runtime config', () => {
     idleResetSeconds: 900,
     halfOpenSuccessThreshold: 2,
     halfOpenCloseMode: 'and',
-    probeLeaseSeconds: 15,
-    halfOpenMaxSeconds: 0,
+    halfOpenMaxProbeCount: 4,
+    halfOpenMaxSeconds: 15,
     halfOpenTimeoutMode: 'partial-close',
     protectHttpCodes: [429, 499, 500, 502, 503, 504],
   });
+  assert.equal('probeLeaseSeconds' in config.throttleConfig, false);
 });
 
 test('worker fails closed when breaker snapshot lookup fails', async () => {
@@ -218,14 +219,15 @@ test('worker fails closed when breaker snapshot lookup fails', async () => {
       throw new Error('snapshot unavailable');
     }
 
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
       return createJsonResponse([{
         STATE: 'closed',
         OPEN_UNTIL: null,
         OPEN_REASON: null,
         VERSION: 1,
         LAST_ERROR_CODE: null,
-        PROBE_GRANTED: false,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
       }]);
     }
 
@@ -274,11 +276,11 @@ test('worker fails closed when breaker snapshot lookup fails', async () => {
   }
 });
 
-test('worker skips breaker probe claim when authority snapshot is closed', async () => {
+test('worker authorizes the actual fetch attempt after a closed pre-check snapshot', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   let upstreamFetches = 0;
-  let claimCalls = 0;
+  let authorizeCalls = 0;
   delete globalThis.bootstrapCache;
 
   globalThis.fetch = async (input, init = {}) => {
@@ -308,15 +310,16 @@ test('worker skips breaker probe claim when authority snapshot is closed', async
       }]);
     }
 
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
-      claimCalls += 1;
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeCalls += 1;
       return createJsonResponse([{
         STATE: 'closed',
         OPEN_UNTIL: null,
         OPEN_REASON: null,
         VERSION: 2,
         LAST_ERROR_CODE: null,
-        PROBE_GRANTED: false,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
       }]);
     }
 
@@ -359,7 +362,7 @@ test('worker skips breaker probe claim when authority snapshot is closed', async
 
     assert.equal(response.status, 200);
     assert.equal(upstreamFetches, 1);
-    assert.equal(claimCalls, 0);
+    assert.equal(authorizeCalls, 1);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -400,14 +403,16 @@ test('worker fails closed when breaker sample reporting fails after half_open au
       }]);
     }
 
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
       return createJsonResponse([{
         STATE: 'half_open',
         OPEN_UNTIL: null,
         OPEN_REASON: 'http_429',
         VERSION: 1,
         LAST_ERROR_CODE: 429,
-        PROBE_GRANTED: true,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 2,
       }]);
     }
 
@@ -742,7 +747,6 @@ test('getBreakerState returns raw breaker snapshot fields', async () => {
       openUntil: nowSeconds + 22,
       reason: 'http_429',
       version: 7,
-      probeLeaseUntil: null,
       lastErrorCode: 429,
     });
     assert.equal(Object.hasOwn(result, 'status'), false);
@@ -776,7 +780,6 @@ test('getBreakerState preserves the half_open breaker state', async () => {
       openUntil: null,
       reason: 'http_429',
       version: 12,
-      probeLeaseUntil: null,
       lastErrorCode: 429,
     });
   } finally {
@@ -784,9 +787,8 @@ test('getBreakerState preserves the half_open breaker state', async () => {
   }
 });
 
-test('getBreakerState exposes probe lease timing from raw breaker snapshots', async () => {
+test('getBreakerState does not expose legacy probe lease timing fields', async () => {
   const originalFetch = globalThis.fetch;
-  const nowSeconds = Math.floor(Date.now() / 1000);
 
   globalThis.fetch = async () => createJsonResponse([{
     STATE: 'half_open',
@@ -794,7 +796,7 @@ test('getBreakerState exposes probe lease timing from raw breaker snapshots', as
     OPEN_REASON: 'http_429',
     VERSION: 12,
     LAST_ERROR_CODE: 429,
-    PROBE_LEASE_UNTIL: nowSeconds + 15,
+    HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
   }]);
 
   try {
@@ -804,7 +806,7 @@ test('getBreakerState exposes probe lease timing from raw breaker snapshots', as
       verifySecret: ['secret'],
     });
 
-    assert.equal(result.probeLeaseUntil, nowSeconds + 15);
+    assert.equal('probeLeaseUntil' in result, false);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -834,7 +836,6 @@ test('getBreakerState preserves the closed breaker state', async () => {
       openUntil: null,
       reason: null,
       version: 11,
-      probeLeaseUntil: null,
       lastErrorCode: null,
     });
   } finally {
@@ -866,50 +867,6 @@ test('getBreakerState ignores breaker states outside closed open and half_open',
   }
 });
 
-test('claimBreakerProbe claims a breaker probe lease via RPC', async () => {
-  const originalFetch = globalThis.fetch;
-  let rpcUrl = null;
-  let rpcBody = null;
-
-  globalThis.fetch = async (url, init) => {
-    rpcUrl = url;
-    rpcBody = JSON.parse(init.body);
-    return createJsonResponse([{
-      STATE: 'half_open',
-      OPEN_UNTIL: null,
-      OPEN_REASON: 'http_429',
-      VERSION: 10,
-      LAST_ERROR_CODE: 429,
-      PROBE_GRANTED: true,
-    }]);
-  };
-
-  try {
-    const result = await claimBreakerProbe('tenant.sharepoint.com', {
-      postgrestUrl: 'https://postgrest.example.test',
-      verifyHeader: ['X-Verify'],
-      verifySecret: ['secret'],
-    });
-
-    assert.equal(rpcUrl, 'https://postgrest.example.test/rpc/download_claim_breaker_probe');
-    assert.equal(rpcBody.p_probe_lease_seconds, 15);
-    assert.equal(rpcBody.p_half_open_max_seconds, 0);
-    assert.equal(rpcBody.p_half_open_timeout_mode, 'partial-close');
-    assert.deepEqual(result, {
-      recordExists: true,
-      state: 'half_open',
-      openUntil: null,
-      reason: 'http_429',
-      version: 10,
-      lastErrorCode: 429,
-      probeLeaseUntil: null,
-      probeGranted: true,
-    });
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
 test('reportBreakerSample sends the canonical breaker report payload', async () => {
   const originalFetch = globalThis.fetch;
   let rpcUrl = null;
@@ -932,6 +889,8 @@ test('reportBreakerSample sends the canonical breaker report payload', async () 
     const result = await reportBreakerSample('tenant.sharepoint.com', {
       sample: 1,
       statusCode: 503,
+      attemptVersion: 11,
+      attemptTicket: 2,
       retryAfterSeconds: 9,
     }, {
       postgrestUrl: 'https://postgrest.example.test',
@@ -946,8 +905,8 @@ test('reportBreakerSample sends the canonical breaker report payload', async () 
       idleResetSeconds: 900,
       halfOpenSuccessThreshold: 2,
       halfOpenCloseMode: 'and',
-      probeLeaseSeconds: 15,
-      halfOpenMaxSeconds: 0,
+      halfOpenMaxProbeCount: 4,
+      halfOpenMaxSeconds: 15,
       halfOpenTimeoutMode: 'partial-close',
       protectHttpCodes: [429, 503],
     });
@@ -964,11 +923,14 @@ test('reportBreakerSample sends the canonical breaker report payload', async () 
     assert.equal(rpcBody.p_idle_reset_seconds, 900);
     assert.equal(rpcBody.p_half_open_success_threshold, 2);
     assert.equal(rpcBody.p_half_open_close_mode, 'and');
-    assert.equal(rpcBody.p_half_open_max_seconds, 0);
+    assert.equal(rpcBody.p_half_open_max_seconds, 15);
     assert.equal(rpcBody.p_half_open_timeout_mode, 'partial-close');
-    assert.equal(rpcBody.p_probe_version, null);
+    assert.equal(rpcBody.p_attempt_version, 11);
+    assert.equal(rpcBody.p_attempt_ticket, 2);
     assert.equal(rpcBody.p_retry_after_seconds, 9);
     assert.deepEqual(Object.keys(rpcBody).sort(), [
+      'p_attempt_ticket',
+      'p_attempt_version',
       'p_close_threshold_percent',
       'p_consecutive_threshold',
       'p_ewma_span',
@@ -983,7 +945,6 @@ test('reportBreakerSample sends the canonical breaker report payload', async () 
       'p_now',
       'p_open_cap_seconds',
       'p_open_threshold_percent',
-      'p_probe_version',
       'p_retry_after_seconds',
       'p_sample',
       'p_status_code',
@@ -1001,11 +962,11 @@ test('reportBreakerSample sends the canonical breaker report payload', async () 
   }
 });
 
-test('worker reports success samples for each managed redirect hop without claim when authority rows are absent', async () => {
+test('worker authorizes and reports success samples for each managed redirect hop when authority rows are absent', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const snapshotBodies = [];
-  const claimBodies = [];
+  const authorizeBodies = [];
   const reportBodies = [];
   delete globalThis.bootstrapCache;
 
@@ -1031,15 +992,16 @@ test('worker reports success samples for each managed redirect hop without claim
       return createJsonResponse([]);
     }
 
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
-      claimBodies.push(JSON.parse(init.body));
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeBodies.push(JSON.parse(init.body));
       return createJsonResponse([{
         STATE: 'closed',
         OPEN_UNTIL: null,
         OPEN_REASON: null,
         VERSION: 1,
         LAST_ERROR_CODE: null,
-        PROBE_GRANTED: false,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
       }]);
     }
 
@@ -1088,11 +1050,18 @@ test('worker reports success samples for each managed redirect hop without claim
     await Promise.all(waitUntilPromises);
 
     assert.equal(response.status, 200);
-    assert.equal(snapshotBodies.length, 3);
-    assert.equal(claimBodies.length, 0);
+    assert.equal(snapshotBodies.length, 1);
+    assert.equal(authorizeBodies.length, 2);
     assert.deepEqual(
-      reportBodies.map((body) => body.p_probe_version),
-      [null, null],
+      authorizeBodies.map((body) => body.p_hostname),
+      ['tenant.sharepoint.com', 'tenant.sharepoint.com'],
+    );
+    assert.deepEqual(
+      reportBodies.map((body) => ({ attemptVersion: body.p_attempt_version, attemptTicket: body.p_attempt_ticket })),
+      [
+        { attemptVersion: null, attemptTicket: null },
+        { attemptVersion: null, attemptTicket: null },
+      ],
     );
     assert.deepEqual(
       reportBodies.map((body) => ({ sample: body.p_sample, statusCode: body.p_status_code })),
@@ -1107,12 +1076,12 @@ test('worker reports success samples for each managed redirect hop without claim
   }
 });
 
-test('worker forwards granted probe version into reportBreakerSample on matching hop', async () => {
+test('worker forwards a granted attempt version and ticket into reportBreakerSample on matching hop', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const reportBodies = [];
   let snapshotReads = 0;
-  let claimCalls = 0;
+  let authorizeCalls = 0;
   delete globalThis.bootstrapCache;
 
   globalThis.fetch = async (input, init = {}) => {
@@ -1143,15 +1112,17 @@ test('worker forwards granted probe version into reportBreakerSample on matching
       }]);
     }
 
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
-      claimCalls += 1;
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeCalls += 1;
       return createJsonResponse([{
         STATE: 'half_open',
         OPEN_UNTIL: null,
         OPEN_REASON: 'http_429',
         VERSION: 13,
         LAST_ERROR_CODE: 429,
-        PROBE_GRANTED: true,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 2,
       }]);
     }
 
@@ -1193,11 +1164,12 @@ test('worker forwards granted probe version into reportBreakerSample on matching
     await Promise.all(waitUntilPromises);
 
     assert.equal(response.status, 200);
-    assert.equal(snapshotReads, 2);
-    assert.equal(claimCalls, 1);
+    assert.equal(snapshotReads, 1);
+    assert.equal(authorizeCalls, 1);
     assert.equal(reportBodies.length, 1);
     assert.equal(reportBodies[0].p_hostname, 'tenant.sharepoint.com');
-    assert.equal(reportBodies[0].p_probe_version, 13);
+    assert.equal(reportBodies[0].p_attempt_version, 13);
+    assert.equal(reportBodies[0].p_attempt_ticket, 2);
     assert.equal(reportBodies[0].p_sample, 0);
     assert.equal(reportBodies[0].p_status_code, 200);
   } finally {
@@ -1206,13 +1178,12 @@ test('worker forwards granted probe version into reportBreakerSample on matching
   }
 });
 
-test('worker re-reads authority snapshot for each managed redirect host before claim gating', async () => {
+test('worker authorizes each managed redirect host without reviving worker-side probe state', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const tenantHash = await decodeHostnameHash('tenant.sharepoint.com');
-  const filesHash = await decodeHostnameHash('files.office.com');
   const snapshotHashes = [];
-  const claimBodies = [];
+  const authorizeBodies = [];
   const reportBodies = [];
   delete globalThis.bootstrapCache;
 
@@ -1248,21 +1219,19 @@ test('worker re-reads authority snapshot for each managed redirect host before c
           LAST_ERROR_CODE: null,
         }]);
       }
-      if (requestedHash === filesHash) {
-        return createJsonResponse([]);
-      }
       throw new Error(`Unexpected hostname hash in test: ${requestedHash}`);
     }
 
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
-      claimBodies.push(JSON.parse(init.body));
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeBodies.push(JSON.parse(init.body));
       return createJsonResponse([{
         STATE: 'closed',
         OPEN_UNTIL: null,
         OPEN_REASON: null,
         VERSION: 41,
         LAST_ERROR_CODE: null,
-        PROBE_GRANTED: false,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
       }]);
     }
 
@@ -1311,14 +1280,21 @@ test('worker re-reads authority snapshot for each managed redirect host before c
     await Promise.all(waitUntilPromises);
 
     assert.equal(response.status, 200);
-    assert.deepEqual(snapshotHashes, [tenantHash, tenantHash, filesHash]);
-    assert.equal(claimBodies.length, 0);
+    assert.deepEqual(snapshotHashes, [tenantHash]);
+    assert.equal(authorizeBodies.length, 2);
     assert.equal(reportBodies.length, 2);
     assert.deepEqual(
-      reportBodies.map((body) => ({ hostname: body.p_hostname, probeVersion: body.p_probe_version })),
+      authorizeBodies.map((body) => body.p_hostname),
       [
-        { hostname: 'tenant.sharepoint.com', probeVersion: null },
-        { hostname: 'files.office.com', probeVersion: null },
+        'tenant.sharepoint.com',
+        'files.office.com',
+      ],
+    );
+    assert.deepEqual(
+      reportBodies.map((body) => ({ hostname: body.p_hostname, attemptVersion: body.p_attempt_version, attemptTicket: body.p_attempt_ticket })),
+      [
+        { hostname: 'tenant.sharepoint.com', attemptVersion: null, attemptTicket: null },
+        { hostname: 'files.office.com', attemptVersion: null, attemptTicket: null },
       ],
     );
   } finally {
@@ -1327,11 +1303,11 @@ test('worker re-reads authority snapshot for each managed redirect host before c
   }
 });
 
-test('worker reports success after same-host 401 refresh without claim when authority rows are absent', async () => {
+test('worker reauthorizes same-host refresh attempts when authority rows are absent', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const snapshotBodies = [];
-  const claimBodies = [];
+  const authorizeBodies = [];
   const reportBodies = [];
   let linkFetchCount = 0;
   delete globalThis.bootstrapCache;
@@ -1361,15 +1337,16 @@ test('worker reports success after same-host 401 refresh without claim when auth
       return createJsonResponse([]);
     }
 
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
-      claimBodies.push(JSON.parse(init.body));
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeBodies.push(JSON.parse(init.body));
       return createJsonResponse([{
         STATE: 'closed',
         OPEN_UNTIL: null,
         OPEN_REASON: null,
         VERSION: 1,
         LAST_ERROR_CODE: null,
-        PROBE_GRANTED: false,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
       }]);
     }
 
@@ -1418,11 +1395,15 @@ test('worker reports success after same-host 401 refresh without claim when auth
     await Promise.all(waitUntilPromises);
 
     assert.equal(response.status, 200);
-    assert.equal(snapshotBodies.length, 3);
-    assert.equal(claimBodies.length, 0);
+    assert.equal(snapshotBodies.length, 1);
+    assert.equal(authorizeBodies.length, 2);
     assert.deepEqual(
-      reportBodies.map((body) => body.p_probe_version),
-      [null],
+      authorizeBodies.map((body) => body.p_hostname),
+      ['tenant.sharepoint.com', 'tenant.sharepoint.com'],
+    );
+    assert.deepEqual(
+      reportBodies.map((body) => ({ attemptVersion: body.p_attempt_version, attemptTicket: body.p_attempt_ticket })),
+      [{ attemptVersion: null, attemptTicket: null }],
     );
     assert.deepEqual(
       reportBodies.map((body) => ({ sample: body.p_sample, statusCode: body.p_status_code })),
@@ -1436,13 +1417,176 @@ test('worker reports success after same-host 401 refresh without claim when auth
   }
 });
 
-test('worker blocks same-host refresh when authority reopens after a claimed probe', async () => {
+test('worker authorizes and reports refreshed external redirects with attempt tickets', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
-  const snapshotStates = [];
+  const snapshotBodies = [];
+  const authorizeBodies = [];
   const reportBodies = [];
   let linkFetchCount = 0;
-  let claimCalls = 0;
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: ['*.sharepoint.com', '*.office.com'],
+      }));
+    }
+
+    if (url.startsWith('https://alist.example.com/api/fs/link')) {
+      linkFetchCount += 1;
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: linkFetchCount === 1
+            ? 'https://tenant.sharepoint.com/stale'
+            : 'https://tenant.sharepoint.com/refresh-start',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      snapshotBodies.push(url);
+      return createJsonResponse([]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
+      throw new Error('legacy claim path called');
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeBodies.push(JSON.parse(init.body));
+      if (authorizeBodies.length === 1) {
+        return createJsonResponse([{
+          STATE: 'closed',
+          OPEN_UNTIL: null,
+          OPEN_REASON: null,
+          VERSION: 1,
+          LAST_ERROR_CODE: null,
+          HALF_OPEN_DEADLINE: null,
+          ATTEMPT_GRANTED: false,
+          ATTEMPT_TICKET: null,
+        }]);
+      }
+      if (authorizeBodies.length === 2) {
+        return createJsonResponse([{
+          STATE: 'half_open',
+          OPEN_UNTIL: null,
+          OPEN_REASON: 'http_429',
+          VERSION: 21,
+          LAST_ERROR_CODE: 429,
+          HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+          ATTEMPT_GRANTED: true,
+          ATTEMPT_TICKET: 1,
+        }]);
+      }
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 31,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 2,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      reportBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: reportBodies.length,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://tenant.sharepoint.com/stale') {
+      return new Response('expired', {
+        status: 401,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/refresh-start') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://files.office.com/final' },
+      });
+    }
+
+    if (url === 'https://files.office.com/final') {
+      return new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/refreshed-external-redirect.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.all(waitUntilPromises);
+
+    assert.equal(response.status, 200);
+    assert.equal(linkFetchCount, 2);
+    assert.equal(snapshotBodies.length, 1);
+    assert.deepEqual(
+      authorizeBodies.map((body) => body.p_hostname),
+      ['tenant.sharepoint.com', 'tenant.sharepoint.com', 'files.office.com'],
+    );
+    assert.deepEqual(
+      reportBodies.map((body) => ({
+        hostname: body.p_hostname,
+        statusCode: body.p_status_code,
+        attemptVersion: body.p_attempt_version,
+        attemptTicket: body.p_attempt_ticket,
+      })),
+      [
+        {
+          hostname: 'tenant.sharepoint.com',
+          statusCode: 302,
+          attemptVersion: 21,
+          attemptTicket: 1,
+        },
+        {
+          hostname: 'files.office.com',
+          statusCode: 200,
+          attemptVersion: 31,
+          attemptTicket: 2,
+        },
+      ],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('worker blocks same-host refresh when a new authorize call returns reopened state', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const reportBodies = [];
+  let linkFetchCount = 0;
+  let authorizeCalls = 0;
   let initialUpstreamFetches = 0;
   let refreshedUpstreamFetches = 0;
   delete globalThis.bootstrapCache;
@@ -1468,34 +1612,38 @@ test('worker blocks same-host refresh when authority reopens after a claimed pro
     }
 
     if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
-      const state = snapshotStates.length < 2
-        ? {
-            STATE: 'half_open',
-            OPEN_UNTIL: null,
-            OPEN_REASON: 'http_429',
-            VERSION: 10,
-            LAST_ERROR_CODE: 429,
-          }
-        : {
-            STATE: 'open',
-            OPEN_UNTIL: Math.floor(Date.now() / 1000) + 30,
-            OPEN_REASON: 'http_429',
-            VERSION: 11,
-            LAST_ERROR_CODE: 429,
-          };
-      snapshotStates.push(state);
-      return createJsonResponse([state]);
-    }
-
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
-      claimCalls += 1;
       return createJsonResponse([{
         STATE: 'half_open',
         OPEN_UNTIL: null,
         OPEN_REASON: 'http_429',
         VERSION: 10,
         LAST_ERROR_CODE: 429,
-        PROBE_GRANTED: true,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeCalls += 1;
+      if (authorizeCalls === 1) {
+        return createJsonResponse([{
+          STATE: 'half_open',
+          OPEN_UNTIL: null,
+          OPEN_REASON: 'http_429',
+          VERSION: 10,
+          LAST_ERROR_CODE: 429,
+          HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+          ATTEMPT_GRANTED: true,
+          ATTEMPT_TICKET: 1,
+        }]);
+      }
+      return createJsonResponse([{
+        STATE: 'open',
+        OPEN_UNTIL: Math.floor(Date.now() / 1000) + 30,
+        OPEN_REASON: 'http_429',
+        VERSION: 11,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: null,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
       }]);
     }
 
@@ -1547,10 +1695,9 @@ test('worker blocks same-host refresh when authority reopens after a claimed pro
 
     assert.equal(response.status, 429);
     assert.equal(linkFetchCount, 2);
-    assert.equal(claimCalls, 1);
+    assert.equal(authorizeCalls, 2);
     assert.equal(initialUpstreamFetches, 1);
     assert.equal(refreshedUpstreamFetches, 0);
-    assert.deepEqual(snapshotStates.map((state) => state.STATE), ['half_open', 'half_open', 'open']);
     assert.deepEqual(reportBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1558,13 +1705,12 @@ test('worker blocks same-host refresh when authority reopens after a claimed pro
   }
 });
 
-test('worker reclaims or blocks same-host refresh when authority moved to a newer half_open version', async () => {
+test('worker blocks same-host refresh when a new authorize call finds a full half_open epoch', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
-  const snapshotStates = [];
   const reportBodies = [];
   let linkFetchCount = 0;
-  let claimCalls = 0;
+  let authorizeCalls = 0;
   let initialUpstreamFetches = 0;
   let refreshedUpstreamFetches = 0;
   delete globalThis.bootstrapCache;
@@ -1590,188 +1736,43 @@ test('worker reclaims or blocks same-host refresh when authority moved to a newe
     }
 
     if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
-      const state = snapshotStates.length < 2
-        ? {
-            STATE: 'half_open',
-            OPEN_UNTIL: null,
-            OPEN_REASON: 'http_429',
-            VERSION: 10,
-            LAST_ERROR_CODE: 429,
-          }
-        : {
-            STATE: 'half_open',
-            OPEN_UNTIL: null,
-            OPEN_REASON: 'http_429',
-            VERSION: 21,
-            LAST_ERROR_CODE: 429,
-          };
-      snapshotStates.push(state);
-      return createJsonResponse([state]);
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 10,
+        LAST_ERROR_CODE: 429,
+      }]);
     }
 
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
-      claimCalls += 1;
-      if (claimCalls === 1) {
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeCalls += 1;
+      if (authorizeCalls === 1) {
         return createJsonResponse([{
           STATE: 'half_open',
           OPEN_UNTIL: null,
           OPEN_REASON: 'http_429',
           VERSION: 10,
           LAST_ERROR_CODE: 429,
-          PROBE_GRANTED: true,
+          HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+          ATTEMPT_GRANTED: true,
+          ATTEMPT_TICKET: 1,
         }]);
       }
       return createJsonResponse([{
         STATE: 'half_open',
         OPEN_UNTIL: null,
         OPEN_REASON: 'http_429',
-        VERSION: 21,
+        VERSION: 10,
         LAST_ERROR_CODE: 429,
-        PROBE_GRANTED: false,
-        PROBE_LEASE_UNTIL: Math.floor(Date.now() / 1000) + 15,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
       }]);
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
       reportBodies.push(JSON.parse(init.body));
-      return createJsonResponse([{
-        STATE: 'closed',
-        OPEN_UNTIL: null,
-        OPEN_REASON: null,
-        VERSION: 22,
-        LAST_ERROR_CODE: null,
-      }]);
-    }
-
-    if (url === 'https://tenant.sharepoint.com/start') {
-      initialUpstreamFetches += 1;
-      return new Response('expired', {
-        status: 401,
-        headers: { 'content-type': 'text/plain' },
-      });
-    }
-
-    if (url === 'https://tenant.sharepoint.com/fresh') {
-      refreshedUpstreamFetches += 1;
-      return new Response('ok', {
-        status: 200,
-        headers: { 'content-type': 'application/octet-stream' },
-      });
-    }
-
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
-  };
-
-  try {
-    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/same-host-refresh-newer-half-open.bin'), {
-      CONTROLLER_URL: 'https://controller.example.test',
-      CONTROLLER_API_TOKEN: 'controller-token',
-      ENV: 'test',
-      ROLE: 'download',
-      INSTANCE_ID: 'worker-1',
-      BOOTSTRAP_CACHE_MODE: 'direct',
-    }, {
-      waitUntil(promise) {
-        waitUntilPromises.push(promise);
-      },
-    });
-
-    await Promise.allSettled(waitUntilPromises);
-
-    assert.equal(response.status, 429);
-    assert.equal(linkFetchCount, 2);
-    assert.equal(claimCalls, 2);
-    assert.equal(initialUpstreamFetches, 1);
-    assert.equal(refreshedUpstreamFetches, 0);
-    assert.deepEqual(snapshotStates.map((state) => state.VERSION), [10, 10, 21]);
-    assert.deepEqual(reportBodies, []);
-  } finally {
-    globalThis.fetch = originalFetch;
-    delete globalThis.bootstrapCache;
-  }
-});
-
-test('worker reclaims same-host refresh when the matching half_open lease expired', async () => {
-  const originalFetch = globalThis.fetch;
-  const originalDateNow = Date.now;
-  const waitUntilPromises = [];
-  const snapshotStates = [];
-  let linkFetchCount = 0;
-  let claimCalls = 0;
-  let initialUpstreamFetches = 0;
-  let refreshedUpstreamFetches = 0;
-  const nowSequence = [1_700_000_000_000, 1_700_000_000_000, 1_700_000_020_000, 1_700_000_020_000];
-  delete globalThis.bootstrapCache;
-
-  Date.now = () => nowSequence.length > 1 ? nowSequence.shift() : nowSequence[0];
-
-  globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
-
-    if (url === 'https://controller.example.test/api/v0/bootstrap') {
-      return createJsonResponse(buildRuntimeBootstrap());
-    }
-
-    if (url.startsWith('https://alist.example.com/api/fs/link')) {
-      linkFetchCount += 1;
-      return createJsonResponse({
-        code: 200,
-        data: {
-          url: linkFetchCount === 1
-            ? 'https://tenant.sharepoint.com/start'
-            : 'https://tenant.sharepoint.com/fresh',
-          header: {},
-        },
-      });
-    }
-
-    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
-      const state = snapshotStates.length < 2
-        ? {
-            STATE: 'half_open',
-            OPEN_UNTIL: null,
-            OPEN_REASON: 'http_429',
-            VERSION: 10,
-            LAST_ERROR_CODE: 429,
-            PROBE_LEASE_UNTIL: 1_700_000_015,
-          }
-        : {
-            STATE: 'half_open',
-            OPEN_UNTIL: null,
-            OPEN_REASON: 'http_429',
-            VERSION: 10,
-            LAST_ERROR_CODE: 429,
-            PROBE_LEASE_UNTIL: 1_700_000_010,
-          };
-      snapshotStates.push(state);
-      return createJsonResponse([state]);
-    }
-
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
-      claimCalls += 1;
-      if (claimCalls === 1) {
-        return createJsonResponse([{
-          STATE: 'half_open',
-          OPEN_UNTIL: null,
-          OPEN_REASON: 'http_429',
-          VERSION: 10,
-          LAST_ERROR_CODE: 429,
-          PROBE_GRANTED: true,
-          PROBE_LEASE_UNTIL: 1_700_000_015,
-        }]);
-      }
-      return createJsonResponse([{
-        STATE: 'half_open',
-        OPEN_UNTIL: null,
-        OPEN_REASON: 'http_429',
-        VERSION: 11,
-        LAST_ERROR_CODE: 429,
-        PROBE_GRANTED: false,
-        PROBE_LEASE_UNTIL: 1_700_000_035,
-      }]);
-    }
-
-    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
       return createJsonResponse([{
         STATE: 'closed',
         OPEN_UNTIL: null,
@@ -1801,7 +1802,7 @@ test('worker reclaims same-host refresh when the matching half_open lease expire
   };
 
   try {
-    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/same-host-refresh-expired-lease.bin'), {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/same-host-refresh-full-epoch.bin'), {
       CONTROLLER_URL: 'https://controller.example.test',
       CONTROLLER_API_TOKEN: 'controller-token',
       ENV: 'test',
@@ -1818,126 +1819,12 @@ test('worker reclaims same-host refresh when the matching half_open lease expire
 
     assert.equal(response.status, 429);
     assert.equal(linkFetchCount, 2);
-    assert.equal(claimCalls, 2);
+    assert.equal(authorizeCalls, 2);
     assert.equal(initialUpstreamFetches, 1);
     assert.equal(refreshedUpstreamFetches, 0);
-    assert.deepEqual(snapshotStates.map((state) => state.PROBE_LEASE_UNTIL), [1_700_000_015, 1_700_000_015, 1_700_000_010]);
+    assert.deepEqual(reportBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
-    Date.now = originalDateNow;
-    delete globalThis.bootstrapCache;
-  }
-});
-
-test('worker re-reads same-host authority at claim time after redirect delay', async () => {
-  const originalFetch = globalThis.fetch;
-  const originalDateNow = Date.now;
-  const waitUntilPromises = [];
-  const nowSequence = [1_700_000_000_000, 1_700_000_000_000, 1_700_000_005_000, 1_700_000_005_000];
-  const snapshotStates = [];
-  const claimBodies = [];
-  delete globalThis.bootstrapCache;
-
-  Date.now = () => nowSequence.length > 1 ? nowSequence.shift() : nowSequence[0];
-
-  globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
-
-    if (url === 'https://controller.example.test/api/v0/bootstrap') {
-      return createJsonResponse(buildRuntimeBootstrap());
-    }
-
-    if (url === 'https://alist.example.com/api/fs/link') {
-      return createJsonResponse({
-        code: 200,
-        data: {
-          url: 'https://tenant.sharepoint.com/start',
-          header: {},
-        },
-      });
-    }
-
-    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
-      const state = snapshotStates.length === 0
-        ? {
-            STATE: 'open',
-            OPEN_UNTIL: 1_700_000_001,
-            OPEN_REASON: 'http_429',
-            VERSION: 7,
-            LAST_ERROR_CODE: 429,
-          }
-        : {
-            STATE: 'open',
-            OPEN_UNTIL: 1_700_000_000,
-            OPEN_REASON: 'http_429',
-            VERSION: 8,
-            LAST_ERROR_CODE: 429,
-          };
-      snapshotStates.push(state);
-      return createJsonResponse([state]);
-    }
-
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
-      claimBodies.push(JSON.parse(init.body));
-      return createJsonResponse([{
-        STATE: 'half_open',
-        OPEN_UNTIL: null,
-        OPEN_REASON: 'http_429',
-        VERSION: 9,
-        LAST_ERROR_CODE: 429,
-        PROBE_GRANTED: true,
-      }]);
-    }
-
-    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
-      return createJsonResponse([{
-        STATE: 'closed',
-        OPEN_UNTIL: null,
-        OPEN_REASON: null,
-        VERSION: 10,
-        LAST_ERROR_CODE: null,
-      }]);
-    }
-
-    if (url === 'https://tenant.sharepoint.com/start') {
-      return new Response(null, {
-        status: 302,
-        headers: { Location: 'https://tenant.sharepoint.com/final' },
-      });
-    }
-
-    if (url === 'https://tenant.sharepoint.com/final') {
-      return new Response('ok', {
-        status: 200,
-        headers: { 'content-type': 'application/octet-stream' },
-      });
-    }
-
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
-  };
-
-  try {
-    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/same-host-delay.bin'), {
-      CONTROLLER_URL: 'https://controller.example.test',
-      CONTROLLER_API_TOKEN: 'controller-token',
-      ENV: 'test',
-      ROLE: 'download',
-      INSTANCE_ID: 'worker-1',
-      BOOTSTRAP_CACHE_MODE: 'direct',
-    }, {
-      waitUntil(promise) {
-        waitUntilPromises.push(promise);
-      },
-    });
-
-    await Promise.all(waitUntilPromises);
-
-    assert.equal(response.status, 200);
-    assert.equal(snapshotStates.length, 3);
-    assert.equal(claimBodies.length, 2);
-  } finally {
-    globalThis.fetch = originalFetch;
-    Date.now = originalDateNow;
     delete globalThis.bootstrapCache;
   }
 });
@@ -1946,7 +1833,7 @@ test('worker ignores unified-check open breaker rows for unmanaged hosts', async
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   let upstreamFetches = 0;
-  let claimCalls = 0;
+  let authorizeCalls = 0;
   let reportCalls = 0;
   delete globalThis.bootstrapCache;
 
@@ -1992,8 +1879,8 @@ test('worker ignores unified-check open breaker rows for unmanaged hosts', async
       }]);
     }
 
-    if (url === 'https://postgrest.example.test/rpc/download_claim_breaker_probe') {
-      claimCalls += 1;
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeCalls += 1;
       return createJsonResponse([]);
     }
 
@@ -2031,7 +1918,7 @@ test('worker ignores unified-check open breaker rows for unmanaged hosts', async
 
     assert.equal(response.status, 200);
     assert.equal(upstreamFetches, 1);
-    assert.equal(claimCalls, 0);
+    assert.equal(authorizeCalls, 0);
     assert.equal(reportCalls, 0);
   } finally {
     globalThis.fetch = originalFetch;

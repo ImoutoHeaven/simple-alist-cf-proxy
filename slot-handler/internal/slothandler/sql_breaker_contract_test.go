@@ -15,12 +15,19 @@ func TestInitSQLThrottleProtectionUsesBreakerStateColumns(t *testing.T) {
 		`"last_sample_at"\s+integer`,
 		`"success_streak"\s+integer`,
 		`"half_open_since"\s+integer`,
-		`"probe_lease_until"\s+integer`,
+		`"half_open_budget"\s+integer`,
+		`"half_open_issued"\s+integer`,
+		`"half_open_reported_mask"\s+bigint`,
+		`"half_open_success_count"\s+integer`,
+		`"half_open_deadline"\s+integer`,
 		`"version"\s+bigint`,
 	} {
 		if !regexp.MustCompile(want).MatchString(text) {
 			t.Fatalf("missing breaker column pattern %s", want)
 		}
+	}
+	if regexp.MustCompile(`"probe_lease_until"`).MatchString(text) {
+		t.Fatalf("legacy single-probe lease column still present")
 	}
 
 	for _, legacy := range []string{`"is_protected"`, `"error_timestamp"`, `"obs_window_start"`} {
@@ -30,22 +37,29 @@ func TestInitSQLThrottleProtectionUsesBreakerStateColumns(t *testing.T) {
 	}
 }
 
-func TestInitSQLDefinesClaimAndReportBreakerFunctions(t *testing.T) {
+func TestInitSQLDefinesAuthorizeAndReportBreakerFunctions(t *testing.T) {
 	text := readInitSQLNormalized(t)
 	for _, fn := range []string{
-		`create\s+or\s+replace\s+function\s+download_claim_breaker_probe`,
+		`create\s+or\s+replace\s+function\s+download_authorize_breaker_attempt`,
 		`create\s+or\s+replace\s+function\s+download_report_breaker_sample`,
 	} {
 		if !regexp.MustCompile(fn).MatchString(text) {
 			t.Fatalf("missing function: %s", fn)
 		}
 	}
+	if regexp.MustCompile(`create\s+or\s+replace\s+function\s+download_claim_breaker_probe`).MatchString(text) {
+		t.Fatalf("legacy single-probe claim function still present")
+	}
 }
 
-func TestInitSQLReportBreakerSampleAcceptsWarmupAndProbeParameters(t *testing.T) {
+func TestInitSQLReportBreakerSampleAcceptsWarmupAndAttemptParameters(t *testing.T) {
 	text := readInitSQLNormalized(t)
-	if !regexp.MustCompile(`download_report_breaker_sample\s*\([^)]*p_min_samples_before_ewma_open\s+integer[^)]*p_idle_reset_seconds\s+integer[^)]*p_probe_version\s+bigint`).MatchString(text) {
-		t.Fatalf("download_report_breaker_sample must accept warmup, idle reset, and probe version parameters")
+	pattern := `download_report_breaker_sample\s*\([^)]*p_min_samples_before_ewma_open\s+integer[^)]*p_idle_reset_seconds\s+integer[^)]*p_attempt_version\s+bigint\s+default\s+null[^)]*p_attempt_ticket\s+integer\s+default\s+null`
+	if !regexp.MustCompile(pattern).MatchString(text) {
+		t.Fatalf("download_report_breaker_sample must accept warmup, idle reset, and attempt version/ticket parameters")
+	}
+	if regexp.MustCompile(`p_probe_version\s+bigint`).MatchString(text) {
+		t.Fatalf("legacy single-probe report parameter still present")
 	}
 }
 
@@ -66,20 +80,33 @@ func TestInitSQLReportBreakerSampleDoesNotPromoteOpenToHalfOpen(t *testing.T) {
 	}
 }
 
-func TestInitSQLClaimBreakerProbeOwnsOpenToHalfOpenTransition(t *testing.T) {
-	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_claim_breaker_probe")
-	if !regexp.MustCompile(`if\s+v_state\s*=\s*'open'\s+and(?s:.*?)v_state\s*:=\s*'half_open'`).MatchString(body) {
-		t.Fatalf("download_claim_breaker_probe must own open to half_open")
+func TestInitSQLAuthorizeBreakerAttemptOwnsOpenToHalfOpenTransition(t *testing.T) {
+	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_authorize_breaker_attempt")
+	pattern := `elsif\s+v_state\s*=\s*'open'\s+and\s+v_open_until\s*<=\s*v_now\s+then(?s:.*?)v_state\s*:=\s*'half_open'(?s:.*?)v_half_open_budget\s*:=\s*v_half_open_max_probe_count(?s:.*?)v_half_open_issued\s*:=\s*1(?s:.*?)v_half_open_reported_mask\s*:=\s*0(?s:.*?)v_half_open_success_count\s*:=\s*0(?s:.*?)v_half_open_deadline\s*:=\s*v_now\s*\+\s*v_half_open_max_seconds(?s:.*?)v_attempt_granted\s*:=\s*true(?s:.*?)v_attempt_ticket\s*:=\s*1`
+	if !regexp.MustCompile(pattern).MatchString(body) {
+		t.Fatalf("download_authorize_breaker_attempt must own open->half_open batch-budget authorization")
 	}
 }
 
-func TestInitSQLReportBreakerSampleConsumesAcceptedProbeVersion(t *testing.T) {
+func TestInitSQLReportBreakerSampleTracksAcceptedAttemptTickets(t *testing.T) {
 	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_report_breaker_sample")
-	if !regexp.MustCompile(`if\s+p_probe_version\s+is\s+not\s+null\s+then(?s:.*?)if\s+v_state\s*<>\s*'half_open'\s+or\s+not\s+v_probe_version_matches\s+then(?s:.*?)return\s+query`).MatchString(body) {
-		t.Fatalf("download_report_breaker_sample must no-op stale or duplicate probe-version reports")
+	if !regexp.MustCompile(`if\s+p_attempt_version\s+is\s+not\s+null\s+then(?s:.*?)if\s+v_state\s*<>\s*'half_open'\s+or\s+p_attempt_version\s*<>\s*v_version\s+then(?s:.*?)return\s+query`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must no-op stale half_open epoch reports")
 	}
-	if !regexp.MustCompile(`if\s+p_probe_version\s+is\s+not\s+null\s+then(?s:.*?)v_version\s*:=\s*v_version\s*\+\s*1`).MatchString(body) {
-		t.Fatalf("download_report_breaker_sample must retire an accepted probe version after one use")
+	if !regexp.MustCompile(`if\s+p_attempt_version\s+is\s+not\s+null\s+then(?s:.*?)if\s+p_attempt_ticket\s+is\s+null\s+or\s+p_attempt_ticket\s*<\s*1\s+or\s+p_attempt_ticket\s*>\s*v_half_open_issued\s+or\s+p_attempt_ticket\s*>\s*v_half_open_ticket_mask_limit\s+then(?s:.*?)return\s+query`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must reject invalid half_open attempt tickets")
+	}
+	if !regexp.MustCompile(`v_ticket_mask\s*:=\s*\(1::bigint\s*<<\s*\(p_attempt_ticket\s*-\s*1\)\)`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must derive a per-ticket mask")
+	}
+	if !regexp.MustCompile(`if\s+\(v_half_open_reported_mask\s*&\s*v_ticket_mask\)\s*<>\s*0\s+then(?s:.*?)return\s+query`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must ignore duplicate half_open ticket reports")
+	}
+	if !regexp.MustCompile(`v_half_open_reported_mask\s*:=\s*v_half_open_reported_mask\s*\|\s*v_ticket_mask`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must record accepted half_open ticket reports in the reported mask")
+	}
+	if regexp.MustCompile(`v_probe_version_matches`).MatchString(body) {
+		t.Fatalf("legacy single-probe version matching still present")
 	}
 }
 
@@ -124,7 +151,7 @@ func TestInitSQLReportBreakerSampleParameterizesHalfOpenCloseRule(t *testing.T) 
 	if !regexp.MustCompile(`v_should_close\s*:=\s*case\s+when\s+v_half_open_close_mode\s*=\s*'or'\s+then`).MatchString(body) {
 		t.Fatalf("download_report_breaker_sample must branch close behavior on half_open_close_mode")
 	}
-	if !regexp.MustCompile(`v_success_streak\s*>=\s*v_half_open_success_threshold`).MatchString(body) {
+	if !regexp.MustCompile(`v_half_open_success_count\s*>=\s*v_half_open_success_threshold`).MatchString(body) {
 		t.Fatalf("download_report_breaker_sample must use half_open_success_threshold")
 	}
 }

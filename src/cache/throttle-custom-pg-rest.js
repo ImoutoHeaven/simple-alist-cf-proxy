@@ -3,8 +3,8 @@ const BREAKER_TABLE = 'THROTTLE_PROTECTION';
 const DEFAULT_CLOSE_THRESHOLD_PERCENT = 15;
 const DEFAULT_HALF_OPEN_SUCCESS_THRESHOLD = 2;
 const DEFAULT_HALF_OPEN_CLOSE_MODE = 'and';
-const DEFAULT_PROBE_LEASE_SECONDS = 15;
-const DEFAULT_HALF_OPEN_MAX_SECONDS = 0;
+const DEFAULT_HALF_OPEN_MAX_PROBE_COUNT = 4;
+const DEFAULT_HALF_OPEN_MAX_SECONDS = 15;
 const DEFAULT_HALF_OPEN_TIMEOUT_MODE = 'partial-close';
 const VALID_BREAKER_STATES = new Set(['closed', 'open', 'half_open']);
 const VALID_HALF_OPEN_CLOSE_MODES = new Set(['and', 'or']);
@@ -25,8 +25,8 @@ const sanitizeThresholds = (config = {}) => {
     minSamplesBeforeEwmaOpen: Math.max(1, toInt(config.minSamplesBeforeEwmaOpen, 8)),
     idleResetSeconds: Math.max(0, toInt(config.idleResetSeconds, 900)),
     halfOpenSuccessThreshold: Math.max(1, toInt(config.halfOpenSuccessThreshold, DEFAULT_HALF_OPEN_SUCCESS_THRESHOLD)),
-    probeLeaseSeconds: Math.max(1, toInt(config.probeLeaseSeconds, DEFAULT_PROBE_LEASE_SECONDS)),
-    halfOpenMaxSeconds: Math.max(0, toInt(config.halfOpenMaxSeconds, DEFAULT_HALF_OPEN_MAX_SECONDS)),
+    halfOpenMaxProbeCount: Math.max(1, toInt(config.halfOpenMaxProbeCount, DEFAULT_HALF_OPEN_MAX_PROBE_COUNT)),
+    halfOpenMaxSeconds: Math.max(1, toInt(config.halfOpenMaxSeconds, DEFAULT_HALF_OPEN_MAX_SECONDS)),
   };
 };
 
@@ -70,7 +70,6 @@ const emptyBreakerSnapshot = () => ({
   openUntil: null,
   reason: null,
   version: null,
-  probeLeaseUntil: null,
   lastErrorCode: null,
 });
 
@@ -104,18 +103,16 @@ const readBreakerSnapshot = (row, options = {}) => {
     openUntil: parseNullableInt(readBreakerField(row, 'OPEN_UNTIL')),
     reason: normalizeBreakerReason(readBreakerField(row, 'OPEN_REASON')),
     version: parseNullableInt(readBreakerField(row, 'VERSION')),
-    probeLeaseUntil: options.includeProbeLeaseUntil
-      ? parseNullableInt(readBreakerField(row, 'PROBE_LEASE_UNTIL'))
-      : undefined,
     lastErrorCode: parseNullableInt(readBreakerField(row, 'LAST_ERROR_CODE')),
   };
 
-  if (!options.includeProbeLeaseUntil) {
-    delete snapshot.probeLeaseUntil;
+  if (options.includeHalfOpenDeadline) {
+    snapshot.halfOpenDeadline = parseNullableInt(readBreakerField(row, 'HALF_OPEN_DEADLINE'));
   }
 
-  if (options.includeProbeGranted) {
-    snapshot.probeGranted = parseBoolean(readBreakerField(row, 'PROBE_GRANTED'));
+  if (options.includeAttemptAuthorization) {
+    snapshot.attemptGranted = parseBoolean(readBreakerField(row, 'ATTEMPT_GRANTED'));
+    snapshot.attemptTicket = parseNullableInt(readBreakerField(row, 'ATTEMPT_TICKET'));
   }
 
   return snapshot;
@@ -237,7 +234,7 @@ const executeBreakerRpc = async (postgrestUrl, verifyHeader, verifySecret, rpcNa
  * @param {string} config.postgrestUrl - PostgREST API endpoint
  * @param {string|string[]} config.verifyHeader - Authentication header name(s)
  * @param {string|string[]} config.verifySecret - Authentication header value(s)
- * @returns {Promise<{recordExists: boolean, state: string|null, openUntil: number|null, reason: string|null, version: number|null, probeLeaseUntil: number|null, lastErrorCode: number|null} | null>}
+ * @returns {Promise<{recordExists: boolean, state: string|null, openUntil: number|null, reason: string|null, version: number|null, lastErrorCode: number|null} | null>}
  */
 export const getBreakerState = async (hostname, config) => {
   if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
@@ -274,16 +271,16 @@ export const getBreakerState = async (hostname, config) => {
 
   const result = records[0];
 
-  return readBreakerSnapshot(result, { includeProbeLeaseUntil: true });
+  return readBreakerSnapshot(result);
 };
 
 /**
- * Claim the single half-open breaker probe lease for a hostname
+ * Authorize a half-open breaker attempt for a hostname
  * @param {string} hostname - Hostname
  * @param {Object} config - Throttle configuration
- * @returns {Promise<{recordExists: boolean, state: string|null, openUntil: number|null, reason: string|null, version: number|null, lastErrorCode: number|null, probeLeaseUntil?: number|null, probeGranted?: boolean} | null>}
+ * @returns {Promise<{recordExists: boolean, state: string|null, openUntil: number|null, reason: string|null, version: number|null, lastErrorCode: number|null, halfOpenDeadline?: number|null, attemptGranted?: boolean, attemptTicket?: number|null} | null>}
  */
-export const claimBreakerProbe = async (hostname, config) => {
+export const authorizeBreakerAttempt = async (hostname, config) => {
   if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
     return null;
   }
@@ -310,20 +307,20 @@ export const claimBreakerProbe = async (hostname, config) => {
     postgrestUrl,
     verifyHeader,
     verifySecret,
-    'download_claim_breaker_probe',
+    'download_authorize_breaker_attempt',
     {
       p_hostname_hash: hostnameHash,
       p_hostname: hostname,
       p_now: now,
-      p_probe_lease_seconds: thresholds.probeLeaseSeconds,
+      p_half_open_max_probe_count: thresholds.halfOpenMaxProbeCount,
       p_half_open_max_seconds: thresholds.halfOpenMaxSeconds,
       p_half_open_timeout_mode: halfOpenTimeoutMode,
     },
   );
 
   return readBreakerSnapshot(row, {
-    includeProbeLeaseUntil: true,
-    includeProbeGranted: true,
+    includeHalfOpenDeadline: true,
+    includeAttemptAuthorization: true,
   });
 };
 
@@ -359,13 +356,17 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
   const retryAfterSecondsRaw = Number.isFinite(updateData?.retryAfterSeconds)
     ? Number(updateData.retryAfterSeconds)
     : Number.parseInt(updateData?.retryAfterSeconds, 10);
-  const probeVersionRaw = Number.isFinite(updateData?.probeVersion)
-    ? Number(updateData.probeVersion)
-    : Number.parseInt(updateData?.probeVersion, 10);
+  const attemptVersionRaw = Number.isFinite(updateData?.attemptVersion)
+    ? Number(updateData.attemptVersion)
+    : Number.parseInt(updateData?.attemptVersion, 10);
+  const attemptTicketRaw = Number.isFinite(updateData?.attemptTicket)
+    ? Number(updateData.attemptTicket)
+    : Number.parseInt(updateData?.attemptTicket, 10);
   const retryAfterSeconds = Number.isFinite(retryAfterSecondsRaw) && retryAfterSecondsRaw > 0
     ? Math.max(1, Math.ceil(retryAfterSecondsRaw))
     : null;
-  const probeVersion = Number.isFinite(probeVersionRaw) ? Math.trunc(probeVersionRaw) : null;
+  const attemptVersion = Number.isFinite(attemptVersionRaw) ? Math.trunc(attemptVersionRaw) : null;
+  const attemptTicket = Number.isFinite(attemptTicketRaw) ? Math.trunc(attemptTicketRaw) : null;
 
   if (!Number.isFinite(statusCode)) {
     console.warn('[Throttle] Skip reportBreakerSample: invalid statusCode:', updateData?.statusCode);
@@ -414,7 +415,8 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
       p_half_open_close_mode: halfOpenCloseMode,
       p_half_open_max_seconds: thresholds.halfOpenMaxSeconds,
       p_half_open_timeout_mode: halfOpenTimeoutMode,
-      p_probe_version: probeVersion,
+      p_attempt_version: attemptVersion,
+      p_attempt_ticket: attemptTicket,
       p_retry_after_seconds: retryAfterSeconds,
     },
   );

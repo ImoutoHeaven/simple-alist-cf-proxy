@@ -29,8 +29,8 @@ const buildBootstrap = () => ({
         idleResetSeconds: 900,
         halfOpenSuccessThreshold: 2,
         halfOpenCloseMode: 'and',
-        probeLeaseSeconds: 15,
-        halfOpenMaxSeconds: 0,
+        halfOpenMaxProbeCount: 4,
+        halfOpenMaxSeconds: 15,
         halfOpenTimeoutMode: 'partial-close',
         protectHttpCodes: [429, 499, 500, 502, 503, 504],
       },
@@ -45,8 +45,8 @@ const buildBootstrap = () => ({
         idleResetSeconds: 900,
         halfOpenSuccessThreshold: 2,
         halfOpenCloseMode: 'and',
-        probeLeaseSeconds: 15,
-        halfOpenMaxSeconds: 0,
+        halfOpenMaxProbeCount: 4,
+        halfOpenMaxSeconds: 15,
         halfOpenTimeoutMode: 'partial-close',
         protectHttpCodes: [429, 503],
       },
@@ -554,7 +554,7 @@ test('fetchControllerState fails closed when matched profileId points to a missi
   }
 });
 
-test('resolveConfig returns the canonical breaker profile shape', () => {
+test('resolveConfig maps halfOpenMaxProbeCount and drops probeLeaseSeconds', () => {
   const config = resolveConfig({}, buildBootstrap(), { download: { throttleProfile: 'sharepoint' } });
 
   assert.deepEqual(config.throttleHostnamePatterns, ['*.sharepoint.com']);
@@ -571,11 +571,33 @@ test('resolveConfig returns the canonical breaker profile shape', () => {
     idleResetSeconds: 900,
     halfOpenSuccessThreshold: 2,
     halfOpenCloseMode: 'and',
-    probeLeaseSeconds: 15,
-    halfOpenMaxSeconds: 0,
+    halfOpenMaxProbeCount: 4,
+    halfOpenMaxSeconds: 15,
     halfOpenTimeoutMode: 'partial-close',
     protectHttpCodes: [429, 503],
   });
+  assert.equal('probeLeaseSeconds' in config.throttleConfig, false);
+});
+
+test('resolveConfig rejects controller throttle profiles with impossible half-open budgets', () => {
+  const bootstrap = buildBootstrap();
+  bootstrap.download.throttleProfiles.default.halfOpenSuccessThreshold = 5;
+
+  assert.throws(
+    () => resolveConfig({}, bootstrap, { download: { throttleProfile: 'default' } }),
+    /halfOpenSuccessThreshold must be <= halfOpenMaxProbeCount/
+  );
+});
+
+
+test('resolveConfig rejects controller throttle profiles that exceed the SQL half-open bitmap ceiling', () => {
+  const bootstrap = buildBootstrap();
+  bootstrap.download.throttleProfiles.default.halfOpenMaxProbeCount = 64;
+
+  assert.throws(
+    () => resolveConfig({}, bootstrap, { download: { throttleProfile: 'default' } }),
+    /halfOpenMaxProbeCount must be <= 63/
+  );
 });
 
 test('getBootstrapConfig ignores stale in-memory payloads from the prior schema epoch', async () => {
@@ -644,8 +666,8 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
       idleResetSeconds: 900,
       halfOpenSuccessThreshold: 2,
       halfOpenCloseMode: 'and',
-      probeLeaseSeconds: 15,
-      halfOpenMaxSeconds: 0,
+      halfOpenMaxProbeCount: 4,
+      halfOpenMaxSeconds: 15,
       halfOpenTimeoutMode: 'partial-close',
     });
 
@@ -663,11 +685,14 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
     assert.equal(rpcBody.p_idle_reset_seconds, 900);
     assert.equal(rpcBody.p_half_open_success_threshold, 2);
     assert.equal(rpcBody.p_half_open_close_mode, 'and');
-    assert.equal(rpcBody.p_half_open_max_seconds, 0);
+    assert.equal(rpcBody.p_half_open_max_seconds, 15);
     assert.equal(rpcBody.p_half_open_timeout_mode, 'partial-close');
-    assert.equal(rpcBody.p_probe_version, null);
+    assert.equal(rpcBody.p_attempt_version, null);
+    assert.equal(rpcBody.p_attempt_ticket, null);
     assert.equal(rpcBody.p_retry_after_seconds, null);
     assert.deepEqual(Object.keys(rpcBody).sort(), [
+      'p_attempt_ticket',
+      'p_attempt_version',
       'p_close_threshold_percent',
       'p_consecutive_threshold',
       'p_ewma_span',
@@ -682,7 +707,6 @@ test('reportBreakerSample sends the canonical breaker RPC payload', async () => 
       'p_now',
       'p_open_cap_seconds',
       'p_open_threshold_percent',
-      'p_probe_version',
       'p_retry_after_seconds',
       'p_sample',
       'p_status_code',

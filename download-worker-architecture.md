@@ -59,8 +59,8 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 - `download.db.mode` 仅支持 `""` 或 `custom-pg-rest`
 - `download.db.*`：PostgREST 地址、校验 header/secret、缓存表/last-active 表、TTL/idle 等
 - `download.db.rateLimit.*`：窗口、限额、block 时间、`pgErrorHandle` 等
-- `download.throttleProfiles.<name>`：只定义 breaker profile，canonical Stage 1 字段固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`closeThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`probeLeaseSeconds`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`、`protectHttpCodes`
-- 该 profile 只覆盖 Stage 1 breaker recovery：`halfOpenCloseMode=and|or` 决定 half-open 成功关闭条件按“成功次数 + EWMA close threshold”取交集或并集；`halfOpenTimeoutMode=open|close|partial-close` 决定 half-open timeout 后的终态；`halfOpenMaxSeconds=0` 表示禁用 timeout cap；`partial-close` 只依赖已有 half-open 成功证据（`SUCCESS_STREAK > 0`）决定关闭；不包含 queue-driven active recovery，也不包含 Stage 2 / slot-handler recovery
+- `download.throttleProfiles.<name>`：只定义 breaker profile，canonical 字段固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`closeThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`、`protectHttpCodes`
+- controller 只新增 `halfOpenMaxProbeCount` 并移除 `probeLeaseSeconds`；worker 在解析 bootstrap 时会校验 `halfOpenSuccessThreshold <= halfOpenMaxProbeCount`，并拒绝 `halfOpenMaxProbeCount > 63`，因为 SQL 用 signed `BIGINT` bitmap 记录 half-open attempt 回报；`halfOpenTimeoutMode` 继续决定 half-open timeout 后的终态
 - `download.fairQueue.*`：slot-handler 地址、鉴权 key、鉴权 header 名、等待超时、轮询策略、siteBucket 计算方式等（worker 侧解析字段）；其中 `slotHandlerAuthHeader` 由 controller 同步下发，默认值为 `X-FQ-Auth`
 - slot-handler in-flight limits（slot-handler 配置项，写在 slot-handler 的 config 中，worker 不解析）：
   - `globalMaxInFlightFlow`：slot-handler 全局 in-flight 上限，超过则返回 `overloaded`
@@ -113,11 +113,11 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 
 9. **Breaker 保护**
     - 若 hostname 匹配 `throttleProfiles.*.hostPatterns`，worker 只读取数据库权威快照；运行时唯一真源是 `THROTTLE_PROTECTION`，worker 不保留本地 breaker 镜像。
-    - breaker 状态机只有 `closed/open/half_open` 三态：`open` 仅按权威快照立即 fail-fast；`open -> half_open` 只允许 `download_claim_breaker_probe` 原子领取单 canary。
-    - `download_report_breaker_sample` 负责回写样本，但只在 `half_open` 且 `p_probe_version` 命中当前版本时接受该 canary 结果；过期或未领取的响应不会推进恢复流程。
-    - worker 分开透传两类 breaker RPC 参数：`download_claim_breaker_probe` 只带 `p_probe_lease_seconds`、`p_half_open_max_seconds`、`p_half_open_timeout_mode`；`download_report_breaker_sample` 带 `p_open_cap_seconds`、`p_open_threshold_percent`、`p_close_threshold_percent`、`p_ewma_span`、`p_consecutive_threshold`、`p_min_samples_before_ewma_open`、`p_idle_reset_seconds`、`p_half_open_success_threshold`、`p_half_open_close_mode`、`p_half_open_max_seconds`、`p_half_open_timeout_mode`，并按响应结果附带 `p_retry_after_seconds` / `p_probe_version`；SQL 按 `halfOpenCloseMode` 计算 half-open 成功关闭条件，按 `halfOpenMaxSeconds` + `halfOpenTimeoutMode` 处理 half-open timeout，其中 `halfOpenMaxSeconds=0` 表示禁用 timeout cap，`partial-close` 只在已有 half-open 成功证据时关闭，否则重新 `open`。
+    - breaker 状态机只有 `closed/open/half_open` 三态：`open` 仅按权威快照立即 fail-fast；若请求启用 Fair Queue，worker 仍先完成 queue grant，再在实际 fetch 前调用 `download_authorize_breaker_attempt` 为这次请求申请 `half_open` attempt。
+    - `download_report_breaker_sample` 负责回写样本，但只在 `half_open` 且 `p_attempt_version` / `p_attempt_ticket` 命中当前 epoch 时接受该 attempt 结果；过期、重复或未获授权的响应不会推进恢复流程。
+    - `half_open` 现在按小批次 epoch 记账收敛：首个受保护错误立即重新 `open`，成功数满足 `halfOpenCloseMode` + `halfOpenSuccessThreshold` 定义的关闭条件时 `close`，整批 attempt 都已发出且全部回报后仍证据不足则重新 `open`，超时仍按 `halfOpenTimeoutMode` 处理；由于回报状态存进 signed `BIGINT` bitmap，`halfOpenMaxProbeCount` 的有效范围固定为 `1..63`。
     - SQL 里 `TOTAL_SAMPLES` 只保留 lifetime observability；EWMA warm-up 只看 `SAMPLES_SINCE_RESET`，并用 `LAST_SAMPLE_AT` + `idleResetSeconds` 在 `closed` 态空闲过久后先软重置 breaker 记忆再评估新样本。
-    - 下载后仅按 `protectHttpCodes` 上报二值 `sample=1`，`2xx/3xx` 上报 `sample=0`；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退；受保护的 `half_open` canary 仍会立即重新 `open`。
+    - 下载后仅按 `protectHttpCodes` 上报二值 `sample=1`，`2xx/3xx` 上报 `sample=0`；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退；受保护的 `half_open` attempt 仍会立即重新 `open`。
 
 10. **Fair Queue（slot-handler）**
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
@@ -160,11 +160,11 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 
 - 下载缓存：`DOWNLOAD_CACHE_TABLE` + `download_upsert_download_cache`
 - IP 限流：`DOWNLOAD_IP_RATELIMIT_TABLE` + `download_upsert_rate_limit`
-- Breaker：`THROTTLE_PROTECTION` + `download_claim_breaker_probe` + `download_report_breaker_sample`（worker 对 `download_claim_breaker_probe` 传 `p_probe_lease_seconds`、`p_half_open_max_seconds`、`p_half_open_timeout_mode`；对 `download_report_breaker_sample` 传 `p_open_cap_seconds`、`p_open_threshold_percent`、`p_close_threshold_percent`、`p_ewma_span`、`p_consecutive_threshold`、`p_min_samples_before_ewma_open`、`p_idle_reset_seconds`、`p_half_open_success_threshold`、`p_half_open_close_mode`、`p_half_open_max_seconds`、`p_half_open_timeout_mode`，并按响应结果附带 `p_retry_after_seconds` / `p_probe_version`；SQL 用 `SAMPLES_SINCE_RESET` / `LAST_SAMPLE_AT` 管 warm-up 与 idle reset，并在 `half_open` 内执行参数化 close/timeout 规则，`partial-close` 只在 `SUCCESS_STREAK > 0` 时关闭，`TOTAL_SAMPLES` 仅保留累计观测）
+- Breaker：`THROTTLE_PROTECTION` + `download_authorize_breaker_attempt` + `download_report_breaker_sample`（controller bootstrap 只新增 `halfOpenMaxProbeCount` 并移除 `probeLeaseSeconds`；controller 和 worker 都会在配置解析阶段拒绝 `halfOpenMaxProbeCount > 63`，因为 SQL 用 signed `BIGINT` bitmap 记录 half-open attempt 回报；worker 先排队拿 slot，再为实际 fetch 调用 `download_authorize_breaker_attempt` 申请 `half_open` attempt，并在响应后带 `p_attempt_version` / `p_attempt_ticket` 回写 sample；SQL 用小批次 epoch 记账收敛：首个受保护错误立即重新 `open`，成功数足够时 `close`，整批耗尽仍证据不足则重新 `open`，超时仍按 `halfOpenTimeoutMode` 处理；`SAMPLES_SINCE_RESET` / `LAST_SAMPLE_AT` 继续负责 warm-up 与 idle reset，`TOTAL_SAMPLES` 仅保留累计观测）
 - Last Active：`DOWNLOAD_LAST_ACTIVE_TABLE` + `download_update_last_active`
 - 统一检查：`download_unified_check`（直接返回 breaker 原始字段 `state/open_until/reason/version/last_error_code`）
 
-Fair Queue 相关函数由 `slot-handler` 使用（`fq_try_acquire_batch` / `fq_release_dual`）；其中 `fq_try_acquire_batch` 只在 backend 判定 `open` 窗口仍有效时返回 `THROTTLED` 与原始 breaker 元数据，不在 slot-handler 本地保存额外 breaker 状态，也不承担 Stage 2 / active recovery 职责。
+Fair Queue 相关函数由 `slot-handler` 使用（`fq_try_acquire_batch` / `fq_release_dual`）；其中 `fq_try_acquire_batch` 只在 backend 判定 `open` 窗口仍有效时返回 `THROTTLED` 与原始 breaker 元数据，不在 slot-handler 本地保存额外 breaker 状态。
 
 ## 7. 限制与注意事项
 

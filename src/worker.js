@@ -30,8 +30,9 @@ const DEFAULT_THROTTLE_MIN_SAMPLES_BEFORE_EWMA_OPEN = 8;
 const DEFAULT_THROTTLE_IDLE_RESET_SECONDS = 900;
 const DEFAULT_THROTTLE_HALF_OPEN_SUCCESS_THRESHOLD = 2;
 const DEFAULT_THROTTLE_HALF_OPEN_CLOSE_MODE = 'and';
-const DEFAULT_THROTTLE_PROBE_LEASE_SECONDS = 15;
-const DEFAULT_THROTTLE_HALF_OPEN_MAX_SECONDS = 0;
+const DEFAULT_THROTTLE_HALF_OPEN_MAX_PROBE_COUNT = 4;
+const MAX_THROTTLE_HALF_OPEN_PROBE_COUNT = 63;
+const DEFAULT_THROTTLE_HALF_OPEN_MAX_SECONDS = 15;
 const DEFAULT_THROTTLE_HALF_OPEN_TIMEOUT_MODE = 'partial-close';
 const DEFAULT_THROTTLE_PROTECT_HTTP_CODES = [429, 499, 500, 502, 503, 504];
 // slot-handler acquire is long-poll based; don't set per-request timeouts below this window.
@@ -265,11 +266,11 @@ const readSlotHandlerBreakerSnapshot = (payload) => {
   };
 };
 
-const readProbeLeaseRetryAfter = (snapshot, fallbackSeconds = 1, nowSeconds = Math.floor(Date.now() / 1000)) => {
-  const rawProbeLeaseUntil = Number(snapshot?.probeLeaseUntil);
-  const probeLeaseUntil = Number.isFinite(rawProbeLeaseUntil) ? Math.trunc(rawProbeLeaseUntil) : null;
-  if (probeLeaseUntil !== null && probeLeaseUntil > nowSeconds) {
-    return Math.max(1, probeLeaseUntil - nowSeconds);
+const readHalfOpenDeadlineRetryAfter = (snapshot, fallbackSeconds = 1, nowSeconds = Math.floor(Date.now() / 1000)) => {
+  const rawHalfOpenDeadline = Number(snapshot?.halfOpenDeadline);
+  const halfOpenDeadline = Number.isFinite(rawHalfOpenDeadline) ? Math.trunc(rawHalfOpenDeadline) : null;
+  if (halfOpenDeadline !== null && halfOpenDeadline > nowSeconds) {
+    return Math.max(1, halfOpenDeadline - nowSeconds);
   }
   return normalizePositiveSeconds(fallbackSeconds, 1) || 1;
 };
@@ -994,17 +995,23 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
       DEFAULT_THROTTLE_HALF_OPEN_SUCCESS_THRESHOLD,
     ),
     halfOpenCloseMode: normalizeHalfOpenCloseMode(throttleProfileConfig.halfOpenCloseMode),
-    probeLeaseSeconds: normalizePositiveSeconds(
-      throttleProfileConfig.probeLeaseSeconds,
-      DEFAULT_THROTTLE_PROBE_LEASE_SECONDS,
+    halfOpenMaxProbeCount: normalizePositiveSeconds(
+      throttleProfileConfig.halfOpenMaxProbeCount,
+      DEFAULT_THROTTLE_HALF_OPEN_MAX_PROBE_COUNT,
     ),
-    halfOpenMaxSeconds: normalizeNonNegativeInt(
+    halfOpenMaxSeconds: normalizePositiveSeconds(
       throttleProfileConfig.halfOpenMaxSeconds,
       DEFAULT_THROTTLE_HALF_OPEN_MAX_SECONDS,
     ),
     halfOpenTimeoutMode: normalizeHalfOpenTimeoutMode(throttleProfileConfig.halfOpenTimeoutMode),
     protectHttpCodes,
   };
+  if (throttleConfig.halfOpenMaxProbeCount > MAX_THROTTLE_HALF_OPEN_PROBE_COUNT) {
+    throw new Error(`controller throttle profile is invalid: halfOpenMaxProbeCount must be <= ${MAX_THROTTLE_HALF_OPEN_PROBE_COUNT}`);
+  }
+  if (throttleConfig.halfOpenSuccessThreshold > throttleConfig.halfOpenMaxProbeCount) {
+    throw new Error('controller throttle profile is invalid: halfOpenSuccessThreshold must be <= halfOpenMaxProbeCount');
+  }
 
   // fair queue from controller + decision
   const fairQueueConfigRaw = downloadBootstrap.fairQueue && typeof downloadBootstrap.fairQueue === 'object'
@@ -2036,12 +2043,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let cacheHit = false;
   let linkData = null;
   let unifiedThrottleHostnameHash = null;
-  const activeProbeVersions = new Map();
-  const normalizeProbeVersion = (value) => {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
-  };
-  
+
   // Use unified check when rate limit is enabled and dbMode is custom-pg-rest
   const supportsUnifiedCheck = config.rateLimitEnabled && config.dbMode === 'custom-pg-rest';
   const rateLimitConfig = config.rateLimitConfig || {};
@@ -2445,103 +2447,75 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  const claimBreakerProbeIfNeeded = async (hostname) => {
+  const authorizeBreakerAttemptIfNeeded = async (hostname) => {
     if (!throttleCheckEnabled || !hostname || !isThrottleManagedHostname(hostname)) {
-      return null;
-    }
-
-    const claimNowSeconds = Math.floor(Date.now() / 1000);
-
-    const shouldClaimProbe = (snapshot, nowSeconds) => {
-      if (!snapshot || typeof snapshot !== 'object') return false;
-      if (snapshot.state === 'half_open') return true;
-      return snapshot.state === 'open'
-        && Number.isFinite(snapshot.openUntil)
-        && snapshot.openUntil <= nowSeconds;
-    };
-
-    const authoritySnapshot = await readAuthoritySnapshotForHostname(hostname);
-    if (authoritySnapshot instanceof Response) {
-      return authoritySnapshot;
-    }
-
-    if (activeProbeVersions.has(hostname)) {
-      const activeProbeVersion = normalizeProbeVersion(activeProbeVersions.get(hostname));
-      const authorityProbeVersion = normalizeProbeVersion(authoritySnapshot?.version);
-      const authorityProbeLeaseUntil = normalizeProbeVersion(authoritySnapshot?.probeLeaseUntil);
-      if (
-        authoritySnapshot?.state === 'half_open'
-        && activeProbeVersion !== null
-        && authorityProbeVersion === activeProbeVersion
-        && authorityProbeLeaseUntil !== null
-        && authorityProbeLeaseUntil > claimNowSeconds
-      ) {
-        return null;
-      }
-      activeProbeVersions.delete(hostname);
-    }
-
-    const openBreaker = readOpenBreakerSnapshot(
-      authoritySnapshot,
-      config.throttleConfig?.openCapSeconds || DEFAULT_THROTTLE_OPEN_CAP_SECONDS,
-      claimNowSeconds,
-    );
-    if (openBreaker) {
-      await slowFailDelay();
-      console.log(
-        `[Throttle] Open breaker from fresh authority snapshot: ${hostname}, returning error ${openBreaker.errorCode}, retry after ${openBreaker.retryAfter}s`
-      );
-      return createThrottleProtectedResponse(origin, openBreaker);
-    }
-
-    if (!shouldClaimProbe(authoritySnapshot, claimNowSeconds)) {
-      return null;
+      return {
+        blockedResponse: null,
+        attemptVersion: null,
+        attemptTicket: null,
+      };
     }
 
     try {
-      const claimedSnapshot = await throttleManager.claimBreakerProbe(hostname, { ...config.throttleConfig, ctx });
-      if (!claimedSnapshot) {
-        console.error('[Throttle] Probe claim returned no authority state');
-        return createBreakerAuthorityUnavailableResponse(origin, 'probe claim');
-      }
-
-      if (claimedSnapshot.state === 'half_open' && claimedSnapshot.probeGranted === true) {
-        activeProbeVersions.set(hostname, normalizeProbeVersion(claimedSnapshot.version));
+      const attemptSnapshot = await throttleManager.authorizeBreakerAttempt(hostname, { ...config.throttleConfig, ctx });
+      if (!attemptSnapshot) {
+        console.error('[Throttle] Attempt authorize returned no authority state');
+        return {
+          blockedResponse: createBreakerAuthorityUnavailableResponse(origin, 'attempt authorize'),
+          attemptVersion: null,
+          attemptTicket: null,
+        };
       }
 
       const openBreaker = readOpenBreakerSnapshot(
-        claimedSnapshot,
+        attemptSnapshot,
         config.throttleConfig?.openCapSeconds || DEFAULT_THROTTLE_OPEN_CAP_SECONDS,
       );
       if (openBreaker) {
         await slowFailDelay();
         console.log(
-          `[Throttle] Open breaker after probe claim: ${hostname}, returning error ${openBreaker.errorCode}, retry after ${openBreaker.retryAfter}s`
+          `[Throttle] Open breaker after attempt authorize: ${hostname}, returning error ${openBreaker.errorCode}, retry after ${openBreaker.retryAfter}s`
         );
-        return createThrottleProtectedResponse(origin, openBreaker);
+        return {
+          blockedResponse: createThrottleProtectedResponse(origin, openBreaker),
+          attemptVersion: null,
+          attemptTicket: null,
+        };
       }
 
-      if (claimedSnapshot.state === 'half_open' && claimedSnapshot.probeGranted !== true) {
-        const retryAfter = readProbeLeaseRetryAfter(claimedSnapshot, 1);
+      if (attemptSnapshot.state === 'half_open' && attemptSnapshot.attemptGranted !== true) {
+        const retryAfter = readHalfOpenDeadlineRetryAfter(attemptSnapshot, 1);
         await slowFailDelay();
         console.log(
-          `[Throttle] Half-open probe already leased for ${hostname}, retry after ${retryAfter}s`
+          `[Throttle] Half-open batch full for ${hostname}, retry after ${retryAfter}s`
         );
-        return createThrottleProtectedResponse(origin, {
-          errorCode: claimedSnapshot.lastErrorCode || 503,
-          retryAfter,
-          message: `Service temporarily unavailable (breaker probe already in flight, retry after ${retryAfter}s)`,
-        });
+        return {
+          blockedResponse: createThrottleProtectedResponse(origin, {
+            errorCode: attemptSnapshot.lastErrorCode || 503,
+            retryAfter,
+            message: `Service temporarily unavailable (half-open batch is full, retry after ${retryAfter}s)`,
+          }),
+          attemptVersion: null,
+          attemptTicket: null,
+        };
       }
-    } catch (error) {
-      console.error('[Throttle] Probe claim failed:', error instanceof Error ? error.message : String(error));
-      return createBreakerAuthorityUnavailableResponse(origin, 'probe claim');
-    }
 
-    return null;
+      return {
+        blockedResponse: null,
+        attemptVersion: attemptSnapshot.attemptGranted === true ? attemptSnapshot.version : null,
+        attemptTicket: attemptSnapshot.attemptGranted === true ? attemptSnapshot.attemptTicket : null,
+      };
+    } catch (error) {
+      console.error('[Throttle] Attempt authorize failed:', error instanceof Error ? error.message : String(error));
+      return {
+        blockedResponse: createBreakerAuthorityUnavailableResponse(origin, 'attempt authorize'),
+        attemptVersion: null,
+        attemptTicket: null,
+      };
+    }
   };
 
-  const reportBreakerResponseIfNeeded = async (hostname, response) => {
+  const reportBreakerResponseIfNeeded = async (hostname, response, attempt = null) => {
     if (!throttleCheckEnabled || !hostname || !response || !isThrottleManagedHostname(hostname)) {
       return;
     }
@@ -2562,8 +2536,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const retryAfterSeconds = isProtectedError
         ? deriveOpenSeconds(response.headers.get('Retry-After'), config.throttleConfig?.openCapSeconds || 60)
         : null;
-      const probeVersion = activeProbeVersions.has(hostname)
-        ? normalizeProbeVersion(activeProbeVersions.get(hostname))
+      const attemptVersion = Number.isFinite(attempt?.attemptVersion)
+        ? Math.trunc(attempt.attemptVersion)
+        : null;
+      const attemptTicket = Number.isFinite(attempt?.attemptTicket)
+        ? Math.trunc(attempt.attemptTicket)
         : null;
 
       if (isProtectedError) {
@@ -2575,7 +2552,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         {
           sample,
           statusCode,
-          probeVersion,
+          attemptVersion,
+          attemptTicket,
           retryAfterSeconds,
         },
         { ...config.throttleConfig, ctx }
@@ -2585,10 +2563,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         console.error('[Throttle] Sample report returned no authority state');
         return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
       }
-
-      activeProbeVersions.delete(hostname);
     } catch (error) {
-      activeProbeVersions.delete(hostname);
       console.error('[Throttle] Sample report failed:', error instanceof Error ? error.message : String(error));
       return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
     }
@@ -2704,12 +2679,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return upstreamRequest;
   };
 
-  const fetchUpstreamWithBreakerClaim = async (requestToFetch) => {
+  const fetchUpstreamWithBreakerAttempt = async (requestToFetch) => {
     const requestHostnameRaw = extractHostname(requestToFetch?.url || '');
     const requestHostname = requestHostnameRaw ? requestHostnameRaw.toLowerCase() : null;
-    const blockedResponse = await claimBreakerProbeIfNeeded(requestHostname);
-    if (blockedResponse) {
-      return { blockedResponse, response: null };
+    const attempt = await authorizeBreakerAttemptIfNeeded(requestHostname);
+    if (attempt.blockedResponse) {
+      return { blockedResponse: attempt.blockedResponse, response: null };
     }
 
     if (fqContext && !fqContext.hitUpstreamAtMs) {
@@ -2720,7 +2695,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       blockedResponse: null,
       response: await (async () => {
         const upstreamResponse = await fetch(requestToFetch);
-        const reportFailureResponse = await reportBreakerResponseIfNeeded(requestHostname, upstreamResponse);
+        const reportFailureResponse = await reportBreakerResponseIfNeeded(requestHostname, upstreamResponse, attempt);
         if (reportFailureResponse) {
           throw reportFailureResponse;
         }
@@ -2739,7 +2714,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     request = buildUpstreamRequest(downloadUrl, res.data.header);
-    let { blockedResponse, response } = await fetchUpstreamWithBreakerClaim(request);
+    let { blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request);
     if (blockedResponse) {
       return blockedResponse;
     }
@@ -2749,13 +2724,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         const currentOrigin = new URL(originalRequest.url).origin;
         if (location.startsWith(`${currentOrigin}/`)) {
           request = new Request(location, request);
-          return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
-        } else {
-          request = new Request(location, request);
-          ({ blockedResponse, response } = await fetchUpstreamWithBreakerClaim(request));
-          if (blockedResponse) {
-            return blockedResponse;
-          }
+            return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
+          } else {
+            request = new Request(location, request);
+            ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
+            if (blockedResponse) {
+              return blockedResponse;
+            }
         }
       } else {
         break;
@@ -2854,7 +2829,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           }
         }
         request = buildUpstreamRequest(downloadUrl, res.data.header);
-        ({ blockedResponse, response } = await fetchUpstreamWithBreakerClaim(request));
+        ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
         if (blockedResponse) {
           return blockedResponse;
         }
@@ -2867,7 +2842,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
               return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
             } else {
               request = new Request(location, request);
-              ({ blockedResponse, response } = await fetchUpstreamWithBreakerClaim(request));
+              ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
               if (blockedResponse) {
                 return blockedResponse;
               }
