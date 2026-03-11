@@ -54,11 +54,11 @@ func TestPickSingleMatchesBatchOfOne(t *testing.T) {
 	storeSingle, schedSingle, nowSingle, logicalSingle := buildSchedulerEngineFixture(t)
 	storeBatch, schedBatch, nowBatch, logicalBatch := buildSchedulerEngineFixture(t)
 
-	pickSingle, ok := schedSingle.PickNextInFlight(storeSingle, "h1", nowSingle)
+	pickSingle, ok := schedSingle.PickNextInFlight(storeSingle, "h1", nowSingle, nil)
 	if !ok {
 		t.Fatalf("expected PickNextInFlight to choose one flow")
 	}
-	picks := schedBatch.PickNextInFlightBatch(storeBatch, "h1", nowBatch, 1)
+	picks := schedBatch.PickNextInFlightBatch(storeBatch, "h1", nowBatch, 1, nil)
 	if len(picks) != 1 {
 		t.Fatalf("expected batch-of-one to choose one flow, got %d", len(picks))
 	}
@@ -107,7 +107,7 @@ func TestSchedulerEngineNoDuplicateAcrossBatch(t *testing.T) {
 		store.mu.Unlock()
 
 		sched := newFQHostFlowScheduler()
-		picks := sched.PickNextInFlightBatch(store, "h1", now, 3)
+		picks := sched.PickNextInFlightBatch(store, "h1", now, 3, nil)
 		if len(picks) != 3 {
 			t.Fatalf("expected 3 picks, got %d", len(picks))
 		}
@@ -149,7 +149,7 @@ func TestSchedulerEngineNoDuplicateAcrossBatch(t *testing.T) {
 		store.mu.Unlock()
 
 		sched := newFQHostFlowScheduler()
-		picks := sched.PickNextInFlightBatch(store, "h1", now, 2)
+		picks := sched.PickNextInFlightBatch(store, "h1", now, 2, nil)
 		if len(picks) != 2 {
 			t.Fatalf("expected 2 picks, got %d", len(picks))
 		}
@@ -222,8 +222,8 @@ func TestSchedulerNormalizationDuringBatchKeepsOrderStable(t *testing.T) {
 	st2Norm.VirtualTime = 1
 	bt2Norm.VirtualTime = 1
 
-	highPicks := schedHigh.PickNextInFlightBatch(storeHigh, "h1", nowHigh, 4)
-	normPicks := schedNormalized.PickNextInFlightBatch(storeNormalized, "h1", nowNormalized, 4)
+	highPicks := schedHigh.PickNextInFlightBatch(storeHigh, "h1", nowHigh, 4, nil)
+	normPicks := schedNormalized.PickNextInFlightBatch(storeNormalized, "h1", nowNormalized, 4, nil)
 	if len(highPicks) != 4 || len(normPicks) != 4 {
 		t.Fatalf("expected 4 picks from both schedulers, got high=%d normalized=%d", len(highPicks), len(normPicks))
 	}

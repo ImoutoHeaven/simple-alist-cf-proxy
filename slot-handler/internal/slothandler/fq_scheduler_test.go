@@ -30,7 +30,7 @@ func TestSchedulerOnlyPicksInFlightWaiters(t *testing.T) {
 	}
 
 	sched := newFQHostFlowScheduler()
-	chosen, ok := sched.PickNextInFlight(store, "h1", now)
+	chosen, ok := sched.PickNextInFlight(store, "h1", now, nil)
 	if !ok {
 		t.Fatalf("expected a chosen flow")
 	}
@@ -69,7 +69,7 @@ func TestSchedulerPicksByLocalVTThenCreatedAt(t *testing.T) {
 		}
 
 		sched := newFQHostFlowScheduler()
-		chosen, ok := sched.PickNextInFlight(store, "h1", now)
+		chosen, ok := sched.PickNextInFlight(store, "h1", now, nil)
 		if !ok {
 			t.Fatalf("expected a chosen flow")
 		}
@@ -103,7 +103,7 @@ func TestSchedulerPicksByLocalVTThenCreatedAt(t *testing.T) {
 
 		// Both LocalVT start at 0; should pick the older CreatedAt.
 		sched := newFQHostFlowScheduler()
-		chosen, ok := sched.PickNextInFlight(store, "h1", now)
+		chosen, ok := sched.PickNextInFlight(store, "h1", now, nil)
 		if !ok {
 			t.Fatalf("expected a chosen flow")
 		}
@@ -131,7 +131,7 @@ func TestSchedulerAdvancesVirtualTimeByInverseWeight(t *testing.T) {
 	st.WaitCount = 3
 	bt.WaitCount = 3
 
-	_, ok := sched.PickNextInFlight(store, "h1", now)
+	_, ok := sched.PickNextInFlight(store, "h1", now, nil)
 	if !ok {
 		t.Fatalf("expected a chosen flow")
 	}
@@ -173,7 +173,7 @@ func TestSchedulerSkipsDeniedBuckets(t *testing.T) {
 	btOK.VirtualTime = 100
 	btDenied.DenyUntil = now.Add(10 * time.Second)
 
-	chosen, ok := sched.PickNextInFlight(store, "h1", now)
+	chosen, ok := sched.PickNextInFlight(store, "h1", now, nil)
 	if !ok {
 		t.Fatalf("expected a chosen flow")
 	}
@@ -211,7 +211,7 @@ func TestSchedulerSkipsDeniedBucketsAcrossSites(t *testing.T) {
 	btDenied.DenyUntil = now.Add(10 * time.Second)
 
 	t.Run("single_pick", func(t *testing.T) {
-		chosen, ok := sched.PickNextInFlight(store, "h1", now)
+		chosen, ok := sched.PickNextInFlight(store, "h1", now, nil)
 		if !ok {
 			t.Fatalf("expected a chosen flow")
 		}
@@ -233,7 +233,7 @@ func TestSchedulerSkipsDeniedBucketsAcrossSites(t *testing.T) {
 		btDeniedBatch.VirtualTime = 0
 		btDeniedBatch.DenyUntil = now.Add(10 * time.Second)
 
-		picks := schedBatch.PickNextInFlightBatch(store, "h1", now, 2)
+		picks := schedBatch.PickNextInFlightBatch(store, "h1", now, 2, nil)
 		if len(picks) != 1 {
 			t.Fatalf("expected one eligible pick, got %d", len(picks))
 		}
@@ -241,6 +241,31 @@ func TestSchedulerSkipsDeniedBucketsAcrossSites(t *testing.T) {
 			t.Fatalf("expected eligible site flow in batch, got %q want %q", picks[0].Token, tokEligible)
 		}
 	})
+}
+
+func TestSchedulerSkipsIneligibleFlowAndPicksNextEligible(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	now := time.Date(2026, 3, 11, 12, 0, 0, 0, time.UTC)
+
+	bad := store.newFlow("h1", "example.com", "ip-full", "s1")
+	good := store.newFlow("h1", "example.com", "ip-open", "s1")
+	if ok, err := store.attachWaiter(bad, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("expected attach ok for ineligible token: ok=%t err=%v", ok, err)
+	}
+	if ok, err := store.attachWaiter(good, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("expected attach ok for eligible token: ok=%t err=%v", ok, err)
+	}
+
+	sched := newFQHostFlowScheduler()
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 1, func(snap fqFlowSnapshot) bool {
+		return snap.IPBucket != "ip-full"
+	})
+
+	if len(picks) != 1 || picks[0].Token != good {
+		t.Fatalf("expected eligible token %q, got %+v", good, picks)
+	}
 }
 
 func TestPickNextInFlightBatchRespectsFairness(t *testing.T) {
@@ -269,7 +294,7 @@ func TestPickNextInFlightBatchRespectsFairness(t *testing.T) {
 	}
 
 	sched := newFQHostFlowScheduler()
-	picks := sched.PickNextInFlightBatch(store, "h1", now, 3)
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 3, nil)
 	if len(picks) != 3 {
 		t.Fatalf("expected 3 picks, got %d", len(picks))
 	}
@@ -300,7 +325,7 @@ func TestPickNextInFlightBatchReturnsUniqueFlows(t *testing.T) {
 	}
 
 	sched := newFQHostFlowScheduler()
-	picks := sched.PickNextInFlightBatch(store, "h1", now, 3)
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 3, nil)
 	if len(picks) != 2 {
 		t.Fatalf("expected 2 picks, got %d", len(picks))
 	}
@@ -326,7 +351,7 @@ func TestPickNextInFlightBatchStopsWhenFewerThanN(t *testing.T) {
 	}
 
 	sched := newFQHostFlowScheduler()
-	picks := sched.PickNextInFlightBatch(store, "h1", now, 5)
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 5, nil)
 	if len(picks) != 1 {
 		t.Fatalf("expected 1 pick, got %d", len(picks))
 	}
@@ -347,10 +372,10 @@ func TestPickNextInFlightBatchNZeroOrLess(t *testing.T) {
 	}
 
 	sched := newFQHostFlowScheduler()
-	if picks := sched.PickNextInFlightBatch(store, "h1", now, 0); len(picks) != 0 {
+	if picks := sched.PickNextInFlightBatch(store, "h1", now, 0, nil); len(picks) != 0 {
 		t.Fatalf("expected empty picks for n=0, got %d", len(picks))
 	}
-	if picks := sched.PickNextInFlightBatch(store, "h1", now, -2); len(picks) != 0 {
+	if picks := sched.PickNextInFlightBatch(store, "h1", now, -2, nil); len(picks) != 0 {
 		t.Fatalf("expected empty picks for n<0, got %d", len(picks))
 	}
 }
@@ -376,7 +401,7 @@ func TestPickNextInFlightBatchSkipsDuplicatesAndContinues(t *testing.T) {
 	}
 
 	sched := newFQHostFlowScheduler()
-	picks := sched.PickNextInFlightBatch(store, "h1", now, 2)
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 2, nil)
 	if len(picks) != 2 {
 		t.Fatalf("expected 2 picks, got %d", len(picks))
 	}
@@ -421,7 +446,7 @@ func TestPickNextInFlightBatchScansOncePerBatch(t *testing.T) {
 	}
 
 	sched := newFQHostFlowScheduler()
-	picks := sched.PickNextInFlightBatch(store, "h1", now, 3)
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 3, nil)
 	if len(picks) != 3 {
 		t.Fatalf("expected 3 picks, got %d", len(picks))
 	}
@@ -446,14 +471,14 @@ func TestSchedulerPrunesIdleStates(t *testing.T) {
 		}
 
 		sched := newFQHostFlowScheduler()
-		if _, ok := sched.PickNextInFlight(store, "h1", now); !ok {
+		if _, ok := sched.PickNextInFlight(store, "h1", now, nil); !ok {
 			t.Fatalf("expected first pick to initialize scheduler state")
 		}
 
 		if !store.detachWaiter(tokDrop) {
 			t.Fatalf("expected detach ok for idle bucket flow")
 		}
-		if _, ok := sched.PickNextInFlight(store, "h1", now); !ok {
+		if _, ok := sched.PickNextInFlight(store, "h1", now, nil); !ok {
 			t.Fatalf("expected second pick from remaining in-flight flow")
 		}
 
@@ -485,14 +510,14 @@ func TestSchedulerPrunesIdleStates(t *testing.T) {
 		}
 
 		sched := newFQHostFlowScheduler()
-		if _, ok := sched.PickNextInFlight(store, "h1", now); !ok {
+		if _, ok := sched.PickNextInFlight(store, "h1", now, nil); !ok {
 			t.Fatalf("expected pick to initialize scheduler state")
 		}
 
 		if !store.detachWaiter(tok) {
 			t.Fatalf("expected detach ok for idle site flow")
 		}
-		if _, ok := sched.PickNextInFlight(store, "h1", now); ok {
+		if _, ok := sched.PickNextInFlight(store, "h1", now, nil); ok {
 			t.Fatalf("expected no in-flight flow after detach")
 		}
 

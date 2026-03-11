@@ -33,7 +33,7 @@ func BenchmarkPickNextInFlightBatch_HeapEngine_Backlog(b *testing.B) {
 			pickedTotal := 0
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				picks := sched.PickNextInFlightBatch(store, "h1", now, batchSize)
+				picks := sched.PickNextInFlightBatch(store, "h1", now, batchSize, nil)
 				if len(picks) != batchSize {
 					b.Fatalf("expected full batch for backlog=%d: got=%d want=%d", backlog, len(picks), batchSize)
 				}

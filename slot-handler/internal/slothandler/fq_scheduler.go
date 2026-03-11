@@ -31,6 +31,8 @@ type fqBucketFlowState struct {
 	DenyUntil   time.Time
 }
 
+type fqFlowEligible func(fqFlowSnapshot) bool
+
 type flowMinHeap []fqFlowSnapshot
 
 func (h flowMinHeap) Len() int { return len(h) }
@@ -191,7 +193,7 @@ func (h *fqHostFlowScheduler) getOrInitBucket(site *fqSiteFlowState, bucketKey s
 //
 // Selection MUST be based only on the in-flight set (flows with waiter != nil).
 // It does not use time-based heuristics like active windows.
-func (h *fqHostFlowScheduler) PickNextInFlight(store *flowStore, hostKey string, now time.Time) (fqFlowSnapshot, bool) {
+func (h *fqHostFlowScheduler) PickNextInFlight(store *flowStore, hostKey string, now time.Time, eligible fqFlowEligible) (fqFlowSnapshot, bool) {
 	if h == nil || store == nil {
 		return fqFlowSnapshot{}, false
 	}
@@ -199,7 +201,7 @@ func (h *fqHostFlowScheduler) PickNextInFlight(store *flowStore, hostKey string,
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	picks := h.pickBatchLocked(store, hostKey, now, 1)
+	picks := h.pickBatchLocked(store, hostKey, now, 1, eligible)
 	if len(picks) == 0 {
 		return fqFlowSnapshot{}, false
 	}
@@ -208,7 +210,7 @@ func (h *fqHostFlowScheduler) PickNextInFlight(store *flowStore, hostKey string,
 
 // PickNextInFlightBatch selects up to n unique in-flight flows using the same wall-clock now.
 // Virtual time advances per pick.
-func (h *fqHostFlowScheduler) PickNextInFlightBatch(store *flowStore, hostKey string, now time.Time, n int) []fqFlowSnapshot {
+func (h *fqHostFlowScheduler) PickNextInFlightBatch(store *flowStore, hostKey string, now time.Time, n int, eligible fqFlowEligible) []fqFlowSnapshot {
 	if h == nil || store == nil || n <= 0 {
 		return nil
 	}
@@ -216,10 +218,10 @@ func (h *fqHostFlowScheduler) PickNextInFlightBatch(store *flowStore, hostKey st
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	return h.pickBatchLocked(store, hostKey, now, n)
+	return h.pickBatchLocked(store, hostKey, now, n, eligible)
 }
 
-func (h *fqHostFlowScheduler) pickBatchLocked(store *flowStore, hostKey string, now time.Time, n int) []fqFlowSnapshot {
+func (h *fqHostFlowScheduler) pickBatchLocked(store *flowStore, hostKey string, now time.Time, n int, eligible fqFlowEligible) []fqFlowSnapshot {
 	if h == nil || store == nil || n <= 0 {
 		return nil
 	}
@@ -314,6 +316,9 @@ func (h *fqHostFlowScheduler) pickBatchLocked(store *flowStore, hostKey string, 
 		picked := false
 		for bn.flows.Len() > 0 {
 			pick := heap.Pop(&bn.flows).(fqFlowSnapshot)
+			if eligible != nil && !eligible(pick) {
+				continue
+			}
 			delete(active, pick.Token)
 
 			selected, ok := store.trySelectInFlight(pick.Token, hostKey, now)

@@ -5,28 +5,97 @@ import (
 	"time"
 )
 
-func TestActiveSlotsTrackHostAndSite(t *testing.T) {
+func TestActiveSlotsTrackHostSiteAndIP(t *testing.T) {
 	tr := newActiveTracker()
 	now := time.Unix(0, 0)
-	tr.AddLease("tok", "h1", "s1", 5*time.Second, now)
-	if tr.ActiveHost("h1", now) != 1 {
-		t.Fatalf("host active mismatch")
+	tr.AddLease("tok", "h1", "s1", "ip1", 5*time.Second, now)
+
+	if got := tr.ActiveHost("h1", now); got != 1 {
+		t.Fatalf("host=%d", got)
 	}
-	if tr.ActiveSite("h1", "s1", now) != 1 {
-		t.Fatalf("site active mismatch")
+	if got := tr.ActiveSite("h1", "s1", now); got != 1 {
+		t.Fatalf("site=%d", got)
+	}
+	if got := tr.ActiveHostIP("h1", "ip1", now); got != 1 {
+		t.Fatalf("host ip=%d", got)
+	}
+	if got := tr.ActiveSiteIP("h1", "s1", "ip1", now); got != 1 {
+		t.Fatalf("site ip=%d", got)
 	}
 }
 
-func TestActiveSlotsIncrementDecrementRoundTrip(t *testing.T) {
+func TestActiveSlotsTrackTrimmedEmptyIPBucket(t *testing.T) {
 	tr := newActiveTracker()
 	now := time.Unix(0, 0)
-	tr.AddLease("tok", "h1", "s1", 5*time.Second, now)
-	tr.ReleaseLease("tok")
-	if tr.ActiveHost("h1", now) != 0 {
-		t.Fatalf("host active mismatch")
+	tr.AddLease("tok", "h1", "s1", " \t ", 5*time.Second, now)
+
+	if got := tr.ActiveHostIP("h1", "", now); got != 1 {
+		t.Fatalf("host empty ip=%d", got)
 	}
-	if tr.ActiveSite("h1", "s1", now) != 0 {
-		t.Fatalf("site active mismatch")
+	if got := tr.ActiveSiteIP("h1", "s1", "", now); got != 1 {
+		t.Fatalf("site empty ip=%d", got)
+	}
+
+	tr.ReleaseLease("tok")
+	if got := tr.ActiveHostIP("h1", "", now); got != 0 {
+		t.Fatalf("host empty ip after release=%d", got)
+	}
+	if got := tr.ActiveSiteIP("h1", "s1", "", now); got != 0 {
+		t.Fatalf("site empty ip after release=%d", got)
+	}
+}
+
+func TestActiveLeaseReleaseClearsIPIndexes(t *testing.T) {
+	tr := newActiveTracker()
+	now := time.Unix(0, 0)
+	tr.AddLease("tok", "h1", "s1", "ip1", 5*time.Second, now)
+	tr.ReleaseLease("tok")
+
+	if got := tr.ActiveHost("h1", now); got != 0 {
+		t.Fatalf("host=%d", got)
+	}
+	if got := tr.ActiveSite("h1", "s1", now); got != 0 {
+		t.Fatalf("site=%d", got)
+	}
+	if got := tr.ActiveHostIP("h1", "ip1", now); got != 0 {
+		t.Fatalf("host ip=%d", got)
+	}
+	if got := tr.ActiveSiteIP("h1", "s1", "ip1", now); got != 0 {
+		t.Fatalf("site ip=%d", got)
+	}
+}
+
+func TestActiveTrackerNoPruneReadsReflectExplicitPrune(t *testing.T) {
+	tr := newActiveTracker()
+	now := time.Unix(0, 0)
+	tr.AddLease("tok", "h1", "s1", "ip1", 5*time.Second, now)
+
+	if got := tr.ActiveHostNoPrune("h1"); got != 1 {
+		t.Fatalf("host no prune=%d", got)
+	}
+	if got := tr.ActiveSiteNoPrune("h1", "s1"); got != 1 {
+		t.Fatalf("site no prune=%d", got)
+	}
+	if got := tr.ActiveHostIPNoPrune("h1", "ip1"); got != 1 {
+		t.Fatalf("host ip no prune=%d", got)
+	}
+	if got := tr.ActiveSiteIPNoPrune("h1", "s1", "ip1"); got != 1 {
+		t.Fatalf("site ip no prune=%d", got)
+	}
+
+	tr.Prune(now.Add(6 * time.Second))
+
+	if got := tr.ActiveHostNoPrune("h1"); got != 0 {
+		t.Fatalf("host no prune after prune=%d", got)
+	}
+	if got := tr.ActiveSiteNoPrune("h1", "s1"); got != 0 {
+		t.Fatalf("site no prune after prune=%d", got)
+	}
+	if got := tr.ActiveHostIPNoPrune("h1", "ip1"); got != 0 {
+		t.Fatalf("host ip no prune after prune=%d", got)
+	}
+	if got := tr.ActiveSiteIPNoPrune("h1", "s1", "ip1"); got != 0 {
+		t.Fatalf("site ip no prune after prune=%d", got)
 	}
 }
 
@@ -45,7 +114,7 @@ func TestActiveSlotsClampBelowZero(t *testing.T) {
 func TestActiveLeaseExpires(t *testing.T) {
 	tr := newActiveTracker()
 	now := time.Unix(0, 0)
-	tr.AddLease("tok", "h1", "s1", 5*time.Second, now)
+	tr.AddLease("tok", "h1", "s1", "ip1", 5*time.Second, now)
 	if tr.ActiveHost("h1", now) != 1 {
 		t.Fatalf("expected host active=1")
 	}
@@ -57,7 +126,7 @@ func TestActiveLeaseExpires(t *testing.T) {
 func TestActiveLeaseExpiresForSite(t *testing.T) {
 	tr := newActiveTracker()
 	now := time.Unix(0, 0)
-	tr.AddLease("tok", "h1", "s1", 5*time.Second, now)
+	tr.AddLease("tok", "h1", "s1", "ip1", 5*time.Second, now)
 	if tr.ActiveSite("h1", "s1", now) != 1 {
 		t.Fatalf("expected site active=1")
 	}
@@ -71,9 +140,9 @@ func TestActiveTrackerCounterConsistency(t *testing.T) {
 	now := time.Unix(0, 0)
 
 	// Add multiple leases for same host
-	tr.AddLease("tok1", "h1", "s1", 5*time.Second, now)
-	tr.AddLease("tok2", "h1", "s2", 5*time.Second, now)
-	tr.AddLease("tok3", "h2", "s1", 5*time.Second, now)
+	tr.AddLease("tok1", "h1", "s1", "ip1", 5*time.Second, now)
+	tr.AddLease("tok2", "h1", "s2", "ip2", 5*time.Second, now)
+	tr.AddLease("tok3", "h2", "s1", "ip3", 5*time.Second, now)
 
 	if got := tr.ActiveHost("h1", now); got != 2 {
 		t.Fatalf("expected h1 active=2, got %d", got)
@@ -88,7 +157,6 @@ func TestActiveTrackerCounterConsistency(t *testing.T) {
 		t.Fatalf("expected h1/s2 active=1, got %d", got)
 	}
 
-	// Release one lease
 	tr.ReleaseLease("tok1")
 	if got := tr.ActiveHost("h1", now); got != 1 {
 		t.Fatalf("after release, expected h1 active=1, got %d", got)
@@ -97,32 +165,11 @@ func TestActiveTrackerCounterConsistency(t *testing.T) {
 		t.Fatalf("after release, expected h1/s1 active=0, got %d", got)
 	}
 
-	// Expire remaining leases
 	expired := now.Add(6 * time.Second)
 	if got := tr.ActiveHost("h1", expired); got != 0 {
 		t.Fatalf("after expiry, expected h1 active=0, got %d", got)
 	}
 	if got := tr.ActiveHost("h2", expired); got != 0 {
 		t.Fatalf("after expiry, expected h2 active=0, got %d", got)
-	}
-}
-
-func TestActiveTrackerLegacyAddWithCounters(t *testing.T) {
-	tr := newActiveTracker()
-
-	// Legacy Add with positive delta
-	tr.Add("h1", "s1", 3)
-	now := time.Now()
-	if got := tr.ActiveHost("h1", now); got != 3 {
-		t.Fatalf("expected h1 active=3, got %d", got)
-	}
-	if got := tr.ActiveSite("h1", "s1", now); got != 3 {
-		t.Fatalf("expected h1/s1 active=3, got %d", got)
-	}
-
-	// Legacy Add with negative delta
-	tr.Add("h1", "s1", -2)
-	if got := tr.ActiveHost("h1", now); got != 1 {
-		t.Fatalf("after decrement, expected h1 active=1, got %d", got)
 	}
 }

@@ -40,6 +40,11 @@ type batchBackend struct {
 	called bool
 }
 
+type recordingBatchBackend struct {
+	mu   sync.Mutex
+	seen [][]AcquireRequest
+}
+
 type holBlockingBackend struct {
 	mu          sync.Mutex
 	seenBatches [][]string
@@ -210,6 +215,38 @@ func (b *partialFailureBackend) TryAcquireBatch(ctx context.Context, reqs []Acqu
 
 func (b *partialFailureBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
 	return nil
+}
+
+func (b *recordingBatchBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+	copyReqs := append([]AcquireRequest(nil), reqs...)
+	b.mu.Lock()
+	b.seen = append(b.seen, copyReqs)
+	b.mu.Unlock()
+
+	results := make([]*tryAcquireResult, len(reqs))
+	for i := range results {
+		results[i] = &tryAcquireResult{status: "WAIT"}
+	}
+	return results, nil
+}
+
+func (b *recordingBatchBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	return nil
+}
+
+func (b *recordingBatchBackend) seenIPBatches() [][]string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	batches := make([][]string, 0, len(b.seen))
+	for _, batch := range b.seen {
+		ips := make([]string, 0, len(batch))
+		for _, req := range batch {
+			ips = append(ips, req.IPBucket)
+		}
+		batches = append(batches, ips)
+	}
+	return batches
 }
 
 func (b *batchBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
@@ -815,6 +852,132 @@ func TestProbeOnceAcquireUndeliveredTriggersRelease(t *testing.T) {
 	}
 }
 
+func TestProbeOnceSkipsHostIPAtCapacity(t *testing.T) {
+	maxHostIP := 1
+	zero := 0
+	backend := &recordingBatchBackend{}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		HostCaps: HostCapsConfig{MaxSlotPerIP: &maxHostIP},
+		SiteCaps: SiteCapsConfig{MaxSlotPerIP: &zero},
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Date(2026, 3, 11, 12, 0, 0, 0, time.UTC)
+	hostKey := "h1"
+	s.activeSlots.AddLease("slot-full", hostKey, "s1", "ip-full", 30*time.Second, now)
+
+	store := s.flowStore
+	fullTok := store.newFlow(hostKey, "example.com", "ip-full", "s1")
+	fullCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(fullTok, &fqWaiter{resCh: fullCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter full-flow ok=%t err=%v", ok, err)
+	}
+	openTok := store.newFlow(hostKey, "example.com", "ip-open", "s1")
+	openCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(openTok, &fqWaiter{resCh: openCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter open-flow ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), hostKey, now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+
+	if got := backend.seenIPBatches(); !reflect.DeepEqual(got, [][]string{{"ip-open"}}) {
+		t.Fatalf("expected backend to see only ip-open, got %v", got)
+	}
+
+	sched := s.getOrCreateFlowScheduler(hostKey)
+	sched.mu.Lock()
+	defer sched.mu.Unlock()
+
+	site := sched.sites["s1"]
+	if site == nil {
+		t.Fatalf("expected scheduler site state for s1")
+	}
+	fullBucket := site.Buckets["ip-full"]
+	if fullBucket == nil {
+		t.Fatalf("expected scheduler bucket state for ip-full")
+	}
+	if fullBucket.WaitCount != 0 {
+		t.Fatalf("expected skipped ip-full wait count to stay 0, got %d", fullBucket.WaitCount)
+	}
+	if !fullBucket.DenyUntil.IsZero() {
+		t.Fatalf("expected skipped ip-full deny window to stay zero, got %v", fullBucket.DenyUntil)
+	}
+	openBucket := site.Buckets["ip-open"]
+	if openBucket == nil {
+		t.Fatalf("expected scheduler bucket state for ip-open")
+	}
+	if openBucket.WaitCount != 1 {
+		t.Fatalf("expected probed ip-open wait count to bump to 1, got %d", openBucket.WaitCount)
+	}
+}
+
+func TestProbeOnceSkipsSiteIPAtCapacity(t *testing.T) {
+	maxSiteIP := 1
+	zero := 0
+	backend := &recordingBatchBackend{}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		HostCaps: HostCapsConfig{MaxSlotPerIP: &zero},
+		SiteCaps: SiteCapsConfig{MaxSlotPerIP: &maxSiteIP},
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Date(2026, 3, 11, 12, 0, 0, 0, time.UTC)
+	hostKey := "h1"
+	s.activeSlots.AddLease("slot-full", hostKey, "s1", "ip-full", 30*time.Second, now)
+
+	store := s.flowStore
+	fullTok := store.newFlow(hostKey, "example.com", "ip-full", "s1")
+	fullCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(fullTok, &fqWaiter{resCh: fullCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter full-flow ok=%t err=%v", ok, err)
+	}
+	openTok := store.newFlow(hostKey, "example.com", "ip-open", "s1")
+	openCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(openTok, &fqWaiter{resCh: openCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter open-flow ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), hostKey, now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+
+	if got := backend.seenIPBatches(); !reflect.DeepEqual(got, [][]string{{"ip-open"}}) {
+		t.Fatalf("expected backend to see only ip-open, got %v", got)
+	}
+
+	sched := s.getOrCreateFlowScheduler(hostKey)
+	sched.mu.Lock()
+	defer sched.mu.Unlock()
+
+	site := sched.sites["s1"]
+	if site == nil {
+		t.Fatalf("expected scheduler site state for s1")
+	}
+	fullBucket := site.Buckets["ip-full"]
+	if fullBucket == nil {
+		t.Fatalf("expected scheduler bucket state for ip-full")
+	}
+	if fullBucket.WaitCount != 0 {
+		t.Fatalf("expected skipped ip-full wait count to stay 0, got %d", fullBucket.WaitCount)
+	}
+	if !fullBucket.DenyUntil.IsZero() {
+		t.Fatalf("expected skipped ip-full deny window to stay zero, got %v", fullBucket.DenyUntil)
+	}
+	openBucket := site.Buckets["ip-open"]
+	if openBucket == nil {
+		t.Fatalf("expected scheduler bucket state for ip-open")
+	}
+	if openBucket.WaitCount != 1 {
+		t.Fatalf("expected probed ip-open wait count to bump to 1, got %d", openBucket.WaitCount)
+	}
+}
+
 func TestProbeBudgetFillOnLowUtil(t *testing.T) {
 	cfg := &Config{FairQueue: FairQueueConfig{UtilWindowSec: 10, MaxBatch: 8, MaxProbeParallel: 4, MaxProbeQpsPerHost: 20}}
 	s := newTestServer()
@@ -943,8 +1106,11 @@ func TestProbeBudgetRespectsSiteHeadroom(t *testing.T) {
 		s.recordUtilizationSample(hostKey, "s1", 2, 10, 1, 10, now.Add(time.Duration(i)*time.Second))
 	}
 
-	s.activeSlots.Add(hostKey, "s1", 2)
-	s.activeSlots.Add(hostKey, "s2", 3)
+	s.activeSlots.AddLease("slot-s1-1", hostKey, "s1", "ip1", 30*time.Second, now)
+	s.activeSlots.AddLease("slot-s1-2", hostKey, "s1", "ip2", 30*time.Second, now)
+	s.activeSlots.AddLease("slot-s2-1", hostKey, "s2", "ip3", 30*time.Second, now)
+	s.activeSlots.AddLease("slot-s2-2", hostKey, "s2", "ip4", 30*time.Second, now)
+	s.activeSlots.AddLease("slot-s2-3", hostKey, "s2", "ip5", 30*time.Second, now)
 
 	inFlight := []fqFlowSnapshot{
 		{Token: "t1", Hostname: "h1", SiteBucket: "s1", IPBucket: "ip1"},

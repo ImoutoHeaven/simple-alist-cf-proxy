@@ -42,6 +42,8 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - 调度器采用单一堆化选择引擎，核心路径为 `pickBatchLocked(...)`，由 `PickNextInFlight(...)` 与 `PickNextInFlightBatch(...)` 共同复用。
 - 层级保持为 `siteBucket -> ipBucket -> flow(LocalVT)`，并且批选内保证不重复 token。
 - flow 级 tie-break 顺序固定为：`LocalVT -> CreatedAt -> Token`。
+- 调度器新增 `eligible` 回调入口；`probeOnce` 会在 picker 阶段跳过当前 `host+ip` 或 `host+site+ip` 活跃槽已满的 bucket，但不会改写 `WaitCount` / `DenyUntil`。
+- `activeSlots` 现在同时按 `host`、`host+site`、`host+ip`、`host+site+ip` 维护活跃 lease 计数；这些索引只服务本地 eligibility 判断，PostgreSQL 仍是最终 slot 权威，`computeProbeBudget()` 也仍保持粗粒度预算。
 - 该重构为 hard cutover：旧选择路径（如 `chooseLocked`、`pickNextInFlightExcluding`）已移除，不存在 fallback/legacy 分支。
 
 ### 2.2 有界并发微批探测 + 顺序提交
@@ -263,13 +265,14 @@ release 重试策略（worker 侧）：
 - `fairQueue.zombieTimeoutSeconds`：僵尸锁回收阈值。
 - `fairQueue.ipCooldownSeconds`：同 IP cooldown 秒数（大于 0 会更保守）。
 - `fairQueue.hostCaps.maxSlotPerHost`：host 维度并发槽上限。
-- `fairQueue.hostCaps.maxSlotPerIp`：host 维度单 IP 并发槽上限。
+- `fairQueue.hostCaps.maxSlotPerIp`：host 维度单 IP 并发槽上限；沿用现有配置字段，同时驱动 backend RPC 参数与 `probeOnce` 的 picker-time eligibility。
 - `fairQueue.siteCaps.maxSlotPerSite`：site 维度并发槽上限。
-- `fairQueue.siteCaps.maxSlotPerIp`：site 维度单 IP 并发槽上限。
+- `fairQueue.siteCaps.maxSlotPerIp`：site 维度单 IP 并发槽上限；沿用现有配置字段，同时驱动 backend RPC 参数与 `probeOnce` 的 picker-time eligibility。
 - `fairQueue.rpc.tryAcquireFunc`：批量 acquire RPC 函数名。
 - `fairQueue.rpc.releaseFunc`：release RPC 函数名。
 - `fairQueue.cleanup.enabled`：是否启用后台 DB 清理任务。
 - `fairQueue.cleanup.intervalSeconds`：后台清理执行周期。
+- 本次 per-IP 感知没有新增 SQL、RPC、config 字段或 worker 协议字段；变化只在 slot-handler 本地 picker-time eligibility。
 
 调参建议（通用）：
 

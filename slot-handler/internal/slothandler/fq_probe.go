@@ -345,6 +345,9 @@ func (s *server) computeProbeBudget(cfg *Config, hostKey string, inFlight []fqFl
 	if cfg == nil {
 		cfg = &Config{}
 	}
+	if s.activeSlots != nil {
+		s.activeSlots.Prune(now)
+	}
 
 	backlog := len(inFlight)
 	windowSize := cfg.FairQueue.utilWindowSeconds()
@@ -385,7 +388,7 @@ func (s *server) computeProbeBudget(cfg *Config, hostKey string, inFlight []fqFl
 	if hostCap > 0 {
 		active := 0
 		if s.activeSlots != nil {
-			active = s.activeSlots.ActiveHost(hostKey, now)
+			active = s.activeSlots.ActiveHostNoPrune(hostKey)
 		}
 		hostHeadroom := hostCap - active
 		if hostHeadroom < 0 {
@@ -408,7 +411,7 @@ func (s *server) computeProbeBudget(cfg *Config, hostKey string, inFlight []fqFl
 			seen[siteKey] = struct{}{}
 			siteActive := 0
 			if s.activeSlots != nil {
-				siteActive = s.activeSlots.ActiveSite(hostKey, siteKey, now)
+				siteActive = s.activeSlots.ActiveSiteNoPrune(hostKey, siteKey)
 			}
 			remaining := siteCap - siteActive
 			if remaining < 0 {
@@ -605,7 +608,25 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	if budget <= 0 {
 		return true
 	}
-	batch := sched.PickNextInFlightBatch(store, hostKey, now, budget)
+	hostIPLimit := cfg.FairQueue.hostMaxSlotPerIP()
+	siteIPLimit := cfg.FairQueue.siteMaxSlotPerIP()
+	eligible := func(snap fqFlowSnapshot) bool {
+		if s.activeSlots == nil {
+			return true
+		}
+		if hostIPLimit > 0 && s.activeSlots.ActiveHostIPNoPrune(hostKey, snap.IPBucket) >= hostIPLimit {
+			return false
+		}
+		siteKey := strings.TrimSpace(snap.SiteBucket)
+		if siteKey == "" {
+			siteKey = "unknown"
+		}
+		if siteIPLimit > 0 && s.activeSlots.ActiveSiteIPNoPrune(hostKey, siteKey, snap.IPBucket) >= siteIPLimit {
+			return false
+		}
+		return true
+	}
+	batch := sched.PickNextInFlightBatch(store, hostKey, now, budget, eligible)
 	if len(batch) == 0 {
 		// All in-flight flows are denied at the moment.
 		return true
@@ -722,7 +743,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 				}
 				if s.activeSlots != nil {
 					ttl := time.Duration(cfg.FairQueue.zombieTimeoutSeconds()) * time.Second
-					s.activeSlots.AddLease(res.slotToken, hostKey, siteKey, ttl, now)
+					s.activeSlots.AddLease(res.slotToken, hostKey, siteKey, snap.IPBucket, ttl, now)
 				}
 				delivered := store.deliverToWaiter(snap.Token, &AcquireResponse{
 					Result:     "granted",
@@ -812,7 +833,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 
 	hostActive := 0
 	if s.activeSlots != nil {
-		hostActive = s.activeSlots.ActiveHost(hostKey, now)
+		hostActive = s.activeSlots.ActiveHostNoPrune(hostKey)
 	}
 	hostCap := cfg.FairQueue.hostMaxSlotPerHost()
 	siteCap := cfg.FairQueue.siteMaxSlotPerSite()
@@ -828,7 +849,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		seenSites[siteKey] = struct{}{}
 		siteActive := 0
 		if s.activeSlots != nil {
-			siteActive = s.activeSlots.ActiveSite(hostKey, siteKey, now)
+			siteActive = s.activeSlots.ActiveSiteNoPrune(hostKey, siteKey)
 		}
 		s.recordUtilizationSample(hostKey, siteKey, hostActive, hostCap, siteActive, siteCap, now)
 	}

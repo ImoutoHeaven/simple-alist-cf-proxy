@@ -68,7 +68,7 @@ func TestReleaseRetryClearsActiveLease(t *testing.T) {
 	s.activeSlots = newActiveTracker()
 
 	now := time.Unix(0, 0)
-	s.activeSlots.AddLease("slot-1", "h1", "s1", 5*time.Second, now)
+	s.activeSlots.AddLease("slot-1", "h1", "s1", "ip1", 5*time.Second, now)
 
 	req := ReleaseRequest{
 		Hostname:      "example.com",
@@ -99,7 +99,7 @@ func TestReleaseRetryFailureReturnsError(t *testing.T) {
 	s.activeSlots = newActiveTracker()
 
 	now := time.Unix(0, 0)
-	s.activeSlots.AddLease("slot-1", "h1", "s1", 5*time.Second, now)
+	s.activeSlots.AddLease("slot-1", "h1", "s1", "ip1", 5*time.Second, now)
 
 	req := ReleaseRequest{
 		Hostname:      "example.com",
