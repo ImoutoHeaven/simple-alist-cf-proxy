@@ -2,6 +2,8 @@ package slothandler
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -16,11 +18,44 @@ type fqHostProbeRunner struct {
 
 type probeMode string
 
+type partitionedAdmitOutcome struct {
+	results          []*admitResult
+	known            []bool
+	compensatedReady []bool
+	err              error
+}
+
 type probeSubBatchResult struct {
-	start int
-	reqs  int
-	res   []*tryAcquireResult
-	err   error
+	start   int
+	reqs    int
+	outcome partitionedAdmitOutcome
+}
+
+type admitBatchPartitionKey struct {
+	hostname              string
+	hostnameHash          string
+	now                   int64
+	breakerEnabled        bool
+	halfOpenMaxProbeCount int
+	halfOpenMaxSeconds    int
+	halfOpenTimeoutMode   string
+	hostMaxSlotPerHost    int
+	hostMaxSlotPerIP      int
+	siteMaxSlotPerSite    int
+	siteMaxSlotPerIP      int
+	zombieTimeoutSeconds  int
+	cooldownSeconds       int
+}
+
+type admitBatchPartition struct {
+	indices []int
+	reqs    []AcquireRequest
+}
+
+type compensatingReady struct {
+	idx int
+	req AcquireRequest
+	res *admitResult
 }
 
 type throttledLatch struct {
@@ -492,7 +527,7 @@ func (r *fqHostProbeRunner) run(s *server) {
 	}
 }
 
-func (s *server) tryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+func (s *server) admitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	if s == nil {
 		return nil, nil
 	}
@@ -500,7 +535,137 @@ func (s *server) tryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]
 	if backend == nil {
 		return nil, nil
 	}
-	return backend.TryAcquireBatch(ctx, reqs)
+	return backend.AdmitBatch(ctx, reqs)
+}
+
+func admitBatchPartitionKeyFor(req AcquireRequest) admitBatchPartitionKey {
+	return admitBatchPartitionKey{
+		hostname:              req.Hostname,
+		hostnameHash:          req.HostnameHash,
+		now:                   req.Now,
+		breakerEnabled:        req.BreakerEnabled,
+		halfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
+		halfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
+		halfOpenTimeoutMode:   strings.TrimSpace(req.HalfOpenTimeoutMode),
+		hostMaxSlotPerHost:    req.HostMaxSlotPerHost,
+		hostMaxSlotPerIP:      req.HostMaxSlotPerIP,
+		siteMaxSlotPerSite:    req.SiteMaxSlotPerSite,
+		siteMaxSlotPerIP:      req.SiteMaxSlotPerIP,
+		zombieTimeoutSeconds:  req.ZombieTimeoutSeconds,
+		cooldownSeconds:       req.CooldownSeconds,
+	}
+}
+
+func partitionAdmitBatchRequests(reqs []AcquireRequest) []admitBatchPartition {
+	if len(reqs) == 0 {
+		return nil
+	}
+	order := make([]admitBatchPartitionKey, 0, len(reqs))
+	byKey := make(map[admitBatchPartitionKey]*admitBatchPartition, len(reqs))
+	for i, req := range reqs {
+		key := admitBatchPartitionKeyFor(req)
+		partition := byKey[key]
+		if partition == nil {
+			partition = &admitBatchPartition{}
+			byKey[key] = partition
+			order = append(order, key)
+		}
+		partition.indices = append(partition.indices, i)
+		partition.reqs = append(partition.reqs, req)
+	}
+	partitions := make([]admitBatchPartition, 0, len(order))
+	for _, key := range order {
+		partition := byKey[key]
+		if partition == nil {
+			continue
+		}
+		partitions = append(partitions, *partition)
+	}
+	return partitions
+}
+
+func (s *server) compensatePartitionReadies(readies []compensatingReady) error {
+	if s == nil || len(readies) == 0 {
+		return nil
+	}
+
+	nowMs := time.Now().UnixMilli()
+	errs := make([]error, 0, len(readies))
+	for _, ready := range readies {
+		if ready.res == nil || strings.ToUpper(strings.TrimSpace(ready.res.status)) != "READY" {
+			continue
+		}
+		slotToken := strings.TrimSpace(ready.res.slotToken)
+		if slotToken == "" {
+			continue
+		}
+		releaseReq := ReleaseRequest{
+			Hostname:      ready.req.Hostname,
+			HostnameHash:  ready.req.HostnameHash,
+			IPBucket:      ready.req.IPBucket,
+			SiteBucket:    ready.req.SiteBucket,
+			SlotToken:     slotToken,
+			HitUpstreamAt: nowMs,
+			Now:           nowMs,
+		}
+		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err := s.releaseSlot(releaseCtx, releaseReq)
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("compensating release %q: %w", slotToken, err))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func (s *server) admitPartitionedSubBatch(ctx context.Context, reqs []AcquireRequest) partitionedAdmitOutcome {
+	outcome := partitionedAdmitOutcome{
+		results:          make([]*admitResult, len(reqs)),
+		known:            make([]bool, len(reqs)),
+		compensatedReady: make([]bool, len(reqs)),
+	}
+	if len(reqs) == 0 {
+		return outcome
+	}
+	partitions := partitionAdmitBatchRequests(reqs)
+	readies := make([]compensatingReady, 0, len(reqs))
+	compensateAndReturn := func(err error) partitionedAdmitOutcome {
+		for _, ready := range readies {
+			if ready.idx < 0 || ready.idx >= len(outcome.compensatedReady) {
+				continue
+			}
+			if ready.res == nil || !strings.EqualFold(strings.TrimSpace(ready.res.status), "READY") {
+				continue
+			}
+			if strings.TrimSpace(ready.res.slotToken) == "" {
+				continue
+			}
+			outcome.compensatedReady[ready.idx] = true
+		}
+		if compErr := s.compensatePartitionReadies(readies); compErr != nil {
+			err = errors.Join(err, compErr)
+		}
+		outcome.err = err
+		return outcome
+	}
+	for _, partition := range partitions {
+		res, err := s.admitBatch(ctx, partition.reqs)
+		if err != nil {
+			return compensateAndReturn(err)
+		}
+		if len(res) != len(partition.indices) {
+			return compensateAndReturn(fmt.Errorf("partitioned admit batch result length mismatch: got %d want %d", len(res), len(partition.indices)))
+		}
+		for i, idx := range partition.indices {
+			outcome.results[idx] = res[i]
+			outcome.known[idx] = true
+			if res[i] != nil && strings.EqualFold(strings.TrimSpace(res[i].status), "READY") {
+				readies = append(readies, compensatingReady{idx: idx, req: partition.reqs[i], res: res[i]})
+			}
+		}
+	}
+	return outcome
 }
 
 func (s *server) probeBatchesInParallel(ctx context.Context, reqs []AcquireRequest, parallel int, timeout time.Duration) <-chan probeSubBatchResult {
@@ -546,12 +711,11 @@ func (s *server) probeBatchesInParallel(ctx context.Context, reqs []AcquireReque
 			}
 			defer cancel()
 
-			res, err := s.tryAcquireBatch(subCtx, subReqs)
+			outcome := s.admitPartitionedSubBatch(subCtx, subReqs)
 			resultCh <- probeSubBatchResult{
-				start: startIdx,
-				reqs:  reqCount,
-				res:   res,
-				err:   err,
+				start:   startIdx,
+				reqs:    reqCount,
+				outcome: outcome,
 			}
 		}()
 	}
@@ -562,6 +726,52 @@ func (s *server) probeBatchesInParallel(ctx context.Context, reqs []AcquireReque
 	}()
 
 	return resultCh
+}
+
+func readyAcquireResponse(queryToken string, res *admitResult) *AcquireResponse {
+	resp := &AcquireResponse{
+		Result:     "granted",
+		QueryToken: queryToken,
+		SlotToken:  res.slotToken,
+	}
+	if res != nil && res.attemptVersion > 0 && res.attemptTicket > 0 {
+		resp.Meta = map[string]interface{}{
+			"attemptVersion": res.attemptVersion,
+			"attemptTicket":  int64(res.attemptTicket),
+		}
+	}
+	return resp
+}
+
+func terminalAdmitResponse(queryToken, responseReason string, res *admitResult) *AcquireResponse {
+	resp := &AcquireResponse{
+		Result:     "throttled",
+		QueryToken: queryToken,
+		Reason:     responseReason,
+	}
+	if res == nil {
+		return resp
+	}
+	resp.ThrottleCode = res.throttleCode
+	resp.BreakerOpenUntil = res.breakerOpenUntil
+	resp.BreakerReason = res.breakerReason
+	resp.BreakerVersion = res.breakerVersion
+	resp.RetryAfter = res.retryAfter
+	return resp
+}
+
+func validReadyAdmitResult(snap fqFlowSnapshot, res *admitResult) bool {
+	if res == nil || strings.TrimSpace(res.slotToken) == "" {
+		return false
+	}
+	return true
+}
+
+func validHalfOpenFullAdmitResult(snap fqFlowSnapshot, res *admitResult) bool {
+	if !snap.BreakerEnabled || res == nil {
+		return false
+	}
+	return res.retryAfter > 0
 }
 
 // probeOnce performs one scheduling decision for the given host.
@@ -636,7 +846,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	timeout := computeProbeCallTimeout(cfg.FairQueue.pollInterval())
 	reqs := make([]AcquireRequest, 0, len(batch))
 	for _, snap := range batch {
-		req := s.buildAcquireRequest(cfg, snap.Hostname, snap.HostnameHash, snap.IPBucket, snap.SiteBucket, now)
+		req := s.buildAcquireRequest(cfg, snap, now)
 		reqs = append(reqs, req)
 	}
 
@@ -652,11 +862,23 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	}
 
 	throttled := throttledLatch{}
+	type readyCandidate struct {
+		snap fqFlowSnapshot
+		res  *admitResult
+	}
+	readyToCommit := make([]readyCandidate, 0, len(batch))
+	structuralHandled := make(map[string]struct{}, len(batch))
 	releaseAsync := func(req ReleaseRequest) {
 		// Compensating cleanup must not delay throttled delivery to waiters.
 		go s.releaseSlot(context.Background(), req)
 	}
-	compensateAcquired := func(snap fqFlowSnapshot, res *tryAcquireResult) {
+	markStructuralHandled := func(snap fqFlowSnapshot) {
+		if snap.Token == "" {
+			return
+		}
+		structuralHandled[snap.Token] = struct{}{}
+	}
+	compensateReady := func(snap fqFlowSnapshot, res *admitResult) {
 		if res == nil || strings.TrimSpace(res.slotToken) == "" {
 			return
 		}
@@ -670,6 +892,32 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 			Now:           now.UnixMilli(),
 		}
 		releaseAsync(releaseReq)
+	}
+	commitReady := func(snap fqFlowSnapshot, res *admitResult) {
+		sched.halveWaitCount(snap.SiteBucket, snap.IPBucket)
+		s.incrementMetric("granted")
+		siteKey := strings.TrimSpace(snap.SiteBucket)
+		if siteKey == "" {
+			siteKey = "unknown"
+		}
+		if s.activeSlots != nil {
+			ttl := time.Duration(cfg.FairQueue.zombieTimeoutSeconds()) * time.Second
+			s.activeSlots.AddLease(res.slotToken, hostKey, siteKey, snap.IPBucket, ttl, now)
+		}
+		delivered := store.deliverToWaiter(snap.Token, readyAcquireResponse(snap.Token, res))
+		if !delivered {
+			releaseReq := ReleaseRequest{
+				Hostname:      snap.Hostname,
+				HostnameHash:  snap.HostnameHash,
+				IPBucket:      snap.IPBucket,
+				SiteBucket:    snap.SiteBucket,
+				SlotToken:     res.slotToken,
+				HitUpstreamAt: now.UnixMilli(),
+				Now:           now.UnixMilli(),
+			}
+			releaseAsync(releaseReq)
+		}
+		store.deleteFlow(snap.Token)
 	}
 
 	applySubBatch := func(sub probeSubBatchResult) {
@@ -685,7 +933,8 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 			return
 		}
 
-		if sub.err != nil || len(sub.res) != (end-start) {
+		outcome := sub.outcome
+		if len(outcome.results) != (end-start) || len(outcome.known) != (end-start) || len(outcome.compensatedReady) != (end-start) {
 			if !throttled.hit {
 				for _, snap := range batch[start:end] {
 					sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
@@ -695,8 +944,15 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		}
 
 		if !throttled.hit {
-			for _, res := range sub.res {
+			for i, res := range outcome.results {
 				if res == nil {
+					continue
+				}
+				if !outcome.known[i] {
+					continue
+				}
+				snap := batch[start+i]
+				if !snap.BreakerEnabled {
 					continue
 				}
 				if strings.EqualFold(strings.TrimSpace(res.status), "THROTTLED") {
@@ -714,7 +970,13 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		}
 
 		for i, snap := range batch[start:end] {
-			res := sub.res[i]
+			if outcome.err != nil && !outcome.known[i] {
+				if !throttled.hit || !snap.BreakerEnabled {
+					sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+				}
+				continue
+			}
+			res := outcome.results[i]
 			if res == nil {
 				if !throttled.hit {
 					sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
@@ -723,58 +985,65 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 			}
 			status := strings.ToUpper(strings.TrimSpace(res.status))
 			if status == "THROTTLED" {
+				if !snap.BreakerEnabled {
+					sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+				}
 				continue
 			}
 
-			if throttled.hit {
-				if status == "ACQUIRED" {
-					compensateAcquired(snap, res)
+			if status == "READY" && outcome.err != nil {
+				if strings.TrimSpace(res.slotToken) != "" && !outcome.compensatedReady[i] {
+					compensateReady(snap, res)
 				}
+				if !throttled.hit || !snap.BreakerEnabled {
+					sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+				}
+				continue
+			}
+
+			if throttled.hit && snap.BreakerEnabled && status == "READY" {
+				compensateReady(snap, res)
 				continue
 			}
 
 			switch status {
-			case "ACQUIRED":
-				sched.halveWaitCount(snap.SiteBucket, snap.IPBucket)
-				s.incrementMetric("granted")
-				siteKey := strings.TrimSpace(snap.SiteBucket)
-				if siteKey == "" {
-					siteKey = "unknown"
-				}
-				if s.activeSlots != nil {
-					ttl := time.Duration(cfg.FairQueue.zombieTimeoutSeconds()) * time.Second
-					s.activeSlots.AddLease(res.slotToken, hostKey, siteKey, snap.IPBucket, ttl, now)
-				}
-				delivered := store.deliverToWaiter(snap.Token, &AcquireResponse{
-					Result:     "granted",
-					QueryToken: snap.Token,
-					SlotToken:  res.slotToken,
-				})
-				if !delivered {
-					releaseReq := ReleaseRequest{
-						Hostname:      snap.Hostname,
-						HostnameHash:  snap.HostnameHash,
-						IPBucket:      snap.IPBucket,
-						SiteBucket:    snap.SiteBucket,
-						SlotToken:     res.slotToken,
-						HitUpstreamAt: now.UnixMilli(),
-						Now:           now.UnixMilli(),
+			case "READY":
+				if !validReadyAdmitResult(snap, res) {
+					if strings.TrimSpace(res.slotToken) != "" {
+						compensateReady(snap, res)
 					}
-					releaseAsync(releaseReq)
+					sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+					continue
 				}
+				if snap.BreakerEnabled {
+					readyToCommit = append(readyToCommit, readyCandidate{snap: snap, res: res})
+					continue
+				}
+				commitReady(snap, res)
+			case "HALF_OPEN_FULL":
+				if !validHalfOpenFullAdmitResult(snap, res) {
+					if strings.TrimSpace(res.slotToken) != "" {
+						compensateReady(snap, res)
+					}
+					sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+					continue
+				}
+				sched.halveWaitCount(snap.SiteBucket, snap.IPBucket)
+				s.incrementMetric("throttled")
+				_ = store.deliverToWaiter(snap.Token, terminalAdmitResponse(snap.Token, "try_acquire_half_open_full", res))
 				store.deleteFlow(snap.Token)
+				markStructuralHandled(snap)
 			case "IP_TOO_MANY":
-				// Structural failure: deny + down-weight (do NOT increase WaitCount).
 				sched.halveWaitCount(snap.SiteBucket, snap.IPBucket)
 				denySeconds := cfg.FairQueue.cooldownSeconds()
 				if denySeconds <= 0 {
 					denySeconds = 3
 				}
 				sched.setBucketDenyUntil(snap.SiteBucket, snap.IPBucket, now.Add(time.Duration(denySeconds)*time.Second))
-			case "WAIT", "QUEUE_FULL":
+				markStructuralHandled(snap)
+			case "WAIT":
 				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
 			default:
-				// Treat unknown / non-structural statuses as contention.
 				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
 			}
 		}
@@ -817,16 +1086,38 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	}
 
 	if throttled.hit {
+		for _, candidate := range readyToCommit {
+			compensateReady(candidate.snap, candidate.res)
+		}
+	} else {
+		for _, candidate := range readyToCommit {
+			commitReady(candidate.snap, candidate.res)
+		}
+	}
+
+	if throttled.hit {
 		for range resultCh {
 		}
 		inFlight2 := store.listInFlightByHost(hostKey, now)
 		for _, snap := range inFlight2 {
+			if !snap.BreakerEnabled {
+				continue
+			}
 			tok := snap.Token
 			if tok == "" {
 				continue
 			}
+			if _, ok := structuralHandled[tok]; ok {
+				continue
+			}
 			s.incrementMetric("throttled")
-			_ = store.deliverToWaiter(tok, throttledAcquireResponse(tok, "try_acquire_throttled", throttled.code, throttled.openUntil, throttled.reason, throttled.version))
+			_ = store.deliverToWaiter(tok, terminalAdmitResponse(tok, "try_acquire_throttled", &admitResult{
+				status:           "THROTTLED",
+				throttleCode:     throttled.code,
+				breakerOpenUntil: throttled.openUntil,
+				breakerReason:    throttled.reason,
+				breakerVersion:   throttled.version,
+			}))
 			store.deleteFlow(tok)
 		}
 	}

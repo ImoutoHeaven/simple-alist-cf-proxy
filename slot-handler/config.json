@@ -52,7 +52,7 @@
       "maxSlotPerIp": 1
     },
     "rpc": {
-      "tryAcquireFunc": "fq_try_acquire_batch",
+      "tryAcquireFunc": "fq_admit_batch",
       "releaseFunc": "fq_release_dual"
     },
     "cleanup": {

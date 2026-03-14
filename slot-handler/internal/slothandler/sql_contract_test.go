@@ -22,10 +22,10 @@ func readInitSQLNormalized(t *testing.T) string {
 func batchAcquireFunctionBody(t *testing.T, text string) string {
 	t.Helper()
 
-	pattern := `(?s)create\s+or\s+replace\s+function\s+fq_try_acquire_batch\s*\(.*?\)\s*returns\s+table\s*\(.*?\)\s*as\s*\$\$(.*?)\$\$\s*language\s+plpgsql\s*;`
+	pattern := `(?s)create\s+or\s+replace\s+function\s+fq_admit_batch\s*\(.*?\)\s*returns\s+table\s*\(.*?\)\s*as\s*\$\$(.*?)\$\$\s*language\s+plpgsql\s*;`
 	m := regexp.MustCompile(pattern).FindStringSubmatch(text)
 	if len(m) != 2 {
-		t.Fatalf("unable to locate fq_try_acquire_batch function body in init.sql")
+		t.Fatalf("unable to locate fq_admit_batch function body in init.sql")
 	}
 	return m[1]
 }
@@ -63,13 +63,62 @@ func mustFindIndex(t *testing.T, text string, pattern string) []int {
 
 func requireReleaseInBranch(t *testing.T, body string, start []int, end int, name string) {
 	t.Helper()
-	if end <= start[0] || end > len(body) {
-		t.Fatalf("invalid branch range for %s", name)
-	}
-	branch := body[start[0]:end]
+	branch := branchTextInRange(t, body, start, end, name)
 	if !regexp.MustCompile(`func_release_host_slot\(\s*v_host_slot_id\s*,\s*false\s*\)`).MatchString(branch) {
 		t.Fatalf("init.sql missing host release in %s branch", name)
 	}
+}
+
+func requireReleaseCallsInBranch(t *testing.T, body string, start []int, end int, name string, patterns ...string) {
+	t.Helper()
+	branch := branchTextInRange(t, body, start, end, name)
+	for _, pattern := range patterns {
+		if !regexp.MustCompile(pattern).MatchString(branch) {
+			t.Fatalf("init.sql missing %s in %s branch", pattern, name)
+		}
+	}
+}
+
+func requireNullAssignmentsInStatusBranches(t *testing.T, body string, status string, fields ...string) {
+	t.Helper()
+
+	branchPattern := regexp.MustCompile(`status\s*:=\s*'` + regexp.QuoteMeta(status) + `'`)
+	branches := branchPattern.FindAllStringIndex(body, -1)
+	if len(branches) == 0 {
+		t.Fatalf("missing %s branch in fq_admit_batch", status)
+	}
+
+	nullPattern := regexp.MustCompile(`^null(?:::\w+)?$`)
+	returnNextPattern := regexp.MustCompile(`return\s+next\s*;`)
+
+	for _, branch := range branches {
+		segment := body[branch[0]:]
+		if end := returnNextPattern.FindStringIndex(segment); end != nil {
+			segment = segment[:end[1]]
+		}
+
+		for _, field := range fields {
+			assignmentPattern := regexp.MustCompile(regexp.QuoteMeta(field) + `\s*:=\s*([^;]+);`)
+			assignments := assignmentPattern.FindAllStringSubmatch(segment, -1)
+			if len(assignments) == 0 {
+				t.Fatalf("status %s must assign %s", status, field)
+			}
+			for _, assignment := range assignments {
+				value := strings.TrimSpace(assignment[1])
+				if !nullPattern.MatchString(value) {
+					t.Fatalf("status %s must assign %s null, got %s", status, field, value)
+				}
+			}
+		}
+	}
+}
+
+func branchTextInRange(t *testing.T, body string, start []int, end int, name string) string {
+	t.Helper()
+	if end <= start[0] || end > len(body) {
+		t.Fatalf("invalid branch range for %s", name)
+	}
+	return body[start[0]:end]
 }
 
 func TestInitSQLBatchAcquireReleasesHostOnSiteFailure(t *testing.T) {
@@ -84,10 +133,49 @@ func TestInitSQLBatchAcquireReleasesHostOnSiteQueueSignals(t *testing.T) {
 	body := batchAcquireFunctionBody(t, readInitSQLNormalized(t))
 	ipTooManyBranch := mustFindIndex(t, body, `if\s+v_site_slot_id\s*=\s*0\s+then`)
 	queueFullBranch := mustFindIndex(t, body, `elsif\s+v_site_slot_id\s*<\s*0\s+then`)
-	acquiredBranch := mustFindIndex(t, body, `status\s*:=\s*'acquired'`)
+	readyBranch := mustFindIndex(t, body, `status\s*:=\s*'ready'`)
 
 	requireReleaseInBranch(t, body, ipTooManyBranch, queueFullBranch[0], "site-slot IP_TOO_MANY")
-	requireReleaseInBranch(t, body, queueFullBranch, acquiredBranch[0], "site-slot QUEUE_FULL")
+	requireReleaseInBranch(t, body, queueFullBranch, readyBranch[0], "site-slot QUEUE_FULL")
+}
+
+func TestInitSQLBatchAcquireHostSlotZeroReturnsIPTooManyWithNullFields(t *testing.T) {
+	body := batchAcquireFunctionBody(t, readInitSQLNormalized(t))
+	ipTooManyBranch := mustFindIndex(t, body, `if\s+v_host_slot_id\s*=\s*0\s+then`)
+	queueFullBranch := mustFindIndex(t, body, `elsif\s+v_host_slot_id\s*<\s*0\s+then`)
+
+	requireReleaseCallsInBranch(
+		t,
+		body,
+		ipTooManyBranch,
+		queueFullBranch[0],
+		"host-slot IP_TOO_MANY",
+		`status\s*:=\s*'ip_too_many'`,
+		`slot_token\s*:=\s*null(?:::\w+)?\s*;`,
+		`retry_after\s*:=\s*null(?:::\w+)?\s*;`,
+		`attempt_version\s*:=\s*null(?:::\w+)?\s*;`,
+		`attempt_ticket\s*:=\s*null(?:::\w+)?\s*;`,
+	)
+}
+
+func TestInitSQLBatchAcquireSiteSlotZeroReturnsIPTooManyAfterReleasingHost(t *testing.T) {
+	body := batchAcquireFunctionBody(t, readInitSQLNormalized(t))
+	ipTooManyBranch := mustFindIndex(t, body, `if\s+v_site_slot_id\s*=\s*0\s+then`)
+	queueFullBranch := mustFindIndex(t, body, `elsif\s+v_site_slot_id\s*<\s*0\s+then`)
+
+	requireReleaseCallsInBranch(
+		t,
+		body,
+		ipTooManyBranch,
+		queueFullBranch[0],
+		"site-slot IP_TOO_MANY",
+		`func_release_host_slot\(\s*v_host_slot_id\s*,\s*false\s*\)`,
+		`status\s*:=\s*'ip_too_many'`,
+		`slot_token\s*:=\s*null(?:::\w+)?\s*;`,
+		`retry_after\s*:=\s*null(?:::\w+)?\s*;`,
+		`attempt_version\s*:=\s*null(?:::\w+)?\s*;`,
+		`attempt_ticket\s*:=\s*null(?:::\w+)?\s*;`,
+	)
 }
 
 func TestInitSQLCooldownConditionIncludesZeroActiveSlots(t *testing.T) {

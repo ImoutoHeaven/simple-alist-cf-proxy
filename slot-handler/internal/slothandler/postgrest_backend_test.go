@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestPostgrestTryAcquireOmitsWaiterCaps(t *testing.T) {
+func TestPostgrestAdmitBatchOmitsWaiterCaps(t *testing.T) {
 	var got map[string]interface{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -33,12 +33,12 @@ func TestPostgrestTryAcquireOmitsWaiterCaps(t *testing.T) {
 			Postgrest: PostgrestConfig{BaseURL: srv.URL},
 		},
 		FairQueue: FairQueueConfig{
-			RPC: RPCConfig{TryAcquireFunc: "fq_try_acquire_batch"},
+			RPC: RPCConfig{TryAcquireFunc: "fq_admit_batch"},
 		},
 	}
 	backend := newPostgrestBackend(cfg, srv.Client(), newLogger("error"))
 
-	_, err := backend.TryAcquireBatch(context.Background(), []AcquireRequest{{
+	_, err := backend.AdmitBatch(context.Background(), []AcquireRequest{{
 		Hostname:             "example.com",
 		HostnameHash:         "h1",
 		IPBucket:             "ip1",
@@ -52,7 +52,7 @@ func TestPostgrestTryAcquireOmitsWaiterCaps(t *testing.T) {
 		CooldownSeconds:      5,
 	}})
 	if err != nil {
-		t.Fatalf("TryAcquireBatch error: %v", err)
+		t.Fatalf("AdmitBatch error: %v", err)
 	}
 
 	if _, ok := got["p_host_max_waiters_per_ip"]; ok {
@@ -63,7 +63,7 @@ func TestPostgrestTryAcquireOmitsWaiterCaps(t *testing.T) {
 	}
 }
 
-func TestPostgrestTryAcquireBatchOmitsThrottleWindow(t *testing.T) {
+func TestPostgrestAdmitBatchOmitsThrottleWindow(t *testing.T) {
 	var got map[string]interface{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -83,12 +83,12 @@ func TestPostgrestTryAcquireBatchOmitsThrottleWindow(t *testing.T) {
 			Postgrest: PostgrestConfig{BaseURL: srv.URL},
 		},
 		FairQueue: FairQueueConfig{
-			RPC: RPCConfig{TryAcquireFunc: "fq_try_acquire_batch"},
+			RPC: RPCConfig{TryAcquireFunc: "fq_admit_batch"},
 		},
 	}
 	backend := newPostgrestBackend(cfg, srv.Client(), newLogger("error"))
 
-	_, err := backend.TryAcquireBatch(context.Background(), []AcquireRequest{{
+	_, err := backend.AdmitBatch(context.Background(), []AcquireRequest{{
 		Hostname:             "example.com",
 		HostnameHash:         "h1",
 		IPBucket:             "ip1",
@@ -102,7 +102,7 @@ func TestPostgrestTryAcquireBatchOmitsThrottleWindow(t *testing.T) {
 		CooldownSeconds:      5,
 	}})
 	if err != nil {
-		t.Fatalf("TryAcquireBatch error: %v", err)
+		t.Fatalf("AdmitBatch error: %v", err)
 	}
 
 	if _, ok := got["p_throttle_time_window"]; ok {
@@ -110,7 +110,7 @@ func TestPostgrestTryAcquireBatchOmitsThrottleWindow(t *testing.T) {
 	}
 }
 
-func TestPostgrestTryAcquireBatchPayload(t *testing.T) {
+func TestPostgrestAdmitBatchPayload(t *testing.T) {
 	var got map[string]interface{}
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -132,45 +132,53 @@ func TestPostgrestTryAcquireBatchPayload(t *testing.T) {
 			Postgrest: PostgrestConfig{BaseURL: srv.URL},
 		},
 		FairQueue: FairQueueConfig{
-			RPC: RPCConfig{TryAcquireFunc: "fq_try_acquire_batch"},
+			RPC: RPCConfig{TryAcquireFunc: "fq_admit_batch"},
 		},
 	}
 	backend := newPostgrestBackend(cfg, srv.Client(), newLogger("error"))
 
-	_, err := backend.TryAcquireBatch(context.Background(), []AcquireRequest{
+	_, err := backend.AdmitBatch(context.Background(), []AcquireRequest{
 		{
-			Hostname:             "example.com",
-			HostnameHash:         "h1",
-			IPBucket:             "ip1",
-			SiteBucket:           "s1",
-			Now:                  123,
-			HostMaxSlotPerHost:   5,
-			HostMaxSlotPerIP:     1,
-			SiteMaxSlotPerSite:   5,
-			SiteMaxSlotPerIP:     1,
-			ZombieTimeoutSeconds: 30,
-			CooldownSeconds:      0,
+			Hostname:              "example.com",
+			HostnameHash:          "h1",
+			IPBucket:              "ip1",
+			SiteBucket:            "s1",
+			Now:                   123,
+			HostMaxSlotPerHost:    5,
+			HostMaxSlotPerIP:      1,
+			SiteMaxSlotPerSite:    5,
+			SiteMaxSlotPerIP:      1,
+			ZombieTimeoutSeconds:  30,
+			CooldownSeconds:       0,
+			BreakerEnabled:        true,
+			HalfOpenMaxProbeCount: 4,
+			HalfOpenMaxSeconds:    15,
+			HalfOpenTimeoutMode:   "partial-close",
 		},
 		{
-			Hostname:             "example.com",
-			HostnameHash:         "h1",
-			IPBucket:             "ip2",
-			SiteBucket:           "s2",
-			Now:                  123,
-			HostMaxSlotPerHost:   5,
-			HostMaxSlotPerIP:     1,
-			SiteMaxSlotPerSite:   5,
-			SiteMaxSlotPerIP:     1,
-			ZombieTimeoutSeconds: 30,
-			CooldownSeconds:      0,
+			Hostname:              "example.com",
+			HostnameHash:          "h1",
+			IPBucket:              "ip2",
+			SiteBucket:            "s2",
+			Now:                   123,
+			HostMaxSlotPerHost:    5,
+			HostMaxSlotPerIP:      1,
+			SiteMaxSlotPerSite:    5,
+			SiteMaxSlotPerIP:      1,
+			ZombieTimeoutSeconds:  30,
+			CooldownSeconds:       0,
+			BreakerEnabled:        true,
+			HalfOpenMaxProbeCount: 4,
+			HalfOpenMaxSeconds:    15,
+			HalfOpenTimeoutMode:   "partial-close",
 		},
 	})
 	if err != nil {
-		t.Fatalf("TryAcquireBatch error: %v", err)
+		t.Fatalf("AdmitBatch error: %v", err)
 	}
 
-	if gotPath != "/rpc/fq_try_acquire_batch" {
-		t.Fatalf("expected rpc path /rpc/fq_try_acquire_batch, got %s", gotPath)
+	if gotPath != "/rpc/fq_admit_batch" {
+		t.Fatalf("expected rpc path /rpc/fq_admit_batch, got %s", gotPath)
 	}
 	if _, ok := got["p_site_bucket"]; ok {
 		t.Fatalf("expected no single site bucket in payload")
@@ -187,6 +195,18 @@ func TestPostgrestTryAcquireBatchPayload(t *testing.T) {
 	}
 	if _, ok := got["p_throttle_time_window"]; ok {
 		t.Fatalf("expected no legacy throttle window in payload")
+	}
+	if got["p_breaker_enabled"] != true {
+		t.Fatalf("expected breaker-enabled payload, got %v", got["p_breaker_enabled"])
+	}
+	if got["p_half_open_max_probe_count"] != float64(4) {
+		t.Fatalf("expected half-open probe count 4, got %v", got["p_half_open_max_probe_count"])
+	}
+	if got["p_half_open_max_seconds"] != float64(15) {
+		t.Fatalf("expected half-open max seconds 15, got %v", got["p_half_open_max_seconds"])
+	}
+	if got["p_half_open_timeout_mode"] != "partial-close" {
+		t.Fatalf("expected half-open timeout mode partial-close, got %v", got["p_half_open_timeout_mode"])
 	}
 
 	if got["p_site_buckets"] == nil {
@@ -212,20 +232,20 @@ func TestPostgrestTryAcquireBatchPayload(t *testing.T) {
 	}
 }
 
-func TestPostgrestTryAcquireBatchNoLongerAcceptsLegacyThrottleWindowField(t *testing.T) {
+func TestPostgrestAdmitBatchNoLongerAcceptsLegacyThrottleWindowField(t *testing.T) {
 	if _, ok := reflect.TypeOf(AcquireRequest{}).FieldByName("ThrottleTimeWindow"); ok {
 		t.Fatalf("AcquireRequest must not retain legacy ThrottleTimeWindow compatibility field")
 	}
 }
 
-func TestPostgrestTryAcquireBatchParsesRawBreakerMetadata(t *testing.T) {
-	if _, ok := reflect.TypeOf(tryAcquireResult{}).FieldByName("throttleRetryAfter"); ok {
-		t.Fatalf("tryAcquireResult must not retain synthesized throttleRetryAfter field")
+func TestBackendParsesAttemptFieldsFromFqAdmitBatch(t *testing.T) {
+	if _, ok := reflect.TypeOf(admitResult{}).FieldByName("throttleRetryAfter"); ok {
+		t.Fatalf("admitResult must not retain synthesized throttleRetryAfter field")
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"status":"THROTTLED","throttle_code":429,"breaker_open_until":173,"breaker_reason":"http_429","breaker_version":9}]`))
+		_, _ = w.Write([]byte(`[{"status":"READY","slot_token":"slot-123","throttle_code":429,"breaker_open_until":173,"breaker_reason":"http_429","breaker_version":9,"retry_after":11,"attempt_version":7,"attempt_ticket":2}]`))
 	}))
 	defer srv.Close()
 
@@ -234,56 +254,80 @@ func TestPostgrestTryAcquireBatchParsesRawBreakerMetadata(t *testing.T) {
 			Postgrest: PostgrestConfig{BaseURL: srv.URL},
 		},
 		FairQueue: FairQueueConfig{
-			RPC: RPCConfig{TryAcquireFunc: "fq_try_acquire_batch"},
+			RPC: RPCConfig{TryAcquireFunc: "fq_admit_batch"},
 		},
 	}
 	backend := newPostgrestBackend(cfg, srv.Client(), newLogger("error"))
 
-	results, err := backend.TryAcquireBatch(context.Background(), []AcquireRequest{{
-		Hostname:             "example.com",
-		HostnameHash:         "h1",
-		IPBucket:             "ip1",
-		SiteBucket:           "s1",
-		Now:                  123,
-		HostMaxSlotPerHost:   1,
-		HostMaxSlotPerIP:     1,
-		SiteMaxSlotPerSite:   1,
-		SiteMaxSlotPerIP:     1,
-		ZombieTimeoutSeconds: 10,
-		CooldownSeconds:      5,
+	results, err := backend.AdmitBatch(context.Background(), []AcquireRequest{{
+		Hostname:              "example.com",
+		HostnameHash:          "h1",
+		IPBucket:              "ip1",
+		SiteBucket:            "s1",
+		Now:                   123,
+		HostMaxSlotPerHost:    1,
+		HostMaxSlotPerIP:      1,
+		SiteMaxSlotPerSite:    1,
+		SiteMaxSlotPerIP:      1,
+		ZombieTimeoutSeconds:  10,
+		CooldownSeconds:       5,
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
 	}})
 	if err != nil {
-		t.Fatalf("TryAcquireBatch error: %v", err)
+		t.Fatalf("AdmitBatch error: %v", err)
 	}
 	if len(results) != 1 || results[0] == nil {
 		t.Fatalf("expected one result, got %+v", results)
 	}
 
 	value := reflect.ValueOf(results[0]).Elem()
+	status := value.FieldByName("status")
+	if !status.IsValid() || status.String() != "READY" {
+		t.Fatalf("expected READY status, got %+v", results[0])
+	}
+	slotToken := value.FieldByName("slotToken")
+	if !slotToken.IsValid() || slotToken.String() != "slot-123" {
+		t.Fatalf("expected slot token slot-123, got %+v", results[0])
+	}
 	openUntil := value.FieldByName("breakerOpenUntil")
 	if !openUntil.IsValid() {
-		t.Fatalf("expected raw breakerOpenUntil field on tryAcquireResult")
+		t.Fatalf("expected raw breakerOpenUntil field on admitResult")
 	}
 	if got := int(openUntil.Int()); got != 173 {
 		t.Fatalf("expected breakerOpenUntil 173, got %d", got)
 	}
 	reason := value.FieldByName("breakerReason")
 	if !reason.IsValid() {
-		t.Fatalf("expected raw breakerReason field on tryAcquireResult")
+		t.Fatalf("expected raw breakerReason field on admitResult")
 	}
 	if got := reason.String(); got != "http_429" {
 		t.Fatalf("expected breakerReason http_429, got %q", got)
 	}
 	version := value.FieldByName("breakerVersion")
 	if !version.IsValid() {
-		t.Fatalf("expected raw breakerVersion field on tryAcquireResult")
+		t.Fatalf("expected raw breakerVersion field on admitResult")
 	}
 	if got := version.Int(); got != 9 {
 		t.Fatalf("expected breakerVersion 9, got %d", got)
 	}
+	retryAfter := value.FieldByName("retryAfter")
+	if !retryAfter.IsValid() || int(retryAfter.Int()) != 11 {
+		t.Fatalf("expected retryAfter 11, got %+v", results[0])
+	}
+	attemptVersion := value.FieldByName("attemptVersion")
+	if !attemptVersion.IsValid() || attemptVersion.Int() != 7 {
+		t.Fatalf("expected attemptVersion 7, got %+v", results[0])
+	}
+	attemptTicket := value.FieldByName("attemptTicket")
+	if !attemptTicket.IsValid() || int(attemptTicket.Int()) != 2 {
+		t.Fatalf("expected attemptTicket 2, got %+v", results[0])
+	}
 }
 
-func TestPostgrestTryAcquireBatchRejectsMixedInputs(t *testing.T) {
+func TestPostgrestAdmitBatchRejectsMixedInputs(t *testing.T) {
 	called := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -297,12 +341,12 @@ func TestPostgrestTryAcquireBatchRejectsMixedInputs(t *testing.T) {
 			Postgrest: PostgrestConfig{BaseURL: srv.URL},
 		},
 		FairQueue: FairQueueConfig{
-			RPC: RPCConfig{TryAcquireFunc: "fq_try_acquire_batch"},
+			RPC: RPCConfig{TryAcquireFunc: "fq_admit_batch"},
 		},
 	}
 	backend := newPostgrestBackend(cfg, srv.Client(), newLogger("error"))
 
-	_, err := backend.TryAcquireBatch(context.Background(), []AcquireRequest{
+	_, err := backend.AdmitBatch(context.Background(), []AcquireRequest{
 		{
 			Hostname:             "example.com",
 			HostnameHash:         "h1",

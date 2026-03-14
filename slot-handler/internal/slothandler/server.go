@@ -99,28 +99,36 @@ type SiteCapsConfig struct {
 }
 
 type AcquireRequest struct {
-	Hostname             string `json:"hostname"`
-	HostnameHash         string `json:"hostnameHash"`
-	IPBucket             string `json:"ipBucket"`
-	SiteBucket           string `json:"siteBucket"`
-	Now                  int64  `json:"now"`
-	HostMaxSlotPerHost   int    `json:"hostMaxSlotPerHost,omitempty"`
-	HostMaxSlotPerIP     int    `json:"hostMaxSlotPerIp,omitempty"`
-	SiteMaxSlotPerSite   int    `json:"siteMaxSlotPerSite,omitempty"`
-	SiteMaxSlotPerIP     int    `json:"siteMaxSlotPerIp,omitempty"`
-	ZombieTimeoutSeconds int    `json:"zombieTimeoutSeconds,omitempty"`
-	CooldownSeconds      int    `json:"cooldownSeconds,omitempty"`
-	PollIntervalMs       int64  `json:"pollIntervalMs,omitempty"`
-	QueryToken           string `json:"queryToken,omitempty"`
+	Hostname              string `json:"hostname"`
+	HostnameHash          string `json:"hostnameHash"`
+	IPBucket              string `json:"ipBucket"`
+	SiteBucket            string `json:"siteBucket"`
+	Now                   int64  `json:"now"`
+	BreakerEnabled        bool   `json:"breakerEnabled,omitempty"`
+	HalfOpenMaxProbeCount int    `json:"halfOpenMaxProbeCount,omitempty"`
+	HalfOpenMaxSeconds    int    `json:"halfOpenMaxSeconds,omitempty"`
+	HalfOpenTimeoutMode   string `json:"halfOpenTimeoutMode,omitempty"`
+	HostMaxSlotPerHost    int    `json:"hostMaxSlotPerHost,omitempty"`
+	HostMaxSlotPerIP      int    `json:"hostMaxSlotPerIp,omitempty"`
+	SiteMaxSlotPerSite    int    `json:"siteMaxSlotPerSite,omitempty"`
+	SiteMaxSlotPerIP      int    `json:"siteMaxSlotPerIp,omitempty"`
+	ZombieTimeoutSeconds  int    `json:"zombieTimeoutSeconds,omitempty"`
+	CooldownSeconds       int    `json:"cooldownSeconds,omitempty"`
+	PollIntervalMs        int64  `json:"pollIntervalMs,omitempty"`
+	QueryToken            string `json:"queryToken,omitempty"`
 }
 
 type AcquirePayload struct {
-	Hostname     string `json:"hostname"`
-	HostnameHash string `json:"hostnameHash"`
-	IPBucket     string `json:"ipBucket"`
-	SiteBucket   string `json:"siteBucket"`
-	Now          int64  `json:"now"`
-	QueryToken   string `json:"queryToken,omitempty"`
+	Hostname              string `json:"hostname"`
+	HostnameHash          string `json:"hostnameHash"`
+	IPBucket              string `json:"ipBucket"`
+	SiteBucket            string `json:"siteBucket"`
+	Now                   int64  `json:"now"`
+	BreakerEnabled        bool   `json:"breakerEnabled,omitempty"`
+	HalfOpenMaxProbeCount int    `json:"halfOpenMaxProbeCount,omitempty"`
+	HalfOpenMaxSeconds    int    `json:"halfOpenMaxSeconds,omitempty"`
+	HalfOpenTimeoutMode   string `json:"halfOpenTimeoutMode,omitempty"`
+	QueryToken            string `json:"queryToken,omitempty"`
 }
 
 type AcquireResponse struct {
@@ -162,13 +170,16 @@ type FairQueueCleanupConfig struct {
 	IntervalSeconds int  `json:"intervalSeconds"`
 }
 
-type tryAcquireResult struct {
+type admitResult struct {
 	status           string
 	slotToken        string
 	throttleCode     int
 	breakerOpenUntil int
 	breakerReason    string
 	breakerVersion   int64
+	retryAfter       int
+	attemptVersion   int64
+	attemptTicket    int
 }
 
 func validateAcquireBatchInputs(reqs []AcquireRequest) error {
@@ -179,23 +190,51 @@ func validateAcquireBatchInputs(reqs []AcquireRequest) error {
 	for i := 1; i < len(reqs); i++ {
 		req := reqs[i]
 		if req.Hostname != first.Hostname || req.HostnameHash != first.HostnameHash || req.Now != first.Now {
-			return fmt.Errorf("tryAcquire batch inputs must match hostname/hash/now (index=%d)", i)
+			return fmt.Errorf("admit batch inputs must match hostname/hash/now (index=%d)", i)
+		}
+		if req.BreakerEnabled != first.BreakerEnabled || req.HalfOpenMaxProbeCount != first.HalfOpenMaxProbeCount || req.HalfOpenMaxSeconds != first.HalfOpenMaxSeconds || req.HalfOpenTimeoutMode != first.HalfOpenTimeoutMode {
+			return fmt.Errorf("admit batch inputs must match breaker settings (index=%d)", i)
 		}
 		if req.HostMaxSlotPerHost != first.HostMaxSlotPerHost || req.HostMaxSlotPerIP != first.HostMaxSlotPerIP {
-			return fmt.Errorf("tryAcquire batch inputs must match host caps (index=%d)", i)
+			return fmt.Errorf("admit batch inputs must match host caps (index=%d)", i)
 		}
 		if req.SiteMaxSlotPerSite != first.SiteMaxSlotPerSite || req.SiteMaxSlotPerIP != first.SiteMaxSlotPerIP {
-			return fmt.Errorf("tryAcquire batch inputs must match site caps (index=%d)", i)
+			return fmt.Errorf("admit batch inputs must match site caps (index=%d)", i)
 		}
 		if req.ZombieTimeoutSeconds != first.ZombieTimeoutSeconds || req.CooldownSeconds != first.CooldownSeconds {
-			return fmt.Errorf("tryAcquire batch inputs must match timeouts (index=%d)", i)
+			return fmt.Errorf("admit batch inputs must match timeouts (index=%d)", i)
 		}
 	}
 	return nil
 }
 
+func validateAcquirePayload(req AcquireRequest) error {
+	if !req.BreakerEnabled {
+		return nil
+	}
+	if strings.TrimSpace(req.HostnameHash) == "" {
+		return errors.New("hostnameHash is required when breakerEnabled is true")
+	}
+	timeoutMode := strings.TrimSpace(req.HalfOpenTimeoutMode)
+	if req.HalfOpenMaxProbeCount == 0 && req.HalfOpenMaxSeconds == 0 && timeoutMode == "" {
+		return errors.New("half-open settings are required when breakerEnabled is true")
+	}
+	if req.HalfOpenMaxProbeCount < 1 || req.HalfOpenMaxProbeCount > 63 {
+		return errors.New("halfOpenMaxProbeCount must be between 1 and 63")
+	}
+	if req.HalfOpenMaxSeconds <= 0 {
+		return errors.New("halfOpenMaxSeconds must be greater than 0")
+	}
+	switch timeoutMode {
+	case "open", "close", "partial-close":
+		return nil
+	default:
+		return errors.New("invalid halfOpenTimeoutMode")
+	}
+}
+
 type queueBackend interface {
-	TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error)
+	AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error)
 	ReleaseSlot(ctx context.Context, req ReleaseRequest) error
 }
 
@@ -381,19 +420,6 @@ func (s *server) getControllerState() (controllerEnv, bool) {
 	value := *controller
 	s.mu.RUnlock()
 	return value, true
-}
-
-func throttledAcquireResponse(queryToken, responseReason string, throttleCode, breakerOpenUntil int, breakerReason string, breakerVersion int64) *AcquireResponse {
-	resp := &AcquireResponse{
-		Result:           "throttled",
-		QueryToken:       queryToken,
-		Reason:           responseReason,
-		ThrottleCode:     throttleCode,
-		BreakerOpenUntil: breakerOpenUntil,
-		BreakerReason:    breakerReason,
-		BreakerVersion:   breakerVersion,
-	}
-	return resp
 }
 
 func (s *server) shouldLogOverloaded(hostnameHash, hostname, scope string, now time.Time) bool {
@@ -1242,12 +1268,20 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := AcquireRequest{
-		Hostname:     payload.Hostname,
-		HostnameHash: payload.HostnameHash,
-		IPBucket:     payload.IPBucket,
-		SiteBucket:   payload.SiteBucket,
-		Now:          payload.Now,
-		QueryToken:   payload.QueryToken,
+		Hostname:              payload.Hostname,
+		HostnameHash:          payload.HostnameHash,
+		IPBucket:              payload.IPBucket,
+		SiteBucket:            payload.SiteBucket,
+		Now:                   payload.Now,
+		BreakerEnabled:        payload.BreakerEnabled,
+		HalfOpenMaxProbeCount: payload.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:    payload.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:   strings.TrimSpace(payload.HalfOpenTimeoutMode),
+		QueryToken:            payload.QueryToken,
+	}
+	if err := validateAcquirePayload(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	resp, err := s.handleAcquireSlot(r.Context(), req)
@@ -1344,28 +1378,36 @@ func (s *server) handleAcquireSlot(ctx context.Context, req AcquireRequest) (*Ac
 	return s.handleAcquireSlotFlow(ctx, req)
 }
 
-func (s *server) buildAcquireRequest(cfg *Config, hostname, hostnameHash, ipBucket, siteBucket string, now time.Time) AcquireRequest {
+func (s *server) buildAcquireRequest(cfg *Config, snap fqFlowSnapshot, now time.Time) AcquireRequest {
 	if cfg == nil {
 		cfg = &Config{}
 	}
 	fq := cfg.FairQueue
 
+	hostname := snap.Hostname
+	hostnameHash := snap.HostnameHash
+	ipBucket := snap.IPBucket
+	siteBucket := snap.SiteBucket
 	if strings.TrimSpace(siteBucket) == "" {
 		siteBucket = "unknown"
 	}
 
 	return AcquireRequest{
-		Hostname:             hostname,
-		HostnameHash:         hostnameHash,
-		IPBucket:             ipBucket,
-		SiteBucket:           siteBucket,
-		Now:                  now.UnixMilli(),
-		HostMaxSlotPerHost:   fq.hostMaxSlotPerHost(),
-		HostMaxSlotPerIP:     fq.hostMaxSlotPerIP(),
-		SiteMaxSlotPerSite:   fq.siteMaxSlotPerSite(),
-		SiteMaxSlotPerIP:     fq.siteMaxSlotPerIP(),
-		ZombieTimeoutSeconds: fq.zombieTimeoutSeconds(),
-		CooldownSeconds:      fq.cooldownSeconds(),
+		Hostname:              hostname,
+		HostnameHash:          hostnameHash,
+		IPBucket:              ipBucket,
+		SiteBucket:            siteBucket,
+		Now:                   now.UnixMilli(),
+		BreakerEnabled:        snap.BreakerEnabled,
+		HalfOpenMaxProbeCount: snap.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:    snap.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:   snap.HalfOpenTimeoutMode,
+		HostMaxSlotPerHost:    fq.hostMaxSlotPerHost(),
+		HostMaxSlotPerIP:      fq.hostMaxSlotPerIP(),
+		SiteMaxSlotPerSite:    fq.siteMaxSlotPerSite(),
+		SiteMaxSlotPerIP:      fq.siteMaxSlotPerIP(),
+		ZombieTimeoutSeconds:  fq.zombieTimeoutSeconds(),
+		CooldownSeconds:       fq.cooldownSeconds(),
 	}
 }
 
@@ -1761,7 +1803,7 @@ func isPointerToSlice(v interface{}) bool {
 	return rv.Elem().Kind() == reflect.Slice
 }
 
-func (b *postgrestBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+func (b *postgrestBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
@@ -1770,7 +1812,7 @@ func (b *postgrestBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRe
 	}
 	fn := b.cfg.FairQueue.RPC.TryAcquireFunc
 	if fn == "" {
-		return nil, errors.New("tryAcquire batch function not configured")
+		return nil, errors.New("admit batch function not configured")
 	}
 	first := reqs[0]
 	siteBuckets := make([]string, len(reqs))
@@ -1780,17 +1822,21 @@ func (b *postgrestBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRe
 		ipBuckets[i] = req.IPBucket
 	}
 	body := map[string]interface{}{
-		"p_hostname_hash":          first.HostnameHash,
-		"p_hostname":               first.Hostname,
-		"p_site_buckets":           siteBuckets,
-		"p_ip_buckets":             ipBuckets,
-		"p_now_ms":                 first.Now,
-		"p_host_max_slot_per_host": first.HostMaxSlotPerHost,
-		"p_host_max_slot_per_ip":   first.HostMaxSlotPerIP,
-		"p_site_max_slot_per_site": first.SiteMaxSlotPerSite,
-		"p_site_max_slot_per_ip":   first.SiteMaxSlotPerIP,
-		"p_zombie_timeout":         first.ZombieTimeoutSeconds,
-		"p_cooldown_seconds":       first.CooldownSeconds,
+		"p_hostname_hash":             first.HostnameHash,
+		"p_hostname":                  first.Hostname,
+		"p_site_buckets":              siteBuckets,
+		"p_ip_buckets":                ipBuckets,
+		"p_now_ms":                    first.Now,
+		"p_breaker_enabled":           first.BreakerEnabled,
+		"p_half_open_max_probe_count": first.HalfOpenMaxProbeCount,
+		"p_half_open_max_seconds":     first.HalfOpenMaxSeconds,
+		"p_half_open_timeout_mode":    first.HalfOpenTimeoutMode,
+		"p_host_max_slot_per_host":    first.HostMaxSlotPerHost,
+		"p_host_max_slot_per_ip":      first.HostMaxSlotPerIP,
+		"p_site_max_slot_per_site":    first.SiteMaxSlotPerSite,
+		"p_site_max_slot_per_ip":      first.SiteMaxSlotPerIP,
+		"p_zombie_timeout":            first.ZombieTimeoutSeconds,
+		"p_cooldown_seconds":          first.CooldownSeconds,
 	}
 	var resp []struct {
 		Status           string `json:"status"`
@@ -1799,22 +1845,28 @@ func (b *postgrestBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRe
 		BreakerOpenUntil int    `json:"breaker_open_until"`
 		BreakerReason    string `json:"breaker_reason"`
 		BreakerVersion   int64  `json:"breaker_version"`
+		RetryAfter       int    `json:"retry_after"`
+		AttemptVersion   int64  `json:"attempt_version"`
+		AttemptTicket    int    `json:"attempt_ticket"`
 	}
 	if err := b.doRPC(ctx, fn, body, &resp); err != nil {
 		return nil, err
 	}
 	if len(resp) != len(reqs) {
-		return nil, fmt.Errorf("tryAcquire batch result length mismatch: got %d want %d", len(resp), len(reqs))
+		return nil, fmt.Errorf("admit batch result length mismatch: got %d want %d", len(resp), len(reqs))
 	}
-	results := make([]*tryAcquireResult, len(resp))
+	results := make([]*admitResult, len(resp))
 	for i, item := range resp {
-		results[i] = &tryAcquireResult{
+		results[i] = &admitResult{
 			status:           item.Status,
 			slotToken:        item.SlotToken,
 			throttleCode:     item.ThrottleCode,
 			breakerOpenUntil: item.BreakerOpenUntil,
 			breakerReason:    item.BreakerReason,
 			breakerVersion:   item.BreakerVersion,
+			retryAfter:       item.RetryAfter,
+			attemptVersion:   item.AttemptVersion,
+			attemptTicket:    item.AttemptTicket,
 		}
 	}
 	return results, nil
@@ -1890,7 +1942,7 @@ func (p *postgresBackend) Close() error {
 	return p.db.Close()
 }
 
-func (p *postgresBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+func (p *postgresBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
@@ -1899,7 +1951,7 @@ func (p *postgresBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireReq
 	}
 	fn := p.cfg.FairQueue.RPC.TryAcquireFunc
 	if fn == "" {
-		return nil, errors.New("tryAcquire batch function not configured")
+		return nil, errors.New("admit batch function not configured")
 	}
 	first := reqs[0]
 	siteBuckets := make([]string, len(reqs))
@@ -1908,35 +1960,39 @@ func (p *postgresBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireReq
 		siteBuckets[i] = req.SiteBucket
 		ipBuckets[i] = req.IPBucket
 	}
-	rows, err := p.db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", fn),
+	rows, err := p.db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)", fn),
 		first.HostnameHash, first.Hostname, siteBuckets, ipBuckets, first.Now,
 		first.HostMaxSlotPerHost, first.HostMaxSlotPerIP, first.SiteMaxSlotPerSite, first.SiteMaxSlotPerIP,
-		first.ZombieTimeoutSeconds, first.CooldownSeconds)
+		first.ZombieTimeoutSeconds, first.CooldownSeconds,
+		first.BreakerEnabled, first.HalfOpenMaxProbeCount, first.HalfOpenMaxSeconds, first.HalfOpenTimeoutMode)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	results := make([]*tryAcquireResult, 0, len(reqs))
+	results := make([]*admitResult, 0, len(reqs))
 	for rows.Next() {
 		var status, slotToken, breakerReason sql.NullString
-		var throttleCode, breakerOpenUntil, breakerVersion sql.NullInt64
-		if err := rows.Scan(&status, &slotToken, &throttleCode, &breakerOpenUntil, &breakerReason, &breakerVersion); err != nil {
+		var throttleCode, breakerOpenUntil, breakerVersion, retryAfter, attemptVersion, attemptTicket sql.NullInt64
+		if err := rows.Scan(&status, &slotToken, &throttleCode, &breakerOpenUntil, &breakerReason, &breakerVersion, &retryAfter, &attemptVersion, &attemptTicket); err != nil {
 			return nil, err
 		}
-		results = append(results, &tryAcquireResult{
+		results = append(results, &admitResult{
 			status:           status.String,
 			slotToken:        slotToken.String,
 			throttleCode:     int(throttleCode.Int64),
 			breakerOpenUntil: int(breakerOpenUntil.Int64),
 			breakerReason:    breakerReason.String,
 			breakerVersion:   breakerVersion.Int64,
+			retryAfter:       int(retryAfter.Int64),
+			attemptVersion:   attemptVersion.Int64,
+			attemptTicket:    int(attemptTicket.Int64),
 		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	if len(results) != len(reqs) {
-		return nil, fmt.Errorf("tryAcquire batch result length mismatch: got %d want %d", len(results), len(reqs))
+		return nil, fmt.Errorf("admit batch result length mismatch: got %d want %d", len(results), len(reqs))
 	}
 	return results, nil
 }

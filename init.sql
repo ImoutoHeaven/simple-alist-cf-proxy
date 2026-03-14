@@ -1768,7 +1768,7 @@ $$;
 -- ========================================
 -- Slot-Handler Friendly Fair Queue RPCs
 -- ========================================
-CREATE OR REPLACE FUNCTION fq_try_acquire_batch(
+CREATE OR REPLACE FUNCTION fq_admit_batch(
   p_hostname_hash TEXT,
   p_hostname TEXT,
   p_site_buckets TEXT[],
@@ -1778,8 +1778,12 @@ CREATE OR REPLACE FUNCTION fq_try_acquire_batch(
   p_host_max_slot_per_ip INT,
   p_site_max_slot_per_site INT,
   p_site_max_slot_per_ip INT,
-  p_zombie_timeout INT DEFAULT 30,
-  p_cooldown_seconds INT DEFAULT 0
+  p_zombie_timeout INT,
+  p_cooldown_seconds INT,
+  p_breaker_enabled BOOLEAN,
+  p_half_open_max_probe_count INT,
+  p_half_open_max_seconds INT,
+  p_half_open_timeout_mode TEXT
 )
 RETURNS TABLE(
   status TEXT,
@@ -1787,20 +1791,26 @@ RETURNS TABLE(
   throttle_code INT,
   breaker_open_until INT,
   breaker_reason TEXT,
-  breaker_version BIGINT
+  breaker_version BIGINT,
+  retry_after INT,
+  attempt_version BIGINT,
+  attempt_ticket INT
 ) AS $$
 DECLARE
   v_hostname TEXT;
   v_site_bucket TEXT;
   v_ip_bucket TEXT;
   v_now INTEGER := COALESCE((p_now_ms / 1000)::INTEGER, EXTRACT(EPOCH FROM NOW())::INTEGER);
-  v_throttled BOOLEAN := FALSE;
-  v_throttle_code INTEGER := NULL;
   v_breaker_state TEXT := NULL;
   v_breaker_open_until INTEGER := NULL;
   v_breaker_reason TEXT := NULL;
   v_breaker_version BIGINT := NULL;
+  v_throttled BOOLEAN := FALSE;
+  v_throttle_code INTEGER := NULL;
   v_breaker_row_count INTEGER := 0;
+  v_authorize_half_open_deadline INTEGER := NULL;
+  v_authorize_attempt_granted BOOLEAN := FALSE;
+  v_authorize_attempt_ticket INTEGER := NULL;
   v_host_slot_id INT;
   v_site_slot_id INT;
   v_site_len INT;
@@ -1814,7 +1824,9 @@ BEGIN
     RETURN;
   END IF;
 
-  IF p_hostname_hash IS NOT NULL AND p_hostname_hash <> '' THEN
+  IF COALESCE(p_breaker_enabled, FALSE)
+    AND p_hostname_hash IS NOT NULL
+    AND p_hostname_hash <> '' THEN
     SELECT "STATE", "OPEN_UNTIL", "OPEN_REASON", "VERSION", "LAST_ERROR_CODE"
     INTO v_breaker_state, v_breaker_open_until, v_breaker_reason, v_breaker_version, v_throttle_code
     FROM "THROTTLE_PROTECTION"
@@ -1835,6 +1847,9 @@ BEGIN
       breaker_open_until := NULL::INTEGER;
       breaker_reason := NULL::TEXT;
       breaker_version := NULL::BIGINT;
+      retry_after := NULL::INTEGER;
+      attempt_version := NULL::BIGINT;
+      attempt_ticket := NULL::INTEGER;
       RETURN NEXT;
     END LOOP;
     RETURN;
@@ -1848,12 +1863,32 @@ BEGIN
       breaker_open_until := v_breaker_open_until;
       breaker_reason := v_breaker_reason;
       breaker_version := v_breaker_version;
+      retry_after := NULL::INTEGER;
+      attempt_version := NULL::BIGINT;
+      attempt_ticket := NULL::INTEGER;
       RETURN NEXT;
     END LOOP;
     RETURN;
   END IF;
 
   FOR v_idx IN 1..v_site_len LOOP
+    IF COALESCE(p_breaker_enabled, FALSE)
+      AND v_breaker_state = 'open'
+      AND v_breaker_open_until IS NOT NULL
+      AND v_breaker_open_until > v_now THEN
+      status := 'THROTTLED';
+      slot_token := NULL::TEXT;
+      throttle_code := v_throttle_code;
+      breaker_open_until := v_breaker_open_until;
+      breaker_reason := v_breaker_reason;
+      breaker_version := v_breaker_version;
+      retry_after := NULL::INTEGER;
+      attempt_version := NULL::BIGINT;
+      attempt_ticket := NULL::INTEGER;
+      RETURN NEXT;
+      CONTINUE;
+    END IF;
+
     v_site_bucket := COALESCE(NULLIF(p_site_buckets[v_idx], ''), 'unknown');
     v_ip_bucket := p_ip_buckets[v_idx];
 
@@ -1878,6 +1913,9 @@ BEGIN
       breaker_open_until := v_breaker_open_until;
       breaker_reason := v_breaker_reason;
       breaker_version := v_breaker_version;
+      retry_after := NULL::INTEGER;
+      attempt_version := NULL::BIGINT;
+      attempt_ticket := NULL::INTEGER;
       RETURN NEXT;
       CONTINUE;
     END IF;
@@ -1889,15 +1927,21 @@ BEGIN
       breaker_open_until := v_breaker_open_until;
       breaker_reason := v_breaker_reason;
       breaker_version := v_breaker_version;
+      retry_after := NULL::INTEGER;
+      attempt_version := NULL::BIGINT;
+      attempt_ticket := NULL::INTEGER;
       RETURN NEXT;
       CONTINUE;
     ELSIF v_host_slot_id < 0 THEN
-      status := 'QUEUE_FULL';
+      status := 'WAIT';
       slot_token := NULL::TEXT;
       throttle_code := v_throttle_code;
       breaker_open_until := v_breaker_open_until;
       breaker_reason := v_breaker_reason;
       breaker_version := v_breaker_version;
+      retry_after := NULL::INTEGER;
+      attempt_version := NULL::BIGINT;
+      attempt_ticket := NULL::INTEGER;
       RETURN NEXT;
       CONTINUE;
     END IF;
@@ -1925,6 +1969,9 @@ BEGIN
       breaker_open_until := v_breaker_open_until;
       breaker_reason := v_breaker_reason;
       breaker_version := v_breaker_version;
+      retry_after := NULL::INTEGER;
+      attempt_version := NULL::BIGINT;
+      attempt_ticket := NULL::INTEGER;
       RETURN NEXT;
       CONTINUE;
     END IF;
@@ -1937,26 +1984,109 @@ BEGIN
       breaker_open_until := v_breaker_open_until;
       breaker_reason := v_breaker_reason;
       breaker_version := v_breaker_version;
+      retry_after := NULL::INTEGER;
+      attempt_version := NULL::BIGINT;
+      attempt_ticket := NULL::INTEGER;
       RETURN NEXT;
       CONTINUE;
     ELSIF v_site_slot_id < 0 THEN
       PERFORM func_release_host_slot(v_host_slot_id, FALSE);
-      status := 'QUEUE_FULL';
+      status := 'WAIT';
       slot_token := NULL::TEXT;
       throttle_code := v_throttle_code;
       breaker_open_until := v_breaker_open_until;
       breaker_reason := v_breaker_reason;
       breaker_version := v_breaker_version;
+      retry_after := NULL::INTEGER;
+      attempt_version := NULL::BIGINT;
+      attempt_ticket := NULL::INTEGER;
       RETURN NEXT;
       CONTINUE;
     END IF;
 
-    status := 'ACQUIRED';
+    IF COALESCE(p_breaker_enabled, FALSE)
+      AND p_hostname_hash IS NOT NULL
+      AND p_hostname_hash <> '' THEN
+      SELECT
+        "STATE",
+        "OPEN_UNTIL",
+        "OPEN_REASON",
+        "VERSION",
+        "HALF_OPEN_DEADLINE",
+        "ATTEMPT_GRANTED",
+        "ATTEMPT_TICKET",
+        "LAST_ERROR_CODE"
+      INTO
+        v_breaker_state,
+        v_breaker_open_until,
+        v_breaker_reason,
+        v_breaker_version,
+        v_authorize_half_open_deadline,
+        v_authorize_attempt_granted,
+        v_authorize_attempt_ticket,
+        v_throttle_code
+      FROM download_authorize_breaker_attempt(
+        p_hostname_hash,
+        p_hostname,
+        v_now,
+        p_half_open_max_probe_count,
+        p_half_open_max_seconds,
+        p_half_open_timeout_mode
+      );
+
+      IF v_breaker_state = 'open'
+        AND v_breaker_open_until IS NOT NULL
+        AND v_breaker_open_until > v_now THEN
+        PERFORM func_release_site_slot(v_site_slot_id, FALSE);
+        PERFORM func_release_host_slot(v_host_slot_id, FALSE);
+        status := 'THROTTLED';
+        slot_token := NULL::TEXT;
+        throttle_code := v_throttle_code;
+        breaker_open_until := v_breaker_open_until;
+        breaker_reason := v_breaker_reason;
+        breaker_version := v_breaker_version;
+        retry_after := NULL::INTEGER;
+        attempt_version := NULL::BIGINT;
+        attempt_ticket := NULL::INTEGER;
+        RETURN NEXT;
+        CONTINUE;
+      END IF;
+
+      IF v_breaker_state = 'half_open' AND NOT COALESCE(v_authorize_attempt_granted, FALSE) THEN
+        PERFORM func_release_site_slot(v_site_slot_id, FALSE);
+        PERFORM func_release_host_slot(v_host_slot_id, FALSE);
+        status := 'HALF_OPEN_FULL';
+        slot_token := NULL::TEXT;
+        throttle_code := v_throttle_code;
+        breaker_open_until := v_breaker_open_until;
+        breaker_reason := v_breaker_reason;
+        breaker_version := v_breaker_version;
+        retry_after := CASE
+          WHEN v_authorize_half_open_deadline IS NOT NULL AND v_authorize_half_open_deadline > v_now THEN v_authorize_half_open_deadline - v_now
+          ELSE 1
+        END;
+        attempt_version := NULL::BIGINT;
+        attempt_ticket := NULL::INTEGER;
+        RETURN NEXT;
+        CONTINUE;
+      END IF;
+    END IF;
+
+    status := 'READY';
     slot_token := encode(convert_to(jsonb_build_object('host', v_host_slot_id, 'site', v_site_slot_id)::text, 'UTF8'), 'base64');
     throttle_code := v_throttle_code;
     breaker_open_until := v_breaker_open_until;
     breaker_reason := v_breaker_reason;
     breaker_version := v_breaker_version;
+    retry_after := NULL::INTEGER;
+    attempt_version := CASE
+      WHEN COALESCE(v_authorize_attempt_granted, FALSE) THEN v_breaker_version
+      ELSE NULL::BIGINT
+    END;
+    attempt_ticket := CASE
+      WHEN COALESCE(v_authorize_attempt_granted, FALSE) THEN v_authorize_attempt_ticket
+      ELSE NULL::INTEGER
+    END;
     RETURN NEXT;
   END LOOP;
 END;

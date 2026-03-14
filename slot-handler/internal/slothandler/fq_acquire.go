@@ -65,9 +65,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		nowFn = store.nowFn
 	}
 	now := nowFn()
-	if strings.TrimSpace(req.SiteBucket) == "" {
-		req.SiteBucket = "unknown"
-	}
+	req.SiteBucket = canonicalSiteBucket(req.SiteBucket)
 	hostKey := fqHostKey(req.HostnameHash, req.Hostname)
 	limits := cfg.FairQueue.inFlightLimits()
 	requestedToken := strings.TrimSpace(req.QueryToken)
@@ -83,10 +81,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			s.incrementMetric("token_stale")
 			return &AcquireResponse{Result: "timeout", Reason: "query_token_stale"}, nil
 		}
-		if snap.Hostname != req.Hostname ||
-			snap.HostnameHash != req.HostnameHash ||
-			snap.IPBucket != req.IPBucket ||
-			snap.SiteBucket != req.SiteBucket {
+		if !matchesAcquireIdentityAndAdmissionTuple(snap, req) {
 			s.incrementMetric("token_mismatch")
 			return &AcquireResponse{Result: "timeout", Reason: "query_token_mismatch"}, nil
 		}
@@ -97,7 +92,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		if scope := detectOverloadScope(store, hostKey, req.SiteBucket, req.IPBucket, limits); scope != "" {
 			return overloadedResponse(scope), nil
 		}
-		token = store.newFlow(req.HostnameHash, req.Hostname, req.IPBucket, req.SiteBucket)
+		token = store.newFlowFromAcquireRequest(req)
 		createdNew = true
 		s.incrementMetric("flow_created")
 	}
@@ -131,7 +126,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			return overloadedResponse(scope), nil
 		}
 		// Flow was deleted/expired concurrently; treat as a new join.
-		token = store.newFlow(req.HostnameHash, req.Hostname, req.IPBucket, req.SiteBucket)
+		token = store.newFlowFromAcquireRequest(req)
 		createdNew = true
 		w = &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
 		if _, err := store.attachWaiterWithLimits(token, w, now, limits); err != nil {
@@ -172,31 +167,41 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		return resp
 	}
 
+	finalizeCanceled := func(delivered *AcquireResponse) error {
+		store.detachWaiter(token)
+		releaseResp := delivered
+		if releaseResp == nil {
+			select {
+			case releaseResp = <-w.resCh:
+			default:
+			}
+		}
+		if releaseResp != nil && strings.EqualFold(strings.TrimSpace(releaseResp.Result), "granted") && strings.TrimSpace(releaseResp.SlotToken) != "" {
+			now2 := nowFn()
+			releaseReq := ReleaseRequest{
+				Hostname:      req.Hostname,
+				HostnameHash:  req.HostnameHash,
+				IPBucket:      req.IPBucket,
+				SiteBucket:    req.SiteBucket,
+				SlotToken:     releaseResp.SlotToken,
+				HitUpstreamAt: now2.UnixMilli(),
+				Now:           now2.UnixMilli(),
+			}
+			go s.releaseSlot(context.Background(), releaseReq)
+		}
+		store.deleteFlow(token)
+		return ctx.Err()
+	}
+
 	select {
 	case <-ctx.Done():
 		// Avoid leaving a waiter attached; delete immediately (no grace) since the
 		// client aborted the request.
-		store.detachWaiter(token)
-		select {
-		case resp := <-w.resCh:
-			if resp != nil && strings.EqualFold(strings.TrimSpace(resp.Result), "granted") && strings.TrimSpace(resp.SlotToken) != "" {
-				now2 := nowFn()
-				releaseReq := ReleaseRequest{
-					Hostname:      req.Hostname,
-					HostnameHash:  req.HostnameHash,
-					IPBucket:      req.IPBucket,
-					SiteBucket:    req.SiteBucket,
-					SlotToken:     resp.SlotToken,
-					HitUpstreamAt: now2.UnixMilli(),
-					Now:           now2.UnixMilli(),
-				}
-				go s.releaseSlot(context.Background(), releaseReq)
-			}
-		default:
-		}
-		store.deleteFlow(token)
-		return nil, ctx.Err()
+		return nil, finalizeCanceled(nil)
 	case resp := <-w.resCh:
+		if ctx.Err() != nil {
+			return nil, finalizeCanceled(resp)
+		}
 		return finalizeDelivered(resp), nil
 	case <-timer.C:
 		// Boundary race guard: prefer delivered outcomes over synthetic pending.
@@ -205,6 +210,9 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		// branch and detachWithGrace.
 		select {
 		case resp := <-w.resCh:
+			if ctx.Err() != nil {
+				return nil, finalizeCanceled(resp)
+			}
 			return finalizeDelivered(resp), nil
 		default:
 		}
@@ -213,6 +221,9 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		store.detachWithGrace(token, now2)
 		select {
 		case resp := <-w.resCh:
+			if ctx.Err() != nil {
+				return nil, finalizeCanceled(resp)
+			}
 			return finalizeDelivered(resp), nil
 		default:
 		}

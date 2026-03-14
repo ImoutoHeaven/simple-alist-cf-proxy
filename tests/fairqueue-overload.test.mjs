@@ -134,6 +134,88 @@ test('slot-handler client uses configured auth header name', async () => {
   }
 });
 
+test('slot-handler client surfaces atomic attempt tokens from granted responses', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: 'granted',
+    slotToken: 'slot-1',
+    meta: {
+      attemptVersion: 7,
+      attemptTicket: 2,
+    },
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.equal(result.kind, 'granted');
+    assert.equal(result.attemptVersion, 7);
+    assert.equal(result.attemptTicket, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('slot-handler client preserves retryAfter for HALF_OPEN_FULL responses', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: 'throttled',
+    reason: 'try_acquire_half_open_full',
+    throttleCode: 503,
+    retryAfter: 9,
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.equal(result.kind, 'throttled');
+    assert.equal(result.throttleCode, 503);
+    assert.equal(result.retryAfter, 9);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('resolveConfig wires controller slotHandlerAuthHeader into slot-handler requests', async () => {
   const { resolveConfig, createSlotHandlerClient } = __fairQueueTestHooks;
   const config = resolveConfig(

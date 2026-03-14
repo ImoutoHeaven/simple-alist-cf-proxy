@@ -79,6 +79,13 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 
 ### 5.2 handleDownload（核心）
 
+admission 固定为四种显式运行模式：
+
+- `none -> fetch only`
+- `breaker_only -> authorize -> fetch -> report`
+- `queue_only -> admit(queue only) -> fetch -> release`
+- `queue_breaker -> admit(queue + breaker) -> fetch -> report -> release`
+
 1. **路径规范化**
    - 对 URL pathname 解码并标准化，失败时返回 400。
 
@@ -112,36 +119,38 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
    - AList 请求头包含：`Authorization: tokenHmacKey`、`CF-Connecting-IP-WORKERS` 以及 `common.alistAuthHeaders`。
 
 9. **Breaker 保护**
-    - 若 hostname 匹配 `throttleProfiles.*.hostPatterns`，worker 只读取数据库权威快照；运行时唯一真源是 `THROTTLE_PROTECTION`，worker 不保留本地 breaker 镜像。
-    - breaker 状态机只有 `closed/open/half_open` 三态：`open` 仅按权威快照立即 fail-fast；若请求启用 Fair Queue，worker 仍先完成 queue grant，再在实际 fetch 前调用 `download_authorize_breaker_attempt` 为这次请求申请 `half_open` attempt。
-    - `download_report_breaker_sample` 负责回写样本，但只在 `half_open` 且 `p_attempt_version` / `p_attempt_ticket` 命中当前 epoch 时接受该 attempt 结果；过期、重复或未获授权的响应不会推进恢复流程。
-    - `half_open` 现在按小批次 epoch 记账收敛：首个受保护错误立即重新 `open`，成功数满足 `halfOpenCloseMode` + `halfOpenSuccessThreshold` 定义的关闭条件时 `close`，整批 attempt 都已发出且全部回报后仍证据不足则重新 `open`，超时仍按 `halfOpenTimeoutMode` 处理；由于回报状态存进 signed `BIGINT` bitmap，`halfOpenMaxProbeCount` 的有效范围固定为 `1..63`。
-    - SQL 里 `TOTAL_SAMPLES` 只保留 lifetime observability；EWMA warm-up 只看 `SAMPLES_SINCE_RESET`，并用 `LAST_SAMPLE_AT` + `idleResetSeconds` 在 `closed` 态空闲过久后先软重置 breaker 记忆再评估新样本。
-    - 下载后仅按 `protectHttpCodes` 上报二值 `sample=1`，`2xx/3xx` 上报 `sample=0`；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退；受保护的 `half_open` attempt 仍会立即重新 `open`。
+     - 若 hostname 匹配 `throttleProfiles.*.hostPatterns`，worker 只读取数据库权威快照；运行时唯一真源是 `THROTTLE_PROTECTION`，worker 不保留本地 breaker 镜像。
+     - breaker 状态机只有 `closed/open/half_open` 三态：`open` 仅按权威快照立即 fail-fast；`download_authorize_breaker_attempt` 只属于 `breaker_only` 路径，`queue_breaker` 直接消费 slot-handler 原子 admission 返回的 `attemptVersion` / `attemptTicket`。
+     - `download_report_breaker_sample` 负责回写样本，但只在 `half_open` 且 `p_attempt_version` / `p_attempt_ticket` 命中当前 epoch 时接受该 attempt 结果；过期、重复或未获授权的响应不会推进恢复流程。`queue_breaker` 的 same-host same-site deferred 3xx report 会先被 defer（armed）；仅当 deferred 仍 armed 且未被终态 sample 取代时，才会在当前 attempt 的终止出口（包括 fetch 抛异常或 abort）flush；终态 sample 一旦进入 report 路径，旧 deferred redirect 会被 disarm 并退出 attempt 竞争；若 report/flush 失败，worker 返回 breaker authority unavailable，同时 finally 仍执行 slot release。
+     - `half_open` 现在按小批次 epoch 记账收敛：首个受保护错误立即重新 `open`，成功数满足 `halfOpenCloseMode` + `halfOpenSuccessThreshold` 定义的关闭条件时 `close`，整批 attempt 都已发出且全部回报后仍证据不足则重新 `open`，超时仍按 `halfOpenTimeoutMode` 处理；由于回报状态存进 signed `BIGINT` bitmap，`halfOpenMaxProbeCount` 的有效范围固定为 `1..63`。
+     - SQL 里 `TOTAL_SAMPLES` 只保留 lifetime observability；EWMA warm-up 只看 `SAMPLES_SINCE_RESET`，并用 `LAST_SAMPLE_AT` + `idleResetSeconds` 在 `closed` 态空闲过久后先软重置 breaker 记忆再评估新样本。
+     - 下载后仅按 `protectHttpCodes` 上报二值 `sample=1`，`2xx/3xx` 上报 `sample=0`；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退；受保护的 `half_open` attempt 仍会立即重新 `open`。
 
 10. **Fair Queue（slot-handler）**
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
+    - `queue_only` 与 `queue_breaker` 都走 slot-handler admission；区别只在 `queue_breaker` 会额外携带 `breakerEnabled` 与 half-open 参数，让 backend 原子决定 queue slot 与 breaker attempt。
+    - worker 把返回的 `queryToken` 视为一次稳定的 admission 会话标识；同 token 续轮询时 `hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket`、`breakerEnabled` 与 `queue_breaker` half-open admission 参数必须保持 canonical 一致，slot-handler 只做校验，不会把新参数覆写回旧 flow。
     - acquire / release 请求使用 `download.fairQueue.slotHandlerAuthHeader` 指定的鉴权 header 名发送 `slotHandlerAuthKey`，不再假定 header 名固定写死。
     - `acquire` 轮询同时受 `maxAttempts` 与 `totalMaxWaitMs` 约束，任一达到即结束等待。
     - 支持 `pending` / `granted` / `throttled` / `overloaded` / `timeout`；其中 `throttled` 仅表示 slot-handler 透传 backend `THROTTLED` 结果，worker 不把它当作本地 breaker 权威。
     - scoped overload 与 global overload 退避会在内存中做短期抑制，但这只属于 fair-queue 退避，不参与 breaker 状态机。
     - `overloaded` 由 slot-handler 返回 `reason=overload_<scope>`（`global|host|site|ip`）与可选 `retryAfter`。
     - overload 行为矩阵：
-     - `overload_global`：worker 立即 fail-fast 返回 `503`；优先使用 slot-handler 的 `retryAfter`，若缺失/非法则按 worker 默认值回填 `Retry-After`。
-     - `overload_host|overload_site|overload_ip`：worker 继续轮询，使用严格阶梯等待（0.5s 起步、每轮 +0.5s、单次最多 2.0s，不加 jitter）。
-     - 当 `queryToken` 仍然有效且 scoped overload 只是要求退避时，slot-handler 会刷新 detached token 的 grace，避免 worker 在退避窗口内把原 token 自己等到过期。
-     - scoped overload（host/site/ip）仍受 `slotHandlerTimeoutMs` 总等待上限约束。
-     - worker 维护 host 级 overloaded 冷却窗口与本地退避 `delayMs`，在下一次 acquire 前先等待剩余冷却时间，避免对同一 host 高频空转重试。
-     - `download.fairQueue.slotHandlerTimeoutMs` 由 controller 下发，worker 内映射为 `slotHandlerConfig.totalMaxWaitMs`，用于总等待上限。
-     - `overloaded` 退避 streak 在收到非 overloaded 结果（如 `pending`/`granted`/`throttled`/`409`）时重置。
-     - 若 token 已 stale、sticky miss 到别的实例，或携带的 host/ip/site 与原 flow 不匹配，slot-handler 仍会返回 `timeout`；worker 侧统一退化为 `503`，不会承诺自动恢复原排队位置。
-     - 完成后发送 `/api/v1/fairqueue/release`（fire-and-forget，通过 `ctx.waitUntil` 执行）。
-     - release 契约：缺失/空或格式非法的 `slotToken` 返回 `4xx`（当前为 `400`）；语法合法但未知/已释放的 `slotToken` 仍返回 `200` 幂等成功。
-     - release 返回非 `2xx` 视为失败：slot-handler 在 backend release 失败时返回 `502`。
-     - release 重试策略：仅在网络错误、`429` 或 `>=500` 时重试（最多 3 次，指数退避）；非可重试 `4xx` 不重试。
+        - `overload_global`：worker 立即 fail-fast 返回 `503`；优先使用 slot-handler 的 `retryAfter`，若缺失/非法则按 worker 默认值回填 `Retry-After`。
+        - `overload_host|overload_site|overload_ip`：worker 继续轮询，使用严格阶梯等待（0.5s 起步、每轮 +0.5s、单次最多 2.0s，不加 jitter）。
+        - 当 `queryToken` 仍然有效且 scoped overload 只是要求退避时，slot-handler 会刷新 detached token 的 grace，避免 worker 在退避窗口内把原 token 自己等到过期。
+        - scoped overload（host/site/ip）仍受 `slotHandlerTimeoutMs` 总等待上限约束。
+        - worker 维护 host 级 overloaded 冷却窗口与本地退避 `delayMs`，在下一次 acquire 前先等待剩余冷却时间，避免对同一 host 高频空转重试。
+        - `download.fairQueue.slotHandlerTimeoutMs` 由 controller 下发，worker 内映射为 `slotHandlerConfig.totalMaxWaitMs`，用于总等待上限。
+        - `overloaded` 退避 streak 在收到非 overloaded 结果（如 `pending`/`granted`/`throttled`/`409`）时重置。
+        - 若 token 已 stale、sticky miss 到别的实例，或携带的 `hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket`、`breakerEnabled` 或 `queue_breaker` half-open admission tuple 与原 flow 不匹配，slot-handler 仍会返回 `timeout`；worker 侧统一退化为 `503`，不会承诺自动恢复原排队位置。
+    - 完成后发送 `/api/v1/fairqueue/release`（fire-and-forget，通过 `ctx.waitUntil` 执行）。
+    - release 契约：缺失/空或格式非法的 `slotToken` 返回 `4xx`（当前为 `400`）；语法合法但未知/已释放的 `slotToken` 仍返回 `200` 幂等成功。
+    - release 返回非 `2xx` 视为失败：slot-handler 在 backend release 失败时返回 `502`。
+    - release 重试策略：仅在网络错误、`429` 或 `>=500` 时重试（最多 3 次，指数退避）；非可重试 `4xx` 不重试。
     - 轮询探测受 `utilWindowSec` 与 `maxBatch` / `maxProbeParallel` / `maxProbeQpsPerHost` 控制。
     - 若 slot-handler 不可用或 fair-queue 接口异常，按 fail-closed 返回 `503`，不绕过排队保护。
-     - 多实例 slot-handler 需要 sticky 路由：同一 `queryToken` 的轮询应稳定落到同一实例，否则会出现 `query_token_stale`/`timeout`，worker 侧退化为 `503`。
+    - 多实例 slot-handler 需要 sticky 路由：同一 `queryToken` 的轮询应稳定落到同一实例，否则会出现 `query_token_stale`/`timeout`，worker 侧退化为 `503`。
 
 11. **上游请求与响应封装**
     - 支持 3xx 重定向与 401/410 触发的 refresh（`refresh=true`）重试一次。
@@ -160,11 +169,11 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 
 - 下载缓存：`DOWNLOAD_CACHE_TABLE` + `download_upsert_download_cache`
 - IP 限流：`DOWNLOAD_IP_RATELIMIT_TABLE` + `download_upsert_rate_limit`
-- Breaker：`THROTTLE_PROTECTION` + `download_authorize_breaker_attempt` + `download_report_breaker_sample`（controller bootstrap 只新增 `halfOpenMaxProbeCount` 并移除 `probeLeaseSeconds`；controller 和 worker 都会在配置解析阶段拒绝 `halfOpenMaxProbeCount > 63`，因为 SQL 用 signed `BIGINT` bitmap 记录 half-open attempt 回报；worker 先排队拿 slot，再为实际 fetch 调用 `download_authorize_breaker_attempt` 申请 `half_open` attempt，并在响应后带 `p_attempt_version` / `p_attempt_ticket` 回写 sample；SQL 用小批次 epoch 记账收敛：首个受保护错误立即重新 `open`，成功数足够时 `close`，整批耗尽仍证据不足则重新 `open`，超时仍按 `halfOpenTimeoutMode` 处理；`SAMPLES_SINCE_RESET` / `LAST_SAMPLE_AT` 继续负责 warm-up 与 idle reset，`TOTAL_SAMPLES` 仅保留累计观测）
+- Breaker：`THROTTLE_PROTECTION` + `download_authorize_breaker_attempt` + `download_report_breaker_sample`（`download_authorize_breaker_attempt` 只用于 `breaker_only`；`queue_breaker` 改由 slot-handler / `fq_admit_batch` 原子返回 attempt 信息，worker 只负责在响应后带 `p_attempt_version` / `p_attempt_ticket` 回写 sample；controller bootstrap 只新增 `halfOpenMaxProbeCount` 并移除 `probeLeaseSeconds`；controller 和 worker 都会在配置解析阶段拒绝 `halfOpenMaxProbeCount > 63`，因为 SQL 用 signed `BIGINT` bitmap 记录 half-open attempt 回报；SQL 用小批次 epoch 记账收敛：首个受保护错误立即重新 `open`，成功数足够时 `close`，整批耗尽仍证据不足则重新 `open`，超时仍按 `halfOpenTimeoutMode` 处理；`SAMPLES_SINCE_RESET` / `LAST_SAMPLE_AT` 继续负责 warm-up 与 idle reset，`TOTAL_SAMPLES` 仅保留累计观测）
 - Last Active：`DOWNLOAD_LAST_ACTIVE_TABLE` + `download_update_last_active`
 - 统一检查：`download_unified_check`（直接返回 breaker 原始字段 `state/open_until/reason/version/last_error_code`）
 
-Fair Queue 相关函数由 `slot-handler` 使用（`fq_try_acquire_batch` / `fq_release_dual`）；其中 `fq_try_acquire_batch` 只在 backend 判定 `open` 窗口仍有效时返回 `THROTTLED` 与原始 breaker 元数据，不在 slot-handler 本地保存额外 breaker 状态。
+Fair Queue 相关函数由 `slot-handler` 使用（`fq_admit_batch` / `fq_release_dual`）；`fq_admit_batch` 在 `queue_only` 下只做 queue admission，在 `queue_breaker` 下同一事务里同时决定 queue slot 与 breaker attempt；其中 host/site per-IP 上限或 cooldown 命中会显式返回 `IP_TOO_MANY`，slot-handler scheduler 用这类结构性反馈做减权和 deny-until。partitioned admit 中，成功 partition 的 `IP_TOO_MANY` / `HALF_OPEN_FULL` / `THROTTLED` 属于已知结构性结果并立即生效；后续 partition 报错或长度不匹配只影响 unknown flow，`READY` 仍按保守补偿策略回滚（release）（`THROTTLED` latch 只会阻止 breaker-enabled `READY` 的最终提交；对已按顺序 apply 的 sub-batch，`IP_TOO_MANY` / `HALF_OPEN_FULL` 的结构性语义会落地且不会被 generic `THROTTLED` 覆盖），普通 `WAIT` 仍只表示 contention；若 backend 返回 `THROTTLED`，slot-handler 只透传原始 breaker 元数据，不在本地保存额外 breaker 状态。
 
 ## 7. 限制与注意事项
 

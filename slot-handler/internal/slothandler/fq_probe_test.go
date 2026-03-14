@@ -2,6 +2,8 @@ package slothandler
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -30,7 +32,7 @@ func (b *releaseRecordingBackend) ReleaseSlot(ctx context.Context, req ReleaseRe
 
 type sequenceBackend struct {
 	mu      sync.Mutex
-	seq     []*tryAcquireResult
+	seq     []*admitResult
 	calls   int
 	reqs    []AcquireRequest
 	errNext error
@@ -69,9 +71,53 @@ type throttledSiblingBackend struct {
 	released       []ReleaseRequest
 }
 
+type laterThrottledWinsBackend struct {
+	mu               sync.Mutex
+	throttledStarted chan struct{}
+	throttledRelease chan struct{}
+	released         chan ReleaseRequest
+	startOnce        sync.Once
+	releaseCalls     int
+	releasedReqs     []ReleaseRequest
+}
+
+type ipTooManyThenThrottledBackend struct {
+	throttledStarted chan struct{}
+	throttledRelease chan struct{}
+	startOnce        sync.Once
+}
+
+type mixedModeLatchBackend struct {
+	mu           sync.Mutex
+	releaseCalls int
+	releasedReqs []ReleaseRequest
+}
+
+type tupleGroupingBackend struct {
+	mu      sync.Mutex
+	batches [][]AcquireRequest
+}
+
 type partialFailureBackend struct{}
 
-func (b *holBlockingBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+type partitionReadyThenErrorBackend struct {
+	mu              sync.Mutex
+	firstPartition  []*admitResult
+	secondPartition []*admitResult
+	secondErr       error
+	thirdPartition  []*admitResult
+	thirdErr        error
+	thirdSet        bool
+	seen            [][]AcquireRequest
+	released        []ReleaseRequest
+	releaseErrs     map[string]error
+}
+
+type statusByIPBackend struct {
+	statuses map[string]*admitResult
+}
+
+func (b *holBlockingBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	if b != nil {
 		ips := make([]string, 0, len(reqs))
 		for _, req := range reqs {
@@ -127,20 +173,20 @@ func (b *holBlockingBackend) TryAcquireBatch(ctx context.Context, reqs []Acquire
 		}
 	}
 
-	results := make([]*tryAcquireResult, len(reqs))
+	results := make([]*admitResult, len(reqs))
 	for i, req := range reqs {
 		if strings.Contains(req.IPBucket, "fast-") {
-			results[i] = &tryAcquireResult{status: "ACQUIRED", slotToken: "slot-" + req.IPBucket}
+			results[i] = &admitResult{status: "READY", slotToken: "slot-" + req.IPBucket}
 			continue
 		}
-		results[i] = &tryAcquireResult{status: "WAIT"}
+		results[i] = &admitResult{status: "WAIT"}
 	}
 	return results, nil
 }
 
 func (b *holBlockingBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }
 
-func (b *throttledSiblingBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+func (b *throttledSiblingBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	hasSlow := false
 	for _, req := range reqs {
 		if strings.Contains(req.IPBucket, "slow-") {
@@ -161,15 +207,15 @@ func (b *throttledSiblingBackend) TryAcquireBatch(ctx context.Context, reqs []Ac
 		}
 	}
 
-	results := make([]*tryAcquireResult, len(reqs))
+	results := make([]*admitResult, len(reqs))
 	for i, req := range reqs {
 		switch {
 		case strings.Contains(req.IPBucket, "slow-"):
-			results[i] = &tryAcquireResult{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Now().Add(15 * time.Second).Unix()), breakerReason: "http_429", breakerVersion: 1}
+			results[i] = &admitResult{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Now().Add(15 * time.Second).Unix()), breakerReason: "http_429", breakerVersion: 1}
 		case strings.Contains(req.IPBucket, "fast-"):
-			results[i] = &tryAcquireResult{status: "ACQUIRED", slotToken: "slot-" + req.IPBucket}
+			results[i] = &admitResult{status: "READY", slotToken: "slot-" + req.IPBucket}
 		default:
-			results[i] = &tryAcquireResult{status: "WAIT"}
+			results[i] = &admitResult{status: "WAIT"}
 		}
 	}
 	return results, nil
@@ -195,20 +241,149 @@ func (b *throttledSiblingBackend) ReleaseSlot(ctx context.Context, req ReleaseRe
 	return nil
 }
 
-func (b *partialFailureBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+func (b *laterThrottledWinsBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	results := make([]*admitResult, len(reqs))
+	for i, req := range reqs {
+		switch {
+		case strings.Contains(req.IPBucket, "z-throttled"):
+			b.startOnce.Do(func() {
+				if b.throttledStarted != nil {
+					close(b.throttledStarted)
+				}
+			})
+			select {
+			case <-b.throttledRelease:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			results[i] = &admitResult{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Now().Add(15 * time.Second).Unix()), breakerReason: "http_429", breakerVersion: 1}
+		case strings.Contains(req.IPBucket, "a-ready"):
+			results[i] = &admitResult{status: "READY", slotToken: "slot-" + req.IPBucket}
+		default:
+			results[i] = &admitResult{status: "WAIT"}
+		}
+	}
+	return results, nil
+}
+
+func (b *laterThrottledWinsBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	b.mu.Lock()
+	b.releaseCalls++
+	b.releasedReqs = append(b.releasedReqs, req)
+	b.mu.Unlock()
+	if b.released != nil {
+		select {
+		case b.released <- req:
+		default:
+		}
+	}
+	return nil
+}
+
+func (b *ipTooManyThenThrottledBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	results := make([]*admitResult, len(reqs))
+	for i, req := range reqs {
+		switch {
+		case strings.Contains(req.IPBucket, "z-throttled"):
+			b.startOnce.Do(func() {
+				if b.throttledStarted != nil {
+					close(b.throttledStarted)
+				}
+			})
+			select {
+			case <-b.throttledRelease:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			results[i] = &admitResult{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Now().Add(15 * time.Second).Unix()), breakerReason: "http_429", breakerVersion: 1}
+		case strings.Contains(req.IPBucket, "a-ip-too-many"):
+			results[i] = &admitResult{status: "IP_TOO_MANY"}
+		default:
+			results[i] = &admitResult{status: "WAIT"}
+		}
+	}
+	return results, nil
+}
+
+func (b *ipTooManyThenThrottledBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	return nil
+}
+
+func (b *mixedModeLatchBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	results := make([]*admitResult, len(reqs))
+	for i, req := range reqs {
+		switch {
+		case req.BreakerEnabled && strings.Contains(req.IPBucket, "breaker-"):
+			results[i] = &admitResult{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Now().Add(15 * time.Second).Unix()), breakerReason: "http_429", breakerVersion: 1}
+		case !req.BreakerEnabled && strings.Contains(req.IPBucket, "queue-"):
+			results[i] = &admitResult{status: "READY", slotToken: "slot-" + req.IPBucket}
+		default:
+			results[i] = &admitResult{status: "WAIT"}
+		}
+	}
+	return results, nil
+}
+
+func (b *mixedModeLatchBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	b.mu.Lock()
+	b.releaseCalls++
+	b.releasedReqs = append(b.releasedReqs, req)
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *tupleGroupingBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	copyReqs := append([]AcquireRequest(nil), reqs...)
+	b.mu.Lock()
+	b.batches = append(b.batches, copyReqs)
+	b.mu.Unlock()
+	if err := validateAcquireBatchInputs(reqs); err != nil {
+		return nil, err
+	}
+	results := make([]*admitResult, len(reqs))
+	for i := range results {
+		results[i] = &admitResult{status: "WAIT"}
+	}
+	return results, nil
+}
+
+func (b *tupleGroupingBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	return nil
+}
+
+func (b *tupleGroupingBackend) batchSignatures() map[string]int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	sigs := make(map[string]int, len(b.batches))
+	for _, batch := range b.batches {
+		if len(batch) == 0 {
+			continue
+		}
+		ips := make([]string, 0, len(batch))
+		for _, req := range batch {
+			ips = append(ips, req.IPBucket)
+		}
+		first := batch[0]
+		key := fmt.Sprintf("be=%t probe=%d sec=%d mode=%s ips=%s", first.BreakerEnabled, first.HalfOpenMaxProbeCount, first.HalfOpenMaxSeconds, first.HalfOpenTimeoutMode, strings.Join(ips, ","))
+		sigs[key]++
+	}
+	return sigs
+}
+
+func (b *partialFailureBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	for _, req := range reqs {
 		if strings.HasPrefix(req.IPBucket, "err-") {
 			return nil, context.DeadlineExceeded
 		}
 	}
 
-	results := make([]*tryAcquireResult, len(reqs))
+	results := make([]*admitResult, len(reqs))
 	for i, req := range reqs {
 		if strings.HasPrefix(req.IPBucket, "fast-") {
-			results[i] = &tryAcquireResult{status: "ACQUIRED", slotToken: "slot-" + req.IPBucket}
+			results[i] = &admitResult{status: "READY", slotToken: "slot-" + req.IPBucket}
 			continue
 		}
-		results[i] = &tryAcquireResult{status: "WAIT"}
+		results[i] = &admitResult{status: "WAIT"}
 	}
 	return results, nil
 }
@@ -217,15 +392,108 @@ func (b *partialFailureBackend) ReleaseSlot(ctx context.Context, req ReleaseRequ
 	return nil
 }
 
-func (b *recordingBatchBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+func cloneAdmitResults(results []*admitResult) []*admitResult {
+	if len(results) == 0 {
+		return nil
+	}
+	clones := make([]*admitResult, len(results))
+	for i, res := range results {
+		if res == nil {
+			continue
+		}
+		copy := *res
+		clones[i] = &copy
+	}
+	return clones
+}
+
+func (b *partitionReadyThenErrorBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	if err := validateAcquireBatchInputs(reqs); err != nil {
+		return nil, err
+	}
+
+	b.mu.Lock()
+	call := len(b.seen)
+	b.seen = append(b.seen, append([]AcquireRequest(nil), reqs...))
+	firstPartition := cloneAdmitResults(b.firstPartition)
+	secondPartition := cloneAdmitResults(b.secondPartition)
+	secondErr := b.secondErr
+	thirdPartition := cloneAdmitResults(b.thirdPartition)
+	thirdErr := b.thirdErr
+	thirdSet := b.thirdSet
+	b.mu.Unlock()
+
+	switch call {
+	case 0:
+		return firstPartition, nil
+	case 1:
+		if secondErr != nil {
+			return nil, secondErr
+		}
+		return secondPartition, nil
+	case 2:
+		if thirdSet {
+			if thirdErr != nil {
+				return nil, thirdErr
+			}
+			return thirdPartition, nil
+		}
+	default:
+		results := make([]*admitResult, len(reqs))
+		for i := range results {
+			results[i] = &admitResult{status: "WAIT"}
+		}
+		return results, nil
+	}
+	results := make([]*admitResult, len(reqs))
+	for i := range results {
+		results[i] = &admitResult{status: "WAIT"}
+	}
+	return results, nil
+}
+
+func (b *partitionReadyThenErrorBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	b.mu.Lock()
+	b.released = append(b.released, req)
+	err := b.releaseErrs[req.SlotToken]
+	b.mu.Unlock()
+	return err
+}
+
+func (b *partitionReadyThenErrorBackend) batchSignatures() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	sigs := make([]string, 0, len(b.seen))
+	for _, batch := range b.seen {
+		if len(batch) == 0 {
+			sigs = append(sigs, "")
+			continue
+		}
+		ips := make([]string, 0, len(batch))
+		for _, req := range batch {
+			ips = append(ips, req.IPBucket)
+		}
+		sigs = append(sigs, fmt.Sprintf("be=%t ips=%s", batch[0].BreakerEnabled, strings.Join(ips, ",")))
+	}
+	return sigs
+}
+
+func (b *partitionReadyThenErrorBackend) releasedRequests() []ReleaseRequest {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]ReleaseRequest(nil), b.released...)
+}
+
+func (b *recordingBatchBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	copyReqs := append([]AcquireRequest(nil), reqs...)
 	b.mu.Lock()
 	b.seen = append(b.seen, copyReqs)
 	b.mu.Unlock()
 
-	results := make([]*tryAcquireResult, len(reqs))
+	results := make([]*admitResult, len(reqs))
 	for i := range results {
-		results[i] = &tryAcquireResult{status: "WAIT"}
+		results[i] = &admitResult{status: "WAIT"}
 	}
 	return results, nil
 }
@@ -249,18 +517,76 @@ func (b *recordingBatchBackend) seenIPBatches() [][]string {
 	return batches
 }
 
-func (b *batchBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+func TestProbeImmutableConflictReuseDoesNotPolluteBackendTuple(t *testing.T) {
+	backend := &recordingBatchBackend{}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		MaxBatch:           1,
+		MaxProbeParallel:   1,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 21, 12, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	base := AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "s1",
+	}
+	tok := store.newFlowFromAcquireRequest(base)
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	conflicting := base
+	conflicting.BreakerEnabled = true
+	conflicting.HalfOpenMaxProbeCount = 9
+	conflicting.HalfOpenMaxSeconds = 15
+	conflicting.HalfOpenTimeoutMode = "partial-close"
+	conflicting.QueryToken = tok
+	_, _ = s.handleAcquireSlot(context.Background(), conflicting)
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiter")
+	}
+
+	backend.mu.Lock()
+	if len(backend.seen) != 1 || len(backend.seen[0]) != 1 {
+		backend.mu.Unlock()
+		t.Fatalf("expected exactly one backend request, got %+v", backend.seen)
+	}
+	seen := backend.seen[0][0]
+	backend.mu.Unlock()
+
+	if seen.Hostname != base.Hostname ||
+		seen.HostnameHash != base.HostnameHash ||
+		seen.IPBucket != base.IPBucket ||
+		seen.SiteBucket != base.SiteBucket {
+		t.Fatalf("expected original identity tuple, got %+v", seen)
+	}
+	if seen.BreakerEnabled ||
+		seen.HalfOpenMaxProbeCount != 0 ||
+		seen.HalfOpenMaxSeconds != 0 ||
+		seen.HalfOpenTimeoutMode != "" {
+		t.Fatalf("expected original breaker tuple, got %+v", seen)
+	}
+}
+
+func (b *batchBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	b.called = true
-	res := make([]*tryAcquireResult, len(reqs))
+	res := make([]*admitResult, len(reqs))
 	for i := range res {
-		res[i] = &tryAcquireResult{status: "WAIT"}
+		res[i] = &admitResult{status: "WAIT"}
 	}
 	return res, nil
 }
 
 func (b *batchBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }
 
-func (b *sequenceBackend) TryAcquire(ctx context.Context, req AcquireRequest) (*tryAcquireResult, error) {
+func (b *sequenceBackend) Admit(ctx context.Context, req AcquireRequest) (*admitResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.calls++
@@ -271,7 +597,7 @@ func (b *sequenceBackend) TryAcquire(ctx context.Context, req AcquireRequest) (*
 		return nil, err
 	}
 	if len(b.seq) == 0 {
-		return &tryAcquireResult{status: "WAIT"}, nil
+		return &admitResult{status: "WAIT"}, nil
 	}
 	idx := b.calls - 1
 	if idx >= len(b.seq) {
@@ -285,10 +611,10 @@ func (b *sequenceBackend) TryAcquire(ctx context.Context, req AcquireRequest) (*
 	return &copy, nil
 }
 
-func (b *sequenceBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
-	results := make([]*tryAcquireResult, len(reqs))
+func (b *sequenceBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	results := make([]*admitResult, len(reqs))
 	for i, req := range reqs {
-		res, err := b.TryAcquire(ctx, req)
+		res, err := b.Admit(ctx, req)
 		if err != nil {
 			return nil, err
 		}
@@ -298,6 +624,23 @@ func (b *sequenceBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireReq
 }
 
 func (b *sequenceBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }
+
+func (b *statusByIPBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	results := make([]*admitResult, len(reqs))
+	for i, req := range reqs {
+		if b != nil && b.statuses != nil {
+			if res, ok := b.statuses[req.IPBucket]; ok && res != nil {
+				copy := *res
+				results[i] = &copy
+				continue
+			}
+		}
+		results[i] = &admitResult{status: "WAIT"}
+	}
+	return results, nil
+}
+
+func (b *statusByIPBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error { return nil }
 
 func expectThrottledResponse(t *testing.T, ch <-chan *AcquireResponse, tok string) {
 	t.Helper()
@@ -312,15 +655,39 @@ func expectThrottledResponse(t *testing.T, ch <-chan *AcquireResponse, tok strin
 	}
 }
 
+func expectAttemptMeta(t *testing.T, resp *AcquireResponse, wantVersion int64, wantTicket int) {
+	t.Helper()
+	if resp == nil {
+		t.Fatalf("expected acquire response")
+	}
+	if resp.Meta == nil {
+		t.Fatalf("expected attempt metadata, got nil meta")
+	}
+	version, ok := resp.Meta["attemptVersion"]
+	if !ok {
+		t.Fatalf("expected attemptVersion in meta: %+v", resp.Meta)
+	}
+	ticket, ok := resp.Meta["attemptTicket"]
+	if !ok {
+		t.Fatalf("expected attemptTicket in meta: %+v", resp.Meta)
+	}
+	if got := reflect.ValueOf(version).Int(); got != wantVersion {
+		t.Fatalf("expected attemptVersion %d, got %d", wantVersion, got)
+	}
+	if got := int(reflect.ValueOf(ticket).Int()); got != wantTicket {
+		t.Fatalf("expected attemptTicket %d, got %d", wantTicket, got)
+	}
+}
+
 func TestProbeOnceWaitIncreasesWaitCount(t *testing.T) {
-	backend := &sequenceBackend{seq: []*tryAcquireResult{{status: "WAIT"}}}
+	backend := &sequenceBackend{seq: []*admitResult{{status: "WAIT"}}}
 	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
 	s := newTestServer()
 	s.updateRuntime(cfg, backend, "test", true)
 
 	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
 	store := s.flowStore
-	tok := store.newFlow("h1", "example.com", "ip1", "s1")
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip1", "s1")
 	respCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
@@ -343,76 +710,361 @@ func TestProbeOnceWaitIncreasesWaitCount(t *testing.T) {
 	}
 }
 
-func TestProbeOnceIpTooManySetsDenyAndDownweights(t *testing.T) {
-	backend := &sequenceBackend{seq: []*tryAcquireResult{{status: "IP_TOO_MANY"}, {status: "WAIT"}}}
+func TestProbeOnceIPTooManyHalvesWaitCountAndSetsDenyUntil(t *testing.T) {
+	backend := &statusByIPBackend{statuses: map[string]*admitResult{
+		"ip-structural": {status: "IP_TOO_MANY"},
+	}}
 	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
 	s := newTestServer()
 	s.updateRuntime(cfg, backend, "test", true)
 
-	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 3, 21, 12, 0, 0, 0, time.UTC)
 	store := s.flowStore
-	tok := store.newFlow("h1", "example.com", "ip1", "s1")
+	tok := store.newFlow("h1", "example.com", "ip-structural", "s1")
 	respCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
 	}
 
 	sched := s.getOrCreateFlowScheduler("h1")
-	_, bt := sched.getOrInitStates("s1", "ip1")
-	bt.WaitCount = 4
-	st, _ := sched.getOrInitStates("s1", "ip1")
-	st.WaitCount = 4
+	st, bt := sched.getOrInitStates("s1", "ip-structural")
+	st.WaitCount = 6
+	bt.WaitCount = 6
 
 	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
 		t.Fatalf("expected probeOnce to see in-flight waiter")
 	}
 
-	_, bt = sched.getOrInitStates("s1", "ip1")
-	if bt.WaitCount != 2 {
-		t.Fatalf("expected WaitCount to halve to 2, got %d", bt.WaitCount)
+	st, bt = sched.getOrInitStates("s1", "ip-structural")
+	if bt.WaitCount != 3 {
+		t.Fatalf("expected IP_TOO_MANY to halve bucket wait count to 3, got %d", bt.WaitCount)
 	}
-	if bt.DenyUntil.IsZero() || !bt.DenyUntil.Equal(now.Add(5*time.Second)) {
-		t.Fatalf("expected DenyUntil=%v, got %v", now.Add(5*time.Second), bt.DenyUntil)
+	if st.WaitCount != 3 {
+		t.Fatalf("expected IP_TOO_MANY to halve site wait count to 3, got %d", st.WaitCount)
 	}
-
-	// While in deny window, probeOnce should not call backend again.
-	if ok := s.probeOnce(context.Background(), "h1", now.Add(1*time.Second)); !ok {
-		t.Fatalf("expected probeOnce to stay alive while denied")
-	}
-	backend.mu.Lock()
-	calls := backend.calls
-	backend.mu.Unlock()
-	if calls != 1 {
-		t.Fatalf("expected backend calls=1 while denied, got %d", calls)
-	}
-
-	// After deny window passes, probeOnce can try again.
-	if ok := s.probeOnce(context.Background(), "h1", now.Add(6*time.Second)); !ok {
-		t.Fatalf("expected probeOnce to see in-flight waiter")
-	}
-	backend.mu.Lock()
-	calls = backend.calls
-	backend.mu.Unlock()
-	if calls != 2 {
-		t.Fatalf("expected backend calls=2 after deny expiry, got %d", calls)
+	wantDenyUntil := now.Add(5 * time.Second)
+	if !bt.DenyUntil.Equal(wantDenyUntil) {
+		t.Fatalf("expected IP_TOO_MANY deny-until %v, got %v", wantDenyUntil, bt.DenyUntil)
 	}
 
 	select {
 	case got := <-respCh:
-		t.Fatalf("expected no delivery on IP_TOO_MANY/WAIT, got %+v", got)
+		t.Fatalf("expected IP_TOO_MANY flow to stay pending, got %+v", got)
 	default:
+	}
+	if _, ok := store.getSnapshot(tok); !ok {
+		t.Fatalf("expected IP_TOO_MANY flow to remain in flow store")
 	}
 }
 
-func TestProbeOnceAcquiredDeliversGrantedAndDownweights(t *testing.T) {
-	backend := &sequenceBackend{seq: []*tryAcquireResult{{status: "ACQUIRED", slotToken: "slot-123"}}}
+func TestProbeOnceIPTooManyFallsBackToThreeSecondDenyUntilWhenCooldownDisabled(t *testing.T) {
+	backend := &statusByIPBackend{statuses: map[string]*admitResult{
+		"ip-fallback": {status: "IP_TOO_MANY"},
+	}}
+	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 0}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 21, 12, 1, 0, 0, time.UTC)
+	store := s.flowStore
+	tok := store.newFlow("h1", "example.com", "ip-fallback", "s1")
+	respCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	st, bt := sched.getOrInitStates("s1", "ip-fallback")
+	st.WaitCount = 8
+	bt.WaitCount = 8
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiter")
+	}
+
+	st, bt = sched.getOrInitStates("s1", "ip-fallback")
+	if bt.WaitCount != 4 {
+		t.Fatalf("expected IP_TOO_MANY fallback path to halve bucket wait count to 4, got %d", bt.WaitCount)
+	}
+	if st.WaitCount != 4 {
+		t.Fatalf("expected IP_TOO_MANY fallback path to halve site wait count to 4, got %d", st.WaitCount)
+	}
+	wantDenyUntil := now.Add(3 * time.Second)
+	if !bt.DenyUntil.Equal(wantDenyUntil) {
+		t.Fatalf("expected IP_TOO_MANY fallback deny-until %v, got %v", wantDenyUntil, bt.DenyUntil)
+	}
+
+	select {
+	case got := <-respCh:
+		t.Fatalf("expected IP_TOO_MANY fallback flow to stay pending, got %+v", got)
+	default:
+	}
+	if _, ok := store.getSnapshot(tok); !ok {
+		t.Fatalf("expected IP_TOO_MANY fallback flow to remain in flow store")
+	}
+}
+
+func TestProbeOnceWAITDoesNotSetDenyUntil(t *testing.T) {
+	backend := &statusByIPBackend{statuses: map[string]*admitResult{
+		"ip-wait": {status: "WAIT"},
+	}}
+	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 21, 12, 5, 0, 0, time.UTC)
+	store := s.flowStore
+	tok := store.newFlow("h1", "example.com", "ip-wait", "s1")
+	respCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	st, bt := sched.getOrInitStates("s1", "ip-wait")
+	st.WaitCount = 6
+	bt.WaitCount = 6
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiter")
+	}
+
+	st, bt = sched.getOrInitStates("s1", "ip-wait")
+	if bt.WaitCount != 7 {
+		t.Fatalf("expected WAIT to bump bucket wait count to 7, got %d", bt.WaitCount)
+	}
+	if st.WaitCount != 7 {
+		t.Fatalf("expected WAIT to bump site wait count to 7, got %d", st.WaitCount)
+	}
+	if !bt.DenyUntil.IsZero() {
+		t.Fatalf("expected WAIT to avoid deny-until, got %v", bt.DenyUntil)
+	}
+
+	select {
+	case got := <-respCh:
+		t.Fatalf("expected WAIT flow to stay pending, got %+v", got)
+	default:
+	}
+	if _, ok := store.getSnapshot(tok); !ok {
+		t.Fatalf("expected WAIT flow to remain in flow store")
+	}
+}
+
+func TestProbeOnceEarlierIPTooManyKeepsDenyUntilAfterLaterThrottled(t *testing.T) {
+	backend := &ipTooManyThenThrottledBackend{
+		throttledStarted: make(chan struct{}),
+		throttledRelease: make(chan struct{}),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 21, 12, 10, 0, 0, time.UTC)
+	store := s.flowStore
+	ipTooManyTok := store.newFlow("h1", "example.com", "a-ip-too-many", "s1")
+	ipTooManyCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(ipTooManyTok, &fqWaiter{resCh: ipTooManyCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ip-too-many flow ok=%t err=%v", ok, err)
+	}
+	throttledTok := newAtomicBreakerFlow(store, "h1", "example.com", "z-throttled-1", "s1")
+	throttledCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(throttledTok, &fqWaiter{resCh: throttledCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter throttled flow ok=%t err=%v", ok, err)
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	sched.bumpWaitCount("s1", "a-ip-too-many", 4)
+	snapshotBucket := func() (siteWait int, bucketWait int, denyUntil time.Time) {
+		sched.mu.Lock()
+		defer sched.mu.Unlock()
+		st := sched.getOrInitSite("s1")
+		bt := sched.getOrInitBucket(st, "a-ip-too-many")
+		if st != nil {
+			siteWait = st.WaitCount
+		}
+		if bt != nil {
+			bucketWait = bt.WaitCount
+			denyUntil = bt.DenyUntil
+		}
+		return
+	}
+	wantDenyUntil := now.Add(5 * time.Second)
+
+	unblockLater := sync.Once{}
+	releaseLater := func() {
+		unblockLater.Do(func() {
+			close(backend.throttledRelease)
+		})
+	}
+	defer releaseLater()
+
+	done := make(chan struct{})
+	go func() {
+		_ = s.probeOnce(context.Background(), "h1", now)
+		close(done)
+	}()
+
+	select {
+	case <-backend.throttledStarted:
+	case <-time.After(time.Second):
+		t.Fatalf("expected later throttled sub-batch to start")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	var gotSiteWait int
+	var gotBucketWait int
+	var gotDenyUntil time.Time
+	for {
+		gotSiteWait, gotBucketWait, gotDenyUntil = snapshotBucket()
+		if !gotDenyUntil.IsZero() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected earlier IP_TOO_MANY to set deny-until before later THROTTLED resolves")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if gotBucketWait != 2 {
+		t.Fatalf("expected earlier IP_TOO_MANY to halve bucket wait count to 2 before later THROTTLED, got %d", gotBucketWait)
+	}
+	if !gotDenyUntil.Equal(wantDenyUntil) {
+		t.Fatalf("expected earlier IP_TOO_MANY deny-until %v, got %v", wantDenyUntil, gotDenyUntil)
+	}
+
+	select {
+	case <-done:
+		t.Fatalf("expected probeOnce to wait for later THROTTLED result")
+	default:
+	}
+
+	releaseLater()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("expected probeOnce to return after later THROTTLED resolves")
+	}
+
+	expectThrottledResponse(t, throttledCh, throttledTok)
+
+	select {
+	case got := <-ipTooManyCh:
+		t.Fatalf("expected earlier IP_TOO_MANY flow to stay pending, got %+v", got)
+	default:
+	}
+	if _, ok := store.getSnapshot(ipTooManyTok); !ok {
+		t.Fatalf("expected earlier IP_TOO_MANY flow to remain in flow store")
+	}
+	if _, ok := store.getSnapshot(throttledTok); ok {
+		t.Fatalf("expected later THROTTLED flow deleted after terminal delivery")
+	}
+
+	gotSiteWait, gotBucketWait, gotDenyUntil = snapshotBucket()
+	if gotBucketWait != 2 {
+		t.Fatalf("expected earlier IP_TOO_MANY wait count to stay halved after later THROTTLED, got %d", gotBucketWait)
+	}
+	if gotSiteWait != 2 {
+		t.Fatalf("expected earlier IP_TOO_MANY site wait count to stay halved after later THROTTLED, got %d", gotSiteWait)
+	}
+	if !gotDenyUntil.Equal(wantDenyUntil) {
+		t.Fatalf("expected earlier IP_TOO_MANY deny-until to persist after later THROTTLED, got %v", gotDenyUntil)
+	}
+}
+
+func TestProbeOnceBreakerEnabledIPTooManySurvivesSameSubBatchLaterThrottled(t *testing.T) {
+	backend := &sequenceBackend{seq: []*admitResult{{status: "IP_TOO_MANY"}, {status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Date(2026, 3, 21, 12, 0, 15, 0, time.UTC).Unix()), breakerReason: "http_429", breakerVersion: 1}}}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 21, 12, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	earlierTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-structural", "s1")
+	earlierCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(earlierTok, &fqWaiter{resCh: earlierCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter earlier-flow ok=%t err=%v", ok, err)
+	}
+	laterTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-structural", "s1")
+	laterCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(laterTok, &fqWaiter{resCh: laterCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter later-flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			// Force both breaker-enabled flows into the same real sub-batch.
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	st, bt := sched.getOrInitStates("s1", "ip-structural")
+	st.WaitCount = 4
+	bt.WaitCount = 4
+	wantDenyUntil := now.Add(5 * time.Second)
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	st, bt = sched.getOrInitStates("s1", "ip-structural")
+	if bt.WaitCount != 2 {
+		t.Fatalf("expected earlier IP_TOO_MANY to halve bucket wait count to 2 despite later THROTTLED, got %d", bt.WaitCount)
+	}
+	if st.WaitCount != 2 {
+		t.Fatalf("expected earlier IP_TOO_MANY to halve site wait count to 2 despite later THROTTLED, got %d", st.WaitCount)
+	}
+	if !bt.DenyUntil.Equal(wantDenyUntil) {
+		t.Fatalf("expected earlier IP_TOO_MANY deny-until %v despite later THROTTLED, got %v", wantDenyUntil, bt.DenyUntil)
+	}
+
+	select {
+	case got := <-earlierCh:
+		t.Fatalf("expected earlier IP_TOO_MANY flow to stay pending without generic THROTTLED delivery, got %+v", got)
+	default:
+	}
+	if _, ok := store.getSnapshot(earlierTok); !ok {
+		t.Fatalf("expected earlier IP_TOO_MANY flow to remain in flow store after same-sub-batch THROTTLED sibling")
+	}
+
+	expectThrottledResponse(t, laterCh, laterTok)
+	if _, ok := store.getSnapshot(laterTok); ok {
+		t.Fatalf("expected later THROTTLED flow deleted after terminal delivery")
+	}
+}
+
+func TestProbeOnceReadyDeliversSlotAndAttempt(t *testing.T) {
+	backend := &sequenceBackend{seq: []*admitResult{{status: "READY", slotToken: "slot-123", attemptVersion: 7, attemptTicket: 2}}}
 	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
 	s := newTestServer()
 	s.updateRuntime(cfg, backend, "test", true)
 
 	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
 	store := s.flowStore
-	tok := store.newFlow("h1", "example.com", "ip1", "s1")
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip1", "s1")
 	respCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
@@ -429,7 +1081,7 @@ func TestProbeOnceAcquiredDeliversGrantedAndDownweights(t *testing.T) {
 
 	_, bt = sched.getOrInitStates("s1", "ip1")
 	if bt.WaitCount != 2 {
-		t.Fatalf("expected WaitCount to halve to 2 after ACQUIRED, got %d", bt.WaitCount)
+		t.Fatalf("expected WaitCount to halve to 2 after READY, got %d", bt.WaitCount)
 	}
 
 	select {
@@ -437,6 +1089,7 @@ func TestProbeOnceAcquiredDeliversGrantedAndDownweights(t *testing.T) {
 		if got == nil || got.Result != "granted" || got.SlotToken != "slot-123" || got.QueryToken != tok {
 			t.Fatalf("unexpected granted resp: %+v", got)
 		}
+		expectAttemptMeta(t, got, 7, 2)
 	default:
 		t.Fatalf("expected granted response delivered")
 	}
@@ -452,7 +1105,7 @@ func TestProbeRunnerThrottledNextWaiterUsesBackendAuthority(t *testing.T) {
 	}
 
 	now := time.Date(2026, 2, 4, 12, 0, 0, 0, time.UTC)
-	backend := &sequenceBackend{seq: []*tryAcquireResult{{
+	backend := &sequenceBackend{seq: []*admitResult{{
 		status:           "THROTTLED",
 		throttleCode:     429,
 		breakerOpenUntil: int(now.Add(15 * time.Second).Unix()),
@@ -464,7 +1117,7 @@ func TestProbeRunnerThrottledNextWaiterUsesBackendAuthority(t *testing.T) {
 	s.updateRuntime(cfg, backend, "test", true)
 
 	store := s.flowStore
-	tok := store.newFlow("h1", "example.com", "ip1", "s1")
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip1", "s1")
 	respCh := make(chan *AcquireResponse, 2)
 	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
@@ -486,7 +1139,7 @@ func TestProbeRunnerThrottledNextWaiterUsesBackendAuthority(t *testing.T) {
 		t.Fatalf("expected flow deleted after throttled")
 	}
 
-	newTok := store.newFlow("h1", "example.com", "ip2", "s1")
+	newTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip2", "s1")
 	newCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(newTok, &fqWaiter{resCh: newCh}, now.Add(1*time.Second)); !ok || err != nil {
 		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
@@ -514,7 +1167,7 @@ func TestProbeRunnerThrottledNextWaiterUsesBackendAuthority(t *testing.T) {
 func TestProbeOnceThrottledDeliversSharedBreakerMetadata(t *testing.T) {
 	now := time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)
 	breakerOpenUntil := int(now.Add(15 * time.Second).Unix())
-	backend := &sequenceBackend{seq: []*tryAcquireResult{{
+	backend := &sequenceBackend{seq: []*admitResult{{
 		status:           "THROTTLED",
 		throttleCode:     429,
 		breakerOpenUntil: breakerOpenUntil,
@@ -526,7 +1179,7 @@ func TestProbeOnceThrottledDeliversSharedBreakerMetadata(t *testing.T) {
 	s.updateRuntime(cfg, backend, "test", true)
 
 	store := s.flowStore
-	tok := store.newFlow("h1", "example.com", "ip1", "s1")
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip1", "s1")
 	respCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
@@ -555,9 +1208,138 @@ func TestProbeOnceThrottledDeliversSharedBreakerMetadata(t *testing.T) {
 	}
 }
 
-func TestProbeOnceThrottledSameSubBatchReleaseCompensatesAcquired(t *testing.T) {
+func TestProbeOnceHalfOpenFullDeliversTerminalWithoutSlot(t *testing.T) {
+	backend := &statusByIPBackend{statuses: map[string]*admitResult{
+		"ip-half-open": {status: "HALF_OPEN_FULL", retryAfter: 9},
+		"ip-wait":      {status: "WAIT"},
+	}}
+	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5, MaxBatch: 2, MaxProbeParallel: 1, MaxProbeQpsPerHost: 100}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 14, 12, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	halfOpenTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-half-open", "s1")
+	halfOpenCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(halfOpenTok, &fqWaiter{resCh: halfOpenCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter half-open flow ok=%t err=%v", ok, err)
+	}
+	waitTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-wait", "s1")
+	waitCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(waitTok, &fqWaiter{resCh: waitCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter wait flow ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+
+	select {
+	case got := <-halfOpenCh:
+		if got == nil || got.Result != "throttled" || got.QueryToken != halfOpenTok {
+			t.Fatalf("unexpected half-open terminal response: %+v", got)
+		}
+		if got.SlotToken != "" {
+			t.Fatalf("expected HALF_OPEN_FULL to omit slot token, got %+v", got)
+		}
+		if got.RetryAfter <= 0 {
+			t.Fatalf("expected HALF_OPEN_FULL retryAfter > 0, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected HALF_OPEN_FULL response delivered")
+	}
+
+	select {
+	case got := <-waitCh:
+		t.Fatalf("expected WAIT flow to stay alive without delivery, got %+v", got)
+	default:
+	}
+
+	if _, ok := store.getSnapshot(halfOpenTok); ok {
+		t.Fatalf("expected HALF_OPEN_FULL flow deleted after terminal delivery")
+	}
+	if _, ok := store.getSnapshot(waitTok); !ok {
+		t.Fatalf("expected WAIT flow to remain in flow store")
+	}
+}
+
+func TestProbeOnceBreakerEnabledHalfOpenFullSurvivesSameSubBatchLaterThrottled(t *testing.T) {
+	backend := &sequenceBackend{seq: []*admitResult{{status: "HALF_OPEN_FULL", retryAfter: 9}, {status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Date(2026, 3, 21, 12, 10, 15, 0, time.UTC).Unix()), breakerReason: "http_429", breakerVersion: 1}}}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 21, 12, 10, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	earlierTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-half-open", "s1")
+	earlierCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(earlierTok, &fqWaiter{resCh: earlierCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter earlier-flow ok=%t err=%v", ok, err)
+	}
+	laterTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-half-open", "s1")
+	laterCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(laterTok, &fqWaiter{resCh: laterCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter later-flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			// Force both breaker-enabled flows into the same real sub-batch.
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-earlierCh:
+		if got == nil || got.Result != "throttled" || got.QueryToken != earlierTok {
+			t.Fatalf("unexpected HALF_OPEN_FULL terminal response: %+v", got)
+		}
+		if got.Reason != "try_acquire_half_open_full" {
+			t.Fatalf("expected HALF_OPEN_FULL terminal reason to survive later THROTTLED, got %+v", got)
+		}
+		if got.SlotToken != "" {
+			t.Fatalf("expected HALF_OPEN_FULL terminal response to omit slot token, got %+v", got)
+		}
+		if got.RetryAfter != 9 {
+			t.Fatalf("expected HALF_OPEN_FULL retryAfter=9 to survive later THROTTLED, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected HALF_OPEN_FULL response delivered")
+	}
+	if _, ok := store.getSnapshot(earlierTok); ok {
+		t.Fatalf("expected earlier HALF_OPEN_FULL flow deleted after terminal delivery")
+	}
+
+	expectThrottledResponse(t, laterCh, laterTok)
+	if _, ok := store.getSnapshot(laterTok); ok {
+		t.Fatalf("expected later THROTTLED flow deleted after terminal delivery")
+	}
+}
+
+func TestProbeOnceThrottledSameSubBatchReleaseCompensatesReady(t *testing.T) {
 	backend := &releaseRecordingBackend{
-		sequenceBackend: sequenceBackend{seq: []*tryAcquireResult{{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Date(2026, 2, 20, 9, 0, 15, 0, time.UTC).Unix()), breakerReason: "http_429", breakerVersion: 1}, {status: "ACQUIRED", slotToken: "slot-same-sub-batch"}}},
+		sequenceBackend: sequenceBackend{seq: []*admitResult{{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Date(2026, 2, 20, 9, 0, 15, 0, time.UTC).Unix()), breakerReason: "http_429", breakerVersion: 1}, {status: "READY", slotToken: "slot-same-sub-batch"}}},
 		released:        make(chan ReleaseRequest, 1),
 	}
 	cfg := &Config{FairQueue: FairQueueConfig{
@@ -578,13 +1360,13 @@ func TestProbeOnceThrottledSameSubBatchReleaseCompensatesAcquired(t *testing.T) 
 		return now.Add(time.Duration(createdCalls) * time.Millisecond)
 	}
 
-	firstTok := store.newFlow("h1", "example.com", "ip1", "s1")
+	firstTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip1", "s1")
 	firstCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(firstTok, &fqWaiter{resCh: firstCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter first-flow ok=%t err=%v", ok, err)
 	}
 
-	secondTok := store.newFlow("h1", "example.com", "ip1", "s1")
+	secondTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip1", "s1")
 	secondCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(secondTok, &fqWaiter{resCh: secondCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter second-flow ok=%t err=%v", ok, err)
@@ -634,9 +1416,9 @@ func TestProbeOnceThrottledSameSubBatchReleaseCompensatesAcquired(t *testing.T) 
 	}
 }
 
-func TestProbeOnceThrottledSameSubBatchLaterRowBeatsEarlierAcquire(t *testing.T) {
+func TestProbeOnceThrottledSameSubBatchLaterRowBeatsEarlierReady(t *testing.T) {
 	backend := &releaseRecordingBackend{
-		sequenceBackend: sequenceBackend{seq: []*tryAcquireResult{{status: "ACQUIRED", slotToken: "slot-earlier-acquire"}, {status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Date(2026, 2, 20, 9, 10, 15, 0, time.UTC).Unix()), breakerReason: "http_429", breakerVersion: 1}}},
+		sequenceBackend: sequenceBackend{seq: []*admitResult{{status: "READY", slotToken: "slot-earlier-acquire"}, {status: "THROTTLED", throttleCode: 429, breakerOpenUntil: int(time.Date(2026, 2, 20, 9, 10, 15, 0, time.UTC).Unix()), breakerReason: "http_429", breakerVersion: 1}}},
 		released:        make(chan ReleaseRequest, 1),
 	}
 	cfg := &Config{FairQueue: FairQueueConfig{
@@ -657,13 +1439,13 @@ func TestProbeOnceThrottledSameSubBatchLaterRowBeatsEarlierAcquire(t *testing.T)
 		return now.Add(time.Duration(createdCalls) * time.Millisecond)
 	}
 
-	firstTok := store.newFlow("h1", "example.com", "ip1", "s1")
+	firstTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip1", "s1")
 	firstCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(firstTok, &fqWaiter{resCh: firstCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter first-flow ok=%t err=%v", ok, err)
 	}
 
-	secondTok := store.newFlow("h1", "example.com", "ip1", "s1")
+	secondTok := newAtomicBreakerFlow(store, "h1", "example.com", "ip1", "s1")
 	secondCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(secondTok, &fqWaiter{resCh: secondCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter second-flow ok=%t err=%v", ok, err)
@@ -717,7 +1499,1661 @@ func TestProbeOnceThrottledSameSubBatchLaterRowBeatsEarlierAcquire(t *testing.T)
 	}
 }
 
-func TestProbeOnceParallelMicroBatchThrottledCompensatesSiblingAcquireWithoutBlockingThrottledDelivery(t *testing.T) {
+func TestProbeOnceLaterThrottledSubBatchBeatsEarlierReady(t *testing.T) {
+	backend := &laterThrottledWinsBackend{
+		throttledStarted: make(chan struct{}),
+		throttledRelease: make(chan struct{}),
+		released:         make(chan ReleaseRequest, 1),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 22, 15, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	readyTok := store.newFlowFromAcquireRequest(AcquireRequest{
+		Hostname:              "example.com",
+		HostnameHash:          "h1",
+		IPBucket:              "a-ready-1",
+		SiteBucket:            "s1",
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
+	})
+	readyCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(readyTok, &fqWaiter{resCh: readyCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ready-flow ok=%t err=%v", ok, err)
+	}
+	throttledTok := store.newFlowFromAcquireRequest(AcquireRequest{
+		Hostname:              "example.com",
+		HostnameHash:          "h1",
+		IPBucket:              "z-throttled-1",
+		SiteBucket:            "s1",
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
+	})
+	throttledCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(throttledTok, &fqWaiter{resCh: throttledCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter throttled-flow ok=%t err=%v", ok, err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = s.probeOnce(context.Background(), "h1", now)
+		close(done)
+	}()
+
+	select {
+	case <-backend.throttledStarted:
+	case <-time.After(time.Second):
+		t.Fatalf("expected later throttled sub-batch to start")
+	}
+
+	select {
+	case got := <-readyCh:
+		t.Fatalf("expected earlier READY sub-batch to stay buffered until later THROTTLED resolves, got %+v", got)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(backend.throttledRelease)
+
+	select {
+	case req := <-backend.released:
+		if req.SlotToken != "slot-a-ready-1" || req.HostnameHash != "h1" || req.SiteBucket != "s1" || req.IPBucket != "a-ready-1" {
+			t.Fatalf("unexpected compensating release request: %+v", req)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("expected compensating release for earlier READY slot")
+	}
+
+	expectThrottledResponse(t, readyCh, readyTok)
+	expectThrottledResponse(t, throttledCh, throttledTok)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("expected probeOnce to return after later THROTTLED resolves")
+	}
+
+	backend.mu.Lock()
+	releaseCalls := backend.releaseCalls
+	backend.mu.Unlock()
+	if releaseCalls != 1 {
+		t.Fatalf("expected exactly one compensating release, got %d", releaseCalls)
+	}
+	if _, ok := store.getSnapshot(readyTok); ok {
+		t.Fatalf("expected earlier READY flow deleted after throttled latch")
+	}
+	if _, ok := store.getSnapshot(throttledTok); ok {
+		t.Fatalf("expected later THROTTLED flow deleted after throttled latch")
+	}
+}
+
+func TestProbeOnceThrottledLatchOnlyAffectsBreakerEnabledFlows(t *testing.T) {
+	backend := &mixedModeLatchBackend{}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 23, 12, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	breakerTok := store.newFlowFromAcquireRequest(AcquireRequest{
+		Hostname:              "example.com",
+		HostnameHash:          "h1",
+		IPBucket:              "breaker-a",
+		SiteBucket:            "s1",
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
+	})
+	breakerCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(breakerTok, &fqWaiter{resCh: breakerCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter breaker-flow ok=%t err=%v", ok, err)
+	}
+	queueTok := store.newFlowFromAcquireRequest(AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "queue-z",
+		SiteBucket:   "s1",
+	})
+	queueCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(queueTok, &fqWaiter{resCh: queueCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter queue-flow ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+
+	expectThrottledResponse(t, breakerCh, breakerTok)
+
+	select {
+	case got := <-queueCh:
+		if got == nil || got.Result != "granted" || got.QueryToken != queueTok || got.SlotToken != "slot-queue-z" {
+			t.Fatalf("expected queue-only flow to stay independent from breaker latch, got %+v", got)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("expected queue-only flow to be granted despite breaker-enabled sibling throttling")
+	}
+
+	backend.mu.Lock()
+	releaseCalls := backend.releaseCalls
+	releasedReqs := append([]ReleaseRequest(nil), backend.releasedReqs...)
+	backend.mu.Unlock()
+	if releaseCalls != 0 || len(releasedReqs) != 0 {
+		t.Fatalf("expected no compensating release for queue-only granted flow, got calls=%d reqs=%+v", releaseCalls, releasedReqs)
+	}
+	if _, ok := store.getSnapshot(queueTok); ok {
+		t.Fatalf("expected queue-only granted flow deleted after delivery")
+	}
+	if _, ok := store.getSnapshot(breakerTok); ok {
+		t.Fatalf("expected breaker-enabled throttled flow deleted after terminal delivery")
+	}
+}
+
+func TestProbeOncePartitionsMixedAtomicSettingsWithinRealSubBatch(t *testing.T) {
+	backend := &tupleGroupingBackend{}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           5,
+		MaxProbeParallel:   5,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 26, 12, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+	for i := 0; i < 10; i++ {
+		s.recordUtilizationSample("h1", "s1", 5, 10, 5, 10, now.Add(time.Duration(i)*time.Second))
+	}
+	flows := []struct {
+		req    AcquireRequest
+		respCh chan *AcquireResponse
+	}{
+		{req: AcquireRequest{Hostname: "example.com", HostnameHash: "h1", IPBucket: "a-queue-1", SiteBucket: "s1"}, respCh: make(chan *AcquireResponse, 1)},
+		{req: atomicBreakerAcquireRequest("example.com", "h1", "b-breaker-1", "s1"), respCh: make(chan *AcquireResponse, 1)},
+		{req: AcquireRequest{Hostname: "example.com", HostnameHash: "h1", IPBucket: "c-queue-2", SiteBucket: "s1"}, respCh: make(chan *AcquireResponse, 1)},
+		{req: atomicBreakerAcquireRequest("example.com", "h1", "d-breaker-2", "s1"), respCh: make(chan *AcquireResponse, 1)},
+		{req: AcquireRequest{Hostname: "example.com", HostnameHash: "h1", IPBucket: "e-breaker-tuned", SiteBucket: "s1", BreakerEnabled: true, HalfOpenMaxProbeCount: 2, HalfOpenMaxSeconds: 9, HalfOpenTimeoutMode: "open"}, respCh: make(chan *AcquireResponse, 1)},
+	}
+
+	for _, flow := range flows {
+		tok := store.newFlowFromAcquireRequest(flow.req)
+		if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: flow.respCh}, now); !ok || err != nil {
+			t.Fatalf("attachWaiter ip=%q ok=%t err=%v", flow.req.IPBucket, ok, err)
+		}
+	}
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to collapse selected probe batch into one real sub-batch, got %d calls", listCalls)
+	}
+
+	for _, flow := range flows {
+		select {
+		case got := <-flow.respCh:
+			t.Fatalf("expected WAIT for grouped mixed batch flow %q, got %+v", flow.req.IPBucket, got)
+		default:
+		}
+	}
+
+	sigs := backend.batchSignatures()
+	expected := map[string]int{
+		"be=false probe=0 sec=0 mode= ips=a-queue-1,c-queue-2":                  1,
+		"be=true probe=4 sec=15 mode=partial-close ips=b-breaker-1,d-breaker-2": 1,
+		"be=true probe=2 sec=9 mode=open ips=e-breaker-tuned":                   1,
+	}
+	if !reflect.DeepEqual(sigs, expected) {
+		t.Fatalf("expected AdmitBatch grouping by atomic settings tuple, got %v", sigs)
+	}
+
+	backend.mu.Lock()
+	batches := append([][]AcquireRequest(nil), backend.batches...)
+	backend.mu.Unlock()
+	hasGroupedCall := false
+	for _, batch := range batches {
+		if len(batch) > 1 {
+			hasGroupedCall = true
+			break
+		}
+	}
+	if !hasGroupedCall {
+		t.Fatalf("expected real grouped AdmitBatch call, got only singleton batches")
+	}
+}
+
+func TestProbeOncePartitionedSubBatchIPTooManyThenLaterErrorStillAppliesDeny(t *testing.T) {
+	partitionErr := errors.New("later partition admit error")
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition: []*admitResult{{status: "IP_TOO_MANY"}},
+		secondErr:      partitionErr,
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 22, 12, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	queueTok := store.newFlow("h1", "example.com", "a-queue-1", "s1")
+	queueCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(queueTok, &fqWaiter{resCh: queueCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter queue-flow ok=%t err=%v", ok, err)
+	}
+	breakerTok := newAtomicBreakerFlow(store, "h1", "example.com", "z-breaker-1", "s1")
+	breakerCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(breakerTok, &fqWaiter{resCh: breakerCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter breaker-flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	st, bt := sched.getOrInitStates("s1", "a-queue-1")
+	st.WaitCount = 6
+	bt.WaitCount = 6
+	wantDenyUntil := now.Add(5 * time.Second)
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-queueCh:
+		t.Fatalf("expected IP_TOO_MANY flow to stay waiting despite later error, got %+v", got)
+	default:
+	}
+	select {
+	case got := <-breakerCh:
+		t.Fatalf("expected later-error partition flow to stay waiting, got %+v", got)
+	default:
+	}
+
+	_, bt = sched.getOrInitStates("s1", "a-queue-1")
+	if bt.WaitCount != 3 {
+		t.Fatalf("expected IP_TOO_MANY to halve wait count to 3 despite later error, got %d", bt.WaitCount)
+	}
+	if !bt.DenyUntil.Equal(wantDenyUntil) {
+		t.Fatalf("expected IP_TOO_MANY deny-until %v despite later error, got %v", wantDenyUntil, bt.DenyUntil)
+	}
+	_, breakerBT := sched.getOrInitStates("s1", "z-breaker-1")
+	if breakerBT.WaitCount != 1 {
+		t.Fatalf("expected later-error partition flow to follow error path and bump wait count to 1, got %d", breakerBT.WaitCount)
+	}
+
+	if _, ok := store.getSnapshot(queueTok); !ok {
+		t.Fatalf("expected IP_TOO_MANY flow to remain in flow store")
+	}
+	if snap, ok := store.getSnapshot(breakerTok); !ok {
+		t.Fatalf("expected later-error partition flow to remain in flow store")
+	} else if !snap.HasWaiter {
+		t.Fatalf("expected later-error partition flow waiter to remain attached")
+	}
+
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=false ips=a-queue-1", "be=true ips=z-breaker-1"}) {
+		t.Fatalf("expected partition ordering queue then breaker, got %v", got)
+	}
+	if released := backend.releasedRequests(); len(released) != 0 {
+		t.Fatalf("expected no compensating releases for structural + error partitions, got %+v", released)
+	}
+}
+
+func TestProbeOncePartitionedSubBatchHalfOpenFullThenLaterErrorStillDeliversTerminal(t *testing.T) {
+	partitionErr := errors.New("later partition admit error")
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition: []*admitResult{{status: "HALF_OPEN_FULL", retryAfter: 9}},
+		secondErr:      partitionErr,
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 22, 12, 5, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	halfOpenTok := store.newFlowFromAcquireRequest(atomicBreakerAcquireRequest("example.com", "h1", "a-half-open", "s1"))
+	halfOpenCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(halfOpenTok, &fqWaiter{resCh: halfOpenCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter half-open flow ok=%t err=%v", ok, err)
+	}
+	unknownReq := atomicBreakerAcquireRequest("example.com", "h1", "z-breaker-unknown", "s1")
+	unknownReq.HalfOpenMaxProbeCount = 2
+	unknownReq.HalfOpenTimeoutMode = "open"
+	unknownTok := store.newFlowFromAcquireRequest(unknownReq)
+	unknownCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(unknownTok, &fqWaiter{resCh: unknownCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter unknown flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-halfOpenCh:
+		if got == nil || got.Result != "throttled" || got.QueryToken != halfOpenTok {
+			t.Fatalf("unexpected HALF_OPEN_FULL terminal response: %+v", got)
+		}
+		if got.Reason != "try_acquire_half_open_full" {
+			t.Fatalf("expected HALF_OPEN_FULL terminal reason to survive later error, got %+v", got)
+		}
+		if got.SlotToken != "" {
+			t.Fatalf("expected HALF_OPEN_FULL to omit slot token, got %+v", got)
+		}
+		if got.RetryAfter != 9 {
+			t.Fatalf("expected HALF_OPEN_FULL retryAfter=9 to survive later error, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected HALF_OPEN_FULL response delivered")
+	}
+	if _, ok := store.getSnapshot(halfOpenTok); ok {
+		t.Fatalf("expected HALF_OPEN_FULL flow deleted after terminal delivery")
+	}
+
+	select {
+	case got := <-unknownCh:
+		t.Fatalf("expected later-error partition flow to stay waiting, got %+v", got)
+	default:
+	}
+	if snap, ok := store.getSnapshot(unknownTok); !ok {
+		t.Fatalf("expected later-error partition flow to remain in flow store")
+	} else if !snap.HasWaiter {
+		t.Fatalf("expected later-error partition flow waiter to remain attached")
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	_, unknownBT := sched.getOrInitStates("s1", "z-breaker-unknown")
+	if unknownBT.WaitCount != 1 {
+		t.Fatalf("expected later-error partition flow to follow error path and bump wait count to 1, got %d", unknownBT.WaitCount)
+	}
+
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=true ips=a-half-open", "be=true ips=z-breaker-unknown"}) {
+		t.Fatalf("expected partition ordering to preserve sub-batch request order, got %v", got)
+	}
+	if released := backend.releasedRequests(); len(released) != 0 {
+		t.Fatalf("expected no compensating releases for HALF_OPEN_FULL + error partitions, got %+v", released)
+	}
+}
+
+func TestProbeOncePartitionedSubBatchThrottledThenLaterErrorStillTripsLatch(t *testing.T) {
+	partitionErr := errors.New("later partition admit error")
+	now := time.Date(2026, 3, 22, 12, 10, 0, 0, time.UTC)
+	openUntil := int(now.Add(15 * time.Second).Unix())
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition: []*admitResult{{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: openUntil, breakerReason: "http_429", breakerVersion: 1}},
+		secondErr:      partitionErr,
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	throttledTok := store.newFlowFromAcquireRequest(atomicBreakerAcquireRequest("example.com", "h1", "a-throttled", "s1"))
+	throttledCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(throttledTok, &fqWaiter{resCh: throttledCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter throttled flow ok=%t err=%v", ok, err)
+	}
+	unknownReq := atomicBreakerAcquireRequest("example.com", "h1", "z-breaker-unknown", "s1")
+	unknownReq.HalfOpenMaxProbeCount = 2
+	unknownReq.HalfOpenTimeoutMode = "open"
+	unknownTok := store.newFlowFromAcquireRequest(unknownReq)
+	unknownCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(unknownTok, &fqWaiter{resCh: unknownCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter unknown flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-throttledCh:
+		if got == nil || got.Result != "throttled" || got.QueryToken != throttledTok {
+			t.Fatalf("unexpected throttled response: %+v", got)
+		}
+		if got.Reason != "try_acquire_throttled" {
+			t.Fatalf("expected latched THROTTLED reason, got %+v", got)
+		}
+		if got.ThrottleCode != 429 || got.BreakerOpenUntil != openUntil || got.BreakerReason != "http_429" || got.BreakerVersion != 1 {
+			t.Fatalf("expected latched THROTTLED metadata to survive later error, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected latched throttled response delivered")
+	}
+	if _, ok := store.getSnapshot(throttledTok); ok {
+		t.Fatalf("expected THROTTLED flow deleted after terminal delivery")
+	}
+
+	select {
+	case got := <-unknownCh:
+		if got == nil || got.Result != "throttled" || got.QueryToken != unknownTok {
+			t.Fatalf("unexpected latched throttled response for unknown flow: %+v", got)
+		}
+		if got.Reason != "try_acquire_throttled" {
+			t.Fatalf("expected latched THROTTLED reason for unknown flow, got %+v", got)
+		}
+		if got.ThrottleCode != 429 || got.BreakerOpenUntil != openUntil || got.BreakerReason != "http_429" || got.BreakerVersion != 1 {
+			t.Fatalf("expected latched THROTTLED metadata for unknown flow, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected latch to deliver throttled terminal to unknown flow despite later error")
+	}
+	if _, ok := store.getSnapshot(unknownTok); ok {
+		t.Fatalf("expected unknown flow deleted after latched throttled terminal")
+	}
+
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=true ips=a-throttled", "be=true ips=z-breaker-unknown"}) {
+		t.Fatalf("expected partition ordering to preserve sub-batch request order, got %v", got)
+	}
+	if released := backend.releasedRequests(); len(released) != 0 {
+		t.Fatalf("expected no compensating releases for THROTTLED + error partitions, got %+v", released)
+	}
+}
+
+func TestProbeOncePartitionedSubBatchThrottledThenQueueOnlyErrorStillBumpsWaitCounts(t *testing.T) {
+	partitionErr := errors.New("later queue-only partition admit error")
+	now := time.Date(2026, 3, 22, 12, 12, 0, 0, time.UTC)
+	openUntil := int(now.Add(15 * time.Second).Unix())
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition:  []*admitResult{{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: openUntil, breakerReason: "http_429", breakerVersion: 1}},
+		secondPartition: []*admitResult{{status: "READY", slotToken: "slot-m-ready-queue"}},
+		thirdErr:        partitionErr,
+		thirdSet:        true,
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           3,
+		MaxProbeParallel:   3,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	throttledTok := store.newFlowFromAcquireRequest(atomicBreakerAcquireRequest("example.com", "h1", "a-throttled", "s1"))
+	throttledCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(throttledTok, &fqWaiter{resCh: throttledCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter throttled flow ok=%t err=%v", ok, err)
+	}
+	queueReadyTok := store.newFlowFromAcquireRequest(AcquireRequest{Hostname: "example.com", HostnameHash: "h1", IPBucket: "m-ready-queue", SiteBucket: "s1"})
+	queueReadyCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(queueReadyTok, &fqWaiter{resCh: queueReadyCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter queue-ready flow ok=%t err=%v", ok, err)
+	}
+	queueLaterTok := store.newFlowFromAcquireRequest(AcquireRequest{Hostname: "example.com", HostnameHash: "h1", IPBucket: "z-queue-later", SiteBucket: "s1", HalfOpenMaxProbeCount: 2, HalfOpenMaxSeconds: 9, HalfOpenTimeoutMode: "open"})
+	queueLaterCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(queueLaterTok, &fqWaiter{resCh: queueLaterCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter queue-later flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-throttledCh:
+		if got == nil || got.Result != "throttled" || got.QueryToken != throttledTok {
+			t.Fatalf("unexpected throttled response: %+v", got)
+		}
+		if got.Reason != "try_acquire_throttled" {
+			t.Fatalf("expected latched THROTTLED reason, got %+v", got)
+		}
+		if got.ThrottleCode != 429 || got.BreakerOpenUntil != openUntil || got.BreakerReason != "http_429" || got.BreakerVersion != 1 {
+			t.Fatalf("expected latched THROTTLED metadata to survive later queue-only error, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected latched throttled response delivered")
+	}
+	if _, ok := store.getSnapshot(throttledTok); ok {
+		t.Fatalf("expected THROTTLED flow deleted after terminal delivery")
+	}
+
+	select {
+	case got := <-queueReadyCh:
+		t.Fatalf("expected compensated queue-only READY flow to stay waiting, got %+v", got)
+	default:
+	}
+	if snap, ok := store.getSnapshot(queueReadyTok); !ok {
+		t.Fatalf("expected compensated queue-only READY flow to remain in flow store")
+	} else if !snap.HasWaiter {
+		t.Fatalf("expected compensated queue-only READY flow waiter to remain attached")
+	}
+
+	select {
+	case got := <-queueLaterCh:
+		t.Fatalf("expected later queue-only error flow to stay waiting, got %+v", got)
+	default:
+	}
+	if snap, ok := store.getSnapshot(queueLaterTok); !ok {
+		t.Fatalf("expected later queue-only error flow to remain in flow store")
+	} else if !snap.HasWaiter {
+		t.Fatalf("expected later queue-only error flow waiter to remain attached")
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	_, readyBT := sched.getOrInitStates("s1", "m-ready-queue")
+	if readyBT.WaitCount != 1 {
+		t.Fatalf("expected compensated queue-only READY flow to bump wait count to 1 after later error, got %d", readyBT.WaitCount)
+	}
+	_, laterBT := sched.getOrInitStates("s1", "z-queue-later")
+	if laterBT.WaitCount != 1 {
+		t.Fatalf("expected later queue-only error flow to bump wait count to 1, got %d", laterBT.WaitCount)
+	}
+
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=true ips=a-throttled", "be=false ips=m-ready-queue", "be=false ips=z-queue-later"}) {
+		t.Fatalf("expected partition ordering throttled then queue-only partitions, got %v", got)
+	}
+
+	released := backend.releasedRequests()
+	if len(released) != 1 {
+		t.Fatalf("expected compensating release for READY queue-only flow before later error, got %+v", released)
+	}
+	if released[0].SlotToken != "slot-m-ready-queue" || released[0].HostnameHash != "h1" || released[0].SiteBucket != "s1" || released[0].IPBucket != "m-ready-queue" {
+		t.Fatalf("unexpected compensating release request: %+v", released[0])
+	}
+}
+
+func TestProbeOncePartitionedSubBatchReadyThenLaterErrorCompensatesRelease(t *testing.T) {
+	partitionErr := errors.New("later partition admit error")
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition: []*admitResult{{status: "READY", slotToken: "slot-a-queue-1"}},
+		secondErr:      partitionErr,
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 21, 12, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	queueTok := store.newFlow("h1", "example.com", "a-queue-1", "s1")
+	queueCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(queueTok, &fqWaiter{resCh: queueCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter queue-flow ok=%t err=%v", ok, err)
+	}
+	breakerTok := newAtomicBreakerFlow(store, "h1", "example.com", "z-breaker-1", "s1")
+	breakerCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(breakerTok, &fqWaiter{resCh: breakerCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter breaker-flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-queueCh:
+		t.Fatalf("expected queue flow to stay waiting after partitioned admit failure, got %+v", got)
+	default:
+	}
+	select {
+	case got := <-breakerCh:
+		t.Fatalf("expected breaker flow to stay waiting after partitioned admit failure, got %+v", got)
+	default:
+	}
+
+	if snap, ok := store.getSnapshot(queueTok); !ok {
+		t.Fatalf("expected queue flow snapshot to remain after partitioned admit failure")
+	} else if !snap.HasWaiter {
+		t.Fatalf("expected queue flow waiter to remain attached")
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	_, bt := sched.getOrInitStates("s1", "a-queue-1")
+	if bt.WaitCount != 1 {
+		t.Fatalf("expected queue wait count to follow error path and bump to 1, got %d", bt.WaitCount)
+	}
+
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=false ips=a-queue-1", "be=true ips=z-breaker-1"}) {
+		t.Fatalf("expected partition ordering queue then breaker, got %v", got)
+	}
+
+	released := backend.releasedRequests()
+	if len(released) != 1 {
+		t.Fatalf("expected compensating release for READY slot acquired before later partition error, got %+v", released)
+	}
+	if released[0].SlotToken != "slot-a-queue-1" || released[0].HostnameHash != "h1" || released[0].SiteBucket != "s1" || released[0].IPBucket != "a-queue-1" {
+		t.Fatalf("unexpected compensating release request: %+v", released)
+	}
+}
+
+func TestProbeOncePartitionedSubBatchReadyThenLengthMismatchCompensatesRelease(t *testing.T) {
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition:  []*admitResult{{status: "READY", slotToken: "slot-a-queue-1"}},
+		secondPartition: []*admitResult{},
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 21, 12, 5, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	queueTok := store.newFlow("h1", "example.com", "a-queue-1", "s1")
+	queueCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(queueTok, &fqWaiter{resCh: queueCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter queue-flow ok=%t err=%v", ok, err)
+	}
+	breakerTok := newAtomicBreakerFlow(store, "h1", "example.com", "z-breaker-1", "s1")
+	breakerCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(breakerTok, &fqWaiter{resCh: breakerCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter breaker-flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-queueCh:
+		t.Fatalf("expected queue flow to stay waiting after partitioned length mismatch, got %+v", got)
+	default:
+	}
+	select {
+	case got := <-breakerCh:
+		t.Fatalf("expected breaker flow to stay waiting after partitioned length mismatch, got %+v", got)
+	default:
+	}
+
+	if _, ok := store.getSnapshot(queueTok); !ok {
+		t.Fatalf("expected queue flow snapshot to remain after partitioned length mismatch")
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	_, bt := sched.getOrInitStates("s1", "a-queue-1")
+	if bt.WaitCount != 1 {
+		t.Fatalf("expected queue wait count to follow error path and bump to 1, got %d", bt.WaitCount)
+	}
+
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=false ips=a-queue-1", "be=true ips=z-breaker-1"}) {
+		t.Fatalf("expected partition ordering queue then breaker, got %v", got)
+	}
+
+	released := backend.releasedRequests()
+	if len(released) != 1 {
+		t.Fatalf("expected compensating release for READY slot acquired before later length mismatch, got %+v", released)
+	}
+	if released[0].SlotToken != "slot-a-queue-1" || released[0].HostnameHash != "h1" || released[0].SiteBucket != "s1" || released[0].IPBucket != "a-queue-1" {
+		t.Fatalf("unexpected compensating release request: %+v", released)
+	}
+}
+
+func TestProbeOncePartitionedSubBatchIPTooManyThenLaterLengthMismatchStillAppliesDeny(t *testing.T) {
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition:  []*admitResult{{status: "IP_TOO_MANY"}},
+		secondPartition: []*admitResult{},
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 22, 12, 15, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	queueTok := store.newFlow("h1", "example.com", "a-queue-1", "s1")
+	queueCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(queueTok, &fqWaiter{resCh: queueCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter queue-flow ok=%t err=%v", ok, err)
+	}
+	breakerTok := newAtomicBreakerFlow(store, "h1", "example.com", "z-breaker-1", "s1")
+	breakerCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(breakerTok, &fqWaiter{resCh: breakerCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter breaker-flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	st, bt := sched.getOrInitStates("s1", "a-queue-1")
+	st.WaitCount = 6
+	bt.WaitCount = 6
+	wantDenyUntil := now.Add(5 * time.Second)
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-queueCh:
+		t.Fatalf("expected IP_TOO_MANY flow to stay waiting despite later length mismatch, got %+v", got)
+	default:
+	}
+	select {
+	case got := <-breakerCh:
+		t.Fatalf("expected later-mismatch partition flow to stay waiting, got %+v", got)
+	default:
+	}
+
+	_, bt = sched.getOrInitStates("s1", "a-queue-1")
+	if bt.WaitCount != 3 {
+		t.Fatalf("expected IP_TOO_MANY to halve wait count to 3 despite later length mismatch, got %d", bt.WaitCount)
+	}
+	if !bt.DenyUntil.Equal(wantDenyUntil) {
+		t.Fatalf("expected IP_TOO_MANY deny-until %v despite later length mismatch, got %v", wantDenyUntil, bt.DenyUntil)
+	}
+	_, breakerBT := sched.getOrInitStates("s1", "z-breaker-1")
+	if breakerBT.WaitCount != 1 {
+		t.Fatalf("expected later-mismatch partition flow to follow error path and bump wait count to 1, got %d", breakerBT.WaitCount)
+	}
+
+	if _, ok := store.getSnapshot(queueTok); !ok {
+		t.Fatalf("expected IP_TOO_MANY flow to remain in flow store")
+	}
+	if snap, ok := store.getSnapshot(breakerTok); !ok {
+		t.Fatalf("expected later-mismatch partition flow to remain in flow store")
+	} else if !snap.HasWaiter {
+		t.Fatalf("expected later-mismatch partition flow waiter to remain attached")
+	}
+
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=false ips=a-queue-1", "be=true ips=z-breaker-1"}) {
+		t.Fatalf("expected partition ordering queue then breaker, got %v", got)
+	}
+	if released := backend.releasedRequests(); len(released) != 0 {
+		t.Fatalf("expected no compensating releases for structural + mismatch partitions, got %+v", released)
+	}
+}
+
+func TestProbeOncePartitionedSubBatchHalfOpenFullThenLaterLengthMismatchStillDeliversTerminal(t *testing.T) {
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition:  []*admitResult{{status: "HALF_OPEN_FULL", retryAfter: 9}},
+		secondPartition: []*admitResult{},
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 22, 12, 20, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	halfOpenTok := store.newFlowFromAcquireRequest(atomicBreakerAcquireRequest("example.com", "h1", "a-half-open", "s1"))
+	halfOpenCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(halfOpenTok, &fqWaiter{resCh: halfOpenCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter half-open flow ok=%t err=%v", ok, err)
+	}
+	unknownReq := atomicBreakerAcquireRequest("example.com", "h1", "z-breaker-unknown", "s1")
+	unknownReq.HalfOpenMaxProbeCount = 2
+	unknownReq.HalfOpenTimeoutMode = "open"
+	unknownTok := store.newFlowFromAcquireRequest(unknownReq)
+	unknownCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(unknownTok, &fqWaiter{resCh: unknownCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter unknown flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-halfOpenCh:
+		if got == nil || got.Result != "throttled" || got.QueryToken != halfOpenTok {
+			t.Fatalf("unexpected HALF_OPEN_FULL terminal response: %+v", got)
+		}
+		if got.Reason != "try_acquire_half_open_full" {
+			t.Fatalf("expected HALF_OPEN_FULL terminal reason to survive later length mismatch, got %+v", got)
+		}
+		if got.SlotToken != "" {
+			t.Fatalf("expected HALF_OPEN_FULL to omit slot token, got %+v", got)
+		}
+		if got.RetryAfter != 9 {
+			t.Fatalf("expected HALF_OPEN_FULL retryAfter=9 to survive later length mismatch, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected HALF_OPEN_FULL response delivered")
+	}
+	if _, ok := store.getSnapshot(halfOpenTok); ok {
+		t.Fatalf("expected HALF_OPEN_FULL flow deleted after terminal delivery")
+	}
+
+	select {
+	case got := <-unknownCh:
+		t.Fatalf("expected later-mismatch partition flow to stay waiting, got %+v", got)
+	default:
+	}
+	if snap, ok := store.getSnapshot(unknownTok); !ok {
+		t.Fatalf("expected later-mismatch partition flow to remain in flow store")
+	} else if !snap.HasWaiter {
+		t.Fatalf("expected later-mismatch partition flow waiter to remain attached")
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	_, unknownBT := sched.getOrInitStates("s1", "z-breaker-unknown")
+	if unknownBT.WaitCount != 1 {
+		t.Fatalf("expected later-mismatch partition flow to follow error path and bump wait count to 1, got %d", unknownBT.WaitCount)
+	}
+
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=true ips=a-half-open", "be=true ips=z-breaker-unknown"}) {
+		t.Fatalf("expected partition ordering to preserve sub-batch request order, got %v", got)
+	}
+	if released := backend.releasedRequests(); len(released) != 0 {
+		t.Fatalf("expected no compensating releases for HALF_OPEN_FULL + mismatch partitions, got %+v", released)
+	}
+}
+
+func TestProbeOncePartitionedSubBatchThrottledThenLaterLengthMismatchStillTripsLatch(t *testing.T) {
+	now := time.Date(2026, 3, 22, 12, 25, 0, 0, time.UTC)
+	openUntil := int(now.Add(15 * time.Second).Unix())
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition:  []*admitResult{{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: openUntil, breakerReason: "http_429", breakerVersion: 1}},
+		secondPartition: []*admitResult{},
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           2,
+		MaxProbeParallel:   2,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	throttledTok := store.newFlowFromAcquireRequest(atomicBreakerAcquireRequest("example.com", "h1", "a-throttled", "s1"))
+	throttledCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(throttledTok, &fqWaiter{resCh: throttledCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter throttled flow ok=%t err=%v", ok, err)
+	}
+	unknownReq := atomicBreakerAcquireRequest("example.com", "h1", "z-breaker-unknown", "s1")
+	unknownReq.HalfOpenMaxProbeCount = 2
+	unknownReq.HalfOpenTimeoutMode = "open"
+	unknownTok := store.newFlowFromAcquireRequest(unknownReq)
+	unknownCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(unknownTok, &fqWaiter{resCh: unknownCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter unknown flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-throttledCh:
+		if got == nil || got.Result != "throttled" || got.QueryToken != throttledTok {
+			t.Fatalf("unexpected throttled response: %+v", got)
+		}
+		if got.Reason != "try_acquire_throttled" {
+			t.Fatalf("expected latched THROTTLED reason, got %+v", got)
+		}
+		if got.ThrottleCode != 429 || got.BreakerOpenUntil != openUntil || got.BreakerReason != "http_429" || got.BreakerVersion != 1 {
+			t.Fatalf("expected latched THROTTLED metadata to survive later length mismatch, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected latched throttled response delivered")
+	}
+	if _, ok := store.getSnapshot(throttledTok); ok {
+		t.Fatalf("expected THROTTLED flow deleted after terminal delivery")
+	}
+
+	select {
+	case got := <-unknownCh:
+		if got == nil || got.Result != "throttled" || got.QueryToken != unknownTok {
+			t.Fatalf("unexpected latched throttled response for unknown flow: %+v", got)
+		}
+		if got.Reason != "try_acquire_throttled" {
+			t.Fatalf("expected latched THROTTLED reason for unknown flow, got %+v", got)
+		}
+		if got.ThrottleCode != 429 || got.BreakerOpenUntil != openUntil || got.BreakerReason != "http_429" || got.BreakerVersion != 1 {
+			t.Fatalf("expected latched THROTTLED metadata for unknown flow, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected latch to deliver throttled terminal to unknown flow despite later length mismatch")
+	}
+	if _, ok := store.getSnapshot(unknownTok); ok {
+		t.Fatalf("expected unknown flow deleted after latched throttled terminal")
+	}
+
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=true ips=a-throttled", "be=true ips=z-breaker-unknown"}) {
+		t.Fatalf("expected partition ordering to preserve sub-batch request order, got %v", got)
+	}
+	if released := backend.releasedRequests(); len(released) != 0 {
+		t.Fatalf("expected no compensating releases for THROTTLED + mismatch partitions, got %+v", released)
+	}
+}
+
+func TestProbeOncePartitionedSubBatchThrottledThenQueueOnlyLengthMismatchStillBumpsWaitCounts(t *testing.T) {
+	now := time.Date(2026, 3, 22, 12, 27, 0, 0, time.UTC)
+	openUntil := int(now.Add(15 * time.Second).Unix())
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition:  []*admitResult{{status: "THROTTLED", throttleCode: 429, breakerOpenUntil: openUntil, breakerReason: "http_429", breakerVersion: 1}},
+		secondPartition: []*admitResult{{status: "READY", slotToken: "slot-m-ready-queue"}},
+		thirdPartition:  []*admitResult{},
+		thirdSet:        true,
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           3,
+		MaxProbeParallel:   3,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+
+	throttledTok := store.newFlowFromAcquireRequest(atomicBreakerAcquireRequest("example.com", "h1", "a-throttled", "s1"))
+	throttledCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(throttledTok, &fqWaiter{resCh: throttledCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter throttled flow ok=%t err=%v", ok, err)
+	}
+	queueReadyTok := store.newFlowFromAcquireRequest(AcquireRequest{Hostname: "example.com", HostnameHash: "h1", IPBucket: "m-ready-queue", SiteBucket: "s1"})
+	queueReadyCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(queueReadyTok, &fqWaiter{resCh: queueReadyCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter queue-ready flow ok=%t err=%v", ok, err)
+	}
+	queueLaterTok := store.newFlowFromAcquireRequest(AcquireRequest{Hostname: "example.com", HostnameHash: "h1", IPBucket: "z-queue-later", SiteBucket: "s1", HalfOpenMaxProbeCount: 2, HalfOpenMaxSeconds: 9, HalfOpenTimeoutMode: "open"})
+	queueLaterCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(queueLaterTok, &fqWaiter{resCh: queueLaterCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter queue-later flow ok=%t err=%v", ok, err)
+	}
+
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+	}
+
+	select {
+	case got := <-throttledCh:
+		if got == nil || got.Result != "throttled" || got.QueryToken != throttledTok {
+			t.Fatalf("unexpected throttled response: %+v", got)
+		}
+		if got.Reason != "try_acquire_throttled" {
+			t.Fatalf("expected latched THROTTLED reason, got %+v", got)
+		}
+		if got.ThrottleCode != 429 || got.BreakerOpenUntil != openUntil || got.BreakerReason != "http_429" || got.BreakerVersion != 1 {
+			t.Fatalf("expected latched THROTTLED metadata to survive later queue-only mismatch, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected latched throttled response delivered")
+	}
+	if _, ok := store.getSnapshot(throttledTok); ok {
+		t.Fatalf("expected THROTTLED flow deleted after terminal delivery")
+	}
+
+	select {
+	case got := <-queueReadyCh:
+		t.Fatalf("expected compensated queue-only READY flow to stay waiting, got %+v", got)
+	default:
+	}
+	if snap, ok := store.getSnapshot(queueReadyTok); !ok {
+		t.Fatalf("expected compensated queue-only READY flow to remain in flow store")
+	} else if !snap.HasWaiter {
+		t.Fatalf("expected compensated queue-only READY flow waiter to remain attached")
+	}
+
+	select {
+	case got := <-queueLaterCh:
+		t.Fatalf("expected later queue-only mismatch flow to stay waiting, got %+v", got)
+	default:
+	}
+	if snap, ok := store.getSnapshot(queueLaterTok); !ok {
+		t.Fatalf("expected later queue-only mismatch flow to remain in flow store")
+	} else if !snap.HasWaiter {
+		t.Fatalf("expected later queue-only mismatch flow waiter to remain attached")
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	_, readyBT := sched.getOrInitStates("s1", "m-ready-queue")
+	if readyBT.WaitCount != 1 {
+		t.Fatalf("expected compensated queue-only READY flow to bump wait count to 1 after later mismatch, got %d", readyBT.WaitCount)
+	}
+	_, laterBT := sched.getOrInitStates("s1", "z-queue-later")
+	if laterBT.WaitCount != 1 {
+		t.Fatalf("expected later queue-only mismatch flow to bump wait count to 1, got %d", laterBT.WaitCount)
+	}
+
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=true ips=a-throttled", "be=false ips=m-ready-queue", "be=false ips=z-queue-later"}) {
+		t.Fatalf("expected partition ordering throttled then queue-only partitions, got %v", got)
+	}
+
+	released := backend.releasedRequests()
+	if len(released) != 1 {
+		t.Fatalf("expected compensating release for READY queue-only flow before later mismatch, got %+v", released)
+	}
+	if released[0].SlotToken != "slot-m-ready-queue" || released[0].HostnameHash != "h1" || released[0].SiteBucket != "s1" || released[0].IPBucket != "m-ready-queue" {
+		t.Fatalf("unexpected compensating release request: %+v", released[0])
+	}
+}
+
+func TestProbeOncePartitionedSubBatchReleaseFailureStillReleasesRemainingTokens(t *testing.T) {
+	partitionErr := errors.New("later partition admit error")
+	releaseErr := errors.New("release failed")
+	t.Run("probeOnce keeps waiters pending while compensation releases both tokens", func(t *testing.T) {
+		backend := &partitionReadyThenErrorBackend{
+			firstPartition: []*admitResult{{status: "READY", slotToken: "slot-a-queue-1"}, {status: "READY", slotToken: "slot-b-queue-2"}},
+			secondErr:      partitionErr,
+			releaseErrs:    map[string]error{"slot-a-queue-1": releaseErr},
+		}
+		cfg := &Config{FairQueue: FairQueueConfig{
+			IPCooldownSeconds:  5,
+			PollIntervalMs:     500,
+			MaxBatch:           3,
+			MaxProbeParallel:   3,
+			MaxProbeQpsPerHost: 100,
+		}}
+		s := newTestServer()
+		s.updateRuntime(cfg, backend, "test", true)
+
+		now := time.Date(2026, 3, 21, 12, 10, 0, 0, time.UTC)
+		store := s.flowStore
+		createdCalls := 0
+		store.nowFn = func() time.Time {
+			createdCalls++
+			return now.Add(time.Duration(createdCalls) * time.Millisecond)
+		}
+
+		queueTokA := store.newFlow("h1", "example.com", "a-queue-1", "s1")
+		queueChA := make(chan *AcquireResponse, 1)
+		if ok, err := store.attachWaiter(queueTokA, &fqWaiter{resCh: queueChA}, now); !ok || err != nil {
+			t.Fatalf("attachWaiter queue-flow-a ok=%t err=%v", ok, err)
+		}
+		queueTokB := store.newFlow("h1", "example.com", "b-queue-2", "s1")
+		queueChB := make(chan *AcquireResponse, 1)
+		if ok, err := store.attachWaiter(queueTokB, &fqWaiter{resCh: queueChB}, now); !ok || err != nil {
+			t.Fatalf("attachWaiter queue-flow-b ok=%t err=%v", ok, err)
+		}
+		breakerTok := newAtomicBreakerFlow(store, "h1", "example.com", "z-breaker-1", "s1")
+		breakerCh := make(chan *AcquireResponse, 1)
+		if ok, err := store.attachWaiter(breakerTok, &fqWaiter{resCh: breakerCh}, now); !ok || err != nil {
+			t.Fatalf("attachWaiter breaker-flow ok=%t err=%v", ok, err)
+		}
+
+		listCalls := 0
+		store.listInFlightByHostHook = func(hostKey string) {
+			listCalls++
+			if hostKey == "h1" && listCalls == 2 {
+				cfg.FairQueue.MaxProbeParallel = 1
+			}
+		}
+
+		if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+			t.Fatalf("expected probeOnce to see in-flight waiters")
+		}
+		if listCalls < 2 {
+			t.Fatalf("expected listInFlightByHost hook to force a combined sub-batch, got %d calls", listCalls)
+		}
+
+		select {
+		case got := <-queueChA:
+			t.Fatalf("expected queue flow a to stay waiting after partitioned admit failure, got %+v", got)
+		default:
+		}
+		select {
+		case got := <-queueChB:
+			t.Fatalf("expected queue flow b to stay waiting after partitioned admit failure, got %+v", got)
+		default:
+		}
+		select {
+		case got := <-breakerCh:
+			t.Fatalf("expected breaker flow to stay waiting after partitioned admit failure, got %+v", got)
+		default:
+		}
+
+		if _, ok := store.getSnapshot(queueTokA); !ok {
+			t.Fatalf("expected queue flow a snapshot to remain after partitioned admit failure")
+		}
+		if _, ok := store.getSnapshot(queueTokB); !ok {
+			t.Fatalf("expected queue flow b snapshot to remain after partitioned admit failure")
+		}
+
+		sched := s.getOrCreateFlowScheduler("h1")
+		_, btA := sched.getOrInitStates("s1", "a-queue-1")
+		_, btB := sched.getOrInitStates("s1", "b-queue-2")
+		if btA.WaitCount != 1 || btB.WaitCount != 1 {
+			t.Fatalf("expected queue wait counts to follow error path and bump to 1, got a=%d b=%d", btA.WaitCount, btB.WaitCount)
+		}
+
+		if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=false ips=a-queue-1,b-queue-2", "be=true ips=z-breaker-1"}) {
+			t.Fatalf("expected partition ordering queue then breaker, got %v", got)
+		}
+
+		released := backend.releasedRequests()
+		if len(released) != 2 {
+			t.Fatalf("expected compensating releases attempted for both tokens despite one release failure, got %+v", released)
+		}
+		seen := make(map[string]ReleaseRequest, len(released))
+		for _, req := range released {
+			seen[req.SlotToken] = req
+		}
+		if _, ok := seen["slot-a-queue-1"]; !ok {
+			t.Fatalf("expected release attempted for slot-a-queue-1, got %+v", released)
+		}
+		if _, ok := seen["slot-b-queue-2"]; !ok {
+			t.Fatalf("expected release attempted for slot-b-queue-2, got %+v", released)
+		}
+	})
+
+	t.Run("admitPartitionedSubBatch returns joined partition and release failures", func(t *testing.T) {
+		backend := &partitionReadyThenErrorBackend{
+			firstPartition: []*admitResult{{status: "READY", slotToken: "slot-a-queue-1"}, {status: "READY", slotToken: "slot-b-queue-2"}},
+			secondErr:      partitionErr,
+			releaseErrs:    map[string]error{"slot-a-queue-1": releaseErr},
+		}
+		cfg := &Config{FairQueue: FairQueueConfig{
+			IPCooldownSeconds:  5,
+			PollIntervalMs:     500,
+			MaxBatch:           3,
+			MaxProbeParallel:   3,
+			MaxProbeQpsPerHost: 100,
+		}}
+		s := newTestServer()
+		s.updateRuntime(cfg, backend, "test", true)
+
+		now := time.Date(2026, 3, 21, 12, 10, 0, 0, time.UTC)
+		fq := cfg.FairQueue
+		base := AcquireRequest{
+			Hostname:             "example.com",
+			HostnameHash:         "h1",
+			SiteBucket:           "s1",
+			Now:                  now.UnixMilli(),
+			HostMaxSlotPerHost:   fq.hostMaxSlotPerHost(),
+			HostMaxSlotPerIP:     fq.hostMaxSlotPerIP(),
+			SiteMaxSlotPerSite:   fq.siteMaxSlotPerSite(),
+			SiteMaxSlotPerIP:     fq.siteMaxSlotPerIP(),
+			ZombieTimeoutSeconds: fq.zombieTimeoutSeconds(),
+			CooldownSeconds:      fq.cooldownSeconds(),
+		}
+		queueFirst := base
+		queueFirst.IPBucket = "a-queue-1"
+		queueSecond := base
+		queueSecond.IPBucket = "b-queue-2"
+		breaker := base
+		breaker.IPBucket = "z-breaker-1"
+		breaker.BreakerEnabled = true
+		breaker.HalfOpenMaxProbeCount = 4
+		breaker.HalfOpenMaxSeconds = 15
+		breaker.HalfOpenTimeoutMode = "partial-close"
+
+		outcome := s.admitPartitionedSubBatch(context.Background(), []AcquireRequest{queueFirst, queueSecond, breaker})
+		if len(outcome.results) != 3 || len(outcome.known) != 3 || len(outcome.compensatedReady) != 3 {
+			t.Fatalf("expected richer outcome slices for all request indexes, got results=%d known=%d compensated=%d", len(outcome.results), len(outcome.known), len(outcome.compensatedReady))
+		}
+		if outcome.results[0] == nil || outcome.results[0].status != "READY" || !outcome.known[0] || !outcome.compensatedReady[0] {
+			t.Fatalf("expected first READY to remain known and compensated, got known=%v compensated=%v result=%+v", outcome.known[0], outcome.compensatedReady[0], outcome.results[0])
+		}
+		if outcome.results[1] == nil || outcome.results[1].status != "READY" || !outcome.known[1] || !outcome.compensatedReady[1] {
+			t.Fatalf("expected second READY to remain known and compensated, got known=%v compensated=%v result=%+v", outcome.known[1], outcome.compensatedReady[1], outcome.results[1])
+		}
+		if outcome.results[2] != nil || outcome.known[2] || outcome.compensatedReady[2] {
+			t.Fatalf("expected failing partition index to stay unknown, got known=%v compensated=%v result=%+v", outcome.known[2], outcome.compensatedReady[2], outcome.results[2])
+		}
+		if outcome.err == nil {
+			t.Fatalf("expected partitioned admit failure")
+		}
+		if !errors.Is(outcome.err, partitionErr) {
+			t.Fatalf("expected error to preserve original partition failure, got %v", outcome.err)
+		}
+		if !errors.Is(outcome.err, releaseErr) {
+			t.Fatalf("expected error to preserve release failure, got %v", outcome.err)
+		}
+		if !strings.Contains(outcome.err.Error(), partitionErr.Error()) || !strings.Contains(outcome.err.Error(), releaseErr.Error()) {
+			t.Fatalf("expected joined error string to expose both partition and release failures, got %v", outcome.err)
+		}
+
+		if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=false ips=a-queue-1,b-queue-2", "be=true ips=z-breaker-1"}) {
+			t.Fatalf("expected partition ordering queue then breaker, got %v", got)
+		}
+
+		released := backend.releasedRequests()
+		if len(released) != 2 {
+			t.Fatalf("expected compensating releases attempted for both tokens despite one failure, got %+v", released)
+		}
+	})
+}
+
+func partitionedAdmitSubBatchTestRequests(now time.Time, fq FairQueueConfig) (AcquireRequest, AcquireRequest, AcquireRequest) {
+	base := AcquireRequest{
+		Hostname:             "example.com",
+		HostnameHash:         "h1",
+		SiteBucket:           "s1",
+		Now:                  now.UnixMilli(),
+		HostMaxSlotPerHost:   fq.hostMaxSlotPerHost(),
+		HostMaxSlotPerIP:     fq.hostMaxSlotPerIP(),
+		SiteMaxSlotPerSite:   fq.siteMaxSlotPerSite(),
+		SiteMaxSlotPerIP:     fq.siteMaxSlotPerIP(),
+		ZombieTimeoutSeconds: fq.zombieTimeoutSeconds(),
+		CooldownSeconds:      fq.cooldownSeconds(),
+	}
+	structural := base
+	structural.IPBucket = "a-queue-structural"
+	ready := base
+	ready.IPBucket = "b-queue-ready"
+	unknown := base
+	unknown.IPBucket = "z-breaker-unknown"
+	unknown.BreakerEnabled = true
+	unknown.HalfOpenMaxProbeCount = 4
+	unknown.HalfOpenMaxSeconds = 15
+	unknown.HalfOpenTimeoutMode = "partial-close"
+	return structural, ready, unknown
+}
+
+func TestAdmitPartitionedSubBatchPreservesStructuralResultsOnLaterError(t *testing.T) {
+	partitionErr := errors.New("later partition admit error")
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition: []*admitResult{{status: "IP_TOO_MANY"}, {status: "READY", slotToken: "slot-b-queue-ready"}},
+		secondErr:      partitionErr,
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           3,
+		MaxProbeParallel:   3,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 22, 10, 0, 0, 0, time.UTC)
+	structural, ready, unknown := partitionedAdmitSubBatchTestRequests(now, cfg.FairQueue)
+
+	outcome := s.admitPartitionedSubBatch(context.Background(), []AcquireRequest{structural, ready, unknown})
+
+	if !errors.Is(outcome.err, partitionErr) {
+		t.Fatalf("expected outcome error to preserve later partition failure, got %v", outcome.err)
+	}
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=false ips=a-queue-structural,b-queue-ready", "be=true ips=z-breaker-unknown"}) {
+		t.Fatalf("expected queue partition to resolve before failing breaker partition, got %v", got)
+	}
+	if len(outcome.results) != 3 || len(outcome.known) != 3 || len(outcome.compensatedReady) != 3 {
+		t.Fatalf("expected three-way outcome slices, got results=%d known=%d compensated=%d", len(outcome.results), len(outcome.known), len(outcome.compensatedReady))
+	}
+	if !outcome.known[0] || outcome.results[0] == nil || outcome.results[0].status != "IP_TOO_MANY" {
+		t.Fatalf("expected structural result at index 0 to stay observable, got known=%v result=%+v", outcome.known[0], outcome.results[0])
+	}
+	if !outcome.known[1] || outcome.results[1] == nil || outcome.results[1].status != "READY" || !outcome.compensatedReady[1] {
+		t.Fatalf("expected READY at index 1 to remain known and marked compensated, got known=%v result=%+v compensated=%v", outcome.known[1], outcome.results[1], outcome.compensatedReady[1])
+	}
+	if outcome.known[2] || outcome.results[2] != nil || outcome.compensatedReady[2] {
+		t.Fatalf("expected failed partition index 2 to stay unknown, got known=%v result=%+v compensated=%v", outcome.known[2], outcome.results[2], outcome.compensatedReady[2])
+	}
+
+	released := backend.releasedRequests()
+	if len(released) != 1 {
+		t.Fatalf("expected compensating release for the READY index only, got %+v", released)
+	}
+	if released[0].SlotToken != "slot-b-queue-ready" || released[0].HostnameHash != "h1" || released[0].SiteBucket != "s1" || released[0].IPBucket != "b-queue-ready" {
+		t.Fatalf("unexpected compensating release request: %+v", released[0])
+	}
+}
+
+func TestAdmitPartitionedSubBatchPreservesStructuralResultsOnLaterLengthMismatch(t *testing.T) {
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition:  []*admitResult{{status: "HALF_OPEN_FULL", retryAfter: 9}, {status: "READY", slotToken: "slot-b-queue-ready"}},
+		secondPartition: []*admitResult{},
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           3,
+		MaxProbeParallel:   3,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 22, 10, 5, 0, 0, time.UTC)
+	structural, ready, unknown := partitionedAdmitSubBatchTestRequests(now, cfg.FairQueue)
+
+	outcome := s.admitPartitionedSubBatch(context.Background(), []AcquireRequest{structural, ready, unknown})
+
+	if outcome.err == nil || !strings.Contains(outcome.err.Error(), "length mismatch") {
+		t.Fatalf("expected outcome error to expose later partition length mismatch, got %v", outcome.err)
+	}
+	if got := backend.batchSignatures(); !reflect.DeepEqual(got, []string{"be=false ips=a-queue-structural,b-queue-ready", "be=true ips=z-breaker-unknown"}) {
+		t.Fatalf("expected queue partition to resolve before mismatched breaker partition, got %v", got)
+	}
+	if len(outcome.results) != 3 || len(outcome.known) != 3 || len(outcome.compensatedReady) != 3 {
+		t.Fatalf("expected three-way outcome slices, got results=%d known=%d compensated=%d", len(outcome.results), len(outcome.known), len(outcome.compensatedReady))
+	}
+	if !outcome.known[0] || outcome.results[0] == nil || outcome.results[0].status != "HALF_OPEN_FULL" || outcome.results[0].retryAfter != 9 {
+		t.Fatalf("expected structural HALF_OPEN_FULL result at index 0 to stay observable, got known=%v result=%+v", outcome.known[0], outcome.results[0])
+	}
+	if !outcome.known[1] || outcome.results[1] == nil || outcome.results[1].status != "READY" || !outcome.compensatedReady[1] {
+		t.Fatalf("expected READY at index 1 to remain known and marked compensated, got known=%v result=%+v compensated=%v", outcome.known[1], outcome.results[1], outcome.compensatedReady[1])
+	}
+	if outcome.known[2] || outcome.results[2] != nil || outcome.compensatedReady[2] {
+		t.Fatalf("expected mismatched partition index 2 to stay unknown, got known=%v result=%+v compensated=%v", outcome.known[2], outcome.results[2], outcome.compensatedReady[2])
+	}
+
+	released := backend.releasedRequests()
+	if len(released) != 1 {
+		t.Fatalf("expected compensating release for the READY index only, got %+v", released)
+	}
+	if released[0].SlotToken != "slot-b-queue-ready" || released[0].HostnameHash != "h1" || released[0].SiteBucket != "s1" || released[0].IPBucket != "b-queue-ready" {
+		t.Fatalf("unexpected compensating release request: %+v", released[0])
+	}
+}
+
+func TestProbeOnceBreakerEnabledReadyWithoutAttemptMetadataStillDeliversSlot(t *testing.T) {
+	backend := &releaseRecordingBackend{
+		sequenceBackend: sequenceBackend{seq: []*admitResult{{status: "READY", slotToken: "slot-missing-attempt"}}},
+		released:        make(chan ReleaseRequest, 1),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 24, 12, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	tok := store.newFlowFromAcquireRequest(AcquireRequest{
+		Hostname:              "example.com",
+		HostnameHash:          "h1",
+		IPBucket:              "ip1",
+		SiteBucket:            "s1",
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
+	})
+	respCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiter")
+	}
+
+	select {
+	case got := <-respCh:
+		if got == nil || got.Result != "granted" || got.SlotToken != "slot-missing-attempt" || got.QueryToken != tok {
+			t.Fatalf("unexpected granted resp: %+v", got)
+		}
+		if got.Meta != nil {
+			t.Fatalf("expected READY without half_open attempt metadata to omit meta, got %+v", got.Meta)
+		}
+	default:
+		t.Fatalf("expected breaker READY without attempt metadata to be delivered")
+	}
+
+	select {
+	case req := <-backend.released:
+		t.Fatalf("expected no compensating release for READY without attempt metadata, got %+v", req)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if _, ok := store.getSnapshot(tok); ok {
+		t.Fatalf("expected delivered READY flow to be deleted")
+	}
+}
+
+func TestProbeOnceHalfOpenFullRequiresPositiveRetryAfter(t *testing.T) {
+	backend := &statusByIPBackend{statuses: map[string]*admitResult{
+		"ip-half-open": {status: "HALF_OPEN_FULL", retryAfter: 0},
+	}}
+	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 25, 12, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	tok := store.newFlowFromAcquireRequest(AcquireRequest{
+		Hostname:              "example.com",
+		HostnameHash:          "h1",
+		IPBucket:              "ip-half-open",
+		SiteBucket:            "s1",
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
+	})
+	respCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiter")
+	}
+
+	select {
+	case got := <-respCh:
+		t.Fatalf("expected malformed HALF_OPEN_FULL to avoid terminal delivery, got %+v", got)
+	default:
+	}
+
+	snap, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected malformed HALF_OPEN_FULL flow to remain for retry")
+	}
+	if !snap.HasWaiter {
+		t.Fatalf("expected malformed HALF_OPEN_FULL to keep waiter attached")
+	}
+}
+
+func TestProbeOnceParallelMicroBatchThrottledCompensatesSiblingReadyWithoutBlockingThrottledDelivery(t *testing.T) {
 	backend := &throttledSiblingBackend{
 		slowStarted:    make(chan struct{}),
 		slowRelease:    make(chan struct{}),
@@ -742,13 +3178,13 @@ func TestProbeOnceParallelMicroBatchThrottledCompensatesSiblingAcquireWithoutBlo
 		return now.Add(time.Duration(createdCalls) * time.Millisecond)
 	}
 
-	slowTok := store.newFlow("h1", "example.com", "a-slow-1", "s1")
+	slowTok := newAtomicBreakerFlow(store, "h1", "example.com", "a-slow-1", "s1")
 	slowCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(slowTok, &fqWaiter{resCh: slowCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter slow-flow ok=%t err=%v", ok, err)
 	}
 
-	fastTok := store.newFlow("h1", "example.com", "z-fast-1", "s1")
+	fastTok := newAtomicBreakerFlow(store, "h1", "example.com", "z-fast-1", "s1")
 	fastCh := make(chan *AcquireResponse, 1)
 	if ok, err := store.attachWaiter(fastTok, &fqWaiter{resCh: fastCh}, now); !ok || err != nil {
 		t.Fatalf("attachWaiter fast-flow ok=%t err=%v", ok, err)
@@ -816,9 +3252,9 @@ func TestProbeOnceParallelMicroBatchThrottledCompensatesSiblingAcquireWithoutBlo
 	}
 }
 
-func TestProbeOnceAcquireUndeliveredTriggersRelease(t *testing.T) {
+func TestProbeOnceReadyUndeliveredTriggersRelease(t *testing.T) {
 	backend := &releaseRecordingBackend{
-		sequenceBackend: sequenceBackend{seq: []*tryAcquireResult{{status: "ACQUIRED", slotToken: "slot-undelivered"}}},
+		sequenceBackend: sequenceBackend{seq: []*admitResult{{status: "READY", slotToken: "slot-undelivered"}}},
 		released:        make(chan ReleaseRequest, 1),
 	}
 	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
@@ -1125,19 +3561,19 @@ func TestProbeBudgetRespectsSiteHeadroom(t *testing.T) {
 	}
 }
 
-func TestTryAcquireBatchUsesBackend(t *testing.T) {
+func TestAdmitBatchUsesBackend(t *testing.T) {
 	cfg := &Config{FairQueue: FairQueueConfig{UtilWindowSec: 10}}
 	batch := &batchBackend{}
 	s := newTestServer()
 	s.updateRuntime(cfg, batch, "test", true)
 
 	reqs := []AcquireRequest{{Hostname: "h1"}, {Hostname: "h1"}}
-	res, err := s.tryAcquireBatch(context.Background(), reqs)
+	res, err := s.admitBatch(context.Background(), reqs)
 	if err != nil {
 		t.Fatalf("expected batch call to succeed, got %v", err)
 	}
 	if !batch.called {
-		t.Fatalf("expected TryAcquireBatch to be called")
+		t.Fatalf("expected AdmitBatch to be called")
 	}
 	if len(res) != len(reqs) {
 		t.Fatalf("expected %d results, got %d", len(reqs), len(res))

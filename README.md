@@ -7,7 +7,7 @@ simple-alist-cf-proxy 是 AList 下载体系里的 Cloudflare Worker 下载代�
 - `payload` / `payloadSign` 校验（HMAC + expire）
 - Origin 绑定：解密 `payload.encrypt` 并重算 `bindingStr`（ip/iprange/Geo/ASN/TLS/path）
 - PostgREST 模式缓存、限流与 Breaker 权威快照：`download_unified_check` 一次 RTT 统一检查
-- SharePoint Breaker 与 Fair Queue：Breaker 由 `THROTTLE_PROTECTION` + authorize/report RPC 统一裁决，`half_open` 按小批次 epoch 记账收敛；slot-handler 只转发 fair-queue 结果与 backend `THROTTLED` 元数据，不持有 breaker 运行时状态
+- SharePoint admission 四种运行模式：`none` / `breaker_only` / `queue_only` / `queue_breaker`；其中 `queue_breaker` 由 slot-handler 原子完成 queue + breaker admission，worker 只在 `breaker_only` 调用 authorize RPC，并在 `breaker_only` / `queue_breaker` fetch 后回写 report RPC
 - 可选 Cloudflare 原生 Rate Limiter
 - 安全响应封装：精简 headers + 统一 CORS + 小文件 Cache-Control 覆盖
 - IPv4-only 模式（`download.auth.ipv4Only`）
@@ -114,7 +114,8 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - 校验 `payloadSign` 与 `payload.expireTime`，解密 `payload.encrypt` 并重算 `bindingStr`
 - 可选 CF Rate Limiter；可选 PostgREST 限流/缓存/Breaker 快照（统一检查，Breaker 权威只在 `THROTTLE_PROTECTION`）
 - 访问 AList `/api/fs/link` 获取真实下载链接（带鉴权 header）
-- 命中托管 breaker hostname 时，worker 先按权威快照对 `open` 立即 fail-fast；若启用 Fair Queue，则仍先排队拿到 slot，再在实际 fetch 前调用 `download_authorize_breaker_attempt` 申请一次 `half_open` attempt，并在响应后带 `p_attempt_version` / `p_attempt_ticket` 回写 sample。`half_open` 现在按小批次 epoch 记账收敛：首个受保护错误立即重新 `open`，成功数满足 close rule 时关闭，整批 attempt 都已发出且全部回报后仍证据不足则重新 `open`，超时仍按 `halfOpenTimeoutMode` 处理；由于 SQL 用 signed `BIGINT` bitmap 记录 attempt 回报，`halfOpenMaxProbeCount` 的有效范围固定为 `1..63`。
+- admission 固定为四种显式路径：`none -> fetch only`、`breaker_only -> authorize -> fetch -> report`、`queue_only -> admit(queue only) -> fetch -> release`、`queue_breaker -> admit(queue + breaker) -> fetch -> report -> release`
+- 命中托管 breaker hostname 时，`breaker_only` 先按权威快照对 `open` 立即 fail-fast，并在实际 fetch 前调用 `download_authorize_breaker_attempt`；`queue_breaker` 不再在拿到 slot 后二次 authorize，而是直接消费 slot-handler 返回的 `attemptVersion` / `attemptTicket` 并在响应后回写 `download_report_breaker_sample`。`half_open` 继续按小批次 epoch 记账收敛：首个受保护错误立即重新 `open`，成功数满足 close rule 时关闭，整批 attempt 都已发出且全部回报后仍证据不足则重新 `open`，超时仍按 `halfOpenTimeoutMode` 处理；由于 SQL 用 signed `BIGINT` bitmap 记录 attempt 回报，`halfOpenMaxProbeCount` 的有效范围固定为 `1..63`。
 - 可选 Fair Queue（slot-handler）获取 slot；slot-handler 只透传 backend `THROTTLED` 元数据，不在本地维护 breaker 运行时状态
 - 转发上游响应，裁剪/补充 headers 并返回
 

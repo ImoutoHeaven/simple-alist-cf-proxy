@@ -12,12 +12,16 @@ import (
 // fqFlow is the token-stable fairness state that survives across long-poll requests.
 // In Task 1 we only implement the minimal store + grace expiry behavior.
 type fqFlow struct {
-	Token        string
-	Hostname     string
-	HostnameHash string
-	IPBucket     string
-	SiteBucket   string
-	CreatedAt    time.Time
+	Token                 string
+	Hostname              string
+	HostnameHash          string
+	IPBucket              string
+	SiteBucket            string
+	BreakerEnabled        bool
+	HalfOpenMaxProbeCount int
+	HalfOpenMaxSeconds    int
+	HalfOpenTimeoutMode   string
+	CreatedAt             time.Time
 
 	// Fairness state (kept across long-polls)
 	LocalVT uint64
@@ -31,15 +35,19 @@ type fqFlow struct {
 // fqFlowSnapshot is an immutable copy of a flow's state.
 // Use this instead of exposing *fqFlow to callers.
 type fqFlowSnapshot struct {
-	Token        string
-	Hostname     string
-	HostnameHash string
-	IPBucket     string
-	SiteBucket   string
-	CreatedAt    time.Time
-	LocalVT      uint64
-	HasWaiter    bool
-	ExpireAt     time.Time
+	Token                 string
+	Hostname              string
+	HostnameHash          string
+	IPBucket              string
+	SiteBucket            string
+	BreakerEnabled        bool
+	HalfOpenMaxProbeCount int
+	HalfOpenMaxSeconds    int
+	HalfOpenTimeoutMode   string
+	CreatedAt             time.Time
+	LocalVT               uint64
+	HasWaiter             bool
+	ExpireAt              time.Time
 }
 
 type fqWaiter struct {
@@ -84,6 +92,39 @@ func newFlowStore(grace time.Duration) *flowStore {
 		inFlightBySite:     make(map[string]int),
 		inFlightByIP:       make(map[string]int),
 	}
+}
+
+func applyAcquireRequestToFlow(f *fqFlow, req AcquireRequest) {
+	if f == nil {
+		return
+	}
+	f.Hostname = req.Hostname
+	f.HostnameHash = req.HostnameHash
+	f.IPBucket = req.IPBucket
+	f.SiteBucket = canonicalSiteBucket(req.SiteBucket)
+	f.BreakerEnabled = req.BreakerEnabled
+	f.HalfOpenMaxProbeCount = req.HalfOpenMaxProbeCount
+	f.HalfOpenMaxSeconds = req.HalfOpenMaxSeconds
+	f.HalfOpenTimeoutMode = canonicalTimeoutMode(req.HalfOpenTimeoutMode)
+}
+
+func canonicalSiteBucket(raw string) string {
+	return normalizeSiteBucket(raw)
+}
+
+func canonicalTimeoutMode(raw string) string {
+	return strings.TrimSpace(raw)
+}
+
+func matchesAcquireIdentityAndAdmissionTuple(snap fqFlowSnapshot, req AcquireRequest) bool {
+	return snap.Hostname == req.Hostname &&
+		snap.HostnameHash == req.HostnameHash &&
+		snap.IPBucket == req.IPBucket &&
+		snap.SiteBucket == canonicalSiteBucket(req.SiteBucket) &&
+		snap.BreakerEnabled == req.BreakerEnabled &&
+		snap.HalfOpenMaxProbeCount == req.HalfOpenMaxProbeCount &&
+		snap.HalfOpenMaxSeconds == req.HalfOpenMaxSeconds &&
+		snap.HalfOpenTimeoutMode == canonicalTimeoutMode(req.HalfOpenTimeoutMode)
 }
 
 // incrementLocalVT bumps the flow-local virtual time counter.
@@ -136,15 +177,19 @@ func (s *flowStore) trySelectInFlight(token string, hostKey string, now time.Tim
 
 	f.LocalVT++
 	return fqFlowSnapshot{
-		Token:        f.Token,
-		Hostname:     f.Hostname,
-		HostnameHash: f.HostnameHash,
-		IPBucket:     f.IPBucket,
-		SiteBucket:   f.SiteBucket,
-		CreatedAt:    f.CreatedAt,
-		LocalVT:      f.LocalVT,
-		HasWaiter:    true,
-		ExpireAt:     f.expireAt,
+		Token:                 f.Token,
+		Hostname:              f.Hostname,
+		HostnameHash:          f.HostnameHash,
+		IPBucket:              f.IPBucket,
+		SiteBucket:            f.SiteBucket,
+		BreakerEnabled:        f.BreakerEnabled,
+		HalfOpenMaxProbeCount: f.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:    f.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:   f.HalfOpenTimeoutMode,
+		CreatedAt:             f.CreatedAt,
+		LocalVT:               f.LocalVT,
+		HasWaiter:             true,
+		ExpireAt:              f.expireAt,
 	}, true
 }
 
@@ -185,15 +230,19 @@ func (s *flowStore) listInFlightByHost(hostKey string, now time.Time) []fqFlowSn
 			continue
 		}
 		res = append(res, fqFlowSnapshot{
-			Token:        f.Token,
-			Hostname:     f.Hostname,
-			HostnameHash: f.HostnameHash,
-			IPBucket:     f.IPBucket,
-			SiteBucket:   f.SiteBucket,
-			CreatedAt:    f.CreatedAt,
-			LocalVT:      f.LocalVT,
-			HasWaiter:    true,
-			ExpireAt:     f.expireAt,
+			Token:                 f.Token,
+			Hostname:              f.Hostname,
+			HostnameHash:          f.HostnameHash,
+			IPBucket:              f.IPBucket,
+			SiteBucket:            f.SiteBucket,
+			BreakerEnabled:        f.BreakerEnabled,
+			HalfOpenMaxProbeCount: f.HalfOpenMaxProbeCount,
+			HalfOpenMaxSeconds:    f.HalfOpenMaxSeconds,
+			HalfOpenTimeoutMode:   f.HalfOpenTimeoutMode,
+			CreatedAt:             f.CreatedAt,
+			LocalVT:               f.LocalVT,
+			HasWaiter:             true,
+			ExpireAt:              f.expireAt,
 		})
 	}
 	if len(bucket) == 0 {
@@ -212,6 +261,15 @@ func (s *flowStore) setGrace(grace time.Duration) {
 }
 
 func (s *flowStore) newFlow(hostHash, host, ip, site string) string {
+	return s.newFlowFromAcquireRequest(AcquireRequest{
+		HostnameHash: hostHash,
+		Hostname:     host,
+		IPBucket:     ip,
+		SiteBucket:   site,
+	})
+}
+
+func (s *flowStore) newFlowFromAcquireRequest(req AcquireRequest) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -220,14 +278,8 @@ func (s *flowStore) newFlow(hostHash, host, ip, site string) string {
 	if nowFn == nil {
 		nowFn = time.Now
 	}
-	f := &fqFlow{
-		Token:        tok,
-		Hostname:     host,
-		HostnameHash: hostHash,
-		IPBucket:     ip,
-		SiteBucket:   site,
-		CreatedAt:    nowFn(),
-	}
+	f := &fqFlow{Token: tok, CreatedAt: nowFn()}
+	applyAcquireRequestToFlow(f, req)
 	s.byToken[tok] = f
 	return tok
 }
@@ -731,15 +783,19 @@ func (s *flowStore) getSnapshot(token string) (fqFlowSnapshot, bool) {
 		return fqFlowSnapshot{}, false
 	}
 	return fqFlowSnapshot{
-		Token:        f.Token,
-		Hostname:     f.Hostname,
-		HostnameHash: f.HostnameHash,
-		IPBucket:     f.IPBucket,
-		SiteBucket:   f.SiteBucket,
-		CreatedAt:    f.CreatedAt,
-		LocalVT:      f.LocalVT,
-		HasWaiter:    f.waiter != nil,
-		ExpireAt:     f.expireAt,
+		Token:                 f.Token,
+		Hostname:              f.Hostname,
+		HostnameHash:          f.HostnameHash,
+		IPBucket:              f.IPBucket,
+		SiteBucket:            f.SiteBucket,
+		BreakerEnabled:        f.BreakerEnabled,
+		HalfOpenMaxProbeCount: f.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:    f.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:   f.HalfOpenTimeoutMode,
+		CreatedAt:             f.CreatedAt,
+		LocalVT:               f.LocalVT,
+		HasWaiter:             f.waiter != nil,
+		ExpireAt:              f.expireAt,
 	}, true
 }
 

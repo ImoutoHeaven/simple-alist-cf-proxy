@@ -14,10 +14,27 @@ func newTestServer() *server {
 type stubBackend struct {
 }
 
-func (s *stubBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
-	results := make([]*tryAcquireResult, len(reqs))
+func atomicBreakerAcquireRequest(hostname, hostnameHash, ipBucket, siteBucket string) AcquireRequest {
+	return AcquireRequest{
+		Hostname:              hostname,
+		HostnameHash:          hostnameHash,
+		IPBucket:              ipBucket,
+		SiteBucket:            siteBucket,
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
+	}
+}
+
+func newAtomicBreakerFlow(store *flowStore, hostnameHash, hostname, ipBucket, siteBucket string) string {
+	return store.newFlowFromAcquireRequest(atomicBreakerAcquireRequest(hostname, hostnameHash, ipBucket, siteBucket))
+}
+
+func (s *stubBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	results := make([]*admitResult, len(reqs))
 	for i := range results {
-		results[i] = &tryAcquireResult{status: "WAIT"}
+		results[i] = &admitResult{status: "WAIT"}
 	}
 	return results, nil
 }

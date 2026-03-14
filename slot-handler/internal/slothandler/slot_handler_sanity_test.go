@@ -1,6 +1,7 @@
 package slothandler
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -98,5 +99,28 @@ func TestDocsNoFailOpenWordingForFairQueueAvailability(t *testing.T) {
 		if strings.Contains(text, token) {
 			t.Fatalf("docs contain fail-open slot-handler availability wording: %s (file=%s)", token, path)
 		}
+	}
+}
+
+func TestConfigUsesAtomicAdmitBatchRPC(t *testing.T) {
+	path := filepath.Join(moduleRootDir(t), "config.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config.json: %v", err)
+	}
+
+	var cfg struct {
+		FairQueue struct {
+			RPC struct {
+				TryAcquireFunc string `json:"tryAcquireFunc"`
+			} `json:"rpc"`
+		} `json:"fairQueue"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("decode config.json: %v", err)
+	}
+
+	if cfg.FairQueue.RPC.TryAcquireFunc != "fq_admit_batch" {
+		t.Fatalf("expected config.json to wire fairQueue.rpc.tryAcquireFunc to fq_admit_batch, got %q", cfg.FairQueue.RPC.TryAcquireFunc)
 	}
 }

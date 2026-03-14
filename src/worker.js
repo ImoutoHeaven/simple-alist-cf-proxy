@@ -207,6 +207,19 @@ const isManagedThrottleHost = (hostname, throttleHostnamePatterns = []) => {
     && throttleHostnamePatterns.some((pattern) => matchHostnamePattern(hostKey, pattern));
 };
 
+function resolveAdmissionMode(config, hostname) {
+  const hostKey = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+  const queue = config.fairQueueEnabled
+    && Boolean(hostKey)
+    && Array.isArray(config.fairQueueHostnamePatterns)
+    && config.fairQueueHostnamePatterns.some((pattern) => matchHostnamePattern(hostKey, pattern));
+  const breaker = config.throttleEnabled && isManagedThrottleHost(hostKey, config.throttleHostnamePatterns);
+  if (queue && breaker) return 'queue_breaker';
+  if (queue) return 'queue_only';
+  if (breaker) return 'breaker_only';
+  return 'none';
+}
+
 const readOpenBreakerSnapshot = (snapshot, fallbackSeconds = 0, nowSeconds = Math.floor(Date.now() / 1000)) => {
   if (!snapshot || snapshot.state !== 'open') {
     return null;
@@ -263,6 +276,25 @@ const readSlotHandlerBreakerSnapshot = (payload) => {
     reason,
     version,
     lastErrorCode,
+  };
+};
+
+const readSlotHandlerAttempt = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return { attemptVersion: null, attemptTicket: null };
+  }
+
+  const meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : null;
+  const rawAttemptVersion = Number(meta?.attemptVersion ?? payload.attemptVersion);
+  const rawAttemptTicket = Number(meta?.attemptTicket ?? payload.attemptTicket);
+
+  return {
+    attemptVersion: Number.isFinite(rawAttemptVersion) && rawAttemptVersion > 0
+      ? Math.trunc(rawAttemptVersion)
+      : null,
+    attemptTicket: Number.isFinite(rawAttemptTicket) && rawAttemptTicket > 0
+      ? Math.trunc(rawAttemptTicket)
+      : null,
   };
 };
 
@@ -1641,6 +1673,18 @@ const createSlotHandlerClient = (config) => {
           now,
           ...(queryToken ? { queryToken } : {}),
         };
+        if (fqContext?.breakerEnabled === true) {
+          payload.breakerEnabled = true;
+          if (Number.isFinite(fqContext?.halfOpenMaxProbeCount)) {
+            payload.halfOpenMaxProbeCount = Math.trunc(fqContext.halfOpenMaxProbeCount);
+          }
+          if (Number.isFinite(fqContext?.halfOpenMaxSeconds)) {
+            payload.halfOpenMaxSeconds = Math.trunc(fqContext.halfOpenMaxSeconds);
+          }
+          if (typeof fqContext?.halfOpenTimeoutMode === 'string' && fqContext.halfOpenTimeoutMode) {
+            payload.halfOpenTimeoutMode = fqContext.halfOpenTimeoutMode;
+          }
+        }
 
         let res;
         try {
@@ -1698,10 +1742,19 @@ const createSlotHandlerClient = (config) => {
           case 'granted':
             pendingStreak = 0;
             overloadStreak = 0;
+            {
+              const { attemptVersion, attemptTicket } = readSlotHandlerAttempt(data);
+              fqContext.attemptVersion = attemptVersion;
+              fqContext.attemptTicket = attemptTicket;
+            }
             fqContext.slotToken = data.slotToken;
             fqContext.slotAcquiredAt = Date.now();
             console.log(`[FQ] slot granted via slot-handler host=${fqContext.hostname}`);
-            return { kind: 'granted' };
+            return {
+              kind: 'granted',
+              attemptVersion: fqContext.attemptVersion,
+              attemptTicket: fqContext.attemptTicket,
+            };
           case 'throttled':
             pendingStreak = 0;
             overloadStreak = 0;
@@ -1710,10 +1763,12 @@ const createSlotHandlerClient = (config) => {
             const openBreaker = breakerSnapshot
               ? readOpenBreakerSnapshot(breakerSnapshot, 0)
               : null;
+            const rawRetryAfter = Number(data?.retryAfter);
             return {
               kind: 'throttled',
               throttleCode,
-              retryAfter: openBreaker?.retryAfter,
+              retryAfter: openBreaker?.retryAfter
+                ?? (Number.isFinite(rawRetryAfter) && rawRetryAfter > 0 ? Math.ceil(rawRetryAfter) : null),
               breakerSnapshot,
             };
           case 'overloaded': {
@@ -1783,7 +1838,7 @@ const createSlotHandlerClient = (config) => {
 
     async releaseSlot(ctx, fqContext) {
       if (!fqContext.slotToken) {
-        return;
+        return true;
       }
 
       const releaseMaxAttempts = 3;
@@ -1812,7 +1867,7 @@ const createSlotHandlerClient = (config) => {
 
           if (res.ok) {
             console.log(`[FQ] slot released via slot-handler host=${fqContext.hostname}`);
-            return;
+            return true;
           }
 
           lastError = new Error(`slot-handler release failed: status ${res.status}`);
@@ -1833,6 +1888,7 @@ const createSlotHandlerClient = (config) => {
 
       const message = lastError instanceof Error ? lastError.message : String(lastError || 'unknown error');
       console.error('[FQ] releaseSlot error (slot-handler):', message);
+      return false;
     },
   };
 };
@@ -2098,6 +2154,17 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return null;
     }
 
+    const resolvedUnifiedThrottleHostname = (() => {
+      const override = typeof options.throttleHostname === 'string' ? options.throttleHostname.trim().toLowerCase() : '';
+      if (override) {
+        return override;
+      }
+      const cachedHostnameRaw = extractHostname(unifiedResult?.cache?.linkData?.url || '');
+      return cachedHostnameRaw ? cachedHostnameRaw.toLowerCase() : '';
+    })();
+    const unifiedAdmissionMode = resolveAdmissionMode(config, resolvedUnifiedThrottleHostname);
+    const unifiedBreakerEligible = unifiedAdmissionMode === 'breaker_only';
+
     console.log('[Idle Debug] Unified check idle payload:', unifiedResult.idle ?? null);
     if (!unifiedResult.rateLimit.allowed) {
       if (unifiedResult.rateLimit.error) {
@@ -2155,16 +2222,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       }
     }
 
-    const unifiedBreaker = config.throttleEnabled
+    const unifiedBreaker = unifiedBreakerEligible && config.throttleEnabled
       ? readOpenBreakerSnapshot(unifiedResult.throttle, config.throttleConfig?.openCapSeconds || 60)
       : null;
-    const unifiedResponse = applyUnifiedResult(unifiedResult, {
-      origin,
-      openCapSeconds: config.throttleConfig?.openCapSeconds || 60,
-      throttleEnabled: config.throttleEnabled,
-      throttleHostname: options.throttleHostname,
-      throttleHostnamePatterns: config.throttleHostnamePatterns,
-    });
+    const unifiedResponse = unifiedBreakerEligible
+      ? applyUnifiedResult(unifiedResult, {
+          origin,
+          openCapSeconds: config.throttleConfig?.openCapSeconds || 60,
+          throttleEnabled: config.throttleEnabled,
+          throttleHostname: resolvedUnifiedThrottleHostname,
+          throttleHostnamePatterns: config.throttleHostnamePatterns,
+        })
+      : null;
     if (unifiedResponse) {
       await slowFailDelay();
 
@@ -2368,12 +2437,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   // Use linkData from cache or API response
   let downloadUrl = res.data.url;
+  const upstreamHostnameRaw = extractHostname(downloadUrl);
+  const upstreamHostname = upstreamHostnameRaw ? upstreamHostnameRaw.toLowerCase() : null;
+  let admissionMode = resolveAdmissionMode(config, upstreamHostname);
   let unifiedThrottleHostname = null;
 
   if (supportsUnifiedCheck && !config.cacheEnabled && !unifiedResult) {
     const throttleHostnameRaw = extractHostname(downloadUrl);
     unifiedThrottleHostname = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : null;
-    const throttleHostnameHash = unifiedThrottleHostname
+    const throttleHostnameHash = admissionMode === 'breaker_only' && unifiedThrottleHostname
       ? await sha256Hash(unifiedThrottleHostname)
       : null;
     unifiedThrottleHostnameHash = throttleHostnameHash || null;
@@ -2414,16 +2486,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   };
 
-  if (throttleCheckEnabled) {
-    const throttleHostnameRaw = extractHostname(downloadUrl);
-    throttleHostname = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : null;
+  if (throttleCheckEnabled && admissionMode === 'breaker_only') {
+    throttleHostname = upstreamHostname;
 
     const unifiedThrottleUsable = Boolean(
       unifiedResult
       && unifiedResult.throttle
       && unifiedThrottleHostnameHash
       && throttleHostname
-      && isThrottleManagedHostname(throttleHostname)
     );
 
     if (unifiedThrottleUsable) {
@@ -2447,8 +2517,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  const authorizeBreakerAttemptIfNeeded = async (hostname) => {
-    if (!throttleCheckEnabled || !hostname || !isThrottleManagedHostname(hostname)) {
+  const authorizeBreakerOnlyAttemptIfNeeded = async (hostname) => {
+    const hostnameAdmissionMode = resolveAdmissionMode(config, hostname);
+    if (!throttleCheckEnabled || hostnameAdmissionMode !== 'breaker_only') {
       return {
         blockedResponse: null,
         attemptVersion: null,
@@ -2515,8 +2586,126 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   };
 
-  const reportBreakerResponseIfNeeded = async (hostname, response, attempt = null) => {
-    if (!throttleCheckEnabled || !hostname || !response || !isThrottleManagedHostname(hostname)) {
+  const armDeferredQueueBreakerReport = (statusCode) => {
+    if (!fqContext) {
+      return;
+    }
+    fqContext.deferredReportStatusCode = statusCode;
+    fqContext.deferredReportArmed = true;
+  };
+
+  const disarmDeferredQueueBreakerReport = () => {
+    if (!fqContext) {
+      return;
+    }
+    fqContext.deferredReportArmed = false;
+  };
+
+  const clearDeferredQueueBreakerReport = () => {
+    if (!fqContext) {
+      return;
+    }
+    fqContext.deferredReportStatusCode = null;
+    fqContext.deferredReportArmed = false;
+  };
+
+  const readQueueBreakerAttempt = (hostname, hostnameAdmissionMode) => {
+    if (hostnameAdmissionMode !== 'queue_breaker' || !fqContext || hostname !== fqContext.hostname) {
+      return {
+        blockedResponse: null,
+        attemptVersion: null,
+        attemptTicket: null,
+      };
+    }
+
+    return {
+      blockedResponse: null,
+      attemptVersion: Number.isFinite(fqContext.attemptVersion) ? Math.trunc(fqContext.attemptVersion) : null,
+      attemptTicket: Number.isFinite(fqContext.attemptTicket) ? Math.trunc(fqContext.attemptTicket) : null,
+      consumeAfterReport() {
+        fqContext.attemptVersion = null;
+        fqContext.attemptTicket = null;
+        clearDeferredQueueBreakerReport();
+      },
+    };
+  };
+
+  const flushDeferredQueueBreakerReportIfNeeded = async () => {
+    if (!fqContext || !fqContext.deferredReportArmed || !Number.isFinite(fqContext.deferredReportStatusCode)) {
+      return null;
+    }
+
+    const attempt = readQueueBreakerAttempt(fqContext.hostname, 'queue_breaker');
+    return reportBreakerResponseIfNeeded(
+      fqContext.hostname,
+      new Response(null, { status: fqContext.deferredReportStatusCode }),
+      '',
+      attempt,
+    );
+  };
+
+  const flushDeferredQueueBreakerReportOnExit = async (response = null) => {
+    if (!fqContext || !fqContext.deferredReportArmed || !Number.isFinite(fqContext.deferredReportStatusCode)) {
+      return null;
+    }
+
+    if (response) {
+      const protectedHttpCodes = Array.isArray(config.throttleConfig?.protectHttpCodes)
+        ? config.throttleConfig.protectHttpCodes
+        : [];
+      const statusCode = response.status;
+      const isProtectedError = protectedHttpCodes.includes(statusCode);
+      const isSuccessStatus = statusCode >= 200 && statusCode < 400;
+      if (isProtectedError || isSuccessStatus) {
+        return null;
+      }
+    }
+
+    return flushDeferredQueueBreakerReportIfNeeded();
+  };
+
+  const shouldDeferQueueBreakerReportForRedirect = async (hostname, response, requestUrl) => {
+    if (!response || response.status < 300 || response.status >= 400) {
+      return false;
+    }
+
+    if (!fqContext || hostname !== fqContext.hostname) {
+      return false;
+    }
+
+    const location = response.headers.get('Location');
+    if (!location) {
+      return false;
+    }
+
+    let redirectUrl;
+    try {
+      redirectUrl = new URL(location, requestUrl).toString();
+    } catch (_error) {
+      return false;
+    }
+
+    const redirectHostnameRaw = extractHostname(redirectUrl);
+    const redirectHostname = redirectHostnameRaw ? redirectHostnameRaw.toLowerCase() : null;
+    if (!redirectHostname || redirectHostname !== fqContext.hostname) {
+      return false;
+    }
+
+    if (resolveAdmissionMode(config, redirectHostname) !== 'queue_breaker') {
+      return false;
+    }
+
+    const redirectSiteBucket = await deriveSiteBucket(redirectHostname, redirectUrl, config.fairQueueSiteBucket);
+    return redirectSiteBucket === fqContext.siteBucket;
+  };
+
+  const reportBreakerResponseIfNeeded = async (hostname, response, requestUrl, attempt = null) => {
+    const hostnameAdmissionMode = resolveAdmissionMode(config, hostname);
+    if (
+      !throttleCheckEnabled
+      || !response
+      || (hostnameAdmissionMode !== 'breaker_only' && hostnameAdmissionMode !== 'queue_breaker')
+    ) {
       return;
     }
 
@@ -2530,6 +2719,20 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const isSuccessStatus = statusCode >= 200 && statusCode < 400;
       if (!isProtectedError && !isSuccessStatus) {
         return;
+      }
+
+      if (hostnameAdmissionMode === 'queue_breaker') {
+        const shouldDefer = await shouldDeferQueueBreakerReportForRedirect(
+          hostname,
+          response,
+          requestUrl,
+        );
+        if (shouldDefer) {
+          armDeferredQueueBreakerReport(statusCode);
+          return;
+        }
+
+        disarmDeferredQueueBreakerReport();
       }
 
       const sample = isProtectedError ? 1 : 0;
@@ -2563,6 +2766,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         console.error('[Throttle] Sample report returned no authority state');
         return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
       }
+
+      attempt?.consumeAfterReport?.();
     } catch (error) {
       console.error('[Throttle] Sample report failed:', error instanceof Error ? error.message : String(error));
       return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
@@ -2574,33 +2779,55 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // ========================================
   // Fair Upstream Queue Integration
   // ========================================
-  const upstreamHostnameRaw = extractHostname(downloadUrl);
-  const upstreamHostname = upstreamHostnameRaw ? upstreamHostnameRaw.toLowerCase() : null;
-  const needFairQueue =
-    config.fairQueueEnabled &&
-    upstreamHostname &&
-    config.fairQueueHostnamePatterns.some((pattern) => matchHostnamePattern(upstreamHostname, pattern));
+  const needFairQueue = admissionMode === 'queue_only' || admissionMode === 'queue_breaker';
+
+  const buildFairQueueAdmissionFields = (mode) => {
+    if (mode !== 'queue_breaker') {
+      return {};
+    }
+
+    return {
+      breakerEnabled: true,
+      halfOpenMaxProbeCount: config.throttleConfig?.halfOpenMaxProbeCount,
+      halfOpenMaxSeconds: config.throttleConfig?.halfOpenMaxSeconds,
+      halfOpenTimeoutMode: config.throttleConfig?.halfOpenTimeoutMode,
+      attemptVersion: null,
+      attemptTicket: null,
+    };
+  };
+
+  const buildFairQueueContext = (hostname, hostnameHash, ipBucket, siteBucket, mode) => ({
+    hostname,
+    hostnameHash,
+    ipBucket,
+    siteBucket,
+    nowMs: Date.now(),
+    deferredReportStatusCode: null,
+    deferredReportArmed: false,
+    ...buildFairQueueAdmissionFields(mode),
+  });
 
   let fairQueueClient = null;
   let fqContext = null;
-  let earlyResponse = null;
+  const pendingFairQueueReleaseContexts = [];
+  let clientIpSubnetHash = null;
 
-  if (needFairQueue) {
+  const ensureFairQueueClientReady = async () => {
     if (!config.slotHandlerConfig?.url) {
       console.error('[Fair Queue] enabled but slot-handler URL missing');
       return createErrorResponse(origin, 503, 'Fair queue misconfigured (slot-handler URL missing)');
     }
 
-    const clientIpSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
-
-    if (!clientIpSubnet) {
-      console.error('[Fair Queue] Failed: unable to derive client subnet for queue enforcement');
-      return createErrorResponse(origin, 503, 'Fair queue unavailable');
+    if (!clientIpSubnetHash) {
+      const clientIpSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
+      if (!clientIpSubnet) {
+        console.error('[Fair Queue] Failed: unable to derive client subnet for queue enforcement');
+        return createErrorResponse(origin, 503, 'Fair queue unavailable');
+      }
+      clientIpSubnetHash = await sha256Hash(clientIpSubnet);
     }
 
-    {
-      const clientIpSubnetHash = await sha256Hash(clientIpSubnet);
-      const hostnameHash = await sha256Hash(upstreamHostname);
+    if (!fairQueueClient) {
       try {
         fairQueueClient = createFairQueueClient(config);
       } catch (error) {
@@ -2608,59 +2835,162 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         console.error('[Fair Queue] Failed to initialize client:', message);
         return createErrorResponse(origin, 503, 'Fair queue unavailable');
       }
-      const siteBucket = await deriveSiteBucket(upstreamHostname, downloadUrl, config.fairQueueSiteBucket);
-      fqContext = {
-        hostname: upstreamHostname,
-        hostnameHash,
-        ipBucket: clientIpSubnetHash,
-        siteBucket,
-        nowMs: Date.now(),
-      };
+    }
 
-      try {
-        const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, clientSignal);
-        if (fqResult.kind === 'throttled') {
-          const breakerState = fqResult.breakerSnapshot
-            ? readOpenBreakerSnapshot(fqResult.breakerSnapshot, 0)
-            : null;
-          await slowFailDelay();
-          return createThrottleProtectedResponse(origin, {
-            errorCode: breakerState?.errorCode || fqResult.throttleCode || 503,
-            retryAfter: breakerState?.retryAfter,
-          });
-        }
+    return null;
+  };
 
-        if (fqResult.kind === 'timeout') {
-          const safeHeaders = new Headers();
-          safeHeaders.set("content-type", "application/json;charset=UTF-8");
-          safeHeaders.set("Access-Control-Allow-Origin", origin);
-          safeHeaders.append("Vary", "Origin");
-          safeHeaders.set("Retry-After", "60");
+  const createFairQueueTimeoutResponse = () => {
+    const safeHeaders = new Headers();
+    safeHeaders.set("content-type", "application/json;charset=UTF-8");
+    safeHeaders.set("Access-Control-Allow-Origin", origin);
+    safeHeaders.append("Vary", "Origin");
+    safeHeaders.set("Retry-After", "60");
 
-          return new Response(
-            JSON.stringify({
-              code: 503,
-              message: 'Upstream queue timeout, please retry later'
-            }),
-            {
-              status: 503,
-              headers: safeHeaders
-            }
-          );
-        }
-
-        if (fqResult.kind === 'overloaded' && fqResult.scope === 'global') {
-          return createFairQueueOverloadedResponse(origin, fqResult.retryAfter);
-        }
-      } catch (error) {
-        if (clientAborted && isAbortError(error)) {
-          earlyResponse = createClientAbortResponse(origin);
-        } else {
-          const message = error instanceof Error ? error.message : String(error);
-          console.error('[Fair Queue] waitForSlot error:', message);
-          return createErrorResponse(origin, 503, 'Fair queue unavailable');
-        }
+    return new Response(
+      JSON.stringify({
+        code: 503,
+        message: 'Upstream queue timeout, please retry later'
+      }),
+      {
+        status: 503,
+        headers: safeHeaders
       }
+    );
+  };
+
+  const handleFairQueueWaitResult = async (fqResult) => {
+    if (fqResult.kind === 'throttled') {
+      const breakerState = fqResult.breakerSnapshot
+        ? readOpenBreakerSnapshot(fqResult.breakerSnapshot, 0)
+        : null;
+      await slowFailDelay();
+      return createThrottleProtectedResponse(origin, {
+        errorCode: breakerState?.errorCode || fqResult.throttleCode || 503,
+        retryAfter: fqResult.retryAfter ?? breakerState?.retryAfter,
+      });
+    }
+
+    if (fqResult.kind === 'timeout') {
+      return createFairQueueTimeoutResponse();
+    }
+
+    if (fqResult.kind === 'overloaded' && fqResult.scope === 'global') {
+      return createFairQueueOverloadedResponse(origin, fqResult.retryAfter);
+    }
+
+    return null;
+  };
+
+  const releaseFairQueueContext = async (contextToRelease, phase) => {
+    if (!fairQueueClient || !contextToRelease || !contextToRelease.slotToken) {
+      return true;
+    }
+
+    try {
+      const released = await fairQueueClient.releaseSlot(ctx, contextToRelease);
+      if (released) {
+        contextToRelease.slotToken = null;
+        return true;
+      }
+      console.warn(`[Fair Queue] releaseSlot exhausted during ${phase} for host=${contextToRelease.hostname}`);
+      return false;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[Fair Queue] releaseSlot failed during ${phase}:`, message);
+      return false;
+    }
+  };
+
+  const admitFairQueueContext = async (phase) => {
+    try {
+      const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, clientSignal);
+      return await handleFairQueueWaitResult(fqResult);
+    } catch (error) {
+      if (clientAborted && isAbortError(error)) {
+        return createClientAbortResponse(origin);
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[Fair Queue] waitForSlot error during ${phase}:`, message);
+      return createErrorResponse(origin, 503, 'Fair queue unavailable');
+    }
+  };
+
+  const reconcileFairQueueContextForTarget = async (targetUrl, phase) => {
+    const updatedHostnameRaw = extractHostname(targetUrl);
+    const updatedHostname = updatedHostnameRaw ? updatedHostnameRaw.toLowerCase() : null;
+    const updatedAdmissionMode = resolveAdmissionMode(config, updatedHostname);
+    admissionMode = updatedAdmissionMode;
+
+    const updatedNeedsFairQueue = updatedAdmissionMode === 'queue_only' || updatedAdmissionMode === 'queue_breaker';
+    if (!updatedNeedsFairQueue) {
+      if (fqContext) {
+        const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+        if (deferredReportResponse) {
+          return deferredReportResponse;
+        }
+        const previousFairQueueContext = fqContext;
+        const released = await releaseFairQueueContext(previousFairQueueContext, phase);
+        if (!released) {
+          pendingFairQueueReleaseContexts.push(previousFairQueueContext);
+        }
+        fqContext = null;
+      }
+      return null;
+    }
+
+    const fairQueueInitResponse = await ensureFairQueueClientReady();
+    if (fairQueueInitResponse) {
+      return fairQueueInitResponse;
+    }
+
+    const updatedSiteBucket = await deriveSiteBucket(updatedHostname, targetUrl, config.fairQueueSiteBucket);
+    if (fqContext && updatedHostname === fqContext.hostname && updatedSiteBucket === fqContext.siteBucket) {
+      return null;
+    }
+
+    if (fqContext) {
+      const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+      if (deferredReportResponse) {
+        return deferredReportResponse;
+      }
+      const previousFairQueueContext = fqContext;
+      const released = await releaseFairQueueContext(previousFairQueueContext, phase);
+      if (!released) {
+        pendingFairQueueReleaseContexts.push(previousFairQueueContext);
+      }
+    }
+    const updatedHostnameHash = await sha256Hash(updatedHostname);
+    fqContext = buildFairQueueContext(
+      updatedHostname,
+      updatedHostnameHash,
+      clientIpSubnetHash,
+      updatedSiteBucket,
+      updatedAdmissionMode,
+    );
+
+    return admitFairQueueContext(phase);
+  };
+
+  if (needFairQueue) {
+    const fairQueueInitResponse = await ensureFairQueueClientReady();
+    if (fairQueueInitResponse) {
+      return fairQueueInitResponse;
+    }
+
+    const hostnameHash = await sha256Hash(upstreamHostname);
+    const siteBucket = await deriveSiteBucket(upstreamHostname, downloadUrl, config.fairQueueSiteBucket);
+    fqContext = buildFairQueueContext(
+      upstreamHostname,
+      hostnameHash,
+      clientIpSubnetHash,
+      siteBucket,
+      admissionMode,
+    );
+
+    const fairQueueWaitResponse = await admitFairQueueContext('initial');
+    if (fairQueueWaitResponse) {
+      return fairQueueWaitResponse;
     }
   }
 
@@ -2682,7 +3012,19 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   const fetchUpstreamWithBreakerAttempt = async (requestToFetch) => {
     const requestHostnameRaw = extractHostname(requestToFetch?.url || '');
     const requestHostname = requestHostnameRaw ? requestHostnameRaw.toLowerCase() : null;
-    const attempt = await authorizeBreakerAttemptIfNeeded(requestHostname);
+    const requestAdmissionMode = resolveAdmissionMode(config, requestHostname);
+    let attempt = {
+      blockedResponse: null,
+      attemptVersion: null,
+      attemptTicket: null,
+    };
+
+    if (requestAdmissionMode === 'queue_breaker') {
+      attempt = readQueueBreakerAttempt(requestHostname, requestAdmissionMode);
+    } else if (requestAdmissionMode === 'breaker_only') {
+      attempt = await authorizeBreakerOnlyAttemptIfNeeded(requestHostname);
+    }
+
     if (attempt.blockedResponse) {
       return { blockedResponse: attempt.blockedResponse, response: null };
     }
@@ -2695,7 +3037,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       blockedResponse: null,
       response: await (async () => {
         const upstreamResponse = await fetch(requestToFetch);
-        const reportFailureResponse = await reportBreakerResponseIfNeeded(requestHostname, upstreamResponse, attempt);
+        const reportFailureResponse = await reportBreakerResponseIfNeeded(
+          requestHostname,
+          upstreamResponse,
+          requestToFetch?.url || '',
+          attempt,
+        );
         if (reportFailureResponse) {
           throw reportFailureResponse;
         }
@@ -2709,10 +3056,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   // Proceed with fetch
   try {
-    if (earlyResponse) {
-      return earlyResponse;
-    }
-
     request = buildUpstreamRequest(downloadUrl, res.data.header);
     let { blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request);
     if (blockedResponse) {
@@ -2726,6 +3069,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           request = new Request(location, request);
             return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
           } else {
+            const fairQueueRedirectResponse = await reconcileFairQueueContextForTarget(location, 'redirect');
+            if (fairQueueRedirectResponse) {
+              return fairQueueRedirectResponse;
+            }
             request = new Request(location, request);
             ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
             if (blockedResponse) {
@@ -2753,80 +3100,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       } else if (refreshedLink && refreshedLink.data && refreshedLink.data.url) {
         downloadUrl = refreshedLink.data.url;
         res = refreshedLink;
-        if (fairQueueClient && fqContext) {
-          const updatedHostnameRaw = extractHostname(downloadUrl);
-          const updatedHostname = updatedHostnameRaw ? updatedHostnameRaw.toLowerCase() : null;
-          const shouldUseFairQueue =
-            config.fairQueueEnabled &&
-            updatedHostname &&
-            config.fairQueueHostnamePatterns.some((pattern) => matchHostnamePattern(updatedHostname, pattern));
-
-          if (!shouldUseFairQueue) {
-            if (fqContext.slotToken) {
-              try {
-                await fairQueueClient.releaseSlot(ctx, fqContext);
-              } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                console.warn('[Fair Queue] releaseSlot failed during refresh:', message);
-              }
-            }
-            fqContext = null;
-          } else {
-            const updatedSiteBucket = await deriveSiteBucket(updatedHostname, downloadUrl, config.fairQueueSiteBucket);
-            if (updatedHostname !== fqContext.hostname || updatedSiteBucket !== fqContext.siteBucket) {
-              if (fqContext.slotToken) {
-                try {
-                  await fairQueueClient.releaseSlot(ctx, fqContext);
-                } catch (error) {
-                  const message = error instanceof Error ? error.message : String(error);
-                  console.warn('[Fair Queue] releaseSlot failed during refresh:', message);
-                }
-              }
-              const updatedHostnameHash = await sha256Hash(updatedHostname);
-              fqContext = {
-                hostname: updatedHostname,
-                hostnameHash: updatedHostnameHash,
-                ipBucket: fqContext.ipBucket,
-                siteBucket: updatedSiteBucket,
-                nowMs: Date.now(),
-              };
-
-              const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, clientSignal);
-              if (fqResult.kind === 'throttled') {
-                const breakerState = fqResult.breakerSnapshot
-                  ? readOpenBreakerSnapshot(fqResult.breakerSnapshot, 0)
-                  : null;
-                await slowFailDelay();
-                return createThrottleProtectedResponse(origin, {
-                  errorCode: breakerState?.errorCode || fqResult.throttleCode || 503,
-                  retryAfter: breakerState?.retryAfter,
-                });
-              }
-
-              if (fqResult.kind === 'timeout') {
-                const safeHeaders = new Headers();
-                safeHeaders.set("content-type", "application/json;charset=UTF-8");
-                safeHeaders.set("Access-Control-Allow-Origin", origin);
-                safeHeaders.append("Vary", "Origin");
-                safeHeaders.set("Retry-After", "60");
-
-                return new Response(
-                  JSON.stringify({
-                    code: 503,
-                    message: 'Upstream queue timeout, please retry later'
-                  }),
-                  {
-                    status: 503,
-                    headers: safeHeaders
-                  }
-                );
-              }
-
-              if (fqResult.kind === 'overloaded' && fqResult.scope === 'global') {
-                return createFairQueueOverloadedResponse(origin, fqResult.retryAfter);
-              }
-            }
-          }
+        const fairQueueRefreshResponse = await reconcileFairQueueContextForTarget(downloadUrl, 'refresh');
+        if (fairQueueRefreshResponse) {
+          return fairQueueRefreshResponse;
         }
         request = buildUpstreamRequest(downloadUrl, res.data.header);
         ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
@@ -2841,6 +3117,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
               request = new Request(location, request);
               return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
             } else {
+              const fairQueueRedirectResponse = await reconcileFairQueueContextForTarget(location, 'redirect');
+              if (fairQueueRedirectResponse) {
+                return fairQueueRedirectResponse;
+              }
               request = new Request(location, request);
               ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
               if (blockedResponse) {
@@ -2852,6 +3132,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           }
         }
       }
+    }
+
+    if (retriedWithFreshLink && shouldRetryAuthError(response.status)) {
+      const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+      if (deferredReportResponse) {
+        return deferredReportResponse;
+      }
+    }
+
+    const deferredTerminalReportResponse = await flushDeferredQueueBreakerReportOnExit(response);
+    if (deferredTerminalReportResponse) {
+      return deferredTerminalReportResponse;
     }
 
     if (response.status !== 200 && response.status !== 206) {
@@ -2964,13 +3256,36 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     return safeResponse;
   } catch (error) {
+    const deferredFailureResponse = await flushDeferredQueueBreakerReportOnExit();
+    if (deferredFailureResponse) {
+      return deferredFailureResponse;
+    }
+
     if (error instanceof Response) {
       return error;
     }
+
+    if (clientAborted && isAbortError(error)) {
+      return createClientAbortResponse(origin);
+    }
     throw error;
   } finally {
-    if (fairQueueClient && fqContext && fqContext.slotToken) {
-      const releasePromise = fairQueueClient.releaseSlot(ctx, fqContext);
+    const finalReleaseContexts = [];
+    if (fqContext && fqContext.slotToken) {
+      finalReleaseContexts.push(fqContext);
+    }
+    for (const pendingReleaseContext of pendingFairQueueReleaseContexts) {
+      if (pendingReleaseContext && pendingReleaseContext.slotToken) {
+        finalReleaseContexts.push(pendingReleaseContext);
+      }
+    }
+
+    if (fairQueueClient && finalReleaseContexts.length > 0) {
+      const releasePromise = (async () => {
+        for (const releaseContext of finalReleaseContexts) {
+          await releaseFairQueueContext(releaseContext, 'final cleanup');
+        }
+      })();
       if (ctx && typeof ctx.waitUntil === 'function') {
         ctx.waitUntil(releasePromise);
       } else {
@@ -3050,6 +3365,7 @@ export const __fairQueueTestHooks = {
   deriveOpenSeconds,
   readOpenBreakerSnapshot,
   resolveConfig,
+  resolveAdmissionMode,
   markHostOverloaded,
   getHostOverloadedRemainingMs,
   getGlobalOverloadedRemainingSeconds,

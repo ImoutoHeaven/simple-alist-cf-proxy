@@ -183,4 +183,39 @@ describe('init.sql breaker RPC definitions', () => {
 
     expect(functionBody).not.toMatch(/p_probe_lease_seconds/i);
   });
+
+  it('replaces fq_try_acquire_batch with fq_admit_batch', () => {
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION fq_admit_batch\(/i);
+    expect(initSql).not.toMatch(/CREATE OR REPLACE FUNCTION fq_try_acquire_batch\(/i);
+  });
+
+  it('defines fq_admit_batch with explicit breaker gate inputs', () => {
+    const functionBody = readFunctionBody('fq_admit_batch');
+
+    expect(functionBody).toMatch(/p_breaker_enabled\s+BOOLEAN/i);
+    expect(functionBody).toMatch(/p_half_open_max_probe_count\s+INT/i);
+    expect(functionBody).toMatch(/p_half_open_max_seconds\s+INT/i);
+    expect(functionBody).toMatch(/p_half_open_timeout_mode\s+TEXT/i);
+  });
+
+  it('returns retry_after and attempt fields from fq_admit_batch', () => {
+    const functionBody = readFunctionBody('fq_admit_batch');
+
+    expect(functionBody).toMatch(/retry_after\s+INT/i);
+    expect(functionBody).toMatch(/attempt_version\s+BIGINT/i);
+    expect(functionBody).toMatch(/attempt_ticket\s+INT/i);
+    expect(functionBody.match(/\bslot_token\s+TEXT\b/gi) ?? []).toHaveLength(1);
+  });
+
+  it('returns explicit IP_TOO_MANY with null non-applicable fields when host slot acquisition hits per-IP structure limits', () => {
+    const functionBody = readFunctionBody('fq_admit_batch');
+
+    expect(functionBody).toMatch(/if\s+v_host_slot_id\s*=\s*0\s+then[\s\S]*?status\s*:=\s*'IP_TOO_MANY'[\s\S]*?slot_token\s*:=\s*NULL[\s\S]*?retry_after\s*:=\s*NULL[\s\S]*?attempt_version\s*:=\s*NULL[\s\S]*?attempt_ticket\s*:=\s*NULL[\s\S]*?return next;[\s\S]*?continue;[\s\S]*?elsif\s+v_host_slot_id\s*<\s*0\s+then/i);
+  });
+
+  it('releases the host slot before returning site-side IP_TOO_MANY with null non-applicable fields', () => {
+    const functionBody = readFunctionBody('fq_admit_batch');
+
+    expect(functionBody).toMatch(/if\s+v_site_slot_id\s*=\s*0\s+then[\s\S]*?PERFORM\s+func_release_host_slot\(v_host_slot_id,\s*FALSE\);[\s\S]*?status\s*:=\s*'IP_TOO_MANY'[\s\S]*?slot_token\s*:=\s*NULL[\s\S]*?retry_after\s*:=\s*NULL[\s\S]*?attempt_version\s*:=\s*NULL[\s\S]*?attempt_ticket\s*:=\s*NULL[\s\S]*?return next;[\s\S]*?continue;[\s\S]*?elsif\s+v_site_slot_id\s*<\s*0\s+then/i);
+  });
 });

@@ -53,10 +53,13 @@ func TestInitSQLHasNoFoundUsage(t *testing.T) {
 	}
 }
 
-func TestInitSQLHasBatchTryAcquireFunction(t *testing.T) {
+func TestInitSQLHasBatchAdmissionFunction(t *testing.T) {
 	text := readInitSQLNormalized(t)
-	if !strings.Contains(text, "fq_try_acquire_batch") {
-		t.Fatalf("init.sql missing fq_try_acquire_batch")
+	if !strings.Contains(text, "fq_admit_batch") {
+		t.Fatalf("init.sql missing fq_admit_batch")
+	}
+	if strings.Contains(text, "fq_try_acquire_batch") {
+		t.Fatalf("init.sql should not include fq_try_acquire_batch")
 	}
 	if strings.Contains(text, "fq_try_acquire_dual") {
 		t.Fatalf("init.sql should not include fq_try_acquire_dual")

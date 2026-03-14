@@ -48,7 +48,7 @@ func (retryableReleaseError) Temporary() bool {
 	return true
 }
 
-func (b *flakyReleaseBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+func (b *flakyReleaseBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	return nil, nil
 }
 
@@ -126,7 +126,7 @@ type alwaysFailReleaseBackend struct {
 	calls int
 }
 
-func (b *alwaysFailReleaseBackend) TryAcquireBatch(ctx context.Context, reqs []AcquireRequest) ([]*tryAcquireResult, error) {
+func (b *alwaysFailReleaseBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	return nil, nil
 }
 

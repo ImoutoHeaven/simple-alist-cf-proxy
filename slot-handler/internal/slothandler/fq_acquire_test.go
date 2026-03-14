@@ -3,6 +3,7 @@ package slothandler
 import (
 	"context"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -13,6 +14,44 @@ func testConfigForAcquire(pollWindow time.Duration, grace time.Duration) *Config
 			PollWindowMs: pollWindow.Milliseconds(),
 			GraceMs:      grace.Milliseconds(),
 		},
+	}
+}
+
+func assertQueryTokenMismatch(t *testing.T, resp *AcquireResponse, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("expected timeout/query_token_mismatch, got err=%v", err)
+	}
+	if resp == nil || resp.Result != "timeout" || resp.Reason != "query_token_mismatch" {
+		t.Fatalf("expected timeout/query_token_mismatch, got %+v", resp)
+	}
+}
+
+func assertFlowAdmissionTuple(t *testing.T, snap fqFlowSnapshot, want AcquireRequest) {
+	t.Helper()
+	wantSite := want.SiteBucket
+	if strings.TrimSpace(wantSite) == "" {
+		wantSite = "unknown"
+	}
+	if snap.Hostname != want.Hostname ||
+		snap.HostnameHash != want.HostnameHash ||
+		snap.IPBucket != want.IPBucket ||
+		snap.SiteBucket != wantSite ||
+		snap.BreakerEnabled != want.BreakerEnabled ||
+		snap.HalfOpenMaxProbeCount != want.HalfOpenMaxProbeCount ||
+		snap.HalfOpenMaxSeconds != want.HalfOpenMaxSeconds ||
+		snap.HalfOpenTimeoutMode != strings.TrimSpace(want.HalfOpenTimeoutMode) {
+		t.Fatalf("unexpected flow tuple: got %+v want hostname=%q hostnameHash=%q ipBucket=%q siteBucket=%q breakerEnabled=%t halfOpenMaxProbeCount=%d halfOpenMaxSeconds=%d halfOpenTimeoutMode=%q",
+			snap,
+			want.Hostname,
+			want.HostnameHash,
+			want.IPBucket,
+			wantSite,
+			want.BreakerEnabled,
+			want.HalfOpenMaxProbeCount,
+			want.HalfOpenMaxSeconds,
+			strings.TrimSpace(want.HalfOpenTimeoutMode),
+		)
 	}
 }
 
@@ -124,10 +163,171 @@ func TestAcquireTokenMismatchDoesNotDeleteFlow(t *testing.T) {
 	}
 }
 
+func TestAcquireQueryTokenMismatchOnIdentityTupleChanges(t *testing.T) {
+	base := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	cases := []struct {
+		name   string
+		mutate func(req *AcquireRequest)
+	}{
+		{"hostname mismatch", func(req *AcquireRequest) { req.Hostname = "other.example.com" }},
+		{"hostnameHash mismatch", func(req *AcquireRequest) { req.HostnameHash = "h2" }},
+		{"ipBucket mismatch", func(req *AcquireRequest) { req.IPBucket = "ip2" }},
+		{"siteBucket mismatch", func(req *AcquireRequest) { req.SiteBucket = "s2" }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer()
+			cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
+			s.updateRuntime(cfg, &stubBackend{}, "test", false)
+			s.flowStore.afterFunc = nil
+
+			tok := s.flowStore.newFlowFromAcquireRequest(base)
+			req := base
+			tc.mutate(&req)
+			req.QueryToken = tok
+
+			resp, err := s.handleAcquireSlot(context.Background(), req)
+			assertQueryTokenMismatch(t, resp, err)
+
+			snap, ok := s.flowStore.getSnapshot(tok)
+			if !ok {
+				t.Fatalf("expected original flow to remain after mismatch")
+			}
+			assertFlowAdmissionTuple(t, snap, base)
+		})
+	}
+}
+
+func TestAcquireQueryTokenMismatchOnBreakerTupleChanges(t *testing.T) {
+	base := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	cases := []struct {
+		name   string
+		mutate func(req *AcquireRequest)
+	}{
+		{"breaker enabled changed", func(req *AcquireRequest) { req.BreakerEnabled = false }},
+		{"half open max probe count changed", func(req *AcquireRequest) { req.HalfOpenMaxProbeCount = 9 }},
+		{"half open max seconds changed", func(req *AcquireRequest) { req.HalfOpenMaxSeconds = 30 }},
+		{"half open timeout mode changed", func(req *AcquireRequest) { req.HalfOpenTimeoutMode = "open" }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer()
+			cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
+			s.updateRuntime(cfg, &stubBackend{}, "test", false)
+			s.flowStore.afterFunc = nil
+
+			tok := s.flowStore.newFlowFromAcquireRequest(base)
+			req := base
+			tc.mutate(&req)
+			req.QueryToken = tok
+
+			resp, err := s.handleAcquireSlot(context.Background(), req)
+			assertQueryTokenMismatch(t, resp, err)
+
+			snap, ok := s.flowStore.getSnapshot(tok)
+			if !ok {
+				t.Fatalf("expected original flow to remain after mismatch")
+			}
+			assertFlowAdmissionTuple(t, snap, base)
+		})
+	}
+}
+
+func TestAcquireQueryTokenCanonicalSiteBucketAllowsUnknownReuse(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	base := AcquireRequest{
+		Hostname:     "example.com",
+		HostnameHash: "h1",
+		IPBucket:     "ip1",
+		SiteBucket:   "unknown",
+	}
+	tok := s.flowStore.newFlowFromAcquireRequest(base)
+	req := base
+	req.SiteBucket = ""
+	req.QueryToken = tok
+
+	resp, err := s.handleAcquireSlot(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.Result != "pending" || resp.QueryToken != tok {
+		t.Fatalf("expected canonical site bucket reuse to stay pending on same token, got %+v", resp)
+	}
+
+	snap, ok := s.flowStore.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected flow to remain after canonical site bucket reuse")
+	}
+	assertFlowAdmissionTuple(t, snap, base)
+}
+
+func TestAcquireHalfOpenTimeoutModeWhitespaceDoesNotMismatch(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	base := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	tok := s.flowStore.newFlowFromAcquireRequest(base)
+	req := base
+	req.HalfOpenTimeoutMode = "  partial-close\t"
+	req.QueryToken = tok
+
+	resp, err := s.handleAcquireSlot(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.Result != "pending" || resp.QueryToken != tok {
+		t.Fatalf("expected timeout-mode whitespace reuse to stay pending on same token, got %+v", resp)
+	}
+
+	snap, ok := s.flowStore.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected flow to remain after whitespace-only timeout-mode reuse")
+	}
+	assertFlowAdmissionTuple(t, snap, base)
+}
+
+func TestAcquireQueryTokenMismatchOnInFlightBreakerConflict(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+
+	now := time.Date(2026, 3, 21, 12, 0, 0, 0, time.UTC)
+	base := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	tok := s.flowStore.newFlowFromAcquireRequest(base)
+	if ok, err := s.flowStore.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	conflicting := base
+	conflicting.HalfOpenMaxSeconds = 30
+	conflicting.QueryToken = tok
+
+	resp, err := s.handleAcquireSlot(context.Background(), conflicting)
+	assertQueryTokenMismatch(t, resp, err)
+
+	snap, ok := s.flowStore.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected original in-flight flow to remain after conflicting reuse")
+	}
+	if !snap.HasWaiter {
+		t.Fatalf("expected original waiter to remain attached after conflicting reuse")
+	}
+	assertFlowAdmissionTuple(t, snap, base)
+}
+
 func TestAcquireBackendThrottledResponseDeletesOwnFlow(t *testing.T) {
 	now := time.Unix(1_700_000_300, 0)
 	breakerOpenUntil := int(now.Add(15 * time.Second).Unix())
-	backend := &sequenceBackend{seq: []*tryAcquireResult{{
+	backend := &sequenceBackend{seq: []*admitResult{{
 		status:           "THROTTLED",
 		throttleCode:     429,
 		breakerOpenUntil: breakerOpenUntil,
@@ -142,10 +342,14 @@ func TestAcquireBackendThrottledResponseDeletesOwnFlow(t *testing.T) {
 	defer s.stopAllHostProbeRunners()
 
 	throttledResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip1",
-		SiteBucket:   "s1",
+		Hostname:              "example.com",
+		HostnameHash:          "h1",
+		IPBucket:              "ip1",
+		SiteBucket:            "s1",
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +396,7 @@ func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing
 	cfg := testConfigForAcquire(50*time.Millisecond, 40*time.Millisecond)
 	now := time.Unix(1_700_000_600, 0)
 	breakerOpenUntil := int(now.Add(15 * time.Second).Unix())
-	backend := &sequenceBackend{seq: []*tryAcquireResult{{status: "WAIT"}, {
+	backend := &sequenceBackend{seq: []*admitResult{{status: "WAIT"}, {
 		status:           "THROTTLED",
 		throttleCode:     429,
 		breakerOpenUntil: breakerOpenUntil,
@@ -204,7 +408,7 @@ func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing
 	s.flowStore.nowFn = func() time.Time { return now }
 	defer s.stopAllHostProbeRunners()
 
-	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
+	tok := newAtomicBreakerFlow(s.flowStore, "h1", "example.com", "ip1", "s1")
 	if tok == "" {
 		t.Fatalf("expected token")
 	}
@@ -213,11 +417,15 @@ func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing
 	errCh := make(chan error, 1)
 	go func() {
 		resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-			Hostname:     "example.com",
-			HostnameHash: "h1",
-			IPBucket:     "ip1",
-			SiteBucket:   "s1",
-			QueryToken:   tok,
+			Hostname:              "example.com",
+			HostnameHash:          "h1",
+			IPBucket:              "ip1",
+			SiteBucket:            "s1",
+			BreakerEnabled:        true,
+			HalfOpenMaxProbeCount: 4,
+			HalfOpenMaxSeconds:    15,
+			HalfOpenTimeoutMode:   "partial-close",
+			QueryToken:            tok,
 		})
 		if err != nil {
 			errCh <- err
@@ -257,10 +465,14 @@ func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing
 	}
 
 	secondResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip-new",
-		SiteBucket:   "s1",
+		Hostname:              "example.com",
+		HostnameHash:          "h1",
+		IPBucket:              "ip-new",
+		SiteBucket:            "s1",
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -294,10 +506,14 @@ func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing
 	}
 
 	thirdResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip-third",
-		SiteBucket:   "s1",
+		Hostname:              "example.com",
+		HostnameHash:          "h1",
+		IPBucket:              "ip-third",
+		SiteBucket:            "s1",
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -464,6 +680,58 @@ func TestAcquireTokenMetricsCounts(t *testing.T) {
 	if got := snap.Counts["token_mismatch"]; got != 1 {
 		t.Fatalf("expected token_mismatch=1, got %d", got)
 	}
+}
+
+func TestAcquireStoresBreakerInputsForProbeBatch(t *testing.T) {
+	s := newTestServer()
+	cfg := testConfigForAcquire(50*time.Millisecond, 20*time.Millisecond)
+	cfg.FairQueue.PollIntervalMs = 1
+	backend := &recordingBatchBackend{}
+	s.updateRuntime(cfg, backend, "test", false)
+	s.flowStore.afterFunc = nil
+	defer s.stopAllHostProbeRunners()
+
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:              "example.com",
+		HostnameHash:          "h1",
+		IPBucket:              "ip1",
+		SiteBucket:            "s1",
+		BreakerEnabled:        true,
+		HalfOpenMaxProbeCount: 4,
+		HalfOpenMaxSeconds:    15,
+		HalfOpenTimeoutMode:   "partial-close",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Result != "pending" {
+		t.Fatalf("expected pending response while backend keeps waiting, got %+v", resp)
+	}
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		backend.mu.Lock()
+		if len(backend.seen) > 0 {
+			seen := backend.seen[0][0]
+			backend.mu.Unlock()
+			if !seen.BreakerEnabled {
+				t.Fatalf("expected probe batch to keep breaker enabled")
+			}
+			if seen.HalfOpenMaxProbeCount != 4 {
+				t.Fatalf("expected half-open probe count 4, got %d", seen.HalfOpenMaxProbeCount)
+			}
+			if seen.HalfOpenMaxSeconds != 15 {
+				t.Fatalf("expected half-open max seconds 15, got %d", seen.HalfOpenMaxSeconds)
+			}
+			if seen.HalfOpenTimeoutMode != "partial-close" {
+				t.Fatalf("expected half-open timeout mode partial-close, got %q", seen.HalfOpenTimeoutMode)
+			}
+			return
+		}
+		backend.mu.Unlock()
+		runtime.Gosched()
+	}
+	t.Fatalf("expected probe runner to submit a backend batch")
 }
 
 func TestAcquirePendingSetsExpireAtAndGraceBoundary(t *testing.T) {
