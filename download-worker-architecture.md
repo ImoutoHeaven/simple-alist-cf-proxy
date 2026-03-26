@@ -144,10 +144,13 @@ admission 固定为四种显式运行模式：
         - `download.fairQueue.slotHandlerTimeoutMs` 由 controller 下发，worker 内映射为 `slotHandlerConfig.totalMaxWaitMs`，用于总等待上限。
         - `overloaded` 退避 streak 在收到非 overloaded 结果（如 `pending`/`granted`/`throttled`/`409`）时重置。
         - 若 token 已 stale、sticky miss 到别的实例，或携带的 `hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket`、`breakerEnabled` 或 `queue_breaker` half-open admission tuple 与原 flow 不匹配，slot-handler 仍会返回 `timeout`；worker 侧统一退化为 `503`，不会承诺自动恢复原排队位置。
-    - 完成后发送 `/api/v1/fairqueue/release`（fire-and-forget，通过 `ctx.waitUntil` 执行）。
+    - redirect / refresh 命中新 target 导致 fair-queue context 变化时，worker 仍沿用现有 inline release -> reacquire 路径；这部分 release 行为未变。
+    - 请求终止出口的 finally cleanup 会补偿未完成的 release：先按 `slotToken` 去重，再按 `hostnameHash || hostname` 分组；同一 host 串行，不同 host 固定最多 `2` 组并发。这个有界并发只用于 finally cleanup，不影响 redirect / refresh 的 inline release。
+    - 完成后发送 `/api/v1/fairqueue/release`；若运行环境支持 `ctx.waitUntil`，finally cleanup 会后台执行。
     - release 契约：缺失/空或格式非法的 `slotToken` 返回 `4xx`（当前为 `400`）；语法合法但未知/已释放的 `slotToken` 仍返回 `200` 幂等成功。
     - release 返回非 `2xx` 视为失败：slot-handler 在 backend release 失败时返回 `502`。
-    - release 重试策略：仅在网络错误、`429` 或 `>=500` 时重试（最多 3 次，指数退避）；非可重试 `4xx` 不重试。
+    - release 每次尝试使用固定 `1500ms` 专用超时，与 acquire long-poll 的 `perRequestTimeoutMs` / timeout clamp 解耦；超时按可重试失败处理。
+    - release 重试策略保持不变：仅在网络错误、超时、`429` 或 `>=500` 时重试（最多 3 次，指数退避）；非可重试 `4xx` 不重试。
     - 轮询探测受 `utilWindowSec` 与 `maxBatch` / `maxProbeParallel` / `maxProbeQpsPerHost` 控制。
     - 若 slot-handler 不可用或 fair-queue 接口异常，按 fail-closed 返回 `503`，不绕过排队保护。
     - 多实例 slot-handler 需要 sticky 路由：同一 `queryToken` 的轮询应稳定落到同一实例，否则会出现 `query_token_stale`/`timeout`，worker 侧退化为 `503`。

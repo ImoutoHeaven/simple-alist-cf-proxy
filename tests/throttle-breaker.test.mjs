@@ -140,6 +140,39 @@ const buildSignedWorkerRequest = async (pathname = '/downloads/test.bin') => {
   });
 };
 
+const createDeferred = () => {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const waitForCondition = async (
+  predicate,
+  {
+    timeoutMs = 250,
+    intervalMs = 5,
+    message = 'timed out waiting for condition',
+  } = {},
+) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await sleep(intervalMs);
+  }
+  if (predicate()) {
+    return;
+  }
+  throw new Error(message);
+};
+
 const buildBootstrap = () => ({
   common: {
     tokenHmacKey: 'bootstrap-token',
@@ -4163,6 +4196,425 @@ test('queue_only retries release of the dropped managed context in finally after
       'a.sharepoint.com',
     ]);
   } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_only final cleanup deduplicates duplicate slot tokens and keeps the first collected context', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const acquireBodies = [];
+  const releaseBodies = [];
+  const releaseAttemptsByToken = new Map();
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: [],
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://a.sharepoint.com/start',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      acquireBodies.push(JSON.parse(init.body));
+      return createJsonResponse({
+        result: 'granted',
+        slotToken: 'slot-dup',
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      const body = JSON.parse(init.body);
+      releaseBodies.push(body);
+      const attempts = (releaseAttemptsByToken.get(body.slotToken) ?? 0) + 1;
+      releaseAttemptsByToken.set(body.slotToken, attempts);
+
+      if (attempts <= 3) {
+        return new Response(JSON.stringify({ error: 'retry later' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://a.sharepoint.com/start') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://b.sharepoint.com/final' },
+      });
+    }
+
+    if (url === 'https://b.sharepoint.com/final') {
+      return new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/queue-only-final-cleanup-dedupe.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(acquireBodies.map((body) => body.hostname), [
+      'a.sharepoint.com',
+      'b.sharepoint.com',
+    ]);
+    assert.equal(releaseAttemptsByToken.get('slot-dup'), 4);
+    assert.deepEqual(releaseBodies.map((body) => body.hostname), [
+      'a.sharepoint.com',
+      'a.sharepoint.com',
+      'a.sharepoint.com',
+      'b.sharepoint.com',
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_only final cleanup keeps same-host releases serial', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const finalReleaseDeferreds = [];
+  const finalReleaseStartTokens = [];
+  const siteBucketAlpha = await decodeHostnameHash('sites:a');
+  const siteBucketBeta = await decodeHostnameHash('sites:b');
+  const siteBucketUnknown = await decodeHostnameHash('unknown');
+  const inlineFailureTokens = new Set(['slot-alpha', 'slot-beta']);
+  const releaseAttemptsByToken = new Map();
+  let currentHostInFlight = 0;
+  let maxHostInFlight = 0;
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: [],
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/a/start',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      const body = JSON.parse(init.body);
+      const tokenBySiteBucket = {
+        [siteBucketAlpha]: 'slot-alpha',
+        [siteBucketBeta]: 'slot-beta',
+        [siteBucketUnknown]: 'slot-final',
+      };
+      return createJsonResponse({
+        result: 'granted',
+        slotToken: tokenBySiteBucket[body.siteBucket],
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      const body = JSON.parse(init.body);
+      const attempts = (releaseAttemptsByToken.get(body.slotToken) ?? 0) + 1;
+      releaseAttemptsByToken.set(body.slotToken, attempts);
+
+      if (inlineFailureTokens.has(body.slotToken) && attempts <= 3) {
+        return new Response(JSON.stringify({ error: 'retry later' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+
+      currentHostInFlight += 1;
+      maxHostInFlight = Math.max(maxHostInFlight, currentHostInFlight);
+      finalReleaseStartTokens.push(body.slotToken);
+
+      const deferred = createDeferred();
+      finalReleaseDeferreds.push(() => {
+        currentHostInFlight -= 1;
+        deferred.resolve(createJsonResponse({ result: 'ok' }));
+      });
+      return deferred.promise;
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/a/start') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://tenant.sharepoint.com/sites/b/step' },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/b/step') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://tenant.sharepoint.com/final' },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/final') {
+      return new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/queue-only-final-cleanup-same-host-serial.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    assert.equal(response.status, 200);
+
+    await waitForCondition(() => finalReleaseStartTokens.length === 1, {
+      timeoutMs: 300,
+      message: 'expected first same-host final cleanup release to start',
+    });
+    await sleep(30);
+    assert.deepEqual(finalReleaseStartTokens, ['slot-final']);
+    assert.equal(maxHostInFlight, 1);
+
+    finalReleaseDeferreds.shift()?.();
+    await waitForCondition(() => finalReleaseStartTokens.length === 2, {
+      timeoutMs: 300,
+      message: 'expected second same-host final cleanup release to start after the first completed',
+    });
+    await sleep(30);
+    assert.deepEqual(finalReleaseStartTokens, ['slot-final', 'slot-alpha']);
+    assert.equal(maxHostInFlight, 1);
+
+    finalReleaseDeferreds.shift()?.();
+    await waitForCondition(() => finalReleaseStartTokens.length === 3, {
+      timeoutMs: 300,
+      message: 'expected third same-host final cleanup release to stay queued behind the second',
+    });
+    assert.deepEqual(finalReleaseStartTokens, ['slot-final', 'slot-alpha', 'slot-beta']);
+    assert.equal(maxHostInFlight, 1);
+
+    finalReleaseDeferreds.shift()?.();
+    await Promise.allSettled(waitUntilPromises);
+  } finally {
+    while (finalReleaseDeferreds.length > 0) {
+      finalReleaseDeferreds.shift()?.();
+    }
+    await Promise.allSettled(waitUntilPromises);
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_only final cleanup overlaps different hosts but caps global concurrency at 2', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const inlineFailureTokens = new Set(['slot-a', 'slot-b', 'slot-c']);
+  const releaseAttemptsByToken = new Map();
+  const finalReleaseStartHosts = [];
+  const finalReleaseDeferreds = [];
+  let currentGlobalInFlight = 0;
+  let maxGlobalInFlight = 0;
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: [],
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://a.sharepoint.com/start',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      const body = JSON.parse(init.body);
+      const tokenByHost = {
+        'a.sharepoint.com': 'slot-a',
+        'b.sharepoint.com': 'slot-b',
+        'c.sharepoint.com': 'slot-c',
+        'd.sharepoint.com': 'slot-d',
+      };
+      return createJsonResponse({
+        result: 'granted',
+        slotToken: tokenByHost[body.hostname],
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      const body = JSON.parse(init.body);
+      const attempts = (releaseAttemptsByToken.get(body.slotToken) ?? 0) + 1;
+      releaseAttemptsByToken.set(body.slotToken, attempts);
+
+      if (inlineFailureTokens.has(body.slotToken) && attempts <= 3) {
+        return new Response(JSON.stringify({ error: 'retry later' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+
+      currentGlobalInFlight += 1;
+      maxGlobalInFlight = Math.max(maxGlobalInFlight, currentGlobalInFlight);
+      finalReleaseStartHosts.push(body.hostname);
+
+      const deferred = createDeferred();
+      finalReleaseDeferreds.push(() => {
+        currentGlobalInFlight -= 1;
+        deferred.resolve(createJsonResponse({ result: 'ok' }));
+      });
+      return deferred.promise;
+    }
+
+    if (url === 'https://a.sharepoint.com/start') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://b.sharepoint.com/step' },
+      });
+    }
+
+    if (url === 'https://b.sharepoint.com/step') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://c.sharepoint.com/more' },
+      });
+    }
+
+    if (url === 'https://c.sharepoint.com/more') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://d.sharepoint.com/final' },
+      });
+    }
+
+    if (url === 'https://d.sharepoint.com/final') {
+      return new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/queue-only-final-cleanup-concurrency.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    assert.equal(response.status, 200);
+
+    await waitForCondition(() => finalReleaseStartHosts.length === 2, {
+      timeoutMs: 300,
+      message: 'expected two different host final cleanup releases to overlap',
+    });
+    assert.deepEqual(finalReleaseStartHosts, [
+      'd.sharepoint.com',
+      'a.sharepoint.com',
+    ]);
+    assert.equal(maxGlobalInFlight, 2);
+
+    await sleep(30);
+    assert.equal(finalReleaseStartHosts.length, 2);
+
+    finalReleaseDeferreds.shift()?.();
+    await waitForCondition(() => finalReleaseStartHosts.length === 3, {
+      timeoutMs: 300,
+      message: 'expected queued final cleanup work to start after one host completed',
+    });
+    assert.deepEqual(finalReleaseStartHosts, [
+      'd.sharepoint.com',
+      'a.sharepoint.com',
+      'b.sharepoint.com',
+    ]);
+    assert.equal(maxGlobalInFlight, 2);
+
+    finalReleaseDeferreds.shift()?.();
+    await waitForCondition(() => finalReleaseStartHosts.length === 4, {
+      timeoutMs: 300,
+      message: 'expected the fourth host cleanup to remain queued behind the global cap',
+    });
+    assert.deepEqual(finalReleaseStartHosts, [
+      'd.sharepoint.com',
+      'a.sharepoint.com',
+      'b.sharepoint.com',
+      'c.sharepoint.com',
+    ]);
+    assert.equal(maxGlobalInFlight, 2);
+
+    while (finalReleaseDeferreds.length > 0) {
+      finalReleaseDeferreds.shift()?.();
+    }
+    await Promise.allSettled(waitUntilPromises);
+  } finally {
+    while (finalReleaseDeferreds.length > 0) {
+      finalReleaseDeferreds.shift()?.();
+    }
+    await Promise.allSettled(waitUntilPromises);
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }

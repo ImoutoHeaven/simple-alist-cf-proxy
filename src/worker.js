@@ -20,6 +20,8 @@ const DEFAULT_RATE_LIMIT_IPV4_SUFFIX = '/32';
 const DEFAULT_RATE_LIMIT_IPV6_SUFFIX = '/60';
 const DEFAULT_SLOT_HANDLER_TIMEOUT_MS = 20000;
 const DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = 8000;
+const DEFAULT_SLOT_HANDLER_RELEASE_TIMEOUT_MS = 1500;
+const FINAL_CLEANUP_RELEASE_CONCURRENCY = 2;
 const DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS = 35;
 const DEFAULT_THROTTLE_OPEN_CAP_SECONDS = 60;
 const DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT = 30;
@@ -1484,6 +1486,58 @@ const normalizePostgrestBaseUrl = (url) => {
   return url.endsWith('/') ? url.slice(0, -1) : url;
 };
 
+const buildFinalCleanupReleaseGroups = (releaseContexts) => {
+  const dedupedContexts = [];
+  const seenSlotTokens = new Set();
+
+  for (const releaseContext of releaseContexts) {
+    const slotToken = releaseContext?.slotToken;
+    if (!slotToken || seenSlotTokens.has(slotToken)) {
+      continue;
+    }
+    seenSlotTokens.add(slotToken);
+    dedupedContexts.push(releaseContext);
+  }
+
+  const groups = [];
+  const groupsByHostKey = new Map();
+
+  for (const releaseContext of dedupedContexts) {
+    const hostGroupKey = releaseContext.hostnameHash || releaseContext.hostname;
+    let group = groupsByHostKey.get(hostGroupKey);
+    if (!group) {
+      group = [];
+      groupsByHostKey.set(hostGroupKey, group);
+      groups.push(group);
+    }
+    group.push(releaseContext);
+  }
+
+  return groups;
+};
+
+const runWithConcurrencyLimit = async (taskFactories, concurrencyLimit) => {
+  if (!Array.isArray(taskFactories) || taskFactories.length === 0) {
+    return;
+  }
+
+  const limit = Number.isFinite(concurrencyLimit) && concurrencyLimit > 0
+    ? Math.max(1, Math.trunc(concurrencyLimit))
+    : 1;
+  let nextTaskIndex = 0;
+
+  const runNextTask = async () => {
+    while (nextTaskIndex < taskFactories.length) {
+      const taskIndex = nextTaskIndex;
+      nextTaskIndex += 1;
+      await taskFactories[taskIndex]();
+    }
+  };
+
+  const workerCount = Math.min(limit, taskFactories.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runNextTask()));
+};
+
 const createFairQueueClient = (config) => createSlotHandlerClient(config);
 
 const createSlotHandlerClient = (config) => {
@@ -1510,6 +1564,7 @@ const createSlotHandlerClient = (config) => {
   const totalMaxWaitMsRaw = Number(slotCfg.totalMaxWaitMs);
   const totalMaxWaitMs =
     Number.isFinite(totalMaxWaitMsRaw) && totalMaxWaitMsRaw > 0 ? totalMaxWaitMsRaw : 20000;
+  const releaseTimeoutMs = DEFAULT_SLOT_HANDLER_RELEASE_TIMEOUT_MS;
   const maxAttemptsCapRaw = Number(slotCfg.maxAttemptsCap);
   const maxAttemptsCap =
     Number.isFinite(maxAttemptsCapRaw) && maxAttemptsCapRaw > 0 ? maxAttemptsCapRaw : 35;
@@ -1859,11 +1914,7 @@ const createSlotHandlerClient = (config) => {
       for (let attempt = 1; attempt <= releaseMaxAttempts; attempt += 1) {
         let shouldRetry = false;
         try {
-          const res = await fetch(releaseUrl, {
-            method: 'POST',
-            headers: buildHeaders(),
-            body: JSON.stringify(payload),
-          });
+          const res = await fetchWithTimeout(releaseUrl, payload, releaseTimeoutMs);
 
           if (res.ok) {
             console.log(`[FQ] slot released via slot-handler host=${fqContext.hostname}`);
@@ -3271,20 +3322,27 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     throw error;
   } finally {
     const finalReleaseContexts = [];
-    if (fqContext && fqContext.slotToken) {
+    if (fqContext) {
       finalReleaseContexts.push(fqContext);
     }
     for (const pendingReleaseContext of pendingFairQueueReleaseContexts) {
-      if (pendingReleaseContext && pendingReleaseContext.slotToken) {
+      if (pendingReleaseContext) {
         finalReleaseContexts.push(pendingReleaseContext);
       }
     }
 
-    if (fairQueueClient && finalReleaseContexts.length > 0) {
+    const finalReleaseGroups = buildFinalCleanupReleaseGroups(finalReleaseContexts);
+
+    if (fairQueueClient && finalReleaseGroups.length > 0) {
       const releasePromise = (async () => {
-        for (const releaseContext of finalReleaseContexts) {
-          await releaseFairQueueContext(releaseContext, 'final cleanup');
-        }
+        await runWithConcurrencyLimit(
+          finalReleaseGroups.map((releaseGroup) => async () => {
+            for (const releaseContext of releaseGroup) {
+              await releaseFairQueueContext(releaseContext, 'final cleanup');
+            }
+          }),
+          FINAL_CLEANUP_RELEASE_CONCURRENCY,
+        );
       })();
       if (ctx && typeof ctx.waitUntil === 'function') {
         ctx.waitUntil(releasePromise);

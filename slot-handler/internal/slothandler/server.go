@@ -1685,6 +1685,10 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 
 	if s.activeSlots != nil {
 		s.activeSlots.ReleaseLease(req.SlotToken)
+		hostKey := strings.TrimSpace(fqHostKey(req.HostnameHash, req.Hostname))
+		if hostKey != "" {
+			s.wakeHostProbeRunner(hostKey)
+		}
 	}
 
 	tokenLog := req.SlotToken

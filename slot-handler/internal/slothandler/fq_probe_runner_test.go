@@ -1,6 +1,8 @@
 package slothandler
 
 import (
+	"context"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -8,6 +10,219 @@ import (
 	"testing"
 	"time"
 )
+
+type probeWakeBackend struct {
+	probeCh    chan time.Time
+	releaseErr error
+}
+
+func (b *probeWakeBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	if b != nil && b.probeCh != nil {
+		select {
+		case b.probeCh <- time.Now():
+		default:
+		}
+	}
+	results := make([]*admitResult, len(reqs))
+	for i := range results {
+		results[i] = &admitResult{status: "WAIT"}
+	}
+	return results, nil
+}
+
+func (b *probeWakeBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	if b == nil {
+		return nil
+	}
+	return b.releaseErr
+}
+
+func attachProbeWakeWaiter(t *testing.T, s *server, hostnameHash, hostname, ipBucket, siteBucket string, now time.Time) string {
+	t.Helper()
+
+	tok := s.flowStore.newFlow(hostnameHash, hostname, ipBucket, siteBucket)
+	if ok, err := s.flowStore.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+	return tok
+}
+
+func TestReleaseSuccessWakesHostProbeRunnerBeforePollInterval(t *testing.T) {
+	backend := &probeWakeBackend{probeCh: make(chan time.Time, 2)}
+	hostCap := 1
+	pollInterval := 300 * time.Millisecond
+	cfg := &Config{FairQueue: FairQueueConfig{
+		PollIntervalMs: pollInterval.Milliseconds(),
+		HostCaps: HostCapsConfig{
+			MaxSlotPerHost: &hostCap,
+		},
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+	defer s.stopAllHostProbeRunners()
+
+	now := time.Now()
+	hostKey := "example.com"
+	attachProbeWakeWaiter(t, s, "", hostKey, "ip-waiting", "s1", now)
+	s.activeSlots.AddLease("slot-held", hostKey, "s1", "ip-held", time.Minute, now)
+
+	firstProbeSeen := make(chan struct{})
+	var firstProbeOnce sync.Once
+	s.flowStore.listInFlightByHostHook = func(gotHostKey string) {
+		if gotHostKey != hostKey {
+			return
+		}
+		firstProbeOnce.Do(func() {
+			close(firstProbeSeen)
+		})
+	}
+
+	s.ensureHostProbeRunner(hostKey)
+
+	select {
+	case <-firstProbeSeen:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected host probe runner to inspect waiting host")
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	select {
+	case <-backend.probeCh:
+		t.Fatalf("expected no backend probe before successful release frees host capacity")
+	default:
+	}
+
+	releaseStartedAt := time.Now()
+	err := s.releaseSlot(context.Background(), ReleaseRequest{
+		Hostname:      hostKey,
+		IPBucket:      "ip-held",
+		SiteBucket:    "s1",
+		SlotToken:     "slot-held",
+		HitUpstreamAt: releaseStartedAt.UnixMilli(),
+		Now:           releaseStartedAt.UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("releaseSlot error: %v", err)
+	}
+
+	select {
+	case <-backend.probeCh:
+	case <-time.After(pollInterval / 3):
+		t.Fatalf("expected successful release to wake host probe runner before full poll interval")
+	}
+
+	if got := s.activeSlots.ActiveHost(hostKey, time.Now()); got != 0 {
+		t.Fatalf("expected active lease cleared before wake-driven probe, got %d", got)
+	}
+}
+
+func TestReleaseFailureDoesNotWakeHostProbeRunnerEarly(t *testing.T) {
+	backend := &probeWakeBackend{
+		probeCh:    make(chan time.Time, 3),
+		releaseErr: errors.New("release backend failed"),
+	}
+	hostCap := 2
+	pollInterval := 200 * time.Millisecond
+	cfg := &Config{FairQueue: FairQueueConfig{
+		PollIntervalMs: pollInterval.Milliseconds(),
+		HostCaps: HostCapsConfig{
+			MaxSlotPerHost: &hostCap,
+		},
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+	defer s.stopAllHostProbeRunners()
+
+	now := time.Now()
+	hostKey := "example.com"
+	attachProbeWakeWaiter(t, s, "", hostKey, "ip-waiting", "s1", now)
+	s.activeSlots.AddLease("slot-held", hostKey, "s1", "ip-held", time.Minute, now)
+
+	s.ensureHostProbeRunner(hostKey)
+
+	select {
+	case <-backend.probeCh:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected initial probe before failed release")
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	releaseStartedAt := time.Now()
+	err := s.releaseSlot(context.Background(), ReleaseRequest{
+		Hostname:      hostKey,
+		IPBucket:      "ip-held",
+		SiteBucket:    "s1",
+		SlotToken:     "slot-held",
+		HitUpstreamAt: releaseStartedAt.UnixMilli(),
+		Now:           releaseStartedAt.UnixMilli(),
+	})
+	if err == nil {
+		t.Fatalf("expected releaseSlot error")
+	}
+
+	select {
+	case probeAt := <-backend.probeCh:
+		t.Fatalf("expected failed release not to wake host probe runner early, got probe after %s", probeAt.Sub(releaseStartedAt))
+	case <-time.After(pollInterval / 3):
+	}
+
+	select {
+	case <-backend.probeCh:
+	case <-time.After(pollInterval + 100*time.Millisecond):
+		t.Fatalf("expected host probe runner to fall back to polling after failed release")
+	}
+}
+
+func TestReleaseNilActiveSlotsDoesNotWakeHostProbeRunnerEarly(t *testing.T) {
+	backend := &probeWakeBackend{probeCh: make(chan time.Time, 3)}
+	pollInterval := 200 * time.Millisecond
+	cfg := &Config{FairQueue: FairQueueConfig{
+		PollIntervalMs: pollInterval.Milliseconds(),
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	defer s.stopAllHostProbeRunners()
+
+	now := time.Now()
+	hostKey := "example.com"
+	attachProbeWakeWaiter(t, s, "", hostKey, "ip-waiting", "s1", now)
+
+	s.ensureHostProbeRunner(hostKey)
+
+	select {
+	case <-backend.probeCh:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected initial probe before nil-activeSlots release")
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	releaseStartedAt := time.Now()
+	err := s.releaseSlot(context.Background(), ReleaseRequest{
+		Hostname:      hostKey,
+		IPBucket:      "ip-held",
+		SiteBucket:    "s1",
+		SlotToken:     "slot-held",
+		HitUpstreamAt: releaseStartedAt.UnixMilli(),
+		Now:           releaseStartedAt.UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("releaseSlot error: %v", err)
+	}
+
+	select {
+	case probeAt := <-backend.probeCh:
+		t.Fatalf("expected nil activeSlots release not to wake host probe runner early, got probe after %s", probeAt.Sub(releaseStartedAt))
+	case <-time.After(pollInterval / 3):
+	}
+
+	select {
+	case <-backend.probeCh:
+	case <-time.After(pollInterval + 100*time.Millisecond):
+		t.Fatalf("expected host probe runner to fall back to polling when activeSlots is nil")
+	}
+}
 
 func TestHostProbeRunnerDeletesSchedulerOnEmpty(t *testing.T) {
 	s := newTestServer()

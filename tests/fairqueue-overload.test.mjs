@@ -1030,6 +1030,87 @@ test('abort during host-overload cooldown should stop immediately without acquir
   }
 });
 
+test('releaseSlot retries timed out releases with dedicated 1500ms timeout', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 100,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+  console.warn = originalWarn;
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    slotToken: 'slot-timeout',
+    nowMs: Date.now(),
+  };
+
+  let calls = 0;
+  let firstAttemptSawSignal = false;
+  let firstAbortElapsedMs = null;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (_url, init) => {
+    calls += 1;
+    if (calls === 1) {
+      const signal = init?.signal;
+      firstAttemptSawSignal = Boolean(signal);
+      const startedAt = Date.now();
+      return new Promise((_resolve, reject) => {
+        if (!signal) {
+          return;
+        }
+        const rejectAborted = () => {
+          firstAbortElapsedMs = Date.now() - startedAt;
+          const error = new Error('Aborted');
+          error.name = 'AbortError';
+          reject(error);
+        };
+        if (signal.aborted) {
+          rejectAborted();
+          return;
+        }
+        signal.addEventListener('abort', rejectAborted, { once: true });
+      });
+    }
+
+    return Promise.resolve(new Response(JSON.stringify({ result: 'ok' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+  };
+
+  const timedOut = Symbol('test-timeout');
+
+  try {
+    const result = await Promise.race([
+      client.releaseSlot({}, fqContext),
+      new Promise((resolve) => setTimeout(() => resolve(timedOut), 3200)),
+    ]);
+
+    assert.equal(result, true);
+    assert.equal(calls, 2);
+    assert.equal(firstAttemptSawSignal, true);
+    assert.ok(firstAbortElapsedMs !== null, 'expected first release attempt to abort');
+    assert.ok(firstAbortElapsedMs >= 1300, `expected dedicated release timeout near 1500ms, got ${firstAbortElapsedMs}ms`);
+    assert.ok(
+      firstAbortElapsedMs < 2400,
+      `expected dedicated 1500ms release timeout instead of acquire perRequestTimeoutMs or long-poll clamping, got ${firstAbortElapsedMs}ms`
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  }
+});
+
 test('releaseSlot retries on retryable status and network errors', async () => {
   const { createSlotHandlerClient } = __fairQueueTestHooks;
   const client = createSlotHandlerClient({

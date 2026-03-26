@@ -35,6 +35,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 
 - 每个 hostKey 维护一个后台 runner（按 `pollIntervalMs` 周期触发，或被唤醒）。
 - runner 每轮执行一次 `probeOnce(hostKey)`，仅在 **当前有 in-flight waiter 的 flows** 中做选择（不会考虑 detached/grace-only flows）。
+- 成功的 `/release` 在 backend release 成功且 `activeSlots.ReleaseLease(slotToken)` 完成本地 bookkeeping 后，会唤醒对应 hostKey 的 probe runner，缩短已有 waiter 的下一次 refill 等待。
 - `flowStore` 仍以 `byToken` 作为唯一真源；同时在同一把 `flowStore.mu` 锁内维护派生索引 `hostInFlightTokens(hostKey -> token set)`，用于把 host 维度候选查找从全表扫描降为 host 局部遍历。
 - `hostInFlightTokens` 只在 waiter 附着状态变更时更新（attach、detach，以及 `removeFlow` 在 waiter 仍附着时触发的移除）；`listInFlightByHost` 遍历 host bucket 时会机会性清理 stale token（例如 flow 已删除、waiter 已解绑、或 flow 过期），保证索引自愈且不引入兼容层。
 
@@ -117,7 +118,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 
 release 重试策略（worker 侧）：
 - 最多重试 3 次（指数退避：100ms、200ms，最大 500ms）。
-- **仅**在网络错误或可重试状态码时重试：`429` 或 `>=500`。
+- **仅**在网络错误、worker 侧 release 专用超时（每次固定 `1500ms`）或可重试状态码时重试：`429` 或 `>=500`。
 - 对非可重试 `4xx`（如 `400/401/403/404`）不重试，避免对永久错误放大请求。
 
 ---
