@@ -9,7 +9,7 @@ import (
 // fqHostFlowScheduler keeps per-host scheduling state for flow-based fairness.
 //
 // Scheduler scope:
-// - Only choose among flows that currently have an attached in-flight waiter.
+// - Order all live queue-visible flows, not just currently attached waiters.
 // - Preserve the scheduling hierarchy: siteBucket -> ipBucket -> flow(LocalVT).
 // - Keep VirtualTime advancement skeleton (weights are treated as 1 for now).
 type fqHostFlowScheduler struct {
@@ -159,6 +159,53 @@ func newFQHostFlowScheduler() *fqHostFlowScheduler {
 	return &fqHostFlowScheduler{sites: map[string]*fqSiteFlowState{}}
 }
 
+func newFQHostFlowSchedulerWithSites(sites map[string]*fqSiteFlowState) *fqHostFlowScheduler {
+	return &fqHostFlowScheduler{sites: cloneSiteFlowStates(sites)}
+}
+
+func cloneSiteFlowStates(src map[string]*fqSiteFlowState) map[string]*fqSiteFlowState {
+	if len(src) == 0 {
+		return map[string]*fqSiteFlowState{}
+	}
+	out := make(map[string]*fqSiteFlowState, len(src))
+	for siteKey, site := range src {
+		if site == nil {
+			continue
+		}
+		copySite := &fqSiteFlowState{
+			Key:         site.Key,
+			VirtualTime: site.VirtualTime,
+			WaitCount:   site.WaitCount,
+			Buckets:     make(map[string]*fqBucketFlowState, len(site.Buckets)),
+		}
+		for bucketKey, bucket := range site.Buckets {
+			if bucket == nil {
+				continue
+			}
+			copySite.Buckets[bucketKey] = &fqBucketFlowState{
+				Key:         bucket.Key,
+				VirtualTime: bucket.VirtualTime,
+				WaitCount:   bucket.WaitCount,
+				DenyUntil:   bucket.DenyUntil,
+			}
+		}
+		out[siteKey] = copySite
+	}
+	if len(out) == 0 {
+		return map[string]*fqSiteFlowState{}
+	}
+	return out
+}
+
+func (h *fqHostFlowScheduler) snapshotSites() map[string]*fqSiteFlowState {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return cloneSiteFlowStates(h.sites)
+}
+
 func (h *fqHostFlowScheduler) getOrInitSite(siteKey string) *fqSiteFlowState {
 	if h.sites == nil {
 		h.sites = map[string]*fqSiteFlowState{}
@@ -191,8 +238,8 @@ func (h *fqHostFlowScheduler) getOrInitBucket(site *fqSiteFlowState, bucketKey s
 
 // PickNextInFlight selects the next flow token to probe within a host.
 //
-// Selection MUST be based only on the in-flight set (flows with waiter != nil).
-// It does not use time-based heuristics like active windows.
+// Ordering is based on the live queue-visible set; final DB admission still
+// requires the flow to remain immediately eligible.
 func (h *fqHostFlowScheduler) PickNextInFlight(store *flowStore, hostKey string, now time.Time, eligible fqFlowEligible) (fqFlowSnapshot, bool) {
 	if h == nil || store == nil {
 		return fqFlowSnapshot{}, false
@@ -208,7 +255,7 @@ func (h *fqHostFlowScheduler) PickNextInFlight(store *flowStore, hostKey string,
 	return picks[0], true
 }
 
-// PickNextInFlightBatch selects up to n unique in-flight flows using the same wall-clock now.
+// PickNextInFlightBatch selects up to n unique live flows using the same wall-clock now.
 // Virtual time advances per pick.
 func (h *fqHostFlowScheduler) PickNextInFlightBatch(store *flowStore, hostKey string, now time.Time, n int, eligible fqFlowEligible) []fqFlowSnapshot {
 	if h == nil || store == nil || n <= 0 {
@@ -226,7 +273,7 @@ func (h *fqHostFlowScheduler) pickBatchLocked(store *flowStore, hostKey string, 
 		return nil
 	}
 
-	cands := store.listInFlightByHost(hostKey, now)
+	cands := store.listQueueVisibleByHost(hostKey, now)
 	h.pruneIdleStatesLocked(cands, now)
 	if len(cands) == 0 {
 		return nil
@@ -319,12 +366,12 @@ func (h *fqHostFlowScheduler) pickBatchLocked(store *flowStore, hostKey string, 
 			if eligible != nil && !eligible(pick) {
 				continue
 			}
-			delete(active, pick.Token)
 
 			selected, ok := store.trySelectInFlight(pick.Token, hostKey, now)
 			if !ok {
 				continue
 			}
+			delete(active, pick.Token)
 
 			siteW := 1 + sn.state.WaitCount
 			if siteW < 1 {

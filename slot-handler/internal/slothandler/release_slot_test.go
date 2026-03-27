@@ -40,6 +40,10 @@ type flakyReleaseBackend struct {
 	calls    int
 }
 
+type timedReleaseBackend struct {
+	calledAtCh chan time.Time
+}
+
 type retryableReleaseError struct{}
 
 func (retryableReleaseError) Error() string { return "release timeout" }
@@ -56,6 +60,20 @@ func (b *flakyReleaseBackend) ReleaseSlot(ctx context.Context, req ReleaseReques
 	b.calls++
 	if b.calls <= b.failures {
 		return retryableReleaseError{}
+	}
+	return nil
+}
+
+func (b *timedReleaseBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	return nil, nil
+}
+
+func (b *timedReleaseBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	if b != nil && b.calledAtCh != nil {
+		select {
+		case b.calledAtCh <- time.Now():
+		default:
+		}
 	}
 	return nil
 }
@@ -91,6 +109,60 @@ func TestReleaseRetryClearsActiveLease(t *testing.T) {
 	}
 }
 
+func TestReleaseSlotHonorsMinSlotHoldMs(t *testing.T) {
+	minHoldMs := int64(60)
+	smoothReleaseOff := int64(0)
+	backend := &timedReleaseBackend{calledAtCh: make(chan time.Time, 1)}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		MinSlotHoldMs:           minHoldMs,
+		SmoothReleaseIntervalMs: &smoothReleaseOff,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	hitAt := time.Now()
+	req := ReleaseRequest{
+		Hostname:      "example.com",
+		HostnameHash:  "h1",
+		IPBucket:      "ip1",
+		SiteBucket:    "s1",
+		SlotToken:     "slot-hold",
+		HitUpstreamAt: hitAt.UnixMilli(),
+		Now:           hitAt.UnixMilli(),
+	}
+	hitAtMs := time.UnixMilli(req.HitUpstreamAt)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.releaseSlot(context.Background(), req)
+	}()
+
+	select {
+	case calledAt := <-backend.calledAtCh:
+		t.Fatalf("expected release backend call to wait for min hold, got %s", calledAt.Sub(hitAtMs))
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	var calledAt time.Time
+	select {
+	case calledAt = <-backend.calledAtCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected release backend call after min hold")
+	}
+
+	heldFor := calledAt.Sub(hitAtMs)
+	if heldFor < 55*time.Millisecond {
+		t.Fatalf("expected release backend call after >=55ms hold, got %s", heldFor)
+	}
+	if heldFor > 250*time.Millisecond {
+		t.Fatalf("expected release backend call to stay bounded, got %s", heldFor)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("releaseSlot error: %v", err)
+	}
+}
+
 func TestReleaseRetryFailureReturnsError(t *testing.T) {
 	cfg := &Config{FairQueue: FairQueueConfig{MinSlotHoldMs: 0}}
 	backend := &flakyReleaseBackend{failures: releaseRetryAttempts}
@@ -119,6 +191,33 @@ func TestReleaseRetryFailureReturnsError(t *testing.T) {
 	}
 	if s.activeSlots.ActiveHost("h1", now.Add(time.Second)) != 1 {
 		t.Fatalf("expected active lease retained after failure")
+	}
+}
+
+func TestReleaseCompensatingClearsActiveLease(t *testing.T) {
+	cfg := &Config{FairQueue: FairQueueConfig{MinSlotHoldMs: 0}}
+	s := newTestServer()
+	s.updateRuntime(cfg, &stubBackend{}, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Unix(0, 0)
+	s.activeSlots.AddLease("slot-compensating", "h1", "s1", "ip1", 5*time.Second, now)
+
+	req := ReleaseRequest{
+		Hostname:      "example.com",
+		HostnameHash:  "h1",
+		IPBucket:      "ip1",
+		SiteBucket:    "s1",
+		SlotToken:     "slot-compensating",
+		HitUpstreamAt: now.UnixMilli(),
+		Now:           now.UnixMilli(),
+	}
+
+	if err := s.releaseSlot(context.Background(), req); err != nil {
+		t.Fatalf("releaseSlot error: %v", err)
+	}
+	if s.activeSlots.ActiveHost("h1", now.Add(time.Second)) != 0 {
+		t.Fatalf("expected compensating release to clear active lease")
 	}
 }
 

@@ -14,6 +14,21 @@ type fqHostProbeRunner struct {
 	hostKey string
 	wakeCh  chan struct{}
 	stopCh  chan struct{}
+
+	probeCredits    float64
+	probeRefilledAt time.Time
+}
+
+type probeOnceResult struct {
+	keepAlive bool
+	probed    int
+}
+
+type hostProbeReactorState struct {
+	keepAlive        bool
+	shouldProbe      bool
+	availableCredits int
+	nextWakeAt       time.Time
 }
 
 type probeMode string
@@ -67,13 +82,45 @@ type throttledLatch struct {
 }
 
 const (
-	probeModeSteady probeMode = "steady"
-	probeModeFill   probeMode = "fill"
+	probeModeSteady  probeMode = "steady"
+	probeModeFill    probeMode = "fill"
+	readyLatchTTL              = 300 * time.Millisecond
+	readyLatchTTLMax           = time.Second
 )
+
+func clampReadyLatchTTL(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return 0
+	}
+	if ttl > readyLatchTTLMax {
+		return readyLatchTTLMax
+	}
+	return ttl
+}
+
+func (s *server) flowStoreNow() time.Time {
+	if s == nil {
+		return time.Now()
+	}
+	s.mu.RLock()
+	store := s.flowStore
+	s.mu.RUnlock()
+	if store != nil && store.nowFn != nil {
+		return store.nowFn()
+	}
+	return time.Now()
+}
 
 func (s *server) getOrCreateFlowScheduler(hostKey string) *fqHostFlowScheduler {
 	if s == nil || hostKey == "" {
 		return nil
+	}
+	s.mu.RLock()
+	store := s.flowStore
+	s.mu.RUnlock()
+	now := time.Now()
+	if store != nil && store.nowFn != nil {
+		now = store.nowFn()
 	}
 	s.flowSchedMu.Lock()
 	defer s.flowSchedMu.Unlock()
@@ -82,7 +129,11 @@ func (s *server) getOrCreateFlowScheduler(hostKey string) *fqHostFlowScheduler {
 	}
 	sched := s.flowSched[hostKey]
 	if sched == nil {
-		sched = newFQHostFlowScheduler()
+		sites := map[string]*fqSiteFlowState(nil)
+		if store != nil {
+			sites = store.loadHostSchedulerSites(hostKey, now)
+		}
+		sched = newFQHostFlowSchedulerWithSites(sites)
 		s.flowSched[hostKey] = sched
 	}
 	return sched
@@ -92,14 +143,30 @@ func (s *server) deleteFlowScheduler(hostKey string) {
 	if s == nil || hostKey == "" {
 		return
 	}
+	s.mu.RLock()
+	store := s.flowStore
+	s.mu.RUnlock()
+	var snapshot map[string]*fqSiteFlowState
 	s.flowSchedMu.Lock()
 	if s.flowSched != nil {
+		if sched := s.flowSched[hostKey]; sched != nil {
+			snapshot = sched.snapshotSites()
+		}
 		delete(s.flowSched, hostKey)
 		if len(s.flowSched) == 0 {
 			s.flowSched = nil
 		}
 	}
 	s.flowSchedMu.Unlock()
+	if store == nil {
+		return
+	}
+	now := s.flowStoreNow()
+	if store.hostHasQueueVisibleFlow(hostKey, now) {
+		store.saveHostSchedulerSites(hostKey, snapshot)
+		return
+	}
+	store.clearHostSchedulerSites(hostKey)
 }
 
 func (s *server) ensureHostProbeRunner(hostKey string) {
@@ -125,7 +192,6 @@ func (s *server) ensureHostProbeRunner(hostKey string) {
 	s.flowRunnerMu.Unlock()
 
 	go r.run(s)
-	s.wakeHostProbeRunner(hostKey)
 }
 
 func (s *server) wakeHostProbeRunner(hostKey string) {
@@ -484,6 +550,257 @@ func computeProbeCallTimeout(interval time.Duration) time.Duration {
 	return timeout
 }
 
+func (r *fqHostProbeRunner) refillProbeCredits(cfg *Config, now time.Time) {
+	if r == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	qps := 1
+	bucketCapacity := 1.0
+	if cfg != nil {
+		qps = cfg.FairQueue.maxProbeQpsPerHost()
+		interval := cfg.FairQueue.pollInterval()
+		bucketCapacity = math.Ceil(float64(qps) * interval.Seconds())
+		if bucketCapacity < 1 {
+			bucketCapacity = 1
+		}
+	}
+	if r.probeRefilledAt.IsZero() {
+		r.probeRefilledAt = now
+		r.probeCredits = bucketCapacity
+		return
+	}
+	if now.Before(r.probeRefilledAt) {
+		r.probeRefilledAt = now
+		if r.probeCredits > bucketCapacity {
+			r.probeCredits = bucketCapacity
+		}
+		return
+	}
+	elapsed := now.Sub(r.probeRefilledAt)
+	if elapsed > 0 {
+		r.probeCredits += elapsed.Seconds() * float64(qps)
+		if r.probeCredits > bucketCapacity {
+			r.probeCredits = bucketCapacity
+		}
+		r.probeRefilledAt = now
+	}
+}
+
+func (r *fqHostProbeRunner) availableProbeCredits() int {
+	if r == nil {
+		return 0
+	}
+	credits := int(math.Floor(r.probeCredits))
+	if credits < 0 {
+		return 0
+	}
+	return credits
+}
+
+func (r *fqHostProbeRunner) nextProbeCreditAt(cfg *Config, now time.Time) (time.Time, bool) {
+	if r == nil {
+		return time.Time{}, false
+	}
+	qps := 1
+	if cfg != nil {
+		qps = cfg.FairQueue.maxProbeQpsPerHost()
+	}
+	if qps <= 0 {
+		return now, true
+	}
+	if r.probeCredits >= 1 {
+		return now, true
+	}
+	missing := 1 - r.probeCredits
+	if missing < 0 {
+		missing = 0
+	}
+	delay := time.Duration(math.Ceil((missing / float64(qps)) * float64(time.Second)))
+	if delay < time.Millisecond {
+		delay = time.Millisecond
+	}
+	return now.Add(delay), true
+}
+
+func (r *fqHostProbeRunner) consumeProbeCredits(used int) {
+	if r == nil || used <= 0 {
+		return
+	}
+	r.probeCredits -= float64(used)
+	if r.probeCredits < 0 {
+		r.probeCredits = 0
+	}
+}
+
+func minNonZeroTime(current, candidate time.Time) time.Time {
+	if candidate.IsZero() {
+		return current
+	}
+	if current.IsZero() || candidate.Before(current) {
+		return candidate
+	}
+	return current
+}
+
+func maxTime(current, candidate time.Time) time.Time {
+	if candidate.IsZero() {
+		return current
+	}
+	if current.IsZero() || candidate.After(current) {
+		return candidate
+	}
+	return current
+}
+
+func (s *server) snapshotHostSchedulerSites(hostKey string) map[string]*fqSiteFlowState {
+	if s == nil || hostKey == "" {
+		return nil
+	}
+	s.flowSchedMu.Lock()
+	sched := s.flowSched[hostKey]
+	s.flowSchedMu.Unlock()
+	if sched == nil {
+		return nil
+	}
+	return sched.snapshotSites()
+}
+
+func hostSchedulerBucketDenyUntil(sites map[string]*fqSiteFlowState, siteKey, bucketKey string) time.Time {
+	if len(sites) == 0 {
+		return time.Time{}
+	}
+	st := sites[siteKey]
+	if st == nil {
+		return time.Time{}
+	}
+	bt := st.Buckets[bucketKey]
+	if bt == nil {
+		return time.Time{}
+	}
+	return bt.DenyUntil
+}
+
+func (s *server) hostFlowProbeEligible(cfg *Config, hostKey string, snap fqFlowSnapshot) bool {
+	if s == nil {
+		return false
+	}
+	if s.activeSlots == nil {
+		return true
+	}
+	hostIPLimit := 0
+	siteIPLimit := 0
+	if cfg != nil {
+		hostIPLimit = cfg.FairQueue.hostMaxSlotPerIP()
+		siteIPLimit = cfg.FairQueue.siteMaxSlotPerIP()
+	}
+	if hostIPLimit > 0 && s.activeSlots.ActiveHostIPNoPrune(hostKey, snap.IPBucket) >= hostIPLimit {
+		return false
+	}
+	siteKey := strings.TrimSpace(snap.SiteBucket)
+	if siteKey == "" {
+		siteKey = "unknown"
+	}
+	if siteIPLimit > 0 && s.activeSlots.ActiveSiteIPNoPrune(hostKey, siteKey, snap.IPBucket) >= siteIPLimit {
+		return false
+	}
+	return true
+}
+
+func (s *server) cleanupExpiredHostDeadlines(hostKey string, now time.Time) {
+	if s == nil || hostKey == "" {
+		return
+	}
+	s.mu.RLock()
+	store := s.flowStore
+	s.mu.RUnlock()
+	if store == nil {
+		return
+	}
+	for _, snap := range store.listQueueVisibleByHost(hostKey, now) {
+		if snap.Token == "" {
+			continue
+		}
+		if !snap.ReadyLatchedUntil.IsZero() && !now.Before(snap.ReadyLatchedUntil) {
+			s.expireReadyLatchAndRelease(snap.Token, now)
+		}
+	}
+}
+
+func (s *server) hostProbeReactorState(r *fqHostProbeRunner, hostKey string, now time.Time) hostProbeReactorState {
+	state := hostProbeReactorState{}
+	if s == nil || r == nil || hostKey == "" {
+		return state
+	}
+	s.mu.RLock()
+	store := s.flowStore
+	s.mu.RUnlock()
+	if store == nil {
+		return state
+	}
+	queueVisible := store.listQueueVisibleByHost(hostKey, now)
+	if len(queueVisible) == 0 {
+		return state
+	}
+	state.keepAlive = true
+
+	cfg := s.getConfig()
+	backend := s.getBackend()
+	sites := s.snapshotHostSchedulerSites(hostKey)
+
+	nextWakeAt := time.Time{}
+	for _, snap := range queueVisible {
+		nextWakeAt = minNonZeroTime(nextWakeAt, hostSchedulerBucketDenyUntil(sites, snap.SiteBucket, snap.IPBucket))
+		nextWakeAt = minNonZeroTime(nextWakeAt, snap.ReadyLatchedUntil)
+		nextWakeAt = minNonZeroTime(nextWakeAt, snap.InvocationLeaseUntil)
+		nextWakeAt = minNonZeroTime(nextWakeAt, snap.ExpireAt)
+	}
+	if !nextWakeAt.IsZero() && !nextWakeAt.After(now) {
+		nextWakeAt = time.Time{}
+	}
+	state.nextWakeAt = nextWakeAt
+
+	if cfg == nil || backend == nil {
+		return state
+	}
+
+	budget, _ := s.computeProbeBudget(cfg, hostKey, queueVisible, now)
+	if budget <= 0 {
+		return state
+	}
+	hasSchedulable := false
+	for _, snap := range queueVisible {
+		if !snap.HasWaiter || !snap.GrantEligible {
+			continue
+		}
+		denyUntil := hostSchedulerBucketDenyUntil(sites, snap.SiteBucket, snap.IPBucket)
+		if !denyUntil.IsZero() && now.Before(denyUntil) {
+			continue
+		}
+		if !s.hostFlowProbeEligible(cfg, hostKey, snap) {
+			continue
+		}
+		hasSchedulable = true
+		break
+	}
+	if !hasSchedulable {
+		return state
+	}
+
+	r.refillProbeCredits(cfg, now)
+	state.availableCredits = r.availableProbeCredits()
+	if state.availableCredits > 0 {
+		state.shouldProbe = true
+		return state
+	}
+	if nextCreditAt, ok := r.nextProbeCreditAt(cfg, now); ok {
+		state.nextWakeAt = minNonZeroTime(state.nextWakeAt, nextCreditAt)
+	}
+	return state
+}
+
 func (r *fqHostProbeRunner) run(s *server) {
 	if r == nil || s == nil {
 		return
@@ -499,30 +816,78 @@ func (r *fqHostProbeRunner) run(s *server) {
 		s.flowRunnerMu.Unlock()
 	}()
 
+	var timer *time.Timer
+	var logicalNowFloor time.Time
+	stopTimer := func() {
+		if timer == nil {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer = nil
+	}
+
 	for {
-		cfg := s.getConfig()
-		interval := 100 * time.Millisecond
-		if cfg != nil {
-			interval = cfg.FairQueue.pollInterval()
-			if interval <= 0 {
-				interval = 100 * time.Millisecond
+		now := maxTime(s.flowStoreNow(), logicalNowFloor)
+		s.cleanupExpiredHostDeadlines(r.hostKey, now)
+		state := s.hostProbeReactorState(r, r.hostKey, now)
+		if !state.keepAlive {
+			stopTimer()
+			s.deleteFlowScheduler(r.hostKey)
+			return
+		}
+		if state.shouldProbe {
+			attempt := s.probeOnceWithLimit(parentCtx, r.hostKey, now, state.availableCredits)
+			if !attempt.keepAlive {
+				stopTimer()
+				s.deleteFlowScheduler(r.hostKey)
+				return
+			}
+			if attempt.probed > 0 {
+				r.consumeProbeCredits(attempt.probed)
+				now = maxTime(s.flowStoreNow(), logicalNowFloor)
+				state = s.hostProbeReactorState(r, r.hostKey, now)
+				if !state.keepAlive {
+					stopTimer()
+					s.deleteFlowScheduler(r.hostKey)
+					return
+				}
+				cfg := s.getConfig()
+				if cfg != nil {
+					state.nextWakeAt = minNonZeroTime(state.nextWakeAt, now.Add(cfg.FairQueue.pollInterval()))
+				}
 			}
 		}
 
-		t := time.NewTimer(interval)
+		if state.nextWakeAt.IsZero() {
+			stopTimer()
+			select {
+			case <-r.stopCh:
+				cancel()
+				return
+			case <-r.wakeCh:
+				continue
+			}
+		}
+
+		wait := state.nextWakeAt.Sub(now)
+		if wait < 0 {
+			wait = 0
+		}
+		timer = resetLoopTimer(timer, wait)
 		select {
 		case <-r.stopCh:
 			cancel()
-			t.Stop()
+			stopTimer()
 			return
 		case <-r.wakeCh:
-			t.Stop()
-		case <-t.C:
-		}
-
-		if ok := s.probeOnce(parentCtx, r.hostKey, time.Now()); !ok {
-			s.deleteFlowScheduler(r.hostKey)
-			return
+			continue
+		case <-timer.C:
+			logicalNowFloor = maxTime(logicalNowFloor, state.nextWakeAt)
 		}
 	}
 }
@@ -774,6 +1139,39 @@ func validHalfOpenFullAdmitResult(snap fqFlowSnapshot, res *admitResult) bool {
 	return res.retryAfter > 0
 }
 
+func (s *server) compensatingReleaseAsync(req ReleaseRequest) {
+	if s == nil || strings.TrimSpace(req.SlotToken) == "" {
+		return
+	}
+	go s.releaseSlot(context.Background(), req)
+}
+
+func (s *server) expireReadyLatchAndRelease(token string, now time.Time) {
+	if s == nil || token == "" {
+		return
+	}
+	s.mu.RLock()
+	store := s.flowStore
+	s.mu.RUnlock()
+	if store == nil {
+		return
+	}
+	expired, releaseReq, ok := store.expireReadyLatchForProbe(token, now)
+	if !expired {
+		return
+	}
+	s.recordReadyLatchExpired()
+	if !ok {
+		return
+	}
+	s.recordCompensatingRelease()
+	hostKey := fqHostKey(releaseReq.HostnameHash, releaseReq.Hostname)
+	if hostKey != "" {
+		s.wakeHostProbeRunner(hostKey)
+	}
+	s.compensatingReleaseAsync(releaseReq)
+}
+
 // probeOnce performs one scheduling decision for the given host.
 // It is intentionally deterministic/testable via injected `now`.
 //
@@ -781,8 +1179,13 @@ func validHalfOpenFullAdmitResult(snap fqFlowSnapshot, res *admitResult) bool {
 // - true: keep runner alive
 // - false: there are no in-flight waiters for this host (runner may exit)
 func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.Time) bool {
+	return s.probeOnceWithLimit(parentCtx, hostKey, now, 0).keepAlive
+}
+
+func (s *server) probeOnceWithLimit(parentCtx context.Context, hostKey string, now time.Time, maxProbeCount int) probeOnceResult {
+	result := probeOnceResult{keepAlive: true}
 	if s == nil || hostKey == "" {
-		return true
+		return result
 	}
 	if parentCtx == nil {
 		parentCtx = context.Background()
@@ -793,54 +1196,45 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	s.mu.RUnlock()
 	if store == nil {
 		// No store means no in-flight flows.
-		return false
+		result.keepAlive = false
+		return result
 	}
 
-	// Runner exits only when there are truly no in-flight waiters.
-	inFlight := store.listInFlightByHost(hostKey, now)
-	if len(inFlight) == 0 {
-		return false
+	queueVisible := store.listQueueVisibleByHost(hostKey, now)
+	if len(queueVisible) == 0 {
+		result.keepAlive = false
+		return result
 	}
 
 	cfg := s.getConfig()
 	backend := s.getBackend()
 	if cfg == nil || backend == nil {
 		// Temporary runtime state (reload, shutdown). Keep runner alive while in-flight exists.
-		return true
+		return result
 	}
 
 	sched := s.getOrCreateFlowScheduler(hostKey)
 	if sched == nil {
-		return true
+		return result
 	}
 
-	budget, _ := s.computeProbeBudget(cfg, hostKey, inFlight, now)
-	if budget <= 0 {
-		return true
+	budget, _ := s.computeProbeBudget(cfg, hostKey, queueVisible, now)
+	if maxProbeCount > 0 && budget > maxProbeCount {
+		budget = maxProbeCount
 	}
-	hostIPLimit := cfg.FairQueue.hostMaxSlotPerIP()
-	siteIPLimit := cfg.FairQueue.siteMaxSlotPerIP()
+	if budget <= 0 {
+		return result
+	}
 	eligible := func(snap fqFlowSnapshot) bool {
-		if s.activeSlots == nil {
-			return true
-		}
-		if hostIPLimit > 0 && s.activeSlots.ActiveHostIPNoPrune(hostKey, snap.IPBucket) >= hostIPLimit {
-			return false
-		}
-		siteKey := strings.TrimSpace(snap.SiteBucket)
-		if siteKey == "" {
-			siteKey = "unknown"
-		}
-		if siteIPLimit > 0 && s.activeSlots.ActiveSiteIPNoPrune(hostKey, siteKey, snap.IPBucket) >= siteIPLimit {
-			return false
-		}
-		return true
+		return s.hostFlowProbeEligible(cfg, hostKey, snap)
 	}
 	batch := sched.PickNextInFlightBatch(store, hostKey, now, budget, eligible)
 	if len(batch) == 0 {
 		// All in-flight flows are denied at the moment.
-		return true
+		return result
 	}
+	s.observeProbe(hostKey, now)
+	result.probed = len(batch)
 
 	// Probe backend with bounded runtime. Parent context is canceled when runner stops.
 	timeout := computeProbeCallTimeout(cfg.FairQueue.pollInterval())
@@ -858,7 +1252,7 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		for _, snap := range batch {
 			sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
 		}
-		return true
+		return result
 	}
 
 	throttled := throttledLatch{}
@@ -870,7 +1264,8 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 	structuralHandled := make(map[string]struct{}, len(batch))
 	releaseAsync := func(req ReleaseRequest) {
 		// Compensating cleanup must not delay throttled delivery to waiters.
-		go s.releaseSlot(context.Background(), req)
+		s.recordCompensatingRelease()
+		s.compensatingReleaseAsync(req)
 	}
 	markStructuralHandled := func(snap fqFlowSnapshot) {
 		if snap.Token == "" {
@@ -894,8 +1289,23 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		releaseAsync(releaseReq)
 	}
 	commitReady := func(snap fqFlowSnapshot, res *admitResult) {
+		if res == nil {
+			sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+			return
+		}
+		commit := store.commitReadyGrantForProbe(snap.Token, res.slotToken, res.attemptVersion, res.attemptTicket, clampReadyLatchTTL(readyLatchTTL), now)
+		if !commit.committed {
+			if strings.TrimSpace(res.slotToken) != "" {
+				compensateReady(snap, res)
+			}
+			sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
+			return
+		}
 		sched.halveWaitCount(snap.SiteBucket, snap.IPBucket)
-		s.incrementMetric("granted")
+		if commit.newlyCommitted {
+			s.incrementMetric("granted")
+			s.recordGrantCommitted(hostKey, now)
+		}
 		siteKey := strings.TrimSpace(snap.SiteBucket)
 		if siteKey == "" {
 			siteKey = "unknown"
@@ -904,20 +1314,33 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 			ttl := time.Duration(cfg.FairQueue.zombieTimeoutSeconds()) * time.Second
 			s.activeSlots.AddLease(res.slotToken, hostKey, siteKey, snap.IPBucket, ttl, now)
 		}
-		delivered := store.deliverToWaiter(snap.Token, readyAcquireResponse(snap.Token, res))
-		if !delivered {
-			releaseReq := ReleaseRequest{
-				Hostname:      snap.Hostname,
-				HostnameHash:  snap.HostnameHash,
-				IPBucket:      snap.IPBucket,
-				SiteBucket:    snap.SiteBucket,
-				SlotToken:     res.slotToken,
-				HitUpstreamAt: now.UnixMilli(),
-				Now:           now.UnixMilli(),
+		if commit.waiterAttached {
+			delivered := store.deliverToWaiter(snap.Token, readyAcquireResponse(snap.Token, res))
+			if delivered {
+				s.recordGrantClaimed()
+				store.deleteFlow(snap.Token)
+				return
 			}
-			releaseAsync(releaseReq)
+			releaseReq, ok := store.clearCommittedGrantForProbe(snap.Token, now)
+			if ok {
+				releaseAsync(releaseReq)
+			}
+			return
 		}
-		store.deleteFlow(snap.Token)
+		if !commit.readyLatched {
+			releaseReq, ok := store.clearCommittedGrantForProbe(snap.Token, now)
+			if ok {
+				releaseAsync(releaseReq)
+			}
+			return
+		}
+		_ = store.armReadyLatchExpiry(snap.Token, now, func() {
+			expireNow := time.Now()
+			if store.nowFn != nil {
+				expireNow = store.nowFn()
+			}
+			s.expireReadyLatchAndRelease(snap.Token, expireNow)
+		})
 	}
 
 	applySubBatch := func(sub probeSubBatchResult) {
@@ -1145,5 +1568,5 @@ func (s *server) probeOnce(parentCtx context.Context, hostKey string, now time.T
 		s.recordUtilizationSample(hostKey, siteKey, hostActive, hostCap, siteActive, siteCap, now)
 	}
 
-	return true
+	return result
 }

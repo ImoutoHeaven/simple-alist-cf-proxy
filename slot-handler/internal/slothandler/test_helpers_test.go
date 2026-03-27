@@ -6,6 +6,7 @@ func newTestServer() *server {
 	return &server{
 		log:             newLogger("error"),
 		metricsCounters: newMetricsCounters(),
+		metricSamples:   make(map[string]float64),
 	}
 }
 

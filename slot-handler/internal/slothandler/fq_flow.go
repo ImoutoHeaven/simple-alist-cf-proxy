@@ -10,7 +10,8 @@ import (
 )
 
 // fqFlow is the token-stable fairness state that survives across long-poll requests.
-// In Task 1 we only implement the minimal store + grace expiry behavior.
+// Task 1 adds the minimum flow-centric lease/grant/latch bookkeeping while keeping
+// the current waiter-driven runtime functional until later tasks cut it over.
 type fqFlow struct {
 	Token                 string
 	Hostname              string
@@ -26,10 +27,28 @@ type fqFlow struct {
 	// Fairness state (kept across long-polls)
 	LocalVT uint64
 
+	// Flow-centric runtime state
+	invocationLeaseUntil time.Time
+	grantEligible        bool
+	grantCommitted       bool
+	readyLatchedAt       time.Time
+	readyLatchedUntil    time.Time
+	slotToken            string
+	attemptVersion       int64
+	attemptTicket        int
+
 	// Runtime state
-	waiter   *fqWaiter
-	expireAt time.Time
-	timer    *time.Timer
+	waiter     *fqWaiter
+	expireAt   time.Time
+	timer      *time.Timer
+	readyTimer *time.Timer
+}
+
+type readyGrantCommitResult struct {
+	committed      bool
+	newlyCommitted bool
+	waiterAttached bool
+	readyLatched   bool
 }
 
 // fqFlowSnapshot is an immutable copy of a flow's state.
@@ -47,6 +66,14 @@ type fqFlowSnapshot struct {
 	CreatedAt             time.Time
 	LocalVT               uint64
 	HasWaiter             bool
+	InvocationLeaseUntil  time.Time
+	GrantEligible         bool
+	GrantCommitted        bool
+	ReadyLatchedAt        time.Time
+	ReadyLatchedUntil     time.Time
+	SlotToken             string
+	AttemptVersion        int64
+	AttemptTicket         int
 	ExpireAt              time.Time
 }
 
@@ -56,10 +83,75 @@ type fqWaiter struct {
 	resCh chan *AcquireResponse
 }
 
+func snapshotFromFlow(f *fqFlow) fqFlowSnapshot {
+	if f == nil {
+		return fqFlowSnapshot{}
+	}
+	return fqFlowSnapshot{
+		Token:                 f.Token,
+		Hostname:              f.Hostname,
+		HostnameHash:          f.HostnameHash,
+		IPBucket:              f.IPBucket,
+		SiteBucket:            f.SiteBucket,
+		BreakerEnabled:        f.BreakerEnabled,
+		HalfOpenMaxProbeCount: f.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:    f.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:   f.HalfOpenTimeoutMode,
+		CreatedAt:             f.CreatedAt,
+		LocalVT:               f.LocalVT,
+		HasWaiter:             f.waiter != nil,
+		InvocationLeaseUntil:  f.invocationLeaseUntil,
+		GrantEligible:         f.grantEligible,
+		GrantCommitted:        f.grantCommitted,
+		ReadyLatchedAt:        f.readyLatchedAt,
+		ReadyLatchedUntil:     f.readyLatchedUntil,
+		SlotToken:             f.slotToken,
+		AttemptVersion:        f.attemptVersion,
+		AttemptTicket:         f.attemptTicket,
+		ExpireAt:              f.expireAt,
+	}
+}
+
+func isQueueVisibleAt(f *fqFlow, now time.Time) bool {
+	if f == nil || isFlowExpiredAt(f, now) {
+		return false
+	}
+	if f.waiter != nil {
+		return true
+	}
+	if !f.invocationLeaseUntil.IsZero() {
+		return true
+	}
+	if !f.expireAt.IsZero() {
+		return true
+	}
+	if f.grantCommitted || !f.readyLatchedUntil.IsZero() {
+		return true
+	}
+	return false
+}
+
+func isGrantEligibleAt(f *fqFlow, now time.Time) bool {
+	if !isQueueVisibleAt(f, now) {
+		return false
+	}
+	if f.waiter == nil {
+		return false
+	}
+	if f.grantCommitted {
+		return false
+	}
+	return f.grantEligible
+}
+
 type flowStore struct {
 	mu      sync.Mutex
 	grace   time.Duration
 	byToken map[string]*fqFlow
+
+	onInvocationLeaseExpired func(token string, releaseReq ReleaseRequest, hasRelease bool, hostKey string)
+
+	hostSchedulerSites map[string]map[string]*fqSiteFlowState
 
 	hostInFlightTokens map[string]map[string]struct{} // hostKey -> set(token)
 
@@ -81,10 +173,19 @@ type flowStore struct {
 	inFlightByIP   map[string]int // "hostKey\x00site\x00ip" -> count
 }
 
+type flowExpiryAction struct {
+	token      string
+	hostKey    string
+	releaseReq ReleaseRequest
+	hasRelease bool
+	expired    bool
+}
+
 func newFlowStore(grace time.Duration) *flowStore {
 	return &flowStore{
 		grace:              grace,
 		byToken:            map[string]*fqFlow{},
+		hostSchedulerSites: make(map[string]map[string]*fqSiteFlowState),
 		afterFunc:          time.AfterFunc,
 		nowFn:              time.Now,
 		hostInFlightTokens: make(map[string]map[string]struct{}),
@@ -106,6 +207,439 @@ func applyAcquireRequestToFlow(f *fqFlow, req AcquireRequest) {
 	f.HalfOpenMaxProbeCount = req.HalfOpenMaxProbeCount
 	f.HalfOpenMaxSeconds = req.HalfOpenMaxSeconds
 	f.HalfOpenTimeoutMode = canonicalTimeoutMode(req.HalfOpenTimeoutMode)
+}
+
+func (s *flowStore) listQueueVisibleByHost(hostKey string, now time.Time) []fqFlowSnapshot {
+	if s == nil || hostKey == "" {
+		return nil
+	}
+	if s.listInFlightByHostHook != nil {
+		s.listInFlightByHostHook(hostKey)
+	}
+	s.mu.Lock()
+	actions := make([]flowExpiryAction, 0)
+
+	res := make([]fqFlowSnapshot, 0, len(s.byToken))
+	for _, f := range s.byToken {
+		if f == nil {
+			continue
+		}
+		if isFlowExpiredAt(f, now) {
+			actions = append(actions, s.expireFlowLocked(f, now))
+			continue
+		}
+		if fqHostKey(f.HostnameHash, f.Hostname) != hostKey {
+			continue
+		}
+		if !isQueueVisibleAt(f, now) {
+			continue
+		}
+		res = append(res, snapshotFromFlow(f))
+	}
+	s.mu.Unlock()
+	s.dispatchInvocationExpiry(actions)
+	return res
+}
+
+func (s *flowStore) listGrantEligibleByHost(hostKey string, now time.Time) []fqFlowSnapshot {
+	if s == nil || hostKey == "" {
+		return nil
+	}
+	s.mu.Lock()
+	actions := make([]flowExpiryAction, 0)
+
+	res := make([]fqFlowSnapshot, 0, len(s.byToken))
+	for _, f := range s.byToken {
+		if f == nil {
+			continue
+		}
+		if isFlowExpiredAt(f, now) {
+			actions = append(actions, s.expireFlowLocked(f, now))
+			continue
+		}
+		if fqHostKey(f.HostnameHash, f.Hostname) != hostKey {
+			continue
+		}
+		if !isGrantEligibleAt(f, now) {
+			continue
+		}
+		res = append(res, snapshotFromFlow(f))
+	}
+	s.mu.Unlock()
+	s.dispatchInvocationExpiry(actions)
+	return res
+}
+
+func (s *flowStore) saveHostSchedulerSites(hostKey string, sites map[string]*fqSiteFlowState) {
+	if s == nil || strings.TrimSpace(hostKey) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(sites) == 0 {
+		delete(s.hostSchedulerSites, hostKey)
+		return
+	}
+	if s.hostSchedulerSites == nil {
+		s.hostSchedulerSites = make(map[string]map[string]*fqSiteFlowState)
+	}
+	s.hostSchedulerSites[hostKey] = cloneSiteFlowStates(sites)
+}
+
+func (s *flowStore) loadHostSchedulerSites(hostKey string, now time.Time) map[string]*fqSiteFlowState {
+	if s == nil || strings.TrimSpace(hostKey) == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.hostHasQueueVisibleFlowLocked(hostKey, now) {
+		delete(s.hostSchedulerSites, hostKey)
+		return nil
+	}
+	return cloneSiteFlowStates(s.hostSchedulerSites[hostKey])
+}
+
+func (s *flowStore) clearHostSchedulerSites(hostKey string) {
+	if s == nil || strings.TrimSpace(hostKey) == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.hostSchedulerSites, hostKey)
+	s.mu.Unlock()
+}
+
+func (s *flowStore) hostHasQueueVisibleFlow(hostKey string, now time.Time) bool {
+	if s == nil || strings.TrimSpace(hostKey) == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hostHasQueueVisibleFlowLocked(hostKey, now)
+}
+
+func (s *flowStore) hostHasQueueVisibleFlowLocked(hostKey string, now time.Time) bool {
+	for _, f := range s.byToken {
+		if f == nil {
+			continue
+		}
+		if isFlowExpiredAt(f, now) {
+			continue
+		}
+		if fqHostKey(f.HostnameHash, f.Hostname) != hostKey {
+			continue
+		}
+		if isQueueVisibleAt(f, now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *flowStore) renewInvocationLease(token string, until time.Time) bool {
+	if s == nil || token == "" || until.IsZero() {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return false
+	}
+	f.invocationLeaseUntil = until
+	f.expireAt = until
+	if f.waiter != nil && !f.grantCommitted {
+		f.grantEligible = true
+	}
+	if f.timer != nil {
+		safeStopTimer(f.timer)
+		f.timer = nil
+	}
+	return true
+}
+
+func (s *flowStore) commitReadyGrantLocked(f *fqFlow, slotToken string, attemptVersion int64, attemptTicket int, latchTTL time.Duration, now time.Time) readyGrantCommitResult {
+	result := readyGrantCommitResult{}
+	if f == nil || strings.TrimSpace(slotToken) == "" {
+		return result
+	}
+	if isFlowExpiredAt(f, now) {
+		return result
+	}
+	result.committed = true
+	result.waiterAttached = f.waiter != nil
+	if f.grantCommitted {
+		result.readyLatched = !f.readyLatchedUntil.IsZero() && now.Before(f.readyLatchedUntil)
+		return result
+	}
+	if f.readyTimer != nil {
+		safeStopTimer(f.readyTimer)
+		f.readyTimer = nil
+	}
+	f.LocalVT++
+	f.grantCommitted = true
+	f.grantEligible = false
+	f.readyLatchedAt = time.Time{}
+	f.slotToken = strings.TrimSpace(slotToken)
+	f.attemptVersion = attemptVersion
+	f.attemptTicket = attemptTicket
+	f.readyLatchedUntil = time.Time{}
+	if !result.waiterAttached && latchTTL > 0 && !f.invocationLeaseUntil.IsZero() && now.Before(f.invocationLeaseUntil) {
+		remainingLease := f.invocationLeaseUntil.Sub(now)
+		if remainingLease > latchTTL {
+			f.readyLatchedAt = now
+			f.readyLatchedUntil = now.Add(latchTTL)
+			result.readyLatched = true
+		}
+	}
+	result.newlyCommitted = true
+	return result
+}
+
+func (s *flowStore) commitReadyGrant(token, slotToken string, attemptVersion int64, attemptTicket int, latchTTL time.Duration, now time.Time) bool {
+	if s == nil || token == "" || strings.TrimSpace(slotToken) == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return false
+	}
+	if isFlowExpiredAt(f, now) {
+		s.removeFlowLocked(f)
+		return false
+	}
+	return s.commitReadyGrantLocked(f, slotToken, attemptVersion, attemptTicket, latchTTL, now).committed
+}
+
+func (s *flowStore) commitReadyGrantForProbe(token, slotToken string, attemptVersion int64, attemptTicket int, latchTTL time.Duration, now time.Time) readyGrantCommitResult {
+	if s == nil || token == "" || strings.TrimSpace(slotToken) == "" {
+		return readyGrantCommitResult{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return readyGrantCommitResult{}
+	}
+	if isFlowExpiredAt(f, now) {
+		s.removeFlowLocked(f)
+		return readyGrantCommitResult{}
+	}
+	return s.commitReadyGrantLocked(f, slotToken, attemptVersion, attemptTicket, latchTTL, now)
+}
+
+func (s *flowStore) armReadyLatchExpiry(token string, now time.Time, onExpire func()) bool {
+	if s == nil || token == "" || onExpire == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return false
+	}
+	if isFlowExpiredAt(f, now) {
+		s.removeFlowLocked(f)
+		return false
+	}
+	if f.readyLatchedUntil.IsZero() || !now.Before(f.readyLatchedUntil) {
+		return false
+	}
+	if f.readyTimer != nil {
+		safeStopTimer(f.readyTimer)
+		f.readyTimer = nil
+	}
+	if s.afterFunc == nil {
+		return false
+	}
+	delay := cleanupDelayUntil(f.readyLatchedUntil, now)
+	f.readyTimer = s.afterFunc(delay, onExpire)
+	return true
+}
+
+func (s *flowStore) takeReadyLatched(token string, now time.Time) (*AcquireResponse, bool) {
+	if s == nil || token == "" {
+		return nil, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return nil, false
+	}
+	if isFlowExpiredAt(f, now) {
+		s.removeFlowLocked(f)
+		return nil, false
+	}
+	if !f.grantCommitted || f.readyLatchedUntil.IsZero() || !now.Before(f.readyLatchedUntil) || strings.TrimSpace(f.slotToken) == "" {
+		return nil, false
+	}
+	if f.readyTimer != nil {
+		safeStopTimer(f.readyTimer)
+		f.readyTimer = nil
+	}
+
+	res := &admitResult{
+		slotToken:      f.slotToken,
+		attemptVersion: f.attemptVersion,
+		attemptTicket:  f.attemptTicket,
+	}
+	resp := readyAcquireResponse(token, res)
+	resp.QueryToken = token
+	if resp.Meta == nil && f.attemptVersion > 0 && f.attemptTicket > 0 {
+		resp.Meta = map[string]interface{}{
+			"attemptVersion": f.attemptVersion,
+			"attemptTicket":  int64(f.attemptTicket),
+		}
+	}
+
+	s.removeFlowLocked(f)
+	return resp, true
+}
+
+func (s *flowStore) settleDetachedFlowLocked(f *fqFlow, now time.Time) {
+	if f == nil {
+		return
+	}
+	if f.waiter != nil {
+		s.decrementInFlightLocked(f)
+		f.waiter = nil
+	}
+	f.grantEligible = false
+	if f.timer != nil {
+		safeStopTimer(f.timer)
+		f.timer = nil
+	}
+	if !f.invocationLeaseUntil.IsZero() && now.Before(f.invocationLeaseUntil) {
+		f.expireAt = f.invocationLeaseUntil
+		if s.afterFunc != nil {
+			nowFn := s.nowFn
+			if nowFn == nil {
+				nowFn = time.Now
+			}
+			token := f.Token
+			delay := cleanupDelayUntil(f.expireAt, now)
+			f.timer = s.afterFunc(delay, func() {
+				s.deleteIfExpired(token, nowFn())
+			})
+		}
+		return
+	}
+	s.removeFlowLocked(f)
+}
+
+func (s *flowStore) clearCommittedGrantLocked(f *fqFlow, now time.Time) (ReleaseRequest, bool) {
+	if f == nil {
+		return ReleaseRequest{}, false
+	}
+	releaseReq, hasRelease := s.consumeCommittedGrantLocked(f, now)
+	s.settleDetachedFlowLocked(f, now)
+	return releaseReq, hasRelease
+}
+
+func (s *flowStore) consumeCommittedGrantLocked(f *fqFlow, now time.Time) (ReleaseRequest, bool) {
+	if f == nil {
+		return ReleaseRequest{}, false
+	}
+	releaseReq := ReleaseRequest{}
+	hasRelease := false
+	if slotToken := strings.TrimSpace(f.slotToken); slotToken != "" {
+		releaseReq = ReleaseRequest{
+			Hostname:      f.Hostname,
+			HostnameHash:  f.HostnameHash,
+			IPBucket:      f.IPBucket,
+			SiteBucket:    f.SiteBucket,
+			SlotToken:     slotToken,
+			HitUpstreamAt: now.UnixMilli(),
+			Now:           now.UnixMilli(),
+		}
+		hasRelease = true
+	}
+	if f.readyTimer != nil {
+		safeStopTimer(f.readyTimer)
+		f.readyTimer = nil
+	}
+	f.grantCommitted = false
+	f.readyLatchedAt = time.Time{}
+	f.readyLatchedUntil = time.Time{}
+	f.slotToken = ""
+	f.attemptVersion = 0
+	f.attemptTicket = 0
+	return releaseReq, hasRelease
+}
+
+func (s *flowStore) expireReadyLatchLocked(f *fqFlow, now time.Time) (bool, ReleaseRequest, bool) {
+	if f == nil {
+		return false, ReleaseRequest{}, false
+	}
+	if f.readyLatchedUntil.IsZero() || now.Before(f.readyLatchedUntil) {
+		return false, ReleaseRequest{}, false
+	}
+	releaseReq, hasRelease := s.clearCommittedGrantLocked(f, now)
+	return true, releaseReq, hasRelease
+}
+
+func (s *flowStore) clearCommittedGrantForProbe(token string, now time.Time) (ReleaseRequest, bool) {
+	if s == nil || token == "" {
+		return ReleaseRequest{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return ReleaseRequest{}, false
+	}
+	if !f.grantCommitted {
+		if isFlowExpiredAt(f, now) {
+			s.removeFlowLocked(f)
+		}
+		return ReleaseRequest{}, false
+	}
+	return s.clearCommittedGrantLocked(f, now)
+}
+
+func (s *flowStore) expireReadyLatchForProbe(token string, now time.Time) (bool, ReleaseRequest, bool) {
+	if s == nil || token == "" {
+		return false, ReleaseRequest{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return false, ReleaseRequest{}, false
+	}
+	expired, releaseReq, hasRelease := s.expireReadyLatchLocked(f, now)
+	if !expired && isFlowExpiredAt(f, now) {
+		s.expireFlowLocked(f, now)
+	}
+	return expired, releaseReq, hasRelease
+}
+
+func (s *flowStore) expireReadyLatch(token string, now time.Time) bool {
+	if s == nil || token == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return false
+	}
+	expired, _, _ := s.expireReadyLatchLocked(f, now)
+	if !expired && isFlowExpiredAt(f, now) {
+		s.removeFlowLocked(f)
+	}
+	return expired
 }
 
 func canonicalSiteBucket(raw string) string {
@@ -143,11 +677,11 @@ func (s *flowStore) incrementLocalVT(token string) (uint64, bool) {
 	return f.LocalVT, true
 }
 
-// trySelectInFlight verifies the flow is still eligible for in-flight scheduling
-// and atomically advances its LocalVT.
+// trySelectInFlight verifies the flow is still grant-eligible for immediate DB
+// admission.
 //
-// This is used by the in-flight host scheduler to avoid selecting detached or
-// expired flows.
+// This is used after the host scheduler orders the broader live queue-visible
+// candidate universe and needs a final authoritative admission check.
 func (s *flowStore) trySelectInFlight(token string, hostKey string, now time.Time) (fqFlowSnapshot, bool) {
 	if s == nil || token == "" || hostKey == "" {
 		return fqFlowSnapshot{}, false
@@ -171,26 +705,11 @@ func (s *flowStore) trySelectInFlight(token string, hostKey string, now time.Tim
 	if key != hostKey {
 		return fqFlowSnapshot{}, false
 	}
-	if f.waiter == nil {
+	if !isGrantEligibleAt(f, now) {
 		return fqFlowSnapshot{}, false
 	}
 
-	f.LocalVT++
-	return fqFlowSnapshot{
-		Token:                 f.Token,
-		Hostname:              f.Hostname,
-		HostnameHash:          f.HostnameHash,
-		IPBucket:              f.IPBucket,
-		SiteBucket:            f.SiteBucket,
-		BreakerEnabled:        f.BreakerEnabled,
-		HalfOpenMaxProbeCount: f.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    f.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   f.HalfOpenTimeoutMode,
-		CreatedAt:             f.CreatedAt,
-		LocalVT:               f.LocalVT,
-		HasWaiter:             true,
-		ExpireAt:              f.expireAt,
-	}, true
+	return snapshotFromFlow(f), true
 }
 
 // listInFlightByHost returns snapshots of flows that currently have an attached
@@ -208,7 +727,7 @@ func (s *flowStore) listInFlightByHost(hostKey string, now time.Time) []fqFlowSn
 		s.listInFlightByHostHook(hostKey)
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	actions := make([]flowExpiryAction, 0)
 
 	// Only flows with a live attached waiter are candidates for the in-flight scheduler.
 	// Iterate host-local tokens and prune stale entries opportunistically.
@@ -222,32 +741,20 @@ func (s *flowStore) listInFlightByHost(hostKey string, now time.Time) []fqFlowSn
 		}
 		if isFlowExpiredAt(f, now) {
 			delete(bucket, token)
-			s.removeFlowLocked(f)
+			actions = append(actions, s.expireFlowLocked(f, now))
 			continue
 		}
-		if fqHostKey(f.HostnameHash, f.Hostname) != hostKey || f.waiter == nil {
+		if fqHostKey(f.HostnameHash, f.Hostname) != hostKey || !isGrantEligibleAt(f, now) {
 			delete(bucket, token)
 			continue
 		}
-		res = append(res, fqFlowSnapshot{
-			Token:                 f.Token,
-			Hostname:              f.Hostname,
-			HostnameHash:          f.HostnameHash,
-			IPBucket:              f.IPBucket,
-			SiteBucket:            f.SiteBucket,
-			BreakerEnabled:        f.BreakerEnabled,
-			HalfOpenMaxProbeCount: f.HalfOpenMaxProbeCount,
-			HalfOpenMaxSeconds:    f.HalfOpenMaxSeconds,
-			HalfOpenTimeoutMode:   f.HalfOpenTimeoutMode,
-			CreatedAt:             f.CreatedAt,
-			LocalVT:               f.LocalVT,
-			HasWaiter:             true,
-			ExpireAt:              f.expireAt,
-		})
+		res = append(res, snapshotFromFlow(f))
 	}
 	if len(bucket) == 0 {
 		delete(s.hostInFlightTokens, hostKey)
 	}
+	s.mu.Unlock()
+	s.dispatchInvocationExpiry(actions)
 	return res
 }
 
@@ -334,6 +841,16 @@ func safeStopTimer(t *time.Timer) {
 		_ = recover()
 	}()
 	t.Stop()
+}
+
+func cleanupDelayUntil(expireAt, now time.Time) time.Duration {
+	if expireAt.IsZero() {
+		return 0
+	}
+	if !expireAt.After(now) {
+		return 0
+	}
+	return expireAt.Sub(now)
 }
 
 func (s *flowStore) addHostInFlightTokenLocked(f *fqFlow) {
@@ -451,6 +968,7 @@ func (s *flowStore) removeFlowLocked(f *fqFlow) {
 	if f == nil {
 		return
 	}
+	hostKey := fqHostKey(f.HostnameHash, f.Hostname)
 	if f.waiter != nil {
 		s.decrementInFlightLocked(f)
 	}
@@ -458,7 +976,21 @@ func (s *flowStore) removeFlowLocked(f *fqFlow) {
 		safeStopTimer(f.timer)
 		f.timer = nil
 	}
+	if f.readyTimer != nil {
+		safeStopTimer(f.readyTimer)
+		f.readyTimer = nil
+	}
 	delete(s.byToken, f.Token)
+	if hostKey != "" && !s.hostHasQueueVisibleFlowLocked(hostKey, s.nowLocked()) {
+		delete(s.hostSchedulerSites, hostKey)
+	}
+}
+
+func (s *flowStore) nowLocked() time.Time {
+	if s != nil && s.nowFn != nil {
+		return s.nowFn()
+	}
+	return time.Now()
 }
 
 // countInFlightLocked is kept for debugging/verification purposes.
@@ -594,6 +1126,7 @@ func (s *flowStore) attachWaiter(token string, w *fqWaiter, now time.Time) (ok b
 		f.timer = nil
 	}
 	f.waiter = w
+	f.grantEligible = !f.grantCommitted
 	s.incrementInFlightLocked(f)
 	return true, nil
 }
@@ -634,6 +1167,7 @@ func (s *flowStore) attachWaiterWithLimits(token string, w *fqWaiter, now time.T
 		f.timer = nil
 	}
 	f.waiter = w
+	f.grantEligible = !f.grantCommitted
 	s.incrementInFlightLocked(f)
 	return true, nil
 }
@@ -653,6 +1187,32 @@ func (s *flowStore) detachWaiter(token string) bool {
 		s.decrementInFlightLocked(f)
 	}
 	f.waiter = nil
+	f.grantEligible = false
+	return true
+}
+
+// settleDetachedFlow settles a flow only if it is still detached. If a
+// replacement waiter has already reattached on the same token, leave that newer
+// waiter state intact.
+func (s *flowStore) settleDetachedFlow(token string, now time.Time) bool {
+	if token == "" {
+		return false
+	}
+	if s == nil {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return false
+	}
+	if f.waiter != nil {
+		return false
+	}
+	s.settleDetachedFlowLocked(f, now)
 	return true
 }
 
@@ -683,32 +1243,40 @@ func (s *flowStore) detachWithGrace(token string, now time.Time) {
 		s.decrementInFlightLocked(f)
 	}
 	f.waiter = nil
-	if f.timer != nil {
-		safeStopTimer(f.timer)
-		f.timer = nil
-	}
+	f.grantEligible = false
 	if s.grace <= 0 {
+		if f.timer != nil {
+			safeStopTimer(f.timer)
+			f.timer = nil
+		}
 		s.removeFlowLocked(f)
 		s.mu.Unlock()
 		return
 	}
 
 	newExpireAt := now.Add(s.grace)
-	if !f.expireAt.IsZero() && f.expireAt.Equal(newExpireAt) {
-		// Avoid re-scheduling identical timers.
+	if !f.invocationLeaseUntil.IsZero() {
+		newExpireAt = f.invocationLeaseUntil
+	}
+	if !f.expireAt.IsZero() && f.expireAt.Equal(newExpireAt) && f.timer != nil {
+		// Keep the existing cleanup timer when expiry is unchanged.
 		s.mu.Unlock()
 		return
 	}
+	if f.timer != nil {
+		safeStopTimer(f.timer)
+		f.timer = nil
+	}
 	f.expireAt = newExpireAt
 	after := s.afterFunc
-	grace := s.grace
 	nowFn := s.nowFn
 	if nowFn == nil {
 		nowFn = time.Now
 	}
 	if after != nil {
+		delay := cleanupDelayUntil(f.expireAt, now)
 		// Ensure detached flows get deleted even if no future requests arrive.
-		f.timer = after(grace, func() {
+		f.timer = after(delay, func() {
 			s.deleteIfExpired(token, nowFn())
 		})
 	}
@@ -733,14 +1301,53 @@ func (s *flowStore) refreshGrace(token string, now time.Time) bool {
 	}
 
 	f.expireAt = now.Add(s.grace)
+	if !f.invocationLeaseUntil.IsZero() {
+		f.expireAt = f.invocationLeaseUntil
+	}
 	after := s.afterFunc
-	grace := s.grace
 	nowFn := s.nowFn
 	if nowFn == nil {
 		nowFn = time.Now
 	}
 	if after != nil {
-		f.timer = after(grace, func() {
+		delay := cleanupDelayUntil(f.expireAt, now)
+		f.timer = after(delay, func() {
+			s.deleteIfExpired(token, nowFn())
+		})
+	}
+	return true
+}
+
+func (s *flowStore) rearmExpiryTimer(token string, now time.Time) bool {
+	if token == "" {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil || f.waiter != nil || isFlowExpiredAt(f, now) {
+		return false
+	}
+	if f.timer != nil {
+		safeStopTimer(f.timer)
+		f.timer = nil
+	}
+	if f.expireAt.IsZero() {
+		f.expireAt = now.Add(s.grace)
+		if !f.invocationLeaseUntil.IsZero() {
+			f.expireAt = f.invocationLeaseUntil
+		}
+	}
+	after := s.afterFunc
+	nowFn := s.nowFn
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	if after != nil {
+		delay := cleanupDelayUntil(f.expireAt, now)
+		f.timer = after(delay, func() {
 			s.deleteIfExpired(token, nowFn())
 		})
 	}
@@ -782,21 +1389,7 @@ func (s *flowStore) getSnapshot(token string) (fqFlowSnapshot, bool) {
 	if f == nil {
 		return fqFlowSnapshot{}, false
 	}
-	return fqFlowSnapshot{
-		Token:                 f.Token,
-		Hostname:              f.Hostname,
-		HostnameHash:          f.HostnameHash,
-		IPBucket:              f.IPBucket,
-		SiteBucket:            f.SiteBucket,
-		BreakerEnabled:        f.BreakerEnabled,
-		HalfOpenMaxProbeCount: f.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    f.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   f.HalfOpenTimeoutMode,
-		CreatedAt:             f.CreatedAt,
-		LocalVT:               f.LocalVT,
-		HasWaiter:             f.waiter != nil,
-		ExpireAt:              f.expireAt,
-	}, true
+	return snapshotFromFlow(f), true
 }
 
 func (s *flowStore) isAlive(token string, now time.Time) bool {
@@ -812,38 +1405,90 @@ func (s *flowStore) isAlive(token string, now time.Time) bool {
 
 func (s *flowStore) deleteIfExpired(token string, now time.Time) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	f := s.byToken[token]
 	if f == nil {
+		s.mu.Unlock()
 		return false
 	}
 	if !isFlowExpiredAt(f, now) {
+		s.mu.Unlock()
 		return false
 	}
-	s.removeFlowLocked(f)
+	action := s.expireFlowLocked(f, now)
+	s.mu.Unlock()
+	s.dispatchInvocationExpiry([]flowExpiryAction{action})
 	return true
 }
 
 func (s *flowStore) pruneExpired(now time.Time) int {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	deleted := 0
+	actions := make([]flowExpiryAction, 0)
 	for _, f := range s.byToken {
 		if f == nil {
 			continue
 		}
 		if isFlowExpiredAt(f, now) {
-			s.removeFlowLocked(f)
+			actions = append(actions, s.expireFlowLocked(f, now))
 			deleted++
 		}
 	}
+	s.mu.Unlock()
+	s.dispatchInvocationExpiry(actions)
 	return deleted
 }
 
+func (s *flowStore) abandonFlow(token string, now time.Time) (ReleaseRequest, bool, bool) {
+	if s == nil || token == "" {
+		return ReleaseRequest{}, false, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil {
+		return ReleaseRequest{}, false, false
+	}
+	releaseReq, hasRelease := s.consumeCommittedGrantLocked(f, now)
+	s.removeFlowLocked(f)
+	return releaseReq, hasRelease, true
+}
+
+func (s *flowStore) expireFlowLocked(f *fqFlow, now time.Time) flowExpiryAction {
+	action := flowExpiryAction{}
+	if f == nil {
+		return action
+	}
+	action.token = f.Token
+	action.hostKey = fqHostKey(f.HostnameHash, f.Hostname)
+	action.releaseReq, action.hasRelease = s.consumeCommittedGrantLocked(f, now)
+	action.expired = true
+	s.removeFlowLocked(f)
+	return action
+}
+
+func (s *flowStore) dispatchInvocationExpiry(actions []flowExpiryAction) {
+	if s == nil || len(actions) == 0 || s.onInvocationLeaseExpired == nil {
+		return
+	}
+	for _, action := range actions {
+		if !action.expired {
+			continue
+		}
+		s.onInvocationLeaseExpired(action.token, action.releaseReq, action.hasRelease, action.hostKey)
+	}
+}
+
 func isFlowExpiredAt(f *fqFlow, now time.Time) bool {
-	if f == nil || f.expireAt.IsZero() {
+	if f == nil {
+		return false
+	}
+	if !f.invocationLeaseUntil.IsZero() && !now.Before(f.invocationLeaseUntil) {
+		return true
+	}
+	if f.expireAt.IsZero() {
 		return false
 	}
 	// Boundary semantics: now >= expireAt => expired.

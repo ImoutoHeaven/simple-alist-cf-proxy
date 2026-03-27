@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -221,6 +222,221 @@ func TestReleaseNilActiveSlotsDoesNotWakeHostProbeRunnerEarly(t *testing.T) {
 	case <-backend.probeCh:
 	case <-time.After(pollInterval + 100*time.Millisecond):
 		t.Fatalf("expected host probe runner to fall back to polling when activeSlots is nil")
+	}
+}
+
+func TestReactorIdleDoesNotSpinWhileWaitingForFarFutureDeadline(t *testing.T) {
+	backend := &probeWakeBackend{probeCh: make(chan time.Time, 4)}
+	pollInterval := 20 * time.Millisecond
+	denyDelay := 250 * time.Millisecond
+	cfg := &Config{FairQueue: FairQueueConfig{
+		PollIntervalMs:     pollInterval.Milliseconds(),
+		MaxBatch:           1,
+		MaxProbeParallel:   1,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	defer s.stopAllHostProbeRunners()
+
+	now := time.Now()
+	hostKey := "example.com"
+	tok := attachProbeWakeWaiter(t, s, "", hostKey, "ip-denied-idle", "s1", now)
+	s.getOrCreateFlowScheduler(hostKey).setBucketDenyUntil("s1", "ip-denied-idle", now.Add(denyDelay))
+
+	var inspections int32
+	s.flowStore.listInFlightByHostHook = func(gotHostKey string) {
+		if gotHostKey == hostKey {
+			atomic.AddInt32(&inspections, 1)
+		}
+	}
+
+	s.ensureHostProbeRunner(hostKey)
+
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for atomic.LoadInt32(&inspections) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&inspections); got == 0 {
+		t.Fatalf("expected reactor to inspect denied host at least once")
+	}
+
+	time.Sleep(90 * time.Millisecond)
+	if got := atomic.LoadInt32(&inspections); got > 2 {
+		t.Fatalf("expected reactor to stay idle until the distant deadline, got %d inspections for token %s", got, tok)
+	}
+
+	select {
+	case probeAt := <-backend.probeCh:
+		t.Fatalf("expected no backend probe before deny deadline, got %s after start", probeAt.Sub(now))
+	default:
+	}
+}
+
+func TestReactorQpsWakeStillGatesDBProbes(t *testing.T) {
+	backend := &probeWakeBackend{probeCh: make(chan time.Time, 8)}
+	pollInterval := 900 * time.Millisecond
+	cfg := &Config{FairQueue: FairQueueConfig{
+		PollIntervalMs:     pollInterval.Milliseconds(),
+		MaxBatch:           1,
+		MaxProbeParallel:   1,
+		MaxProbeQpsPerHost: 1,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	defer s.stopAllHostProbeRunners()
+
+	now := time.Now()
+	hostKey := "example.com"
+	attachProbeWakeWaiter(t, s, "", hostKey, "ip-qps", "s1", now)
+
+	s.ensureHostProbeRunner(hostKey)
+
+	select {
+	case <-backend.probeCh:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatalf("expected initial probe on runner wake")
+	}
+
+	for i := 0; i < 4; i++ {
+		s.wakeHostProbeRunner(hostKey)
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	select {
+	case probeAt := <-backend.probeCh:
+		t.Fatalf("expected repeated wakes to respect QPS gate, got second probe after %s", probeAt.Sub(now))
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	select {
+	case <-backend.probeCh:
+	case <-time.After(1300 * time.Millisecond):
+		t.Fatalf("expected reactor to wake again once QPS budget refilled")
+	}
+}
+
+func TestReactorDeadlineWakeUsesDenyUntilInsteadOfFullPollInterval(t *testing.T) {
+	backend := &probeWakeBackend{probeCh: make(chan time.Time, 4)}
+	pollInterval := 600 * time.Millisecond
+	denyDelay := 120 * time.Millisecond
+	cfg := &Config{FairQueue: FairQueueConfig{
+		PollIntervalMs:     pollInterval.Milliseconds(),
+		MaxBatch:           1,
+		MaxProbeParallel:   1,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	defer s.stopAllHostProbeRunners()
+
+	now := time.Now()
+	hostKey := "example.com"
+	attachProbeWakeWaiter(t, s, "", hostKey, "ip-denied-deadline", "s1", now)
+	s.getOrCreateFlowScheduler(hostKey).setBucketDenyUntil("s1", "ip-denied-deadline", now.Add(denyDelay))
+
+	start := time.Now()
+	s.ensureHostProbeRunner(hostKey)
+
+	select {
+	case probeAt := <-backend.probeCh:
+		if delay := probeAt.Sub(start); delay > pollInterval/2 {
+			t.Fatalf("expected deny deadline to wake reactor before poll interval, got probe after %s", delay)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("expected deny deadline wake to trigger a backend probe before the full poll interval")
+	}
+}
+
+func TestReactorActiveLeasePruneWakeBeforeLaterFlowDeadline(t *testing.T) {
+	backend := &probeWakeBackend{probeCh: make(chan time.Time, 4)}
+	hostCap := 1
+	pollInterval := 3 * time.Second
+	cfg := &Config{FairQueue: FairQueueConfig{
+		PollIntervalMs:       pollInterval.Milliseconds(),
+		MaxBatch:             1,
+		MaxProbeParallel:     1,
+		MaxProbeQpsPerHost:   100,
+		ZombieTimeoutSeconds: 1,
+		HostCaps: HostCapsConfig{
+			MaxSlotPerHost: &hostCap,
+		},
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+	defer s.stopAllHostProbeRunners()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	now := time.Now()
+	hostKey := "example.com"
+	tok := attachProbeWakeWaiter(t, s, "", hostKey, "ip-waiting", "s1", now)
+	if !s.flowStore.renewInvocationLease(tok, now.Add(10*time.Second)) {
+		t.Fatalf("expected waiting flow to retain a later lease deadline")
+	}
+	s.activeSlots.AddLease("slot-expiring", hostKey, "s1", "ip-held", 50*time.Millisecond, now)
+
+	s.ensureHostProbeRunner(hostKey)
+	s.startActiveLeasePrune(ctx)
+
+	time.Sleep(120 * time.Millisecond)
+	select {
+	case probeAt := <-backend.probeCh:
+		t.Fatalf("expected no probe before prune-driven capacity release, got probe after %s", probeAt.Sub(now))
+	default:
+	}
+
+	pruneDeadline := time.Now().Add(1500 * time.Millisecond)
+	for s.activeSlots.ActiveHostNoPrune(hostKey) != 0 && time.Now().Before(pruneDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := s.activeSlots.ActiveHostNoPrune(hostKey); got != 0 {
+		t.Fatalf("expected prune loop to clear expired active lease, got %d", got)
+	}
+
+	select {
+	case probeAt := <-backend.probeCh:
+		if delay := probeAt.Sub(now); delay >= pollInterval/2 {
+			t.Fatalf("expected prune wake before later poll/deadline, got probe after %s", delay)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("expected active lease prune to wake reactor once host capacity was freed")
+	}
+}
+
+func TestReactorUsesFlowStoreClockForLeaseVisibility(t *testing.T) {
+	backend := &probeWakeBackend{probeCh: make(chan time.Time, 2)}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		PollIntervalMs:     20,
+		MaxBatch:           1,
+		MaxProbeParallel:   1,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	defer s.stopAllHostProbeRunners()
+
+	flowNow := time.Unix(1_700_000_900, 0)
+	s.flowStore.nowFn = func() time.Time { return flowNow }
+
+	hostKey := "example.com"
+	tok := attachProbeWakeWaiter(t, s, "", hostKey, "ip-clock", "s1", flowNow)
+	if !s.flowStore.renewInvocationLease(tok, flowNow.Add(10*time.Second)) {
+		t.Fatalf("expected invocation lease renew to succeed")
+	}
+
+	s.ensureHostProbeRunner(hostKey)
+
+	select {
+	case <-backend.probeCh:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected reactor to probe using flow-store clock domain")
+	}
+
+	if _, ok := s.flowStore.getSnapshot(tok); !ok {
+		t.Fatalf("expected reactor not to prune a lease that is still live in flow-store time")
 	}
 }
 

@@ -5,6 +5,170 @@ import (
 	"time"
 )
 
+func TestFlowDetachVisibleKeepsBucketWRROrderAcrossReattach(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	now := time.Date(2026, 3, 27, 9, 0, 0, 0, time.UTC)
+	tokDetached := store.newFlow("h1", "example.com", "ip-detached", "s1")
+	tokOther := store.newFlow("h1", "example.com", "ip-other", "s1")
+	renewFlowLease(t, store, tokDetached, now.Add(30*time.Second))
+
+	if ok, err := store.attachWaiter(tokDetached, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter detached flow ok=%t err=%v", ok, err)
+	}
+	if ok, err := store.attachWaiter(tokOther, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter other flow ok=%t err=%v", ok, err)
+	}
+
+	sched := newFQHostFlowScheduler()
+	_, btDetached := sched.getOrInitStates("s1", "ip-detached")
+	_, btOther := sched.getOrInitStates("s1", "ip-other")
+	if btDetached == nil || btOther == nil {
+		t.Fatalf("expected scheduler buckets")
+	}
+	btDetached.VirtualTime = 10
+	btOther.VirtualTime = 1
+
+	if !store.detachWaiter(tokDetached) {
+		t.Fatalf("expected detached live flow to lose waiter")
+	}
+
+	detached := findFlowSnapshot(t, queueVisibleByHost(t, store, "h1", now.Add(time.Millisecond)), tokDetached)
+	if detached.HasWaiter {
+		t.Fatalf("expected detached live flow to remain queue-visible without waiter")
+	}
+
+	first, ok := sched.PickNextInFlight(store, "h1", now.Add(2*time.Millisecond), nil)
+	if !ok {
+		t.Fatalf("expected first eligible pick after detach")
+	}
+	if first.Token != tokOther {
+		t.Fatalf("expected lower-VT eligible bucket to stay ahead after detach, got %q want %q", first.Token, tokOther)
+	}
+
+	if ok, err := store.attachWaiter(tokDetached, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now.Add(3*time.Millisecond)); !ok || err != nil {
+		t.Fatalf("reattach detached flow ok=%t err=%v", ok, err)
+	}
+
+	second, ok := sched.PickNextInFlight(store, "h1", now.Add(4*time.Millisecond), nil)
+	if !ok {
+		t.Fatalf("expected second eligible pick after reattach")
+	}
+	if second.Token != tokOther {
+		t.Fatalf("expected detached bucket to keep prior WRR position across reattach, got %q want %q", second.Token, tokOther)
+	}
+}
+
+func TestFlowDetachVisibleKeepsBucketWRROrderAcrossHostWideGap(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	now := time.Date(2026, 3, 27, 9, 2, 0, 0, time.UTC)
+	store.nowFn = func() time.Time { return now.Add(time.Millisecond) }
+	tokDetached := store.newFlow("h1", "example.com", "ip-detached", "s1")
+	tokOther := store.newFlow("h1", "example.com", "ip-other", "s1")
+	renewFlowLease(t, store, tokDetached, now.Add(30*time.Second))
+	renewFlowLease(t, store, tokOther, now.Add(30*time.Second))
+
+	if ok, err := store.attachWaiter(tokDetached, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter detached flow ok=%t err=%v", ok, err)
+	}
+	if ok, err := store.attachWaiter(tokOther, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter other flow ok=%t err=%v", ok, err)
+	}
+
+	s := newTestServer()
+	s.flowStore = store
+	s.flowSched = map[string]*fqHostFlowScheduler{}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	_, btDetached := sched.getOrInitStates("s1", "ip-detached")
+	_, btOther := sched.getOrInitStates("s1", "ip-other")
+	if btDetached == nil || btOther == nil {
+		t.Fatalf("expected scheduler buckets")
+	}
+	btDetached.VirtualTime = 10
+	btOther.VirtualTime = 1
+
+	if !store.detachWaiter(tokDetached) {
+		t.Fatalf("expected first waiter detach")
+	}
+	if !store.detachWaiter(tokOther) {
+		t.Fatalf("expected second waiter detach")
+	}
+
+	if inFlight := store.listInFlightByHost("h1", now.Add(time.Millisecond)); len(inFlight) != 0 {
+		t.Fatalf("expected host-wide detach gap to remove all attached waiters, got %+v", inFlight)
+	}
+	if visible := queueVisibleByHost(t, store, "h1", now.Add(time.Millisecond)); len(visible) != 2 {
+		t.Fatalf("expected detached-but-live flows to remain queue-visible across host-wide gap, got %+v", visible)
+	}
+
+	s.deleteFlowScheduler("h1")
+
+	if ok, err := store.attachWaiter(tokDetached, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now.Add(2*time.Millisecond)); !ok || err != nil {
+		t.Fatalf("reattach detached flow ok=%t err=%v", ok, err)
+	}
+	if ok, err := store.attachWaiter(tokOther, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now.Add(2*time.Millisecond)); !ok || err != nil {
+		t.Fatalf("reattach other flow ok=%t err=%v", ok, err)
+	}
+
+	recreated := s.getOrCreateFlowScheduler("h1")
+	first, ok := recreated.PickNextInFlight(store, "h1", now.Add(3*time.Millisecond), nil)
+	if !ok {
+		t.Fatalf("expected first eligible pick after scheduler recreation")
+	}
+	if first.Token != tokOther {
+		t.Fatalf("expected preserved WRR bucket order across host-wide gap, got %q want %q", first.Token, tokOther)
+	}
+}
+
+func TestSchedulerWRRPreservesSiteIPFlowOrderWithLiveDetachedFlows(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	t0 := time.Date(2026, 3, 27, 9, 5, 0, 0, time.UTC)
+	tick := 0
+	store.nowFn = func() time.Time {
+		tick++
+		return t0.Add(time.Duration(tick) * time.Millisecond)
+	}
+
+	now := t0.Add(2 * time.Second)
+	tokDetached := store.newFlow("h1", "example.com", "ip-00-detached", "s1")
+	tokS1Older := store.newFlow("h1", "example.com", "ip-01-live", "s1")
+	tokS2 := store.newFlow("h1", "example.com", "ip-00-live", "s2")
+	tokS1Newer := store.newFlow("h1", "example.com", "ip-01-live", "s1")
+	renewFlowLease(t, store, tokDetached, now.Add(30*time.Second))
+
+	if ok, err := store.attachWaiter(tokDetached, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter detached flow ok=%t err=%v", ok, err)
+	}
+	if !store.detachWaiter(tokDetached) {
+		t.Fatalf("expected detached live flow to drop waiter")
+	}
+	for _, tok := range []string{tokS1Older, tokS2, tokS1Newer} {
+		if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+			t.Fatalf("attachWaiter token=%q ok=%t err=%v", tok, ok, err)
+		}
+	}
+
+	sched := newFQHostFlowScheduler()
+	picks := sched.PickNextInFlightBatch(store, "h1", now, 3, nil)
+	if len(picks) != 3 {
+		t.Fatalf("expected 3 eligible picks, got %d", len(picks))
+	}
+
+	got := []string{picks[0].Token, picks[1].Token, picks[2].Token}
+	want := []string{tokS1Older, tokS2, tokS1Newer}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected site -> ip -> flow(LocalVT) order at %d, got %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestSchedulerOnlyPicksInFlightWaiters(t *testing.T) {
 	store := newFlowStore(0)
 	// Avoid real timers.

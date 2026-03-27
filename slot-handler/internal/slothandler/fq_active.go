@@ -89,6 +89,20 @@ func (t *activeTracker) Prune(now time.Time) {
 	t.mu.Unlock()
 }
 
+func (t *activeTracker) PruneHosts(now time.Time) []string {
+	if t == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return t.pruneLockedHosts(now)
+}
+
 func (t *activeTracker) ActiveHost(host string, now ...time.Time) int {
 	if t == nil || host == "" {
 		return 0
@@ -198,18 +212,34 @@ func (t *activeTracker) ActiveSiteIPNoPrune(host, site, ip string) int {
 }
 
 func (t *activeTracker) pruneLocked(now time.Time) {
+	_ = t.pruneLockedHosts(now)
+}
+
+func (t *activeTracker) pruneLockedHosts(now time.Time) []string {
 	if len(t.leases) == 0 {
-		return
+		return nil
 	}
 	if now.IsZero() {
 		now = time.Now()
 	}
+	affectedHosts := make(map[string]struct{})
 	for token, lease := range t.leases {
 		if !lease.expiresAt.IsZero() && !lease.expiresAt.After(now) {
 			t.decrementCountersLocked(lease.host, lease.site, lease.ip)
 			delete(t.leases, token)
+			if strings.TrimSpace(lease.host) != "" {
+				affectedHosts[lease.host] = struct{}{}
+			}
 		}
 	}
+	if len(affectedHosts) == 0 {
+		return nil
+	}
+	hosts := make([]string, 0, len(affectedHosts))
+	for host := range affectedHosts {
+		hosts = append(hosts, host)
+	}
+	return hosts
 }
 
 func (t *activeTracker) incrementCountersLocked(host, site, ip string) {

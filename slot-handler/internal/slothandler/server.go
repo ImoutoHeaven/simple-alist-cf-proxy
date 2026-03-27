@@ -145,6 +145,14 @@ type AcquireResponse struct {
 	Meta             map[string]interface{} `json:"meta,omitempty"`
 }
 
+type AbandonRequest struct {
+	Hostname     string `json:"hostname"`
+	HostnameHash string `json:"hostnameHash"`
+	IPBucket     string `json:"ipBucket"`
+	SiteBucket   string `json:"siteBucket"`
+	QueryToken   string `json:"queryToken"`
+}
+
 type ReleaseRequest struct {
 	Hostname      string `json:"hostname"`
 	HostnameHash  string `json:"hostnameHash"`
@@ -281,12 +289,16 @@ type metricsSnapshot struct {
 	Timestamp     int64
 	ConfigVersion string
 	Counts        map[string]int64
+	Metrics       map[string]float64
 	Flows         map[string]int
 	SmoothHosts   int
 }
 
 func (m metricsSnapshot) empty() bool {
 	if len(m.Counts) > 0 {
+		return false
+	}
+	if len(m.Metrics) > 0 {
 		return false
 	}
 	if len(m.Flows) == 0 {
@@ -371,6 +383,11 @@ type server struct {
 	configVersion    string
 	metrics          *metricsReporter
 	metricsCounters  *metricsCounters
+	metricSamplesMu  sync.Mutex
+	metricSamples    map[string]float64
+	lastReleaseAt    map[string]time.Time
+	lastProbeAt      map[string]time.Time
+	lastGrantAt      map[string]time.Time
 	overloadLogMu    sync.Mutex
 	overloadLogLast  map[string]time.Time
 }
@@ -447,6 +464,32 @@ func (s *server) shouldLogOverloaded(hostnameHash, hostname, scope string, now t
 	return true
 }
 
+func (s *server) wireFlowStoreRuntimeLocked(cfg *Config) {
+	if s == nil || cfg == nil {
+		return
+	}
+	grace := cfg.FairQueue.graceDuration()
+	if s.flowStore == nil {
+		s.flowStore = newFlowStore(grace)
+	} else {
+		s.flowStore.setGrace(grace)
+	}
+	s.flowStore.onInvocationLeaseExpired = func(token string, releaseReq ReleaseRequest, hasRelease bool, hostKey string) {
+		s.recordInvocationLeaseExpired()
+		if !hasRelease {
+			if hostKey != "" {
+				s.wakeHostProbeRunner(hostKey)
+			}
+			return
+		}
+		s.recordCompensatingRelease()
+		if hostKey != "" {
+			s.wakeHostProbeRunner(hostKey)
+		}
+		s.compensatingReleaseAsync(releaseReq)
+	}
+}
+
 func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion string, resetState bool) {
 	s.mu.Lock()
 	oldBackend := s.backend
@@ -472,12 +515,7 @@ func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion str
 	s.cfg = cfg
 	s.backend = backend
 	if cfg != nil {
-		grace := cfg.FairQueue.graceDuration()
-		if s.flowStore == nil {
-			s.flowStore = newFlowStore(grace)
-		} else {
-			s.flowStore.setGrace(grace)
-		}
+		s.wireFlowStoreRuntimeLocked(cfg)
 	}
 	s.configVersion = cfgVersion
 	s.mu.Unlock()
@@ -497,12 +535,100 @@ func (s *server) incrementMetric(name string) {
 	}
 }
 
+func (s *server) setMetricSample(name string, value float64) {
+	if s == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	s.metricSamplesMu.Lock()
+	if s.metricSamples == nil {
+		s.metricSamples = make(map[string]float64)
+	}
+	s.metricSamples[name] = value
+	s.metricSamplesMu.Unlock()
+}
+
+func (s *server) observeRelease(hostKey string, at time.Time) {
+	if s == nil || strings.TrimSpace(hostKey) == "" || at.IsZero() {
+		return
+	}
+	s.metricSamplesMu.Lock()
+	if s.lastReleaseAt == nil {
+		s.lastReleaseAt = make(map[string]time.Time)
+	}
+	s.lastReleaseAt[hostKey] = at
+	s.metricSamplesMu.Unlock()
+}
+
+func (s *server) observeProbe(hostKey string, at time.Time) {
+	if s == nil || strings.TrimSpace(hostKey) == "" || at.IsZero() {
+		return
+	}
+	probeGap := 0.0
+	s.metricSamplesMu.Lock()
+	if s.lastProbeAt == nil {
+		s.lastProbeAt = make(map[string]time.Time)
+	}
+	if s.lastReleaseAt != nil {
+		if releasedAt := s.lastReleaseAt[hostKey]; !releasedAt.IsZero() && !at.Before(releasedAt) {
+			probeGap = float64(at.Sub(releasedAt).Milliseconds())
+		}
+	}
+	s.lastProbeAt[hostKey] = at
+	s.metricSamplesMu.Unlock()
+	s.setMetricSample("release_to_next_probe_ms", probeGap)
+}
+
+func (s *server) observeGrant(hostKey string, at time.Time) {
+	if s == nil || strings.TrimSpace(hostKey) == "" || at.IsZero() {
+		return
+	}
+	grantGap := 0.0
+	s.metricSamplesMu.Lock()
+	if s.lastGrantAt == nil {
+		s.lastGrantAt = make(map[string]time.Time)
+	}
+	if s.lastReleaseAt != nil {
+		if releasedAt := s.lastReleaseAt[hostKey]; !releasedAt.IsZero() && !at.Before(releasedAt) {
+			grantGap = float64(at.Sub(releasedAt).Milliseconds())
+		}
+	}
+	s.lastGrantAt[hostKey] = at
+	s.metricSamplesMu.Unlock()
+	s.setMetricSample("release_to_next_grant_ms", grantGap)
+}
+
+func (s *server) recordGrantCommitted(hostKey string, at time.Time) {
+	s.incrementMetric("grant_committed_count")
+	s.observeGrant(hostKey, at)
+}
+
+func (s *server) recordGrantClaimed() {
+	s.incrementMetric("grant_claimed_count")
+}
+
+func (s *server) recordReadyLatchExpired() {
+	s.incrementMetric("ready_latch_expire_count")
+}
+
+func (s *server) recordInvocationLeaseExpired() {
+	s.incrementMetric("invocation_lease_expire_count")
+}
+
+func (s *server) recordCompensatingRelease() {
+	s.incrementMetric("compensating_release_count")
+}
+
 func (s *server) collectMetricsSnapshot() metricsSnapshot {
 	counts := s.metricsCounters.snapshotAndReset()
 	if counts == nil {
 		counts = make(map[string]int64)
 	}
 	for _, key := range []string{"flow_created", "granted", "throttled", "timeout", "released", "token_stale", "token_mismatch", "overloaded", "overloaded_global", "overloaded_host", "overloaded_site", "overloaded_ip", "overloaded_unknown"} {
+		if _, ok := counts[key]; !ok {
+			counts[key] = 0
+		}
+	}
+	for _, key := range []string{"ready_latch_expire_count", "invocation_lease_expire_count", "compensating_release_count", "grant_committed_count", "grant_claimed_count"} {
 		if _, ok := counts[key]; !ok {
 			counts[key] = 0
 		}
@@ -520,6 +646,14 @@ func (s *server) collectMetricsSnapshot() metricsSnapshot {
 	s.mu.RUnlock()
 	if store != nil {
 		store.mu.Lock()
+		queueVisibleCount := 0
+		grantEligibleCount := 0
+		readyLatchedCount := 0
+		readyLatchAgeTotalMs := 0.0
+		now := time.Now()
+		if store.nowFn != nil {
+			now = store.nowFn()
+		}
 		for _, f := range store.byToken {
 			if f == nil {
 				continue
@@ -533,8 +667,71 @@ func (s *server) collectMetricsSnapshot() metricsSnapshot {
 					flows["grace"]++
 				}
 			}
+			if isQueueVisibleAt(f, now) {
+				queueVisibleCount++
+			}
+			if isGrantEligibleAt(f, now) {
+				grantEligibleCount++
+			}
+			if !f.readyLatchedUntil.IsZero() && now.Before(f.readyLatchedUntil) {
+				readyLatchedCount++
+				if !f.readyLatchedAt.IsZero() && !now.Before(f.readyLatchedAt) {
+					readyLatchAgeTotalMs += float64(now.Sub(f.readyLatchedAt).Milliseconds())
+				}
+			}
 		}
 		store.mu.Unlock()
+		s.setMetricSample("queue_visible_flow_count", float64(queueVisibleCount))
+		s.setMetricSample("grant_eligible_flow_count", float64(grantEligibleCount))
+		s.setMetricSample("ready_latched_count", float64(readyLatchedCount))
+		if readyLatchedCount == 0 {
+			s.setMetricSample("ready_latch_age_ms", 0)
+		} else {
+			s.setMetricSample("ready_latch_age_ms", readyLatchAgeTotalMs/float64(readyLatchedCount))
+		}
+	}
+
+	idleProbeRatio := 0.0
+	if cfg := s.getConfig(); cfg != nil {
+		windowSize := cfg.FairQueue.utilWindowSeconds()
+		if windowSize <= 0 {
+			windowSize = 1
+		}
+		var totalRatio float64
+		var totalWindows int
+		s.utilMu.Lock()
+		for _, win := range s.utilHost {
+			if win == nil || win.count == 0 {
+				continue
+			}
+			totalWindows++
+			nonIdle := 0
+			for i := 0; i < win.count; i++ {
+				sample := win.samples[i]
+				if sample.active > 0 {
+					nonIdle++
+				}
+			}
+			idle := win.count - nonIdle
+			totalRatio += float64(idle) / float64(win.count)
+		}
+		s.utilMu.Unlock()
+		if totalWindows > 0 {
+			idleProbeRatio = totalRatio / float64(totalWindows)
+		}
+	}
+	s.setMetricSample("idle_probe_ratio", idleProbeRatio)
+
+	s.metricSamplesMu.Lock()
+	metrics := make(map[string]float64, len(s.metricSamples)+8)
+	for k, v := range s.metricSamples {
+		metrics[k] = v
+	}
+	s.metricSamplesMu.Unlock()
+	for _, key := range []string{"release_to_next_probe_ms", "release_to_next_grant_ms", "idle_probe_ratio", "queue_visible_flow_count", "grant_eligible_flow_count", "ready_latched_count", "ready_latch_age_ms"} {
+		if _, ok := metrics[key]; !ok {
+			metrics[key] = 0
+		}
 	}
 
 	smoothHosts := 0
@@ -548,6 +745,7 @@ func (s *server) collectMetricsSnapshot() metricsSnapshot {
 		Timestamp:     time.Now().UnixMilli(),
 		ConfigVersion: s.getConfigVersion(),
 		Counts:        counts,
+		Metrics:       metrics,
 		Flows:         flows,
 		SmoothHosts:   smoothHosts,
 	}
@@ -862,6 +1060,7 @@ func (m *metricsReporter) sendSnapshot(ctx context.Context, meta runtimeMeta, sn
 		"ts":            snap.Timestamp,
 		"configVersion": snap.ConfigVersion,
 		"counts":        snap.Counts,
+		"metrics":       snap.Metrics,
 		"flows":         snap.Flows,
 		"smoothHosts":   snap.SmoothHosts,
 	}
@@ -1374,6 +1573,48 @@ func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ReleaseResponse{Result: "ok"})
 }
 
+func (s *server) handleAbandon(w http.ResponseWriter, r *http.Request) {
+	if !s.authPassed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	defer r.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+	var req AbandonRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.QueryToken) == "" {
+		http.Error(w, "queryToken is required", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.RLock()
+	store := s.flowStore
+	s.mu.RUnlock()
+	if store == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	now := s.flowStoreNow()
+	releaseReq, hasRelease, removed := store.abandonFlow(strings.TrimSpace(req.QueryToken), now)
+	if removed && hasRelease {
+		s.recordCompensatingRelease()
+		hostKey := fqHostKey(releaseReq.HostnameHash, releaseReq.Hostname)
+		if hostKey != "" {
+			s.wakeHostProbeRunner(hostKey)
+		}
+		s.compensatingReleaseAsync(releaseReq)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *server) handleAcquireSlot(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
 	return s.handleAcquireSlotFlow(ctx, req)
 }
@@ -1473,7 +1714,13 @@ func (s *server) startActiveLeasePrune(ctx context.Context) {
 			}
 
 			if s.activeSlots != nil {
-				s.activeSlots.Prune(time.Now())
+				now := time.Now()
+				for _, hostKey := range s.activeSlots.PruneHosts(now) {
+					if strings.TrimSpace(hostKey) == "" {
+						continue
+					}
+					s.wakeHostProbeRunner(hostKey)
+				}
 			}
 		}
 	}()
@@ -1686,6 +1933,7 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 	if s.activeSlots != nil {
 		s.activeSlots.ReleaseLease(req.SlotToken)
 		hostKey := strings.TrimSpace(fqHostKey(req.HostnameHash, req.Hostname))
+		s.observeRelease(hostKey, now)
 		if hostKey != "" {
 			s.wakeHostProbeRunner(hostKey)
 		}
@@ -2163,6 +2411,9 @@ func Main() {
 		metricsCounters:  metricsCounters,
 		activeSlots:      newActiveTracker(),
 	}
+	s.mu.Lock()
+	s.wireFlowStoreRuntimeLocked(&cfg)
+	s.mu.Unlock()
 	s.startFairQueueCleanup(gcCtx)
 	s.startActiveLeasePrune(gcCtx)
 	s.startRuntimeStatePrune(gcCtx)
@@ -2173,6 +2424,7 @@ func Main() {
 	mux.HandleFunc("/api/v0/refresh", s.handleInternalRefresh)
 	mux.HandleFunc("/api/v0/flush", s.handleInternalFlush)
 	mux.HandleFunc("/api/v1/fairqueue/acquire", s.handleAcquire)
+	mux.HandleFunc("/api/v1/fairqueue/abandon", s.handleAbandon)
 	mux.HandleFunc("/api/v1/fairqueue/release", s.handleRelease)
 
 	httpServer := &http.Server{

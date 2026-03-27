@@ -11,6 +11,25 @@ const overloadRetryAfterSeconds = 1
 
 const overloadScopedFallback = "host"
 
+func acquireInvocationLeaseDuration(cfg *Config) time.Duration {
+	if cfg == nil {
+		return 10 * time.Second
+	}
+	pollWindow := cfg.FairQueue.pollWindowDuration()
+	reconnectSlack := cfg.FairQueue.graceDuration()
+	if pollWindow < 0 {
+		pollWindow = 0
+	}
+	if reconnectSlack < 0 {
+		reconnectSlack = 0
+	}
+	lease := pollWindow + reconnectSlack
+	if lease <= 0 {
+		return 10 * time.Second
+	}
+	return lease
+}
+
 func overloadedResponse(scope string) *AcquireResponse {
 	resolved := strings.TrimSpace(scope)
 	if resolved == "" {
@@ -55,6 +74,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		s.mu.Lock()
 		if s.flowStore == nil {
 			s.flowStore = newFlowStore(grace)
+			s.wireFlowStoreRuntimeLocked(cfg)
 		}
 		store = s.flowStore
 		s.mu.Unlock()
@@ -65,6 +85,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		nowFn = store.nowFn
 	}
 	now := nowFn()
+	leaseUntil := now.Add(acquireInvocationLeaseDuration(cfg))
 	req.SiteBucket = canonicalSiteBucket(req.SiteBucket)
 	hostKey := fqHostKey(req.HostnameHash, req.Hostname)
 	limits := cfg.FairQueue.inFlightLimits()
@@ -85,6 +106,15 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			s.incrementMetric("token_mismatch")
 			return &AcquireResponse{Result: "timeout", Reason: "query_token_mismatch"}, nil
 		}
+		if !store.renewInvocationLease(token, leaseUntil) {
+			store.deleteIfExpired(token, now)
+			s.incrementMetric("token_stale")
+			return &AcquireResponse{Result: "timeout", Reason: "query_token_stale"}, nil
+		}
+		if resp, ok := store.takeReadyLatched(token, now); ok {
+			s.recordGrantClaimed()
+			return resp, nil
+		}
 	}
 
 	createdNew := false
@@ -93,6 +123,10 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			return overloadedResponse(scope), nil
 		}
 		token = store.newFlowFromAcquireRequest(req)
+		if !store.renewInvocationLease(token, leaseUntil) {
+			store.deleteFlow(token)
+			return nil, errors.New("failed to initialize invocation lease")
+		}
 		createdNew = true
 		s.incrementMetric("flow_created")
 	}
@@ -108,6 +142,8 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			if requestedToken != "" {
 				if scope != "global" {
 					store.refreshGrace(token, nowFn())
+				} else {
+					store.rearmExpiryTimer(token, nowFn())
 				}
 			} else if createdNew {
 				store.deleteFlow(token)
@@ -189,7 +225,11 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			}
 			go s.releaseSlot(context.Background(), releaseReq)
 		}
-		store.deleteFlow(token)
+		if requestedToken != "" && releaseResp == nil {
+			store.settleDetachedFlow(token, nowFn())
+		} else {
+			store.deleteFlow(token)
+		}
 		return ctx.Err()
 	}
 
