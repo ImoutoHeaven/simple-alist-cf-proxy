@@ -42,7 +42,7 @@ func TestHostInFlightIndexTracksAttachDetachAndDelete(t *testing.T) {
 		t.Fatalf("expected second token present before detach")
 	}
 
-	store.detachWithGrace(token, now)
+	store.detachToReconnectWindow(token, now)
 	hostTokens = store.hostInFlightTokens[hostKey]
 	if _, exists := hostTokens[token]; exists {
 		t.Fatalf("expected token removed after detach")

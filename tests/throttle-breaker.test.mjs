@@ -522,7 +522,12 @@ test('slot-handler acquire payload omits breaker admission fields in queue_only 
 
   globalThis.fetch = async (_url, init) => {
     seenPayload = JSON.parse(init.body);
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-queue-only-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -570,7 +575,12 @@ test('slot-handler acquire payload carries breaker admission fields for queue_br
 
   globalThis.fetch = async (_url, init) => {
     seenPayload = JSON.parse(init.body);
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-queue-breaker-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -612,6 +622,8 @@ test('slot-handler throttled responses preserve raw breaker snapshot metadata', 
 
   globalThis.fetch = async () => new Response(JSON.stringify({
     result: 'throttled',
+    queryToken: 'query-throttled-snapshot',
+    invocationEpoch: 1,
     throttleCode: 429,
     breakerOpenUntil: nowSeconds + 22,
     breakerReason: 'http_429',
@@ -662,11 +674,13 @@ test('slot-handler client rechecks shared breaker state on repeated throttled ac
 
   globalThis.fetch = async () => {
     fetchCalls += 1;
-    return new Response(JSON.stringify({
-      result: 'throttled',
-      throttleCode: 429,
-      breakerOpenUntil: nowSeconds + 30,
-      breakerReason: 'http_429',
+      return new Response(JSON.stringify({
+        result: 'throttled',
+        queryToken: `query-throttled-${fetchCalls}`,
+        invocationEpoch: fetchCalls,
+        throttleCode: 429,
+        breakerOpenUntil: nowSeconds + 30,
+        breakerReason: 'http_429',
       breakerVersion: fetchCalls,
     }), {
       status: 200,
@@ -2072,6 +2086,8 @@ test('queue_breaker ignores unified-check breaker rows and still reaches atomic 
       acquireCalls += 1;
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-unified-queue-breaker',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 7,
@@ -2203,6 +2219,8 @@ test('queue_breaker cache-hit unified flow ignores breaker rows and still reache
       acquireCalls += 1;
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-unified-cache-hit-queue-breaker',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 7,
@@ -2307,6 +2325,8 @@ test('queue_breaker HALF_OPEN_FULL returns throttle-protected response and never
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
       return createJsonResponse({
         result: 'throttled',
+        queryToken: 'query-half-open-full',
+        invocationEpoch: 1,
         reason: 'try_acquire_half_open_full',
         throttleCode: 503,
         retryAfter: 9,
@@ -2411,6 +2431,8 @@ test('queue_breaker redirects reacquire atomic attempts on managed host changes'
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: `slot-${acquireBodies.length}`,
         meta: {
           attemptVersion: 100 + acquireBodies.length,
@@ -2548,6 +2570,8 @@ test('queue_breaker redirects reacquire when site buckets change on same host', 
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: `slot-${acquireBodies.length}`,
         meta: {
           attemptVersion: 200 + acquireBodies.length,
@@ -2666,6 +2690,8 @@ test('queue_breaker defers same-host same-site redirect reporting until the term
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
       });
     }
@@ -2784,6 +2810,8 @@ test('queue_breaker terminal report failure disarms deferred same-site redirect 
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 911,
@@ -2898,6 +2926,8 @@ test('queue_breaker flushes a deferred same-site redirect as 302 when the termin
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 901,
@@ -3018,6 +3048,8 @@ test('queue_breaker flushes deferred same-site redirect before propagating throw
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 701,
@@ -3132,6 +3164,8 @@ test('queue_breaker flushes deferred same-site redirect before propagating refre
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 702,
@@ -3247,6 +3281,8 @@ test('queue_breaker returns authority unavailable when deferred flush fails but 
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 703,
@@ -3355,6 +3391,8 @@ test('queue_breaker preserves a deferred same-site no-meta admission across auth
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
       });
     }
@@ -3487,6 +3525,8 @@ test('queue_breaker flushes a deferred same-site redirect as 302 after refresh w
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 902,
@@ -3621,6 +3661,8 @@ test('queue_breaker flushes a deferred same-site attempt only when refresh failu
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 801,
@@ -3747,6 +3789,8 @@ test('queue_breaker flushes a deferred same-site redirect attempt before refresh
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 601,
@@ -3891,6 +3935,8 @@ test('queue_only redirects reacquire fair-queue slots across managed hosts', asy
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: `slot-${acquireBodies.length}`,
       });
     }
@@ -3996,6 +4042,8 @@ test('queue_only retries release of the old managed context in finally after red
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: `slot-${acquireBodies.length}`,
       });
     }
@@ -4118,6 +4166,8 @@ test('queue_only retries release of the dropped managed context in finally after
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
       });
     }
@@ -4233,6 +4283,8 @@ test('queue_only final cleanup deduplicates duplicate slot tokens and keeps the 
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-dup',
       });
     }
@@ -4347,6 +4399,8 @@ test('queue_only final cleanup keeps same-host releases serial', async () => {
       };
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: tokenBySiteBucket[body.siteBucket],
       });
     }
@@ -4493,6 +4547,8 @@ test('queue_only final cleanup overlaps different hosts but caps global concurre
       };
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: tokenByHost[body.hostname],
       });
     }
@@ -4653,6 +4709,8 @@ test('unmanaged redirects into queue_only and acquires a slot for the managed ta
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
       });
     }
@@ -4761,6 +4819,8 @@ test('breaker_only redirects into queue_breaker and the managed target gets atom
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 41,
@@ -4902,6 +4962,8 @@ test('unmanaged refresh into queue_breaker bootstraps atomic admission for the r
       acquireBodies.push(JSON.parse(init.body));
       return createJsonResponse({
         result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
         slotToken: 'slot-1',
         meta: {
           attemptVersion: 51,

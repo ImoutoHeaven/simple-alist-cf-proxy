@@ -132,28 +132,42 @@ type AcquirePayload struct {
 }
 
 type AcquireResponse struct {
-	Result           string                 `json:"result"`
-	QueryToken       string                 `json:"queryToken,omitempty"`
-	SlotToken        string                 `json:"slotToken,omitempty"`
-	HoldMs           int64                  `json:"holdMs,omitempty"`
-	ThrottleCode     int                    `json:"throttleCode,omitempty"`
-	BreakerOpenUntil int                    `json:"breakerOpenUntil,omitempty"`
-	BreakerReason    string                 `json:"breakerReason,omitempty"`
-	BreakerVersion   int64                  `json:"breakerVersion,omitempty"`
-	RetryAfter       int                    `json:"retryAfter,omitempty"`
-	Reason           string                 `json:"reason,omitempty"`
-	Meta             map[string]interface{} `json:"meta,omitempty"`
+	Result               string                 `json:"result"`
+	QueryToken           string                 `json:"queryToken,omitempty"`
+	InvocationEpoch      uint64                 `json:"invocationEpoch,omitempty"`
+	SlotToken            string                 `json:"slotToken,omitempty"`
+	ReleaseOwnerRequired bool                   `json:"releaseOwnerRequired,omitempty"`
+	HoldMs               int64                  `json:"holdMs,omitempty"`
+	ThrottleCode         int                    `json:"throttleCode,omitempty"`
+	BreakerOpenUntil     int                    `json:"breakerOpenUntil,omitempty"`
+	BreakerReason        string                 `json:"breakerReason,omitempty"`
+	BreakerVersion       int64                  `json:"breakerVersion,omitempty"`
+	RetryAfter           int                    `json:"retryAfter,omitempty"`
+	Reason               string                 `json:"reason,omitempty"`
+	Meta                 map[string]interface{} `json:"meta,omitempty"`
+}
+
+type AbandonRequest struct {
+	QueryToken      string `json:"queryToken"`
+	InvocationEpoch uint64 `json:"invocationEpoch"`
+}
+
+type AbandonResponse struct {
+	Result string `json:"result"`
 }
 
 type ReleaseRequest struct {
-	Hostname      string `json:"hostname"`
-	HostnameHash  string `json:"hostnameHash"`
-	IPBucket      string `json:"ipBucket"`
-	SiteBucket    string `json:"siteBucket"`
-	SlotToken     string `json:"slotToken"`
-	HitUpstreamAt int64  `json:"hitUpstreamAtMs"`
-	Now           int64  `json:"now"`
-	MinSlotHoldMs int64  `json:"minSlotHoldMs,omitempty"`
+	Hostname             string `json:"hostname"`
+	HostnameHash         string `json:"hostnameHash"`
+	IPBucket             string `json:"ipBucket"`
+	SiteBucket           string `json:"siteBucket"`
+	SlotToken            string `json:"slotToken"`
+	QueryToken           string `json:"queryToken,omitempty"`
+	InvocationEpoch      uint64 `json:"invocationEpoch,omitempty"`
+	ReleaseOwnerRequired *bool  `json:"releaseOwnerRequired"`
+	HitUpstreamAt        int64  `json:"hitUpstreamAtMs"`
+	Now                  int64  `json:"now"`
+	MinSlotHoldMs        int64  `json:"minSlotHoldMs,omitempty"`
 }
 
 type ReleaseResponse struct {
@@ -281,12 +295,16 @@ type metricsSnapshot struct {
 	Timestamp     int64
 	ConfigVersion string
 	Counts        map[string]int64
+	Metrics       map[string]float64
 	Flows         map[string]int
 	SmoothHosts   int
 }
 
 func (m metricsSnapshot) empty() bool {
 	if len(m.Counts) > 0 {
+		return false
+	}
+	if len(m.Metrics) > 0 {
 		return false
 	}
 	if len(m.Flows) == 0 {
@@ -352,6 +370,8 @@ type server struct {
 	backend          queueBackend
 	log              *logger
 	flowStore        *flowStore
+	inFlightAfterUse map[releaseIdentityKey]*inFlightAfterUseRelease
+
 	activeSlots      *activeTracker
 	utilMu           sync.Mutex
 	utilHost         map[string]*utilWindow
@@ -371,8 +391,18 @@ type server struct {
 	configVersion    string
 	metrics          *metricsReporter
 	metricsCounters  *metricsCounters
+	metricSamplesMu  sync.Mutex
+	metricSamples    map[string]float64
+	lastReleaseAt    map[string]time.Time
+	lastProbeAt      map[string]time.Time
+	lastGrantAt      map[string]time.Time
 	overloadLogMu    sync.Mutex
 	overloadLogLast  map[string]time.Time
+}
+
+type inFlightAfterUseRelease struct {
+	done chan struct{}
+	err  error
 }
 
 func (s *server) getConfig() *Config {
@@ -447,6 +477,45 @@ func (s *server) shouldLogOverloaded(hostnameHash, hostname, scope string, now t
 	return true
 }
 
+func (s *server) wireFlowStoreRuntimeLocked(cfg *Config) {
+	if s == nil || cfg == nil {
+		return
+	}
+	grace := cfg.FairQueue.graceDuration()
+	handoffTTL := time.Duration(cfg.FairQueue.zombieTimeoutSeconds()) * time.Second
+	if handoffTTL <= 0 {
+		handoffTTL = 30 * time.Second
+	}
+	if s.flowStore == nil {
+		s.flowStore = newFlowStore(grace)
+	} else {
+		s.flowStore.setGrace(grace)
+	}
+	s.flowStore.deliveredGrantHandoffTTL = handoffTTL
+	s.flowStore.claimedGrantTTL = handoffTTL
+	s.flowStore.onInvocationLeaseExpired = func(token string, releaseReq ReleaseRequest, hasRelease bool, hostKey string) {
+		if !hasRelease {
+			s.recordInvocationLeaseExpired()
+			if hostKey != "" {
+				s.wakeHostProbeRunner(hostKey)
+			}
+			return
+		}
+		if hostKey != "" {
+			s.wakeHostProbeRunner(hostKey)
+		}
+		if releaseReq.ReleaseOwnerRequired != nil && *releaseReq.ReleaseOwnerRequired {
+			go func(req ReleaseRequest) {
+				_ = s.releaseExpiredClaimedGrant(context.Background(), req)
+			}(releaseReq)
+			return
+		}
+		s.recordInvocationLeaseExpired()
+		s.recordCompensatingRelease()
+		s.compensatingReleaseAsync(releaseReq)
+	}
+}
+
 func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion string, resetState bool) {
 	s.mu.Lock()
 	oldBackend := s.backend
@@ -472,12 +541,7 @@ func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion str
 	s.cfg = cfg
 	s.backend = backend
 	if cfg != nil {
-		grace := cfg.FairQueue.graceDuration()
-		if s.flowStore == nil {
-			s.flowStore = newFlowStore(grace)
-		} else {
-			s.flowStore.setGrace(grace)
-		}
+		s.wireFlowStoreRuntimeLocked(cfg)
 	}
 	s.configVersion = cfgVersion
 	s.mu.Unlock()
@@ -497,12 +561,129 @@ func (s *server) incrementMetric(name string) {
 	}
 }
 
+func (s *server) setMetricSample(name string, value float64) {
+	if s == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	s.metricSamplesMu.Lock()
+	if s.metricSamples == nil {
+		s.metricSamples = make(map[string]float64)
+	}
+	s.metricSamples[name] = value
+	s.metricSamplesMu.Unlock()
+}
+
+func (s *server) observeRelease(hostKey string, at time.Time) {
+	if s == nil || strings.TrimSpace(hostKey) == "" || at.IsZero() {
+		return
+	}
+	s.metricSamplesMu.Lock()
+	if s.lastReleaseAt == nil {
+		s.lastReleaseAt = make(map[string]time.Time)
+	}
+	s.lastReleaseAt[hostKey] = at
+	s.metricSamplesMu.Unlock()
+}
+
+func (s *server) observeProbe(hostKey string, at time.Time) {
+	if s == nil || strings.TrimSpace(hostKey) == "" || at.IsZero() {
+		return
+	}
+	probeGap := 0.0
+	s.metricSamplesMu.Lock()
+	if s.lastProbeAt == nil {
+		s.lastProbeAt = make(map[string]time.Time)
+	}
+	if s.lastReleaseAt != nil {
+		if releasedAt := s.lastReleaseAt[hostKey]; !releasedAt.IsZero() && !at.Before(releasedAt) {
+			probeGap = float64(at.Sub(releasedAt).Milliseconds())
+		}
+	}
+	s.lastProbeAt[hostKey] = at
+	s.metricSamplesMu.Unlock()
+	s.setMetricSample("release_to_next_probe_ms", probeGap)
+}
+
+func (s *server) observeGrant(hostKey string, at time.Time) {
+	if s == nil || strings.TrimSpace(hostKey) == "" || at.IsZero() {
+		return
+	}
+	grantGap := 0.0
+	s.metricSamplesMu.Lock()
+	if s.lastGrantAt == nil {
+		s.lastGrantAt = make(map[string]time.Time)
+	}
+	if s.lastReleaseAt != nil {
+		if releasedAt := s.lastReleaseAt[hostKey]; !releasedAt.IsZero() && !at.Before(releasedAt) {
+			grantGap = float64(at.Sub(releasedAt).Milliseconds())
+		}
+	}
+	s.lastGrantAt[hostKey] = at
+	s.metricSamplesMu.Unlock()
+	s.setMetricSample("release_to_next_grant_ms", grantGap)
+}
+
+func (s *server) recordGrantCommitted(hostKey string, at time.Time) {
+	s.incrementMetric("grant_committed_count")
+	s.observeGrant(hostKey, at)
+}
+
+func (s *server) recordGrantClaimed() {
+	s.incrementMetric("grant_claimed_count")
+}
+
+func (s *server) recordReadyLatchExpired() {
+	s.incrementMetric("ready_latch_expire_count")
+}
+
+func (s *server) recordInvocationLeaseExpired() {
+	s.incrementMetric("invocation_lease_expire_count")
+}
+
+func (s *server) recordCompensatingRelease() {
+	s.incrementMetric("compensating_release_count")
+}
+
+func abandonOutcomeMetricName(result string) string {
+	switch result {
+	case "abandoned":
+		return "abandon_abandoned"
+	case "noop_not_found":
+		return "abandon_noop_not_found"
+	case "noop_attached":
+		return "abandon_noop_attached"
+	case "noop_epoch_mismatch":
+		return "abandon_noop_epoch_mismatch"
+	default:
+		return ""
+	}
+}
+
+func (s *server) recordAbandonOutcome(queryToken string, invocationEpoch uint64, result string) {
+	if metricName := abandonOutcomeMetricName(result); metricName != "" {
+		s.incrementMetric(metricName)
+	}
+	if s != nil && s.log != nil {
+		s.log.Infof("fairqueue abandon queryToken=%s invocationEpoch=%d result=%s", queryToken, invocationEpoch, result)
+	}
+}
+
 func (s *server) collectMetricsSnapshot() metricsSnapshot {
 	counts := s.metricsCounters.snapshotAndReset()
 	if counts == nil {
 		counts = make(map[string]int64)
 	}
 	for _, key := range []string{"flow_created", "granted", "throttled", "timeout", "released", "token_stale", "token_mismatch", "overloaded", "overloaded_global", "overloaded_host", "overloaded_site", "overloaded_ip", "overloaded_unknown"} {
+		if _, ok := counts[key]; !ok {
+			counts[key] = 0
+		}
+	}
+	for _, key := range []string{"ready_latch_expire_count", "invocation_lease_expire_count", "compensating_release_count", "grant_committed_count", "grant_claimed_count"} {
+		if _, ok := counts[key]; !ok {
+			counts[key] = 0
+		}
+	}
+	for _, key := range []string{"abandon_abandoned", "abandon_noop_not_found", "abandon_noop_attached", "abandon_noop_epoch_mismatch"} {
 		if _, ok := counts[key]; !ok {
 			counts[key] = 0
 		}
@@ -520,6 +701,14 @@ func (s *server) collectMetricsSnapshot() metricsSnapshot {
 	s.mu.RUnlock()
 	if store != nil {
 		store.mu.Lock()
+		queueVisibleCount := 0
+		grantEligibleCount := 0
+		readyLatchedCount := 0
+		readyLatchAgeTotalMs := 0.0
+		now := time.Now()
+		if store.nowFn != nil {
+			now = store.nowFn()
+		}
 		for _, f := range store.byToken {
 			if f == nil {
 				continue
@@ -533,8 +722,71 @@ func (s *server) collectMetricsSnapshot() metricsSnapshot {
 					flows["grace"]++
 				}
 			}
+			if isQueueVisibleAt(f, now) {
+				queueVisibleCount++
+			}
+			if isGrantEligibleAt(f, now) {
+				grantEligibleCount++
+			}
+			if !f.readyLatchedUntil.IsZero() && now.Before(f.readyLatchedUntil) {
+				readyLatchedCount++
+				if !f.readyLatchedAt.IsZero() && !now.Before(f.readyLatchedAt) {
+					readyLatchAgeTotalMs += float64(now.Sub(f.readyLatchedAt).Milliseconds())
+				}
+			}
 		}
 		store.mu.Unlock()
+		s.setMetricSample("queue_visible_flow_count", float64(queueVisibleCount))
+		s.setMetricSample("grant_eligible_flow_count", float64(grantEligibleCount))
+		s.setMetricSample("ready_latched_count", float64(readyLatchedCount))
+		if readyLatchedCount == 0 {
+			s.setMetricSample("ready_latch_age_ms", 0)
+		} else {
+			s.setMetricSample("ready_latch_age_ms", readyLatchAgeTotalMs/float64(readyLatchedCount))
+		}
+	}
+
+	idleProbeRatio := 0.0
+	if cfg := s.getConfig(); cfg != nil {
+		windowSize := cfg.FairQueue.utilWindowSeconds()
+		if windowSize <= 0 {
+			windowSize = 1
+		}
+		var totalRatio float64
+		var totalWindows int
+		s.utilMu.Lock()
+		for _, win := range s.utilHost {
+			if win == nil || win.count == 0 {
+				continue
+			}
+			totalWindows++
+			nonIdle := 0
+			for i := 0; i < win.count; i++ {
+				sample := win.samples[i]
+				if sample.active > 0 {
+					nonIdle++
+				}
+			}
+			idle := win.count - nonIdle
+			totalRatio += float64(idle) / float64(win.count)
+		}
+		s.utilMu.Unlock()
+		if totalWindows > 0 {
+			idleProbeRatio = totalRatio / float64(totalWindows)
+		}
+	}
+	s.setMetricSample("idle_probe_ratio", idleProbeRatio)
+
+	s.metricSamplesMu.Lock()
+	metrics := make(map[string]float64, len(s.metricSamples)+8)
+	for k, v := range s.metricSamples {
+		metrics[k] = v
+	}
+	s.metricSamplesMu.Unlock()
+	for _, key := range []string{"release_to_next_probe_ms", "release_to_next_grant_ms", "idle_probe_ratio", "queue_visible_flow_count", "grant_eligible_flow_count", "ready_latched_count", "ready_latch_age_ms"} {
+		if _, ok := metrics[key]; !ok {
+			metrics[key] = 0
+		}
 	}
 
 	smoothHosts := 0
@@ -548,6 +800,7 @@ func (s *server) collectMetricsSnapshot() metricsSnapshot {
 		Timestamp:     time.Now().UnixMilli(),
 		ConfigVersion: s.getConfigVersion(),
 		Counts:        counts,
+		Metrics:       metrics,
 		Flows:         flows,
 		SmoothHosts:   smoothHosts,
 	}
@@ -862,6 +1115,7 @@ func (m *metricsReporter) sendSnapshot(ctx context.Context, meta runtimeMeta, sn
 		"ts":            snap.Timestamp,
 		"configVersion": snap.ConfigVersion,
 		"counts":        snap.Counts,
+		"metrics":       snap.Metrics,
 		"flows":         snap.Flows,
 		"smoothHosts":   snap.SmoothHosts,
 	}
@@ -1295,7 +1549,7 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, errWaiterAlreadyAttached) {
-			http.Error(w, "conflict", http.StatusConflict)
+			writeJSON(w, http.StatusConflict, conflictResponse())
 			return
 		}
 		s.log.Errorf("AcquireSlot failed: %v", err)
@@ -1346,6 +1600,31 @@ func validateReleaseSlotToken(raw string) error {
 	return nil
 }
 
+func validateReleaseRequest(req ReleaseRequest) error {
+	if req.ReleaseOwnerRequired == nil {
+		return errors.New("releaseOwnerRequired is required")
+	}
+	if strings.TrimSpace(req.QueryToken) == "" {
+		return errors.New("queryToken is required")
+	}
+	if req.InvocationEpoch == 0 {
+		return errors.New("invocationEpoch is required")
+	}
+	if strings.TrimSpace(req.Hostname) == "" {
+		return errors.New("hostname is required")
+	}
+	if strings.TrimSpace(req.HostnameHash) == "" {
+		return errors.New("hostnameHash is required")
+	}
+	if strings.TrimSpace(req.IPBucket) == "" {
+		return errors.New("ipBucket is required")
+	}
+	if strings.TrimSpace(req.SiteBucket) == "" {
+		return errors.New("siteBucket is required")
+	}
+	return validateReleaseSlotToken(req.SlotToken)
+}
+
 func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	if !s.authPassed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -1362,16 +1641,74 @@ func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	if err := validateReleaseSlotToken(req.SlotToken); err != nil {
+	if err := validateReleaseRequest(req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.releaseSlot(r.Context(), req); err != nil {
+	if err := s.releaseSlotAfterUse(r.Context(), req); err != nil {
+		if errors.Is(err, errAfterUseReleaseOwnerRouteMiss) {
+			http.Error(w, "release owner unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if errors.Is(err, errAfterUseReleaseBackendConsistency) {
+			http.Error(w, "release owner unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		s.log.Errorf("ReleaseSlot failed: %v", err)
 		http.Error(w, "release failed", http.StatusBadGateway)
 		return
 	}
 	writeJSON(w, http.StatusOK, ReleaseResponse{Result: "ok"})
+}
+
+func (s *server) handleAbandon(w http.ResponseWriter, r *http.Request) {
+	if !s.authPassed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	defer r.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+	var req AbandonRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	queryToken := strings.TrimSpace(req.QueryToken)
+	if queryToken == "" {
+		http.Error(w, "queryToken is required", http.StatusBadRequest)
+		return
+	}
+	if req.InvocationEpoch == 0 {
+		http.Error(w, "invocationEpoch is required", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.RLock()
+	store := s.flowStore
+	s.mu.RUnlock()
+	if store == nil {
+		result := "noop_not_found"
+		s.recordAbandonOutcome(queryToken, req.InvocationEpoch, result)
+		writeJSON(w, http.StatusOK, AbandonResponse{Result: result})
+		return
+	}
+
+	now := s.flowStoreNow()
+	result, releaseReq, hasRelease := store.abandonDetachedInvocation(queryToken, req.InvocationEpoch, now)
+	if result == "abandoned" && hasRelease {
+		s.recordCompensatingRelease()
+		hostKey := fqHostKey(releaseReq.HostnameHash, releaseReq.Hostname)
+		if hostKey != "" {
+			s.wakeHostProbeRunner(hostKey)
+		}
+		s.compensatingReleaseAsync(releaseReq)
+	}
+	s.recordAbandonOutcome(queryToken, req.InvocationEpoch, result)
+	writeJSON(w, http.StatusOK, AbandonResponse{Result: result})
 }
 
 func (s *server) handleAcquireSlot(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
@@ -1473,7 +1810,13 @@ func (s *server) startActiveLeasePrune(ctx context.Context) {
 			}
 
 			if s.activeSlots != nil {
-				s.activeSlots.Prune(time.Now())
+				now := time.Now()
+				for _, hostKey := range s.activeSlots.PruneHosts(now) {
+					if strings.TrimSpace(hostKey) == "" {
+						continue
+					}
+					s.wakeHostProbeRunner(hostKey)
+				}
 			}
 		}
 	}()
@@ -1618,6 +1961,250 @@ func isRetryableReleaseError(err error) bool {
 }
 
 func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
+	if err := validateReleaseRequest(req); err != nil {
+		return err
+	}
+	return s.releaseSlotAfterUse(ctx, req)
+}
+
+var errAfterUseReleaseOwnerRouteMiss = errors.New("after-use release owner route miss")
+var errAfterUseReleaseBackendConsistency = errors.New("after-use release backend consistency failure")
+
+func (s *server) beginOwnerRoutedAfterUseRelease(req ReleaseRequest) (*inFlightAfterUseRelease, bool) {
+	if s == nil {
+		return nil, true
+	}
+	key, ok := releaseIdentityKeyForRequest(req)
+	if !ok {
+		return nil, true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inFlightAfterUse == nil {
+		s.inFlightAfterUse = make(map[releaseIdentityKey]*inFlightAfterUseRelease)
+	}
+	if existing := s.inFlightAfterUse[key]; existing != nil {
+		return existing, false
+	}
+	current := &inFlightAfterUseRelease{done: make(chan struct{})}
+	s.inFlightAfterUse[key] = current
+	return current, true
+}
+
+func (s *server) finishOwnerRoutedAfterUseRelease(req ReleaseRequest, release *inFlightAfterUseRelease, err error) {
+	if s == nil || release == nil {
+		return
+	}
+	key, ok := releaseIdentityKeyForRequest(req)
+	if !ok {
+		release.err = err
+		close(release.done)
+		return
+	}
+	s.mu.Lock()
+	if s.inFlightAfterUse != nil && s.inFlightAfterUse[key] == release {
+		delete(s.inFlightAfterUse, key)
+		if len(s.inFlightAfterUse) == 0 {
+			s.inFlightAfterUse = nil
+		}
+	}
+	release.err = err
+	close(release.done)
+	s.mu.Unlock()
+}
+
+func waitForOwnerRoutedAfterUseRelease(ctx context.Context, release *inFlightAfterUseRelease) error {
+	if release == nil {
+		return nil
+	}
+	select {
+	case <-release.done:
+		return release.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *server) currentOwnerRoutedAfterUseRelease(req ReleaseRequest) *inFlightAfterUseRelease {
+	if s == nil {
+		return nil
+	}
+	key, ok := releaseIdentityKeyForRequest(req)
+	if !ok {
+		return nil
+	}
+	s.mu.RLock()
+	release := s.inFlightAfterUse[key]
+	s.mu.RUnlock()
+	return release
+}
+
+func releaseModeRequiresOwner(req ReleaseRequest) bool {
+	return req.ReleaseOwnerRequired != nil && *req.ReleaseOwnerRequired
+}
+
+func (s *server) releaseExpiredClaimedGrant(ctx context.Context, req ReleaseRequest) error {
+	if err := validateReleaseRequest(req); err != nil {
+		return err
+	}
+	store := s.flowStore
+	var err error
+	inFlight, leader := s.beginOwnerRoutedAfterUseRelease(req)
+	if !leader {
+		return waitForOwnerRoutedAfterUseRelease(ctx, inFlight)
+	}
+	defer func() {
+		s.finishOwnerRoutedAfterUseRelease(req, inFlight, err)
+	}()
+	if store != nil {
+		switch store.prepareAfterUseRelease(req).state {
+		case afterUseReleasePreparationCompleted:
+			err = nil
+			return nil
+		case afterUseReleasePreparationFailedAfterBackend:
+			err = errAfterUseReleaseBackendConsistency
+			return err
+		}
+	}
+	s.recordInvocationLeaseExpired()
+	s.recordCompensatingRelease()
+	err = s.releaseSlotCompensating(ctx, req)
+	if err != nil {
+		return err
+	}
+	if store != nil {
+		if !store.recordAfterUseReleaseCompletionForRequest(req) {
+			err = errAfterUseReleaseBackendConsistency
+			return err
+		}
+	}
+	err = nil
+	return nil
+}
+
+func (s *server) releaseSlotAfterUse(ctx context.Context, req ReleaseRequest) (err error) {
+	if err := validateReleaseRequest(req); err != nil {
+		return err
+	}
+	var cleanupTarget afterUseReleaseCleanupTarget
+	var inFlight *inFlightAfterUseRelease
+	leader := true
+	var releaseStartedAt time.Time
+	inFlight, leader = s.beginOwnerRoutedAfterUseRelease(req)
+	if !leader {
+		return waitForOwnerRoutedAfterUseRelease(ctx, inFlight)
+	}
+	defer func() {
+		s.finishOwnerRoutedAfterUseRelease(req, inFlight, err)
+	}()
+	s.mu.RLock()
+	store := s.flowStore
+	s.mu.RUnlock()
+	prep := afterUseReleasePreparation{state: afterUseReleasePreparationMiss}
+	directProofReserved := false
+	directProofConsumed := false
+	if store != nil {
+		prep = store.prepareAfterUseRelease(req)
+		switch prep.state {
+		case afterUseReleasePreparationCompleted:
+			err = nil
+			return nil
+		case afterUseReleasePreparationFailedAfterBackend:
+			err = errAfterUseReleaseBackendConsistency
+			return err
+		case afterUseReleasePreparationCaptured:
+			cleanupTarget = prep.cleanupTarget
+			directProofReserved = !releaseModeRequiresOwner(req)
+		case afterUseReleasePreparationMiss:
+			return errAfterUseReleaseOwnerRouteMiss
+		}
+	} else {
+		return errAfterUseReleaseOwnerRouteMiss
+	}
+	if directProofReserved {
+		defer func() {
+			if !directProofConsumed {
+				store.releaseCapturedDirectReleaseProof(req)
+			}
+		}()
+	}
+	releaseStartedAt, err = s.runAfterUseReleaseTiming(req)
+	if err != nil {
+		return err
+	}
+	if delay := time.Until(releaseStartedAt); delay > 0 {
+		if err := sleepWithContext(ctx, delay); err != nil {
+			return err
+		}
+	}
+	releaseStartedAt = time.Now()
+	err = s.performBackendRelease(ctx, req, releaseStartedAt, "after_use")
+	if err != nil {
+		return err
+	}
+	if store != nil {
+		if releaseModeRequiresOwner(req) {
+			if !store.completeAfterUseRelease(cleanupTarget) {
+				store.recordAfterUseReleaseFailedAfterBackendLocked(cleanupTarget)
+				return errAfterUseReleaseBackendConsistency
+			}
+		} else {
+			if !store.consumeDirectReleaseProof(req) {
+				store.recordAfterUseReleaseFailedAfterBackendForRequest(req)
+				return errAfterUseReleaseBackendConsistency
+			}
+			directProofConsumed = true
+		}
+	}
+	err = nil
+	return nil
+}
+
+func (s *server) releaseSlotCompensating(ctx context.Context, req ReleaseRequest) error {
+	releaseStartedAt, err := s.runCompensatingReleaseTiming(req)
+	if err != nil {
+		return err
+	}
+	if delay := time.Until(releaseStartedAt); delay > 0 {
+		if err := sleepWithContext(ctx, delay); err != nil {
+			return err
+		}
+	}
+	releaseStartedAt = time.Now()
+	return s.performBackendRelease(ctx, req, releaseStartedAt, "compensating")
+}
+
+func (s *server) runAfterUseReleaseTiming(req ReleaseRequest) (time.Time, error) {
+	cfg := s.getConfig()
+	if cfg == nil {
+		return time.Time{}, errors.New("config not loaded")
+	}
+
+	minHoldMs := cfg.FairQueue.minHold(0)
+	hitAt := time.UnixMilli(req.HitUpstreamAt)
+	if req.HitUpstreamAt == 0 || hitAt.IsZero() {
+		hitAt = time.Now()
+	}
+
+	baseTime := hitAt.Add(time.Duration(minHoldMs) * time.Millisecond)
+	if now := time.Now(); baseTime.Before(now) {
+		baseTime = now
+	}
+
+	interval := cfg.FairQueue.smoothInterval()
+	if interval <= 0 {
+		return baseTime, nil
+	}
+
+	releaser := s.getSmoothReleaser(req.HostnameHash, req.Hostname)
+	return releaser.nextReleaseAfter(baseTime, interval), nil
+}
+
+func (s *server) runCompensatingReleaseTiming(req ReleaseRequest) (time.Time, error) {
+	return time.Now(), nil
+}
+
+func (s *server) performBackendRelease(ctx context.Context, req ReleaseRequest, releaseStartedAt time.Time, releaseKind string) error {
 	cfg := s.getConfig()
 	if cfg == nil {
 		return errors.New("config not loaded")
@@ -1627,36 +2214,14 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 		return errors.New("backend not initialized")
 	}
 
-	minHoldMs := cfg.FairQueue.minHold(0)
+	if releaseStartedAt.IsZero() {
+		releaseStartedAt = time.Now()
+	}
 
 	hitAt := time.UnixMilli(req.HitUpstreamAt)
 	if req.HitUpstreamAt == 0 || hitAt.IsZero() {
-		hitAt = time.Now()
+		hitAt = releaseStartedAt
 	}
-
-	now := time.Now()
-	minHoldTarget := hitAt.Add(time.Duration(minHoldMs) * time.Millisecond)
-	baseTime := minHoldTarget
-	if baseTime.Before(now) {
-		baseTime = now
-	}
-
-	interval := cfg.FairQueue.smoothInterval()
-	releaser := s.getSmoothReleaser(req.HostnameHash, req.Hostname)
-
-	target := baseTime
-	if interval > 0 {
-		target = releaser.nextReleaseAfter(baseTime, interval)
-	}
-
-	if delay := time.Until(target); delay > 0 {
-		if err := sleepWithContext(ctx, delay); err != nil {
-			return err
-		}
-	}
-
-	now = time.Now()
-	holdMs := now.Sub(hitAt).Milliseconds()
 
 	var err error
 	for attempt := 1; attempt <= releaseRetryAttempts; attempt++ {
@@ -1686,18 +2251,25 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 	if s.activeSlots != nil {
 		s.activeSlots.ReleaseLease(req.SlotToken)
 		hostKey := strings.TrimSpace(fqHostKey(req.HostnameHash, req.Hostname))
+		s.observeRelease(hostKey, releaseStartedAt)
 		if hostKey != "" {
 			s.wakeHostProbeRunner(hostKey)
 		}
 	}
+
+	minHoldMs := int64(0)
+	if releaseKind == "after_use" {
+		minHoldMs = cfg.FairQueue.minHold(0)
+	}
+	holdMs := releaseStartedAt.Sub(hitAt).Milliseconds()
 
 	tokenLog := req.SlotToken
 	if len(tokenLog) > 8 {
 		tokenLog = tokenLog[len(tokenLog)-8:]
 	}
 	s.log.Debugf(
-		"slot released host=%s ip=%s token=%s hold_ms=%d min_hold_ms=%d",
-		req.Hostname, req.IPBucket, tokenLog, holdMs, minHoldMs,
+		"slot released kind=%s host=%s ip=%s token=%s hold_ms=%d min_hold_ms=%d",
+		releaseKind, req.Hostname, req.IPBucket, tokenLog, holdMs, minHoldMs,
 	)
 	s.incrementMetric("released")
 	return nil
@@ -2163,6 +2735,9 @@ func Main() {
 		metricsCounters:  metricsCounters,
 		activeSlots:      newActiveTracker(),
 	}
+	s.mu.Lock()
+	s.wireFlowStoreRuntimeLocked(&cfg)
+	s.mu.Unlock()
 	s.startFairQueueCleanup(gcCtx)
 	s.startActiveLeasePrune(gcCtx)
 	s.startRuntimeStatePrune(gcCtx)
@@ -2173,6 +2748,7 @@ func Main() {
 	mux.HandleFunc("/api/v0/refresh", s.handleInternalRefresh)
 	mux.HandleFunc("/api/v0/flush", s.handleInternalFlush)
 	mux.HandleFunc("/api/v1/fairqueue/acquire", s.handleAcquire)
+	mux.HandleFunc("/api/v1/fairqueue/abandon", s.handleAbandon)
 	mux.HandleFunc("/api/v1/fairqueue/release", s.handleRelease)
 
 	httpServer := &http.Server{

@@ -143,7 +143,12 @@ const createModeHarness = ({ fairQueueHostPatterns = [], throttleHostPatterns = 
 const runModeScenario = async ({
   fairQueueHostPatterns = [],
   throttleHostPatterns = [],
-  slotHandlerResponse = { result: 'granted', slotToken: 'slot-1' },
+  slotHandlerResponse = {
+    result: 'granted',
+    queryToken: 'query-mode-default',
+    invocationEpoch: 1,
+    slotToken: 'slot-1',
+  },
 } = {}) => {
   const { bootstrap } = createModeHarness({ fairQueueHostPatterns, throttleHostPatterns });
   const calls = {
@@ -326,6 +331,8 @@ test('queue_breaker uses slot-handler READY attempt tokens and skips authorize R
     throttleHostPatterns: ['*.sharepoint.com'],
     slotHandlerResponse: {
       result: 'granted',
+      queryToken: 'query-mode-queue-breaker',
+      invocationEpoch: 1,
       slotToken: 'slot-1',
       meta: {
         attemptVersion: 7,

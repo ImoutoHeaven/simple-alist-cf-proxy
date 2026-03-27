@@ -3,41 +3,46 @@
 slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排队与 slot 管理。
 
 它负责：
-- 接收 worker 的 acquire/release 请求
-- 在内存中维护 flow（token-stable）状态与 per-host in-flight 调度
+- 接收 worker 的 acquire/release/abandon 请求
+- 在内存中维护 flow（`queryToken`）、accepted invocation（`invocationEpoch`）、accepted invocation lease、短 latch 与 per-host flow 调度
 - 通过 PostgREST 或 Postgres 调用数据库 RPC，分配/释放 slot
 
 目标：worker 只做 HTTP 调用；公平排队、长轮询与调度都集中在 slot-handler。
 
 ---
 
-## 1. 核心模型（Flow / In-flight / Grace）
+## 1. 核心模型（Flow / InvocationEpoch / Waiter / Lease / Grace）
 
 - **Flow（流）**
   - `queryToken` 是 flow 的唯一标识，并绑定创建时的完整 canonical admission tuple（`hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket` + `breakerEnabled` + breaker half-open 参数）。
-  - flow 会跨多次 /acquire 轮询保留公平性状态（例如 LocalVT）。
+  - `invocationEpoch` 标识当前 accepted invocation；只有 waiter attach 成功才会创建或推进它，客户端可持有的 epoch 永远 `>= 1`。
+  - `committedGrantEpoch` 只标识当前已 commit 的 `READY` grant；它只服务 READY cleanup，不赋予 `/abandon` ownership。
+  - flow 会跨多次 /acquire 轮询保留公平性状态（例如 LocalVT）；队列可见性绑定在 live flow 上，而不是绑定在某个瞬时 HTTP waiter 上。
   - 带 `queryToken` 的请求若 token 已过期/不存在（stale），或后续轮询让上述任一 admission 字段发生变化（mismatch），会返回 `timeout/query_token_stale` 或 `timeout/query_token_mismatch`；不会静默创建新 flow 重入队列。
-  - existing-token 路径只做 tuple 校验与 waiter 续接，不覆写 flow 已固化的 admission state。
+  - existing-token 路径只做 tuple 校验、waiter 续接，以及可用 latched READY 的直接认领；accepted invocation ownership 只在 attach 成功后更新，不会覆写 flow 已固化的 admission state。
 
-- **In-flight（在途请求）**
-  - 同一个 `queryToken` 同一时间只允许 1 个 in-flight acquire（并发会返回冲突）。
-  - in-flight 请求通过内部 waiter channel 等待调度结果。
+- **Waiter / In-flight（在途请求）**
+  - 同一个 `queryToken` 同一时间只允许 1 个活跃 acquire waiter（并发会返回冲突）。
+  - waiter 只是当前这次 long-poll 的投递通道，不再定义 flow 是否还在 fair-queue 里。
+  - 只有 waiter 已附着且尚未 commit READY 的 flow 才是 `grantEligible`；detached live flow 仍可 queue-visible，但不会继续向 DB claim slot。
 
-- **Grace（宽限窗口）**
-  - 当 /acquire 返回 `pending` 时，flow 会从 in-flight 变为 detached，并开始 `graceMs` 倒计时。
-  - 客户端在 `graceMs` 内带同一个 `queryToken` 重试，可以延续排队位置。
-  - 若携带有效 `queryToken` 的 resumed acquire 只遇到 scoped overload（`overload_host|overload_site|overload_ip`），slot-handler 会刷新 detached flow 的 grace，避免 token 仅因 worker 退避等待而自然过期。
-  - 连接/ctx 取消会立刻删除 flow（no grace）。
+- **Lease / Grace（续命与复接窗口）**
+  - `accepted invocation lease` 只在 waiter attach 成功时续期；当前实现的 lease 时长仍由 `pollWindowMs + graceMs` 推导，但 global overload、single-waiter conflict，以及 detached scoped overload 都不会续期。
+  - 当 `pending` 或其他 waiter 脱离路径把 flow 置为 detached 时，`expireAt` 会被重算为 `now + cfg.FairQueue.graceDuration()`；这是 detached reconnect window 的唯一 deadline，不受 `invocationLeaseUntil` 截断。
+  - 若携带有效 `queryToken` 的 resumed acquire 只遇到 scoped overload（`overload_host|overload_site|overload_ip`），slot-handler 只刷新 detached reconnect window；它同样用 `cfg.FairQueue.graceDuration()` 重算 `expireAt`，不会获得新的 accepted invocation ownership。
+  - 若 detached flow 之前已 short-latch 一个 `READY`，下一次同 token /acquire 会直接认领该 grant，并推进到新的 `invocationEpoch`。
+  - `/abandon` 使用 `queryToken + invocationEpoch` 作为 ownership tuple。
 
 ---
 
 ## 2. 调度与探测（probeOnce）
 
-- 每个 hostKey 维护一个后台 runner（按 `pollIntervalMs` 周期触发，或被唤醒）。
-- runner 每轮执行一次 `probeOnce(hostKey)`，仅在 **当前有 in-flight waiter 的 flows** 中做选择（不会考虑 detached/grace-only flows）。
-- 成功的 `/release` 在 backend release 成功且 `activeSlots.ReleaseLease(slotToken)` 完成本地 bookkeeping 后，会唤醒对应 hostKey 的 probe runner，缩短已有 waiter 的下一次 refill 等待。
-- `flowStore` 仍以 `byToken` 作为唯一真源；同时在同一把 `flowStore.mu` 锁内维护派生索引 `hostInFlightTokens(hostKey -> token set)`，用于把 host 维度候选查找从全表扫描降为 host 局部遍历。
-- `hostInFlightTokens` 只在 waiter 附着状态变更时更新（attach、detach，以及 `removeFlow` 在 waiter 仍附着时触发的移除）；`listInFlightByHost` 遍历 host bucket 时会机会性清理 stale token（例如 flow 已删除、waiter 已解绑、或 flow 过期），保证索引自愈且不引入兼容层。
+- 每个 hostKey 维护一个后台 reactor runner；它由显式 wake 事件和下一批 deadline 共同驱动，而不是只靠固定 tick 空转轮询。
+- runner 每轮执行一次 `probeOnce(hostKey)`，但候选 universe 已切到 **当前 host 下所有 live queue-visible flows**；真正发起 DB admission 前，仍只允许当前 waiter 已附着且 `grantEligible=true` 的 flow 进入 probe。
+- 成功的 `/release`、新 waiter attach、bucket `DenyUntil` 到期、probe QPS credit 可用、ready latch 过期、invocation lease/expiry cleanup 等事件都会唤醒对应 hostKey 的 reactor；空闲 host 可一直睡到下一次有效 deadline。
+- `flowStore` 仍以 `byToken` 作为唯一真源；`hostInFlightTokens(hostKey -> token set)` 现在只服务 attached waiter / in-flight bookkeeping，不再代表 scheduler 的完整候选集。
+- backend `READY` 是公平性记账点：commit 时立即消耗该 flow 的公平性机会；若 waiter 仍在线则直接投递，否则进入极短 `ready_latched` bridge（当前默认 `300ms`，上限 `1s`）。
+- `ready_latched` 过期、invocation lease 到期，或带当前 `queryToken + invocationEpoch` 的 `/abandon` 删除 detached flow 且消费已提交但未被实际使用的 grant 时，都会触发 compensating release，把 slot 还给 DB；首次 backend release 会立即发出，不受 `minSlotHoldMs` / `smoothReleaseIntervalMs` 影响；但公平性 debit 不会回滚。
 
 ### 2.1 单一堆化调度引擎（单选/批选共用）
 
@@ -46,24 +51,22 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - flow 级 tie-break 顺序固定为：`LocalVT -> CreatedAt -> Token`。
 - 调度器新增 `eligible` 回调入口；`probeOnce` 会在 picker 阶段跳过当前 `host+ip` 或 `host+site+ip` 活跃槽已满的 bucket，但不会改写 `WaitCount` / `DenyUntil`。
 - `activeSlots` 现在同时按 `host`、`host+site`、`host+ip`、`host+site+ip` 维护活跃 lease 计数；这些索引只服务本地 eligibility 判断，PostgreSQL 仍是最终 slot 权威，`computeProbeBudget()` 也仍保持粗粒度预算。
-- 该重构为 hard cutover：旧选择路径（如 `chooseLocked`、`pickNextInFlightExcluding`）已移除，不存在 fallback/legacy 分支。
 
 ### 2.2 有界并发微批探测 + 顺序提交
 
 - `probeOnce` 先批量选出候选，再按 `maxProbeParallel` 切分为多个微批并并发调用 backend `AdmitBatch`（`probeBatchesInParallel`）。
 - 结果提交顺序按子批次 `start` 下标严格顺序 apply（即使返回先后不同），确保状态更新与 waiter 投递行为可复现且确定。
 - 子批次失败只惩罚失败子批次（对应 flow 增加 waitCount），不连带惩罚同 tick 内成功子批次。
-- 不再保留“单次串行单大批”旧探测路径。
 
 ### 2.3 Probe 调用超时策略（收紧窗口）
 
 - probe 调用超时由 `computeProbeCallTimeout(pollInterval)` 统一计算。
 - 超时窗口被限制在 `[300ms, 900ms]`：低于下界时上调到 300ms，高于上界时下压到 900ms。
-- 该策略替代旧的长阻塞窗口，避免单个慢 probe 长时间占用一个 tick。
+- 这样可以避免单个慢 probe 长时间占用一个 tick。
 
 ### 2.4 可验证性与性能基线
 
-- 调度 clean-cutover 契约由单测覆盖（例如 `TestPickSingleMatchesBatchOfOne`、`TestSchedulerEngineNoDuplicateAcrossBatch`）。
+- 调度器单选/批选一致性契约由单测覆盖（例如 `TestPickSingleMatchesBatchOfOne`、`TestSchedulerEngineNoDuplicateAcrossBatch`）。
 - 探测并发与顺序提交契约由单测覆盖（例如 `TestProbeOnceParallelMicroBatchReducesHOL`、`TestProbeOnceParallelMicroBatchAppliesSubBatchesInStartOrder`）。
 - 仓库包含高 backlog 调度基准：`BenchmarkPickNextInFlightBatch_HeapEngine_Backlog`（`slot-handler/internal/slothandler/fq_scheduler_benchmark_test.go`）。
 - 复现实测基准命令：`go -C ./slot-handler test ./internal/slothandler -run '^$' -bench 'BenchmarkPickNextInFlightBatch_HeapEngine_Backlog' -benchmem -count=3`。
@@ -97,38 +100,53 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - 校验失败直接返回 `400`（plain-text；错误短语稳定），且在创建/续接 flow 与启动 probe runner 前失败。
 
 响应字段：
-- `result`: `pending` / `granted` / `throttled` / `overloaded` / `timeout`
-- `queryToken`
+- `result`: `pending` / `granted` / `throttled` / `overloaded` / `timeout` / `conflict`
+- `queryToken`（仅 `pending` / `granted` / `throttled`）
+- `invocationEpoch`（仅 `pending` / `granted` / `throttled`；标识当前 accepted invocation）
 - `slotToken`（granted 时）
-- `meta.attemptVersion` / `meta.attemptTicket`（granted 且本次 atomic admission 同时拿到 breaker attempt 时）
+- `meta.attemptVersion` / `meta.attemptTicket`（granted 且 atomic admission 同时拿到 breaker attempt 时）
 - `throttleCode`（throttled 时）
 - `breakerOpenUntil` / `breakerReason` / `breakerVersion`（throttled 时，直接透传 backend 返回的共享 breaker 元数据）
 - `reason`：`throttled` 时为 terminal breaker 原因（如 `try_acquire_throttled` / `try_acquire_half_open_full`），`overloaded` 时为 `overload_global|overload_host|overload_site|overload_ip`
 - `retryAfter`：`throttled` 或 `overloaded` 时的建议重试秒数
 
+行为说明：
+- `pending` 结束的是当前 waiter，不是整个 flow；同一个 live `queryToken` 后续仍可继续排队并复接。
+- `granted` 与 `throttled` 都只会在当前请求已经 attach 成功后返回；其中 `throttled` 是 terminal cleanup 响应，返回后 flow 已被删除。
+- `overloaded` / `timeout` / `conflict` 都不返回 ownership 字段；`single_waiter_conflict` 走 HTTP `409` + `result="conflict"`。
+- 若上一次 READY 已进入有效的 `ready_latched`，下一次同 token `/acquire` 会直接返回 `granted`，同时推进 `invocationEpoch`。
+
 ### POST /api/v1/fairqueue/release
 
-- 释放 slot（仍支持 `minSlotHoldMs` 和 `smoothReleaseIntervalMs`）。
+- granted slot 的正常 after-use release 路径；仍支持 `minSlotHoldMs` 和 `smoothReleaseIntervalMs`。
 - 成功返回 `200` + `{"result":"ok"}`；若 `slotToken` 语法合法但对应 slot 已未知、已释放，backend 仍按幂等 no-op 处理，HTTP 仍返回 `200`。
 - 失败时返回非 `2xx`：
   - `502`：slot-handler 调用 backend release（`fq_release_dual`）失败（包括 backend error/unavailable）。
   - `4xx`：请求参数错误或鉴权失败；其中缺失/空 `slotToken` 与格式非法的 `slotToken` 当前返回 `400`。
   - `5xx`：slot-handler 内部错误。
-- 约定：worker 将 release 视为 fire-and-forget，不影响本次下载响应，但会记录错误日志并按重试策略补偿。
+- 约定：worker 将 release 视为 fire-and-forget，不影响下载响应，但会记录错误日志并按重试策略补偿。
 
 release 重试策略（worker 侧）：
 - 最多重试 3 次（指数退避：100ms、200ms，最大 500ms）。
 - **仅**在网络错误、worker 侧 release 专用超时（每次固定 `1500ms`）或可重试状态码时重试：`429` 或 `>=500`。
 - 对非可重试 `4xx`（如 `400/401/403/404`）不重试，避免对永久错误放大请求。
 
+### POST /api/v1/fairqueue/abandon
+
+- 可选的 best-effort pre-grant 清理加速接口；只针对 detached 的当前 accepted invocation。
+- 请求体必须同时提供 `queryToken` 与 `invocationEpoch`；缺失任一字段，或 `invocationEpoch=0`，都会返回 `400`。
+- 成功返回 `200` + `{"result":"..."}`；允许值只有 `abandoned` / `noop_not_found` / `noop_attached` / `noop_epoch_mismatch`。
+- 结果映射顺序固定为：flow 不存在 -> `noop_not_found`；flow 仍 attached -> `noop_attached`；epoch 不匹配 -> `noop_epoch_mismatch`；其余 owned detached invocation -> `abandoned`。
+- 若 owned detached flow 仍持有 latched READY，slot-handler 会先做 compensating release，再删除 flow；noop 路径不会删除 flow，也不会消费更新的 READY。
+
 ---
 
 ## 4. 配置（config.json）
 
 `fairQueue` 关键字段：
-- `pollIntervalMs`：probe runner 节奏
+- `pollIntervalMs`：host reactor 的最小探测节拍；无显式 wake 时也用它做 probe/QPS 补偿节奏
 - `pollWindowMs`：单次 /acquire long-poll 的最大等待时间
-- `graceMs`：pending 后 flow 保留窗口
+- `graceMs`：worker 重连 slack；`cfg.FairQueue.graceDuration()` 定义 detached reconnect window；accepted invocation lease 仍由 `pollWindowMs + graceMs` 推导，但只在 waiter attach 成功时续期
 - `utilWindowSec`：利用率采样窗口，用于 probe 调度权重
 - `minSlotHoldMs` / `smoothReleaseIntervalMs`：release 节奏控制
 - `maxBatch`：单轮 probe 尝试的最大 flow 数
@@ -261,9 +279,9 @@ release 重试策略（worker 侧）：
 
 `fairQueue` 字段：
 
-- `fairQueue.pollIntervalMs`：probe runner 调度周期。
+- `fairQueue.pollIntervalMs`：host reactor 的最小探测节拍；同时影响 probe QPS credit 的 refill 节奏。
 - `fairQueue.pollWindowMs`：单次 acquire 长轮询窗口。
-- `fairQueue.graceMs`：`pending` 后 token 可续期的 grace 窗口。
+- `fairQueue.graceMs`：worker 重连 slack；`cfg.FairQueue.graceDuration()` 是 detached reconnect window 的唯一时长来源；accepted invocation lease 仍由 `pollWindowMs + graceMs` 推导，但只有 attach success 才会续期。
 - `fairQueue.utilWindowSec`：利用率统计窗口长度，用于 probe 预算策略。
 - `fairQueue.maxBatch`：每轮 probe 最多尝试的 flow 数。
 - `fairQueue.maxProbeParallel`：每个 host 的 probe 并发上限。
@@ -284,7 +302,6 @@ release 重试策略（worker 侧）：
 - `fairQueue.rpc.releaseFunc`：release RPC 函数名。
 - `fairQueue.cleanup.enabled`：是否启用后台 DB 清理任务。
 - `fairQueue.cleanup.intervalSeconds`：后台清理执行周期。
-- 本次 per-IP 感知没有新增 SQL、RPC、config 字段或 worker 协议字段；变化只在 slot-handler 本地 picker-time eligibility。
 
 调参建议（通用）：
 
@@ -298,7 +315,8 @@ release 重试策略（worker 侧）：
 ## 5. 指标（controller 模式）
 
 周期上报 `slot_handler.snapshot`：
-- `counts`：关键计数（granted/throttled/overloaded、`overloaded_<scope>`、released/token_stale/token_mismatch 等）
+- `counts`：关键计数（granted/throttled/overloaded、`overloaded_<scope>`、`released`/token_stale/token_mismatch，以及 `ready_latch_expire_count` / `invocation_lease_expire_count` / `compensating_release_count` / `grant_committed_count` / `grant_claimed_count`）；其中 `released` 继续表示 backend release 成功总次数，补偿清理由 `compensating_release_count` 单独标记，debug log 用 `kind=after_use|compensating` 区分语义。
+- `metrics`：`release_to_next_probe_ms`、`release_to_next_grant_ms`、`idle_probe_ratio`、`queue_visible_flow_count`、`grant_eligible_flow_count`、`ready_latched_count`、`ready_latch_age_ms`
 - `flows`：`total/inflight/detached/grace`
 - `smoothHosts`：smooth releaser 的 host 数
 
@@ -339,8 +357,9 @@ slot-handler 依赖以下函数（名称可在配置中改）：
 
 ## 8. 与 download worker 的关系
 
-- worker 调用 `acquire/release`；`acquire` 返回 `pending` 时持续轮询。
-- `queryToken` 是排队位置的唯一标识；在 `graceMs` 内重试可延续公平性。
+- worker 调用 `acquire`；拿到 `slotToken` 后走 `/release`；未拿到 `slotToken` 且仍持有 `queryToken + invocationEpoch` 的 pre-grant cleanup 才会 best-effort 调 `/abandon`；`acquire` 返回 `pending` 时持续轮询。
+- `queryToken` 标识 live flow，`invocationEpoch` 标识当前 accepted invocation；worker 只消费这组 ownership tuple，不在本地复刻正确性。
+- 若 detached flow 已 short-latch 一个 `READY`，worker 的下一次同 token `acquire` 会直接拿到已有 grant，并切到新的 `invocationEpoch`。
 - worker 与 slot-handler 的边界固定为四种 admission 模式：`none` 不触达 slot-handler，`breaker_only` 由 worker 走 `download_authorize_breaker_attempt`，`queue_only` 只做 queue admission，`queue_breaker` 由 slot-handler 原子完成 queue + breaker admission，再由 worker 在响应后回写 report；slot-handler 不保存任何 breaker 运行时状态。
 - `overloaded` 表示 in-flight 超限，worker 按 scope 分流处理：
   - `overload_global`：fail-fast 返回 `503`，并携带 `Retry-After`。

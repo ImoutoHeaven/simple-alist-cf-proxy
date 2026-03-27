@@ -1,10 +1,151 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { nextOverloadDelayMs } from '../src/fairqueue-overload.js';
-import { __fairQueueTestHooks } from '../src/worker.js';
+import worker, { __fairQueueTestHooks } from '../src/worker.js';
+import { encryptBindingPayload } from '../src/origin-binding.js';
 
 const SCOPED_OVERLOAD_WAIT_MIN_MS = 350;
 const SCOPED_OVERLOAD_WAIT_MAX_MS = 3000;
+
+const createJsonResponse = (payload) => new Response(JSON.stringify(payload), {
+  status: 200,
+  headers: { 'content-type': 'application/json' },
+});
+
+const encodeBase64Url = (input) => Buffer.from(input)
+  .toString('base64')
+  .replace(/\+/g, '-')
+  .replace(/\//g, '_')
+  .replace(/=+$/g, '');
+
+const encodeSignatureBase64Url = (input) => Buffer.from(input)
+  .toString('base64')
+  .replace(/\+/g, '-')
+  .replace(/\//g, '_');
+
+const signPayload = async (payload, expire, token) => {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(token),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const signature = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    new TextEncoder().encode(`${payload}:${expire}`),
+  );
+  return `${encodeSignatureBase64Url(Buffer.from(signature))}:${expire}`;
+};
+
+const buildRuntimeBootstrap = ({ fairQueueHostPatterns = [] } = {}) => ({
+  configVersion: 'chunk1-overload-runtime',
+  ttlSeconds: 300,
+  global: {
+    defaultProfileId: 'default',
+  },
+  pathProfiles: [{
+    id: 'default',
+    dynamic: false,
+    actions: {
+      checkOriginMode: '',
+    },
+  }],
+  common: {
+    tokenHmacKey: 'bootstrap-token',
+    workerAddresses: ['https://worker.example.com'],
+    landingWorkerAddresses: ['https://landing.example.com'],
+    binding: {
+      defaultModes: '',
+      version: 1,
+    },
+  },
+  download: {
+    address: 'https://alist.example.com',
+    db: {
+      mode: 'custom-pg-rest',
+      postgrestUrl: 'https://postgrest.example.test',
+      verifyHeader: ['X-Verify'],
+      verifySecret: ['secret'],
+      cacheEnabled: false,
+      cleanupPercentage: 0,
+    },
+    throttleProfiles: {
+      default: {
+        hostPatterns: [],
+        openCapSeconds: 60,
+        openThresholdPercent: 30,
+        closeThresholdPercent: 15,
+        ewmaSpan: 8,
+        consecutiveThreshold: 4,
+        minSamplesBeforeEwmaOpen: 8,
+        idleResetSeconds: 900,
+        halfOpenSuccessThreshold: 2,
+        halfOpenCloseMode: 'and',
+        halfOpenMaxProbeCount: 4,
+        halfOpenMaxSeconds: 15,
+        halfOpenTimeoutMode: 'partial-close',
+        protectHttpCodes: [429, 499, 500, 502, 503, 504],
+      },
+    },
+    ...(fairQueueHostPatterns.length > 0 ? {
+      fairQueue: {
+        enabled: true,
+        hostPatterns: fairQueueHostPatterns,
+        slotHandlerUrl: 'https://slot-handler.example.test',
+        slotHandlerAuthKey: 'slot-secret',
+        slotHandlerAuthHeader: 'X-FQ-Auth',
+      },
+    } : {}),
+  },
+});
+
+const buildSignedWorkerRequest = async (pathname = '/downloads/chunk1-overload.bin') => {
+  const token = 'bootstrap-token';
+  const expire = Math.floor(Date.now() / 1000) + 300;
+  const encryptedBinding = await encryptBindingPayload({
+    v: 2,
+    issuer: 'https://landing.example.com',
+    workerAddress: 'https://worker.example.com',
+  }, token);
+  const payload = encodeBase64Url(JSON.stringify({
+    v: 1,
+    expireTime: expire,
+    encrypt: encryptedBinding,
+  }));
+  const payloadSign = await signPayload(payload, expire, token);
+  const url = new URL(pathname, 'https://worker.example.com');
+  url.searchParams.set('payload', payload);
+  url.searchParams.set('payloadSign', payloadSign);
+  return new Request(url, {
+    headers: {
+      origin: 'https://landing.example.com',
+      'CF-Connecting-IP': '192.0.2.10',
+    },
+  });
+};
+
+const buildWorkerEnv = () => ({
+  CONTROLLER_URL: 'https://controller.example.test',
+  CONTROLLER_API_TOKEN: 'controller-token',
+  ENV: 'test',
+  ROLE: 'download',
+  INSTANCE_ID: 'worker-1',
+  BOOTSTRAP_CACHE_MODE: 'direct',
+});
+
+const waitForNextTurn = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+const createDeferred = () => {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
 
 test('overload backoff increases by 500ms up to 2s', () => {
   assert.equal(nextOverloadDelayMs(0), 500);
@@ -81,7 +222,12 @@ test('slot-handler client defaults auth header name to X-FQ-Auth', async () => {
   globalThis.fetch = async (_url, init) => {
     const headers = new Headers(init?.headers);
     assert.equal(headers.get('X-FQ-Auth'), 'secret');
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-auth-default',
+      invocationEpoch: 1,
+      slotToken: 'slot-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -120,7 +266,12 @@ test('slot-handler client uses configured auth header name', async () => {
     const headers = new Headers(init?.headers);
     assert.equal(headers.get('X-Custom-FQ-Auth'), 'secret');
     assert.equal(headers.get('X-FQ-Auth'), null);
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-auth-custom',
+      invocationEpoch: 1,
+      slotToken: 'slot-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -131,6 +282,94 @@ test('slot-handler client uses configured auth header name', async () => {
     assert.equal(result.kind, 'granted');
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('slot-handler client stores queryToken and invocationEpoch on pending responses', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+  const controller = new AbortController();
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    setTimeout(() => controller.abort(), 0);
+    return new Response(JSON.stringify({
+      result: 'pending',
+      queryToken: 'query-pending',
+      invocationEpoch: 4,
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    await assert.rejects(
+      client.waitForSlot({}, fqContext, controller.signal),
+      (error) => error && error.name === 'AbortError',
+    );
+    assert.equal(fqContext.queryToken, 'query-pending');
+    assert.equal(fqContext.invocationEpoch, 4);
+    assert.equal(fqContext.slotToken, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('slot-handler client rejects pending responses missing accepted ownership', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 50,
+      perRequestTimeoutMs: 50,
+      maxAttemptsCap: 1,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    queryToken: 'query-owned',
+    invocationEpoch: 3,
+  };
+  const originalFetch = globalThis.fetch;
+  const originalMathRandom = Math.random;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: 'pending',
+    queryToken: 'query-partial',
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+  Math.random = () => 0;
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(result, { kind: 'timeout', reason: 'slot-handler-invalid-response' });
+    assert.equal(fqContext.queryToken, 'query-owned');
+    assert.equal(fqContext.invocationEpoch, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+    Math.random = originalMathRandom;
   }
 });
 
@@ -156,6 +395,8 @@ test('slot-handler client surfaces atomic attempt tokens from granted responses'
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({
     result: 'granted',
+    queryToken: 'query-granted',
+    invocationEpoch: 6,
     slotToken: 'slot-1',
     meta: {
       attemptVersion: 7,
@@ -171,6 +412,95 @@ test('slot-handler client surfaces atomic attempt tokens from granted responses'
     assert.equal(result.kind, 'granted');
     assert.equal(result.attemptVersion, 7);
     assert.equal(result.attemptTicket, 2);
+    assert.equal(fqContext.queryToken, 'query-granted');
+    assert.equal(fqContext.invocationEpoch, 6);
+    assert.equal(fqContext.slotToken, 'slot-1');
+    assert.equal(fqContext.releaseOwnerRequired, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('slot-handler client marks owner-routed release only when granted response requires it', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: 'granted',
+    queryToken: 'query-granted-owner',
+    invocationEpoch: 9,
+    slotToken: 'slot-owner',
+    releaseOwnerRequired: true,
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.equal(result.kind, 'granted');
+    assert.equal(fqContext.queryToken, 'query-granted-owner');
+    assert.equal(fqContext.invocationEpoch, 9);
+    assert.equal(fqContext.slotToken, 'slot-owner');
+    assert.equal(fqContext.releaseOwnerRequired, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('slot-handler client rejects granted responses missing accepted ownership', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    queryToken: 'query-owned',
+    invocationEpoch: 3,
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: 'granted',
+    slotToken: 'slot-1',
+    queryToken: 'query-partial',
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(result, { kind: 'timeout', reason: 'slot-handler-invalid-response' });
+    assert.equal(fqContext.queryToken, 'query-owned');
+    assert.equal(fqContext.invocationEpoch, 3);
+    assert.equal(fqContext.slotToken, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -193,11 +523,16 @@ test('slot-handler client preserves retryAfter for HALF_OPEN_FULL responses', as
     hostnameHash: 'host-hash',
     ipBucket: 'ip-bucket',
     siteBucket: 'site-bucket',
+    queryToken: 'query-stale',
+    invocationEpoch: 2,
+    slotToken: 'slot-stale',
   };
 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({
     result: 'throttled',
+    queryToken: 'query-throttled',
+    invocationEpoch: 5,
     reason: 'try_acquire_half_open_full',
     throttleCode: 503,
     retryAfter: 9,
@@ -211,8 +546,359 @@ test('slot-handler client preserves retryAfter for HALF_OPEN_FULL responses', as
     assert.equal(result.kind, 'throttled');
     assert.equal(result.throttleCode, 503);
     assert.equal(result.retryAfter, 9);
+    assert.equal(fqContext.queryToken, null);
+    assert.equal(fqContext.invocationEpoch, null);
+    assert.equal(fqContext.slotToken, null);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('slot-handler client rejects throttled responses missing accepted ownership', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    queryToken: 'query-owned',
+    invocationEpoch: 3,
+    slotToken: 'slot-owned',
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: 'throttled',
+    throttleCode: 503,
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(result, { kind: 'timeout', reason: 'slot-handler-invalid-response' });
+    assert.equal(fqContext.queryToken, 'query-owned');
+    assert.equal(fqContext.invocationEpoch, 3);
+    assert.equal(fqContext.slotToken, 'slot-owned');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('slot-handler client clears full ownership tuple on timeout responses', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    queryToken: 'query-timeout',
+    invocationEpoch: 7,
+    slotToken: 'slot-timeout',
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: 'timeout',
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(result, { kind: 'timeout', reason: 'slot-handler-timeout' });
+    assert.equal(fqContext.queryToken, null);
+    assert.equal(fqContext.invocationEpoch, null);
+    assert.equal(fqContext.slotToken, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('slot-handler client preserves last owned tuple on overloaded responses', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    queryToken: 'query-owned',
+    invocationEpoch: 3,
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: 'overloaded',
+    reason: 'overload_global',
+    retryAfter: 2,
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(result, {
+      kind: 'overloaded',
+      scope: 'global',
+      retryAfter: 2,
+    });
+    assert.equal(fqContext.queryToken, 'query-owned');
+    assert.equal(fqContext.invocationEpoch, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
+test('slot-handler client preserves last owned tuple on conflict responses', async () => {
+  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+  clearOverloadedByHost();
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 50,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    queryToken: 'query-conflict',
+    invocationEpoch: 8,
+  };
+  const originalMathRandom = Math.random;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: 'conflict',
+  }), {
+    status: 409,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  Math.random = () => 0;
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(result, { kind: 'conflict' });
+    assert.equal(fqContext.queryToken, 'query-conflict');
+    assert.equal(fqContext.invocationEpoch, 8);
+  } finally {
+    globalThis.fetch = originalFetch;
+    Math.random = originalMathRandom;
+    clearOverloadedByHost();
+  }
+});
+
+test('conflict early-return emits exactly one abandon for one accepted tuple', async () => {
+  const { clearOverloadedByHost } = __fairQueueTestHooks;
+  const waitUntilPromises = [];
+  const abandonBodies = [];
+  const releaseBodies = [];
+  const firstAbandon = createDeferred();
+  let abandonCalls = 0;
+  let acquireCalls = 0;
+  const originalFetch = globalThis.fetch;
+  delete globalThis.bootstrapCache;
+  clearOverloadedByHost();
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ fairQueueHostPatterns: ['*.sharepoint.com'] }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/start',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      acquireCalls += 1;
+      if (acquireCalls === 1) {
+        return createJsonResponse({
+          result: 'pending',
+          queryToken: 'query-conflict-owned',
+          invocationEpoch: 21,
+        });
+      }
+      return new Response(JSON.stringify({
+        result: 'conflict',
+      }), {
+        status: 409,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/abandon') {
+      abandonCalls += 1;
+      abandonBodies.push(JSON.parse(init.body));
+      if (abandonCalls === 1) {
+        return await firstAbandon.promise;
+      }
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/fairqueue-conflict-single-owner.bin'), buildWorkerEnv(), {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    assert.equal(response.status, 503);
+    await waitForNextTurn();
+    assert.equal(abandonCalls, 1);
+
+    firstAbandon.resolve(createJsonResponse({ result: 'ok' }));
+    await Promise.allSettled(waitUntilPromises);
+    await waitForNextTurn();
+
+    assert.deepEqual(abandonBodies, [{ queryToken: 'query-conflict-owned', invocationEpoch: 21 }]);
+    assert.deepEqual(releaseBodies, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('global overload early-return emits exactly one abandon for one accepted tuple', async () => {
+  const { clearOverloadedByHost } = __fairQueueTestHooks;
+  const waitUntilPromises = [];
+  const abandonBodies = [];
+  const releaseBodies = [];
+  const firstAbandon = createDeferred();
+  let abandonCalls = 0;
+  let acquireCalls = 0;
+  const originalFetch = globalThis.fetch;
+  delete globalThis.bootstrapCache;
+  clearOverloadedByHost();
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ fairQueueHostPatterns: ['*.sharepoint.com'] }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/start',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      acquireCalls += 1;
+      if (acquireCalls === 1) {
+        return createJsonResponse({
+          result: 'pending',
+          queryToken: 'query-global-owned',
+          invocationEpoch: 31,
+        });
+      }
+      return createJsonResponse({
+        result: 'overloaded',
+        reason: 'overload_global',
+        retryAfter: 2,
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/abandon') {
+      abandonCalls += 1;
+      abandonBodies.push(JSON.parse(init.body));
+      if (abandonCalls === 1) {
+        return await firstAbandon.promise;
+      }
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/fairqueue-global-overload-single-owner.bin'), buildWorkerEnv(), {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    assert.equal(response.status, 503);
+    await waitForNextTurn();
+    assert.equal(abandonCalls, 1);
+
+    firstAbandon.resolve(createJsonResponse({ result: 'ok' }));
+    await Promise.allSettled(waitUntilPromises);
+    await waitForNextTurn();
+
+    assert.deepEqual(abandonBodies, [{ queryToken: 'query-global-owned', invocationEpoch: 31 }]);
+    assert.deepEqual(releaseBodies, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+    delete globalThis.bootstrapCache;
   }
 });
 
@@ -265,7 +951,12 @@ test('resolveConfig wires controller slotHandlerAuthHeader into slot-handler req
     const headers = new Headers(init?.headers);
     assert.equal(headers.get('X-Bootstrap-FQ-Auth'), 'secret');
     assert.equal(headers.get('X-FQ-Auth'), null);
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-bootstrap-auth',
+      invocationEpoch: 1,
+      slotToken: 'slot-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -367,7 +1058,12 @@ test('global overload cooldown should suppress repeated acquire calls', async ()
         headers: { 'content-type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-global-cooldown-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -430,7 +1126,12 @@ test('scoped overload should keep bounded wait loop and then grant', async () =>
         headers: { 'content-type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-host-overload-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -491,7 +1192,12 @@ test('site-scoped overload should keep bounded wait loop and then grant', async 
         headers: { 'content-type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-site-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-site-overload-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-site-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -552,7 +1258,12 @@ test('ip-scoped overload should keep bounded wait loop and then grant', async ()
         headers: { 'content-type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-ip-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-ip-overload-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-ip-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -620,7 +1331,12 @@ test('site-scoped overload cooldown should not suppress other sites under same h
         headers: { 'content-type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-site-b-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-site-b-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-site-b-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -684,7 +1400,12 @@ test('ip-scoped overload cooldown should not suppress other ip buckets under sam
         headers: { 'content-type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-ip-b-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-ip-b-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-ip-b-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -707,8 +1428,14 @@ test('ip-scoped overload cooldown should not suppress other ip buckets under sam
   }
 });
 
-test('unknown scoped overload reason falls back to host-level cooldown', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
+test('unknown scoped overload reason does not create scoped cooldown state', async () => {
+  const {
+    createSlotHandlerClient,
+    clearOverloadedByHost,
+    getHostOverloadedRemainingMs,
+    getSiteOverloadedRemainingMs,
+    getIpOverloadedRemainingMs,
+  } = __fairQueueTestHooks;
   clearOverloadedByHost();
 
   const client = createSlotHandlerClient({
@@ -748,7 +1475,12 @@ test('unknown scoped overload reason falls back to host-level cooldown', async (
         headers: { 'content-type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-2' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-unknown-scope-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-2',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -757,11 +1489,17 @@ test('unknown scoped overload reason falls back to host-level cooldown', async (
   try {
     const first = await client.waitForSlot({}, siteAContext);
     assert.equal(first.kind, 'timeout');
+    assert.equal(getHostOverloadedRemainingMs(siteAContext.hostname), 0);
+    assert.equal(getSiteOverloadedRemainingMs(siteAContext.hostname, siteAContext.siteBucket), 0);
+    assert.equal(getIpOverloadedRemainingMs(siteAContext.hostname, siteAContext.siteBucket, siteAContext.ipBucket), 0);
 
+    const startedAt = Date.now();
     const second = await client.waitForSlot({}, siteBContext);
+    const elapsedMs = Date.now() - startedAt;
 
-    assert.equal(second.kind, 'timeout');
-    assert.equal(fetchCalls, 1);
+    assert.equal(second.kind, 'granted');
+    assert.equal(fetchCalls, 2);
+    assert.ok(elapsedMs < 250, `expected unknown scoped overload not to suppress later requests, got ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
     clearOverloadedByHost();
@@ -809,7 +1547,12 @@ test('ip-scoped keys with embedded delimiters do not collide', async () => {
         headers: { 'content-type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-safe-key' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-safe-key-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-safe-key',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -900,7 +1643,12 @@ test('scoped overload wait uses strict 500ms staircase contract', async () => {
       });
     }
 
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-host-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-staircase-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-host-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -964,7 +1712,12 @@ test('near-expiry host-overload cooldown should not be inflated to extra long sl
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => {
     fetchCalls += 1;
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-near-expiry-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -1010,7 +1763,12 @@ test('abort during host-overload cooldown should stop immediately without acquir
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => {
     fetchCalls += 1;
-    return new Response(JSON.stringify({ result: 'granted', slotToken: 'slot-1' }), {
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-release-retry-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-1',
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -1051,6 +1809,9 @@ test('releaseSlot retries timed out releases with dedicated 1500ms timeout', asy
     ipBucket: 'ip-bucket',
     siteBucket: 'site-bucket',
     slotToken: 'slot-timeout',
+    queryToken: 'query-release-timeout',
+    invocationEpoch: 1,
+    releaseOwnerRequired: false,
     nowMs: Date.now(),
   };
 
@@ -1129,6 +1890,9 @@ test('releaseSlot retries on retryable status and network errors', async () => {
     ipBucket: 'ip-bucket',
     siteBucket: 'site-bucket',
     slotToken: 'slot-1',
+    queryToken: 'query-release-retryable',
+    invocationEpoch: 1,
+    releaseOwnerRequired: false,
     nowMs: Date.now(),
   };
 
@@ -1171,6 +1935,9 @@ test('releaseSlot does not retry on non-retryable 4xx', async () => {
     ipBucket: 'ip-bucket',
     siteBucket: 'site-bucket',
     slotToken: 'slot-1',
+    queryToken: 'query-release-4xx',
+    invocationEpoch: 1,
+    releaseOwnerRequired: false,
     nowMs: Date.now(),
   };
 

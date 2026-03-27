@@ -9,7 +9,33 @@ import (
 
 const overloadRetryAfterSeconds = 1
 
-const overloadScopedFallback = "host"
+const overloadScopedFallback = "unknown"
+
+var acceptAcquireInvocationForAcquire = func(store *flowStore, token string, req AcquireRequest, w *fqWaiter, now, leaseUntil time.Time, limits inFlightLimits) (*AcquireResponse, error) {
+	if store == nil {
+		return nil, nil
+	}
+	return store.acceptAcquireInvocation(token, req, w, now, leaseUntil, limits)
+}
+
+func acquireInvocationLeaseDuration(cfg *Config) time.Duration {
+	if cfg == nil {
+		return 10 * time.Second
+	}
+	pollWindow := cfg.FairQueue.pollWindowDuration()
+	reconnectSlack := cfg.FairQueue.graceDuration()
+	if pollWindow < 0 {
+		pollWindow = 0
+	}
+	if reconnectSlack < 0 {
+		reconnectSlack = 0
+	}
+	lease := pollWindow + reconnectSlack
+	if lease <= 0 {
+		return 10 * time.Second
+	}
+	return lease
+}
 
 func overloadedResponse(scope string) *AcquireResponse {
 	resolved := strings.TrimSpace(scope)
@@ -23,19 +49,20 @@ func overloadedResponse(scope string) *AcquireResponse {
 	}
 }
 
+func timeoutResponse(reason string) *AcquireResponse {
+	return &AcquireResponse{Result: "timeout", Reason: reason}
+}
+
+func conflictResponse() *AcquireResponse {
+	return &AcquireResponse{Result: "conflict"}
+}
+
 func detectOverloadScope(store *flowStore, hostKey, siteBucket, ipBucket string, limits inFlightLimits) string {
 	_, scope := store.overloadScope(hostKey, siteBucket, ipBucket, limits)
 	return scope
 }
 
 // handleAcquireSlotFlow implements token-stable acquire semantics for fair-queue long polling.
-//
-// Key behaviors:
-// - token lookup/create (unknown/expired => timeout for provided token, new flow for first join)
-// - one in-flight waiter per token (concurrent waiters => conflict)
-// - long-poll up to pollWindow; timeout returns pending and starts grace at that moment
-// - terminal delivery (granted/throttled/timeout) detaches waiter and deletes the flow
-// - ctx cancellation detaches and deletes the flow (no grace)
 func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -55,6 +82,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		s.mu.Lock()
 		if s.flowStore == nil {
 			s.flowStore = newFlowStore(grace)
+			s.wireFlowStoreRuntimeLocked(cfg)
 		}
 		store = s.flowStore
 		s.mu.Unlock()
@@ -65,6 +93,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		nowFn = store.nowFn
 	}
 	now := nowFn()
+	leaseUntil := now.Add(acquireInvocationLeaseDuration(cfg))
 	req.SiteBucket = canonicalSiteBucket(req.SiteBucket)
 	hostKey := fqHostKey(req.HostnameHash, req.Hostname)
 	limits := cfg.FairQueue.inFlightLimits()
@@ -74,16 +103,16 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		if !store.isAlive(token, now) {
 			store.deleteIfExpired(token, now)
 			s.incrementMetric("token_stale")
-			return &AcquireResponse{Result: "timeout", Reason: "query_token_stale"}, nil
+			return timeoutResponse("query_token_stale"), nil
 		}
 		snap, ok := store.getSnapshot(token)
 		if !ok {
 			s.incrementMetric("token_stale")
-			return &AcquireResponse{Result: "timeout", Reason: "query_token_stale"}, nil
+			return timeoutResponse("query_token_stale"), nil
 		}
 		if !matchesAcquireIdentityAndAdmissionTuple(snap, req) {
 			s.incrementMetric("token_mismatch")
-			return &AcquireResponse{Result: "timeout", Reason: "query_token_mismatch"}, nil
+			return timeoutResponse("query_token_mismatch"), nil
 		}
 	}
 
@@ -96,9 +125,24 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		createdNew = true
 		s.incrementMetric("flow_created")
 	}
+	if requestedToken != "" {
+		expired, releaseReq, hasRelease, expiredHostKey := store.expireDetachedReadyLatchForAcquire(token, now)
+		if expired {
+			s.recordReadyLatchExpired()
+			if hasRelease {
+				s.recordCompensatingRelease()
+			}
+			if expiredHostKey != "" {
+				s.wakeHostProbeRunner(expiredHostKey)
+			}
+			if hasRelease {
+				s.compensatingReleaseAsync(releaseReq)
+			}
+		}
+	}
 
 	w := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-	ok, err := store.attachWaiterWithLimits(token, w, now, limits)
+	resp, err := acceptAcquireInvocationForAcquire(store, token, req, w, now, leaseUntil, limits)
 	if err != nil {
 		if errors.Is(err, errWaiterOverloaded) {
 			scope := overloadScopeFromError(err)
@@ -107,7 +151,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			}
 			if requestedToken != "" {
 				if scope != "global" {
-					store.refreshGrace(token, nowFn())
+					store.refreshDetachedReconnectWindow(token, nowFn())
 				}
 			} else if createdNew {
 				store.deleteFlow(token)
@@ -116,30 +160,40 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		}
 		return nil, err
 	}
-	if !ok {
+	if resp != nil && strings.EqualFold(strings.TrimSpace(resp.Result), "timeout") {
+		return timeoutResponse(resp.Reason), nil
+	}
+	if resp == nil {
 		if requestedToken != "" {
 			store.deleteIfExpired(token, nowFn())
 			s.incrementMetric("token_stale")
-			return &AcquireResponse{Result: "timeout", Reason: "query_token_stale"}, nil
+			return timeoutResponse("query_token_stale"), nil
 		}
-		if scope := detectOverloadScope(store, hostKey, req.SiteBucket, req.IPBucket, limits); scope != "" {
-			return overloadedResponse(scope), nil
+		if createdNew {
+			store.deleteFlow(token)
 		}
-		// Flow was deleted/expired concurrently; treat as a new join.
-		token = store.newFlowFromAcquireRequest(req)
-		createdNew = true
-		w = &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-		if _, err := store.attachWaiterWithLimits(token, w, now, limits); err != nil {
-			if errors.Is(err, errWaiterOverloaded) {
-				store.deleteFlow(token)
-				scope := overloadScopeFromError(err)
-				if scope == "" {
-					scope = detectOverloadScope(store, hostKey, req.SiteBucket, req.IPBucket, limits)
-				}
-				return overloadedResponse(scope), nil
-			}
-			return nil, err
+		return nil, errors.New("failed to accept acquire invocation")
+	}
+	acceptedInvocationEpoch := resp.InvocationEpoch
+	if acceptedInvocationEpoch == 0 {
+		return nil, errors.New("accepted acquire response missing invocation epoch")
+	}
+	decorateAcceptedResponse := func(resp *AcquireResponse) *AcquireResponse {
+		if resp == nil {
+			return nil
 		}
+		if strings.TrimSpace(resp.QueryToken) == "" {
+			resp.QueryToken = token
+		}
+		if resp.InvocationEpoch == 0 {
+			resp.InvocationEpoch = acceptedInvocationEpoch
+		}
+		return resp
+	}
+	resp = decorateAcceptedResponse(resp)
+	if strings.EqualFold(strings.TrimSpace(resp.Result), "granted") {
+		s.recordGrantClaimed()
+		return resp, nil
 	}
 
 	// Ensure host runner is running; otherwise the waiter could remain pending forever.
@@ -153,50 +207,67 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		if resp == nil {
 			resp = &AcquireResponse{Result: "pending"}
 		}
-		if strings.TrimSpace(resp.QueryToken) == "" {
-			resp.QueryToken = token
-		}
+		resp = decorateAcceptedResponse(resp)
 		if strings.EqualFold(strings.TrimSpace(resp.Result), "pending") {
-			// Pending response is the authoritative moment to start grace.
-			store.detachWithGrace(token, nowFn())
+			store.detachToReconnectWindow(token, nowFn())
 		} else {
 			store.detachWaiter(token)
-			// Terminal cleanup (double-insurance, probeOnce may also delete).
 			store.deleteFlow(token)
 		}
 		return resp
 	}
 
 	finalizeCanceled := func(delivered *AcquireResponse) error {
-		store.detachWaiter(token)
-		releaseResp := delivered
-		if releaseResp == nil {
-			select {
-			case releaseResp = <-w.resCh:
-			default:
-			}
+		releaseResp := decorateAcceptedResponse(delivered)
+		now2 := nowFn()
+		hasGrantedCleanup := false
+		handoffEpoch := acceptedInvocationEpoch
+		if releaseResp != nil && releaseResp.InvocationEpoch != 0 {
+			handoffEpoch = releaseResp.InvocationEpoch
 		}
-		if releaseResp != nil && strings.EqualFold(strings.TrimSpace(releaseResp.Result), "granted") && strings.TrimSpace(releaseResp.SlotToken) != "" {
-			now2 := nowFn()
+		if releaseResp != nil && strings.EqualFold(strings.TrimSpace(releaseResp.Result), "granted") {
+			store.discardDeliveredGrantHandoff(token, handoffEpoch)
+			slotToken := strings.TrimSpace(releaseResp.SlotToken)
+			if slotToken != "" {
+				releaseReq := ReleaseRequest{
+					Hostname:      req.Hostname,
+					HostnameHash:  req.HostnameHash,
+					IPBucket:      req.IPBucket,
+					SiteBucket:    req.SiteBucket,
+					SlotToken:     slotToken,
+					HitUpstreamAt: now2.UnixMilli(),
+					Now:           now2.UnixMilli(),
+				}
+				go s.releaseSlotCompensating(context.Background(), releaseReq)
+			}
+			hasGrantedCleanup = true
+		} else if handoff, ok := store.takeDeliveredGrantHandoff(token, handoffEpoch); ok {
 			releaseReq := ReleaseRequest{
-				Hostname:      req.Hostname,
-				HostnameHash:  req.HostnameHash,
-				IPBucket:      req.IPBucket,
-				SiteBucket:    req.SiteBucket,
-				SlotToken:     releaseResp.SlotToken,
+				Hostname:      handoff.Hostname,
+				HostnameHash:  handoff.HostnameHash,
+				IPBucket:      handoff.IPBucket,
+				SiteBucket:    handoff.SiteBucket,
+				SlotToken:     handoff.SlotToken,
 				HitUpstreamAt: now2.UnixMilli(),
 				Now:           now2.UnixMilli(),
 			}
-			go s.releaseSlot(context.Background(), releaseReq)
+			go s.releaseSlotCompensating(context.Background(), releaseReq)
+			hasGrantedCleanup = true
 		}
-		store.deleteFlow(token)
+		if hasGrantedCleanup || (releaseResp != nil && strings.EqualFold(strings.TrimSpace(releaseResp.Result), "granted")) {
+			store.deleteFlow(token)
+		} else if releaseResp == nil {
+			store.detachToReconnectWindow(token, nowFn())
+		} else if strings.EqualFold(strings.TrimSpace(releaseResp.Result), "pending") {
+			store.detachToReconnectWindow(token, nowFn())
+		} else {
+			store.deleteFlow(token)
+		}
 		return ctx.Err()
 	}
 
 	select {
 	case <-ctx.Done():
-		// Avoid leaving a waiter attached; delete immediately (no grace) since the
-		// client aborted the request.
 		return nil, finalizeCanceled(nil)
 	case resp := <-w.resCh:
 		if ctx.Err() != nil {
@@ -207,7 +278,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		// Boundary race guard: prefer delivered outcomes over synthetic pending.
 		// We check once before detach, then detach, then check again. The second
 		// check closes the window where delivery could happen between a default
-		// branch and detachWithGrace.
+		// branch and detached reconnect transition.
 		select {
 		case resp := <-w.resCh:
 			if ctx.Err() != nil {
@@ -217,8 +288,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		default:
 		}
 		now2 := nowFn()
-		// Pending is the authoritative moment to start grace.
-		store.detachWithGrace(token, now2)
+		store.detachToReconnectWindow(token, now2)
 		select {
 		case resp := <-w.resCh:
 			if ctx.Err() != nil {
@@ -227,6 +297,6 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 			return finalizeDelivered(resp), nil
 		default:
 		}
-		return &AcquireResponse{Result: "pending", QueryToken: token}, nil
+		return decorateAcceptedResponse(&AcquireResponse{Result: "pending", QueryToken: token}), nil
 	}
 }

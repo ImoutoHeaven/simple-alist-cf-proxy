@@ -33,6 +33,12 @@ func TestAcquireOverloadedByGlobalLimit(t *testing.T) {
 	if resp.Result != "overloaded" {
 		t.Fatalf("expected overloaded, got %s", resp.Result)
 	}
+	if resp.QueryToken != "" {
+		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
+	}
+	if resp.InvocationEpoch != 0 {
+		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
+	}
 }
 
 func TestAcquireOverloadedByIPBucketScope(t *testing.T) {
@@ -61,6 +67,12 @@ func TestAcquireOverloadedByIPBucketScope(t *testing.T) {
 	}
 	if resp.Result != "overloaded" {
 		t.Fatalf("expected overloaded, got %s", resp.Result)
+	}
+	if resp.QueryToken != "" {
+		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
+	}
+	if resp.InvocationEpoch != 0 {
+		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
 	}
 
 	// different site bucket should not be affected by the ip bucket limit
@@ -105,6 +117,12 @@ func TestAcquireOverloadedByHostLimit(t *testing.T) {
 	if resp.Result != "overloaded" {
 		t.Fatalf("expected overloaded, got %s", resp.Result)
 	}
+	if resp.QueryToken != "" {
+		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
+	}
+	if resp.InvocationEpoch != 0 {
+		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
+	}
 
 	resp2, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
 		Hostname:     "other.example.com",
@@ -146,6 +164,12 @@ func TestAcquireOverloadedBySiteLimit(t *testing.T) {
 	}
 	if resp.Result != "overloaded" {
 		t.Fatalf("expected overloaded, got %s", resp.Result)
+	}
+	if resp.QueryToken != "" {
+		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
+	}
+	if resp.InvocationEpoch != 0 {
+		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
 	}
 
 	resp2, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
@@ -189,6 +213,12 @@ func TestAcquireOverloadedByGlobalLimitWithEmptyHostKey(t *testing.T) {
 	if resp.Result != "overloaded" {
 		t.Fatalf("expected overloaded, got %s", resp.Result)
 	}
+	if resp.QueryToken != "" {
+		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
+	}
+	if resp.InvocationEpoch != 0 {
+		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
+	}
 }
 
 func TestAcquireOverloadedWithExistingToken(t *testing.T) {
@@ -219,6 +249,12 @@ func TestAcquireOverloadedWithExistingToken(t *testing.T) {
 	}
 	if resp.Result != "overloaded" {
 		t.Fatalf("expected overloaded, got %s", resp.Result)
+	}
+	if resp.QueryToken != "" {
+		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
+	}
+	if resp.InvocationEpoch != 0 {
+		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
 	}
 }
 
@@ -258,10 +294,10 @@ func TestAcquireOverloadedResponseContainsScope(t *testing.T) {
 }
 
 func TestAcquireOverloadedReasonMapping(t *testing.T) {
-	t.Run("fallback_scope_is_scoped_not_global", func(t *testing.T) {
+	t.Run("unknown_scope_stays_unknown", func(t *testing.T) {
 		resp := overloadedResponse("")
-		if resp.Reason != "overload_host" {
-			t.Fatalf("expected fallback reason overload_host, got %q", resp.Reason)
+		if resp.Reason != "overload_unknown" {
+			t.Fatalf("expected unknown scope reason overload_unknown, got %q", resp.Reason)
 		}
 		if resp.RetryAfter <= 0 {
 			t.Fatalf("expected positive retryAfter, got %d", resp.RetryAfter)

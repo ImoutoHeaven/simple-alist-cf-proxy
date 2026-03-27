@@ -14,10 +14,17 @@ import (
 type releaseRecordingBackend struct {
 	sequenceBackend
 	released     chan ReleaseRequest
+	calledAtCh   chan time.Time
 	releaseCalls int
 }
 
 func (b *releaseRecordingBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	if b != nil && b.calledAtCh != nil {
+		select {
+		case b.calledAtCh <- time.Now():
+		default:
+		}
+	}
 	b.mu.Lock()
 	b.releaseCalls++
 	b.mu.Unlock()
@@ -93,6 +100,16 @@ type mixedModeLatchBackend struct {
 	releasedReqs []ReleaseRequest
 }
 
+type blockingReadyBackend struct {
+	mu           sync.Mutex
+	started      chan struct{}
+	releaseProbe chan struct{}
+	released     chan ReleaseRequest
+	startOnce    sync.Once
+	releaseCalls int
+	releasedReqs []ReleaseRequest
+}
+
 type tupleGroupingBackend struct {
 	mu      sync.Mutex
 	batches [][]AcquireRequest
@@ -110,6 +127,7 @@ type partitionReadyThenErrorBackend struct {
 	thirdSet        bool
 	seen            [][]AcquireRequest
 	released        []ReleaseRequest
+	calledAtCh      chan time.Time
 	releaseErrs     map[string]error
 }
 
@@ -332,6 +350,45 @@ func (b *mixedModeLatchBackend) ReleaseSlot(ctx context.Context, req ReleaseRequ
 	return nil
 }
 
+func (b *blockingReadyBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	b.startOnce.Do(func() {
+		if b.started != nil {
+			close(b.started)
+		}
+	})
+	if b.releaseProbe != nil {
+		select {
+		case <-b.releaseProbe:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	results := make([]*admitResult, len(reqs))
+	for i, req := range reqs {
+		results[i] = &admitResult{
+			status:         "READY",
+			slotToken:      "slot-" + req.IPBucket,
+			attemptVersion: 23,
+			attemptTicket:  5,
+		}
+	}
+	return results, nil
+}
+
+func (b *blockingReadyBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	b.mu.Lock()
+	b.releaseCalls++
+	b.releasedReqs = append(b.releasedReqs, req)
+	b.mu.Unlock()
+	if b.released != nil {
+		select {
+		case b.released <- req:
+		default:
+		}
+	}
+	return nil
+}
+
 func (b *tupleGroupingBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
 	copyReqs := append([]AcquireRequest(nil), reqs...)
 	b.mu.Lock()
@@ -453,6 +510,12 @@ func (b *partitionReadyThenErrorBackend) AdmitBatch(ctx context.Context, reqs []
 }
 
 func (b *partitionReadyThenErrorBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	if b != nil && b.calledAtCh != nil {
+		select {
+		case b.calledAtCh <- time.Now():
+		default:
+		}
+	}
 	b.mu.Lock()
 	b.released = append(b.released, req)
 	err := b.releaseErrs[req.SlotToken]
@@ -676,6 +739,981 @@ func expectAttemptMeta(t *testing.T, resp *AcquireResponse, wantVersion int64, w
 	}
 	if got := int(reflect.ValueOf(ticket).Int()); got != wantTicket {
 		t.Fatalf("expected attemptTicket %d, got %d", wantTicket, got)
+	}
+}
+
+func recommitReadyGrantOnSameToken(t *testing.T, store *flowStore, token, slotToken string, attemptVersion int64, attemptTicket int, latchTTL time.Duration, leaseUntil, now time.Time) {
+	t.Helper()
+
+	store.mu.Lock()
+	f := store.byToken[token]
+	if f == nil {
+		store.mu.Unlock()
+		t.Fatalf("expected live flow %q before recommitting READY grant", token)
+	}
+	if f.readyTimer != nil {
+		safeStopTimer(f.readyTimer)
+		f.readyTimer = nil
+	}
+	f.grantCommitted = false
+	f.grantEligible = false
+	f.readyLatchedAt = time.Time{}
+	f.readyLatchedUntil = time.Time{}
+	f.slotToken = ""
+	f.attemptVersion = 0
+	f.attemptTicket = 0
+	store.mu.Unlock()
+
+	renewFlowLease(t, store, token, leaseUntil)
+	commit := store.commitReadyGrantForProbe(token, slotToken, attemptVersion, attemptTicket, latchTTL, now)
+	if !commit.committed {
+		t.Fatalf("expected recommitted READY grant for token %q", token)
+	}
+	if !commit.readyLatched {
+		t.Fatalf("expected recommitted READY grant for token %q to latch", token)
+	}
+}
+
+func TestProbeReadyCommitFairnessDebitBeforeWorkerClaim(t *testing.T) {
+	store := newFlowStore(0)
+	store.afterFunc = nil
+
+	now := time.Date(2026, 3, 26, 13, 0, 0, 0, time.UTC)
+	tok := store.newFlow("h1", "example.com", "ip-ready", "s1")
+	renewFlowLease(t, store, tok, now.Add(30*time.Second))
+
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+	if _, ok := store.incrementLocalVT(tok); !ok {
+		t.Fatalf("expected initial LocalVT increment")
+	}
+	if !store.detachWaiter(tok) {
+		t.Fatalf("expected waiter detach before READY commit")
+	}
+
+	before, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected snapshot before READY commit")
+	}
+	beforeVT := before.LocalVT
+
+	commitReadyGrant(t, store, tok, "slot-ready", 7, 2, 300*time.Millisecond, now)
+
+	after, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected snapshot after READY commit")
+	}
+	if got := snapshotStringField(t, after, "SlotToken"); got != "slot-ready" {
+		t.Fatalf("expected committed slot token slot-ready, got %q", got)
+	}
+	if !snapshotBoolField(t, after, "GrantCommitted") {
+		t.Fatalf("expected READY commit to mark grantCommitted=true")
+	}
+	if snapshotBoolField(t, after, "GrantEligible") {
+		t.Fatalf("expected detached committed flow to remain non-eligible before worker claim")
+	}
+	if after.LocalVT != beforeVT+1 {
+		t.Fatalf("expected READY commit fairness debit to increment LocalVT from %d to %d, got %d", beforeVT, beforeVT+1, after.LocalVT)
+	}
+	if got := snapshotTimeField(t, after, "ReadyLatchedUntil"); !got.Equal(now.Add(300 * time.Millisecond)) {
+		t.Fatalf("expected latch expiry %v, got %v", now.Add(300*time.Millisecond), got)
+	}
+
+	if eligible := grantEligibleByHost(t, store, "h1", now.Add(10*time.Millisecond)); len(eligible) != 0 {
+		t.Fatalf("expected committed detached flow to stay DB-ineligible before claim, got %+v", eligible)
+	}
+	queueVisible := queueVisibleByHost(t, store, "h1", now.Add(10*time.Millisecond))
+	if len(queueVisible) != 1 || queueVisible[0].Token != tok {
+		t.Fatalf("expected committed flow to remain queue-visible until claim/expiry, got %+v", queueVisible)
+	}
+}
+
+func TestLatchExpireFairnessDebitPersistsAcrossReconnectWindow(t *testing.T) {
+	cfg := testConfigForAcquire(25*time.Millisecond, 500*time.Millisecond)
+	store := newFlowStore(cfg.FairQueue.graceDuration())
+	store.afterFunc = nil
+
+	now := time.Date(2026, 3, 26, 13, 5, 0, 0, time.UTC)
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip-latch", "s1")
+	tok := store.newFlowFromAcquireRequest(req)
+	leaseUntil := now.Add(45 * time.Second)
+
+	resp, err := store.acceptAcquireInvocation(tok, req, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now, leaseUntil, cfg.FairQueue.inFlightLimits())
+	if err != nil {
+		t.Fatalf("acceptAcquireInvocation err=%v", err)
+	}
+	if resp == nil || resp.Result != "pending" {
+		t.Fatalf("expected accepted pending response before latch expiry, got %+v", resp)
+	}
+	if _, ok := store.incrementLocalVT(tok); !ok {
+		t.Fatalf("expected initial LocalVT increment")
+	}
+	if !store.detachToReconnectWindow(tok, now) {
+		t.Fatalf("expected detachToReconnectWindow before latching READY")
+	}
+
+	before, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected snapshot before latching READY")
+	}
+	beforeVT := before.LocalVT
+
+	commitReadyGrant(t, store, tok, "slot-latch", 11, 5, 250*time.Millisecond, now)
+	expireReadyLatch(t, store, tok, now.Add(300*time.Millisecond))
+
+	after, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected live flow to remain after latch expiry")
+	}
+	if after.LocalVT != beforeVT+1 {
+		t.Fatalf("expected latch expiry to preserve READY fairness debit at %d, got %d", beforeVT+1, after.LocalVT)
+	}
+	if got := snapshotStringField(t, after, "SlotToken"); got != "" {
+		t.Fatalf("expected latch expiry to clear slot token, got %q", got)
+	}
+	if got := snapshotTimeField(t, after, "ReadyLatchedUntil"); !got.IsZero() {
+		t.Fatalf("expected latch expiry to clear ReadyLatchedUntil, got %v", got)
+	}
+	if snapshotBoolField(t, after, "GrantCommitted") {
+		t.Fatalf("expected latch expiry to settle the committed READY event")
+	}
+	if snapshotBoolField(t, after, "GrantEligible") {
+		t.Fatalf("expected expired latch flow without waiter to remain non-eligible")
+	}
+	if !store.isAlive(tok, now.Add(310*time.Millisecond)) {
+		t.Fatalf("expected reconnect window to keep flow alive after latch expiry")
+	}
+
+	if eligible := grantEligibleByHost(t, store, "h1", now.Add(310*time.Millisecond)); len(eligible) != 0 {
+		t.Fatalf("expected latch expiry not to restore grant eligibility, got %+v", eligible)
+	}
+	queueVisible := queueVisibleByHost(t, store, "h1", now.Add(310*time.Millisecond))
+	if len(queueVisible) != 1 || queueVisible[0].Token != tok {
+		t.Fatalf("expected flow to remain queue-visible after latch expiry, got %+v", queueVisible)
+	}
+}
+
+func TestExpireDetachedReadyLatchForAcquire(t *testing.T) {
+	cfg := testConfigForAcquire(25*time.Millisecond, 500*time.Millisecond)
+	store := newFlowStore(cfg.FairQueue.graceDuration())
+	store.afterFunc = nil
+
+	now := time.Date(2026, 3, 29, 10, 0, 0, 0, time.UTC)
+
+	noCommitTok, _ := newDetachedAcceptedAbandonFlow(t, store, cfg, "h-no-commit", "example.com", "ip-no-commit", "s1", now)
+	if expired, releaseReq, hasRelease, hostKey := store.expireDetachedReadyLatchForAcquire(noCommitTok, now.Add(400*time.Millisecond)); expired || hasRelease || hostKey != "" || !reflect.DeepEqual(releaseReq, ReleaseRequest{}) {
+		t.Fatalf("expected detached flow without committed ready latch to stay ineligible for acquire-side expiry, expired=%t release=%+v hasRelease=%t hostKey=%q", expired, releaseReq, hasRelease, hostKey)
+	}
+
+	withinTTLTok, _ := newDetachedAcceptedAbandonFlow(t, store, cfg, "h-within-ttl", "example.com", "ip-within-ttl", "s1", now)
+	commitReadyGrant(t, store, withinTTLTok, "slot-within-ttl", 11, 2, 300*time.Millisecond, now)
+	if expired, releaseReq, hasRelease, hostKey := store.expireDetachedReadyLatchForAcquire(withinTTLTok, now.Add(299*time.Millisecond)); expired || hasRelease || hostKey != "" || !reflect.DeepEqual(releaseReq, ReleaseRequest{}) {
+		t.Fatalf("expected detached ready latch inside TTL to stay ineligible for acquire-side expiry, expired=%t release=%+v hasRelease=%t hostKey=%q", expired, releaseReq, hasRelease, hostKey)
+	}
+
+	attachedTok := newAtomicBreakerFlow(store, "h-attached", "example.com", "ip-attached", "s1")
+	renewFlowLease(t, store, attachedTok, now.Add(10*time.Second))
+	if ok, err := store.attachWaiter(attachedTok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+	commitReadyGrant(t, store, attachedTok, "slot-attached", 13, 4, 300*time.Millisecond, now)
+	if expired, releaseReq, hasRelease, hostKey := store.expireDetachedReadyLatchForAcquire(attachedTok, now.Add(400*time.Millisecond)); expired || hasRelease || hostKey != "" || !reflect.DeepEqual(releaseReq, ReleaseRequest{}) {
+		t.Fatalf("expected waiter-attached committed grant to stay ineligible for acquire-side expiry, expired=%t release=%+v hasRelease=%t hostKey=%q", expired, releaseReq, hasRelease, hostKey)
+	}
+
+	staleTok, staleEpoch := newDetachedAcceptedAbandonFlow(t, store, cfg, "h-stale", "example.com", "ip-stale", "s1", now)
+	commitReadyGrant(t, store, staleTok, "slot-stale", 17, 5, 300*time.Millisecond, now)
+	expireAt := now.Add(300 * time.Millisecond)
+
+	expired, releaseReq, hasRelease, hostKey := store.expireDetachedReadyLatchForAcquire(staleTok, expireAt)
+	if !expired {
+		t.Fatalf("expected now >= readyLatchedUntil to expire detached ready latch")
+	}
+	if !hasRelease {
+		t.Fatalf("expected stale detached ready latch expiry to return compensating release request")
+	}
+	wantRelease := ReleaseRequest{
+		Hostname:      "example.com",
+		HostnameHash:  "h-stale",
+		IPBucket:      "ip-stale",
+		SiteBucket:    "s1",
+		SlotToken:     "slot-stale",
+		HitUpstreamAt: expireAt.UnixMilli(),
+		Now:           expireAt.UnixMilli(),
+	}
+	if !reflect.DeepEqual(releaseReq, wantRelease) {
+		t.Fatalf("expected release request %+v, got %+v", wantRelease, releaseReq)
+	}
+	if hostKey != "h-stale" {
+		t.Fatalf("expected hostKey h-stale, got %q", hostKey)
+	}
+
+	after, ok := store.getSnapshot(staleTok)
+	if !ok {
+		t.Fatalf("expected acquire-side stale latch expiry to keep flow alive for reconnect")
+	}
+	if after.InvocationEpoch != staleEpoch {
+		t.Fatalf("expected stale latch expiry to preserve invocation epoch %d, got %d", staleEpoch, after.InvocationEpoch)
+	}
+	if after.HasWaiter {
+		t.Fatalf("expected stale latch expiry to keep reconnect-form flow detached")
+	}
+	if snapshotBoolField(t, after, "GrantCommitted") {
+		t.Fatalf("expected stale latch expiry to clear committed grant state")
+	}
+	if snapshotBoolField(t, after, "GrantEligible") {
+		t.Fatalf("expected stale latch expiry reconnect form to remain grant-ineligible until later attach")
+	}
+	if got := snapshotStringField(t, after, "SlotToken"); got != "" {
+		t.Fatalf("expected stale latch expiry to clear slot token, got %q", got)
+	}
+	if got := snapshotTimeField(t, after, "ReadyLatchedUntil"); !got.IsZero() {
+		t.Fatalf("expected stale latch expiry to clear ready latch deadline, got %v", got)
+	}
+	if got := snapshotTimeField(t, after, "ExpireAt"); !got.Equal(expireAt.Add(cfg.FairQueue.graceDuration())) {
+		t.Fatalf("expected stale latch expiry to rearm reconnect window until %v, got %v", expireAt.Add(cfg.FairQueue.graceDuration()), got)
+	}
+	if !store.isAlive(staleTok, expireAt.Add(100*time.Millisecond)) {
+		t.Fatalf("expected flow to stay alive in reconnect form after stale latch expiry")
+	}
+	if visible := queueVisibleByHost(t, store, "h-stale", expireAt.Add(100*time.Millisecond)); len(visible) != 1 || visible[0].Token != staleTok {
+		t.Fatalf("expected stale latch expiry flow to remain queue-visible in reconnect form, got %+v", visible)
+	}
+	if eligible := grantEligibleByHost(t, store, "h-stale", expireAt.Add(100*time.Millisecond)); len(eligible) != 0 {
+		t.Fatalf("expected stale latch expiry reconnect form to stay grant-ineligible, got %+v", eligible)
+	}
+}
+
+func TestAcquireSideReadyLatchExpiryReturnsPendingAndCompensates(t *testing.T) {
+	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 1)}
+	cfg := testConfigForAcquire(25*time.Millisecond, 500*time.Millisecond)
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 29, 10, 30, 0, 0, time.UTC)
+	store := s.flowStore
+	store.afterFunc = nil
+	store.nowFn = func() time.Time { return now }
+
+	req := atomicBreakerAcquireRequest("example.com", "h-acquire-stale", "ip-acquire-stale", "s1")
+	tok, detachedEpoch := newDetachedAcceptedAbandonFlow(t, store, cfg, req.HostnameHash, req.Hostname, req.IPBucket, req.SiteBucket, now)
+	commitReadyGrant(t, store, tok, "slot-acquire-stale", 29, 7, 300*time.Millisecond, now)
+	originalAccept := acceptAcquireInvocationForAcquire
+	acceptCalled := 0
+	acceptAcquireInvocationForAcquire = func(store *flowStore, gotToken string, gotReq AcquireRequest, w *fqWaiter, acceptAt, leaseUntil time.Time, limits inFlightLimits) (*AcquireResponse, error) {
+		acceptCalled++
+		snap, ok := store.getSnapshot(gotToken)
+		if !ok {
+			t.Fatalf("expected live flow before acquire-side accept after stale latch expiry")
+		}
+		if snap.HasWaiter {
+			t.Fatalf("expected stale latch expiry to run before waiter attach")
+		}
+		if snapshotBoolField(t, snap, "GrantCommitted") {
+			t.Fatalf("expected stale latch expiry to clear committed grant before accept path")
+		}
+		if got := snapshotStringField(t, snap, "SlotToken"); got != "" {
+			t.Fatalf("expected stale latch expiry to clear slot token before accept path, got %q", got)
+		}
+		if got := snapshotTimeField(t, snap, "ReadyLatchedUntil"); !got.IsZero() {
+			t.Fatalf("expected stale latch expiry to clear ready latch deadline before accept path, got %v", got)
+		}
+		resp, err := originalAccept(store, gotToken, gotReq, w, acceptAt, leaseUntil, limits)
+		if err != nil {
+			return nil, err
+		}
+		afterAccept, ok := store.getSnapshot(gotToken)
+		if !ok {
+			t.Fatalf("expected live flow immediately after acquire-side accept")
+		}
+		if !afterAccept.HasWaiter {
+			t.Fatalf("expected same acquire call to attach as waiter during normal accept path")
+		}
+		if !snapshotBoolField(t, afterAccept, "GrantEligible") {
+			t.Fatalf("expected accepted waiter to become grant-eligible after stale latch retirement")
+		}
+		return resp, nil
+	}
+	defer func() {
+		acceptAcquireInvocationForAcquire = originalAccept
+	}()
+
+	now = now.Add(300 * time.Millisecond)
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:              req.Hostname,
+		HostnameHash:          req.HostnameHash,
+		IPBucket:              req.IPBucket,
+		SiteBucket:            req.SiteBucket,
+		BreakerEnabled:        req.BreakerEnabled,
+		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
+		QueryToken:            tok,
+	})
+	if err != nil {
+		t.Fatalf("handleAcquireSlot err=%v", err)
+	}
+	if resp == nil || resp.Result != "pending" || resp.QueryToken != tok {
+		t.Fatalf("expected stale detached latch acquire to return pending on same call, got %+v", resp)
+	}
+	if resp.InvocationEpoch != detachedEpoch+1 {
+		t.Fatalf("expected stale latch acquire to advance invocation epoch from %d to %d, got %+v", detachedEpoch, detachedEpoch+1, resp)
+	}
+	if acceptCalled != 1 {
+		t.Fatalf("expected stale latch acquire to continue through normal accept path exactly once, got %d", acceptCalled)
+	}
+
+	releaseReq := waitForReleaseRequest(t, backend.released)
+	wantRelease := ReleaseRequest{
+		Hostname:      req.Hostname,
+		HostnameHash:  req.HostnameHash,
+		IPBucket:      req.IPBucket,
+		SiteBucket:    req.SiteBucket,
+		SlotToken:     "slot-acquire-stale",
+		HitUpstreamAt: now.UnixMilli(),
+		Now:           now.UnixMilli(),
+	}
+	if !reflect.DeepEqual(releaseReq, wantRelease) {
+		t.Fatalf("expected acquire-side stale latch expiry release %+v, got %+v", wantRelease, releaseReq)
+	}
+
+	after, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected stale latch acquire path to keep flow alive after returning pending")
+	}
+	if after.HasWaiter {
+		t.Fatalf("expected pending acquire return to leave flow detached in reconnect form")
+	}
+	if after.InvocationEpoch != detachedEpoch+1 {
+		t.Fatalf("expected attached waiter invocation epoch %d, got %d", detachedEpoch+1, after.InvocationEpoch)
+	}
+	if snapshotBoolField(t, after, "GrantCommitted") {
+		t.Fatalf("expected stale latch acquire path to retire committed grant before attach")
+	}
+	if snapshotBoolField(t, after, "GrantEligible") {
+		t.Fatalf("expected pending acquire return to keep reconnect-form flow grant-ineligible")
+	}
+	if got := snapshotStringField(t, after, "SlotToken"); got != "" {
+		t.Fatalf("expected stale latch acquire path to clear slot token before attach, got %q", got)
+	}
+	if got := snapshotTimeField(t, after, "ReadyLatchedUntil"); !got.IsZero() {
+		t.Fatalf("expected stale latch acquire path to clear ready latch deadline, got %v", got)
+	}
+	if got := snapshotTimeField(t, after, "ExpireAt"); !got.Equal(now.Add(cfg.FairQueue.graceDuration())) {
+		t.Fatalf("expected pending acquire return to rearm reconnect window until %v, got %v", now.Add(cfg.FairQueue.graceDuration()), got)
+	}
+	if visible := queueVisibleByHost(t, store, req.HostnameHash, now.Add(time.Millisecond)); len(visible) != 1 || visible[0].Token != tok {
+		t.Fatalf("expected stale latch acquire path to keep the reattached flow queue-visible, got %+v", visible)
+	}
+	if eligible := grantEligibleByHost(t, store, req.HostnameHash, now.Add(time.Millisecond)); len(eligible) != 0 {
+		t.Fatalf("expected pending acquire return to leave reconnect-form flow grant-ineligible, got %+v", eligible)
+	}
+}
+
+func TestAcquireSideValidReadyLatchStillClaimsGranted(t *testing.T) {
+	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 1)}
+	cfg := testConfigForAcquire(25*time.Millisecond, 500*time.Millisecond)
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 29, 10, 45, 0, 0, time.UTC)
+	store := s.flowStore
+	store.afterFunc = nil
+	store.nowFn = func() time.Time { return now }
+
+	req := atomicBreakerAcquireRequest("example.com", "h-acquire-valid", "ip-acquire-valid", "s1")
+	tok, detachedEpoch := newDetachedAcceptedAbandonFlow(t, store, cfg, req.HostnameHash, req.Hostname, req.IPBucket, req.SiteBucket, now)
+	commitReadyGrant(t, store, tok, "slot-acquire-valid", 31, 8, 300*time.Millisecond, now)
+
+	now = now.Add(250 * time.Millisecond)
+	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
+		Hostname:              req.Hostname,
+		HostnameHash:          req.HostnameHash,
+		IPBucket:              req.IPBucket,
+		SiteBucket:            req.SiteBucket,
+		BreakerEnabled:        req.BreakerEnabled,
+		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
+		QueryToken:            tok,
+	})
+	if err != nil {
+		t.Fatalf("handleAcquireSlot err=%v", err)
+	}
+	if resp == nil || resp.Result != "granted" || resp.QueryToken != tok || resp.SlotToken != "slot-acquire-valid" {
+		t.Fatalf("expected detached ready latch within TTL to claim granted, got %+v", resp)
+	}
+	if resp.InvocationEpoch != detachedEpoch+1 {
+		t.Fatalf("expected valid detached latch claim to advance invocation epoch from %d to %d, got %+v", detachedEpoch, detachedEpoch+1, resp)
+	}
+
+	select {
+	case req := <-backend.released:
+		t.Fatalf("expected valid detached latch claim to avoid compensating release, got %+v", req)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	after, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected valid detached latch claim to preserve live flow state")
+	}
+	if after.HasWaiter {
+		t.Fatalf("expected valid detached latch claim to transition into claimed active grant without waiter attachment")
+	}
+	if !snapshotBoolField(t, after, "GrantClaimed") {
+		t.Fatalf("expected valid detached latch claim to mark claimed grant state")
+	}
+	if !snapshotBoolField(t, after, "GrantCommitted") {
+		t.Fatalf("expected valid detached latch claim to preserve committed grant state")
+	}
+	if got := snapshotStringField(t, after, "SlotToken"); got != "slot-acquire-valid" {
+		t.Fatalf("expected valid detached latch claim to preserve slot token, got %q", got)
+	}
+	if got := snapshotTimeField(t, after, "ReadyLatchedUntil"); !got.IsZero() {
+		t.Fatalf("expected valid detached latch claim to clear detached latch deadline after claim, got %v", got)
+	}
+	if got := snapshotTimeField(t, after, "ExpireAt"); !got.IsZero() {
+		t.Fatalf("expected valid detached latch claim to stay outside detached reconnect state, got %v", got)
+	}
+	if got := snapshotTimeField(t, after, "InvocationLeaseUntil"); !got.IsZero() {
+		t.Fatalf("expected valid detached latch claim to clear accepted invocation lease after claim, got %v", got)
+	}
+}
+
+func TestReadyCommitFairnessAllowsLaterGrantEligibilityAfterLatchExpiryAndReattach(t *testing.T) {
+	cfg := testConfigForAcquire(25*time.Millisecond, 500*time.Millisecond)
+	store := newFlowStore(cfg.FairQueue.graceDuration())
+	store.afterFunc = nil
+
+	now := time.Date(2026, 3, 26, 13, 10, 0, 0, time.UTC)
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip-ready-reuse", "s1")
+	tok := store.newFlowFromAcquireRequest(req)
+	firstLeaseUntil := now.Add(45 * time.Second)
+
+	resp, err := store.acceptAcquireInvocation(tok, req, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now, firstLeaseUntil, cfg.FairQueue.inFlightLimits())
+	if err != nil {
+		t.Fatalf("initial acceptAcquireInvocation err=%v", err)
+	}
+	if resp == nil || resp.Result != "pending" {
+		t.Fatalf("expected initial accepted pending response, got %+v", resp)
+	}
+	if !store.detachToReconnectWindow(tok, now) {
+		t.Fatalf("expected detachToReconnectWindow before READY commit")
+	}
+
+	commitReadyGrant(t, store, tok, "slot-reuse", 13, 6, 200*time.Millisecond, now)
+	expireReadyLatch(t, store, tok, now.Add(250*time.Millisecond))
+
+	afterExpire, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected live flow after latch expiry")
+	}
+	if snapshotBoolField(t, afterExpire, "GrantCommitted") {
+		t.Fatalf("expected settled READY event to clear grantCommitted before later waiter attach")
+	}
+
+	secondLeaseUntil := now.Add(55 * time.Second)
+	reattachResp, err := store.acceptAcquireInvocation(tok, req, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now.Add(300*time.Millisecond), secondLeaseUntil, cfg.FairQueue.inFlightLimits())
+	if err != nil {
+		t.Fatalf("reattach acceptAcquireInvocation err=%v", err)
+	}
+	if reattachResp == nil || reattachResp.Result != "pending" {
+		t.Fatalf("expected reattach after latch expiry to return pending, got %+v", reattachResp)
+	}
+
+	reused := findFlowSnapshot(t, grantEligibleByHost(t, store, "h1", now.Add(305*time.Millisecond)), tok)
+	if !reused.HasWaiter {
+		t.Fatalf("expected reattached flow to have waiter")
+	}
+	if got := reused.InvocationEpoch; got != afterExpire.InvocationEpoch+1 {
+		t.Fatalf("expected later accepted reattach to advance invocation epoch from %d to %d, got %d", afterExpire.InvocationEpoch, afterExpire.InvocationEpoch+1, got)
+	}
+	if !snapshotBoolField(t, reused, "GrantEligible") {
+		t.Fatalf("expected later waiter attach to restore grant eligibility after prior READY event settled")
+	}
+	if snapshotStringField(t, reused, "SlotToken") != "" {
+		t.Fatalf("expected settled READY event to clear slot token before later eligibility")
+	}
+	if got := snapshotTimeField(t, reused, "ReadyLatchedUntil"); !got.IsZero() {
+		t.Fatalf("expected settled READY event to clear latch deadline, got %v", got)
+	}
+}
+
+func TestProbeReadyCommitDebitsFairnessOnlyOnReady(t *testing.T) {
+	backend := &sequenceBackend{seq: []*admitResult{{status: "WAIT"}, {status: "READY", slotToken: "slot-ip-ready-commit", attemptVersion: 29, attemptTicket: 7}}}
+	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Date(2026, 3, 27, 11, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-ready-commit", "s1")
+	respCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to keep runner alive after WAIT")
+	}
+	select {
+	case got := <-respCh:
+		t.Fatalf("expected WAIT probe to keep flow pending, got %+v", got)
+	default:
+	}
+	snap, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected WAIT probe to leave flow live")
+	}
+	if snap.LocalVT != 0 {
+		t.Fatalf("expected fairness debit to wait for READY commit, got LocalVT=%d after WAIT", snap.LocalVT)
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now.Add(time.Millisecond)); !ok {
+		t.Fatalf("expected probeOnce to keep runner alive after READY")
+	}
+	select {
+	case got := <-respCh:
+		if got == nil || got.Result != "granted" || got.QueryToken != tok || got.SlotToken != "slot-ip-ready-commit" {
+			t.Fatalf("unexpected READY commit delivery: %+v", got)
+		}
+		expectAttemptMeta(t, got, 29, 7)
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("expected READY commit to deliver grant")
+	}
+	if _, ok := store.getSnapshot(tok); ok {
+		t.Fatalf("expected READY commit delivery to clear flow state")
+	}
+	if got := s.activeSlots.ActiveHost("h1", now.Add(time.Second)); got != 1 {
+		t.Fatalf("expected READY commit to add one active lease, got %d", got)
+	}
+}
+
+func TestProbeLatchExpireCompensatesReleaseAndKeepsFlowDetached(t *testing.T) {
+	backend := &blockingReadyBackend{
+		started:      make(chan struct{}),
+		releaseProbe: make(chan struct{}),
+		released:     make(chan ReleaseRequest, 1),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{PollIntervalMs: 300, IPCooldownSeconds: 5, ZombieTimeoutSeconds: 30}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Millisecond)
+	store := s.flowStore
+	store.nowFn = func() time.Time { return now }
+	var latchDelay time.Duration
+	expireFns := make(chan func(), 1)
+	var expireFn func()
+	store.afterFunc = func(d time.Duration, fn func()) *time.Timer {
+		latchDelay = d
+		expireFns <- fn
+		return time.NewTimer(time.Hour)
+	}
+
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-latched-expire", "s1")
+	leaseUntil := now.Add(325 * time.Millisecond)
+	renewFlowLease(t, store, tok, leaseUntil)
+	respCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = s.probeOnce(context.Background(), "h1", now)
+		close(done)
+	}()
+
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatalf("expected READY probe to start")
+	}
+	if !store.detachWaiter(tok) {
+		t.Fatalf("expected waiter detach before READY commit resolves")
+	}
+	close(backend.releaseProbe)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("expected probeOnce to finish after READY commit")
+	}
+
+	select {
+	case got := <-respCh:
+		t.Fatalf("expected detached READY to latch instead of direct delivery, got %+v", got)
+	default:
+	}
+	select {
+	case expireFn = <-expireFns:
+	default:
+		t.Fatalf("expected detached READY commit to arm latch expiry callback")
+	}
+	if latchDelay < 200*time.Millisecond || latchDelay > 500*time.Millisecond {
+		t.Fatalf("expected short READY latch TTL within 200ms-500ms, got %s", latchDelay)
+	}
+	if got := s.activeSlots.ActiveHost("h1", now.Add(time.Second)); got != 1 {
+		t.Fatalf("expected detached READY commit to hold one active lease before expiry, got %d", got)
+	}
+
+	snap, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected detached READY flow to remain live while latched")
+	}
+	if !snapshotBoolField(t, snap, "GrantCommitted") {
+		t.Fatalf("expected detached READY flow to record committed grant")
+	}
+	if got := snapshotStringField(t, snap, "SlotToken"); got != "slot-ip-latched-expire" {
+		t.Fatalf("expected detached READY flow to retain slot token, got %q", got)
+	}
+	if eligible := grantEligibleByHost(t, store, "h1", now.Add(time.Millisecond)); len(eligible) != 0 {
+		t.Fatalf("expected detached READY latch to stay DB-ineligible, got %+v", eligible)
+	}
+	visible := queueVisibleByHost(t, store, "h1", now.Add(time.Millisecond))
+	if len(visible) != 1 || visible[0].Token != tok {
+		t.Fatalf("expected detached READY latch to stay queue-visible, got %+v", visible)
+	}
+	if got := snapshotTimeField(t, snap, "ReadyLatchedUntil"); !got.Equal(now.Add(latchDelay)) {
+		t.Fatalf("expected detached READY flow to latch until %v, got %v", now.Add(latchDelay), got)
+	}
+
+	now = now.Add(latchDelay)
+	expireFn()
+	select {
+	case <-backend.released:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("expected latch expiry to trigger compensating release")
+	}
+
+	backend.mu.Lock()
+	releaseCalls := backend.releaseCalls
+	releasedReqs := append([]ReleaseRequest(nil), backend.releasedReqs...)
+	backend.mu.Unlock()
+	if releaseCalls != 1 || len(releasedReqs) != 1 {
+		t.Fatalf("expected exactly one compensating release after latch expiry, got calls=%d reqs=%+v", releaseCalls, releasedReqs)
+	}
+	if releasedReqs[0].SlotToken != "slot-ip-latched-expire" || releasedReqs[0].HostnameHash != "h1" || releasedReqs[0].SiteBucket != "s1" || releasedReqs[0].IPBucket != "ip-latched-expire" {
+		t.Fatalf("unexpected compensating release request after latch expiry: %+v", releasedReqs[0])
+	}
+	if got := s.activeSlots.ActiveHost("h1", now.Add(time.Second)); got != 0 {
+		t.Fatalf("expected compensating release to clear active lease, got %d", got)
+	}
+
+	after, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected flow to remain live after latch expiry while lease is valid")
+	}
+	if snapshotBoolField(t, after, "GrantCommitted") {
+		t.Fatalf("expected latch expiry to settle committed grant")
+	}
+	if snapshotBoolField(t, after, "GrantEligible") {
+		t.Fatalf("expected latch expiry to keep detached flow DB-ineligible")
+	}
+	if got := snapshotStringField(t, after, "SlotToken"); got != "" {
+		t.Fatalf("expected latch expiry to clear slot token, got %q", got)
+	}
+	if got := snapshotTimeField(t, after, "ReadyLatchedUntil"); !got.IsZero() {
+		t.Fatalf("expected latch expiry to clear ready latch deadline, got %v", got)
+	}
+	if !store.isAlive(tok, leaseUntil.Add(-time.Second)) {
+		t.Fatalf("expected invocation lease to keep latched flow alive after expiry")
+	}
+	visible = queueVisibleByHost(t, store, "h1", now.Add(time.Millisecond))
+	if len(visible) != 1 || visible[0].Token != tok {
+		t.Fatalf("expected post-expiry flow to remain queue-visible, got %+v", visible)
+	}
+	if eligible := grantEligibleByHost(t, store, "h1", now.Add(time.Millisecond)); len(eligible) != 0 {
+		t.Fatalf("expected post-expiry flow to remain grant-ineligible, got %+v", eligible)
+	}
+}
+
+func TestReadyLatchExpiryCallbackNoopsAfterWaiterReattach(t *testing.T) {
+	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 1)}
+	cfg := &Config{FairQueue: FairQueueConfig{ZombieTimeoutSeconds: 30}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 27, 14, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	store.nowFn = func() time.Time { return now }
+	var expireFn func()
+	store.afterFunc = func(d time.Duration, fn func()) *time.Timer {
+		expireFn = fn
+		return time.NewTimer(time.Hour)
+	}
+
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-stale-reattach", "s1")
+	leaseUntil := now.Add(325 * time.Millisecond)
+	renewFlowLease(t, store, tok, leaseUntil)
+	commit := store.commitReadyGrantForProbe(tok, "slot-stale-reattach", 19, 4, 300*time.Millisecond, now)
+	if !commit.readyLatched {
+		t.Fatalf("expected detached READY grant to latch before waiter reattach race")
+	}
+	if !store.armReadyLatchExpiry(tok, commit.committedGrantEpoch, now, func(token string, epoch uint64) {
+		expireNow := store.nowFn()
+		s.expireReadyLatchAndRelease(token, epoch, expireNow)
+	}) {
+		t.Fatalf("expected READY latch expiry callback to arm")
+	}
+	if expireFn == nil {
+		t.Fatalf("expected READY latch expiry callback capture")
+	}
+	store.afterFunc = nil
+
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now.Add(100*time.Millisecond)); !ok || err != nil {
+		t.Fatalf("reattach waiter ok=%t err=%v", ok, err)
+	}
+
+	before, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected flow snapshot before stale latch callback runs")
+	}
+	if !before.HasWaiter {
+		t.Fatalf("expected waiter to be attached before stale latch callback")
+	}
+	if !snapshotBoolField(t, before, "GrantCommitted") {
+		t.Fatalf("expected committed grant to remain live before stale latch callback")
+	}
+	wantLatchUntil := snapshotTimeField(t, before, "ReadyLatchedUntil")
+
+	now = now.Add(350 * time.Millisecond)
+	expireFn()
+
+	select {
+	case req := <-backend.released:
+		t.Fatalf("expected stale latch callback to noop after waiter reattach, got release %+v", req)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	after, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected flow to remain live after stale latch callback")
+	}
+	if !after.HasWaiter {
+		t.Fatalf("expected stale latch callback not to detach the reattached waiter")
+	}
+	if !snapshotBoolField(t, after, "GrantCommitted") {
+		t.Fatalf("expected stale latch callback not to clear committed grant after waiter reattach")
+	}
+	if got := snapshotStringField(t, after, "SlotToken"); got != "slot-stale-reattach" {
+		t.Fatalf("expected stale latch callback to preserve current slot token, got %q", got)
+	}
+	if got := snapshotTimeField(t, after, "ReadyLatchedUntil"); !got.Equal(wantLatchUntil) {
+		t.Fatalf("expected stale latch callback to preserve latch deadline %v, got %v", wantLatchUntil, got)
+	}
+}
+
+func TestReadyLatchExpiryCallbackNoopsAfterNewerCommittedGrant(t *testing.T) {
+	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 1)}
+	cfg := &Config{FairQueue: FairQueueConfig{ZombieTimeoutSeconds: 30}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 27, 14, 5, 0, 0, time.UTC)
+	store := s.flowStore
+	store.nowFn = func() time.Time { return now }
+	var expireFn func()
+	store.afterFunc = func(d time.Duration, fn func()) *time.Timer {
+		expireFn = fn
+		return time.NewTimer(time.Hour)
+	}
+
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-stale-newer", "s1")
+	leaseUntil := now.Add(10 * time.Second)
+	renewFlowLease(t, store, tok, leaseUntil)
+	commit := store.commitReadyGrantForProbe(tok, "slot-stale-old", 23, 5, 300*time.Millisecond, now)
+	if !commit.readyLatched {
+		t.Fatalf("expected initial READY grant to latch before newer-grant race")
+	}
+	if !store.armReadyLatchExpiry(tok, commit.committedGrantEpoch, now, func(token string, epoch uint64) {
+		expireNow := store.nowFn()
+		s.expireReadyLatchAndRelease(token, epoch, expireNow)
+	}) {
+		t.Fatalf("expected initial READY latch expiry callback to arm")
+	}
+	if expireFn == nil {
+		t.Fatalf("expected stale READY latch expiry callback capture")
+	}
+	store.afterFunc = nil
+
+	recommitReadyGrantOnSameToken(t, store, tok, "slot-stale-new", 29, 7, 150*time.Millisecond, leaseUntil, now.Add(50*time.Millisecond))
+
+	before, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected flow snapshot after recommitting newer READY grant")
+	}
+	if got := snapshotStringField(t, before, "SlotToken"); got != "slot-stale-new" {
+		t.Fatalf("expected newer committed slot token before stale callback, got %q", got)
+	}
+	if !snapshotBoolField(t, before, "GrantCommitted") {
+		t.Fatalf("expected newer grant to stay committed before stale callback")
+	}
+	wantLatchUntil := snapshotTimeField(t, before, "ReadyLatchedUntil")
+
+	now = now.Add(250 * time.Millisecond)
+	expireFn()
+
+	select {
+	case req := <-backend.released:
+		t.Fatalf("expected stale older callback to noop after newer committed grant, got release %+v", req)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	after, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected newer committed grant to remain live after stale callback")
+	}
+	if !snapshotBoolField(t, after, "GrantCommitted") {
+		t.Fatalf("expected stale older callback not to clear newer committed grant")
+	}
+	if got := snapshotStringField(t, after, "SlotToken"); got != "slot-stale-new" {
+		t.Fatalf("expected stale older callback to preserve newer slot token, got %q", got)
+	}
+	if got := snapshotTimeField(t, after, "ReadyLatchedUntil"); !got.Equal(wantLatchUntil) {
+		t.Fatalf("expected stale older callback to preserve newer latch deadline %v, got %v", wantLatchUntil, got)
+	}
+}
+
+func TestReactorDeadlineWakeUsesLatchExpiryBeforePollInterval(t *testing.T) {
+	backend := &probeWakeBackend{probeCh: make(chan time.Time, 4)}
+	pollInterval := 600 * time.Millisecond
+	latchTTL := 120 * time.Millisecond
+	hostCap := 1
+	cfg := &Config{FairQueue: FairQueueConfig{
+		PollIntervalMs:       pollInterval.Milliseconds(),
+		MaxBatch:             1,
+		MaxProbeParallel:     1,
+		MaxProbeQpsPerHost:   100,
+		ZombieTimeoutSeconds: 30,
+		HostCaps: HostCapsConfig{
+			MaxSlotPerHost: &hostCap,
+		},
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+	defer s.stopAllHostProbeRunners()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	store := s.flowStore
+	store.nowFn = func() time.Time { return now }
+	hostKey := "h1"
+
+	waitTok := store.newFlow(hostKey, "example.com", "ip-waiting", "s1")
+	if ok, err := store.attachWaiter(waitTok, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter waiting flow ok=%t err=%v", ok, err)
+	}
+
+	latchedTok := store.newFlow(hostKey, "example.com", "ip-latched", "s1")
+	if !store.renewAcceptedInvocationLease(latchedTok, now.Add(5*time.Second)) {
+		t.Fatalf("expected latched flow lease renewal")
+	}
+	commit := store.commitReadyGrantForProbe(latchedTok, "slot-latched-deadline", 17, 3, latchTTL, now)
+	if !commit.readyLatched {
+		t.Fatalf("expected READY commit to enter latch state")
+	}
+	s.activeSlots.AddLease("slot-latched-deadline", hostKey, "s1", "ip-latched", 30*time.Second, now)
+	if !store.armReadyLatchExpiry(latchedTok, commit.committedGrantEpoch, now, func(token string, epoch uint64) {
+		expireNow := store.nowFn()
+		s.expireReadyLatchAndRelease(token, epoch, expireNow)
+	}) {
+		t.Fatalf("expected latch expiry timer to arm")
+	}
+
+	s.ensureHostProbeRunner(hostKey)
+
+	time.Sleep(40 * time.Millisecond)
+	select {
+	case probeAt := <-backend.probeCh:
+		t.Fatalf("expected no backend probe before latch expiry frees capacity, got probe after %s", probeAt.Sub(now))
+	default:
+	}
+
+	start := time.Now()
+	select {
+	case probeAt := <-backend.probeCh:
+		if delay := probeAt.Sub(start); delay > pollInterval/2 {
+			t.Fatalf("expected latch expiry to wake reactor before full poll interval, got probe after %s", delay)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("expected latch expiry to wake reactor before the full poll interval")
+	}
+}
+
+func TestProbeEligibleDetachedLiveFlowDoesNotClaimDBSlot(t *testing.T) {
+	backend := &recordingBatchBackend{}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		MaxBatch:           1,
+		MaxProbeParallel:   1,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 27, 9, 10, 0, 0, time.UTC)
+	store := s.flowStore
+	tokDetached := store.newFlow("h1", "example.com", "ip-detached", "s1")
+	tokEligible := store.newFlow("h1", "example.com", "ip-eligible", "s1")
+	eligibleCh := make(chan *AcquireResponse, 1)
+	renewFlowLease(t, store, tokDetached, now.Add(30*time.Second))
+
+	if ok, err := store.attachWaiter(tokDetached, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter detached flow ok=%t err=%v", ok, err)
+	}
+	if !store.detachWaiter(tokDetached) {
+		t.Fatalf("expected detached live flow to lose waiter before probe")
+	}
+	if !store.refreshDetachedReconnectWindow(tokDetached, now) {
+		t.Fatalf("expected detached live flow to enter reconnect window before probe")
+	}
+	if ok, err := store.attachWaiter(tokEligible, &fqWaiter{resCh: eligibleCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter eligible flow ok=%t err=%v", ok, err)
+	}
+
+	sched := s.getOrCreateFlowScheduler("h1")
+	_, btDetached := sched.getOrInitStates("s1", "ip-detached")
+	_, btEligible := sched.getOrInitStates("s1", "ip-eligible")
+	if btDetached == nil || btEligible == nil {
+		t.Fatalf("expected scheduler buckets for detached and eligible flows")
+	}
+	btDetached.VirtualTime = 77
+	btEligible.VirtualTime = 1
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to stay alive with eligible waiter")
+	}
+
+	batches := backend.seenIPBatches()
+	if len(batches) != 1 || len(batches[0]) != 1 || batches[0][0] != "ip-eligible" {
+		t.Fatalf("expected only grant-eligible live flow admitted to backend, got %+v", batches)
+	}
+
+	select {
+	case got := <-eligibleCh:
+		t.Fatalf("expected WAIT backend to keep eligible flow pending, got %+v", got)
+	default:
+	}
+
+	detached := findFlowSnapshot(t, queueVisibleByHost(t, store, "h1", now.Add(time.Millisecond)), tokDetached)
+	if detached.HasWaiter {
+		t.Fatalf("expected detached live flow to remain queue-visible without waiter")
+	}
+	if snapshotBoolField(t, detached, "GrantEligible") {
+		t.Fatalf("expected detached live flow to remain DB-ineligible after probe")
+	}
+
+	_, btDetachedAfter := sched.getOrInitStates("s1", "ip-detached")
+	if btDetachedAfter == nil {
+		t.Fatalf("expected detached live flow bucket to remain tracked")
+	}
+	if btDetachedAfter.VirtualTime != 77 {
+		t.Fatalf("expected detached live flow bucket to remain in scheduler state with VT 77, got %f", btDetachedAfter.VirtualTime)
 	}
 }
 
@@ -1056,7 +2094,7 @@ func TestProbeOnceBreakerEnabledIPTooManySurvivesSameSubBatchLaterThrottled(t *t
 	}
 }
 
-func TestProbeOnceReadyDeliversSlotAndAttempt(t *testing.T) {
+func TestProbeReadyCommitDirectDeliveryStillWorksWithWaiter(t *testing.T) {
 	backend := &sequenceBackend{seq: []*admitResult{{status: "READY", slotToken: "slot-123", attemptVersion: 7, attemptTicket: 2}}}
 	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
 	s := newTestServer()
@@ -2254,6 +3292,80 @@ func TestProbeOncePartitionedSubBatchReadyThenLaterErrorCompensatesRelease(t *te
 	}
 }
 
+func TestAdmitPartitionedSubBatchCompensatingReadyReleaseBypassesHoldAndSmooth(t *testing.T) {
+	partitionErr := errors.New("later partition admit error")
+	smoothMs := int64(120)
+	backend := &partitionReadyThenErrorBackend{
+		firstPartition: []*admitResult{{status: "READY", slotToken: "slot-a-queue-1"}},
+		secondErr:      partitionErr,
+		calledAtCh:     make(chan time.Time, 1),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		MinSlotHoldMs:           80,
+		SmoothReleaseIntervalMs: &smoothMs,
+		IPCooldownSeconds:       5,
+		PollIntervalMs:          500,
+		MaxBatch:                2,
+		MaxProbeParallel:        2,
+		MaxProbeQpsPerHost:      100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	start := time.Now()
+	releaser := s.getSmoothReleaser("h1", "example.com")
+	releaser.mu.Lock()
+	releaser.lastReleaseAt = start.Add(150 * time.Millisecond)
+	releaser.mu.Unlock()
+
+	fq := cfg.FairQueue
+	queueReq := AcquireRequest{
+		Hostname:             "example.com",
+		HostnameHash:         "h1",
+		IPBucket:             "a-queue-1",
+		SiteBucket:           "s1",
+		Now:                  start.UnixMilli(),
+		HostMaxSlotPerHost:   fq.hostMaxSlotPerHost(),
+		HostMaxSlotPerIP:     fq.hostMaxSlotPerIP(),
+		SiteMaxSlotPerSite:   fq.siteMaxSlotPerSite(),
+		SiteMaxSlotPerIP:     fq.siteMaxSlotPerIP(),
+		ZombieTimeoutSeconds: fq.zombieTimeoutSeconds(),
+		CooldownSeconds:      fq.cooldownSeconds(),
+	}
+	breakerReq := queueReq
+	breakerReq.IPBucket = "z-breaker-1"
+	breakerReq.BreakerEnabled = true
+	breakerReq.HalfOpenMaxProbeCount = 4
+	breakerReq.HalfOpenMaxSeconds = 15
+	breakerReq.HalfOpenTimeoutMode = "partial-close"
+
+	outcomeCh := make(chan partitionedAdmitOutcome, 1)
+	go func() {
+		outcomeCh <- s.admitPartitionedSubBatch(context.Background(), []AcquireRequest{queueReq, breakerReq})
+	}()
+
+	select {
+	case calledAt := <-backend.calledAtCh:
+		if delay := calledAt.Sub(start); delay > 35*time.Millisecond {
+			t.Fatalf("expected compensating release to bypass hold/smooth, got %s", delay)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected immediate compensating release")
+	}
+
+	outcome := <-outcomeCh
+	if !errors.Is(outcome.err, partitionErr) {
+		t.Fatalf("expected partition error preserved, got %v", outcome.err)
+	}
+	released := backend.releasedRequests()
+	if len(released) != 1 {
+		t.Fatalf("expected one compensating release, got %+v", released)
+	}
+	if released[0].SlotToken != "slot-a-queue-1" {
+		t.Fatalf("unexpected compensating release request: %+v", released[0])
+	}
+}
+
 func TestProbeOncePartitionedSubBatchReadyThenLengthMismatchCompensatesRelease(t *testing.T) {
 	backend := &partitionReadyThenErrorBackend{
 		firstPartition:  []*admitResult{{status: "READY", slotToken: "slot-a-queue-1"}},
@@ -3285,6 +4397,236 @@ func TestProbeOnceReadyUndeliveredTriggersRelease(t *testing.T) {
 
 	if _, ok := store.getSnapshot(tok); ok {
 		t.Fatalf("expected flow deleted after acquired handling")
+	}
+}
+
+func TestProbeOnceReadyUndeliveredSettlesTransportState(t *testing.T) {
+	backend := &releaseRecordingBackend{
+		sequenceBackend: sequenceBackend{seq: []*admitResult{{status: "READY", slotToken: "slot-undelivered-state"}}},
+		released:        make(chan ReleaseRequest, 1),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Millisecond)
+	store := s.flowStore
+	tok := store.newFlow("h1", "example.com", "ip-undelivered-state", "s1")
+	leaseUntil := now.Add(10 * time.Second)
+	renewFlowLease(t, store, tok, leaseUntil)
+	respCh := make(chan *AcquireResponse, 1)
+	respCh <- &AcquireResponse{Result: "pending", QueryToken: tok}
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiter")
+	}
+
+	select {
+	case req := <-backend.released:
+		if req.SlotToken != "slot-undelivered-state" || req.HostnameHash != "h1" || req.SiteBucket != "s1" || req.IPBucket != "ip-undelivered-state" {
+			t.Fatalf("unexpected release request: %+v", req)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected undelivered acquired slot to trigger release")
+	}
+
+	snap, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected live lease to keep direct-delivery miss flow alive after compensation")
+	}
+	if snap.HasWaiter {
+		t.Fatalf("expected transport miss to clear stale waiter attachment")
+	}
+	if snapshotBoolField(t, snap, "GrantCommitted") {
+		t.Fatalf("expected transport miss to clear committed grant state")
+	}
+	if snapshotBoolField(t, snap, "GrantEligible") {
+		t.Fatalf("expected transport miss to leave flow detached and non-eligible")
+	}
+	if got := snapshotStringField(t, snap, "SlotToken"); got != "" {
+		t.Fatalf("expected transport miss to clear slot token, got %q", got)
+	}
+	visible := queueVisibleByHost(t, store, "h1", now.Add(time.Millisecond))
+	if len(visible) != 1 || visible[0].Token != tok {
+		t.Fatalf("expected compensated live flow to remain queue-visible, got %+v", visible)
+	}
+	if got := grantEligibleByHost(t, store, "h1", now.Add(time.Millisecond)); len(got) != 0 {
+		t.Fatalf("expected no grant-eligible flow after direct-delivery miss settlement, got %+v", got)
+	}
+	if active := store.listInFlightByHost("h1", now.Add(time.Millisecond)); len(active) != 0 {
+		t.Fatalf("expected no attached waiter to survive direct-delivery miss settlement, got %+v", active)
+	}
+	if got := s.activeSlots.ActiveHost("h1", now.Add(time.Second)); got != 0 {
+		t.Fatalf("expected transport miss compensation to clear active lease, got %d", got)
+	}
+}
+
+func TestProbeOnceReadyReattachDeliversCurrentAcceptedInvocationEpoch(t *testing.T) {
+	backend := &blockingReadyBackend{
+		started:      make(chan struct{}),
+		releaseProbe: make(chan struct{}),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{IPCooldownSeconds: 5, ZombieTimeoutSeconds: 30}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 28, 18, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	store.nowFn = func() time.Time { return now }
+
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip-probe-reattach", "s1")
+	tok := store.newFlowFromAcquireRequest(req)
+	firstWaiterCh := make(chan *AcquireResponse, 1)
+	if _, err := store.acceptAcquireInvocation(tok, req, &fqWaiter{resCh: firstWaiterCh}, now, now.Add(5*time.Second), inFlightLimits{}); err != nil {
+		t.Fatalf("acceptAcquireInvocation first waiter: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = s.probeOnce(context.Background(), "h1", now)
+		close(done)
+	}()
+
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatalf("expected READY probe to start")
+	}
+
+	if !store.detachToReconnectWindow(tok, now.Add(100*time.Millisecond)) {
+		t.Fatalf("expected original waiter detach before probe resolves")
+	}
+	replacementWaiterCh := make(chan *AcquireResponse, 1)
+	replacementAccepted, err := store.acceptAcquireInvocation(tok, req, &fqWaiter{resCh: replacementWaiterCh}, now.Add(200*time.Millisecond), now.Add(6*time.Second), inFlightLimits{})
+	if err != nil {
+		t.Fatalf("acceptAcquireInvocation replacement waiter: %v", err)
+	}
+	if replacementAccepted == nil || replacementAccepted.InvocationEpoch != 2 {
+		t.Fatalf("expected replacement waiter to own invocation epoch 2, got %+v", replacementAccepted)
+	}
+
+	close(backend.releaseProbe)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("expected probeOnce to finish after backend release")
+	}
+
+	select {
+	case got := <-replacementWaiterCh:
+		if got == nil || got.Result != "granted" || got.QueryToken != tok || got.SlotToken != "slot-ip-probe-reattach" {
+			t.Fatalf("unexpected replacement waiter response: %+v", got)
+		}
+		if got.InvocationEpoch != 2 {
+			t.Fatalf("expected replacement waiter to receive current invocation epoch 2, got %+v", got)
+		}
+		expectAttemptMeta(t, got, 23, 5)
+	case <-time.After(time.Second):
+		t.Fatalf("expected replacement waiter to receive granted response")
+	}
+
+	select {
+	case got := <-firstWaiterCh:
+		t.Fatalf("expected original waiter to receive no stale probe delivery, got %+v", got)
+	default:
+	}
+
+	if _, ok := store.getSnapshot(tok); ok {
+		t.Fatalf("expected flow deleted after granted delivery to current accepted invocation")
+	}
+}
+
+func TestProbeLatchSkipsWhenRemainingLeaseIsTooShort(t *testing.T) {
+	backend := &blockingReadyBackend{
+		started:      make(chan struct{}),
+		releaseProbe: make(chan struct{}),
+		released:     make(chan ReleaseRequest, 1),
+	}
+	cfg := &Config{FairQueue: FairQueueConfig{PollIntervalMs: 300, IPCooldownSeconds: 5, ZombieTimeoutSeconds: 30}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	now := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Millisecond)
+	store := s.flowStore
+	store.nowFn = func() time.Time { return now }
+	armedDelays := make([]time.Duration, 0, 1)
+	store.afterFunc = func(d time.Duration, fn func()) *time.Timer {
+		armedDelays = append(armedDelays, d)
+		return time.NewTimer(time.Hour)
+	}
+
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-short-lease", "s1")
+	leaseUntil := now.Add(100 * time.Millisecond)
+	renewFlowLease(t, store, tok, leaseUntil)
+	respCh := make(chan *AcquireResponse, 1)
+	if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: respCh}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = s.probeOnce(context.Background(), "h1", now)
+		close(done)
+	}()
+
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatalf("expected READY probe to start")
+	}
+	if !store.detachWaiter(tok) {
+		t.Fatalf("expected waiter detach before READY commit resolves")
+	}
+	close(backend.releaseProbe)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("expected probeOnce to finish after READY commit")
+	}
+
+	select {
+	case req := <-backend.released:
+		if req.SlotToken != "slot-ip-short-lease" || req.HostnameHash != "h1" || req.SiteBucket != "s1" || req.IPBucket != "ip-short-lease" {
+			t.Fatalf("unexpected compensating release for short-lease READY: %+v", req)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("expected short remaining lease to decline latch and compensating-release immediately")
+	}
+	if len(armedDelays) != 1 || armedDelays[0] != cfg.FairQueue.graceDuration() {
+		t.Fatalf("expected declined short-lease path to arm only detached reconnect window %s, got %v", cfg.FairQueue.graceDuration(), armedDelays)
+	}
+	if got := s.activeSlots.ActiveHost("h1", now.Add(time.Second)); got != 0 {
+		t.Fatalf("expected declined latch path to clear active lease, got %d", got)
+	}
+	snap, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected short remaining lease path to keep live flow visible for later reattach")
+	}
+	if snap.HasWaiter {
+		t.Fatalf("expected short remaining lease path to stay detached")
+	}
+	if snapshotBoolField(t, snap, "GrantCommitted") {
+		t.Fatalf("expected short remaining lease path to clear committed grant state")
+	}
+	if snapshotBoolField(t, snap, "GrantEligible") {
+		t.Fatalf("expected short remaining lease path to remain grant-ineligible")
+	}
+	if got := snapshotTimeField(t, snap, "ReadyLatchedUntil"); !got.IsZero() {
+		t.Fatalf("expected short remaining lease path not to retain a latch deadline, got %v", got)
+	}
+	visible := queueVisibleByHost(t, store, "h1", now.Add(time.Millisecond))
+	if len(visible) != 1 || visible[0].Token != tok {
+		t.Fatalf("expected short remaining lease flow to remain queue-visible, got %+v", visible)
+	}
+	if got := grantEligibleByHost(t, store, "h1", now.Add(time.Millisecond)); len(got) != 0 {
+		t.Fatalf("expected short remaining lease flow to remain grant-ineligible, got %+v", got)
 	}
 }
 

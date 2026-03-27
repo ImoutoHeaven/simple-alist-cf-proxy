@@ -144,16 +144,23 @@ admission 固定为四种显式运行模式：
         - `download.fairQueue.slotHandlerTimeoutMs` 由 controller 下发，worker 内映射为 `slotHandlerConfig.totalMaxWaitMs`，用于总等待上限。
         - `overloaded` 退避 streak 在收到非 overloaded 结果（如 `pending`/`granted`/`throttled`/`409`）时重置。
         - 若 token 已 stale、sticky miss 到别的实例，或携带的 `hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket`、`breakerEnabled` 或 `queue_breaker` half-open admission tuple 与原 flow 不匹配，slot-handler 仍会返回 `timeout`；worker 侧统一退化为 `503`，不会承诺自动恢复原排队位置。
-    - redirect / refresh 命中新 target 导致 fair-queue context 变化时，worker 仍沿用现有 inline release -> reacquire 路径；这部分 release 行为未变。
-    - 请求终止出口的 finally cleanup 会补偿未完成的 release：先按 `slotToken` 去重，再按 `hostnameHash || hostname` 分组；同一 host 串行，不同 host 固定最多 `2` 组并发。这个有界并发只用于 finally cleanup，不影响 redirect / refresh 的 inline release。
-    - 完成后发送 `/api/v1/fairqueue/release`；若运行环境支持 `ctx.waitUntil`，finally cleanup 会后台执行。
+        - acquire invocation lease 只约束 queue participation 与 attached waiter；`attached committed unclaimed` 等 acquire-owned flow 仍受这段 lease 管理。
+        - `detached ready latched` 的 grant 一旦被 worker claim 并返回 `granted`，就转为 `claimed active grant`；该 grant 归 worker 持有，slot-handler 仅保留本地 flow 以等待 after-use `release` cleanup。
+        - claim 之后的 cleanup 只走 after-use `release`；acquire lease expiry 不决定 `claimed active grant` 的生命周期，也不会回收 worker 已持有的 slot。
+        - redirect / refresh 命中新 target 导致 fair-queue context 变化时，worker 仍沿用现有 inline release -> reacquire 路径；这部分 release 行为未变。
+        - 请求终止出口的 finally cleanup 会补偿未完成的 release：先按 `slotToken` 去重，再按 `hostnameHash || hostname` 分组；同一 host 串行，不同 host 固定最多 `2` 组并发。这个有界并发只用于 finally cleanup，不影响 redirect / refresh 的 inline release。
+        - 完成后发送 `/api/v1/fairqueue/release`；若运行环境支持 `ctx.waitUntil`，finally cleanup 会后台执行。
+        - claimed-active-grant 的 after-use `release` 除了 `slotToken` 外，还会额外携带可选 owner tuple：`queryToken + invocationEpoch`，并发送 `X-FQ-Owner-Token` / `X-FQ-Owner-Epoch` header，方便 LB / gateway 基于 claim owner 做 release sticky 路由。
     - release 契约：缺失/空或格式非法的 `slotToken` 返回 `4xx`（当前为 `400`）；语法合法但未知/已释放的 `slotToken` 仍返回 `200` 幂等成功。
+    - 只有 acquire `granted` 明确声明 `releaseOwnerRequired=true` 的 claim path，worker 后续 `release` 才会带上这组 owner tuple；普通 waiter-delivered `granted` 仍只按 host/hash/site/ip + `slotToken` 走 after-use cleanup。
+    - 带 owner tuple 的 claimed-path `release` 若落到错误实例、owner route miss，slot-handler 会 fail-closed 返回 `503`，不会先释放 backend capacity 再本地静默 no-op；这是为了避免 split-brain 下留下永久残留的 claimed flow。
     - release 返回非 `2xx` 视为失败：slot-handler 在 backend release 失败时返回 `502`。
     - release 每次尝试使用固定 `1500ms` 专用超时，与 acquire long-poll 的 `perRequestTimeoutMs` / timeout clamp 解耦；超时按可重试失败处理。
     - release 重试策略保持不变：仅在网络错误、超时、`429` 或 `>=500` 时重试（最多 3 次，指数退避）；非可重试 `4xx` 不重试。
     - 轮询探测受 `utilWindowSec` 与 `maxBatch` / `maxProbeParallel` / `maxProbeQpsPerHost` 控制。
     - 若 slot-handler 不可用或 fair-queue 接口异常，按 fail-closed 返回 `503`，不绕过排队保护。
     - 多实例 slot-handler 需要 sticky 路由：同一 `queryToken` 的轮询应稳定落到同一实例，否则会出现 `query_token_stale`/`timeout`，worker 侧退化为 `503`。
+    - `release` 只在 claimed-path owner tuple 存在时需要 owner-routing：LB 至少要能基于 `X-FQ-Owner-Token`（或 request body 中的 `queryToken`）把这类 after-use cleanup 路由回 claim owner；如果做不到，slot-handler 会把 owner route miss 显式返回 `503`，而不是静默吞掉本地 cleanup miss。
 
 11. **上游请求与响应封装**
     - 支持 3xx 重定向与 401/410 触发的 refresh（`refresh=true`）重试一次。
