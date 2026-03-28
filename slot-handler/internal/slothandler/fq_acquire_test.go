@@ -1774,9 +1774,12 @@ func TestAcquireCancelCleanupPreservesReplacementWaiterOnSameToken(t *testing.T)
 }
 
 func TestAcquireCancelAfterGrantedStillReleases(t *testing.T) {
-	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 1)}
+	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 1), calledAtCh: make(chan time.Time, 1)}
 	s := newTestServer()
 	cfg := testConfigForAcquire(200*time.Millisecond, 50*time.Millisecond)
+	smoothMs := int64(120)
+	cfg.FairQueue.MinSlotHoldMs = 80
+	cfg.FairQueue.SmoothReleaseIntervalMs = &smoothMs
 	s.updateRuntime(cfg, backend, "test", false)
 	s.flowStore.afterFunc = nil
 
@@ -1835,6 +1838,11 @@ func TestAcquireCancelAfterGrantedStillReleases(t *testing.T) {
 	}()
 
 	<-enteredBeforeSend
+	releaser := s.getSmoothReleaser("h1", "example.com")
+	releaser.mu.Lock()
+	releaser.lastReleaseAt = time.Now().Add(150 * time.Millisecond)
+	releaser.mu.Unlock()
+	cancelAt := time.Now()
 	cancel()
 	close(continueSend)
 
@@ -1849,6 +1857,15 @@ func TestAcquireCancelAfterGrantedStillReleases(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatalf("acquire did not return")
+	}
+
+	select {
+	case calledAt := <-backend.calledAtCh:
+		if delay := calledAt.Sub(cancelAt); delay > 35*time.Millisecond {
+			t.Fatalf("expected cancel-after-grant release to bypass hold/smooth, got %s", delay)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected immediate compensating release after cancel")
 	}
 
 	select {

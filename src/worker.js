@@ -1486,34 +1486,157 @@ const normalizePostgrestBaseUrl = (url) => {
   return url.endsWith('/') ? url.slice(0, -1) : url;
 };
 
-const buildFinalCleanupReleaseGroups = (releaseContexts) => {
-  const dedupedContexts = [];
-  const seenSlotTokens = new Set();
+const buildFairQueueCleanupIdentity = (cleanupContext) => {
+  if (cleanupContext?.slotToken) {
+    return `release:${cleanupContext.slotToken}`;
+  }
+  if (cleanupContext?.queryToken) {
+    return `abandon:${cleanupContext.queryToken}`;
+  }
+  return '';
+};
 
-  for (const releaseContext of releaseContexts) {
-    const slotToken = releaseContext?.slotToken;
-    if (!slotToken || seenSlotTokens.has(slotToken)) {
+const buildFinalCleanupGroups = (cleanupContexts) => {
+  const dedupedContexts = [];
+  const seenCleanupIdentities = new Set();
+
+  for (const cleanupContext of cleanupContexts) {
+    const cleanupIdentity = buildFairQueueCleanupIdentity(cleanupContext);
+    if (!cleanupIdentity || seenCleanupIdentities.has(cleanupIdentity)) {
       continue;
     }
-    seenSlotTokens.add(slotToken);
-    dedupedContexts.push(releaseContext);
+    seenCleanupIdentities.add(cleanupIdentity);
+    dedupedContexts.push(cleanupContext);
   }
 
   const groups = [];
   const groupsByHostKey = new Map();
 
-  for (const releaseContext of dedupedContexts) {
-    const hostGroupKey = releaseContext.hostnameHash || releaseContext.hostname;
+  for (const cleanupContext of dedupedContexts) {
+    const hostGroupKey = cleanupContext.hostnameHash || cleanupContext.hostname;
     let group = groupsByHostKey.get(hostGroupKey);
     if (!group) {
       group = [];
       groupsByHostKey.set(hostGroupKey, group);
       groups.push(group);
     }
-    group.push(releaseContext);
+    group.push(cleanupContext);
   }
 
   return groups;
+};
+
+const clearReleasedFairQueueMetadata = (fqContext) => {
+  if (!fqContext) {
+    return;
+  }
+
+  fqContext.slotToken = null;
+  fqContext.queryToken = null;
+  fqContext.attemptVersion = null;
+  fqContext.attemptTicket = null;
+  fqContext.slotAcquiredAt = null;
+};
+
+const clearAbandonedFairQueueMetadata = (fqContext) => {
+  if (!fqContext) {
+    return;
+  }
+
+  fqContext.queryToken = null;
+  fqContext.attemptVersion = null;
+  fqContext.attemptTicket = null;
+  fqContext.deferredReportArmed = false;
+  fqContext.deferredReportStatusCode = null;
+};
+
+const finalizeFairQueueContext = async ({ fairQueueClient, ctx, fqContext, phase }) => {
+  if (!fairQueueClient || !fqContext) {
+    return true;
+  }
+
+  if (fqContext.slotToken) {
+    try {
+      const released = await fairQueueClient.releaseSlot(ctx, fqContext);
+      if (released) {
+        clearReleasedFairQueueMetadata(fqContext);
+        return true;
+      }
+      console.warn(`[Fair Queue] releaseSlot exhausted during ${phase} for host=${fqContext.hostname}`);
+      return false;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[Fair Queue] releaseSlot failed during ${phase}:`, message);
+      return false;
+    }
+  }
+
+  if (fqContext.grantPromoted === true) {
+    return true;
+  }
+
+  if (!fqContext.queryToken) {
+    return true;
+  }
+
+  try {
+    const abandoned = await fairQueueClient.abandonWait(ctx, fqContext);
+    if (abandoned) {
+      clearAbandonedFairQueueMetadata(fqContext);
+      return true;
+    }
+    console.warn(`[Fair Queue] abandonWait exhausted during ${phase} for host=${fqContext.hostname}`);
+    return false;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[Fair Queue] abandonWait failed during ${phase}:`, message);
+    return false;
+  }
+};
+
+const reconcileFairQueueContextForTarget = async ({
+  fairQueueClient,
+  ctx,
+  fqContext,
+  targetUrl,
+  phase,
+  pendingCleanupContexts = null,
+  targetHostname = null,
+  targetSiteBucket,
+}) => {
+  if (!fqContext) {
+    return { retired: false, finalized: true };
+  }
+
+  const resolvedHostnameRaw = targetHostname || extractHostname(targetUrl);
+  const resolvedHostname = resolvedHostnameRaw ? resolvedHostnameRaw.toLowerCase() : null;
+  const resolvedSiteBucket = targetSiteBucket ?? fqContext.siteBucket;
+
+  if (resolvedHostname === fqContext.hostname && resolvedSiteBucket === fqContext.siteBucket) {
+    return {
+      retired: false,
+      finalized: true,
+      targetHostname: resolvedHostname,
+      targetSiteBucket: resolvedSiteBucket,
+    };
+  }
+
+  const finalized = await finalizeFairQueueContext({
+    fairQueueClient,
+    ctx,
+    fqContext,
+    phase,
+  });
+  if (!finalized && Array.isArray(pendingCleanupContexts)) {
+    pendingCleanupContexts.push(fqContext);
+  }
+
+  return {
+    retired: true,
+    finalized,
+    targetHostname: resolvedHostname,
+    targetSiteBucket: resolvedSiteBucket,
+  };
 };
 
 const runWithConcurrencyLimit = async (taskFactories, concurrencyLimit) => {
@@ -1542,6 +1665,9 @@ const createFairQueueClient = (config) => createSlotHandlerClient(config);
 
 const createSlotHandlerClient = (config) => {
   const slotCfg = config.slotHandlerConfig || {};
+  const testHooks = config.testHooks && typeof config.testHooks === 'object'
+    ? config.testHooks
+    : null;
   const baseUrl = normalizePostgrestBaseUrl(slotCfg.url);
   if (!baseUrl) {
     throw new Error('[FQ] slot-handler backend enabled but FAIR_QUEUE_SLOT_HANDLER_URL is missing');
@@ -1549,6 +1675,7 @@ const createSlotHandlerClient = (config) => {
 
   const acquireUrl = `${baseUrl}/api/v1/fairqueue/acquire`;
   const releaseUrl = `${baseUrl}/api/v1/fairqueue/release`;
+  const abandonUrl = `${baseUrl}/api/v1/fairqueue/abandon`;
   const authKey = slotCfg.authKey || '';
   const authHeader = normalizeStringValue(slotCfg.authHeader, 'X-FQ-Auth');
   const perRequestTimeoutMsRaw = Number(slotCfg.perRequestTimeoutMs);
@@ -1799,11 +1926,15 @@ const createSlotHandlerClient = (config) => {
             overloadStreak = 0;
             {
               const { attemptVersion, attemptTicket } = readSlotHandlerAttempt(data);
+              fqContext.grantPromoted = true;
+              fqContext.slotToken = data.slotToken;
+              fqContext.slotAcquiredAt = Date.now();
               fqContext.attemptVersion = attemptVersion;
               fqContext.attemptTicket = attemptTicket;
+              if (typeof testHooks?.onGrantPromotion === 'function') {
+                testHooks.onGrantPromotion(fqContext);
+              }
             }
-            fqContext.slotToken = data.slotToken;
-            fqContext.slotAcquiredAt = Date.now();
             console.log(`[FQ] slot granted via slot-handler host=${fqContext.hostname}`);
             return {
               kind: 'granted',
@@ -1939,6 +2070,50 @@ const createSlotHandlerClient = (config) => {
 
       const message = lastError instanceof Error ? lastError.message : String(lastError || 'unknown error');
       console.error('[FQ] releaseSlot error (slot-handler):', message);
+      return false;
+    },
+
+    async abandonWait(ctx, fqContext) {
+      if (!fqContext?.queryToken || fqContext?.slotToken) {
+        return true;
+      }
+
+      const abandonMaxAttempts = 3;
+      const abandonBaseBackoffMs = 100;
+      const abandonMaxBackoffMs = 500;
+      const payload = {
+        queryToken: fqContext.queryToken,
+      };
+
+      let lastError = null;
+      for (let attempt = 1; attempt <= abandonMaxAttempts; attempt += 1) {
+        let shouldRetry = false;
+        try {
+          const res = await fetchWithTimeout(abandonUrl, payload, releaseTimeoutMs);
+
+          if (res.ok) {
+            console.log('[FQ] wait abandoned via slot-handler');
+            return true;
+          }
+
+          lastError = new Error(`slot-handler abandon failed: status ${res.status}`);
+          shouldRetry = isRetryableReleaseStatus(res.status);
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error));
+          shouldRetry = true;
+        }
+
+        if (shouldRetry && attempt < abandonMaxAttempts) {
+          const backoffMs = Math.min(abandonMaxBackoffMs, abandonBaseBackoffMs * (2 ** (attempt - 1)));
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          continue;
+        }
+
+        break;
+      }
+
+      const message = lastError instanceof Error ? lastError.message : String(lastError || 'unknown error');
+      console.error('[FQ] abandonWait error (slot-handler):', message);
       return false;
     },
   };
@@ -2860,7 +3035,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   let fairQueueClient = null;
   let fqContext = null;
-  const pendingFairQueueReleaseContexts = [];
+  const pendingFairQueueCleanupContexts = [];
   let clientIpSubnetHash = null;
 
   const ensureFairQueueClientReady = async () => {
@@ -2933,26 +3108,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return null;
   };
 
-  const releaseFairQueueContext = async (contextToRelease, phase) => {
-    if (!fairQueueClient || !contextToRelease || !contextToRelease.slotToken) {
-      return true;
-    }
-
-    try {
-      const released = await fairQueueClient.releaseSlot(ctx, contextToRelease);
-      if (released) {
-        contextToRelease.slotToken = null;
-        return true;
-      }
-      console.warn(`[Fair Queue] releaseSlot exhausted during ${phase} for host=${contextToRelease.hostname}`);
-      return false;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[Fair Queue] releaseSlot failed during ${phase}:`, message);
-      return false;
-    }
-  };
-
   const admitFairQueueContext = async (phase) => {
     try {
       const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, clientSignal);
@@ -2967,7 +3122,28 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   };
 
-  const reconcileFairQueueContextForTarget = async (targetUrl, phase) => {
+  const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
+    if (!response || !fqContext || !fairQueueClient) {
+      return response;
+    }
+
+    const cleanupPromise = finalizeFairQueueContext({
+      fairQueueClient,
+      ctx,
+      fqContext,
+      phase,
+    });
+
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(cleanupPromise);
+      return response;
+    }
+
+    await cleanupPromise;
+    return response;
+  };
+
+  const reconcileCurrentFairQueueContextForTarget = async (targetUrl, phase) => {
     const updatedHostnameRaw = extractHostname(targetUrl);
     const updatedHostname = updatedHostnameRaw ? updatedHostnameRaw.toLowerCase() : null;
     const updatedAdmissionMode = resolveAdmissionMode(config, updatedHostname);
@@ -2981,11 +3157,20 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           return deferredReportResponse;
         }
         const previousFairQueueContext = fqContext;
-        const released = await releaseFairQueueContext(previousFairQueueContext, phase);
-        if (!released) {
-          pendingFairQueueReleaseContexts.push(previousFairQueueContext);
-        }
+        const cleanupResult = await reconcileFairQueueContextForTarget({
+          fairQueueClient,
+          ctx,
+          fqContext: previousFairQueueContext,
+          targetUrl,
+          phase,
+          pendingCleanupContexts: pendingFairQueueCleanupContexts,
+          targetHostname: updatedHostname,
+          targetSiteBucket: previousFairQueueContext.siteBucket,
+        });
         fqContext = null;
+        if (!cleanupResult.finalized) {
+          // already queued for final cleanup retry
+        }
       }
       return null;
     }
@@ -3006,10 +3191,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         return deferredReportResponse;
       }
       const previousFairQueueContext = fqContext;
-      const released = await releaseFairQueueContext(previousFairQueueContext, phase);
-      if (!released) {
-        pendingFairQueueReleaseContexts.push(previousFairQueueContext);
-      }
+      await reconcileFairQueueContextForTarget({
+        fairQueueClient,
+        ctx,
+        fqContext: previousFairQueueContext,
+        targetUrl,
+        phase,
+        pendingCleanupContexts: pendingFairQueueCleanupContexts,
+        targetHostname: updatedHostname,
+        targetSiteBucket: updatedSiteBucket,
+      });
     }
     const updatedHostnameHash = await sha256Hash(updatedHostname);
     fqContext = buildFairQueueContext(
@@ -3041,7 +3232,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     const fairQueueWaitResponse = await admitFairQueueContext('initial');
     if (fairQueueWaitResponse) {
-      return fairQueueWaitResponse;
+      return await runEarlyFairQueueCleanupAndReturn(fairQueueWaitResponse, 'initial');
     }
   }
 
@@ -3120,7 +3311,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           request = new Request(location, request);
             return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
           } else {
-            const fairQueueRedirectResponse = await reconcileFairQueueContextForTarget(location, 'redirect');
+            const fairQueueRedirectResponse = await reconcileCurrentFairQueueContextForTarget(location, 'redirect');
             if (fairQueueRedirectResponse) {
               return fairQueueRedirectResponse;
             }
@@ -3151,7 +3342,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       } else if (refreshedLink && refreshedLink.data && refreshedLink.data.url) {
         downloadUrl = refreshedLink.data.url;
         res = refreshedLink;
-        const fairQueueRefreshResponse = await reconcileFairQueueContextForTarget(downloadUrl, 'refresh');
+        const fairQueueRefreshResponse = await reconcileCurrentFairQueueContextForTarget(downloadUrl, 'refresh');
         if (fairQueueRefreshResponse) {
           return fairQueueRefreshResponse;
         }
@@ -3168,7 +3359,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
               request = new Request(location, request);
               return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
             } else {
-              const fairQueueRedirectResponse = await reconcileFairQueueContextForTarget(location, 'redirect');
+              const fairQueueRedirectResponse = await reconcileCurrentFairQueueContextForTarget(location, 'redirect');
               if (fairQueueRedirectResponse) {
                 return fairQueueRedirectResponse;
               }
@@ -3321,33 +3512,38 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
     throw error;
   } finally {
-    const finalReleaseContexts = [];
+    const finalCleanupContexts = [];
     if (fqContext) {
-      finalReleaseContexts.push(fqContext);
+      finalCleanupContexts.push(fqContext);
     }
-    for (const pendingReleaseContext of pendingFairQueueReleaseContexts) {
-      if (pendingReleaseContext) {
-        finalReleaseContexts.push(pendingReleaseContext);
+    for (const pendingCleanupContext of pendingFairQueueCleanupContexts) {
+      if (pendingCleanupContext) {
+        finalCleanupContexts.push(pendingCleanupContext);
       }
     }
 
-    const finalReleaseGroups = buildFinalCleanupReleaseGroups(finalReleaseContexts);
+    const finalCleanupGroups = buildFinalCleanupGroups(finalCleanupContexts);
 
-    if (fairQueueClient && finalReleaseGroups.length > 0) {
-      const releasePromise = (async () => {
+    if (fairQueueClient && finalCleanupGroups.length > 0) {
+      const cleanupPromise = (async () => {
         await runWithConcurrencyLimit(
-          finalReleaseGroups.map((releaseGroup) => async () => {
-            for (const releaseContext of releaseGroup) {
-              await releaseFairQueueContext(releaseContext, 'final cleanup');
+          finalCleanupGroups.map((cleanupGroup) => async () => {
+            for (const cleanupContext of cleanupGroup) {
+              await finalizeFairQueueContext({
+                fairQueueClient,
+                ctx,
+                fqContext: cleanupContext,
+                phase: 'final cleanup',
+              });
             }
           }),
           FINAL_CLEANUP_RELEASE_CONCURRENCY,
         );
       })();
       if (ctx && typeof ctx.waitUntil === 'function') {
-        ctx.waitUntil(releasePromise);
+        ctx.waitUntil(cleanupPromise);
       } else {
-        await releasePromise;
+        await cleanupPromise;
       }
     }
   }
@@ -3419,9 +3615,12 @@ export const __fairQueueTestHooks = {
     openCapSeconds: DEFAULT_THROTTLE_OPEN_CAP_SECONDS,
     ...options,
   }),
+  buildFinalCleanupGroups,
   createSlotHandlerClient,
   deriveOpenSeconds,
+  finalizeFairQueueContext,
   readOpenBreakerSnapshot,
+  reconcileFairQueueContextForTarget,
   resolveConfig,
   resolveAdmissionMode,
   markHostOverloaded,

@@ -724,7 +724,7 @@ func (s *server) cleanupExpiredHostDeadlines(hostKey string, now time.Time) {
 			continue
 		}
 		if !snap.ReadyLatchedUntil.IsZero() && !now.Before(snap.ReadyLatchedUntil) {
-			s.expireReadyLatchAndRelease(snap.Token, now)
+			s.expireReadyLatchAndRelease(snap.Token, snap.CommittedGrantEpoch, now)
 		}
 	}
 }
@@ -974,7 +974,7 @@ func (s *server) compensatePartitionReadies(readies []compensatingReady) error {
 			Now:           nowMs,
 		}
 		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		err := s.releaseSlot(releaseCtx, releaseReq)
+		err := s.releaseSlotCompensating(releaseCtx, releaseReq)
 		cancel()
 		if err != nil {
 			errs = append(errs, fmt.Errorf("compensating release %q: %w", slotToken, err))
@@ -1143,11 +1143,11 @@ func (s *server) compensatingReleaseAsync(req ReleaseRequest) {
 	if s == nil || strings.TrimSpace(req.SlotToken) == "" {
 		return
 	}
-	go s.releaseSlot(context.Background(), req)
+	go s.releaseSlotCompensating(context.Background(), req)
 }
 
-func (s *server) expireReadyLatchAndRelease(token string, now time.Time) {
-	if s == nil || token == "" {
+func (s *server) expireReadyLatchAndRelease(token string, epoch uint64, now time.Time) {
+	if s == nil || token == "" || epoch == 0 {
 		return
 	}
 	s.mu.RLock()
@@ -1156,7 +1156,7 @@ func (s *server) expireReadyLatchAndRelease(token string, now time.Time) {
 	if store == nil {
 		return
 	}
-	expired, releaseReq, ok := store.expireReadyLatchForProbe(token, now)
+	expired, releaseReq, ok := store.expireReadyLatchForProbe(token, epoch, now)
 	if !expired {
 		return
 	}
@@ -1334,12 +1334,12 @@ func (s *server) probeOnceWithLimit(parentCtx context.Context, hostKey string, n
 			}
 			return
 		}
-		_ = store.armReadyLatchExpiry(snap.Token, now, func() {
+		_ = store.armReadyLatchExpiry(snap.Token, commit.committedGrantEpoch, now, func(token string, epoch uint64) {
 			expireNow := time.Now()
 			if store.nowFn != nil {
 				expireNow = store.nowFn()
 			}
-			s.expireReadyLatchAndRelease(snap.Token, expireNow)
+			s.expireReadyLatchAndRelease(token, epoch, expireNow)
 		})
 	}
 

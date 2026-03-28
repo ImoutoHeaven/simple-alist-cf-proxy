@@ -1565,7 +1565,7 @@ func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.releaseSlot(r.Context(), req); err != nil {
+	if err := s.releaseSlotAfterUse(r.Context(), req); err != nil {
 		s.log.Errorf("ReleaseSlot failed: %v", err)
 		http.Error(w, "release failed", http.StatusBadGateway)
 		return
@@ -1865,6 +1865,68 @@ func isRetryableReleaseError(err error) bool {
 }
 
 func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
+	return s.releaseSlotAfterUse(ctx, req)
+}
+
+func (s *server) releaseSlotAfterUse(ctx context.Context, req ReleaseRequest) error {
+	releaseStartedAt, err := s.runAfterUseReleaseTiming(req)
+	if err != nil {
+		return err
+	}
+	if delay := time.Until(releaseStartedAt); delay > 0 {
+		if err := sleepWithContext(ctx, delay); err != nil {
+			return err
+		}
+	}
+	releaseStartedAt = time.Now()
+	return s.performBackendRelease(ctx, req, releaseStartedAt, "after_use")
+}
+
+func (s *server) releaseSlotCompensating(ctx context.Context, req ReleaseRequest) error {
+	releaseStartedAt, err := s.runCompensatingReleaseTiming(req)
+	if err != nil {
+		return err
+	}
+	if delay := time.Until(releaseStartedAt); delay > 0 {
+		if err := sleepWithContext(ctx, delay); err != nil {
+			return err
+		}
+	}
+	releaseStartedAt = time.Now()
+	return s.performBackendRelease(ctx, req, releaseStartedAt, "compensating")
+}
+
+func (s *server) runAfterUseReleaseTiming(req ReleaseRequest) (time.Time, error) {
+	cfg := s.getConfig()
+	if cfg == nil {
+		return time.Time{}, errors.New("config not loaded")
+	}
+
+	minHoldMs := cfg.FairQueue.minHold(0)
+	hitAt := time.UnixMilli(req.HitUpstreamAt)
+	if req.HitUpstreamAt == 0 || hitAt.IsZero() {
+		hitAt = time.Now()
+	}
+
+	baseTime := hitAt.Add(time.Duration(minHoldMs) * time.Millisecond)
+	if now := time.Now(); baseTime.Before(now) {
+		baseTime = now
+	}
+
+	interval := cfg.FairQueue.smoothInterval()
+	if interval <= 0 {
+		return baseTime, nil
+	}
+
+	releaser := s.getSmoothReleaser(req.HostnameHash, req.Hostname)
+	return releaser.nextReleaseAfter(baseTime, interval), nil
+}
+
+func (s *server) runCompensatingReleaseTiming(req ReleaseRequest) (time.Time, error) {
+	return time.Now(), nil
+}
+
+func (s *server) performBackendRelease(ctx context.Context, req ReleaseRequest, releaseStartedAt time.Time, releaseKind string) error {
 	cfg := s.getConfig()
 	if cfg == nil {
 		return errors.New("config not loaded")
@@ -1874,36 +1936,14 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 		return errors.New("backend not initialized")
 	}
 
-	minHoldMs := cfg.FairQueue.minHold(0)
+	if releaseStartedAt.IsZero() {
+		releaseStartedAt = time.Now()
+	}
 
 	hitAt := time.UnixMilli(req.HitUpstreamAt)
 	if req.HitUpstreamAt == 0 || hitAt.IsZero() {
-		hitAt = time.Now()
+		hitAt = releaseStartedAt
 	}
-
-	now := time.Now()
-	minHoldTarget := hitAt.Add(time.Duration(minHoldMs) * time.Millisecond)
-	baseTime := minHoldTarget
-	if baseTime.Before(now) {
-		baseTime = now
-	}
-
-	interval := cfg.FairQueue.smoothInterval()
-	releaser := s.getSmoothReleaser(req.HostnameHash, req.Hostname)
-
-	target := baseTime
-	if interval > 0 {
-		target = releaser.nextReleaseAfter(baseTime, interval)
-	}
-
-	if delay := time.Until(target); delay > 0 {
-		if err := sleepWithContext(ctx, delay); err != nil {
-			return err
-		}
-	}
-
-	now = time.Now()
-	holdMs := now.Sub(hitAt).Milliseconds()
 
 	var err error
 	for attempt := 1; attempt <= releaseRetryAttempts; attempt++ {
@@ -1933,19 +1973,25 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 	if s.activeSlots != nil {
 		s.activeSlots.ReleaseLease(req.SlotToken)
 		hostKey := strings.TrimSpace(fqHostKey(req.HostnameHash, req.Hostname))
-		s.observeRelease(hostKey, now)
+		s.observeRelease(hostKey, releaseStartedAt)
 		if hostKey != "" {
 			s.wakeHostProbeRunner(hostKey)
 		}
 	}
+
+	minHoldMs := int64(0)
+	if releaseKind == "after_use" {
+		minHoldMs = cfg.FairQueue.minHold(0)
+	}
+	holdMs := releaseStartedAt.Sub(hitAt).Milliseconds()
 
 	tokenLog := req.SlotToken
 	if len(tokenLog) > 8 {
 		tokenLog = tokenLog[len(tokenLog)-8:]
 	}
 	s.log.Debugf(
-		"slot released host=%s ip=%s token=%s hold_ms=%d min_hold_ms=%d",
-		req.Hostname, req.IPBucket, tokenLog, holdMs, minHoldMs,
+		"slot released kind=%s host=%s ip=%s token=%s hold_ms=%d min_hold_ms=%d",
+		releaseKind, req.Hostname, req.IPBucket, tokenLog, holdMs, minHoldMs,
 	)
 	s.incrementMetric("released")
 	return nil

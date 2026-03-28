@@ -223,7 +223,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 				HitUpstreamAt: now2.UnixMilli(),
 				Now:           now2.UnixMilli(),
 			}
-			go s.releaseSlot(context.Background(), releaseReq)
+			go s.releaseSlotCompensating(context.Background(), releaseReq)
 		}
 		if requestedToken != "" && releaseResp == nil {
 			store.settleDetachedFlow(token, nowFn())

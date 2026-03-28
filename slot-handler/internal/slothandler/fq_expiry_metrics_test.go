@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,20 @@ func waitForReleaseRequest(t *testing.T, ch <-chan ReleaseRequest) ReleaseReques
 	case <-time.After(time.Second):
 		t.Fatalf("expected compensating release request")
 		return ReleaseRequest{}
+	}
+}
+
+func collectReleaseRequests(t *testing.T, ch <-chan ReleaseRequest, wait time.Duration) []ReleaseRequest {
+	t.Helper()
+	deadline := time.After(wait)
+	reqs := make([]ReleaseRequest, 0, 2)
+	for {
+		select {
+		case req := <-ch:
+			reqs = append(reqs, req)
+		case <-deadline:
+			return reqs
+		}
 	}
 }
 
@@ -147,6 +162,47 @@ func TestFlowInvocationExpireCompensatesReleaseAfterLazyInitStoreBootstrap(t *te
 	}
 }
 
+func TestFlowInvocationExpireCompensatingReleaseIsImmediate(t *testing.T) {
+	minHoldMs := int64(80)
+	smoothMs := int64(120)
+	backend := &timedReleaseBackend{calledAtCh: make(chan time.Time, 1)}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		MinSlotHoldMs:           minHoldMs,
+		SmoothReleaseIntervalMs: &smoothMs,
+		ZombieTimeoutSeconds:    30,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	start := time.Now()
+	store := s.flowStore
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-expire-immediate", "s1")
+	leaseUntil := start.Add(40 * time.Millisecond)
+	renewFlowLease(t, store, tok, leaseUntil)
+	commit := store.commitReadyGrantForProbe(tok, "slot-expire-immediate", 5, 2, 20*time.Millisecond, start)
+	if !commit.readyLatched {
+		t.Fatalf("expected READY commit to latch before invocation expiry immediacy test")
+	}
+
+	releaser := s.getSmoothReleaser("h1", "example.com")
+	releaser.mu.Lock()
+	releaser.lastReleaseAt = start.Add(150 * time.Millisecond)
+	releaser.mu.Unlock()
+
+	if !store.deleteIfExpired(tok, leaseUntil) {
+		t.Fatalf("expected invocation expiry to delete token %q", tok)
+	}
+
+	select {
+	case calledAt := <-backend.calledAtCh:
+		if delay := calledAt.Sub(start); delay > 25*time.Millisecond {
+			t.Fatalf("expected immediate compensating release after invocation expiry, got %s", delay)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected immediate compensating release after invocation expiry")
+	}
+}
+
 func TestAbandonFlowRemovesLatchedGrantAndCompensatesRelease(t *testing.T) {
 	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 1)}
 	cfg := &Config{FairQueue: FairQueueConfig{ZombieTimeoutSeconds: 30}}
@@ -191,6 +247,289 @@ func TestAbandonFlowRemovesLatchedGrantAndCompensatesRelease(t *testing.T) {
 	}
 	if got := requireMetricValue(t, snap, "ready_latched_count"); got != 0 {
 		t.Fatalf("expected ready_latched_count=0 after abandon, got %v", got)
+	}
+}
+
+func TestAbandonCompensatingReleaseIsImmediate(t *testing.T) {
+	minHoldMs := int64(80)
+	smoothMs := int64(120)
+	backend := &timedReleaseBackend{calledAtCh: make(chan time.Time, 1)}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		MinSlotHoldMs:           minHoldMs,
+		SmoothReleaseIntervalMs: &smoothMs,
+		ZombieTimeoutSeconds:    30,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	start := time.Now()
+	store := s.flowStore
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-abandon-immediate", "s1")
+	renewFlowLease(t, store, tok, start.Add(10*time.Second))
+	commit := store.commitReadyGrantForProbe(tok, "slot-abandon-immediate", 7, 3, 300*time.Millisecond, start)
+	if !commit.readyLatched {
+		t.Fatalf("expected READY commit to latch before abandon immediacy test")
+	}
+
+	releaser := s.getSmoothReleaser("h1", "example.com")
+	releaser.mu.Lock()
+	releaser.lastReleaseAt = start.Add(150 * time.Millisecond)
+	releaser.mu.Unlock()
+
+	body := `{"hostname":"example.com","hostnameHash":"h1","ipBucket":"ip-abandon-immediate","siteBucket":"s1","queryToken":"` + tok + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/fairqueue/abandon", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	s.handleAbandon(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected abandon to return 204, got %d body=%q", rec.Code, rec.Body.String())
+	}
+
+	select {
+	case calledAt := <-backend.calledAtCh:
+		if delay := calledAt.Sub(start); delay > 25*time.Millisecond {
+			t.Fatalf("expected immediate compensating release after abandon, got %s", delay)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected immediate compensating release after abandon")
+	}
+}
+
+func TestCompensatingCleanupSingleConsumptionAcrossReadyExpiryAndAbandon(t *testing.T) {
+	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 4)}
+	cfg := &Config{FairQueue: FairQueueConfig{ZombieTimeoutSeconds: 30}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 27, 15, 0, 0, 0, time.UTC)
+	store := s.flowStore
+	store.nowFn = func() time.Time { return now }
+	var expireFn func()
+	store.afterFunc = func(d time.Duration, fn func()) *time.Timer {
+		expireFn = fn
+		return time.NewTimer(time.Hour)
+	}
+
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-race-abandon", "s1")
+	leaseUntil := now.Add(10 * time.Second)
+	renewFlowLease(t, store, tok, leaseUntil)
+	commit := store.commitReadyGrantForProbe(tok, "slot-race-abandon", 31, 6, 300*time.Millisecond, now)
+	if !commit.readyLatched {
+		t.Fatalf("expected initial READY grant to latch before abandon race")
+	}
+	if !store.armReadyLatchExpiry(tok, commit.committedGrantEpoch, now, func(token string, epoch uint64) {
+		expireNow := store.nowFn()
+		s.expireReadyLatchAndRelease(token, epoch, expireNow)
+	}) {
+		t.Fatalf("expected same-grant ready-expiry callback to arm")
+	}
+	if expireFn == nil {
+		t.Fatalf("expected same-grant ready-expiry callback capture")
+	}
+	store.afterFunc = nil
+
+	now = now.Add(350 * time.Millisecond)
+	expireFn()
+
+	body := `{"hostname":"example.com","hostnameHash":"h1","ipBucket":"ip-race-abandon","siteBucket":"s1","queryToken":"` + tok + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/fairqueue/abandon", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleAbandon(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected abandon to return 204, got %d body=%q", rec.Code, rec.Body.String())
+	}
+
+	reqs := collectReleaseRequests(t, backend.released, 200*time.Millisecond)
+	if len(reqs) != 1 {
+		t.Fatalf("expected exactly one compensating release across same-grant ready-expiry and abandon cleanup, got %+v", reqs)
+	}
+	if reqs[0].SlotToken != "slot-race-abandon" {
+		t.Fatalf("expected same-grant cleanup race to target slot-race-abandon, got %+v", reqs)
+	}
+
+	metrics := s.collectMetricsSnapshot()
+	if got := metrics.Counts["compensating_release_count"]; got != 1 {
+		t.Fatalf("expected compensating_release_count=1 across abandon race, got %d", got)
+	}
+	if got := metrics.Counts["ready_latch_expire_count"]; got != 1 {
+		t.Fatalf("expected ready_latch_expire_count=1 across abandon race, got %d", got)
+	}
+	if _, ok := store.getSnapshot(tok); ok {
+		t.Fatalf("expected abandon loser path to remove detached flow after ready-expiry winner")
+	}
+}
+
+func TestCompensatingCleanupSingleConsumptionAcrossReadyExpiryAndInvocationExpiry(t *testing.T) {
+	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 4)}
+	cfg := &Config{FairQueue: FairQueueConfig{ZombieTimeoutSeconds: 30}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 27, 15, 5, 0, 0, time.UTC)
+	store := s.flowStore
+	store.nowFn = func() time.Time { return now }
+	var expireFn func()
+	store.afterFunc = func(d time.Duration, fn func()) *time.Timer {
+		expireFn = fn
+		return time.NewTimer(time.Hour)
+	}
+
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-race-expiry", "s1")
+	leaseUntil := now.Add(300 * time.Millisecond)
+	renewFlowLease(t, store, tok, leaseUntil)
+	commit := store.commitReadyGrantForProbe(tok, "slot-race-expiry", 41, 9, 200*time.Millisecond, now)
+	if !commit.readyLatched {
+		t.Fatalf("expected initial READY grant to latch before invocation-expiry race")
+	}
+	if !store.armReadyLatchExpiry(tok, commit.committedGrantEpoch, now, func(token string, epoch uint64) {
+		expireNow := store.nowFn()
+		s.expireReadyLatchAndRelease(token, epoch, expireNow)
+	}) {
+		t.Fatalf("expected same-grant ready-expiry callback to arm")
+	}
+	if expireFn == nil {
+		t.Fatalf("expected same-grant ready-expiry callback capture")
+	}
+	store.afterFunc = nil
+
+	now = now.Add(350 * time.Millisecond)
+	if !store.deleteIfExpired(tok, now) {
+		t.Fatalf("expected invocation-expiry path to delete token %q in same-grant race", tok)
+	}
+	expireFn()
+
+	reqs := collectReleaseRequests(t, backend.released, 200*time.Millisecond)
+	if len(reqs) != 1 {
+		t.Fatalf("expected exactly one compensating release across same-grant ready-expiry and invocation-expiry cleanup, got %+v", reqs)
+	}
+	if reqs[0].SlotToken != "slot-race-expiry" {
+		t.Fatalf("expected same-grant cleanup race to target slot-race-expiry, got %+v", reqs)
+	}
+
+	metrics := s.collectMetricsSnapshot()
+	if got := metrics.Counts["compensating_release_count"]; got != 1 {
+		t.Fatalf("expected compensating_release_count=1 across invocation-expiry race, got %d", got)
+	}
+	if got := metrics.Counts["invocation_lease_expire_count"]; got != 1 {
+		t.Fatalf("expected invocation_lease_expire_count=1 across invocation-expiry race, got %d", got)
+	}
+	if got := metrics.Counts["ready_latch_expire_count"]; got != 0 {
+		t.Fatalf("expected ready_latch_expire_count=0 when invocation-expiry winner removes flow before ready callback, got %d", got)
+	}
+	if _, ok := store.getSnapshot(tok); ok {
+		t.Fatalf("expected invocation-expiry winner to remove flow before ready-expiry loser callback")
+	}
+}
+
+func TestInvocationExpiryNoopsWhenObservedEpochIsStale(t *testing.T) {
+	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 2)}
+	cfg := &Config{FairQueue: FairQueueConfig{ZombieTimeoutSeconds: 30}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 27, 15, 10, 0, 0, time.UTC)
+	store := s.flowStore
+	store.nowFn = func() time.Time { return now }
+
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-stale-invocation", "s1")
+	leaseUntil := now.Add(10 * time.Second)
+	renewFlowLease(t, store, tok, leaseUntil)
+	commit := store.commitReadyGrantForProbe(tok, "slot-stale-invocation-old", 47, 11, 300*time.Millisecond, now)
+	if !commit.readyLatched {
+		t.Fatalf("expected initial READY grant to latch before stale invocation-expiry test")
+	}
+
+	store.mu.Lock()
+	f := store.byToken[tok]
+	if f == nil {
+		store.mu.Unlock()
+		t.Fatalf("expected live flow before preparing stale invocation-expiry action")
+	}
+	action := store.expireFlowLocked(f, now.Add(40*time.Millisecond))
+	store.byToken[tok] = f
+	store.mu.Unlock()
+
+	recommitReadyGrantOnSameToken(t, store, tok, "slot-stale-invocation-new", 53, 12, 300*time.Millisecond, leaseUntil, now.Add(50*time.Millisecond))
+
+	store.dispatchInvocationExpiry([]flowExpiryAction{action})
+
+	reqs := collectReleaseRequests(t, backend.released, 200*time.Millisecond)
+	if len(reqs) != 0 {
+		t.Fatalf("expected stale invocation-expiry action to noop after newer committed grant, got %+v", reqs)
+	}
+
+	snap, ok := store.getSnapshot(tok)
+	if !ok {
+		t.Fatalf("expected newer committed grant to remain live after stale invocation-expiry action")
+	}
+	if !snapshotBoolField(t, snap, "GrantCommitted") {
+		t.Fatalf("expected stale invocation-expiry action not to clear newer committed grant")
+	}
+	if got := snapshotStringField(t, snap, "SlotToken"); got != "slot-stale-invocation-new" {
+		t.Fatalf("expected newer committed grant to keep slot-stale-invocation-new, got %q", got)
+	}
+
+	metrics := s.collectMetricsSnapshot()
+	if got := metrics.Counts["compensating_release_count"]; got != 0 {
+		t.Fatalf("expected compensating_release_count=0 for stale invocation-expiry action, got %d", got)
+	}
+}
+
+func TestInvocationExpiryDispatchConsumesPendingCleanupOnlyOnce(t *testing.T) {
+	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 4)}
+	cfg := &Config{FairQueue: FairQueueConfig{ZombieTimeoutSeconds: 30}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 3, 27, 15, 15, 0, 0, time.UTC)
+	store := s.flowStore
+	store.nowFn = func() time.Time { return now }
+
+	tok := newAtomicBreakerFlow(store, "h1", "example.com", "ip-duplicate-invocation", "s1")
+	leaseUntil := now.Add(10 * time.Second)
+	renewFlowLease(t, store, tok, leaseUntil)
+	commit := store.commitReadyGrantForProbe(tok, "slot-duplicate-invocation", 59, 13, 300*time.Millisecond, now)
+	if !commit.readyLatched {
+		t.Fatalf("expected READY grant to latch before duplicate invocation-expiry dispatch")
+	}
+
+	store.mu.Lock()
+	f := store.byToken[tok]
+	if f == nil {
+		store.mu.Unlock()
+		t.Fatalf("expected flow to exist before preparing invocation-expiry action")
+	}
+	action := store.expireFlowLocked(f, now.Add(40*time.Millisecond))
+	store.mu.Unlock()
+
+	store.dispatchInvocationExpiry([]flowExpiryAction{action})
+	store.dispatchInvocationExpiry([]flowExpiryAction{action})
+
+	reqs := collectReleaseRequests(t, backend.released, 200*time.Millisecond)
+	if len(reqs) != 1 {
+		t.Fatalf("expected duplicate invocation-expiry dispatch to emit exactly one compensating release, got %+v", reqs)
+	}
+	if reqs[0].SlotToken != "slot-duplicate-invocation" {
+		t.Fatalf("expected duplicate invocation-expiry dispatch to target slot-duplicate-invocation, got %+v", reqs)
+	}
+
+	metrics := s.collectMetricsSnapshot()
+	if got := metrics.Counts["invocation_lease_expire_count"]; got != 1 {
+		t.Fatalf("expected invocation_lease_expire_count=1 across duplicate invocation-expiry dispatch, got %d", got)
+	}
+	if got := metrics.Counts["compensating_release_count"]; got != 1 {
+		t.Fatalf("expected compensating_release_count=1 across duplicate invocation-expiry dispatch, got %d", got)
+	}
+}
+
+func TestInvocationExpiryActionCarriesIdentityOnly(t *testing.T) {
+	actionType := reflect.TypeOf(flowExpiryAction{})
+	if _, ok := actionType.FieldByName("releaseReq"); ok {
+		t.Fatalf("expected flowExpiryAction not to expose compensating release payload")
+	}
+	if _, ok := actionType.FieldByName("hasRelease"); ok {
+		t.Fatalf("expected flowExpiryAction not to expose compensating release payload presence")
 	}
 }
 

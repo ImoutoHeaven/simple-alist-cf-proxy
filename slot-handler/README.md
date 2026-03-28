@@ -40,7 +40,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - 成功的 `/release`、新 waiter attach/renew、bucket `DenyUntil` 到期、probe QPS credit 可用、ready latch 过期、invocation lease/expiry cleanup 等事件都会唤醒对应 hostKey 的 reactor；空闲 host 可一直睡到下一次有效 deadline。
 - `flowStore` 仍以 `byToken` 作为唯一真源；`hostInFlightTokens(hostKey -> token set)` 现在只服务 attached waiter / in-flight bookkeeping，不再代表 scheduler 的完整候选集。
 - backend `READY` 是公平性记账点：commit 时立即消耗该 flow 的公平性机会；若 waiter 仍在线则直接投递，否则进入极短 `ready_latched` bridge（当前默认 `300ms`，上限 `1s`）。
-- `ready_latched` 或 invocation lease 到期都会触发 compensating release，把 slot 还给 DB；但公平性 debit 不会回滚。
+- `ready_latched` 过期、invocation lease 到期，或 `/abandon` 消费已提交但未被实际使用的 grant 时，都会触发 compensating release，把 slot 还给 DB；首次 backend release 会立即发出，不受 `minSlotHoldMs` / `smoothReleaseIntervalMs` 影响；但公平性 debit 不会回滚。
 
 ### 2.1 单一堆化调度引擎（单选/批选共用）
 
@@ -115,7 +115,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 
 ### POST /api/v1/fairqueue/release
 
-- 释放 slot（仍支持 `minSlotHoldMs` 和 `smoothReleaseIntervalMs`）。
+- granted slot 的正常 after-use release 路径；仍支持 `minSlotHoldMs` 和 `smoothReleaseIntervalMs`。
 - 成功返回 `200` + `{"result":"ok"}`；若 `slotToken` 语法合法但对应 slot 已未知、已释放，backend 仍按幂等 no-op 处理，HTTP 仍返回 `200`。
 - 失败时返回非 `2xx`：
   - `502`：slot-handler 调用 backend release（`fq_release_dual`）失败（包括 backend error/unavailable）。
@@ -130,9 +130,10 @@ release 重试策略（worker 侧）：
 
 ### POST /api/v1/fairqueue/abandon
 
-- 可选的 best-effort 清理接口；请求体至少需要 `queryToken`。
+- 可选的 best-effort pre-grant 清理加速接口；用于 flow 在拿到 slot 前停止等待的场景，请求体至少需要 `queryToken`。
 - 若该 flow 仍存在且持有 latched READY，slot-handler 会先做 compensating release，再终态删除 flow。
 - 成功或 token 已不存在时都返回 `204`；缺失 `queryToken` 返回 `400`。
+- rollout 顺序：先部署 slot-handler 端 `/release` / compensating semantics 与 `/abandon` endpoint，再启用 worker 侧 `/abandon` 流量；旧 worker 仍可依赖 invocation lease expiry 作为正确性 backstop，反向混部不属于支持目标。
 
 ---
 
@@ -311,7 +312,7 @@ release 重试策略（worker 侧）：
 ## 5. 指标（controller 模式）
 
 周期上报 `slot_handler.snapshot`：
-- `counts`：关键计数（granted/throttled/overloaded、`overloaded_<scope>`、released/token_stale/token_mismatch，以及 `ready_latch_expire_count` / `invocation_lease_expire_count` / `compensating_release_count` / `grant_committed_count` / `grant_claimed_count`）
+- `counts`：关键计数（granted/throttled/overloaded、`overloaded_<scope>`、`released`/token_stale/token_mismatch，以及 `ready_latch_expire_count` / `invocation_lease_expire_count` / `compensating_release_count` / `grant_committed_count` / `grant_claimed_count`）；其中 `released` 继续表示 backend release 成功总次数，补偿清理由 `compensating_release_count` 单独标记，debug log 用 `kind=after_use|compensating` 区分语义。
 - `metrics`：`release_to_next_probe_ms`、`release_to_next_grant_ms`、`idle_probe_ratio`、`queue_visible_flow_count`、`grant_eligible_flow_count`、`ready_latched_count`、`ready_latch_age_ms`
 - `flows`：`total/inflight/detached/grace`
 - `smoothHosts`：smooth releaser 的 host 数
@@ -353,7 +354,7 @@ slot-handler 依赖以下函数（名称可在配置中改）：
 
 ## 8. 与 download worker 的关系
 
-- worker 调用 `acquire/release`；`acquire` 返回 `pending` 时持续轮询。
+- worker 调用 `acquire`；拿到 `slotToken` 后走 `/release`，未拿到 `slotToken` 但已有 `queryToken` 的 pre-grant cleanup 可 best-effort 调 `/abandon`；`acquire` 返回 `pending` 时持续轮询。
 - `queryToken` 是 live flow 的唯一标识；waiter detached 后只要 invocation lease 仍有效，后续同 token 轮询就能延续公平性状态。
 - 若 detached flow 已 short-latch 一个 `READY`，worker 的下一次同 token `acquire` 会直接拿到已有 grant。
 - worker 与 slot-handler 的边界固定为四种 admission 模式：`none` 不触达 slot-handler，`breaker_only` 由 worker 走 `download_authorize_breaker_attempt`，`queue_only` 只做 queue admission，`queue_breaker` 由 slot-handler 原子完成 queue + breaker admission，再由 worker 在响应后回写 report；slot-handler 不保存任何 breaker 运行时状态。

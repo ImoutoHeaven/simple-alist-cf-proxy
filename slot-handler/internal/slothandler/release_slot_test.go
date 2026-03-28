@@ -78,6 +78,52 @@ func (b *timedReleaseBackend) ReleaseSlot(ctx context.Context, req ReleaseReques
 	return nil
 }
 
+func TestReleaseSlotCompensatingBypassesHoldAndSmooth(t *testing.T) {
+	minHoldMs := int64(80)
+	smoothMs := int64(120)
+	backend := &timedReleaseBackend{calledAtCh: make(chan time.Time, 1)}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		MinSlotHoldMs:           minHoldMs,
+		SmoothReleaseIntervalMs: &smoothMs,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	start := time.Now()
+	req := ReleaseRequest{
+		Hostname:      "example.com",
+		HostnameHash:  "h1",
+		IPBucket:      "ip1",
+		SiteBucket:    "s1",
+		SlotToken:     "slot-comp",
+		HitUpstreamAt: start.UnixMilli(),
+		Now:           start.UnixMilli(),
+	}
+
+	releaser := s.getSmoothReleaser(req.HostnameHash, req.Hostname)
+	releaser.mu.Lock()
+	releaser.lastReleaseAt = start.Add(150 * time.Millisecond)
+	releaser.mu.Unlock()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.releaseSlotCompensating(context.Background(), req)
+	}()
+
+	select {
+	case calledAt := <-backend.calledAtCh:
+		if delay := calledAt.Sub(start); delay > 25*time.Millisecond {
+			t.Fatalf("expected immediate compensating release, got %s", delay)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected immediate compensating release")
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("releaseSlotCompensating error: %v", err)
+	}
+}
+
 func TestReleaseRetryClearsActiveLease(t *testing.T) {
 	cfg := &Config{FairQueue: FairQueueConfig{MinSlotHoldMs: 0}}
 	backend := &flakyReleaseBackend{failures: 1}
@@ -109,7 +155,7 @@ func TestReleaseRetryClearsActiveLease(t *testing.T) {
 	}
 }
 
-func TestReleaseSlotHonorsMinSlotHoldMs(t *testing.T) {
+func TestReleaseSlotAfterUseStillHonorsMinHold(t *testing.T) {
 	minHoldMs := int64(60)
 	smoothReleaseOff := int64(0)
 	backend := &timedReleaseBackend{calledAtCh: make(chan time.Time, 1)}
@@ -134,7 +180,7 @@ func TestReleaseSlotHonorsMinSlotHoldMs(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- s.releaseSlot(context.Background(), req)
+		errCh <- s.releaseSlotAfterUse(context.Background(), req)
 	}()
 
 	select {
@@ -159,7 +205,65 @@ func TestReleaseSlotHonorsMinSlotHoldMs(t *testing.T) {
 	}
 
 	if err := <-errCh; err != nil {
-		t.Fatalf("releaseSlot error: %v", err)
+		t.Fatalf("releaseSlotAfterUse error: %v", err)
+	}
+}
+
+func TestReleaseSlotAfterUseStillHonorsSmoothSpacing(t *testing.T) {
+	minHoldMs := int64(0)
+	smoothMs := int64(50)
+	backend := &timedReleaseBackend{calledAtCh: make(chan time.Time, 1)}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		MinSlotHoldMs:           minHoldMs,
+		SmoothReleaseIntervalMs: &smoothMs,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	start := time.Now()
+	req := ReleaseRequest{
+		Hostname:      "example.com",
+		HostnameHash:  "h1",
+		IPBucket:      "ip1",
+		SiteBucket:    "s1",
+		SlotToken:     "slot-smooth",
+		HitUpstreamAt: start.UnixMilli(),
+		Now:           start.UnixMilli(),
+	}
+
+	releaser := s.getSmoothReleaser(req.HostnameHash, req.Hostname)
+	releaser.mu.Lock()
+	releaser.lastReleaseAt = start.Add(50 * time.Millisecond)
+	releaser.mu.Unlock()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.releaseSlotAfterUse(context.Background(), req)
+	}()
+
+	select {
+	case calledAt := <-backend.calledAtCh:
+		t.Fatalf("expected release backend call to wait for smooth spacing, got %s", calledAt.Sub(start))
+	case <-time.After(60 * time.Millisecond):
+	}
+
+	var calledAt time.Time
+	select {
+	case calledAt = <-backend.calledAtCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected release backend call after smooth spacing")
+	}
+
+	spacing := calledAt.Sub(start)
+	if spacing < 85*time.Millisecond {
+		t.Fatalf("expected release backend call after >=85ms smooth spacing, got %s", spacing)
+	}
+	if spacing > 300*time.Millisecond {
+		t.Fatalf("expected release backend call to stay bounded, got %s", spacing)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("releaseSlotAfterUse error: %v", err)
 	}
 }
 
@@ -194,10 +298,11 @@ func TestReleaseRetryFailureReturnsError(t *testing.T) {
 	}
 }
 
-func TestReleaseCompensatingClearsActiveLease(t *testing.T) {
+func TestReleaseSlotCompensatingClearsActiveLease(t *testing.T) {
 	cfg := &Config{FairQueue: FairQueueConfig{MinSlotHoldMs: 0}}
+	backend := &flakyReleaseBackend{failures: 1}
 	s := newTestServer()
-	s.updateRuntime(cfg, &stubBackend{}, "test", true)
+	s.updateRuntime(cfg, backend, "test", true)
 	s.activeSlots = newActiveTracker()
 
 	now := time.Unix(0, 0)
@@ -213,8 +318,11 @@ func TestReleaseCompensatingClearsActiveLease(t *testing.T) {
 		Now:           now.UnixMilli(),
 	}
 
-	if err := s.releaseSlot(context.Background(), req); err != nil {
-		t.Fatalf("releaseSlot error: %v", err)
+	if err := s.releaseSlotCompensating(context.Background(), req); err != nil {
+		t.Fatalf("releaseSlotCompensating error: %v", err)
+	}
+	if backend.calls != 2 {
+		t.Fatalf("expected 2 release attempts, got %d", backend.calls)
 	}
 	if s.activeSlots.ActiveHost("h1", now.Add(time.Second)) != 0 {
 		t.Fatalf("expected compensating release to clear active lease")

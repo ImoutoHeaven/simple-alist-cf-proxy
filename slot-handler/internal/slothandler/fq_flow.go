@@ -31,6 +31,7 @@ type fqFlow struct {
 	invocationLeaseUntil time.Time
 	grantEligible        bool
 	grantCommitted       bool
+	committedGrantEpoch  uint64
 	readyLatchedAt       time.Time
 	readyLatchedUntil    time.Time
 	slotToken            string
@@ -45,10 +46,11 @@ type fqFlow struct {
 }
 
 type readyGrantCommitResult struct {
-	committed      bool
-	newlyCommitted bool
-	waiterAttached bool
-	readyLatched   bool
+	committed           bool
+	newlyCommitted      bool
+	waiterAttached      bool
+	readyLatched        bool
+	committedGrantEpoch uint64
 }
 
 // fqFlowSnapshot is an immutable copy of a flow's state.
@@ -69,6 +71,7 @@ type fqFlowSnapshot struct {
 	InvocationLeaseUntil  time.Time
 	GrantEligible         bool
 	GrantCommitted        bool
+	CommittedGrantEpoch   uint64
 	ReadyLatchedAt        time.Time
 	ReadyLatchedUntil     time.Time
 	SlotToken             string
@@ -103,6 +106,7 @@ func snapshotFromFlow(f *fqFlow) fqFlowSnapshot {
 		InvocationLeaseUntil:  f.invocationLeaseUntil,
 		GrantEligible:         f.grantEligible,
 		GrantCommitted:        f.grantCommitted,
+		CommittedGrantEpoch:   f.committedGrantEpoch,
 		ReadyLatchedAt:        f.readyLatchedAt,
 		ReadyLatchedUntil:     f.readyLatchedUntil,
 		SlotToken:             f.slotToken,
@@ -149,6 +153,8 @@ type flowStore struct {
 	grace   time.Duration
 	byToken map[string]*fqFlow
 
+	pendingInvocationExpiry map[flowCleanupKey]pendingInvocationExpiry
+
 	onInvocationLeaseExpired func(token string, releaseReq ReleaseRequest, hasRelease bool, hostKey string)
 
 	hostSchedulerSites map[string]map[string]*fqSiteFlowState
@@ -174,24 +180,77 @@ type flowStore struct {
 }
 
 type flowExpiryAction struct {
-	token      string
-	hostKey    string
+	token   string
+	hostKey string
+	epoch   uint64
+	expired bool
+}
+
+type flowCleanupKey struct {
+	token string
+	epoch uint64
+}
+
+type pendingInvocationExpiry struct {
 	releaseReq ReleaseRequest
 	hasRelease bool
-	expired    bool
 }
 
 func newFlowStore(grace time.Duration) *flowStore {
 	return &flowStore{
-		grace:              grace,
-		byToken:            map[string]*fqFlow{},
-		hostSchedulerSites: make(map[string]map[string]*fqSiteFlowState),
-		afterFunc:          time.AfterFunc,
-		nowFn:              time.Now,
-		hostInFlightTokens: make(map[string]map[string]struct{}),
-		inFlightByHost:     make(map[string]int),
-		inFlightBySite:     make(map[string]int),
-		inFlightByIP:       make(map[string]int),
+		grace:                   grace,
+		byToken:                 map[string]*fqFlow{},
+		pendingInvocationExpiry: make(map[flowCleanupKey]pendingInvocationExpiry),
+		hostSchedulerSites:      make(map[string]map[string]*fqSiteFlowState),
+		afterFunc:               time.AfterFunc,
+		nowFn:                   time.Now,
+		hostInFlightTokens:      make(map[string]map[string]struct{}),
+		inFlightByHost:          make(map[string]int),
+		inFlightBySite:          make(map[string]int),
+		inFlightByIP:            make(map[string]int),
+	}
+}
+
+func flowCleanupKeyFor(token string, epoch uint64) flowCleanupKey {
+	return flowCleanupKey{token: token, epoch: epoch}
+}
+
+func (s *flowStore) stashInvocationExpiryLocked(token string, epoch uint64, releaseReq ReleaseRequest, hasRelease bool) {
+	if s == nil || token == "" {
+		return
+	}
+	if s.pendingInvocationExpiry == nil {
+		s.pendingInvocationExpiry = make(map[flowCleanupKey]pendingInvocationExpiry)
+	}
+	s.pendingInvocationExpiry[flowCleanupKeyFor(token, epoch)] = pendingInvocationExpiry{
+		releaseReq: releaseReq,
+		hasRelease: hasRelease,
+	}
+}
+
+func (s *flowStore) takePendingInvocationExpiryLocked(token string, epoch uint64) (ReleaseRequest, bool, bool) {
+	if s == nil || token == "" || s.pendingInvocationExpiry == nil {
+		return ReleaseRequest{}, false, false
+	}
+	key := flowCleanupKeyFor(token, epoch)
+	pending, ok := s.pendingInvocationExpiry[key]
+	if !ok {
+		return ReleaseRequest{}, false, false
+	}
+	delete(s.pendingInvocationExpiry, key)
+	if len(s.pendingInvocationExpiry) == 0 {
+		s.pendingInvocationExpiry = nil
+	}
+	return pending.releaseReq, pending.hasRelease, true
+}
+
+func (s *flowStore) discardPendingInvocationExpiryLocked(token string, epoch uint64) {
+	if s == nil || token == "" || s.pendingInvocationExpiry == nil {
+		return
+	}
+	delete(s.pendingInvocationExpiry, flowCleanupKeyFor(token, epoch))
+	if len(s.pendingInvocationExpiry) == 0 {
+		s.pendingInvocationExpiry = nil
 	}
 }
 
@@ -370,6 +429,7 @@ func (s *flowStore) commitReadyGrantLocked(f *fqFlow, slotToken string, attemptV
 	result.waiterAttached = f.waiter != nil
 	if f.grantCommitted {
 		result.readyLatched = !f.readyLatchedUntil.IsZero() && now.Before(f.readyLatchedUntil)
+		result.committedGrantEpoch = f.committedGrantEpoch
 		return result
 	}
 	if f.readyTimer != nil {
@@ -377,6 +437,7 @@ func (s *flowStore) commitReadyGrantLocked(f *fqFlow, slotToken string, attemptV
 		f.readyTimer = nil
 	}
 	f.LocalVT++
+	f.committedGrantEpoch++
 	f.grantCommitted = true
 	f.grantEligible = false
 	f.readyLatchedAt = time.Time{}
@@ -393,6 +454,7 @@ func (s *flowStore) commitReadyGrantLocked(f *fqFlow, slotToken string, attemptV
 		}
 	}
 	result.newlyCommitted = true
+	result.committedGrantEpoch = f.committedGrantEpoch
 	return result
 }
 
@@ -432,8 +494,8 @@ func (s *flowStore) commitReadyGrantForProbe(token, slotToken string, attemptVer
 	return s.commitReadyGrantLocked(f, slotToken, attemptVersion, attemptTicket, latchTTL, now)
 }
 
-func (s *flowStore) armReadyLatchExpiry(token string, now time.Time, onExpire func()) bool {
-	if s == nil || token == "" || onExpire == nil {
+func (s *flowStore) armReadyLatchExpiry(token string, epoch uint64, now time.Time, onExpire func(token string, epoch uint64)) bool {
+	if s == nil || token == "" || epoch == 0 || onExpire == nil {
 		return false
 	}
 	s.mu.Lock()
@@ -447,6 +509,9 @@ func (s *flowStore) armReadyLatchExpiry(token string, now time.Time, onExpire fu
 		s.removeFlowLocked(f)
 		return false
 	}
+	if !f.grantCommitted || f.committedGrantEpoch != epoch {
+		return false
+	}
 	if f.readyLatchedUntil.IsZero() || !now.Before(f.readyLatchedUntil) {
 		return false
 	}
@@ -458,7 +523,9 @@ func (s *flowStore) armReadyLatchExpiry(token string, now time.Time, onExpire fu
 		return false
 	}
 	delay := cleanupDelayUntil(f.readyLatchedUntil, now)
-	f.readyTimer = s.afterFunc(delay, onExpire)
+	f.readyTimer = s.afterFunc(delay, func() {
+		onExpire(token, epoch)
+	})
 	return true
 }
 
@@ -575,8 +642,11 @@ func (s *flowStore) consumeCommittedGrantLocked(f *fqFlow, now time.Time) (Relea
 	return releaseReq, hasRelease
 }
 
-func (s *flowStore) expireReadyLatchLocked(f *fqFlow, now time.Time) (bool, ReleaseRequest, bool) {
+func (s *flowStore) expireReadyLatchLocked(f *fqFlow, epoch uint64, now time.Time) (bool, ReleaseRequest, bool) {
 	if f == nil {
+		return false, ReleaseRequest{}, false
+	}
+	if epoch == 0 || !f.grantCommitted || f.committedGrantEpoch != epoch || f.waiter != nil {
 		return false, ReleaseRequest{}, false
 	}
 	if f.readyLatchedUntil.IsZero() || now.Before(f.readyLatchedUntil) {
@@ -606,8 +676,8 @@ func (s *flowStore) clearCommittedGrantForProbe(token string, now time.Time) (Re
 	return s.clearCommittedGrantLocked(f, now)
 }
 
-func (s *flowStore) expireReadyLatchForProbe(token string, now time.Time) (bool, ReleaseRequest, bool) {
-	if s == nil || token == "" {
+func (s *flowStore) expireReadyLatchForProbe(token string, epoch uint64, now time.Time) (bool, ReleaseRequest, bool) {
+	if s == nil || token == "" || epoch == 0 {
 		return false, ReleaseRequest{}, false
 	}
 	s.mu.Lock()
@@ -617,11 +687,7 @@ func (s *flowStore) expireReadyLatchForProbe(token string, now time.Time) (bool,
 	if f == nil {
 		return false, ReleaseRequest{}, false
 	}
-	expired, releaseReq, hasRelease := s.expireReadyLatchLocked(f, now)
-	if !expired && isFlowExpiredAt(f, now) {
-		s.expireFlowLocked(f, now)
-	}
-	return expired, releaseReq, hasRelease
+	return s.expireReadyLatchLocked(f, epoch, now)
 }
 
 func (s *flowStore) expireReadyLatch(token string, now time.Time) bool {
@@ -635,7 +701,8 @@ func (s *flowStore) expireReadyLatch(token string, now time.Time) bool {
 	if f == nil {
 		return false
 	}
-	expired, _, _ := s.expireReadyLatchLocked(f, now)
+	epoch := f.committedGrantEpoch
+	expired, _, _ := s.expireReadyLatchLocked(f, epoch, now)
 	if !expired && isFlowExpiredAt(f, now) {
 		s.removeFlowLocked(f)
 	}
@@ -1463,21 +1530,57 @@ func (s *flowStore) expireFlowLocked(f *fqFlow, now time.Time) flowExpiryAction 
 	}
 	action.token = f.Token
 	action.hostKey = fqHostKey(f.HostnameHash, f.Hostname)
-	action.releaseReq, action.hasRelease = s.consumeCommittedGrantLocked(f, now)
+	action.epoch = f.committedGrantEpoch
+	releaseReq, hasRelease := s.consumeCommittedGrantLocked(f, now)
 	action.expired = true
+	s.stashInvocationExpiryLocked(action.token, action.epoch, releaseReq, hasRelease)
 	s.removeFlowLocked(f)
 	return action
+}
+
+func (s *flowStore) consumeInvocationExpiryForEpoch(action flowExpiryAction, now time.Time) (ReleaseRequest, bool, bool) {
+	if s == nil || action.token == "" || !action.expired {
+		return ReleaseRequest{}, false, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[action.token]
+	if f == nil {
+		return s.takePendingInvocationExpiryLocked(action.token, action.epoch)
+	}
+	if !f.grantCommitted || action.epoch == 0 || f.committedGrantEpoch != action.epoch {
+		s.discardPendingInvocationExpiryLocked(action.token, action.epoch)
+		return ReleaseRequest{}, false, false
+	}
+	if !isFlowExpiredAt(f, now) {
+		s.discardPendingInvocationExpiryLocked(action.token, action.epoch)
+		return ReleaseRequest{}, false, false
+	}
+	releaseReq, hasRelease := s.consumeCommittedGrantLocked(f, now)
+	s.removeFlowLocked(f)
+	s.discardPendingInvocationExpiryLocked(action.token, action.epoch)
+	return releaseReq, hasRelease, true
 }
 
 func (s *flowStore) dispatchInvocationExpiry(actions []flowExpiryAction) {
 	if s == nil || len(actions) == 0 || s.onInvocationLeaseExpired == nil {
 		return
 	}
+	nowFn := s.nowFn
+	if nowFn == nil {
+		nowFn = time.Now
+	}
 	for _, action := range actions {
 		if !action.expired {
 			continue
 		}
-		s.onInvocationLeaseExpired(action.token, action.releaseReq, action.hasRelease, action.hostKey)
+		releaseReq, hasRelease, expired := s.consumeInvocationExpiryForEpoch(action, nowFn())
+		if !expired {
+			continue
+		}
+		s.onInvocationLeaseExpired(action.token, releaseReq, hasRelease, action.hostKey)
 	}
 }
 
