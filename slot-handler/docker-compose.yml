@@ -1,0 +1,11 @@
+services:
+  slot-handler:
+    image: slot-handler:ci
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped

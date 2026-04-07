@@ -1,0 +1,140 @@
+name: slot-handler-ci
+
+on:
+  push:
+    paths:
+      - slot-handler/**
+      - .github/workflows/slot-handler-ci.yml
+  pull_request:
+    paths:
+      - slot-handler/**
+      - .github/workflows/slot-handler-ci.yml
+  workflow_dispatch:
+
+jobs:
+  go-verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: slot-handler
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: slot-handler/go.mod
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Run Go build
+        run: go build ./...
+
+  docker-verify:
+    runs-on: ubuntu-latest
+    needs: go-verify
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert workflow uses go-version-file
+        run: "grep -n 'go-version-file: slot-handler/go.mod' .github/workflows/slot-handler-ci.yml"
+
+      - name: Assert Dockerfile contract from source
+        run: |
+          set -euo pipefail
+          test "$(grep -c '^FROM ' slot-handler/Dockerfile)" -eq 2
+          grep -n '^FROM golang:1.24.4' slot-handler/Dockerfile
+          grep -n '^FROM debian:bookworm-slim' slot-handler/Dockerfile
+          grep -n 'CGO_ENABLED=0' slot-handler/Dockerfile
+          test "$(awk '/^go / {print $2}' slot-handler/go.mod)" = "$(grep '^FROM golang:' slot-handler/Dockerfile | head -n1 | sed -E 's/^FROM golang:([^ ]+).*$/\1/')"
+
+      - name: Build direct CI image
+        run: docker build -t slot-handler:ci -f slot-handler/Dockerfile slot-handler
+
+      - name: Render Compose config
+        run: docker compose -f slot-handler/docker-compose.yml config --format json > /tmp/slot-handler-compose.json
+
+      - name: Assert rendered Compose contract
+        run: |
+          set -euo pipefail
+          jq -e '.services | keys == ["slot-handler"]' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].image == "slot-handler:ci"' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].restart == "unless-stopped"' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].command == null' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].entrypoint == null' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].user == null' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].environment == null' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].env_file == null' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].healthcheck == null' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].ports | length == 1' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].ports[0].target == 8080' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '(.services["slot-handler"].ports[0].published | tostring) == "8080"' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].ports[0].protocol == "tcp"' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].volumes | length == 1' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].volumes[0].target == "/app/config.json"' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].volumes[0].type == "bind"' /tmp/slot-handler-compose.json > /dev/null
+          jq -e '.services["slot-handler"].volumes[0].read_only == true' /tmp/slot-handler-compose.json > /dev/null
+          context="$(jq -r '.services["slot-handler"].build.context' /tmp/slot-handler-compose.json)"
+          case "$context" in
+            slot-handler|./slot-handler|*/slot-handler) ;;
+            *) echo "unexpected build context: $context"; exit 1 ;;
+          esac
+          dockerfile="$(jq -r '.services["slot-handler"].build.dockerfile' /tmp/slot-handler-compose.json)"
+          case "$dockerfile" in
+            Dockerfile|*/Dockerfile) ;;
+            *) echo "unexpected dockerfile: $dockerfile"; exit 1 ;;
+          esac
+          source_path="$(jq -r '.services["slot-handler"].volumes[0].source' /tmp/slot-handler-compose.json)"
+          case "$source_path" in
+            slot-handler/config.json|./slot-handler/config.json|*/slot-handler/config.json) ;;
+            *) echo "unexpected config source: $source_path"; exit 1 ;;
+          esac
+
+      - name: Build Compose image
+        run: docker compose -f slot-handler/docker-compose.yml build
+
+      - name: Assert image metadata
+        run: |
+          set -euo pipefail
+          docker image inspect slot-handler:ci > /tmp/slot-handler-image.json
+          jq -e '.[0].Config.Healthcheck == null' /tmp/slot-handler-image.json > /dev/null
+          jq -e '.[0].Config.ExposedPorts["8080/tcp"] != null' /tmp/slot-handler-image.json > /dev/null
+          jq -e '.[0].Config.User != "" and .[0].Config.User != "0" and .[0].Config.User != "root"' /tmp/slot-handler-image.json > /dev/null
+          jq -e '.[0].Config.Entrypoint == ["/app/slot-handler"]' /tmp/slot-handler-image.json > /dev/null
+          jq -e '.[0].Config.Cmd == ["-c", "/app/config.json"]' /tmp/slot-handler-image.json > /dev/null
+
+      - name: Assert image filesystem payload
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh slot-handler:ci -c 'set -eu; test "$(find /app -mindepth 1 -maxdepth 1 | wc -l)" -eq 1; test -f /app/slot-handler'
+
+      - name: Start Compose service
+        run: docker compose -f slot-handler/docker-compose.yml up -d
+
+      - name: Wait for authenticated health check
+        run: |
+          set -euo pipefail
+          token="$(jq -r '.internalApiToken' slot-handler/config.json)"
+          test "$token" = "local-dev-internal-token"
+          timeout 30s bash -c '
+            set -euo pipefail
+            token="$1"
+            while true; do
+              status="$(curl --max-time 1 -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${token}" http://127.0.0.1:8080/api/v0/health || true)"
+              if [ "$status" = "204" ]; then
+                exit 0
+              fi
+              sleep 1
+            done
+          ' _ "$token" || {
+            docker compose -f slot-handler/docker-compose.yml ps
+            docker compose -f slot-handler/docker-compose.yml logs --no-color
+            exit 1
+          }
+
+      - name: Assert CA bundle inside running container
+        run: docker compose -f slot-handler/docker-compose.yml exec -T slot-handler test -f /etc/ssl/certs/ca-certificates.crt
+
+      - name: Stop Compose service
+        if: always()
+        run: docker compose -f slot-handler/docker-compose.yml down -v

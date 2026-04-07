@@ -9,7 +9,7 @@
     "appName": "slot-handler",
     "appVersion": ""
   },
-  "internalApiToken": "change-me",
+  "internalApiToken": "local-dev-internal-token",
   "listen": ":8080",
   "logLevel": "info",
   "auth": {

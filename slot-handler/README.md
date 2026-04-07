@@ -372,3 +372,55 @@ slot-handler 依赖以下函数（名称可在配置中改）：
 - 同一 `queryToken` 的后续 `/acquire` 轮询应尽量命中同一 slot-handler 实例（例如基于 token 的一致性哈希或 LB sticky）。
 - 若未做 sticky，跨实例请求会被判定为 `query_token_stale`/`timeout`；worker 侧会退化为 `503`，公平性与等待时延也会退化。
 - 建议在 LB 层开启健康检查与平滑摘除，减少实例切换导致的 token 失效抖动。
+
+## 10. Docker 与 CI
+
+以下 Docker 与 Compose 命令均在仓库根目录执行。
+
+### 10.1 构建本地镜像
+
+```bash
+docker build -t slot-handler:local -f slot-handler/Dockerfile slot-handler
+```
+
+### 10.2 使用 Compose 启动
+
+```bash
+docker compose -f slot-handler/docker-compose.yml up --build
+```
+
+- Compose 只启动 `slot-handler` 单服务。
+- 容器通过只读 bind mount 读取 `slot-handler/config.json`，容器内路径固定为 `/app/config.json`。
+- `slot-handler/` 不提供 `docker-compose.local.yml` 和 `env.example`。
+
+### 10.3 手工健康检查
+
+```bash
+curl -i -H "Authorization: Bearer <internalApiToken>" http://127.0.0.1:8080/api/v0/health
+```
+
+### 10.4 GitHub Actions
+
+仓库包含 `.github/workflows/slot-handler-ci.yml`，仅在以下情况触发：
+
+- `slot-handler/**` 发生变更
+- `.github/workflows/slot-handler-ci.yml` 自身发生变更
+- 手动触发 `workflow_dispatch`
+
+CI 会执行：
+
+- 在 `slot-handler/` 工作目录内执行 `go test ./...`
+- 在 `slot-handler/` 工作目录内执行 `go build ./...`
+- `docker build -t slot-handler:ci -f slot-handler/Dockerfile slot-handler`
+- `docker compose -f slot-handler/docker-compose.yml config --format json`
+- `docker compose -f slot-handler/docker-compose.yml build`
+- 基于 `slot-handler/config.json` 的容器启动与 `/api/v0/health` 鉴权烟测
+
+### 10.5 Go 工作区边界
+
+根目录 `go.work` 已移除。与 `slot-handler` 相关的 Go 命令请直接针对模块执行，例如：
+
+```bash
+go -C slot-handler test ./...
+go -C slot-handler build ./...
+```
