@@ -3291,6 +3291,33 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   };
 
+  const settleQueueBreakerAttemptIfNeeded = async (hostname) => {
+    const hostnameAdmissionMode = resolveAdmissionMode(config, hostname);
+    if (hostnameAdmissionMode !== 'queue_breaker' || !fqContext || hostname !== fqContext.hostname) {
+      return null;
+    }
+
+    const attemptVersion = Number.isFinite(fqContext.attemptVersion) ? Math.trunc(fqContext.attemptVersion) : null;
+    const attemptTicket = Number.isFinite(fqContext.attemptTicket) ? Math.trunc(fqContext.attemptTicket) : null;
+    if (!Number.isFinite(attemptVersion) || !Number.isFinite(attemptTicket)) {
+      return null;
+    }
+
+    try {
+      const snapshot = await throttleManager.settleBreakerAttempt(hostname, {
+        attemptVersion,
+        attemptTicket,
+      }, { ...config.throttleConfig, ctx });
+      fqContext.attemptVersion = null;
+      fqContext.attemptTicket = null;
+      clearDeferredQueueBreakerReport();
+      return snapshot;
+    } catch (error) {
+      console.error('[Throttle] Attempt settlement failed:', error instanceof Error ? error.message : String(error));
+      return createBreakerAuthorityUnavailableResponse(origin, 'attempt settlement');
+    }
+  };
+
   const armDeferredQueueBreakerReport = (statusCode) => {
     if (!fqContext) {
       return;
@@ -3518,6 +3545,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let fairQueueClient = null;
   let fqContext = null;
   const pendingFairQueueCleanupContexts = [];
+  let pendingBreakerOnlyAttempt = null;
   let clientIpSubnetHash = null;
   let concurrencyClient = null;
   let cqPlan = null;
@@ -3526,6 +3554,72 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let cqLease = null;
   let cqReleaseController = null;
   let cqCleanupBoundToStream = false;
+
+  const clearPendingBreakerOnlyAttempt = () => {
+    pendingBreakerOnlyAttempt = null;
+  };
+
+  const armPendingBreakerOnlyAttempt = (hostname, attempt = null) => {
+    if (resolveAdmissionMode(config, hostname) !== 'breaker_only') {
+      clearPendingBreakerOnlyAttempt();
+      return;
+    }
+
+    pendingBreakerOnlyAttempt = {
+      hostname,
+      attemptVersion: Number.isFinite(attempt?.attemptVersion) ? Math.trunc(attempt.attemptVersion) : null,
+      attemptTicket: Number.isFinite(attempt?.attemptTicket) ? Math.trunc(attempt.attemptTicket) : null,
+    };
+  };
+
+  const settleBreakerOnlyAttemptIfNeeded = async (hostname) => {
+    if (
+      resolveAdmissionMode(config, hostname) !== 'breaker_only'
+      || !pendingBreakerOnlyAttempt
+      || pendingBreakerOnlyAttempt.hostname !== hostname
+    ) {
+      return null;
+    }
+
+    const attemptVersion = Number.isFinite(pendingBreakerOnlyAttempt.attemptVersion)
+      ? Math.trunc(pendingBreakerOnlyAttempt.attemptVersion)
+      : null;
+    const attemptTicket = Number.isFinite(pendingBreakerOnlyAttempt.attemptTicket)
+      ? Math.trunc(pendingBreakerOnlyAttempt.attemptTicket)
+      : null;
+
+    if (!Number.isFinite(attemptVersion) || !Number.isFinite(attemptTicket)) {
+      clearPendingBreakerOnlyAttempt();
+      return null;
+    }
+
+    try {
+      const snapshot = await throttleManager.settleBreakerAttempt(hostname, {
+        attemptVersion,
+        attemptTicket,
+      }, { ...config.throttleConfig, ctx });
+      clearPendingBreakerOnlyAttempt();
+      return snapshot;
+    } catch (error) {
+      console.error('[Throttle] Attempt settlement failed:', error instanceof Error ? error.message : String(error));
+      clearPendingBreakerOnlyAttempt();
+      return createBreakerAuthorityUnavailableResponse(origin, 'attempt settlement');
+    }
+  };
+
+  const settleBreakerAttemptIfNeeded = async (hostname) => {
+    const queueBreakerSettlement = await settleQueueBreakerAttemptIfNeeded(hostname);
+    if (queueBreakerSettlement instanceof Response) {
+      return queueBreakerSettlement;
+    }
+
+    const breakerOnlySettlement = await settleBreakerOnlyAttemptIfNeeded(hostname);
+    if (breakerOnlySettlement instanceof Response) {
+      return breakerOnlySettlement;
+    }
+
+    return breakerOnlySettlement || queueBreakerSettlement;
+  };
 
   const ensureClientIpSubnetHash = async (label, unavailableResponse) => {
     if (clientIpSubnetHash) {
@@ -3906,6 +4000,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return fairQueuePrepareResult;
     }
 
+    if (needFairQueue || !needTrueConcurrency) {
+      clearPendingBreakerOnlyAttempt();
+    }
+
     let nextPlan = null;
     if (needTrueConcurrency) {
       if (Date.now() >= hardExpireAtMs) {
@@ -3958,15 +4056,39 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     if (needTrueConcurrency && !cqLease && cqPlan) {
       if (Date.now() >= cqPlan.hardExpireAtMs) {
+        const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
+        if (settleResponse instanceof Response) {
+          if (needFairQueue) {
+            await finalizeFairQueueOnFailure(`${phase} expired before concurrency acquire`);
+          }
+          return settleResponse;
+        }
         if (needFairQueue) {
           await finalizeFairQueueOnFailure(`${phase} expired before concurrency acquire`);
         }
         return createUnauthorizedResponse(origin, 'link expired');
       }
+
+      if (!needFairQueue) {
+        clearPendingBreakerOnlyAttempt();
+        const breakerAttempt = await authorizeBreakerOnlyAttemptIfNeeded(cqPlan.hostname);
+        if (breakerAttempt?.blockedResponse) {
+          return breakerAttempt.blockedResponse;
+        }
+        armPendingBreakerOnlyAttempt(cqPlan.hostname, breakerAttempt);
+      }
+
       try {
         cqPlan.nowMs = Date.now();
         const acquireResult = await concurrencyClient.acquire(ctx, cqPlan, clientSignal);
         if (acquireResult.result === 'deny') {
+          const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
+          if (settleResponse instanceof Response) {
+            if (needFairQueue) {
+              await finalizeFairQueueOnFailure(`${phase} cq deny`);
+            }
+            return settleResponse;
+          }
           if (needFairQueue) {
             await finalizeFairQueueOnFailure(`${phase} cq deny`);
           }
@@ -3989,6 +4111,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         });
       } catch (error) {
         if (clientAborted && isAbortError(error)) {
+          const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan?.hostname);
+          if (settleResponse instanceof Response) {
+            if (needFairQueue) {
+              await finalizeFairQueueOnFailure(`${phase} client abort during cq acquire`);
+            }
+            return settleResponse;
+          }
           if (needFairQueue) {
             await finalizeFairQueueOnFailure(`${phase} client abort during cq acquire`);
           }
@@ -3996,6 +4125,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         }
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[CQ] acquire failed during ${phase}:`, message);
+        const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan?.hostname);
+        if (settleResponse instanceof Response) {
+          if (needFairQueue) {
+            await finalizeFairQueueOnFailure(`${phase} cq failure`);
+          }
+          return settleResponse;
+        }
         if (needFairQueue) {
           await finalizeFairQueueOnFailure(`${phase} cq failure`);
         }
@@ -4061,7 +4197,27 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (requestAdmissionMode === 'queue_breaker') {
       attempt = readQueueBreakerAttempt(requestHostname, requestAdmissionMode);
     } else if (requestAdmissionMode === 'breaker_only') {
-      attempt = await authorizeBreakerOnlyAttemptIfNeeded(requestHostname);
+      if (
+        pendingBreakerOnlyAttempt
+        && pendingBreakerOnlyAttempt.hostname === requestHostname
+      ) {
+        attempt = {
+          blockedResponse: null,
+          attemptVersion: pendingBreakerOnlyAttempt.attemptVersion,
+          attemptTicket: pendingBreakerOnlyAttempt.attemptTicket,
+          consumeAfterReport() {
+            clearPendingBreakerOnlyAttempt();
+          },
+        };
+      } else {
+        attempt = await authorizeBreakerOnlyAttemptIfNeeded(requestHostname);
+        if (!attempt?.blockedResponse) {
+          armPendingBreakerOnlyAttempt(requestHostname, attempt);
+          attempt.consumeAfterReport = () => {
+            clearPendingBreakerOnlyAttempt();
+          };
+        }
+      }
     }
 
     if (attempt.blockedResponse) {
@@ -4273,6 +4429,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     if (!retriedWithFreshLink && shouldRetryAuthError(response.status)) {
+      if (needTrueConcurrency && !needFairQueue) {
+        const settleResponse = await settleBreakerOnlyAttemptIfNeeded(extractHostname(request?.url || '')?.toLowerCase() || null);
+        if (settleResponse instanceof Response) {
+          return await releaseAdmissionBeforeTerminalResponse(settleResponse, 'prestream_terminal');
+        }
+      }
       retriedWithFreshLink = true;
       console.warn(`[Upstream] Auth error ${response.status} for ${path}, refreshing link from API`);
       const refreshType =
@@ -4327,6 +4489,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     if (retriedWithFreshLink && shouldRetryAuthError(response.status)) {
+      if (needTrueConcurrency && !needFairQueue) {
+        const settleResponse = await settleBreakerOnlyAttemptIfNeeded(extractHostname(request?.url || '')?.toLowerCase() || null);
+        if (settleResponse instanceof Response) {
+          return await releaseAdmissionBeforeTerminalResponse(settleResponse, 'prestream_terminal');
+        }
+      }
       const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
       if (deferredReportResponse) {
         return deferredReportResponse;
@@ -4410,6 +4578,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (cqReleaseController && !cqCleanupBoundToStream) {
       cqReleaseController.ensureReleased('final_cleanup');
     }
+    clearPendingBreakerOnlyAttempt();
 
     const finalCleanupContexts = [];
     if (fqContext && fqContext.cleanupRetired !== true) {

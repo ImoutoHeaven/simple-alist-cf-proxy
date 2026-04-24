@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getBreakerState, reportBreakerSample } from '../src/cache/throttle-custom-pg-rest.js';
+import { getBreakerState, reportBreakerSample, settleBreakerAttempt } from '../src/cache/throttle-custom-pg-rest.js';
 import { scheduleAllCleanups } from '../src/cleanup-scheduler.js';
 import { encryptBindingPayload } from '../src/origin-binding.js';
 import worker from '../src/worker.js';
@@ -1058,6 +1058,46 @@ test('reportBreakerSample sends the canonical breaker report payload', async () 
       version: 5,
       lastErrorCode: 503,
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('settleBreakerAttempt sends the canonical breaker settlement payload', async () => {
+  const originalFetch = globalThis.fetch;
+  let rpcUrl = null;
+  let rpcBody = null;
+
+  globalThis.fetch = async (url, init) => {
+    rpcUrl = url;
+    rpcBody = JSON.parse(init.body);
+    return createJsonResponse([{
+      STATE: 'half_open',
+      OPEN_UNTIL: null,
+      OPEN_REASON: 'http_429',
+      VERSION: 18,
+      LAST_ERROR_CODE: 429,
+      HALF_OPEN_DEADLINE: 999,
+    }]);
+  };
+
+  try {
+    const result = await settleBreakerAttempt('tenant.sharepoint.com', {
+      attemptVersion: 18,
+      attemptTicket: 5,
+    }, {
+      postgrestUrl: 'https://postgrest.example.test',
+      verifyHeader: ['X-Verify'],
+      verifySecret: ['secret'],
+    });
+
+    assert.equal(rpcUrl, 'https://postgrest.example.test/rpc/download_settle_breaker_attempt');
+    assert.equal(rpcBody.p_attempt_version, 18);
+    assert.equal(rpcBody.p_attempt_ticket, 5);
+    assert.equal(rpcBody.p_hostname, 'tenant.sharepoint.com');
+    assert.equal(typeof rpcBody.p_now, 'number');
+    assert.equal(result.state, 'half_open');
+    assert.equal(result.version, 18);
   } finally {
     globalThis.fetch = originalFetch;
   }

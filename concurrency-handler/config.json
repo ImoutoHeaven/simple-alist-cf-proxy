@@ -33,8 +33,7 @@
       "siteIpMaxInFlight": 4
     },
     "lease": {
-      "requireHardExpiry": true,
-      "maxFutureTtlSeconds": 7200
+      "requireHardExpiry": true
     },
     "sweep": {
       "enabled": true,

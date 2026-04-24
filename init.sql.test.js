@@ -37,6 +37,19 @@ describe('init.sql breaker RPC definitions', () => {
     expect(initSql).not.toMatch(/CREATE OR REPLACE FUNCTION download_claim_breaker_probe\(/i);
   });
 
+  it('defines download_settle_breaker_attempt for non-probe terminal settlement', () => {
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION download_settle_breaker_attempt\(/i);
+  });
+
+  it('marks only the reported mask in download_settle_breaker_attempt without modifying sample counters', () => {
+    const functionBody = readFunctionBody('download_settle_breaker_attempt');
+
+    expect(functionBody).toMatch(/v_half_open_reported_mask := COALESCE\(v_half_open_reported_mask, 0\) \| v_ticket_mask/i);
+    expect(functionBody).toMatch(/"HALF_OPEN_REPORTED_MASK" = v_half_open_reported_mask/i);
+    expect(functionBody).not.toMatch(/v_total_samples :=/i);
+    expect(functionBody).not.toMatch(/v_half_open_success_count := v_half_open_success_count \+ 1/i);
+  });
+
   it('uses an explicit primary-key conflict target when seeding download_authorize_breaker_attempt', () => {
     const functionBody = readFunctionBody('download_authorize_breaker_attempt');
 

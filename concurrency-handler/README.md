@@ -70,7 +70,6 @@ Both modes normalize to the same service-level `allow|deny|granted|released|noop
 - `caps.siteMaxInFlight`
 - `caps.siteIpMaxInFlight`
 - `lease.requireHardExpiry`
-- `lease.maxFutureTtlSeconds`
 - `sweep.enabled`
 - `sweep.intervalSeconds`
 - `sweep.batchSize`

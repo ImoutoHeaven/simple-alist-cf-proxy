@@ -969,6 +969,162 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION download_settle_breaker_attempt(
+  p_hostname_hash TEXT,
+  p_hostname TEXT,
+  p_attempt_version BIGINT,
+  p_attempt_ticket INTEGER,
+  p_now INTEGER DEFAULT NULL
+)
+RETURNS TABLE(
+  "HOSTNAME_HASH" TEXT,
+  "HOSTNAME" TEXT,
+  "STATE" TEXT,
+  "OPEN_UNTIL" INTEGER,
+  "EWMA_SCORE" NUMERIC,
+  "TOTAL_SAMPLES" INTEGER,
+  "SAMPLES_SINCE_RESET" INTEGER,
+  "CONSECUTIVE_ERROR_COUNT" INTEGER,
+  "SUCCESS_STREAK" INTEGER,
+  "HALF_OPEN_DEADLINE" INTEGER,
+  "LAST_SAMPLE_AT" INTEGER,
+  "LAST_ERROR_CODE" INTEGER,
+  "OPEN_REASON" TEXT,
+  "LAST_OPEN_SECONDS" INTEGER,
+  "VERSION" BIGINT
+) AS $$
+DECLARE
+  v_now INTEGER := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::INTEGER);
+  v_half_open_ticket_mask_limit CONSTANT INTEGER := 63;
+  v_hostname TEXT := p_hostname;
+  v_state TEXT := 'closed';
+  v_open_until INTEGER := NULL;
+  v_ewma_score NUMERIC := 0;
+  v_total_samples INTEGER := 0;
+  v_samples_since_reset INTEGER := 0;
+  v_consecutive_error_count INTEGER := 0;
+  v_success_streak INTEGER := 0;
+  v_half_open_budget INTEGER := 0;
+  v_half_open_issued INTEGER := 0;
+  v_half_open_reported_mask BIGINT := 0;
+  v_half_open_success_count INTEGER := 0;
+  v_half_open_deadline INTEGER := NULL;
+  v_last_sample_at INTEGER := NULL;
+  v_last_error_code INTEGER := NULL;
+  v_open_reason TEXT := NULL;
+  v_last_open_seconds INTEGER := 0;
+  v_version BIGINT := 0;
+  v_ticket_mask BIGINT := 0;
+  v_locked BOOLEAN := FALSE;
+  v_locked_row_count INTEGER := 0;
+BEGIN
+  IF p_hostname_hash IS NULL OR p_hostname_hash = '' OR p_attempt_version IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF p_attempt_ticket IS NULL OR p_attempt_ticket < 1 OR p_attempt_ticket > v_half_open_ticket_mask_limit THEN
+    RETURN QUERY
+    SELECT
+      p_hostname_hash,
+      COALESCE(NULLIF(p_hostname, ''), p_hostname_hash),
+      'closed'::TEXT,
+      NULL::INTEGER,
+      0::NUMERIC,
+      0::INTEGER,
+      0::INTEGER,
+      0::INTEGER,
+      0::INTEGER,
+      NULL::INTEGER,
+      NULL::INTEGER,
+      NULL::INTEGER,
+      NULL::TEXT,
+      0::INTEGER,
+      0::BIGINT;
+    RETURN;
+  END IF;
+
+  WHILE NOT v_locked LOOP
+    SELECT
+      tp."HOSTNAME",
+      tp."STATE",
+      tp."OPEN_UNTIL",
+      tp."EWMA_SCORE",
+      tp."TOTAL_SAMPLES",
+      tp."SAMPLES_SINCE_RESET",
+      tp."CONSECUTIVE_ERROR_COUNT",
+      tp."SUCCESS_STREAK",
+      tp."HALF_OPEN_BUDGET",
+      tp."HALF_OPEN_ISSUED",
+      tp."HALF_OPEN_REPORTED_MASK",
+      tp."HALF_OPEN_SUCCESS_COUNT",
+      tp."HALF_OPEN_DEADLINE",
+      tp."LAST_SAMPLE_AT",
+      tp."LAST_ERROR_CODE",
+      tp."OPEN_REASON",
+      tp."LAST_OPEN_SECONDS",
+      tp."VERSION"
+    INTO
+      v_hostname,
+      v_state,
+      v_open_until,
+      v_ewma_score,
+      v_total_samples,
+      v_samples_since_reset,
+      v_consecutive_error_count,
+      v_success_streak,
+      v_half_open_budget,
+      v_half_open_issued,
+      v_half_open_reported_mask,
+      v_half_open_success_count,
+      v_half_open_deadline,
+      v_last_sample_at,
+      v_last_error_code,
+      v_open_reason,
+      v_last_open_seconds,
+      v_version
+    FROM "THROTTLE_PROTECTION" AS tp
+    WHERE tp."HOSTNAME_HASH" = p_hostname_hash
+    FOR UPDATE;
+
+    GET DIAGNOSTICS v_locked_row_count = ROW_COUNT;
+    v_locked := v_locked_row_count > 0;
+
+    IF NOT v_locked THEN
+      INSERT INTO "THROTTLE_PROTECTION" ("HOSTNAME_HASH", "HOSTNAME", "STATE")
+      VALUES (p_hostname_hash, COALESCE(NULLIF(p_hostname, ''), p_hostname_hash), 'closed')
+      ON CONFLICT ON CONSTRAINT "THROTTLE_PROTECTION_pkey" DO NOTHING;
+    END IF;
+  END LOOP;
+
+  IF v_state = 'half_open' AND p_attempt_version = v_version AND p_attempt_ticket <= v_half_open_issued THEN
+    v_ticket_mask := (1::BIGINT << (p_attempt_ticket - 1));
+    v_half_open_reported_mask := COALESCE(v_half_open_reported_mask, 0) | v_ticket_mask;
+
+    UPDATE "THROTTLE_PROTECTION" AS tp SET
+      "HALF_OPEN_REPORTED_MASK" = v_half_open_reported_mask
+    WHERE tp."HOSTNAME_HASH" = p_hostname_hash;
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    p_hostname_hash,
+    COALESCE(v_hostname, COALESCE(NULLIF(p_hostname, ''), p_hostname_hash)),
+    v_state,
+    v_open_until,
+    v_ewma_score,
+    v_total_samples,
+    v_samples_since_reset,
+    v_consecutive_error_count,
+    v_success_streak,
+    v_half_open_deadline,
+    v_last_sample_at,
+    v_last_error_code,
+    v_open_reason,
+    v_last_open_seconds,
+    v_version;
+END;
+$$ LANGUAGE plpgsql;
+
 
 -- ========================================
 -- Download IP Rate Limit Table Schema

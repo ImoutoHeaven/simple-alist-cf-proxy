@@ -31,8 +31,7 @@ func validTestConfig() Config {
 				SiteIPMaxInFlight: 4,
 			},
 			Lease: ConcurrencyLeaseConfig{
-				RequireHardExpiry:   true,
-				MaxFutureTTLSeconds: 7200,
+				RequireHardExpiry: true,
 			},
 			Sweep: ConcurrencySweepConfig{
 				Enabled:         true,
@@ -116,7 +115,7 @@ func TestParseConfigBytesAppliesDefaults(t *testing.T) {
 		},
 		"concurrency": {
 			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
-			"lease": {"requireHardExpiry": true, "maxFutureTtlSeconds": 7200},
+			"lease": {"requireHardExpiry": true},
 			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
 			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
 		}

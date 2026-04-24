@@ -40,7 +40,11 @@ const signPayload = async (payload, expire, token) => {
   return `${encodeSignatureBase64Url(Buffer.from(signature))}:${expire}`;
 };
 
-const buildRuntimeBootstrap = ({ fairQueueHostPatterns = [], trueConcurrencyHostPatterns = [] } = {}) => ({
+const buildRuntimeBootstrap = ({
+  fairQueueHostPatterns = [],
+  trueConcurrencyHostPatterns = [],
+  throttleHostPatterns = [],
+} = {}) => ({
   configVersion: 'task-group-4-runtime',
   ttlSeconds: 300,
   global: {
@@ -74,7 +78,7 @@ const buildRuntimeBootstrap = ({ fairQueueHostPatterns = [], trueConcurrencyHost
     },
     throttleProfiles: {
       default: {
-        hostPatterns: [],
+        hostPatterns: throttleHostPatterns,
         openCapSeconds: 60,
         openThresholdPercent: 30,
         closeThresholdPercent: 15,
@@ -178,6 +182,7 @@ test('dual mode performs precheck before fairqueue and acquire before origin fet
       return createJsonResponse(buildRuntimeBootstrap({
         fairQueueHostPatterns: ['*.sharepoint.com'],
         trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
       }));
     }
 
@@ -231,6 +236,17 @@ test('dual mode performs precheck before fairqueue and acquire before origin fet
       });
     }
 
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      calls.push('breaker-report');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 1,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       calls.push('fairqueue-release');
       return createJsonResponse({ result: 'ok' });
@@ -274,6 +290,7 @@ test('dual mode precheck deny returns 503 before fairqueue', async () => {
       return createJsonResponse(buildRuntimeBootstrap({
         fairQueueHostPatterns: ['*.sharepoint.com'],
         trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
       }));
     }
 
@@ -322,6 +339,7 @@ test('dual mode malformed precheck deny fails open to fairqueue admission', asyn
       return createJsonResponse(buildRuntimeBootstrap({
         fairQueueHostPatterns: ['*.sharepoint.com'],
         trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
       }));
     }
 
@@ -369,6 +387,17 @@ test('dual mode malformed precheck deny fails open to fairqueue admission', asyn
       });
     }
 
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      calls.push('breaker-report');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 1,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       calls.push('fairqueue-release');
       return createJsonResponse({ result: 'ok' });
@@ -411,6 +440,7 @@ test('dual mode concurrency acquire deny releases fairqueue and returns 503', as
       return createJsonResponse(buildRuntimeBootstrap({
         fairQueueHostPatterns: ['*.sharepoint.com'],
         trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
       }));
     }
 
@@ -459,6 +489,679 @@ test('dual mode concurrency acquire deny releases fairqueue and returns 503', as
     assert.equal(response.status, 503);
     assert.deepEqual(calls, ['precheck', 'fairqueue-acquire', 'concurrency-acquire', 'fairqueue-release']);
   } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_breaker dual mode settles breaker attempt before returning CQ deny', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const reportBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/precheck') {
+      calls.push('precheck');
+      return createJsonResponse({ result: 'allow' });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-qb-cq-deny',
+        invocationEpoch: 1,
+        slotToken: 'slot-qb-cq-deny',
+        meta: {
+          attemptVersion: 17,
+          attemptTicket: 3,
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      return createJsonResponse({ result: 'deny', scope: 'site', reason: 'full', retryAfter: 5 });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      reportBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 17,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.deepEqual(calls, [
+      'precheck',
+      'fairqueue-acquire',
+      'concurrency-acquire',
+      'breaker-settle',
+      'fairqueue-release',
+    ]);
+    assert.equal(reportBodies.length, 1);
+    assert.equal(reportBodies[0].p_attempt_version, 17);
+    assert.equal(reportBodies[0].p_attempt_ticket, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency authorizes breaker before CQ acquire', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 10,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 10,
+        LAST_ERROR_CODE: null,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-breaker-only',
+        leaseToken: 'token-breaker-only',
+        expiresAtMs: body.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      calls.push('breaker-report');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 11,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    assert.equal(response.status, 200);
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(calls.slice(0, 4), [
+      'breaker-snapshot',
+      'breaker-authorize',
+      'concurrency-acquire',
+      'origin-fetch',
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency settles breaker attempt when CQ deny happens after authorize', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const settleBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 21,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 22,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 4,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      return createJsonResponse({ result: 'deny', scope: 'host', reason: 'full', retryAfter: 4 });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 22,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), createTestContext().ctx);
+    assert.equal(response.status, 503);
+    assert.deepEqual(calls, [
+      'breaker-snapshot',
+      'breaker-authorize',
+      'concurrency-acquire',
+      'breaker-settle',
+    ]);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 22);
+    assert.equal(settleBodies[0].p_attempt_ticket, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency settles granted attempt before auth refresh retries', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const settleBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url.startsWith('https://alist.example.com/api/fs/link')) {
+      calls.push('link-api');
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 31,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 32,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 7,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-breaker-refresh',
+        leaseToken: 'token-breaker-refresh',
+        expiresAtMs: body.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch-401');
+      return new Response('expired', {
+        status: 401,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 32,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    assert.equal(response.status, 401);
+    assert.equal(await response.text(), 'expired');
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(calls, [
+      'link-api',
+      'breaker-snapshot',
+      'breaker-authorize',
+      'concurrency-acquire',
+      'origin-fetch-401',
+      'breaker-settle',
+      'link-api',
+      'breaker-authorize',
+      'origin-fetch-401',
+      'breaker-settle',
+    ]);
+    assert.equal(settleBodies.length, 2);
+    assert.equal(settleBodies[0].p_attempt_version, 32);
+    assert.equal(settleBodies[0].p_attempt_ticket, 7);
+    assert.equal(settleBodies[1].p_attempt_version, 32);
+    assert.equal(settleBodies[1].p_attempt_ticket, 7);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency checks handler readiness before authorizing breaker attempts', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalDateNow = Date.now;
+  const calls = [];
+  let advancedClock = false;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      advancedClock = true;
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 41,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 42,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 8,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      throw new Error('concurrency acquire should not be reached after hard expiry');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseNowMs = Date.now();
+    Date.now = () => (advancedClock ? (baseNowMs + 5000) : baseNowMs);
+
+    const expireSeconds = Math.floor((baseNowMs + 2500) / 1000);
+    const request = await buildSignedWorkerRequest({
+      payloadExpireTime: expireSeconds,
+      payloadSignExpire: expireSeconds,
+    });
+    const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
+    assert.equal(response.status, 401);
+    assert.deepEqual(calls, ['breaker-snapshot']);
+  } finally {
+    Date.now = originalDateNow;
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency settles granted attempt on client-aborted CQ acquire', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const settleBodies = [];
+  const abortController = new AbortController();
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 51,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 52,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 9,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      abortController.abort();
+      throw new DOMException('The operation was aborted.', 'AbortError');
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 52,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const request = await buildSignedWorkerRequest({ signal: abortController.signal });
+    const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
+    assert.equal(response.status, 499);
+    assert.deepEqual(calls, [
+      'breaker-snapshot',
+      'breaker-authorize',
+      'concurrency-acquire',
+      'breaker-settle',
+    ]);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 52);
+    assert.equal(settleBodies[0].p_attempt_ticket, 9);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_breaker dual mode settles breaker attempt when target expires before CQ acquire', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalDateNow = Date.now;
+  const calls = [];
+  const settleBodies = [];
+  let advancedClock = false;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/precheck') {
+      calls.push('precheck');
+      return createJsonResponse({ result: 'allow' });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      advancedClock = true;
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-expire-before-cq',
+        invocationEpoch: 1,
+        slotToken: 'slot-expire-before-cq',
+        meta: {
+          attemptVersion: 61,
+          attemptTicket: 4,
+        },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 61,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      throw new Error('concurrency acquire should not be reached after expiry gate');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseNowMs = Date.now();
+    Date.now = () => (advancedClock ? (baseNowMs + 5000) : baseNowMs);
+
+    const expireSeconds = Math.floor((baseNowMs + 2500) / 1000);
+    const request = await buildSignedWorkerRequest({
+      payloadExpireTime: expireSeconds,
+      payloadSignExpire: expireSeconds,
+    });
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(request, buildWorkerEnv(), ctx);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 401);
+    assert.deepEqual(calls, [
+      'precheck',
+      'fairqueue-acquire',
+      'breaker-settle',
+      'fairqueue-release',
+    ]);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 61);
+    assert.equal(settleBodies[0].p_attempt_ticket, 4);
+  } finally {
+    Date.now = originalDateNow;
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }

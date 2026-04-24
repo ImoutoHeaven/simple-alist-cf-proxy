@@ -63,8 +63,7 @@ type ConcurrencyCapsConfig struct {
 }
 
 type ConcurrencyLeaseConfig struct {
-	RequireHardExpiry   bool `json:"requireHardExpiry"`
-	MaxFutureTTLSeconds int  `json:"maxFutureTtlSeconds"`
+	RequireHardExpiry bool `json:"requireHardExpiry"`
 }
 
 type ConcurrencySweepConfig struct {
@@ -153,9 +152,6 @@ func (c *Config) Validate() error {
 	}
 	if !c.Concurrency.Lease.RequireHardExpiry {
 		return errors.New("concurrency.lease.requireHardExpiry must be true in v1")
-	}
-	if c.Concurrency.Lease.MaxFutureTTLSeconds <= 0 {
-		return errors.New("concurrency.lease.maxFutureTtlSeconds is required")
 	}
 	if c.Concurrency.Sweep.IntervalSeconds <= 0 {
 		return errors.New("concurrency.sweep.intervalSeconds is required")

@@ -324,6 +324,52 @@ export const authorizeBreakerAttempt = async (hostname, config) => {
   });
 };
 
+export const settleBreakerAttempt = async (hostname, updateData, config) => {
+  if (!config.postgrestUrl || !hasVerifyCredentials(config.verifyHeader, config.verifySecret)) {
+    return null;
+  }
+
+  if (!hostname || typeof hostname !== 'string') {
+    return null;
+  }
+
+  const attemptVersionRaw = Number.isFinite(updateData?.attemptVersion)
+    ? Number(updateData.attemptVersion)
+    : Number.parseInt(updateData?.attemptVersion, 10);
+  const attemptTicketRaw = Number.isFinite(updateData?.attemptTicket)
+    ? Number(updateData.attemptTicket)
+    : Number.parseInt(updateData?.attemptTicket, 10);
+  const attemptVersion = Number.isFinite(attemptVersionRaw) ? Math.trunc(attemptVersionRaw) : null;
+  const attemptTicket = Number.isFinite(attemptTicketRaw) ? Math.trunc(attemptTicketRaw) : null;
+
+  if (!Number.isFinite(attemptVersion) || !Number.isFinite(attemptTicket)) {
+    console.warn('[Throttle] Skip settleBreakerAttempt: invalid attempt identity');
+    return null;
+  }
+
+  const { postgrestUrl, verifyHeader, verifySecret } = config;
+  const hostnameHash = await sha256Hash(hostname);
+  if (!hostnameHash) {
+    throw new Error('Failed to calculate hostname hash');
+  }
+
+  const row = await executeBreakerRpc(
+    postgrestUrl,
+    verifyHeader,
+    verifySecret,
+    'download_settle_breaker_attempt',
+    {
+      p_hostname_hash: hostnameHash,
+      p_hostname: hostname,
+      p_attempt_version: attemptVersion,
+      p_attempt_ticket: attemptTicket,
+      p_now: Math.floor(Date.now() / 1000),
+    },
+  );
+
+  return readBreakerSnapshot(row, { includeHalfOpenDeadline: true });
+};
+
 /**
  * Report a breaker sample for a hostname using the breaker report RPC
  * @param {string} hostname - Hostname
