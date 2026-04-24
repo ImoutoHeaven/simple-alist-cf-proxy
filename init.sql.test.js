@@ -218,4 +218,133 @@ describe('init.sql breaker RPC definitions', () => {
 
     expect(functionBody).toMatch(/if\s+v_site_slot_id\s*=\s*0\s+then[\s\S]*?PERFORM\s+func_release_host_slot\(v_host_slot_id,\s*FALSE\);[\s\S]*?status\s*:=\s*'IP_TOO_MANY'[\s\S]*?slot_token\s*:=\s*NULL[\s\S]*?retry_after\s*:=\s*NULL[\s\S]*?attempt_version\s*:=\s*NULL[\s\S]*?attempt_ticket\s*:=\s*NULL[\s\S]*?return next;[\s\S]*?continue;[\s\S]*?elsif\s+v_site_slot_id\s*<\s*0\s+then/i);
   });
+
+  it('defines true-concurrency lease tables and rpc entrypoints', () => {
+    expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_leases/i);
+    expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_host_counters/i);
+    expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_site_counters/i);
+    expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_site_ip_counters/i);
+    expect(initSql).toMatch(/CREATE UNIQUE INDEX IF NOT EXISTS\s+concurrency_leases_request_id_idx\s+ON\s+concurrency_leases\s*\(request_id\)/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_precheck\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_expire_scope\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_acquire\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_release\(/i);
+  });
+
+  it('uses database-authoritative time for cq_precheck lease visibility and retry_after', () => {
+    const precheckBody = readFunctionBody('cq_precheck');
+
+    expect(precheckBody).toMatch(/clock_timestamp\(\)/i);
+    expect(precheckBody).not.toMatch(/p_now_ms/i);
+    expect(precheckBody).toMatch(/expires_at_ms\s*>\s*v_now_ms/i);
+    expect(precheckBody).toMatch(/retry_after\s*:=\s*CASE/i);
+  });
+
+  it('documents acquire replay rejection and release idempotency', () => {
+    const acquireBody = readFunctionBody('cq_acquire');
+    const releaseBody = readFunctionBody('cq_release');
+    const expireBody = readFunctionBody('cq_expire_scope');
+
+    expect(acquireBody).toMatch(/request_id/i);
+    expect(acquireBody).toMatch(/hard_expire_at_ms/i);
+    expect(acquireBody).toMatch(/expires_at_ms/i);
+    expect(acquireBody).toMatch(/FOR UPDATE/i);
+    expect(acquireBody).toMatch(/state\s*=\s*'active'/i);
+    expect(acquireBody).toMatch(/tuple/i);
+    expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire request_id tuple mismatch'/i);
+    expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire request_id replay is no longer active'/i);
+    expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire hard_expire_at_ms is already in the past'/i);
+    expect(acquireBody).toMatch(/FROM\s+concurrency_host_counters[\s\S]*?FOR UPDATE/i);
+    expect(acquireBody).toMatch(/FROM\s+concurrency_site_counters[\s\S]*?FOR UPDATE/i);
+    expect(acquireBody).toMatch(/FROM\s+concurrency_site_ip_counters[\s\S]*?FOR UPDATE/i);
+    expect(acquireBody.indexOf('FROM concurrency_host_counters')).toBeLessThan(acquireBody.indexOf('FROM concurrency_site_counters'));
+    expect(acquireBody.indexOf('FROM concurrency_site_counters')).toBeLessThan(acquireBody.indexOf('FROM concurrency_site_ip_counters'));
+    expect(acquireBody).toMatch(/v_expires_at_ms\s*:=\s*p_hard_expire_at_ms/i);
+
+    expect(releaseBody).toMatch(/lease_token/i);
+    expect(releaseBody).toMatch(/state\s*=\s*'released'/i);
+    expect(releaseBody).toMatch(/released_at/i);
+    expect(releaseBody).toMatch(/FOR UPDATE/i);
+    expect(releaseBody).toMatch(/active_count\s*=\s*GREATEST\(active_count\s*-\s*1,\s*0\)/i);
+    expect(releaseBody).toMatch(/result\s*:=\s*'released'/i);
+
+    expect(expireBody).toMatch(/state\s*=\s*'expired'/i);
+    expect(expireBody).toMatch(/FOR UPDATE/i);
+    expect(expireBody).toMatch(/concurrency_host_counters/i);
+    expect(expireBody).toMatch(/concurrency_site_counters/i);
+    expect(expireBody).toMatch(/concurrency_site_ip_counters/i);
+    expect(expireBody).toMatch(/active_count\s*=\s*GREATEST\(active_count\s*-\s*v_expired_count,\s*0\)/i);
+  });
+
+  it('uses executable plpgsql lock statements for true-concurrency counters', () => {
+    const acquireBody = readFunctionBody('cq_acquire');
+    const expireBody = readFunctionBody('cq_expire_scope');
+
+    expect(acquireBody).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = v_hostname_hash\s+FOR UPDATE;/i);
+    expect(acquireBody).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_counters\s+WHERE hostname_hash = v_hostname_hash AND site_bucket = v_site_bucket\s+FOR UPDATE;/i);
+    expect(acquireBody).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_ip_counters\s+WHERE hostname_hash = v_hostname_hash AND site_bucket = v_site_bucket AND ip_bucket = v_ip_bucket\s+FOR UPDATE;/i);
+    expect(acquireBody).not.toMatch(/SELECT\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = v_hostname_hash\s+FOR UPDATE;/i);
+    expect(acquireBody).not.toMatch(/SELECT\s+1\s+FROM\s+concurrency_site_counters\s+WHERE hostname_hash = v_hostname_hash AND site_bucket = v_site_bucket\s+FOR UPDATE;/i);
+    expect(acquireBody).not.toMatch(/SELECT\s+1\s+FROM\s+concurrency_site_ip_counters\s+WHERE hostname_hash = v_hostname_hash AND site_bucket = v_site_bucket AND ip_bucket = v_ip_bucket\s+FOR UPDATE;/i);
+
+    expect(expireBody).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_host_counters[\s\S]*?FOR UPDATE;/i);
+    expect(expireBody).not.toMatch(/SELECT\s+1\s+FROM\s+concurrency_host_counters[\s\S]*?FOR UPDATE;/i);
+  });
+
+  it('serializes request_id before tuple-scoped counter locks', () => {
+    const acquireBody = readFunctionBody('cq_acquire');
+    const requestLockIndex = acquireBody.search(/pg_advisory_xact_lock\(\s*3\s*,\s*hashtext\(v_request_id\)\s*\)/i);
+    const hostLockIndex = acquireBody.search(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = v_hostname_hash\s+FOR UPDATE;/i);
+    const existingLeaseIndex = acquireBody.search(/FROM\s+concurrency_leases\s+WHERE request_id = v_request_id\s+FOR UPDATE/i);
+
+    expect(requestLockIndex).toBeGreaterThan(-1);
+    expect(hostLockIndex).toBeGreaterThan(requestLockIndex);
+    expect(existingLeaseIndex).toBeGreaterThan(requestLockIndex);
+  });
+
+  it('locks host-scope and site-scope expiry counters before lease rows', () => {
+    const expireBody = readFunctionBody('cq_expire_scope');
+    const hostBranch = expireBody.match(/IF v_scope = 'host' THEN([\s\S]*?)ELSIF v_scope = 'site' THEN/i)?.[1] ?? '';
+    const siteBranch = expireBody.match(/ELSIF v_scope = 'site' THEN([\s\S]*?)ELSE/i)?.[1] ?? '';
+
+    expect(hostBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = p_hostname_hash\s+FOR UPDATE;/i);
+    expect(hostBranch).toMatch(/SELECT DISTINCT\s+site_bucket\s+FROM\s*\(\s*SELECT\s+site_bucket,\s+ip_bucket\s+FROM\s+concurrency_leases/i);
+    expect(hostBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_counters\s+WHERE hostname_hash = p_hostname_hash\s+AND site_bucket = v_site_lock\.site_bucket\s+FOR UPDATE;/i);
+    expect(hostBranch).toMatch(/SELECT DISTINCT\s+site_bucket,\s+ip_bucket\s+FROM\s*\(\s*SELECT\s+site_bucket,\s+ip_bucket\s+FROM\s+concurrency_leases/i);
+    expect(hostBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_ip_counters\s+WHERE hostname_hash = p_hostname_hash\s+AND site_bucket = v_site_ip_lock\.site_bucket\s+AND ip_bucket = v_site_ip_lock\.ip_bucket\s+FOR UPDATE;/i);
+
+    expect(siteBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = p_hostname_hash\s+FOR UPDATE;/i);
+    expect(siteBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_counters\s+WHERE hostname_hash = p_hostname_hash\s+AND site_bucket = p_site_bucket\s+FOR UPDATE;/i);
+    expect(siteBranch).toMatch(/SELECT DISTINCT\s+ip_bucket\s+FROM\s*\(\s*SELECT\s+ip_bucket\s+FROM\s+concurrency_leases/i);
+    expect(siteBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_ip_counters\s+WHERE hostname_hash = p_hostname_hash\s+AND site_bucket = p_site_bucket\s+AND ip_bucket = v_site_ip_lock\.ip_bucket\s+FOR UPDATE;/i);
+  });
+
+  it('locks cq_release shared counters before the lease row', () => {
+    const releaseBody = readFunctionBody('cq_release');
+    const hostLockIndex = releaseBody.search(/FROM concurrency_host_counters/i);
+    const siteLockIndex = releaseBody.search(/FROM concurrency_site_counters/i);
+    const siteIpLockIndex = releaseBody.search(/FROM concurrency_site_ip_counters/i);
+    const leaseLockIndex = releaseBody.search(/FROM concurrency_leases\s+WHERE lease_id = p_lease_id\s+FOR UPDATE/i);
+
+    expect(releaseBody).toMatch(/SELECT\s+lease_id,\s*hostname_hash,\s*site_bucket,\s*ip_bucket\s+INTO\s+v_release_scope\s+FROM concurrency_leases\s+WHERE lease_id = p_lease_id;/i);
+    expect(releaseBody).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = v_release_scope\.hostname_hash\s+FOR UPDATE;/i);
+    expect(releaseBody).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_counters\s+WHERE hostname_hash = v_release_scope\.hostname_hash\s+AND site_bucket = v_release_scope\.site_bucket\s+FOR UPDATE;/i);
+    expect(releaseBody).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_ip_counters\s+WHERE hostname_hash = v_release_scope\.hostname_hash\s+AND site_bucket = v_release_scope\.site_bucket\s+AND ip_bucket = v_release_scope\.ip_bucket\s+FOR UPDATE;/i);
+    expect(releaseBody).toMatch(/SELECT\s+\*\s+INTO\s+v_locked_lease\s+FROM concurrency_leases\s+WHERE lease_id = p_lease_id\s+FOR UPDATE;/i);
+
+    expect(hostLockIndex).toBeGreaterThan(-1);
+    expect(siteLockIndex).toBeGreaterThan(hostLockIndex);
+    expect(siteIpLockIndex).toBeGreaterThan(siteLockIndex);
+    expect(leaseLockIndex).toBeGreaterThan(siteIpLockIndex);
+  });
+
+  it('runs host-scope targeted expiry cleanup on the release hot path before locking the addressed lease', () => {
+    const releaseBody = readFunctionBody('cq_release');
+    const releaseScopeLookupIndex = releaseBody.search(/SELECT\s+lease_id,\s*hostname_hash,\s*site_bucket,\s*ip_bucket\s+INTO\s+v_release_scope/i);
+    const expireIndex = releaseBody.search(/PERFORM\s+cq_expire_scope\(\s*'host'\s*,\s*v_release_scope\.hostname_hash\s*,\s*NULL\s*,\s*NULL\s*,\s*v_now_ms\s*,\s*500\s*\);/i);
+    const leaseLockIndex = releaseBody.search(/FROM concurrency_leases\s+WHERE lease_id = p_lease_id\s+FOR UPDATE/i);
+
+    expect(expireIndex).toBeGreaterThan(releaseScopeLookupIndex);
+    expect(leaseLockIndex).toBeGreaterThan(expireIndex);
+  });
 });

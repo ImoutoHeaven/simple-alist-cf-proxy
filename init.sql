@@ -1449,6 +1449,724 @@ BEGIN
 END;
 $$;
 
+
+-- ========================================
+-- True Concurrency Lease And Counter RPCs
+-- ========================================
+CREATE TABLE IF NOT EXISTS concurrency_leases (
+  lease_id uuid PRIMARY KEY,
+  lease_token text NOT NULL,
+  request_id text NOT NULL,
+  hostname_hash text NOT NULL,
+  hostname text NOT NULL,
+  site_bucket text NOT NULL,
+  ip_bucket text NOT NULL,
+  hard_expire_at_ms bigint NOT NULL,
+  expires_at_ms bigint NOT NULL,
+  expires_at timestamptz NOT NULL,
+  state text NOT NULL CHECK (state IN ('active', 'released', 'expired')),
+  released_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS concurrency_leases_request_id_idx
+  ON concurrency_leases (request_id);
+
+CREATE INDEX IF NOT EXISTS concurrency_leases_scope_state_idx
+  ON concurrency_leases (hostname_hash, site_bucket, ip_bucket, state, expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS concurrency_host_counters (
+  hostname_hash text PRIMARY KEY,
+  hostname text NOT NULL,
+  active_count integer NOT NULL DEFAULT 0,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS concurrency_site_counters (
+  hostname_hash text NOT NULL,
+  site_bucket text NOT NULL,
+  active_count integer NOT NULL DEFAULT 0,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (hostname_hash, site_bucket)
+);
+
+CREATE TABLE IF NOT EXISTS concurrency_site_ip_counters (
+  hostname_hash text NOT NULL,
+  site_bucket text NOT NULL,
+  ip_bucket text NOT NULL,
+  active_count integer NOT NULL DEFAULT 0,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (hostname_hash, site_bucket, ip_bucket)
+);
+
+CREATE OR REPLACE FUNCTION cq_make_uuid(p_seed text)
+RETURNS uuid
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT (
+    substr(md5(p_seed), 1, 8) || '-' ||
+    substr(md5(p_seed), 9, 4) || '-' ||
+    substr(md5(p_seed), 13, 4) || '-' ||
+    substr(md5(p_seed), 17, 4) || '-' ||
+    substr(md5(p_seed), 21, 12)
+  )::uuid;
+$$;
+
+CREATE OR REPLACE FUNCTION cq_precheck(
+  p_hostname_hash text,
+  p_site_bucket text,
+  p_ip_bucket text,
+  p_host_max_in_flight integer DEFAULT 0,
+  p_site_max_in_flight integer DEFAULT 0,
+  p_site_ip_max_in_flight integer DEFAULT 0
+)
+RETURNS TABLE(result text, scope text, reason text, retry_after integer) AS $$
+DECLARE
+  v_now_ms bigint := (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint;
+  v_hostname_hash text := BTRIM(COALESCE(p_hostname_hash, ''));
+  v_site_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_site_bucket, '')), ''), 'unknown');
+  v_ip_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_ip_bucket, '')), ''), 'unknown');
+  v_host_count integer := 0;
+  v_site_count integer := 0;
+  v_site_ip_count integer := 0;
+  v_min_expires_at_ms bigint := NULL;
+BEGIN
+  IF v_hostname_hash = '' THEN
+    RAISE EXCEPTION 'cq_precheck hostname_hash is required';
+  END IF;
+
+  IF COALESCE(p_host_max_in_flight, 0) > 0 THEN
+    SELECT COUNT(*), MIN(l.expires_at_ms)
+      INTO v_host_count, v_min_expires_at_ms
+    FROM concurrency_leases AS l
+    WHERE l.hostname_hash = v_hostname_hash
+      AND l.state = 'active'
+      AND l.expires_at_ms > v_now_ms;
+
+    IF v_host_count >= p_host_max_in_flight THEN
+      result := 'deny';
+      scope := 'host';
+      reason := 'full';
+      retry_after := CASE
+        WHEN v_min_expires_at_ms IS NOT NULL THEN GREATEST(1, CEIL((v_min_expires_at_ms - v_now_ms) / 1000.0)::integer)
+        ELSE 1
+      END;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+  END IF;
+
+  IF COALESCE(p_site_max_in_flight, 0) > 0 THEN
+    SELECT COUNT(*), MIN(l.expires_at_ms)
+      INTO v_site_count, v_min_expires_at_ms
+    FROM concurrency_leases AS l
+    WHERE l.hostname_hash = v_hostname_hash
+      AND l.site_bucket = v_site_bucket
+      AND l.state = 'active'
+      AND l.expires_at_ms > v_now_ms;
+
+    IF v_site_count >= p_site_max_in_flight THEN
+      result := 'deny';
+      scope := 'site';
+      reason := 'full';
+      retry_after := CASE
+        WHEN v_min_expires_at_ms IS NOT NULL THEN GREATEST(1, CEIL((v_min_expires_at_ms - v_now_ms) / 1000.0)::integer)
+        ELSE 1
+      END;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+  END IF;
+
+  IF COALESCE(p_site_ip_max_in_flight, 0) > 0 THEN
+    SELECT COUNT(*), MIN(l.expires_at_ms)
+      INTO v_site_ip_count, v_min_expires_at_ms
+    FROM concurrency_leases AS l
+    WHERE l.hostname_hash = v_hostname_hash
+      AND l.site_bucket = v_site_bucket
+      AND l.ip_bucket = v_ip_bucket
+      AND l.state = 'active'
+      AND l.expires_at_ms > v_now_ms;
+
+    IF v_site_ip_count >= p_site_ip_max_in_flight THEN
+      result := 'deny';
+      scope := 'site_ip';
+      reason := 'full';
+      retry_after := CASE
+        WHEN v_min_expires_at_ms IS NOT NULL THEN GREATEST(1, CEIL((v_min_expires_at_ms - v_now_ms) / 1000.0)::integer)
+        ELSE 1
+      END;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+  END IF;
+
+  result := 'allow';
+  scope := NULL;
+  reason := NULL;
+  retry_after := NULL;
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_expire_scope(
+  p_scope text,
+  p_hostname_hash text,
+  p_site_bucket text DEFAULT NULL,
+  p_ip_bucket text DEFAULT NULL,
+  p_now_ms bigint DEFAULT NULL,
+  p_limit integer DEFAULT 500
+)
+RETURNS integer AS $$
+DECLARE
+  v_scope text := LOWER(BTRIM(COALESCE(p_scope, '')));
+  v_now_ms bigint := (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint;
+  v_limit integer := GREATEST(COALESCE(p_limit, 500), 0);
+  v_expired_count integer := 0;
+  v_row record;
+  v_site_lock record;
+  v_site_ip_lock record;
+BEGIN
+  IF p_hostname_hash IS NULL OR BTRIM(p_hostname_hash) = '' OR v_limit = 0 THEN
+    RETURN 0;
+  END IF;
+
+  IF v_scope NOT IN ('host', 'site', 'site_ip') THEN
+    RAISE EXCEPTION 'cq_expire_scope invalid scope: %', p_scope;
+  END IF;
+
+  IF v_scope IN ('site', 'site_ip') AND (p_site_bucket IS NULL OR BTRIM(p_site_bucket) = '') THEN
+    RETURN 0;
+  END IF;
+
+  IF v_scope = 'site_ip' AND (p_ip_bucket IS NULL OR BTRIM(p_ip_bucket) = '') THEN
+    RETURN 0;
+  END IF;
+
+  IF v_scope = 'host' THEN
+    PERFORM 1
+      FROM concurrency_host_counters
+      WHERE hostname_hash = p_hostname_hash
+      FOR UPDATE;
+
+    FOR v_site_lock IN
+      SELECT DISTINCT site_bucket
+      FROM (
+        SELECT site_bucket, ip_bucket
+        FROM concurrency_leases AS l
+        WHERE l.state = 'active'
+          AND l.hostname_hash = p_hostname_hash
+          AND l.expires_at_ms <= v_now_ms
+        ORDER BY l.expires_at_ms, l.lease_id
+        LIMIT v_limit
+      ) AS host_site_rows
+      ORDER BY site_bucket
+    LOOP
+      PERFORM 1
+        FROM concurrency_site_counters
+        WHERE hostname_hash = p_hostname_hash
+          AND site_bucket = v_site_lock.site_bucket
+        FOR UPDATE;
+    END LOOP;
+
+    FOR v_site_ip_lock IN
+      SELECT DISTINCT site_bucket, ip_bucket
+      FROM (
+        SELECT site_bucket, ip_bucket
+        FROM concurrency_leases AS l
+        WHERE l.state = 'active'
+          AND l.hostname_hash = p_hostname_hash
+          AND l.expires_at_ms <= v_now_ms
+        ORDER BY l.expires_at_ms, l.lease_id
+        LIMIT v_limit
+      ) AS host_site_ip_rows
+      ORDER BY site_bucket, ip_bucket
+    LOOP
+      PERFORM 1
+        FROM concurrency_site_ip_counters
+        WHERE hostname_hash = p_hostname_hash
+          AND site_bucket = v_site_ip_lock.site_bucket
+          AND ip_bucket = v_site_ip_lock.ip_bucket
+        FOR UPDATE;
+    END LOOP;
+  ELSIF v_scope = 'site' THEN
+    PERFORM 1
+      FROM concurrency_host_counters
+      WHERE hostname_hash = p_hostname_hash
+      FOR UPDATE;
+    PERFORM 1
+      FROM concurrency_site_counters
+      WHERE hostname_hash = p_hostname_hash
+        AND site_bucket = p_site_bucket
+      FOR UPDATE;
+
+    FOR v_site_ip_lock IN
+      SELECT DISTINCT ip_bucket
+      FROM (
+        SELECT ip_bucket
+        FROM concurrency_leases AS l
+        WHERE l.state = 'active'
+          AND l.hostname_hash = p_hostname_hash
+          AND l.site_bucket = p_site_bucket
+          AND l.expires_at_ms <= v_now_ms
+        ORDER BY l.expires_at_ms, l.lease_id
+        LIMIT v_limit
+      ) AS site_ip_rows
+      ORDER BY ip_bucket
+    LOOP
+      PERFORM 1
+        FROM concurrency_site_ip_counters
+        WHERE hostname_hash = p_hostname_hash
+          AND site_bucket = p_site_bucket
+          AND ip_bucket = v_site_ip_lock.ip_bucket
+        FOR UPDATE;
+    END LOOP;
+  ELSE
+    PERFORM 1
+      FROM concurrency_host_counters
+      WHERE hostname_hash = p_hostname_hash
+      FOR UPDATE;
+    PERFORM 1
+      FROM concurrency_site_counters
+      WHERE hostname_hash = p_hostname_hash
+        AND site_bucket = p_site_bucket
+      FOR UPDATE;
+    PERFORM 1
+      FROM concurrency_site_ip_counters
+      WHERE hostname_hash = p_hostname_hash
+        AND site_bucket = p_site_bucket
+        AND ip_bucket = p_ip_bucket
+      FOR UPDATE;
+  END IF;
+
+  FOR v_row IN
+    WITH expired_rows AS (
+      SELECT l.lease_id, l.site_bucket, l.ip_bucket
+      FROM concurrency_leases AS l
+      WHERE l.state = 'active'
+        AND l.hostname_hash = p_hostname_hash
+        AND l.expires_at_ms <= v_now_ms
+        AND (
+          v_scope = 'host'
+          OR (v_scope = 'site' AND l.site_bucket = p_site_bucket)
+          OR (v_scope = 'site_ip' AND l.site_bucket = p_site_bucket AND l.ip_bucket = p_ip_bucket)
+        )
+      ORDER BY l.expires_at_ms, l.lease_id
+      LIMIT v_limit
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE concurrency_leases AS l
+    SET state = 'expired',
+        released_at = COALESCE(released_at, to_timestamp(v_now_ms / 1000.0)),
+        updated_at = now()
+    FROM expired_rows
+    WHERE l.lease_id = expired_rows.lease_id
+    RETURNING expired_rows.site_bucket, expired_rows.ip_bucket
+  LOOP
+    v_expired_count := v_expired_count + 1;
+
+    UPDATE concurrency_site_counters
+    SET active_count = GREATEST(active_count - 1, 0),
+        updated_at = now()
+    WHERE hostname_hash = p_hostname_hash
+      AND site_bucket = v_row.site_bucket;
+
+    UPDATE concurrency_site_ip_counters
+    SET active_count = GREATEST(active_count - 1, 0),
+        updated_at = now()
+    WHERE hostname_hash = p_hostname_hash
+      AND site_bucket = v_row.site_bucket
+      AND ip_bucket = v_row.ip_bucket;
+  END LOOP;
+
+  IF v_expired_count > 0 THEN
+    UPDATE concurrency_host_counters
+    SET active_count = GREATEST(active_count - v_expired_count, 0),
+        updated_at = now()
+    WHERE hostname_hash = p_hostname_hash;
+  END IF;
+
+  RETURN v_expired_count;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_release(
+  p_lease_id uuid,
+  p_lease_token text,
+  p_reason text,
+  p_now_ms bigint DEFAULT NULL
+)
+RETURNS TABLE(result text, reason text) AS $$
+DECLARE
+  v_now_ms bigint := (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint;
+  v_release_scope record;
+  v_locked_lease record;
+  v_release_scope_row_count bigint := 0;
+  v_locked_lease_row_count bigint := 0;
+BEGIN
+  IF p_lease_id IS NULL THEN
+    result := 'noop';
+    reason := 'not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  SELECT lease_id, hostname_hash, site_bucket, ip_bucket
+    INTO v_release_scope
+  FROM concurrency_leases
+  WHERE lease_id = p_lease_id;
+
+  GET DIAGNOSTICS v_release_scope_row_count = ROW_COUNT;
+
+  IF v_release_scope_row_count = 0 THEN
+    result := 'noop';
+    reason := 'not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  PERFORM cq_expire_scope('host', v_release_scope.hostname_hash, NULL, NULL, v_now_ms, 500);
+
+  PERFORM 1
+  FROM concurrency_host_counters
+  WHERE hostname_hash = v_release_scope.hostname_hash
+  FOR UPDATE;
+
+  PERFORM 1
+  FROM concurrency_site_counters
+  WHERE hostname_hash = v_release_scope.hostname_hash
+    AND site_bucket = v_release_scope.site_bucket
+  FOR UPDATE;
+
+  PERFORM 1
+  FROM concurrency_site_ip_counters
+  WHERE hostname_hash = v_release_scope.hostname_hash
+    AND site_bucket = v_release_scope.site_bucket
+    AND ip_bucket = v_release_scope.ip_bucket
+  FOR UPDATE;
+
+  SELECT *
+    INTO v_locked_lease
+  FROM concurrency_leases
+  WHERE lease_id = p_lease_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_locked_lease_row_count = ROW_COUNT;
+
+  IF v_locked_lease_row_count = 0 THEN
+    result := 'noop';
+    reason := 'not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_locked_lease.lease_token IS DISTINCT FROM p_lease_token THEN
+    result := 'noop';
+    reason := 'token_mismatch';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_locked_lease.state = 'released' THEN
+    result := 'noop';
+    reason := 'already_released';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_locked_lease.state = 'expired' THEN
+    result := 'noop';
+    reason := 'expired';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_locked_lease.state <> 'active' THEN
+    result := 'noop';
+    reason := 'not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  UPDATE concurrency_leases
+  SET state = 'released',
+      released_at = COALESCE(released_at, to_timestamp(v_now_ms / 1000.0)),
+      updated_at = now()
+  WHERE lease_id = p_lease_id;
+
+  UPDATE concurrency_host_counters
+  SET active_count = GREATEST(active_count - 1, 0),
+      updated_at = now()
+  WHERE hostname_hash = v_locked_lease.hostname_hash;
+
+  UPDATE concurrency_site_counters
+  SET active_count = GREATEST(active_count - 1, 0),
+      updated_at = now()
+  WHERE hostname_hash = v_locked_lease.hostname_hash
+    AND site_bucket = v_locked_lease.site_bucket;
+
+  UPDATE concurrency_site_ip_counters
+  SET active_count = GREATEST(active_count - 1, 0),
+      updated_at = now()
+  WHERE hostname_hash = v_locked_lease.hostname_hash
+    AND site_bucket = v_locked_lease.site_bucket
+    AND ip_bucket = v_locked_lease.ip_bucket;
+
+  result := 'released';
+  reason := NULL;
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_acquire(
+  p_hostname_hash text,
+  p_hostname text,
+  p_site_bucket text,
+  p_ip_bucket text,
+  p_request_id text,
+  p_hard_expire_at_ms bigint,
+  p_now_ms bigint,
+  p_host_max_in_flight integer DEFAULT 0,
+  p_site_max_in_flight integer DEFAULT 0,
+  p_site_ip_max_in_flight integer DEFAULT 0,
+  p_cleanup_limit integer DEFAULT 500
+)
+RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, scope text, reason text, retry_after integer) AS $$
+DECLARE
+  v_now_ms bigint := (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint;
+  v_site_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_site_bucket, '')), ''), 'unknown');
+  v_ip_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_ip_bucket, '')), ''), 'unknown');
+  v_hostname_hash text := BTRIM(COALESCE(p_hostname_hash, ''));
+  v_hostname text := COALESCE(NULLIF(BTRIM(COALESCE(p_hostname, '')), ''), v_hostname_hash);
+  v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_existing record;
+  v_lease_seed text;
+  v_lease_token text;
+  v_lease_id uuid;
+  v_retry_after integer := 1;
+  v_expires_at_ms bigint;
+  v_host_count integer := 0;
+  v_site_count integer := 0;
+  v_site_ip_count integer := 0;
+  v_min_expires_at_ms bigint := NULL;
+  v_existing_row_count bigint := 0;
+BEGIN
+  IF v_request_id = '' THEN
+    RAISE EXCEPTION 'cq_acquire request_id is required';
+  END IF;
+
+  IF v_hostname_hash = '' THEN
+    RAISE EXCEPTION 'cq_acquire hostname_hash is required';
+  END IF;
+
+  IF p_hard_expire_at_ms IS NULL OR p_hard_expire_at_ms <= v_now_ms THEN
+    RAISE EXCEPTION 'cq_acquire hard_expire_at_ms is already in the past';
+  END IF;
+
+  v_expires_at_ms := p_hard_expire_at_ms;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+
+  PERFORM cq_expire_scope('host', v_hostname_hash, NULL, NULL, v_now_ms, GREATEST(COALESCE(p_cleanup_limit, 500), 1));
+
+  INSERT INTO concurrency_host_counters (hostname_hash, hostname, active_count)
+  VALUES (v_hostname_hash, v_hostname, 0)
+  ON CONFLICT (hostname_hash) DO UPDATE SET hostname = EXCLUDED.hostname;
+
+  INSERT INTO concurrency_site_counters (hostname_hash, site_bucket, active_count)
+  VALUES (v_hostname_hash, v_site_bucket, 0)
+  ON CONFLICT (hostname_hash, site_bucket) DO NOTHING;
+
+  INSERT INTO concurrency_site_ip_counters (hostname_hash, site_bucket, ip_bucket, active_count)
+  VALUES (v_hostname_hash, v_site_bucket, v_ip_bucket, 0)
+  ON CONFLICT (hostname_hash, site_bucket, ip_bucket) DO NOTHING;
+
+  PERFORM 1 FROM concurrency_host_counters WHERE hostname_hash = v_hostname_hash FOR UPDATE;
+  PERFORM 1 FROM concurrency_site_counters WHERE hostname_hash = v_hostname_hash AND site_bucket = v_site_bucket FOR UPDATE;
+  PERFORM 1 FROM concurrency_site_ip_counters WHERE hostname_hash = v_hostname_hash AND site_bucket = v_site_bucket AND ip_bucket = v_ip_bucket FOR UPDATE;
+
+  SELECT *
+    INTO v_existing
+  FROM concurrency_leases
+  WHERE request_id = v_request_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_existing_row_count = ROW_COUNT;
+
+  IF v_existing_row_count > 0 THEN
+    IF v_existing.hostname_hash IS DISTINCT FROM v_hostname_hash
+      OR v_existing.site_bucket IS DISTINCT FROM v_site_bucket
+      OR v_existing.ip_bucket IS DISTINCT FROM v_ip_bucket
+      OR v_existing.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms THEN
+      RAISE EXCEPTION 'cq_acquire request_id tuple mismatch';
+    END IF;
+
+    IF v_existing.state = 'active' THEN
+      result := 'granted';
+      lease_id := v_existing.lease_id;
+      lease_token := v_existing.lease_token;
+      expires_at_ms := v_existing.expires_at_ms;
+      scope := NULL;
+      reason := NULL;
+      retry_after := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    RAISE EXCEPTION 'cq_acquire request_id replay is no longer active';
+  END IF;
+
+  SELECT active_count
+    INTO v_host_count
+  FROM concurrency_host_counters
+  WHERE hostname_hash = v_hostname_hash;
+
+  IF COALESCE(p_host_max_in_flight, 0) > 0 AND v_host_count >= p_host_max_in_flight THEN
+    SELECT MIN(l.expires_at_ms)
+      INTO v_min_expires_at_ms
+    FROM concurrency_leases AS l
+    WHERE l.hostname_hash = v_hostname_hash
+      AND l.state = 'active';
+
+    result := 'deny';
+    lease_id := NULL;
+    lease_token := NULL;
+    expires_at_ms := NULL;
+    scope := 'host';
+    reason := 'full';
+    retry_after := CASE
+      WHEN v_min_expires_at_ms IS NOT NULL AND v_min_expires_at_ms > v_now_ms THEN GREATEST(1, CEIL((v_min_expires_at_ms - v_now_ms) / 1000.0)::integer)
+      ELSE v_retry_after
+    END;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  SELECT active_count
+    INTO v_site_count
+  FROM concurrency_site_counters
+  WHERE hostname_hash = v_hostname_hash
+    AND site_bucket = v_site_bucket;
+
+  IF COALESCE(p_site_max_in_flight, 0) > 0 AND v_site_count >= p_site_max_in_flight THEN
+    SELECT MIN(l.expires_at_ms)
+      INTO v_min_expires_at_ms
+    FROM concurrency_leases AS l
+    WHERE l.hostname_hash = v_hostname_hash
+      AND l.site_bucket = v_site_bucket
+      AND l.state = 'active';
+
+    result := 'deny';
+    lease_id := NULL;
+    lease_token := NULL;
+    expires_at_ms := NULL;
+    scope := 'site';
+    reason := 'full';
+    retry_after := CASE
+      WHEN v_min_expires_at_ms IS NOT NULL AND v_min_expires_at_ms > v_now_ms THEN GREATEST(1, CEIL((v_min_expires_at_ms - v_now_ms) / 1000.0)::integer)
+      ELSE v_retry_after
+    END;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  SELECT active_count
+    INTO v_site_ip_count
+  FROM concurrency_site_ip_counters
+  WHERE hostname_hash = v_hostname_hash
+    AND site_bucket = v_site_bucket
+    AND ip_bucket = v_ip_bucket;
+
+  IF COALESCE(p_site_ip_max_in_flight, 0) > 0 AND v_site_ip_count >= p_site_ip_max_in_flight THEN
+    SELECT MIN(l.expires_at_ms)
+      INTO v_min_expires_at_ms
+    FROM concurrency_leases AS l
+    WHERE l.hostname_hash = v_hostname_hash
+      AND l.site_bucket = v_site_bucket
+      AND l.ip_bucket = v_ip_bucket
+      AND l.state = 'active';
+
+    result := 'deny';
+    lease_id := NULL;
+    lease_token := NULL;
+    expires_at_ms := NULL;
+    scope := 'site_ip';
+    reason := 'full';
+    retry_after := CASE
+      WHEN v_min_expires_at_ms IS NOT NULL AND v_min_expires_at_ms > v_now_ms THEN GREATEST(1, CEIL((v_min_expires_at_ms - v_now_ms) / 1000.0)::integer)
+      ELSE v_retry_after
+    END;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  v_lease_seed := v_request_id || '|' || v_hostname_hash || '|' || v_site_bucket || '|' || v_ip_bucket || '|' || p_hard_expire_at_ms::text;
+  v_lease_token := md5(v_lease_seed || '|token');
+  v_lease_id := cq_make_uuid(v_lease_seed || '|lease_id');
+
+  INSERT INTO concurrency_leases (
+    lease_id,
+    lease_token,
+    request_id,
+    hostname_hash,
+    hostname,
+    site_bucket,
+    ip_bucket,
+    hard_expire_at_ms,
+    expires_at_ms,
+    expires_at,
+    state,
+    released_at,
+    created_at,
+    updated_at
+  ) VALUES (
+    v_lease_id,
+    v_lease_token,
+    v_request_id,
+    v_hostname_hash,
+    v_hostname,
+    v_site_bucket,
+    v_ip_bucket,
+    p_hard_expire_at_ms,
+    v_expires_at_ms,
+    to_timestamp(v_expires_at_ms / 1000.0),
+    'active',
+    NULL,
+    now(),
+    now()
+  );
+
+  UPDATE concurrency_host_counters
+  SET active_count = active_count + 1,
+      updated_at = now()
+  WHERE hostname_hash = v_hostname_hash;
+
+  UPDATE concurrency_site_counters
+  SET active_count = active_count + 1,
+      updated_at = now()
+  WHERE hostname_hash = v_hostname_hash
+    AND site_bucket = v_site_bucket;
+
+  UPDATE concurrency_site_ip_counters
+  SET active_count = active_count + 1,
+      updated_at = now()
+  WHERE hostname_hash = v_hostname_hash
+    AND site_bucket = v_site_bucket
+    AND ip_bucket = v_ip_bucket;
+
+  result := 'granted';
+  lease_id := v_lease_id;
+  lease_token := v_lease_token;
+  expires_at_ms := v_expires_at_ms;
+  scope := NULL;
+  reason := NULL;
+  retry_after := NULL;
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION func_try_acquire_site_slot(
   p_hostname_pattern           TEXT,
   p_site_bucket                TEXT,

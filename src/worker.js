@@ -21,6 +21,11 @@ const DEFAULT_RATE_LIMIT_IPV6_SUFFIX = '/60';
 const DEFAULT_SLOT_HANDLER_TIMEOUT_MS = 20000;
 const DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = 8000;
 const DEFAULT_SLOT_HANDLER_RELEASE_TIMEOUT_MS = 1500;
+const DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER = 'X-CQ-Auth';
+const DEFAULT_TRUE_CONCURRENCY_PRECHECK_TIMEOUT_MS = 1200;
+const DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS = 2000;
+const DEFAULT_TRUE_CONCURRENCY_RELEASE_TIMEOUT_MS = 1500;
+const TRUE_CONCURRENCY_RELEASE_RETRY_DELAYS_MS = [0, 2000, 4000, 8000];
 const FINAL_CLEANUP_RELEASE_CONCURRENCY = 2;
 const DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS = 35;
 const DEFAULT_THROTTLE_OPEN_CAP_SECONDS = 60;
@@ -1090,6 +1095,51 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     fairQueueSiteBucket,
   };
 
+  const trueConcurrencyConfigRaw = downloadBootstrap.trueConcurrency && typeof downloadBootstrap.trueConcurrency === 'object'
+    ? downloadBootstrap.trueConcurrency
+    : {};
+  const trueConcurrencyHostnamePatterns = Array.isArray(trueConcurrencyConfigRaw.hostPatterns)
+    ? trueConcurrencyConfigRaw.hostPatterns.map((p) => normalizeString(p)).filter((p) => p.length > 0)
+    : [];
+  if (Boolean(trueConcurrencyConfigRaw.enabled) && trueConcurrencyHostnamePatterns.length === 0) {
+    throw new Error('controller trueConcurrency.hostPatterns is required when trueConcurrency.enabled is true');
+  }
+  const trueConcurrencyEnabled = Boolean(trueConcurrencyConfigRaw.enabled) && trueConcurrencyHostnamePatterns.length > 0;
+  const concurrencyHandlerUrl = normalizeString(trueConcurrencyConfigRaw.handlerUrl);
+  const concurrencyHandlerAuthKey = normalizeString(trueConcurrencyConfigRaw.handlerAuthKey);
+  const concurrencyHandlerAuthHeader = normalizeString(trueConcurrencyConfigRaw.handlerAuthHeader)
+    || DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER;
+  if (trueConcurrencyEnabled && !concurrencyHandlerUrl) {
+    throw new Error('controller trueConcurrency.handlerUrl is required when trueConcurrency.enabled is true');
+  }
+  if (trueConcurrencyEnabled && !concurrencyHandlerAuthKey) {
+    throw new Error('controller trueConcurrency.handlerAuthKey is required when trueConcurrency.enabled is true');
+  }
+  const trueConcurrencySiteBucketRaw = trueConcurrencyConfigRaw.siteBucket && typeof trueConcurrencyConfigRaw.siteBucket === 'object'
+    ? trueConcurrencyConfigRaw.siteBucket
+    : {};
+  const trueConcurrencySiteBucketMode = normalizeString(trueConcurrencySiteBucketRaw.mode, 'sharepoint').toLowerCase();
+  if (trueConcurrencySiteBucketMode !== 'sharepoint') {
+    throw new Error('controller trueConcurrency.siteBucket.mode must be "sharepoint" in V1');
+  }
+  const concurrencyHandlerConfig = {
+    url: concurrencyHandlerUrl,
+    authKey: concurrencyHandlerAuthKey,
+    authHeader: concurrencyHandlerAuthHeader,
+    precheckTimeoutMs: normalizePositiveMs(
+      trueConcurrencyConfigRaw.precheckTimeoutMs,
+      DEFAULT_TRUE_CONCURRENCY_PRECHECK_TIMEOUT_MS,
+    ),
+    acquireTimeoutMs: normalizePositiveMs(
+      trueConcurrencyConfigRaw.acquireTimeoutMs,
+      DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS,
+    ),
+    releaseTimeoutMs: normalizePositiveMs(
+      trueConcurrencyConfigRaw.releaseTimeoutMs,
+      DEFAULT_TRUE_CONCURRENCY_RELEASE_TIMEOUT_MS,
+    ),
+  };
+
   const enableCfRatelimiter = normalizeString(env.ENABLE_CF_RATELIMITER, 'false').toLowerCase() === 'true';
   const cfRatelimiterBinding = normalizeString(env.CF_RATELIMITER_BINDING, 'CF_RATE_LIMITER');
 
@@ -1141,6 +1191,10 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     fairQueueEnabled: fairQueueContext.fairQueueEnabled,
     fairQueueHostnamePatterns: fairQueueContext.fairQueueHostnamePatterns,
     fairQueueSiteBucket: fairQueueContext.fairQueueSiteBucket,
+    trueConcurrencyEnabled,
+    trueConcurrencyHostnamePatterns,
+    trueConcurrencySiteBucket: { mode: trueConcurrencySiteBucketMode },
+    concurrencyHandlerConfig,
   };
 };
 
@@ -1486,6 +1540,320 @@ const normalizePostgrestBaseUrl = (url) => {
   return url.endsWith('/') ? url.slice(0, -1) : url;
 };
 
+const TRUE_CONCURRENCY_PRECHECK_RESULTS = new Set(['allow', 'deny']);
+const TRUE_CONCURRENCY_ACQUIRE_RESULTS = new Set(['granted', 'deny']);
+const TRUE_CONCURRENCY_RELEASE_RESULTS = new Set(['released', 'noop']);
+const TRUE_CONCURRENCY_DENY_SCOPES = new Set(['host', 'site', 'site_ip']);
+const TRUE_CONCURRENCY_DENY_REASONS = new Set(['full']);
+const TRUE_CONCURRENCY_RELEASE_NOOP_REASONS = new Set([
+  'already_released',
+  'expired',
+  'not_found',
+  'token_mismatch',
+]);
+
+const normalizeTrueConcurrencyResult = (operation, data, options = {}) => {
+  const result = typeof data?.result === 'string' ? data.result : '';
+  const allowedResults = options.allowedResults instanceof Set ? options.allowedResults : null;
+
+  if (!result || (allowedResults && !allowedResults.has(result))) {
+    throw new Error(`[CQ] ${operation} returned malformed success result: ${result || 'unknown'}`);
+  }
+
+  if (result === 'allow') {
+    return { result: 'allow' };
+  }
+
+  if (result === 'deny') {
+    if (typeof data?.scope !== 'string' || !data.scope) {
+      throw new Error(`[CQ] ${operation} deny response missing scope`);
+    }
+    if (!TRUE_CONCURRENCY_DENY_SCOPES.has(data.scope)) {
+      throw new Error(`[CQ] ${operation} deny response has unsupported scope`);
+    }
+    if (typeof data?.reason !== 'string' || !data.reason) {
+      throw new Error(`[CQ] ${operation} deny response missing reason`);
+    }
+    if (!TRUE_CONCURRENCY_DENY_REASONS.has(data.reason)) {
+      throw new Error(`[CQ] ${operation} deny response has unsupported reason`);
+    }
+    const retryAfter = Number(data?.retryAfter);
+    if (!Number.isFinite(retryAfter) || retryAfter <= 0) {
+      throw new Error(`[CQ] ${operation} deny response missing retryAfter`);
+    }
+    return {
+      result: 'deny',
+      scope: data.scope,
+      reason: data.reason,
+      retryAfter,
+    };
+  }
+
+  if (result === 'granted') {
+    if (typeof data?.leaseId !== 'string' || !data.leaseId) {
+      throw new Error('[CQ] acquire granted response missing leaseId');
+    }
+    if (typeof data?.leaseToken !== 'string' || !data.leaseToken) {
+      throw new Error('[CQ] acquire granted response missing leaseToken');
+    }
+    const expiresAtMs = Number(data?.expiresAtMs);
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= 0) {
+      throw new Error('[CQ] acquire granted response missing expiresAtMs');
+    }
+    if (Number.isFinite(options.hardExpireAtMs) && expiresAtMs > options.hardExpireAtMs) {
+      throw new Error('[CQ] acquire granted response exceeds hardExpireAtMs');
+    }
+    return {
+      result: 'granted',
+      leaseId: data.leaseId,
+      leaseToken: data.leaseToken,
+      expiresAtMs,
+    };
+  }
+
+  if (result === 'released') {
+    return { result: 'released' };
+  }
+
+  if (result === 'noop') {
+    if (typeof data?.reason !== 'string' || !data.reason) {
+      throw new Error('[CQ] release noop response missing reason');
+    }
+    if (!TRUE_CONCURRENCY_RELEASE_NOOP_REASONS.has(data.reason)) {
+      throw new Error('[CQ] release noop response has unsupported reason');
+    }
+    return {
+      result: 'noop',
+      reason: data.reason,
+    };
+  }
+
+  throw new Error(`[CQ] ${operation} returned unsupported result: ${result || 'unknown'}`);
+};
+
+const createConcurrencyHandlerClient = (config) => {
+  const handlerCfg = config.concurrencyHandlerConfig || {};
+  const baseUrl = normalizePostgrestBaseUrl(handlerCfg.url);
+  if (!baseUrl) {
+    throw new Error('[CQ] concurrency-handler enabled but handler URL is missing');
+  }
+
+  const authKey = normalizeStringValue(handlerCfg.authKey);
+  const authHeader = normalizeStringValue(handlerCfg.authHeader, DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER);
+  const precheckUrl = `${baseUrl}/api/v1/concurrency/precheck`;
+  const acquireUrl = `${baseUrl}/api/v1/concurrency/acquire`;
+  const releaseUrl = `${baseUrl}/api/v1/concurrency/release`;
+  const precheckTimeoutMs = normalizePositiveMs(
+    handlerCfg.precheckTimeoutMs,
+    DEFAULT_TRUE_CONCURRENCY_PRECHECK_TIMEOUT_MS,
+  );
+  const acquireTimeoutMs = normalizePositiveMs(
+    handlerCfg.acquireTimeoutMs,
+    DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS,
+  );
+  const releaseTimeoutMs = normalizePositiveMs(
+    handlerCfg.releaseTimeoutMs,
+    DEFAULT_TRUE_CONCURRENCY_RELEASE_TIMEOUT_MS,
+  );
+
+  const buildHeaders = () => {
+    const headers = { 'Content-Type': 'application/json' };
+    if (authKey) {
+      headers[authHeader] = authKey;
+    }
+    return headers;
+  };
+
+  const postJson = async (url, payload, timeoutMs, signal) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const abortHandler = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) {
+        controller.abort();
+      } else {
+        signal.addEventListener('abort', abortHandler, { once: true });
+      }
+    }
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: buildHeaders(),
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`[CQ] handler request failed with status ${response.status}`);
+      }
+
+      let data;
+      try {
+        data = await response.json();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`[CQ] handler response parse failed: ${message}`);
+      }
+      return data;
+    } finally {
+      clearTimeout(timer);
+      if (signal) {
+        signal.removeEventListener('abort', abortHandler);
+      }
+    }
+  };
+
+  return {
+    async precheck(_ctx, plan, signal) {
+      const data = await postJson(precheckUrl, {
+        hostname: plan.hostname,
+        hostnameHash: plan.hostnameHash,
+        siteBucket: plan.siteBucket,
+        ipBucket: plan.ipBucket,
+        nowMs: plan.nowMs,
+      }, precheckTimeoutMs, signal);
+      return normalizeTrueConcurrencyResult('precheck', data, {
+        allowedResults: TRUE_CONCURRENCY_PRECHECK_RESULTS,
+      });
+    },
+
+    async acquire(_ctx, plan, signal) {
+      const data = await postJson(acquireUrl, {
+        hostname: plan.hostname,
+        hostnameHash: plan.hostnameHash,
+        siteBucket: plan.siteBucket,
+        ipBucket: plan.ipBucket,
+        requestId: plan.requestId,
+        hardExpireAtMs: plan.hardExpireAtMs,
+        nowMs: plan.nowMs,
+      }, acquireTimeoutMs, signal);
+      return normalizeTrueConcurrencyResult('acquire', data, {
+        allowedResults: TRUE_CONCURRENCY_ACQUIRE_RESULTS,
+        hardExpireAtMs: plan.hardExpireAtMs,
+      });
+    },
+
+    async release(_ctx, lease, reason, signal) {
+      const data = await postJson(releaseUrl, {
+        leaseId: lease.leaseId,
+        leaseToken: lease.leaseToken,
+        reason,
+        nowMs: Date.now(),
+      }, releaseTimeoutMs, signal);
+      return normalizeTrueConcurrencyResult('release', data, {
+        allowedResults: TRUE_CONCURRENCY_RELEASE_RESULTS,
+      });
+    },
+  };
+};
+
+const isTrueConcurrencyManagedHostname = (config, hostname) => {
+  const hostKey = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+  return Boolean(config?.trueConcurrencyEnabled)
+    && Boolean(hostKey)
+    && Array.isArray(config?.trueConcurrencyHostnamePatterns)
+    && config.trueConcurrencyHostnamePatterns.some((pattern) => matchHostnamePattern(hostKey, pattern));
+};
+
+const createTrueConcurrencyUnavailableResponse = (origin, message = 'True concurrency unavailable') => (
+  createErrorResponse(origin, 503, message)
+);
+
+const createIdentityTransformStream = () => {
+  if (typeof IdentityTransformStream === 'function') {
+    return new IdentityTransformStream();
+  }
+  return new TransformStream();
+};
+
+const createTrueConcurrencyRequestId = () => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `cq-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+};
+
+const sleepMs = (delayMs) => new Promise((resolve) => {
+  const timer = setTimeout(resolve, delayMs);
+  if (typeof timer?.unref === 'function') {
+    timer.unref();
+  }
+});
+
+const createConcurrencyReleaseController = ({ client, ctx, lease, label }) => {
+  let settled = false;
+  let firstReason = null;
+  let immediateAttemptPromise = null;
+  let fullReleasePromise = null;
+
+  const attemptRelease = async (reason) => {
+    if (settled) {
+      return true;
+    }
+    try {
+      const result = await client.release(ctx, lease, reason);
+      if (result?.result === 'released' || result?.result === 'noop') {
+        settled = true;
+        return true;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[CQ] release failed for ${label}:`, message);
+    }
+    return false;
+  };
+
+  const ensureImmediateAttempt = async () => {
+    if (!immediateAttemptPromise) {
+      immediateAttemptPromise = attemptRelease(firstReason);
+    }
+    return immediateAttemptPromise;
+  };
+
+  return {
+    isSettled() {
+      return settled;
+    },
+
+    async releaseImmediately(reason) {
+      if (!firstReason) {
+        firstReason = reason;
+      }
+      const released = await ensureImmediateAttempt();
+      if (!released) {
+        this.ensureReleased(firstReason);
+      }
+      return released;
+    },
+
+    ensureReleased(reason) {
+      if (!firstReason) {
+        firstReason = reason;
+      }
+      if (!fullReleasePromise) {
+        fullReleasePromise = (async () => {
+          if (await ensureImmediateAttempt()) {
+            return true;
+          }
+
+          for (const delayMs of TRUE_CONCURRENCY_RELEASE_RETRY_DELAYS_MS.slice(1)) {
+            await sleepMs(delayMs);
+            if (await attemptRelease(firstReason)) {
+              return true;
+            }
+          }
+
+          return false;
+        })();
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil(fullReleasePromise);
+        }
+      }
+      return fullReleasePromise;
+    },
+  };
+};
+
 const readFairQueueInvocationEpoch = (value) => {
   const epoch = Number(value);
   if (!Number.isInteger(epoch) || epoch <= 0) {
@@ -1559,8 +1927,10 @@ const clearReleasedFairQueueMetadata = (fqContext) => {
   }
 
   clearFairQueueOwnershipMetadata(fqContext);
-  fqContext.attemptVersion = null;
-  fqContext.attemptTicket = null;
+  if (!fqContext.deferredReportArmed) {
+    fqContext.attemptVersion = null;
+    fqContext.attemptTicket = null;
+  }
 };
 
 const clearAbandonedFairQueueMetadata = (fqContext) => {
@@ -1629,6 +1999,7 @@ const reconcileFairQueueContextForTarget = async ({
   pendingCleanupContexts = null,
   targetHostname = null,
   targetSiteBucket,
+  forceRetire = false,
 }) => {
   if (!fqContext) {
     return { retired: false, finalized: true };
@@ -1638,7 +2009,7 @@ const reconcileFairQueueContextForTarget = async ({
   const resolvedHostname = resolvedHostnameRaw ? resolvedHostnameRaw.toLowerCase() : null;
   const resolvedSiteBucket = targetSiteBucket ?? fqContext.siteBucket;
 
-  if (resolvedHostname === fqContext.hostname && resolvedSiteBucket === fqContext.siteBucket) {
+  if (!forceRetire && resolvedHostname === fqContext.hostname && resolvedSiteBucket === fqContext.siteBucket) {
     return {
       retired: false,
       finalized: true,
@@ -2328,6 +2699,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   }
 
   const payloadSignExpire = extractExpireFromSign(payloadSign);
+  if (!Number.isFinite(payloadSignExpire) || payloadSignExpire <= 0) {
+    return createUnauthorizedResponse(origin, 'payloadSign expire invalid');
+  }
   const decodedPayload = base64UrlDecodeToString(payload);
   if (!decodedPayload) {
     return createUnauthorizedResponse(origin, "payload decode failed");
@@ -2350,10 +2724,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return createUnauthorizedResponse(origin, "payload expire invalid");
   }
 
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const hardExpire = payloadSignExpire > 0 ? payloadSignExpire : Number.POSITIVE_INFINITY;
-  const effectiveExpire = Math.min(hardExpire, payloadExpireTime);
-  if (nowSeconds > effectiveExpire) {
+  const hardExpireAtMs = Math.min(payloadSignExpire, payloadExpireTime) * 1000;
+  if (!Number.isFinite(hardExpireAtMs) || hardExpireAtMs <= 0) {
+    return createUnauthorizedResponse(origin, "link expired");
+  }
+  if (Date.now() >= hardExpireAtMs) {
     return createUnauthorizedResponse(origin, "link expired");
   }
 
@@ -3109,7 +3484,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // ========================================
   // Fair Upstream Queue Integration
   // ========================================
-  const needFairQueue = admissionMode === 'queue_only' || admissionMode === 'queue_breaker';
+  const needsFairQueueForMode = (mode) => mode === 'queue_only' || mode === 'queue_breaker';
+  let needFairQueue = needsFairQueueForMode(admissionMode);
+  let needTrueConcurrency = isTrueConcurrencyManagedHostname(config, upstreamHostname);
 
   const buildFairQueueAdmissionFields = (mode) => {
     if (mode !== 'queue_breaker') {
@@ -3142,6 +3519,33 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let fqContext = null;
   const pendingFairQueueCleanupContexts = [];
   let clientIpSubnetHash = null;
+  let concurrencyClient = null;
+  let cqPlan = null;
+  let cqPlanKey = '';
+  let cqTargetUrl = '';
+  let cqLease = null;
+  let cqReleaseController = null;
+  let cqCleanupBoundToStream = false;
+
+  const ensureClientIpSubnetHash = async (label, unavailableResponse) => {
+    if (clientIpSubnetHash) {
+      return null;
+    }
+
+    const clientIpSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
+    if (!clientIpSubnet) {
+      console.error(`[${label}] Failed: unable to derive client subnet for admission enforcement`);
+      return unavailableResponse;
+    }
+
+    clientIpSubnetHash = await sha256Hash(clientIpSubnet);
+    if (!clientIpSubnetHash) {
+      console.error(`[${label}] Failed: unable to hash client subnet for admission enforcement`);
+      return unavailableResponse;
+    }
+
+    return null;
+  };
 
   const ensureFairQueueClientReady = async () => {
     if (!config.slotHandlerConfig?.url) {
@@ -3149,13 +3553,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return createErrorResponse(origin, 503, 'Fair queue misconfigured (slot-handler URL missing)');
     }
 
-    if (!clientIpSubnetHash) {
-      const clientIpSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
-      if (!clientIpSubnet) {
-        console.error('[Fair Queue] Failed: unable to derive client subnet for queue enforcement');
-        return createErrorResponse(origin, 503, 'Fair queue unavailable');
-      }
-      clientIpSubnetHash = await sha256Hash(clientIpSubnet);
+    const subnetResponse = await ensureClientIpSubnetHash('Fair Queue', createErrorResponse(origin, 503, 'Fair queue unavailable'));
+    if (subnetResponse) {
+      return subnetResponse;
     }
 
     if (!fairQueueClient) {
@@ -3169,6 +3569,99 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     return null;
+  };
+
+  const ensureConcurrencyClientReady = async () => {
+    if (!config.concurrencyHandlerConfig?.url) {
+      console.error('[CQ] enabled but concurrency-handler URL missing');
+      return createTrueConcurrencyUnavailableResponse(origin, 'True concurrency misconfigured (handler URL missing)');
+    }
+
+    const subnetResponse = await ensureClientIpSubnetHash('CQ', createTrueConcurrencyUnavailableResponse(origin));
+    if (subnetResponse) {
+      return subnetResponse;
+    }
+
+    if (!concurrencyClient) {
+      try {
+        concurrencyClient = createConcurrencyHandlerClient(config);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[CQ] Failed to initialize client:', message);
+        return createTrueConcurrencyUnavailableResponse(origin);
+      }
+    }
+
+    return null;
+  };
+
+  const buildTrueConcurrencyPlanKey = (plan) => JSON.stringify([
+    plan?.hostnameHash || '',
+    plan?.siteBucket || '',
+    plan?.ipBucket || '',
+    plan?.hardExpireAtMs || 0,
+  ]);
+
+  const buildTrueConcurrencyPlanForTarget = async (targetUrl, requestId = createTrueConcurrencyRequestId()) => {
+    const hostnameRaw = extractHostname(targetUrl);
+    const hostname = hostnameRaw ? hostnameRaw.toLowerCase() : null;
+    if (!hostname) {
+      throw new Error('[CQ] target hostname missing');
+    }
+    return {
+      hostname,
+      hostnameHash: await sha256Hash(hostname),
+      siteBucket: await deriveSiteBucket(hostname, targetUrl, config.trueConcurrencySiteBucket),
+      ipBucket: clientIpSubnetHash,
+      requestId,
+      hardExpireAtMs,
+      nowMs: Date.now(),
+    };
+  };
+
+  const createTrueConcurrencyDenyResponse = (denyResult) => {
+    const safeHeaders = new Headers();
+    safeHeaders.set('content-type', 'application/json;charset=UTF-8');
+    safeHeaders.set('Access-Control-Allow-Origin', origin);
+    safeHeaders.append('Vary', 'Origin');
+    if (denyResult?.retryAfter) {
+      safeHeaders.set('Retry-After', String(Math.max(1, Math.ceil(denyResult.retryAfter))));
+    }
+    return new Response(JSON.stringify({
+      code: 503,
+      message: 'True concurrency limit reached, please retry later',
+    }), {
+      status: 503,
+      headers: safeHeaders,
+    });
+  };
+
+  const clearCurrentTrueConcurrencyState = () => {
+    cqPlan = null;
+    cqPlanKey = '';
+    cqTargetUrl = '';
+    cqLease = null;
+    cqReleaseController = null;
+    cqCleanupBoundToStream = false;
+  };
+
+  const ensureCurrentTrueConcurrencyReleased = async (reason, immediate = false) => {
+    if (!cqReleaseController) {
+      return true;
+    }
+
+    const releaseController = cqReleaseController;
+    clearCurrentTrueConcurrencyState();
+    if (immediate) {
+      const released = await releaseController.releaseImmediately(reason);
+      if (!released) {
+        releaseController.ensureReleased(reason);
+      }
+      return released;
+    }
+
+    releaseController.ensureReleased(reason);
+    return true;
   };
 
   const createFairQueueTimeoutResponse = () => {
@@ -3231,6 +3724,60 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   };
 
+  const finalizeFairQueueOnFailure = async (phase) => {
+    if (!fqContext || !fairQueueClient) {
+      return;
+    }
+
+    const finalized = await finalizeFairQueueContext({
+      fairQueueClient,
+      ctx,
+      fqContext,
+      phase,
+    });
+    if (!finalized) {
+      pendingFairQueueCleanupContexts.push(fqContext);
+    }
+  };
+
+  const waitForInFlightFairQueueHeaderRelease = async (cleanupContext) => {
+    const inFlightRelease = cleanupContext?.headerReleasePromise;
+    if (!inFlightRelease) {
+      return null;
+    }
+    return inFlightRelease;
+  };
+
+  const releaseFairQueueAfterHeadersIfNeeded = () => {
+    if (!fqContext?.slotToken || !fairQueueClient || !needFairQueue || !needTrueConcurrency) {
+      return;
+    }
+
+    if (fqContext.headerReleasePromise) {
+      return;
+    }
+
+    const releaseContext = fqContext;
+    releaseContext.headerReleasePromise = (async () => {
+      const finalized = await finalizeFairQueueContext({
+        fairQueueClient,
+        ctx,
+        fqContext: releaseContext,
+        phase: 'upstream headers',
+      });
+      if (!finalized) {
+        console.warn(`[Fair Queue] early release after upstream headers failed for host=${releaseContext.hostname}`);
+      }
+      return finalized;
+    })().finally(() => {
+      releaseContext.headerReleasePromise = null;
+    });
+
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(releaseContext.headerReleasePromise);
+    }
+  };
+
   const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     if (!response || !fqContext || !fairQueueClient) {
       return response;
@@ -3265,14 +3812,25 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return response;
   };
 
-  const reconcileCurrentFairQueueContextForTarget = async (targetUrl, phase) => {
+  const prepareFairQueueContextForTarget = async (targetUrl, phase) => {
     const updatedHostnameRaw = extractHostname(targetUrl);
     const updatedHostname = updatedHostnameRaw ? updatedHostnameRaw.toLowerCase() : null;
     const updatedAdmissionMode = resolveAdmissionMode(config, updatedHostname);
     admissionMode = updatedAdmissionMode;
+    needFairQueue = needsFairQueueForMode(updatedAdmissionMode);
+    needTrueConcurrency = isTrueConcurrencyManagedHostname(config, updatedHostname);
+    const normalizedTargetUrl = String(targetUrl);
+    const updatedSiteBucket = needFairQueue
+      ? await deriveSiteBucket(updatedHostname, targetUrl, config.fairQueueSiteBucket)
+      : null;
+    const fairQueueIdentityChanged = !fqContext
+      || updatedHostname !== fqContext.hostname
+      || updatedSiteBucket !== fqContext.siteBucket;
+    const fairQueueTargetChanged = fairQueueIdentityChanged
+      || ((updatedAdmissionMode === 'queue_only' || needTrueConcurrency)
+        && (!fqContext || fqContext.targetUrl !== normalizedTargetUrl));
 
-    const updatedNeedsFairQueue = updatedAdmissionMode === 'queue_only' || updatedAdmissionMode === 'queue_breaker';
-    if (!updatedNeedsFairQueue) {
+    if (!needFairQueue) {
       if (fqContext) {
         const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
         if (deferredReportResponse) {
@@ -3288,13 +3846,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           pendingCleanupContexts: pendingFairQueueCleanupContexts,
           targetHostname: updatedHostname,
           targetSiteBucket: previousFairQueueContext.siteBucket,
+          forceRetire: fairQueueTargetChanged,
         });
         fqContext = null;
         if (!cleanupResult.finalized) {
           // already queued for final cleanup retry
         }
       }
-      return null;
+      return { targetHostname: updatedHostname, targetSiteBucket: null };
     }
 
     const fairQueueInitResponse = await ensureFairQueueClientReady();
@@ -3302,8 +3861,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return fairQueueInitResponse;
     }
 
-    const updatedSiteBucket = await deriveSiteBucket(updatedHostname, targetUrl, config.fairQueueSiteBucket);
-    if (fqContext && updatedHostname === fqContext.hostname && updatedSiteBucket === fqContext.siteBucket) {
+    if (!fairQueueTargetChanged && fqContext && updatedHostname === fqContext.hostname && updatedSiteBucket === fqContext.siteBucket) {
       return null;
     }
 
@@ -3322,6 +3880,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         pendingCleanupContexts: pendingFairQueueCleanupContexts,
         targetHostname: updatedHostname,
         targetSiteBucket: updatedSiteBucket,
+        forceRetire: fairQueueTargetChanged,
       });
     }
     const updatedHostnameHash = await sha256Hash(updatedHostname);
@@ -3332,31 +3891,120 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       updatedSiteBucket,
       updatedAdmissionMode,
     );
+    fqContext.targetUrl = normalizedTargetUrl;
 
-    return admitFairQueueContext(phase);
+    return {
+      targetHostname: updatedHostname,
+      targetSiteBucket: updatedSiteBucket,
+    };
   };
 
-  if (needFairQueue) {
-    const fairQueueInitResponse = await ensureFairQueueClientReady();
-    if (fairQueueInitResponse) {
-      return fairQueueInitResponse;
+  const prepareTargetForFetch = async (targetUrl, phase) => {
+    const normalizedTargetUrl = String(targetUrl);
+    const fairQueuePrepareResult = await prepareFairQueueContextForTarget(targetUrl, phase);
+    if (fairQueuePrepareResult instanceof Response) {
+      return fairQueuePrepareResult;
     }
 
-    const hostnameHash = await sha256Hash(upstreamHostname);
-    const siteBucket = await deriveSiteBucket(upstreamHostname, downloadUrl, config.fairQueueSiteBucket);
-    fqContext = buildFairQueueContext(
-      upstreamHostname,
-      hostnameHash,
-      clientIpSubnetHash,
-      siteBucket,
-      admissionMode,
-    );
+    let nextPlan = null;
+    if (needTrueConcurrency) {
+      if (Date.now() >= hardExpireAtMs) {
+        return createUnauthorizedResponse(origin, 'link expired');
+      }
 
-    const fairQueueWaitResponse = await admitFairQueueContext('initial');
-    if (fairQueueWaitResponse) {
-      return await runEarlyFairQueueCleanupAndReturn(fairQueueWaitResponse, 'initial');
+      const concurrencyInitResponse = await ensureConcurrencyClientReady();
+      if (concurrencyInitResponse) {
+        return concurrencyInitResponse;
+      }
+
+      nextPlan = await buildTrueConcurrencyPlanForTarget(targetUrl);
+      const nextPlanKey = buildTrueConcurrencyPlanKey(nextPlan);
+      const trueConcurrencyTargetChanged = cqTargetUrl !== '' && cqTargetUrl !== normalizedTargetUrl;
+
+      if (cqReleaseController && (trueConcurrencyTargetChanged || (cqPlanKey && cqPlanKey !== nextPlanKey))) {
+        await ensureCurrentTrueConcurrencyReleased('target_change', true);
+      }
+
+      if (!cqPlan || trueConcurrencyTargetChanged || cqPlanKey !== nextPlanKey) {
+        cqPlan = nextPlan;
+        cqPlanKey = nextPlanKey;
+        cqTargetUrl = normalizedTargetUrl;
+        cqLease = null;
+        cqReleaseController = null;
+        cqCleanupBoundToStream = false;
+      }
+
+      if (needFairQueue) {
+        try {
+          const precheckResult = await concurrencyClient.precheck(ctx, cqPlan, clientSignal);
+          if (precheckResult.result === 'deny') {
+            return createTrueConcurrencyDenyResponse(precheckResult);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`[CQ] advisory precheck failed during ${phase}:`, message);
+        }
+      }
+    } else if (cqReleaseController) {
+      await ensureCurrentTrueConcurrencyReleased('target_change', true);
     }
-  }
+
+    if (needFairQueue && fqContext && !fqContext.slotToken) {
+      const fairQueueWaitResponse = await admitFairQueueContext(phase);
+      if (fairQueueWaitResponse) {
+        return await runEarlyFairQueueCleanupAndReturn(fairQueueWaitResponse, phase);
+      }
+    }
+
+    if (needTrueConcurrency && !cqLease && cqPlan) {
+      if (Date.now() >= cqPlan.hardExpireAtMs) {
+        if (needFairQueue) {
+          await finalizeFairQueueOnFailure(`${phase} expired before concurrency acquire`);
+        }
+        return createUnauthorizedResponse(origin, 'link expired');
+      }
+      try {
+        cqPlan.nowMs = Date.now();
+        const acquireResult = await concurrencyClient.acquire(ctx, cqPlan, clientSignal);
+        if (acquireResult.result === 'deny') {
+          if (needFairQueue) {
+            await finalizeFairQueueOnFailure(`${phase} cq deny`);
+          }
+          return createTrueConcurrencyDenyResponse(acquireResult);
+        }
+        cqLease = {
+          ...acquireResult,
+          requestId: cqPlan.requestId,
+          hostname: cqPlan.hostname,
+          hostnameHash: cqPlan.hostnameHash,
+          siteBucket: cqPlan.siteBucket,
+          ipBucket: cqPlan.ipBucket,
+          hardExpireAtMs: cqPlan.hardExpireAtMs,
+        };
+        cqReleaseController = createConcurrencyReleaseController({
+          client: concurrencyClient,
+          ctx,
+          lease: cqLease,
+          label: cqPlan.hostname,
+        });
+      } catch (error) {
+        if (clientAborted && isAbortError(error)) {
+          if (needFairQueue) {
+            await finalizeFairQueueOnFailure(`${phase} client abort during cq acquire`);
+          }
+          return createClientAbortResponse(origin);
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[CQ] acquire failed during ${phase}:`, message);
+        if (needFairQueue) {
+          await finalizeFairQueueOnFailure(`${phase} cq failure`);
+        }
+        return createTrueConcurrencyUnavailableResponse(origin);
+      }
+    }
+
+    return null;
+  };
 
   const buildUpstreamRequest = (urlValue, headerConfig) => {
     const upstreamRequest = new Request(urlValue, originalRequest);
@@ -3371,6 +4019,33 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       });
     }
     return upstreamRequest;
+  };
+
+  const resolveRedirectLocation = (location, baseUrl) => new URL(location, baseUrl).toString();
+
+  const retireAdmissionBeforeRecursiveWorkerRedirect = async (phase) => {
+    let deferredReportResponse = null;
+
+    if (fqContext) {
+      deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+      const previousFairQueueContext = fqContext;
+      fqContext = null;
+      const finalized = await finalizeFairQueueContext({
+        fairQueueClient,
+        ctx,
+        fqContext: previousFairQueueContext,
+        phase,
+      });
+      if (!finalized) {
+        pendingFairQueueCleanupContexts.push(previousFairQueueContext);
+      }
+    }
+
+    if (cqReleaseController) {
+      await ensureCurrentTrueConcurrencyReleased('target_change', true);
+    }
+
+    return deferredReportResponse;
   };
 
   const fetchUpstreamWithBreakerAttempt = async (requestToFetch) => {
@@ -3400,7 +4075,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return {
       blockedResponse: null,
       response: await (async () => {
-        const upstreamResponse = await fetch(requestToFetch);
+        let upstreamResponse;
+        try {
+          upstreamResponse = await fetch(requestToFetch);
+        } catch (error) {
+          if (cqReleaseController) {
+            await ensureCurrentTrueConcurrencyReleased('origin_fetch_failure', true);
+          }
+          if (needFairQueue) {
+            await finalizeFairQueueOnFailure('origin fetch failure');
+          }
+          throw error;
+        }
         const reportFailureResponse = await reportBreakerResponseIfNeeded(
           requestHostname,
           upstreamResponse,
@@ -3416,32 +4102,170 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   };
   const shouldRetryAuthError = (status) => status === 401 || status === 410;
 
+  const buildSafeResponseHeaders = (responseToWrap, requestToWrap) => {
+    const safeHeaders = new Headers();
+    const isCryptedDownload = payloadData?.isCrypted === true;
+
+    const preserveHeaders = [
+      'content-type',
+      'content-disposition',
+      'content-length',
+      'cache-control',
+      'content-encoding',
+      'accept-ranges',
+      'content-range',
+      'transfer-encoding',
+      'content-language',
+      'expires',
+      'pragma',
+      'etag',
+      'last-modified'
+    ];
+
+    preserveHeaders.forEach((header) => {
+      if (header === 'content-disposition' && isCryptedDownload) {
+        return;
+      }
+      const value = responseToWrap.headers.get(header);
+      if (value) {
+        safeHeaders.set(header, value);
+      }
+    });
+
+    if (isCryptedDownload) {
+      const derivedName = deriveFileNameFromPath(path);
+      const encryptedFileName = ensureEncryptedFileName(derivedName);
+      safeHeaders.set('content-disposition', buildAttachmentContentDisposition(encryptedFileName));
+    }
+
+    const hasRangeRequest = Boolean(requestToWrap.headers.get('range'));
+    const hasContentRange = Boolean(responseToWrap.headers.get('content-range'));
+    const shouldOverrideCacheControl = config.overrideCacheControl
+      && (
+        responseToWrap.status === 200
+        || (responseToWrap.status === 206 && hasRangeRequest && hasContentRange)
+      );
+
+    if (shouldOverrideCacheControl) {
+      const fileSize = readPayloadFileSize(payloadData);
+      if (typeof fileSize === 'number' && fileSize <= config.cacheOverrideMaxSizeBytes) {
+        const maxAge = config.cacheOverrideSeconds;
+        safeHeaders.set('cache-control', `public, max-age=${maxAge}, s-maxage=${maxAge}`);
+        safeHeaders.delete('x-cache');
+      }
+    }
+
+    applyDownloadCorsHeaders(safeHeaders);
+    return safeHeaders;
+  };
+
+  const buildManagedConcurrencyResponse = (upstreamResponse, requestToWrap) => {
+    const safeHeaders = buildSafeResponseHeaders(upstreamResponse, requestToWrap);
+
+    if (!upstreamResponse.body) {
+      if (cqReleaseController) {
+        cqReleaseController.ensureReleased('no_body_response');
+      }
+      return new Response(null, {
+        status: upstreamResponse.status,
+        statusText: upstreamResponse.statusText,
+        headers: safeHeaders,
+      });
+    }
+
+    const streamPair = createIdentityTransformStream();
+    const abortController = new AbortController();
+    const msUntilExpire = Math.max(0, hardExpireAtMs - Date.now());
+    const expireTimer = setTimeout(() => abortController.abort(), msUntilExpire);
+    if (typeof expireTimer?.unref === 'function') {
+      expireTimer.unref();
+    }
+    const onClientAbort = () => abortController.abort();
+    if (clientSignal && typeof clientSignal.addEventListener === 'function') {
+      clientSignal.addEventListener('abort', onClientAbort, { once: true });
+    }
+    if (clientSignal?.aborted) {
+      clientAborted = true;
+      onClientAbort();
+    }
+
+    const pipePromise = upstreamResponse.body.pipeTo(streamPair.writable, {
+      signal: abortController.signal,
+      preventAbort: false,
+      preventCancel: false,
+      preventClose: false,
+    }).then(async () => {
+      await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
+    }).catch(async (error) => {
+      const reason = clientAborted
+        ? 'client_disconnect'
+        : (Date.now() >= hardExpireAtMs ? 'hard_expiry' : 'upstream_failure');
+      await ensureCurrentTrueConcurrencyReleased(reason, true);
+      if (!isAbortError(error)) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn('[CQ] managed stream terminated with error:', message);
+      }
+    }).finally(() => {
+      clearTimeout(expireTimer);
+      if (clientSignal && typeof clientSignal.removeEventListener === 'function') {
+        clientSignal.removeEventListener('abort', onClientAbort);
+      }
+    });
+
+    cqCleanupBoundToStream = true;
+    return new Response(streamPair.readable, {
+      status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
+      headers: safeHeaders,
+    });
+  };
+
+  const releaseAdmissionBeforeTerminalResponse = async (response, reason) => {
+    if (cqReleaseController && !cqCleanupBoundToStream) {
+      await ensureCurrentTrueConcurrencyReleased(reason, true);
+    }
+    if (needFairQueue && fqContext?.slotToken) {
+      await finalizeFairQueueOnFailure(reason);
+    }
+    return response;
+  };
+
   let retriedWithFreshLink = false;
 
   // Proceed with fetch
   try {
+    const initialPrepareResponse = await prepareTargetForFetch(downloadUrl, 'initial');
+    if (initialPrepareResponse) {
+      return initialPrepareResponse;
+    }
+
     request = buildUpstreamRequest(downloadUrl, res.data.header);
     let { blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request);
     if (blockedResponse) {
-      return blockedResponse;
+      return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
     }
+    const currentOrigin = new URL(originalRequest.url).origin;
     while (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("Location");
       if (location) {
-        const currentOrigin = new URL(originalRequest.url).origin;
-        if (location.startsWith(`${currentOrigin}/`)) {
-          request = new Request(location, request);
-            return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
-          } else {
-            const fairQueueRedirectResponse = await reconcileCurrentFairQueueContextForTarget(location, 'redirect');
-            if (fairQueueRedirectResponse) {
-              return fairQueueRedirectResponse;
-            }
-            request = new Request(location, request);
-            ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
-            if (blockedResponse) {
-              return blockedResponse;
-            }
+        const resolvedLocation = resolveRedirectLocation(location, request.url);
+        if (new URL(resolvedLocation).origin === currentOrigin) {
+          const recursiveRedirectResponse = await retireAdmissionBeforeRecursiveWorkerRedirect('recursive redirect');
+          if (recursiveRedirectResponse) {
+            return recursiveRedirectResponse;
+          }
+          request = new Request(resolvedLocation, request);
+          return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
+        } else {
+          const targetPrepareResponse = await prepareTargetForFetch(resolvedLocation, 'redirect');
+          if (targetPrepareResponse) {
+            return targetPrepareResponse;
+          }
+          request = new Request(resolvedLocation, request);
+          ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
+          if (blockedResponse) {
+            return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
+          }
         }
       } else {
         break;
@@ -3464,31 +4288,35 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       } else if (refreshedLink && refreshedLink.data && refreshedLink.data.url) {
         downloadUrl = refreshedLink.data.url;
         res = refreshedLink;
-        const fairQueueRefreshResponse = await reconcileCurrentFairQueueContextForTarget(downloadUrl, 'refresh');
-        if (fairQueueRefreshResponse) {
-          return fairQueueRefreshResponse;
+        const targetPrepareResponse = await prepareTargetForFetch(downloadUrl, 'refresh');
+        if (targetPrepareResponse) {
+          return targetPrepareResponse;
         }
         request = buildUpstreamRequest(downloadUrl, res.data.header);
         ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
         if (blockedResponse) {
-          return blockedResponse;
+          return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
         }
         while (response.status >= 300 && response.status < 400) {
           const location = response.headers.get("Location");
           if (location) {
-            const currentOrigin = new URL(originalRequest.url).origin;
-            if (location.startsWith(`${currentOrigin}/`)) {
-              request = new Request(location, request);
+            const resolvedLocation = resolveRedirectLocation(location, request.url);
+            if (new URL(resolvedLocation).origin === currentOrigin) {
+              const recursiveRedirectResponse = await retireAdmissionBeforeRecursiveWorkerRedirect('recursive redirect');
+              if (recursiveRedirectResponse) {
+                return recursiveRedirectResponse;
+              }
+              request = new Request(resolvedLocation, request);
               return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
             } else {
-              const fairQueueRedirectResponse = await reconcileCurrentFairQueueContextForTarget(location, 'redirect');
-              if (fairQueueRedirectResponse) {
-                return fairQueueRedirectResponse;
+              const redirectPrepareResponse = await prepareTargetForFetch(resolvedLocation, 'redirect');
+              if (redirectPrepareResponse) {
+                return redirectPrepareResponse;
               }
-              request = new Request(location, request);
+              request = new Request(resolvedLocation, request);
               ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
               if (blockedResponse) {
-                return blockedResponse;
+                return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
               }
             }
           } else {
@@ -3515,71 +4343,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         `[Upstream] Unexpected status ${response.status} for ${path} (url ${downloadUrl})`
       );
     }
-    
-    // 创建仅包含安全必要headers的响应
-    const safeHeaders = new Headers();
-    const isCryptedDownload = payloadData?.isCrypted === true;
 
-    // 保留重要的内容相关headers
-    const preserveHeaders = [
-      'content-type',
-      'content-disposition',
-      'content-length',
-      'cache-control',
-      'content-encoding',
-      'accept-ranges',
-      'content-range', // Added for partial downloads
-      'transfer-encoding', // Added for chunked transfers
-      'content-language', // Added for internationalization
-      'expires', // Added for cache control
-      'pragma', // Added for cache control
-      'etag',
-      'last-modified'
-    ];
+    releaseFairQueueAfterHeadersIfNeeded();
 
-    // 仅复制必要的headers
-    preserveHeaders.forEach(header => {
-      if (header === 'content-disposition' && isCryptedDownload) {
-        return;
-      }
-      const value = response.headers.get(header);
-      if (value) {
-        safeHeaders.set(header, value);
-      }
-    });
-
-    if (isCryptedDownload) {
-      const derivedName = deriveFileNameFromPath(path);
-      const encryptedFileName = ensureEncryptedFileName(derivedName);
-      safeHeaders.set('content-disposition', buildAttachmentContentDisposition(encryptedFileName));
-    }
-
-    const hasRangeRequest = Boolean(request.headers.get('range'));
-    const hasContentRange = Boolean(response.headers.get('content-range'));
-    const shouldOverrideCacheControl = config.overrideCacheControl
-      && (
-        response.status === 200
-        || (response.status === 206 && hasRangeRequest && hasContentRange)
-      );
-
-    if (shouldOverrideCacheControl) {
-      const fileSize = readPayloadFileSize(payloadData);
-      if (typeof fileSize === 'number' && fileSize <= config.cacheOverrideMaxSizeBytes) {
-        const maxAge = config.cacheOverrideSeconds;
-        safeHeaders.set('cache-control', `public, max-age=${maxAge}, s-maxage=${maxAge}`);
-        safeHeaders.delete('x-cache');
-      }
-    }
-
-    // 设置CORS headers
-    applyDownloadCorsHeaders(safeHeaders);
-
-    // 创建带有安全headers的新响应
-    const safeResponse = new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: safeHeaders
-    });
+    const safeResponse = needTrueConcurrency
+      ? buildManagedConcurrencyResponse(response, request)
+      : new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: buildSafeResponseHeaders(response, request),
+      });
 
     const shouldUpdateLastActive =
       config.cacheConfig &&
@@ -3634,6 +4407,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
     throw error;
   } finally {
+    if (cqReleaseController && !cqCleanupBoundToStream) {
+      cqReleaseController.ensureReleased('final_cleanup');
+    }
+
     const finalCleanupContexts = [];
     if (fqContext && fqContext.cleanupRetired !== true) {
       finalCleanupContexts.push(fqContext);
@@ -3651,6 +4428,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         await runWithConcurrencyLimit(
           finalCleanupGroups.map((cleanupGroup) => async () => {
             for (const cleanupContext of cleanupGroup) {
+              if (await waitForInFlightFairQueueHeaderRelease(cleanupContext)) {
+                continue;
+              }
               await finalizeFairQueueContext({
                 fairQueueClient,
                 ctx,
@@ -3738,6 +4518,8 @@ export const __fairQueueTestHooks = {
     ...options,
   }),
   buildFinalCleanupGroups,
+  createConcurrencyHandlerClient,
+  createConcurrencyReleaseController,
   createSlotHandlerClient,
   deriveOpenSeconds,
   finalizeFairQueueContext,

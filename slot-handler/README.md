@@ -9,6 +9,10 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 
 目标：worker 只做 HTTP 调用；公平排队、长轮询与调度都集中在 slot-handler。
 
+`slot-handler` 只负责 fairqueue，不负责 true in-flight concurrency。true concurrency 由独立的 `concurrency-handler` 服务处理，slot-handler 不创建 true-concurrency lease，也不维护 true-concurrency 计数或续租。
+
+当目标同时启用 fairqueue 与 true concurrency 时，worker 的固定顺序是：先调用 `concurrency-handler` 的 advisory `precheck`，再进入 `slot-handler` 的 fairqueue acquire；fairqueue grant 成功后，worker 才会调用 `concurrency-handler` 的 `acquire`，然后再发起 origin fetch。slot-handler 在这个组合模式里仍然只承担公平排队与 slot release。
+
 ---
 
 ## 1. 核心模型（Flow / InvocationEpoch / Waiter / Lease / Grace）
