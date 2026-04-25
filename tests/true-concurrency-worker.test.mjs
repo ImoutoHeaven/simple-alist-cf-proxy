@@ -1167,11 +1167,12 @@ test('queue_breaker dual mode settles breaker attempt when target expires before
   }
 });
 
-test('dual mode malformed concurrency acquire deny fails closed as handler failure', async () => {
+test('dual mode malformed concurrency acquire deny fails closed after best-effort release recovery', async () => {
   const originalFetch = globalThis.fetch;
+  const originalRandomUUID = crypto.randomUUID;
   const calls = [];
 
-  globalThis.fetch = async (input) => {
+  globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
@@ -1211,9 +1212,82 @@ test('dual mode malformed concurrency acquire deny fails closed as handler failu
       return createJsonResponse({ result: 'deny', scope: 'site', reason: 'full', retryAfter: 0 });
     }
 
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      const body = JSON.parse(init.body);
+      assert.equal(body.requestId, 'req-malformed-acquire-recovery');
+      return createJsonResponse({ result: 'noop', reason: 'not_found' });
+    }
+
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       calls.push('fairqueue-release');
       return createJsonResponse({ result: 'ok' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    crypto.randomUUID = () => 'req-malformed-acquire-recovery';
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.match(body.message, /true concurrency unavailable/i);
+    assert.deepEqual(calls, ['precheck', 'fairqueue-acquire', 'concurrency-acquire', 'concurrency-release', 'fairqueue-release']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    crypto.randomUUID = originalRandomUUID;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency malformed granted acquire response still triggers best-effort release recovery', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalRandomUUID = crypto.randomUUID;
+  const calls = [];
+  let acquireBody = null;
+  let releaseBody = null;
+
+  crypto.randomUUID = () => 'req-ambiguous-acquire-1';
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      acquireBody = JSON.parse(init.body);
+      return new Response('{"result":"granted"', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      throw new Error('origin fetch should not run after ambiguous acquire failure');
     }
 
     throw new Error(`Unexpected fetch URL in test: ${url}`);
@@ -1224,11 +1298,160 @@ test('dual mode malformed concurrency acquire deny fails closed as handler failu
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     const body = await readJson(response);
     await Promise.allSettled(waitUntilPromises);
+
     assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
-    assert.deepEqual(calls, ['precheck', 'fairqueue-acquire', 'concurrency-acquire', 'fairqueue-release']);
+    assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-release']);
+    assert.equal(releaseBody?.requestId, acquireBody?.requestId);
+    assert.equal(releaseBody?.hostnameHash, acquireBody?.hostnameHash);
+    assert.equal(releaseBody?.siteBucket, acquireBody?.siteBucket);
+    assert.equal(releaseBody?.ipBucket, acquireBody?.ipBucket);
+    assert.equal(releaseBody?.hardExpireAtMs, acquireBody?.hardExpireAtMs);
+    assert.equal(releaseBody?.leaseId, undefined);
+    assert.equal(releaseBody?.leaseToken, undefined);
   } finally {
     globalThis.fetch = originalFetch;
+    crypto.randomUUID = originalRandomUUID;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency acquire fetch rejection after dispatch still triggers best-effort release recovery', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalRandomUUID = crypto.randomUUID;
+  const calls = [];
+  let acquireBody = null;
+  let releaseBody = null;
+
+  crypto.randomUUID = () => 'req-ambiguous-reject-1';
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      acquireBody = JSON.parse(init.body);
+      throw new TypeError('fetch failed');
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      throw new Error('origin fetch should not run after acquire fetch rejection');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 503);
+    assert.match(body.message, /true concurrency unavailable/i);
+    assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-release']);
+    assert.equal(releaseBody?.requestId, acquireBody?.requestId);
+    assert.equal(releaseBody?.hostnameHash, acquireBody?.hostnameHash);
+    assert.equal(releaseBody?.siteBucket, acquireBody?.siteBucket);
+    assert.equal(releaseBody?.ipBucket, acquireBody?.ipBucket);
+    assert.equal(releaseBody?.hardExpireAtMs, acquireBody?.hardExpireAtMs);
+    assert.equal(releaseBody?.leaseId, undefined);
+    assert.equal(releaseBody?.leaseToken, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    crypto.randomUUID = originalRandomUUID;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency non-200 acquire response after dispatch still triggers best-effort release recovery', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalRandomUUID = crypto.randomUUID;
+  const calls = [];
+  let acquireBody = null;
+  let releaseBody = null;
+
+  crypto.randomUUID = () => 'req-ambiguous-status-1';
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      acquireBody = JSON.parse(init.body);
+      return new Response('service unavailable', { status: 503 });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      throw new Error('origin fetch should not run after acquire non-200 failure');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 503);
+    assert.match(body.message, /true concurrency unavailable/i);
+    assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-release']);
+    assert.equal(releaseBody?.requestId, acquireBody?.requestId);
+    assert.equal(releaseBody?.hostnameHash, acquireBody?.hostnameHash);
+    assert.equal(releaseBody?.siteBucket, acquireBody?.siteBucket);
+    assert.equal(releaseBody?.ipBucket, acquireBody?.ipBucket);
+    assert.equal(releaseBody?.hardExpireAtMs, acquireBody?.hardExpireAtMs);
+    assert.equal(releaseBody?.leaseId, undefined);
+    assert.equal(releaseBody?.leaseToken, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    crypto.randomUUID = originalRandomUUID;
     delete globalThis.bootstrapCache;
   }
 });

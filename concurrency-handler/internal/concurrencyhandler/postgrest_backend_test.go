@@ -209,6 +209,44 @@ func TestPostgrestReleaseRejectsInvalidSuccessfulResult(t *testing.T) {
 	}
 }
 
+func TestPostgrestReleaseByRequestUsesFixedDatabaseAuthoritativeRPC(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"released"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.Release(context.Background(), validRecoveryReleaseRequest())
+	if err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+	if gotPath != "/rpc/cq_release_by_request" {
+		t.Fatalf("expected fixed recovery release rpc path, got %s", gotPath)
+	}
+	if gotBody["p_request_id"] != "request-1" || gotBody["p_hard_expire_at_ms"] != float64(5000) {
+		t.Fatalf("expected request tuple payload, got %v", gotBody)
+	}
+	if result.Result != "released" {
+		t.Fatalf("unexpected release result: %+v", result)
+	}
+}
+
 func TestPostgrestPrecheckUsesFixedDatabaseAuthoritativeRPC(t *testing.T) {
 	var gotPath string
 	var gotBody map[string]any

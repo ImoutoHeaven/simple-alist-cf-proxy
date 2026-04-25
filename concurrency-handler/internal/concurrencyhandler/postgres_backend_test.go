@@ -165,6 +165,34 @@ func TestPostgresAcquireClassifiesInactiveReplayAsConflict(t *testing.T) {
 	}
 }
 
+func TestPostgresReleaseByRequestUsesFixedDatabaseAuthoritativeFunction(t *testing.T) {
+	req := validRecoveryReleaseRequest()
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "FROM cq_release_by_request(") {
+			t.Fatalf("release recovery must use fixed database-authoritative function, got %s", query)
+		}
+		if len(args) != 7 {
+			t.Fatalf("expected 7 release recovery args, got %d", len(args))
+		}
+		if got := args[0]; got != req.RequestID {
+			t.Fatalf("expected request id %q, got %v", req.RequestID, got)
+		}
+		if got := args[4]; got != req.HardExpireAtMs {
+			t.Fatalf("expected hard expiry %d, got %v", req.HardExpireAtMs, got)
+		}
+		return &stubRows{rows: [][]any{{"released", nil}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.Release(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+	if result.Result != "released" {
+		t.Fatalf("unexpected release result: %+v", result)
+	}
+}
+
 func TestPostgresPrecheckUsesFixedDatabaseAuthoritativeFunction(t *testing.T) {
 	req := validPrecheckRequest()
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {

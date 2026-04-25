@@ -18,6 +18,7 @@ type stubBackend struct {
 	acquireErr     error
 	releaseResult  *ReleaseResult
 	releaseErr     error
+	releaseFn      func(context.Context, ReleaseRequest) (*ReleaseResult, error)
 	expireResult   *ExpireScopeResult
 	expireErr      error
 }
@@ -33,7 +34,10 @@ func (s *stubBackend) Acquire(_ context.Context, _ AcquireRequest) (*AcquireResu
 	return s.acquireResult, s.acquireErr
 }
 
-func (s *stubBackend) Release(_ context.Context, _ ReleaseRequest) (*ReleaseResult, error) {
+func (s *stubBackend) Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
+	if s.releaseFn != nil {
+		return s.releaseFn(ctx, req)
+	}
 	return s.releaseResult, s.releaseErr
 }
 
@@ -229,6 +233,38 @@ func TestReleaseReturnsNoopBody(t *testing.T) {
 	body := decodeBody(t, rec)
 	if body["result"] != "noop" || body["reason"] != "expired" {
 		t.Fatalf("expected noop body, got %v", body)
+	}
+}
+
+func TestReleaseAcceptsRecoveryTupleBody(t *testing.T) {
+	var got ReleaseRequest
+	handler := newTestServer(t, &stubBackend{
+		releaseFn: func(_ context.Context, req ReleaseRequest) (*ReleaseResult, error) {
+			got = req
+			return &ReleaseResult{Result: "released"}, nil
+		},
+	})
+
+	rec := postJSON(t, handler, "/api/v1/concurrency/release", validRecoveryReleaseRequest(), "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if got.RequestID != "request-1" || got.HostnameHash != "host-hash" || got.HardExpireAtMs != 5000 {
+		t.Fatalf("expected recovery tuple forwarded to backend, got %+v", got)
+	}
+	body := decodeBody(t, rec)
+	if body["result"] != "released" {
+		t.Fatalf("expected released body, got %v", body)
+	}
+}
+
+func TestReleaseRecoveryRejectsMissingHardExpiry(t *testing.T) {
+	req := validRecoveryReleaseRequest()
+	req.HardExpireAtMs = 0
+	handler := newTestServer(t, &stubBackend{})
+	rec := postJSON(t, handler, "/api/v1/concurrency/release", req, "secret")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
 	}
 }
 

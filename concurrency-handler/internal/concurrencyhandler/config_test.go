@@ -78,6 +78,18 @@ func validReleaseRequest() ReleaseRequest {
 	}
 }
 
+func validRecoveryReleaseRequest() ReleaseRequest {
+	return ReleaseRequest{
+		RequestID:      "request-1",
+		HostnameHash:   "host-hash",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		HardExpireAtMs: 5000,
+		Reason:         "acquire_recovery",
+		NowMs:          1000,
+	}
+}
+
 func TestConfigValidateSupportsPostgresAndPostgrest(t *testing.T) {
 	cfg := validTestConfig()
 	if err := cfg.Validate(); err != nil {

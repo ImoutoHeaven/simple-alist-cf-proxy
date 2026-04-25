@@ -174,19 +174,34 @@ func (b *postgrestBackend) Acquire(ctx context.Context, req AcquireRequest) (*Ac
 }
 
 func (b *postgrestBackend) Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
-	if _, err := validatedIdentifier(b.cfg.Concurrency.RPC.ReleaseFunc); err != nil {
-		return nil, err
-	}
 	result := &struct {
 		Result string `json:"result"`
 		Reason string `json:"reason"`
 	}{}
-	err := b.doRPC(ctx, b.cfg.Concurrency.RPC.ReleaseFunc, map[string]any{
+	funcName := b.cfg.Concurrency.RPC.ReleaseFunc
+	payload := map[string]any{
 		"p_lease_id":    req.LeaseID,
 		"p_lease_token": req.LeaseToken,
 		"p_reason":      req.Reason,
 		"p_now_ms":      req.NowMs,
-	}, result)
+	}
+	if releaseRequestHasLeaseIdentity(req) {
+		if _, err := validatedIdentifier(funcName); err != nil {
+			return nil, err
+		}
+	} else {
+		funcName = fixedReleaseByRequestFunc
+		payload = map[string]any{
+			"p_request_id":        req.RequestID,
+			"p_hostname_hash":     req.HostnameHash,
+			"p_site_bucket":       canonicalBucket(req.SiteBucket),
+			"p_ip_bucket":         canonicalBucket(req.IPBucket),
+			"p_hard_expire_at_ms": req.HardExpireAtMs,
+			"p_reason":            req.Reason,
+			"p_now_ms":            req.NowMs,
+		}
+	}
+	err := b.doRPC(ctx, funcName, payload, result)
 	if err != nil {
 		return nil, err
 	}

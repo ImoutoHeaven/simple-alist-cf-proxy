@@ -576,6 +576,55 @@ func TestRuntimeReleaseExpiresStaleHostScopeUsingDatabaseClock(t *testing.T) {
 	}
 }
 
+func TestRuntimeReleaseByRequestReleasesExistingLeaseWithoutCreatingNewLease(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	lease, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash: "recover-host",
+		Hostname:     "recover.example.com",
+		SiteBucket:   "site-a",
+		IPBucket:     "ip-a",
+		RequestID:    "recover-request",
+		HardExpireMs: nowMs + 60_000,
+		NowMs:        nowMs,
+	})
+	if err != nil {
+		t.Fatalf("seed acquire: %v", err)
+	}
+	if lease.Result != "granted" {
+		t.Fatalf("expected granted seed lease, got %+v", lease)
+	}
+
+	var releaseResult string
+	var releaseReason sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason
+		FROM cq_release_by_request($1, $2, $3, $4, $5, $6, $7)
+	`, "recover-request", "recover-host", "site-a", "ip-a", nowMs+60_000, "acquire_recovery", int64(1)).Scan(&releaseResult, &releaseReason); err != nil {
+		t.Fatalf("release by request: %v", err)
+	}
+	if releaseResult != "released" {
+		t.Fatalf("expected release result released, got result=%q reason=%q", releaseResult, releaseReason.String)
+	}
+
+	var leaseCount int
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM concurrency_leases WHERE request_id = $1`, "recover-request").Scan(&leaseCount); err != nil {
+		t.Fatalf("count request leases: %v", err)
+	}
+	if leaseCount != 1 {
+		t.Fatalf("expected release-by-request to avoid creating new leases, got %d rows", leaseCount)
+	}
+
+	var state string
+	if err := db.QueryRowContext(context.Background(), `SELECT state FROM concurrency_leases WHERE lease_id = $1::uuid`, lease.LeaseID).Scan(&state); err != nil {
+		t.Fatalf("read released lease state: %v", err)
+	}
+	if state != "released" {
+		t.Fatalf("expected released state, got %q", state)
+	}
+}
+
 func TestRuntimeAcquireSerializesRequestIDAcrossTuplesAndRejectsConflictingReuse(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	seedConcurrencyCounterRows(t, db, "host-a", "a.example.com", "site-a", "ip-a")

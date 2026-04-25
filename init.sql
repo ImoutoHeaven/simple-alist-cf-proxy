@@ -2076,6 +2076,67 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION cq_release_by_request(
+  p_request_id text,
+  p_hostname_hash text,
+  p_site_bucket text,
+  p_ip_bucket text,
+  p_hard_expire_at_ms bigint,
+  p_reason text,
+  p_now_ms bigint DEFAULT NULL
+)
+RETURNS TABLE(result text, reason text) AS $$
+DECLARE
+  v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_hostname_hash text := BTRIM(COALESCE(p_hostname_hash, ''));
+  v_site_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_site_bucket, '')), ''), 'unknown');
+  v_ip_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_ip_bucket, '')), ''), 'unknown');
+  v_locked_lease record;
+  v_locked_lease_row_count bigint := 0;
+BEGIN
+  IF v_request_id = ''
+    OR v_hostname_hash = ''
+    OR p_hard_expire_at_ms IS NULL
+    OR p_hard_expire_at_ms <= 0 THEN
+    result := 'noop';
+    reason := 'not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+
+  SELECT *
+    INTO v_locked_lease
+  FROM concurrency_leases
+  WHERE request_id = v_request_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_locked_lease_row_count = ROW_COUNT;
+
+  IF v_locked_lease_row_count = 0 THEN
+    result := 'noop';
+    reason := 'not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_locked_lease.hostname_hash IS DISTINCT FROM v_hostname_hash
+    OR v_locked_lease.site_bucket IS DISTINCT FROM v_site_bucket
+    OR v_locked_lease.ip_bucket IS DISTINCT FROM v_ip_bucket
+    OR v_locked_lease.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms THEN
+    result := 'noop';
+    reason := 'not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT released.result, released.reason
+  FROM cq_release(v_locked_lease.lease_id, v_locked_lease.lease_token, p_reason, p_now_ms) AS released;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION cq_acquire(
   p_hostname_hash text,
   p_hostname text,

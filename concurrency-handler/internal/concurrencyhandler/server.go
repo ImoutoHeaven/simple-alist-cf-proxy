@@ -315,11 +315,31 @@ func validateAcquireRequest(req AcquireRequest) error {
 }
 
 func validateReleaseRequest(req ReleaseRequest) error {
-	if strings.TrimSpace(req.LeaseID) == "" {
-		return errors.New("leaseId is required")
-	}
-	if strings.TrimSpace(req.LeaseToken) == "" {
-		return errors.New("leaseToken is required")
+	if releaseRequestHasLeaseIdentity(req) {
+		if strings.TrimSpace(req.LeaseID) == "" {
+			return errors.New("leaseId is required")
+		}
+		if strings.TrimSpace(req.LeaseToken) == "" {
+			return errors.New("leaseToken is required")
+		}
+	} else if releaseRequestHasRecoveryIdentity(req) {
+		if strings.TrimSpace(req.RequestID) == "" {
+			return errors.New("requestId is required")
+		}
+		if strings.TrimSpace(req.HostnameHash) == "" {
+			return errors.New("hostnameHash is required")
+		}
+		if strings.TrimSpace(req.SiteBucket) == "" {
+			return errors.New("siteBucket is required")
+		}
+		if strings.TrimSpace(req.IPBucket) == "" {
+			return errors.New("ipBucket is required")
+		}
+		if req.HardExpireAtMs <= 0 {
+			return errors.New("hardExpireAtMs is required")
+		}
+	} else {
+		return errors.New("leaseId/leaseToken or request recovery tuple is required")
 	}
 	if strings.TrimSpace(req.Reason) == "" {
 		return errors.New("reason is required")

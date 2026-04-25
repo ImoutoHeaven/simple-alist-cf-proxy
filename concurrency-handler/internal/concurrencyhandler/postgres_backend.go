@@ -180,11 +180,34 @@ func (p *postgresBackend) Acquire(ctx context.Context, req AcquireRequest) (*Acq
 }
 
 func (p *postgresBackend) Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
-	query, err := rpcSelectAll(p.cfg.Concurrency.RPC.ReleaseFunc, 4)
-	if err != nil {
-		return nil, err
+	var (
+		query string
+		rows  pgRows
+		err   error
+	)
+	if releaseRequestHasLeaseIdentity(req) {
+		query, err = rpcSelectAll(p.cfg.Concurrency.RPC.ReleaseFunc, 4)
+		if err != nil {
+			return nil, err
+		}
+		rows, err = p.db.Query(ctx, query, req.LeaseID, req.LeaseToken, req.Reason, req.NowMs)
+	} else {
+		query, err = rpcSelectAll(fixedReleaseByRequestFunc, 7)
+		if err != nil {
+			return nil, err
+		}
+		rows, err = p.db.Query(
+			ctx,
+			query,
+			req.RequestID,
+			req.HostnameHash,
+			canonicalBucket(req.SiteBucket),
+			canonicalBucket(req.IPBucket),
+			req.HardExpireAtMs,
+			req.Reason,
+			req.NowMs,
+		)
 	}
-	rows, err := p.db.Query(ctx, query, req.LeaseID, req.LeaseToken, req.Reason, req.NowMs)
 	if err != nil {
 		return nil, err
 	}

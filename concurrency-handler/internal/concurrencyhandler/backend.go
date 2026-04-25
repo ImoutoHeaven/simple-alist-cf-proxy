@@ -43,10 +43,15 @@ type AcquireResult struct {
 }
 
 type ReleaseRequest struct {
-	LeaseID    string `json:"leaseId"`
-	LeaseToken string `json:"leaseToken"`
-	Reason     string `json:"reason"`
-	NowMs      int64  `json:"nowMs"`
+	LeaseID        string `json:"leaseId,omitempty"`
+	LeaseToken     string `json:"leaseToken,omitempty"`
+	RequestID      string `json:"requestId,omitempty"`
+	HostnameHash   string `json:"hostnameHash,omitempty"`
+	SiteBucket     string `json:"siteBucket,omitempty"`
+	IPBucket       string `json:"ipBucket,omitempty"`
+	HardExpireAtMs int64  `json:"hardExpireAtMs,omitempty"`
+	Reason         string `json:"reason"`
+	NowMs          int64  `json:"nowMs"`
 }
 
 type ReleaseResult struct {
@@ -69,6 +74,7 @@ type ExpireScopeResult struct {
 
 const (
 	fixedPrecheckFunc                             = "cq_precheck"
+	fixedReleaseByRequestFunc                     = "cq_release_by_request"
 	acquireConflictReasonRequestIDTupleMismatch   = "request_id_tuple_mismatch"
 	acquireConflictReasonRequestIDReplayNotActive = "request_id_replay_not_active"
 )
@@ -206,6 +212,18 @@ func validateReleaseResult(result *ReleaseResult) error {
 	default:
 		return fmt.Errorf("invalid release result %q", result.Result)
 	}
+}
+
+func releaseRequestHasLeaseIdentity(req ReleaseRequest) bool {
+	return strings.TrimSpace(req.LeaseID) != "" || strings.TrimSpace(req.LeaseToken) != ""
+}
+
+func releaseRequestHasRecoveryIdentity(req ReleaseRequest) bool {
+	return strings.TrimSpace(req.RequestID) != "" ||
+		strings.TrimSpace(req.HostnameHash) != "" ||
+		strings.TrimSpace(req.SiteBucket) != "" ||
+		strings.TrimSpace(req.IPBucket) != "" ||
+		req.HardExpireAtMs > 0
 }
 
 func validateExpireScopeResult(result *ExpireScopeResult) error {

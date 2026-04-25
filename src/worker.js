@@ -1552,6 +1552,51 @@ const TRUE_CONCURRENCY_RELEASE_NOOP_REASONS = new Set([
   'token_mismatch',
 ]);
 
+const isTrueConcurrencyLeaseIdentity = (lease) => (
+  typeof lease?.leaseId === 'string'
+  && lease.leaseId
+  && typeof lease?.leaseToken === 'string'
+  && lease.leaseToken
+);
+
+const isTrueConcurrencyRecoveryIdentity = (lease) => (
+  typeof lease?.requestId === 'string'
+  && lease.requestId
+  && typeof lease?.hostnameHash === 'string'
+  && lease.hostnameHash
+  && typeof lease?.siteBucket === 'string'
+  && lease.siteBucket
+  && typeof lease?.ipBucket === 'string'
+  && lease.ipBucket
+  && Number.isFinite(Number(lease?.hardExpireAtMs))
+  && Number(lease.hardExpireAtMs) > 0
+);
+
+const buildTrueConcurrencyReleasePayload = (lease, reason) => {
+  if (isTrueConcurrencyLeaseIdentity(lease)) {
+    return {
+      leaseId: lease.leaseId,
+      leaseToken: lease.leaseToken,
+      reason,
+      nowMs: Date.now(),
+    };
+  }
+
+  if (isTrueConcurrencyRecoveryIdentity(lease)) {
+    return {
+      requestId: lease.requestId,
+      hostnameHash: lease.hostnameHash,
+      siteBucket: lease.siteBucket,
+      ipBucket: lease.ipBucket,
+      hardExpireAtMs: Number(lease.hardExpireAtMs),
+      reason,
+      nowMs: Date.now(),
+    };
+  }
+
+  throw new Error('[CQ] release requires lease identity or recovery tuple');
+};
+
 const normalizeTrueConcurrencyResult = (operation, data, options = {}) => {
   const result = typeof data?.result === 'string' ? data.result : '';
   const allowedResults = options.allowedResults instanceof Set ? options.allowedResults : null;
@@ -1734,12 +1779,12 @@ const createConcurrencyHandlerClient = (config) => {
     },
 
     async release(_ctx, lease, reason, signal) {
-      const data = await postJson(releaseUrl, {
-        leaseId: lease.leaseId,
-        leaseToken: lease.leaseToken,
-        reason,
-        nowMs: Date.now(),
-      }, releaseTimeoutMs, signal);
+      const data = await postJson(
+        releaseUrl,
+        buildTrueConcurrencyReleasePayload(lease, reason),
+        releaseTimeoutMs,
+        signal,
+      );
       return normalizeTrueConcurrencyResult('release', data, {
         allowedResults: TRUE_CONCURRENCY_RELEASE_RESULTS,
       });
@@ -4125,6 +4170,23 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         }
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[CQ] acquire failed during ${phase}:`, message);
+        if (!cqReleaseController && cqPlan) {
+          cqLease = {
+            requestId: cqPlan.requestId,
+            hostname: cqPlan.hostname,
+            hostnameHash: cqPlan.hostnameHash,
+            siteBucket: cqPlan.siteBucket,
+            ipBucket: cqPlan.ipBucket,
+            hardExpireAtMs: cqPlan.hardExpireAtMs,
+          };
+          cqReleaseController = createConcurrencyReleaseController({
+            client: concurrencyClient,
+            ctx,
+            lease: cqLease,
+            label: cqPlan.hostname,
+          });
+          await ensureCurrentTrueConcurrencyReleased('acquire_recovery', true);
+        }
         const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan?.hostname);
         if (settleResponse instanceof Response) {
           if (needFairQueue) {
