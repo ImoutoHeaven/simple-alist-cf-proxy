@@ -71,6 +71,12 @@ func (s *stubRows) Scan(dest ...any) error {
 			} else {
 				*d = sql.NullInt64{Int64: row[i].(int64), Valid: true}
 			}
+		case *[]byte:
+			if row[i] == nil {
+				*d = nil
+			} else {
+				*d = []byte(row[i].(string))
+			}
 		default:
 			panic("unsupported scan target")
 		}
@@ -87,7 +93,7 @@ func TestPostgresAcquireCallsConfiguredRPCAndNormalizesGrantedResult(t *testing.
 		if !strings.Contains(query, "custom_acquire") {
 			t.Fatalf("expected custom acquire rpc query, got %s", query)
 		}
-		return &stubRows{rows: [][]any{{"granted", "lease-1", "token-1", int64(2500), nil, nil, nil}}}, nil
+		return &stubRows{rows: [][]any{{`{"result":"granted","lease_id":"lease-1","lease_token":"token-1","expires_at_ms":2500}`}}}, nil
 	}}
 
 	cfg := validTestConfig()
@@ -104,32 +110,67 @@ func TestPostgresAcquireCallsConfiguredRPCAndNormalizesGrantedResult(t *testing.
 	if len(client.queries) != 1 {
 		t.Fatalf("expected one query, got %d", len(client.queries))
 	}
-	if got := client.queries[0].args[9]; got != 4 {
+	if got := client.queries[0].args[12]; got != 4 {
 		t.Fatalf("expected site_ip cap argument 4, got %v", got)
 	}
 }
 
-func TestPostgresAcquireRejectsInvalidSuccessfulResult(t *testing.T) {
+func TestPostgresAcquireNormalizesWaitResult(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		return &stubRows{rows: [][]any{{"released", "lease-1", "token-1", int64(2500), nil, nil, nil}}}, nil
+		return &stubRows{rows: [][]any{{`{"result":"wait","wait_token":"wait-1","scope":"site","retry_after":2}`}}}, nil
 	}}
 
-	backend := &postgresBackend{cfg: validTestConfig(), db: client}
-	_, err := backend.Acquire(context.Background(), validAcquireRequest())
-	if err == nil {
-		t.Fatal("expected error for invalid acquire result")
+	cfg := validTestConfig()
+	cfg.Concurrency.RPC.AcquireFunc = "custom_acquire"
+	backend := &postgresBackend{cfg: cfg, db: client}
+
+	result, err := backend.Acquire(context.Background(), validAcquireRequest())
+	if err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if result.Result != "wait" || result.WaitToken != "wait-1" || result.Scope != "site" || result.RetryAfter != 2 {
+		t.Fatalf("unexpected wait result: %+v", result)
 	}
 }
 
-func TestPostgresAcquireRejectsIncompleteGrantedRow(t *testing.T) {
+func TestPostgresAcquireIncludesWaitTokenWhenProvided(t *testing.T) {
+	req := validAcquireRequest()
+	req.WaitToken = "wait-1"
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		return &stubRows{rows: [][]any{{"granted", "lease-1", nil, nil, nil, nil, nil}}}, nil
+		if len(args) != 14 {
+			t.Fatalf("expected 14 acquire args, got %d", len(args))
+		}
+		if got := args[7]; got != "wait-1" {
+			t.Fatalf("expected wait token argument wait-1, got %v", got)
+		}
+		if got := args[8]; got != 10000 {
+			t.Fatalf("expected wait poll window argument 10000, got %v", got)
+		}
+		if got := args[9]; got != 1500 {
+			t.Fatalf("expected wait reconnect grace argument 1500, got %v", got)
+		}
+		return &stubRows{rows: [][]any{{`{"result":"wait","wait_token":"wait-1","scope":"host","retry_after":1}`}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.Acquire(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if result.WaitToken != "wait-1" {
+		t.Fatalf("expected wait token replay result, got %+v", result)
+	}
+}
+
+func TestPostgresAcquireRejectsLegacyDenyResult(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{`{"result":"deny","scope":"host","reason":"full","retry_after":1}`}}}, nil
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
 	_, err := backend.Acquire(context.Background(), validAcquireRequest())
 	if err == nil {
-		t.Fatal("expected error for incomplete granted row")
+		t.Fatal("expected error for legacy deny acquire result")
 	}
 }
 
@@ -149,9 +190,9 @@ func TestPostgresAcquireClassifiesTupleMismatchAsConflict(t *testing.T) {
 	}
 }
 
-func TestPostgresAcquireClassifiesInactiveReplayAsConflict(t *testing.T) {
+func TestPostgresAcquireClassifiesWaiterAlreadyAttachedAsConflict(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		return nil, errors.New("pq: cq_acquire request_id replay is no longer active")
+		return nil, errors.New("pq: cq_acquire waiter already attached")
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
@@ -160,66 +201,8 @@ func TestPostgresAcquireClassifiesInactiveReplayAsConflict(t *testing.T) {
 	if !errors.As(err, &conflictErr) {
 		t.Fatalf("expected acquireConflictError, got %v", err)
 	}
-	if conflictErr.Reason != acquireConflictReasonRequestIDReplayNotActive {
-		t.Fatalf("expected replay-not-active reason, got %+v", conflictErr)
-	}
-}
-
-func TestPostgresReleaseByRequestUsesFixedDatabaseAuthoritativeFunction(t *testing.T) {
-	req := validRecoveryReleaseRequest()
-	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		if !strings.Contains(query, "FROM cq_release_by_request(") {
-			t.Fatalf("release recovery must use fixed database-authoritative function, got %s", query)
-		}
-		if len(args) != 7 {
-			t.Fatalf("expected 7 release recovery args, got %d", len(args))
-		}
-		if got := args[0]; got != req.RequestID {
-			t.Fatalf("expected request id %q, got %v", req.RequestID, got)
-		}
-		if got := args[4]; got != req.HardExpireAtMs {
-			t.Fatalf("expected hard expiry %d, got %v", req.HardExpireAtMs, got)
-		}
-		return &stubRows{rows: [][]any{{"released", nil}}}, nil
-	}}
-
-	backend := &postgresBackend{cfg: validTestConfig(), db: client}
-	result, err := backend.Release(context.Background(), req)
-	if err != nil {
-		t.Fatalf("Release error: %v", err)
-	}
-	if result.Result != "released" {
-		t.Fatalf("unexpected release result: %+v", result)
-	}
-}
-
-func TestPostgresPrecheckUsesFixedDatabaseAuthoritativeFunction(t *testing.T) {
-	req := validPrecheckRequest()
-	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		if !strings.Contains(query, "FROM cq_precheck(") {
-			t.Fatalf("precheck must use fixed database-authoritative function, got %s", query)
-		}
-		if len(args) != 6 {
-			t.Fatalf("expected 6 precheck args, got %d", len(args))
-		}
-		if got := args[0]; got != req.HostnameHash {
-			t.Fatalf("expected hostname hash %q, got %v", req.HostnameHash, got)
-		}
-		for _, arg := range args {
-			if gotNowMs, ok := arg.(int64); ok && gotNowMs == req.NowMs {
-				t.Fatalf("precheck must not forward caller nowMs %d to the database helper", req.NowMs)
-			}
-		}
-		return &stubRows{rows: [][]any{{"allow", nil, nil, nil}}}, nil
-	}}
-
-	backend := &postgresBackend{cfg: validTestConfig(), db: client}
-	result, err := backend.Precheck(context.Background(), req)
-	if err != nil {
-		t.Fatalf("Precheck error: %v", err)
-	}
-	if result.Result != "allow" {
-		t.Fatalf("unexpected precheck result: %+v", result)
+	if conflictErr.Reason != acquireConflictReasonWaiterAlreadyAttached {
+		t.Fatalf("expected waiter_already_attached reason, got %+v", conflictErr)
 	}
 }
 
@@ -228,7 +211,10 @@ func TestPostgresReleaseCallsConfiguredRPCAndNormalizesNoopResult(t *testing.T) 
 		if !strings.Contains(query, "custom_release") {
 			t.Fatalf("expected custom release rpc query, got %s", query)
 		}
-		return &stubRows{rows: [][]any{{"noop", "expired"}}}, nil
+		if len(args) != 4 {
+			t.Fatalf("expected 4 release args, got %d", len(args))
+		}
+		return &stubRows{rows: [][]any{{"noop", "expired", "request-1"}}}, nil
 	}}
 
 	cfg := validTestConfig()
@@ -239,20 +225,143 @@ func TestPostgresReleaseCallsConfiguredRPCAndNormalizesNoopResult(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Release error: %v", err)
 	}
-	if result.Result != "noop" || result.Reason != "expired" {
+	if result.Result != "noop" || result.Reason != "expired" || result.RequestID != "request-1" {
 		t.Fatalf("unexpected release result: %+v", result)
 	}
 }
 
-func TestPostgresReleaseRejectsInvalidSuccessfulResult(t *testing.T) {
+func TestPostgresReleaseReturnsAuthoritativeRequestIDWhenPresent(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		return &stubRows{rows: [][]any{{"foo", nil}}}, nil
+		return &stubRows{rows: [][]any{{"released", nil, "request-1"}}}, nil
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
-	_, err := backend.Release(context.Background(), validReleaseRequest())
-	if err == nil {
-		t.Fatal("expected error for invalid release result")
+	result, err := backend.Release(context.Background(), validReleaseRequest())
+	if err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+	if result.RequestID != "request-1" {
+		t.Fatalf("expected authoritative request id, got %+v", result)
+	}
+}
+
+func TestPostgresReleaseRejectsReleasedResultWithoutAuthoritativeRequestID(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{"released", nil, nil}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	if _, err := backend.Release(context.Background(), validReleaseRequest()); err == nil {
+		t.Fatal("expected release validation error when authoritative request id is missing")
+	}
+}
+
+func TestPostgresReleaseRejectsExpiredNoopWithoutAuthoritativeRequestID(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{"noop", "expired", nil}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	if _, err := backend.Release(context.Background(), validReleaseRequest()); err == nil {
+		t.Fatal("expected noop expired validation error when authoritative request id is missing")
+	}
+}
+
+func TestPostgresReleaseRejectsAlreadyReleasedNoopWithoutAuthoritativeRequestID(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{"noop", "already_released", nil}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	if _, err := backend.Release(context.Background(), validReleaseRequest()); err == nil {
+		t.Fatal("expected noop already_released validation error when authoritative request id is missing")
+	}
+}
+
+func TestPostgresPromoteWaitingUsesFixedRPCAndNormalizesGrantedResult(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "row_to_json(result_row) FROM cq_promote_waiting_request(") {
+			t.Fatalf("promote waiting must use fixed authoritative function, got %s", query)
+		}
+		if len(args) != 9 {
+			t.Fatalf("expected 9 promote args, got %d", len(args))
+		}
+		if got := args[0]; got != "waiting-request" {
+			t.Fatalf("expected request id waiting-request, got %v", got)
+		}
+		return &stubRows{rows: [][]any{{`{"result":"granted","lease_id":"lease-2","lease_token":"token-2","expires_at_ms":2400}`}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.PromoteWaiting(context.Background(), PromoteWaitingRequest{
+		RequestID:      "waiting-request",
+		HostnameHash:   "host-hash",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		HardExpireAtMs: 5000,
+		NowMs:          1000,
+	})
+	if err != nil {
+		t.Fatalf("PromoteWaiting error: %v", err)
+	}
+	if result.Result != "granted" || result.LeaseID != "lease-2" || result.LeaseToken != "token-2" {
+		t.Fatalf("unexpected promote result: %+v", result)
+	}
+}
+
+func TestPostgresCancelUsesFixedRPCWhenSQLContractExists(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "FROM cq_cancel(") {
+			t.Fatalf("cancel must use fixed database-authoritative function, got %s", query)
+		}
+		if len(args) != 7 {
+			t.Fatalf("expected 7 cancel args, got %d", len(args))
+		}
+		if got := args[0]; got != "request-1" {
+			t.Fatalf("expected request id request-1, got %v", got)
+		}
+		return &stubRows{rows: [][]any{{"cancelled", nil}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.Cancel(context.Background(), CancelRequest{
+		RequestID:      "request-1",
+		HostnameHash:   "host-hash",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		HardExpireAtMs: 5000,
+		Reason:         "worker_aborted",
+		NowMs:          1000,
+	})
+	if err != nil {
+		t.Fatalf("Cancel error: %v", err)
+	}
+	if result.Result != "cancelled" {
+		t.Fatalf("unexpected cancel result: %+v", result)
+	}
+}
+
+func TestPostgresCancelClassifiesActiveLeaseConflict(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return nil, errors.New("pq: cq_cancel must release active lease")
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	_, err := backend.Cancel(context.Background(), CancelRequest{
+		RequestID:      "request-1",
+		HostnameHash:   "host-hash",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		HardExpireAtMs: 5000,
+		Reason:         "worker_aborted",
+		NowMs:          1000,
+	})
+	var conflictErr *cancelConflictError
+	if !errors.As(err, &conflictErr) {
+		t.Fatalf("expected cancelConflictError, got %v", err)
+	}
+	if conflictErr.Reason != cancelConflictReasonMustReleaseActiveLease {
+		t.Fatalf("expected must_release_active_lease reason, got %+v", conflictErr)
 	}
 }
 
@@ -264,7 +373,7 @@ func TestPostgresExpireScopeUsesConfiguredRPCAndBoundedLimit(t *testing.T) {
 		if got := args[5]; got != 500 {
 			t.Fatalf("expected bounded limit 500, got %v", got)
 		}
-		return &stubRows{rows: [][]any{{int64(17)}}}, nil
+		return &stubRows{rows: [][]any{{"expired-request-1"}, {"expired-request-2"}}}, nil
 	}}
 
 	cfg := validTestConfig()
@@ -275,8 +384,77 @@ func TestPostgresExpireScopeUsesConfiguredRPCAndBoundedLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExpireScope error: %v", err)
 	}
-	if result.ExpiredCount != 17 {
+	if result.ExpiredCount != 2 {
 		t.Fatalf("expected 17 expired leases, got %+v", result)
+	}
+	if len(result.ExpiredRequestIDs) != 2 || result.ExpiredRequestIDs[0] != "expired-request-1" || result.ExpiredRequestIDs[1] != "expired-request-2" {
+		t.Fatalf("expected authoritative expired request ids, got %+v", result)
+	}
+}
+
+func TestPostgresExpireScopeTreatsZeroRowsAsNoop(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: nil}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.ExpireScope(context.Background(), ExpireScopeRequest{Scope: "host", HostnameHash: "host-hash", Limit: 1})
+	if err != nil {
+		t.Fatalf("expected zero-row expire noop, got err=%v", err)
+	}
+	if result.ExpiredCount != 0 || len(result.ExpiredRequestIDs) != 0 {
+		t.Fatalf("expected zero-row expire noop result, got %+v", result)
+	}
+}
+
+func TestPostgresLoadWaitingRequestsReturnsOrderedSnapshots(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if args != nil && len(args) != 0 {
+			t.Fatalf("expected load waiting query without args, got %v", args)
+		}
+		if !strings.Contains(query, "FROM concurrency_requests") || !strings.Contains(query, "WHERE state = 'waiting'") {
+			t.Fatalf("expected waiting recovery query over concurrency_requests, got %s", query)
+		}
+		return &stubRows{rows: [][]any{
+			{"request-1", "example.com", "host-hash", "site-a", "ip-a", "wait-1", int64(100), int64(250), int64(1000)},
+			{"request-2", "example.com", "host-hash", "site-b", "ip-b", nil, int64(200), nil, int64(2000)},
+		}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	results, err := backend.LoadWaitingRequests(context.Background())
+	if err != nil {
+		t.Fatalf("LoadWaitingRequests error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 waiting snapshots, got %+v", results)
+	}
+	if results[0].RequestID != "request-1" || results[0].State != "waiting" || results[0].WaitToken != "wait-1" || results[0].TupleKey != makeTupleKey("host-hash", "site-a", "ip-a") {
+		t.Fatalf("unexpected first waiting snapshot: %+v", results[0])
+	}
+	if results[1].RequestID != "request-2" || results[1].WaitToken != "" || results[1].WaiterLeaseUntilMs != 0 || results[1].TupleKey != makeTupleKey("host-hash", "site-b", "ip-b") {
+		t.Fatalf("unexpected second waiting snapshot: %+v", results[1])
+	}
+}
+
+func TestPostgresLoadActiveRequestIDsReturnsOrderedIDs(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if args != nil && len(args) != 0 {
+			t.Fatalf("expected load active query without args, got %v", args)
+		}
+		if !strings.Contains(query, "FROM concurrency_requests") || !strings.Contains(query, "WHERE state = 'active'") {
+			t.Fatalf("expected active recovery query over concurrency_requests, got %s", query)
+		}
+		return &stubRows{rows: [][]any{{"active-request-1"}, {"active-request-2"}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	results, err := backend.LoadActiveRequestIDs(context.Background())
+	if err != nil {
+		t.Fatalf("LoadActiveRequestIDs error: %v", err)
+	}
+	if len(results) != 2 || results[0] != "active-request-1" || results[1] != "active-request-2" {
+		t.Fatalf("unexpected active request ids: %+v", results)
 	}
 }
 

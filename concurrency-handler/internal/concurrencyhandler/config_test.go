@@ -33,6 +33,10 @@ func validTestConfig() Config {
 			Lease: ConcurrencyLeaseConfig{
 				RequireHardExpiry: true,
 			},
+			Wait: ConcurrencyWaitConfig{
+				WaitPollWindowMs:     10000,
+				WaitReconnectGraceMs: 1500,
+			},
 			Sweep: ConcurrencySweepConfig{
 				Enabled:         true,
 				IntervalSeconds: 300,
@@ -44,16 +48,6 @@ func validTestConfig() Config {
 				ExpireFunc:  "cq_expire_scope",
 			},
 		},
-	}
-}
-
-func validPrecheckRequest() PrecheckRequest {
-	return PrecheckRequest{
-		Hostname:     "example.com",
-		HostnameHash: "host-hash",
-		SiteBucket:   "site-a",
-		IPBucket:     "ip-a",
-		NowMs:        1000,
 	}
 }
 
@@ -75,18 +69,6 @@ func validReleaseRequest() ReleaseRequest {
 		LeaseToken: "lease-token",
 		Reason:     "stream_complete",
 		NowMs:      1000,
-	}
-}
-
-func validRecoveryReleaseRequest() ReleaseRequest {
-	return ReleaseRequest{
-		RequestID:      "request-1",
-		HostnameHash:   "host-hash",
-		SiteBucket:     "site-a",
-		IPBucket:       "ip-a",
-		HardExpireAtMs: 5000,
-		Reason:         "acquire_recovery",
-		NowMs:          1000,
 	}
 }
 
@@ -128,6 +110,7 @@ func TestParseConfigBytesAppliesDefaults(t *testing.T) {
 		"concurrency": {
 			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
 			"lease": {"requireHardExpiry": true},
+			"wait": {"waitPollWindowMs": 10000, "waitReconnectGraceMs": 1500},
 			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
 			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
 		}
@@ -158,5 +141,60 @@ func TestConfigValidateRequiresConcurrencyContractFields(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "acquire") {
 		t.Fatalf("expected acquire rpc error, got %v", err)
+	}
+}
+
+func TestConfigValidateRequiresWaitPollWindowMs(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Concurrency.Wait.WaitPollWindowMs = 0
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected missing waitPollWindowMs error")
+	}
+	if !strings.Contains(err.Error(), "waitPollWindowMs") {
+		t.Fatalf("expected waitPollWindowMs error, got %v", err)
+	}
+}
+
+func TestConfigValidateRequiresWaitReconnectGraceMs(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Concurrency.Wait.WaitReconnectGraceMs = 0
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected missing waitReconnectGraceMs error")
+	}
+	if !strings.Contains(err.Error(), "waitReconnectGraceMs") {
+		t.Fatalf("expected waitReconnectGraceMs error, got %v", err)
+	}
+}
+
+func TestParseConfigBytesPreservesWaitingTimingValues(t *testing.T) {
+	data := []byte(`{
+		"controller": {},
+		"auth": {"enabled": true, "token": "secret"},
+		"backend": {
+			"mode": "postgrest",
+			"postgrest": {"baseUrl": "https://postgrest.example.test"}
+		},
+		"concurrency": {
+			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
+			"lease": {"requireHardExpiry": true},
+			"wait": {"waitPollWindowMs": 12000, "waitReconnectGraceMs": 1800},
+			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
+			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
+		}
+	}`)
+
+	cfg, err := ParseConfigBytes(data)
+	if err != nil {
+		t.Fatalf("ParseConfigBytes error: %v", err)
+	}
+	if cfg.Concurrency.Wait.WaitPollWindowMs != 12000 {
+		t.Fatalf("expected waitPollWindowMs 12000, got %d", cfg.Concurrency.Wait.WaitPollWindowMs)
+	}
+	if cfg.Concurrency.Wait.WaitReconnectGraceMs != 1800 {
+		t.Fatalf("expected waitReconnectGraceMs 1800, got %d", cfg.Concurrency.Wait.WaitReconnectGraceMs)
 	}
 }

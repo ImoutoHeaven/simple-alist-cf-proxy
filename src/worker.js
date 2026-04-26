@@ -22,8 +22,8 @@ const DEFAULT_SLOT_HANDLER_TIMEOUT_MS = 20000;
 const DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = 8000;
 const DEFAULT_SLOT_HANDLER_RELEASE_TIMEOUT_MS = 1500;
 const DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER = 'X-CQ-Auth';
-const DEFAULT_TRUE_CONCURRENCY_PRECHECK_TIMEOUT_MS = 1200;
-const DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS = 2000;
+// Must exceed the default CQ wait poll window with explicit slack, or held acquires can time out client-side first.
+const DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS = 11500;
 const DEFAULT_TRUE_CONCURRENCY_RELEASE_TIMEOUT_MS = 1500;
 const TRUE_CONCURRENCY_RELEASE_RETRY_DELAYS_MS = [0, 2000, 4000, 8000];
 const FINAL_CLEANUP_RELEASE_CONCURRENCY = 2;
@@ -1126,10 +1126,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     url: concurrencyHandlerUrl,
     authKey: concurrencyHandlerAuthKey,
     authHeader: concurrencyHandlerAuthHeader,
-    precheckTimeoutMs: normalizePositiveMs(
-      trueConcurrencyConfigRaw.precheckTimeoutMs,
-      DEFAULT_TRUE_CONCURRENCY_PRECHECK_TIMEOUT_MS,
-    ),
     acquireTimeoutMs: normalizePositiveMs(
       trueConcurrencyConfigRaw.acquireTimeoutMs,
       DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS,
@@ -1540,17 +1536,32 @@ const normalizePostgrestBaseUrl = (url) => {
   return url.endsWith('/') ? url.slice(0, -1) : url;
 };
 
-const TRUE_CONCURRENCY_PRECHECK_RESULTS = new Set(['allow', 'deny']);
-const TRUE_CONCURRENCY_ACQUIRE_RESULTS = new Set(['granted', 'deny']);
+const TRUE_CONCURRENCY_ACQUIRE_RESULTS = new Set(['granted', 'wait', 'conflict', 'released', 'cancelled', 'expired']);
 const TRUE_CONCURRENCY_RELEASE_RESULTS = new Set(['released', 'noop']);
-const TRUE_CONCURRENCY_DENY_SCOPES = new Set(['host', 'site', 'site_ip']);
-const TRUE_CONCURRENCY_DENY_REASONS = new Set(['full']);
+const TRUE_CONCURRENCY_CANCEL_RESULTS = new Set(['cancelled', 'noop', 'conflict']);
+const TRUE_CONCURRENCY_WAIT_SCOPES = new Set(['host', 'site', 'site_ip']);
+const TRUE_CONCURRENCY_ACQUIRE_CONFLICT_REASONS = new Set([
+  'request_id_tuple_mismatch',
+  'waiter_already_attached',
+  'stale_wait_token',
+]);
+const TRUE_CONCURRENCY_CANCEL_CONFLICT_REASONS = new Set([
+  'request_id_tuple_mismatch',
+  'must_release_active_lease',
+]);
+const TRUE_CONCURRENCY_TERMINAL_REASONS = new Set([
+  'already_released',
+  'request_cancelled',
+  'hard_expired',
+  'waiter_detached_timeout',
+]);
 const TRUE_CONCURRENCY_RELEASE_NOOP_REASONS = new Set([
   'already_released',
   'expired',
   'not_found',
   'token_mismatch',
 ]);
+const TRUE_CONCURRENCY_CANCEL_NOOP_REASONS = new Set(['already_terminal']);
 
 const isTrueConcurrencyLeaseIdentity = (lease) => (
   typeof lease?.leaseId === 'string'
@@ -1559,17 +1570,17 @@ const isTrueConcurrencyLeaseIdentity = (lease) => (
   && lease.leaseToken
 );
 
-const isTrueConcurrencyRecoveryIdentity = (lease) => (
-  typeof lease?.requestId === 'string'
-  && lease.requestId
-  && typeof lease?.hostnameHash === 'string'
-  && lease.hostnameHash
-  && typeof lease?.siteBucket === 'string'
-  && lease.siteBucket
-  && typeof lease?.ipBucket === 'string'
-  && lease.ipBucket
-  && Number.isFinite(Number(lease?.hardExpireAtMs))
-  && Number(lease.hardExpireAtMs) > 0
+const isTrueConcurrencyRequestIdentity = (requestIdentity) => (
+  typeof requestIdentity?.requestId === 'string'
+  && requestIdentity.requestId
+  && typeof requestIdentity?.hostnameHash === 'string'
+  && requestIdentity.hostnameHash
+  && typeof requestIdentity?.siteBucket === 'string'
+  && requestIdentity.siteBucket
+  && typeof requestIdentity?.ipBucket === 'string'
+  && requestIdentity.ipBucket
+  && Number.isFinite(Number(requestIdentity?.hardExpireAtMs))
+  && Number(requestIdentity.hardExpireAtMs) > 0
 );
 
 const buildTrueConcurrencyReleasePayload = (lease, reason) => {
@@ -1582,57 +1593,35 @@ const buildTrueConcurrencyReleasePayload = (lease, reason) => {
     };
   }
 
-  if (isTrueConcurrencyRecoveryIdentity(lease)) {
+  throw new Error('[CQ] release requires lease identity');
+};
+
+const buildTrueConcurrencyCancelPayload = (requestIdentity, reason) => {
+  if (isTrueConcurrencyRequestIdentity(requestIdentity)) {
     return {
-      requestId: lease.requestId,
-      hostnameHash: lease.hostnameHash,
-      siteBucket: lease.siteBucket,
-      ipBucket: lease.ipBucket,
-      hardExpireAtMs: Number(lease.hardExpireAtMs),
+      requestId: requestIdentity.requestId,
+      hostnameHash: requestIdentity.hostnameHash,
+      siteBucket: requestIdentity.siteBucket,
+      ipBucket: requestIdentity.ipBucket,
+      hardExpireAtMs: Number(requestIdentity.hardExpireAtMs),
       reason,
       nowMs: Date.now(),
     };
   }
 
-  throw new Error('[CQ] release requires lease identity or recovery tuple');
+  throw new Error('[CQ] cancel requires request identity');
 };
 
-const normalizeTrueConcurrencyResult = (operation, data, options = {}) => {
+const readTrueConcurrencyResult = (operation, data, allowedResults) => {
   const result = typeof data?.result === 'string' ? data.result : '';
-  const allowedResults = options.allowedResults instanceof Set ? options.allowedResults : null;
-
-  if (!result || (allowedResults && !allowedResults.has(result))) {
+  if (!result || !(allowedResults instanceof Set) || !allowedResults.has(result)) {
     throw new Error(`[CQ] ${operation} returned malformed success result: ${result || 'unknown'}`);
   }
+  return result;
+};
 
-  if (result === 'allow') {
-    return { result: 'allow' };
-  }
-
-  if (result === 'deny') {
-    if (typeof data?.scope !== 'string' || !data.scope) {
-      throw new Error(`[CQ] ${operation} deny response missing scope`);
-    }
-    if (!TRUE_CONCURRENCY_DENY_SCOPES.has(data.scope)) {
-      throw new Error(`[CQ] ${operation} deny response has unsupported scope`);
-    }
-    if (typeof data?.reason !== 'string' || !data.reason) {
-      throw new Error(`[CQ] ${operation} deny response missing reason`);
-    }
-    if (!TRUE_CONCURRENCY_DENY_REASONS.has(data.reason)) {
-      throw new Error(`[CQ] ${operation} deny response has unsupported reason`);
-    }
-    const retryAfter = Number(data?.retryAfter);
-    if (!Number.isFinite(retryAfter) || retryAfter <= 0) {
-      throw new Error(`[CQ] ${operation} deny response missing retryAfter`);
-    }
-    return {
-      result: 'deny',
-      scope: data.scope,
-      reason: data.reason,
-      retryAfter,
-    };
-  }
+const normalizeTrueConcurrencyAcquireResult = (data, options = {}) => {
+  const result = readTrueConcurrencyResult('acquire', data, TRUE_CONCURRENCY_ACQUIRE_RESULTS);
 
   if (result === 'granted') {
     if (typeof data?.leaseId !== 'string' || !data.leaseId) {
@@ -1656,24 +1645,97 @@ const normalizeTrueConcurrencyResult = (operation, data, options = {}) => {
     };
   }
 
+  if (result === 'wait') {
+    if (typeof data?.waitToken !== 'string' || !data.waitToken) {
+      throw new Error('[CQ] acquire wait response missing waitToken');
+    }
+    if (typeof data?.scope !== 'string' || !data.scope) {
+      throw new Error('[CQ] acquire wait response missing scope');
+    }
+    if (!TRUE_CONCURRENCY_WAIT_SCOPES.has(data.scope)) {
+      throw new Error('[CQ] acquire wait response has unsupported scope');
+    }
+    const retryAfter = Number(data?.retryAfter);
+    if (!Number.isFinite(retryAfter) || retryAfter <= 0) {
+      throw new Error('[CQ] acquire wait response missing retryAfter');
+    }
+    return {
+      result: 'wait',
+      waitToken: data.waitToken,
+      scope: data.scope,
+      retryAfter,
+    };
+  }
+
+  if (result === 'conflict') {
+    if (typeof data?.reason !== 'string' || !data.reason) {
+      throw new Error('[CQ] acquire conflict response missing reason');
+    }
+    if (!TRUE_CONCURRENCY_ACQUIRE_CONFLICT_REASONS.has(data.reason)) {
+      throw new Error('[CQ] acquire conflict response has unsupported reason');
+    }
+    return {
+      result: 'conflict',
+      reason: data.reason,
+    };
+  }
+
+  if (typeof data?.reason !== 'string' || !data.reason) {
+    throw new Error(`[CQ] acquire ${result} response missing reason`);
+  }
+  if (!TRUE_CONCURRENCY_TERMINAL_REASONS.has(data.reason)) {
+    throw new Error(`[CQ] acquire ${result} response has unsupported reason`);
+  }
+  return {
+    result,
+    reason: data.reason,
+  };
+};
+
+const normalizeTrueConcurrencyReleaseResult = (data) => {
+  const result = readTrueConcurrencyResult('release', data, TRUE_CONCURRENCY_RELEASE_RESULTS);
   if (result === 'released') {
     return { result: 'released' };
   }
+  if (typeof data?.reason !== 'string' || !data.reason) {
+    throw new Error('[CQ] release noop response missing reason');
+  }
+  if (!TRUE_CONCURRENCY_RELEASE_NOOP_REASONS.has(data.reason)) {
+    throw new Error('[CQ] release noop response has unsupported reason');
+  }
+  return {
+    result: 'noop',
+    reason: data.reason,
+  };
+};
 
+const normalizeTrueConcurrencyCancelResult = (data) => {
+  const result = readTrueConcurrencyResult('cancel', data, TRUE_CONCURRENCY_CANCEL_RESULTS);
+  if (result === 'cancelled') {
+    return { result: 'cancelled' };
+  }
   if (result === 'noop') {
     if (typeof data?.reason !== 'string' || !data.reason) {
-      throw new Error('[CQ] release noop response missing reason');
+      throw new Error('[CQ] cancel noop response missing reason');
     }
-    if (!TRUE_CONCURRENCY_RELEASE_NOOP_REASONS.has(data.reason)) {
-      throw new Error('[CQ] release noop response has unsupported reason');
+    if (!TRUE_CONCURRENCY_CANCEL_NOOP_REASONS.has(data.reason)) {
+      throw new Error('[CQ] cancel noop response has unsupported reason');
     }
     return {
       result: 'noop',
       reason: data.reason,
     };
   }
-
-  throw new Error(`[CQ] ${operation} returned unsupported result: ${result || 'unknown'}`);
+  if (typeof data?.reason !== 'string' || !data.reason) {
+    throw new Error('[CQ] cancel conflict response missing reason');
+  }
+  if (!TRUE_CONCURRENCY_CANCEL_CONFLICT_REASONS.has(data.reason)) {
+    throw new Error('[CQ] cancel conflict response has unsupported reason');
+  }
+  return {
+    result: 'conflict',
+    reason: data.reason,
+  };
 };
 
 const createConcurrencyHandlerClient = (config) => {
@@ -1685,13 +1747,9 @@ const createConcurrencyHandlerClient = (config) => {
 
   const authKey = normalizeStringValue(handlerCfg.authKey);
   const authHeader = normalizeStringValue(handlerCfg.authHeader, DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER);
-  const precheckUrl = `${baseUrl}/api/v1/concurrency/precheck`;
   const acquireUrl = `${baseUrl}/api/v1/concurrency/acquire`;
   const releaseUrl = `${baseUrl}/api/v1/concurrency/release`;
-  const precheckTimeoutMs = normalizePositiveMs(
-    handlerCfg.precheckTimeoutMs,
-    DEFAULT_TRUE_CONCURRENCY_PRECHECK_TIMEOUT_MS,
-  );
+  const cancelUrl = `${baseUrl}/api/v1/concurrency/cancel`;
   const acquireTimeoutMs = normalizePositiveMs(
     handlerCfg.acquireTimeoutMs,
     DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS,
@@ -1709,7 +1767,12 @@ const createConcurrencyHandlerClient = (config) => {
     return headers;
   };
 
-  const postJson = async (url, payload, timeoutMs, signal) => {
+  const postJson = async (url, payload, options = {}) => {
+    const timeoutMs = normalizePositiveMs(options.timeoutMs, DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS);
+    const signal = options.signal;
+    const allowedStatuses = Array.isArray(options.allowedStatuses) && options.allowedStatuses.length > 0
+      ? options.allowedStatuses
+      : [200];
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const abortHandler = () => controller.abort();
@@ -1728,7 +1791,7 @@ const createConcurrencyHandlerClient = (config) => {
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
-      if (!response.ok) {
+      if (!allowedStatuses.includes(response.status)) {
         throw new Error(`[CQ] handler request failed with status ${response.status}`);
       }
 
@@ -1739,7 +1802,7 @@ const createConcurrencyHandlerClient = (config) => {
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(`[CQ] handler response parse failed: ${message}`);
       }
-      return data;
+      return { status: response.status, data };
     } finally {
       clearTimeout(timer);
       if (signal) {
@@ -1749,21 +1812,8 @@ const createConcurrencyHandlerClient = (config) => {
   };
 
   return {
-    async precheck(_ctx, plan, signal) {
-      const data = await postJson(precheckUrl, {
-        hostname: plan.hostname,
-        hostnameHash: plan.hostnameHash,
-        siteBucket: plan.siteBucket,
-        ipBucket: plan.ipBucket,
-        nowMs: plan.nowMs,
-      }, precheckTimeoutMs, signal);
-      return normalizeTrueConcurrencyResult('precheck', data, {
-        allowedResults: TRUE_CONCURRENCY_PRECHECK_RESULTS,
-      });
-    },
-
     async acquire(_ctx, plan, signal) {
-      const data = await postJson(acquireUrl, {
+      const payload = {
         hostname: plan.hostname,
         hostnameHash: plan.hostnameHash,
         siteBucket: plan.siteBucket,
@@ -1771,23 +1821,43 @@ const createConcurrencyHandlerClient = (config) => {
         requestId: plan.requestId,
         hardExpireAtMs: plan.hardExpireAtMs,
         nowMs: plan.nowMs,
-      }, acquireTimeoutMs, signal);
-      return normalizeTrueConcurrencyResult('acquire', data, {
-        allowedResults: TRUE_CONCURRENCY_ACQUIRE_RESULTS,
+      };
+      if (typeof plan.waitToken === 'string' && plan.waitToken) {
+        payload.waitToken = plan.waitToken;
+      }
+      const { data } = await postJson(acquireUrl, payload, {
+        timeoutMs: acquireTimeoutMs,
+        signal,
+        allowedStatuses: [200, 409, 410],
+      });
+      return normalizeTrueConcurrencyAcquireResult(data, {
         hardExpireAtMs: plan.hardExpireAtMs,
       });
     },
 
     async release(_ctx, lease, reason, signal) {
-      const data = await postJson(
+      const { data } = await postJson(
         releaseUrl,
         buildTrueConcurrencyReleasePayload(lease, reason),
-        releaseTimeoutMs,
-        signal,
+        {
+          timeoutMs: releaseTimeoutMs,
+          signal,
+        },
       );
-      return normalizeTrueConcurrencyResult('release', data, {
-        allowedResults: TRUE_CONCURRENCY_RELEASE_RESULTS,
-      });
+      return normalizeTrueConcurrencyReleaseResult(data);
+    },
+
+    async cancel(_ctx, requestIdentity, reason, signal) {
+      const { data } = await postJson(
+        cancelUrl,
+        buildTrueConcurrencyCancelPayload(requestIdentity, reason),
+        {
+          timeoutMs: releaseTimeoutMs,
+          signal,
+          allowedStatuses: [200, 409],
+        },
+      );
+      return normalizeTrueConcurrencyCancelResult(data);
     },
   };
 };
@@ -1803,13 +1873,6 @@ const isTrueConcurrencyManagedHostname = (config, hostname) => {
 const createTrueConcurrencyUnavailableResponse = (origin, message = 'True concurrency unavailable') => (
   createErrorResponse(origin, 503, message)
 );
-
-const createIdentityTransformStream = () => {
-  if (typeof IdentityTransformStream === 'function') {
-    return new IdentityTransformStream();
-  }
-  return new TransformStream();
-};
 
 const createTrueConcurrencyRequestId = () => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -2540,6 +2603,9 @@ const createSlotHandlerClient = (config) => {
         console.error('[FQ] releaseSlot skipped: missing full release identity');
         return false;
       }
+      const hitUpstreamAtMs = Number.isFinite(fqContext.hitUpstreamAtMs)
+        ? fqContext.hitUpstreamAtMs
+        : fqContext.nowMs;
       const payload = {
         hostname,
         hostnameHash,
@@ -2549,7 +2615,7 @@ const createSlotHandlerClient = (config) => {
         queryToken,
         invocationEpoch,
         releaseOwnerRequired: ownerRoutingEnabled,
-        hitUpstreamAtMs: fqContext.hitUpstreamAtMs || fqContext.nowMs,
+        hitUpstreamAtMs,
         now: Date.now(),
       };
       const routingHeaders = ownerRoutingEnabled
@@ -2646,8 +2712,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   const url = new URL(request.url);
   const normalizedPath = normalizePath(url.pathname);
   let path = normalizedPath;
-  let clientAborted = false;
   const clientSignal = request.signal;
+  let clientAborted = clientSignal?.aborted === true;
+  const didClientAbort = () => clientAborted || clientSignal?.aborted === true;
   if (clientSignal && typeof clientSignal.addEventListener === 'function') {
     clientSignal.addEventListener('abort', () => {
       clientAborted = true;
@@ -3267,9 +3334,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  const authorizeBreakerOnlyAttemptIfNeeded = async (hostname) => {
-    const hostnameAdmissionMode = resolveAdmissionMode(config, hostname);
-    if (!throttleCheckEnabled || hostnameAdmissionMode !== 'breaker_only') {
+  const authorizeBreakerAttempt = async (hostname) => {
+    if (!throttleCheckEnabled || !hostname || !isThrottleManagedHostname(hostname)) {
       return {
         blockedResponse: null,
         attemptVersion: null,
@@ -3334,6 +3400,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         attemptTicket: null,
       };
     }
+  };
+
+  const authorizeBreakerOnlyAttemptIfNeeded = async (hostname) => {
+    const hostnameAdmissionMode = resolveAdmissionMode(config, hostname);
+    if (hostnameAdmissionMode !== 'breaker_only') {
+      return {
+        blockedResponse: null,
+        attemptVersion: null,
+        attemptTicket: null,
+      };
+    }
+    return authorizeBreakerAttempt(hostname);
   };
 
   const settleQueueBreakerAttemptIfNeeded = async (hostname) => {
@@ -3599,6 +3677,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let cqLease = null;
   let cqReleaseController = null;
   let cqCleanupBoundToStream = false;
+  let cqAcquireDispatched = false;
 
   const clearPendingBreakerOnlyAttempt = () => {
     pendingBreakerOnlyAttempt = null;
@@ -3758,21 +3837,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     };
   };
 
-  const createTrueConcurrencyDenyResponse = (denyResult) => {
-    const safeHeaders = new Headers();
-    safeHeaders.set('content-type', 'application/json;charset=UTF-8');
-    safeHeaders.set('Access-Control-Allow-Origin', origin);
-    safeHeaders.append('Vary', 'Origin');
-    if (denyResult?.retryAfter) {
-      safeHeaders.set('Retry-After', String(Math.max(1, Math.ceil(denyResult.retryAfter))));
-    }
-    return new Response(JSON.stringify({
-      code: 503,
-      message: 'True concurrency limit reached, please retry later',
-    }), {
-      status: 503,
-      headers: safeHeaders,
-    });
+  const createTrueConcurrencyTerminalResponse = (result, reason = '') => {
+    const suffix = reason ? ` (${reason})` : '';
+    return createTrueConcurrencyUnavailableResponse(origin, `True concurrency ${result}${suffix}`);
   };
 
   const clearCurrentTrueConcurrencyState = () => {
@@ -3782,6 +3849,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     cqLease = null;
     cqReleaseController = null;
     cqCleanupBoundToStream = false;
+    cqAcquireDispatched = false;
   };
 
   const ensureCurrentTrueConcurrencyReleased = async (reason, immediate = false) => {
@@ -3801,6 +3869,66 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     releaseController.ensureReleased(reason);
     return true;
+  };
+
+  const buildCurrentTrueConcurrencyRequestIdentity = () => {
+    if (!cqPlan) {
+      return null;
+    }
+    return {
+      requestId: cqPlan.requestId,
+      hostnameHash: cqPlan.hostnameHash,
+      siteBucket: cqPlan.siteBucket,
+      ipBucket: cqPlan.ipBucket,
+      hardExpireAtMs: cqPlan.hardExpireAtMs,
+    };
+  };
+
+  const ensureCurrentTrueConcurrencyCancelled = async (reason, options = {}) => {
+    const allowPreActive = options && options.allowPreActive === true;
+    if (!cqPlan || cqLease || !concurrencyClient) {
+      return true;
+    }
+    if (!cqPlan.waitToken && !allowPreActive) {
+      return true;
+    }
+    if (!cqPlan.waitToken && !cqAcquireDispatched) {
+      return true;
+    }
+
+    const requestIdentity = buildCurrentTrueConcurrencyRequestIdentity();
+    clearCurrentTrueConcurrencyState();
+    if (!requestIdentity) {
+      return true;
+    }
+
+    try {
+      const result = await concurrencyClient.cancel(ctx, requestIdentity, reason);
+      return result?.result === 'cancelled' || result?.result === 'noop';
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[CQ] cancel failed for ${requestIdentity.requestId}:`, message);
+      return false;
+    }
+  };
+
+  const replayCurrentTrueConcurrencyAcquireAfterWaitError = async (phase, error) => {
+    if (!cqPlan?.waitToken || !concurrencyClient || didClientAbort()) {
+      throw error;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[CQ] continue-wait acquire failed during ${phase}, replaying immutable tuple:`, message);
+    cqPlan.nowMs = Date.now();
+    return concurrencyClient.acquire(ctx, cqPlan, clientSignal);
+  };
+
+  const releaseUnusedFairQueueGrantIfNeeded = async (phase) => {
+    if (!needFairQueue || !fqContext?.slotToken) {
+      return true;
+    }
+    fqContext.hitUpstreamAtMs = 0;
+    return finalizeFairQueueOnFailure(phase);
   };
 
   const createFairQueueTimeoutResponse = () => {
@@ -3854,7 +3982,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, clientSignal);
       return await handleFairQueueWaitResult(fqResult);
     } catch (error) {
-      if (clientAborted && isAbortError(error)) {
+      if (didClientAbort() && isAbortError(error)) {
         return createClientAbortResponse(origin);
       }
       const message = error instanceof Error ? error.message : String(error);
@@ -3865,7 +3993,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const finalizeFairQueueOnFailure = async (phase) => {
     if (!fqContext || !fairQueueClient) {
-      return;
+      return true;
     }
 
     const finalized = await finalizeFairQueueContext({
@@ -3877,6 +4005,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (!finalized) {
       pendingFairQueueCleanupContexts.push(fqContext);
     }
+    return finalized;
   };
 
   const waitForInFlightFairQueueHeaderRelease = async (cleanupContext) => {
@@ -4045,6 +4174,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return fairQueuePrepareResult;
     }
 
+    // Worker CQ behavior matrix:
+    // queue_only + CQ: FQ acquire -> CQ fast acquire.
+    // granted => fetch -> FQ early release after headers -> CQ release.
+    // wait => FQ immediate unused-grant release -> continue-wait via stable waitToken -> granted -> fetch -> CQ release.
+    // terminal/conflict => FQ immediate unused-grant release -> terminal response with waiting request cleanup via CQ cancel.
+    // queue_breaker + CQ: FQ acquire(granted + attempt) -> CQ fast acquire.
+    // wait => settle old breaker attempt -> FQ immediate unused-grant release -> continue-wait.
+    // granted after wait => fresh breaker authorize -> fetch or immediate CQ release on breaker deny.
+
     if (needFairQueue || !needTrueConcurrency) {
       clearPendingBreakerOnlyAttempt();
     }
@@ -4077,17 +4215,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         cqCleanupBoundToStream = false;
       }
 
-      if (needFairQueue) {
-        try {
-          const precheckResult = await concurrencyClient.precheck(ctx, cqPlan, clientSignal);
-          if (precheckResult.result === 'deny') {
-            return createTrueConcurrencyDenyResponse(precheckResult);
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          console.warn(`[CQ] advisory precheck failed during ${phase}:`, message);
-        }
-      }
     } else if (cqReleaseController) {
       await ensureCurrentTrueConcurrencyReleased('target_change', true);
     }
@@ -4100,19 +4227,19 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     if (needTrueConcurrency && !cqLease && cqPlan) {
-      if (Date.now() >= cqPlan.hardExpireAtMs) {
-        const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
-        if (settleResponse instanceof Response) {
-          if (needFairQueue) {
-            await finalizeFairQueueOnFailure(`${phase} expired before concurrency acquire`);
+        if (Date.now() >= cqPlan.hardExpireAtMs) {
+          const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
+          if (settleResponse instanceof Response) {
+            if (needFairQueue) {
+              await releaseUnusedFairQueueGrantIfNeeded(`${phase} expired before concurrency acquire`);
+            }
+            return settleResponse;
           }
-          return settleResponse;
+          if (needFairQueue) {
+            await releaseUnusedFairQueueGrantIfNeeded(`${phase} expired before concurrency acquire`);
+          }
+          return createUnauthorizedResponse(origin, 'link expired');
         }
-        if (needFairQueue) {
-          await finalizeFairQueueOnFailure(`${phase} expired before concurrency acquire`);
-        }
-        return createUnauthorizedResponse(origin, 'link expired');
-      }
 
       if (!needFairQueue) {
         clearPendingBreakerOnlyAttempt();
@@ -4125,20 +4252,83 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
       try {
         cqPlan.nowMs = Date.now();
-        const acquireResult = await concurrencyClient.acquire(ctx, cqPlan, clientSignal);
-        if (acquireResult.result === 'deny') {
+        cqAcquireDispatched = true;
+        let acquireResult = await concurrencyClient.acquire(ctx, cqPlan, clientSignal);
+
+        if (acquireResult.result === 'wait') {
+          cqPlan.waitToken = acquireResult.waitToken;
+          if (resolveAdmissionMode(config, cqPlan.hostname) === 'queue_breaker') {
+            const settleResponse = await settleQueueBreakerAttemptIfNeeded(cqPlan.hostname);
+            if (settleResponse instanceof Response) {
+              const fairQueueReleased = await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq wait settle failure`);
+              await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
+              if (!fairQueueReleased) {
+                return createErrorResponse(origin, 503, 'Fair queue unavailable');
+              }
+              return settleResponse;
+            }
+          }
+          const fairQueueReleased = await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq wait release`);
+          if (!fairQueueReleased) {
+            await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
+            return createErrorResponse(origin, 503, 'Fair queue unavailable');
+          }
+
+          while (acquireResult.result === 'wait') {
+            cqPlan.nowMs = Date.now();
+            try {
+              acquireResult = await concurrencyClient.acquire(ctx, cqPlan, clientSignal);
+            } catch (error) {
+              acquireResult = await replayCurrentTrueConcurrencyAcquireAfterWaitError(phase, error);
+            }
+          }
+        }
+
+        if (acquireResult.result === 'conflict' || acquireResult.result === 'released' || acquireResult.result === 'cancelled' || acquireResult.result === 'expired') {
           const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
           if (settleResponse instanceof Response) {
             if (needFairQueue) {
-              await finalizeFairQueueOnFailure(`${phase} cq deny`);
+              await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq terminal settle failure`);
+            }
+            if (cqPlan?.waitToken) {
+              await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
             }
             return settleResponse;
           }
           if (needFairQueue) {
-            await finalizeFairQueueOnFailure(`${phase} cq deny`);
+            await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq terminal release`);
           }
-          return createTrueConcurrencyDenyResponse(acquireResult);
+          if (cqPlan?.waitToken) {
+            await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
+          }
+          return createTrueConcurrencyTerminalResponse(acquireResult.result, acquireResult.reason);
         }
+
+        if (resolveAdmissionMode(config, cqPlan.hostname) === 'queue_breaker' && needFairQueue && !fqContext?.slotToken) {
+          const breakerAttempt = await authorizeBreakerAttempt(cqPlan.hostname);
+          if (breakerAttempt?.blockedResponse) {
+            cqLease = {
+              ...acquireResult,
+              requestId: cqPlan.requestId,
+              hostname: cqPlan.hostname,
+              hostnameHash: cqPlan.hostnameHash,
+              siteBucket: cqPlan.siteBucket,
+              ipBucket: cqPlan.ipBucket,
+              hardExpireAtMs: cqPlan.hardExpireAtMs,
+            };
+            cqReleaseController = createConcurrencyReleaseController({
+              client: concurrencyClient,
+              ctx,
+              lease: cqLease,
+              label: cqPlan.hostname,
+            });
+            await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
+            return breakerAttempt.blockedResponse;
+          }
+          fqContext.attemptVersion = breakerAttempt?.attemptVersion ?? null;
+          fqContext.attemptTicket = breakerAttempt?.attemptTicket ?? null;
+        }
+
         cqLease = {
           ...acquireResult,
           requestId: cqPlan.requestId,
@@ -4154,49 +4344,37 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           lease: cqLease,
           label: cqPlan.hostname,
         });
+        cqAcquireDispatched = false;
+        delete cqPlan.waitToken;
       } catch (error) {
-        if (clientAborted && isAbortError(error)) {
+        if (didClientAbort() && isAbortError(error)) {
           const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan?.hostname);
           if (settleResponse instanceof Response) {
             if (needFairQueue) {
-              await finalizeFairQueueOnFailure(`${phase} client abort during cq acquire`);
+              await releaseUnusedFairQueueGrantIfNeeded(`${phase} client abort during cq acquire`);
             }
             return settleResponse;
           }
           if (needFairQueue) {
-            await finalizeFairQueueOnFailure(`${phase} client abort during cq acquire`);
+            await releaseUnusedFairQueueGrantIfNeeded(`${phase} client abort during cq acquire`);
           }
+          await ensureCurrentTrueConcurrencyCancelled('worker_aborted', { allowPreActive: true });
           return createClientAbortResponse(origin);
         }
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[CQ] acquire failed during ${phase}:`, message);
-        if (!cqReleaseController && cqPlan) {
-          cqLease = {
-            requestId: cqPlan.requestId,
-            hostname: cqPlan.hostname,
-            hostnameHash: cqPlan.hostnameHash,
-            siteBucket: cqPlan.siteBucket,
-            ipBucket: cqPlan.ipBucket,
-            hardExpireAtMs: cqPlan.hardExpireAtMs,
-          };
-          cqReleaseController = createConcurrencyReleaseController({
-            client: concurrencyClient,
-            ctx,
-            lease: cqLease,
-            label: cqPlan.hostname,
-          });
-          await ensureCurrentTrueConcurrencyReleased('acquire_recovery', true);
-        }
         const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan?.hostname);
         if (settleResponse instanceof Response) {
           if (needFairQueue) {
-            await finalizeFairQueueOnFailure(`${phase} cq failure`);
+            await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq failure`);
           }
+          await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
           return settleResponse;
         }
         if (needFairQueue) {
-          await finalizeFairQueueOnFailure(`${phase} cq failure`);
+          await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq failure`);
         }
+        await ensureCurrentTrueConcurrencyCancelled('worker_aborted', { allowPreActive: true });
         return createTrueConcurrencyUnavailableResponse(origin);
       }
     }
@@ -4391,7 +4569,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       });
     }
 
-    const streamPair = createIdentityTransformStream();
+    const streamPair = new TransformStream({
+      transform(chunk, controller) {
+        controller.enqueue(chunk);
+      },
+      async flush() {
+        await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
+      },
+    });
     const abortController = new AbortController();
     const msUntilExpire = Math.max(0, hardExpireAtMs - Date.now());
     const expireTimer = setTimeout(() => abortController.abort(), msUntilExpire);
@@ -4412,10 +4597,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       preventAbort: false,
       preventCancel: false,
       preventClose: false,
-    }).then(async () => {
-      await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
     }).catch(async (error) => {
-      const reason = clientAborted
+      const reason = didClientAbort()
         ? 'client_disconnect'
         : (Date.now() >= hardExpireAtMs ? 'hard_expiry' : 'upstream_failure');
       await ensureCurrentTrueConcurrencyReleased(reason, true);
@@ -4632,7 +4815,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return error;
     }
 
-    if (clientAborted && isAbortError(error)) {
+    if (didClientAbort() && isAbortError(error)) {
       return createClientAbortResponse(origin);
     }
     throw error;

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -51,13 +52,6 @@ func normalizeRPCPayload(raw any) any {
 	return raw
 }
 
-func requireResultString(result string, action string) error {
-	if strings.TrimSpace(result) == "" {
-		return fmt.Errorf("postgrest %s returned missing result", action)
-	}
-	return nil
-}
-
 func (b *postgrestBackend) doRPC(ctx context.Context, funcName string, payload any, result any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -75,7 +69,7 @@ func (b *postgrestBackend) doRPC(ctx context.Context, funcName string, payload a
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
-		return classifyAcquireConflict(fmt.Errorf("postgrest rpc %s failed: status=%d body=%s", funcName, response.StatusCode, string(data)))
+		return fmt.Errorf("postgrest rpc %s failed: status=%d body=%s", funcName, response.StatusCode, string(data))
 	}
 	if result == nil {
 		return nil
@@ -99,50 +93,21 @@ func (b *postgrestBackend) doRPC(ctx context.Context, funcName string, payload a
 	return json.Unmarshal(data, result)
 }
 
-func (b *postgrestBackend) Precheck(ctx context.Context, req PrecheckRequest) (*PrecheckResult, error) {
-	result := &struct {
-		Result     string `json:"result"`
-		Scope      string `json:"scope"`
-		Reason     string `json:"reason"`
-		RetryAfter int    `json:"retry_after"`
-	}{}
-	err := b.doRPC(ctx, fixedPrecheckFunc, map[string]any{
-		"p_hostname_hash":         req.HostnameHash,
-		"p_site_bucket":           canonicalBucket(req.SiteBucket),
-		"p_ip_bucket":             canonicalBucket(req.IPBucket),
-		"p_host_max_in_flight":    b.cfg.Concurrency.Caps.HostMaxInFlight,
-		"p_site_max_in_flight":    b.cfg.Concurrency.Caps.SiteMaxInFlight,
-		"p_site_ip_max_in_flight": b.cfg.Concurrency.Caps.SiteIPMaxInFlight,
-	}, result)
-	if err != nil {
-		return nil, err
-	}
-	serviceResult := &PrecheckResult{
-		Result:     result.Result,
-		Scope:      result.Scope,
-		Reason:     result.Reason,
-		RetryAfter: result.RetryAfter,
-	}
-	if err := validatePrecheckResult(serviceResult); err != nil {
-		return nil, err
-	}
-	return serviceResult, nil
-}
-
 func (b *postgrestBackend) Acquire(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
 	if _, err := validatedIdentifier(b.cfg.Concurrency.RPC.AcquireFunc); err != nil {
 		return nil, err
 	}
 	result := &struct {
-		Result      string `json:"result"`
-		LeaseID     string `json:"lease_id"`
-		LeaseToken  string `json:"lease_token"`
-		ExpiresAtMs int64  `json:"expires_at_ms"`
-		Scope       string `json:"scope"`
-		Reason      string `json:"reason"`
-		RetryAfter  int    `json:"retry_after"`
+		Result      string  `json:"result"`
+		LeaseID     *string `json:"lease_id"`
+		LeaseToken  *string `json:"lease_token"`
+		ExpiresAtMs *int64  `json:"expires_at_ms"`
+		WaitToken   *string `json:"wait_token"`
+		Scope       *string `json:"scope"`
+		Reason      *string `json:"reason"`
+		RetryAfter  *int    `json:"retry_after"`
 	}{}
-	err := b.doRPC(ctx, b.cfg.Concurrency.RPC.AcquireFunc, map[string]any{
+	payload := map[string]any{
 		"p_hostname_hash":         req.HostnameHash,
 		"p_hostname":              req.Hostname,
 		"p_site_bucket":           canonicalBucket(req.SiteBucket),
@@ -150,23 +115,70 @@ func (b *postgrestBackend) Acquire(ctx context.Context, req AcquireRequest) (*Ac
 		"p_request_id":            req.RequestID,
 		"p_hard_expire_at_ms":     req.HardExpireAtMs,
 		"p_now_ms":                req.NowMs,
+		"p_wait_poll_window_ms":   b.cfg.Concurrency.Wait.WaitPollWindowMs,
+		"p_wait_reconnect_grace_ms": b.cfg.Concurrency.Wait.WaitReconnectGraceMs,
 		"p_host_max_in_flight":    b.cfg.Concurrency.Caps.HostMaxInFlight,
 		"p_site_max_in_flight":    b.cfg.Concurrency.Caps.SiteMaxInFlight,
 		"p_site_ip_max_in_flight": b.cfg.Concurrency.Caps.SiteIPMaxInFlight,
 		"p_cleanup_limit":         boundedExpireLimit(b.cfg.Concurrency.Sweep.BatchSize, 500),
-	}, result)
-	if err != nil {
-		return nil, err
 	}
-	serviceResult := &AcquireResult{
+	if strings.TrimSpace(req.WaitToken) != "" {
+		payload["p_wait_token"] = req.WaitToken
+	}
+	err := b.doRPC(ctx, b.cfg.Concurrency.RPC.AcquireFunc, payload, result)
+	if err != nil {
+		return nil, classifyAcquireConflict(err)
+	}
+	serviceResult := (&acquireWireResult{
 		Result:      result.Result,
 		LeaseID:     result.LeaseID,
 		LeaseToken:  result.LeaseToken,
 		ExpiresAtMs: result.ExpiresAtMs,
+		WaitToken:   result.WaitToken,
 		Scope:       result.Scope,
 		Reason:      result.Reason,
 		RetryAfter:  result.RetryAfter,
+	}).toServiceResult()
+	if err := validateAcquireResult(req, serviceResult); err != nil {
+		return nil, err
 	}
+	return serviceResult, nil
+}
+
+func (b *postgrestBackend) ProbeContinueWait(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
+	result := &struct {
+		Result      string  `json:"result"`
+		LeaseID     *string `json:"lease_id"`
+		LeaseToken  *string `json:"lease_token"`
+		ExpiresAtMs *int64  `json:"expires_at_ms"`
+		WaitToken   *string `json:"wait_token"`
+		Scope       *string `json:"scope"`
+		Reason      *string `json:"reason"`
+		RetryAfter  *int    `json:"retry_after"`
+	}{}
+	err := b.doRPC(ctx, fixedContinueWaitProbeFunc, map[string]any{
+		"p_hostname_hash":     req.HostnameHash,
+		"p_hostname":          req.Hostname,
+		"p_site_bucket":       canonicalBucket(req.SiteBucket),
+		"p_ip_bucket":         canonicalBucket(req.IPBucket),
+		"p_request_id":        req.RequestID,
+		"p_hard_expire_at_ms": req.HardExpireAtMs,
+		"p_now_ms":            req.NowMs,
+		"p_wait_token":        strings.TrimSpace(req.WaitToken),
+	}, result)
+	if err != nil {
+		return nil, classifyAcquireConflict(err)
+	}
+	serviceResult := (&acquireWireResult{
+		Result:      result.Result,
+		LeaseID:     result.LeaseID,
+		LeaseToken:  result.LeaseToken,
+		ExpiresAtMs: result.ExpiresAtMs,
+		WaitToken:   result.WaitToken,
+		Scope:       result.Scope,
+		Reason:      result.Reason,
+		RetryAfter:  result.RetryAfter,
+	}).toServiceResult()
 	if err := validateAcquireResult(req, serviceResult); err != nil {
 		return nil, err
 	}
@@ -174,39 +186,90 @@ func (b *postgrestBackend) Acquire(ctx context.Context, req AcquireRequest) (*Ac
 }
 
 func (b *postgrestBackend) Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
+	if _, err := validatedIdentifier(b.cfg.Concurrency.RPC.ReleaseFunc); err != nil {
+		return nil, err
+	}
 	result := &struct {
-		Result string `json:"result"`
-		Reason string `json:"reason"`
+		Result    string `json:"result"`
+		Reason    string `json:"reason"`
+		RequestID string `json:"request_id"`
 	}{}
-	funcName := b.cfg.Concurrency.RPC.ReleaseFunc
-	payload := map[string]any{
+	err := b.doRPC(ctx, b.cfg.Concurrency.RPC.ReleaseFunc, map[string]any{
 		"p_lease_id":    req.LeaseID,
 		"p_lease_token": req.LeaseToken,
 		"p_reason":      req.Reason,
 		"p_now_ms":      req.NowMs,
-	}
-	if releaseRequestHasLeaseIdentity(req) {
-		if _, err := validatedIdentifier(funcName); err != nil {
-			return nil, err
-		}
-	} else {
-		funcName = fixedReleaseByRequestFunc
-		payload = map[string]any{
-			"p_request_id":        req.RequestID,
-			"p_hostname_hash":     req.HostnameHash,
-			"p_site_bucket":       canonicalBucket(req.SiteBucket),
-			"p_ip_bucket":         canonicalBucket(req.IPBucket),
-			"p_hard_expire_at_ms": req.HardExpireAtMs,
-			"p_reason":            req.Reason,
-			"p_now_ms":            req.NowMs,
-		}
-	}
-	err := b.doRPC(ctx, funcName, payload, result)
+	}, result)
 	if err != nil {
 		return nil, err
 	}
-	serviceResult := &ReleaseResult{Result: result.Result, Reason: result.Reason}
+	serviceResult := &ReleaseResult{Result: result.Result, Reason: result.Reason, RequestID: result.RequestID}
 	if err := validateReleaseResult(serviceResult); err != nil {
+		return nil, err
+	}
+	return serviceResult, nil
+}
+
+func (b *postgrestBackend) PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+	result := &struct {
+		Result      string  `json:"result"`
+		LeaseID     *string `json:"lease_id"`
+		LeaseToken  *string `json:"lease_token"`
+		ExpiresAtMs *int64  `json:"expires_at_ms"`
+		WaitToken   *string `json:"wait_token"`
+		Scope       *string `json:"scope"`
+		Reason      *string `json:"reason"`
+		RetryAfter  *int    `json:"retry_after"`
+	}{}
+	err := b.doRPC(ctx, fixedPromoteWaitingFunc, map[string]any{
+		"p_request_id":         req.RequestID,
+		"p_hostname_hash":      req.HostnameHash,
+		"p_site_bucket":        canonicalBucket(req.SiteBucket),
+		"p_ip_bucket":          canonicalBucket(req.IPBucket),
+		"p_hard_expire_at_ms":  req.HardExpireAtMs,
+		"p_now_ms":             req.NowMs,
+		"p_host_max_in_flight": b.cfg.Concurrency.Caps.HostMaxInFlight,
+		"p_site_max_in_flight": b.cfg.Concurrency.Caps.SiteMaxInFlight,
+		"p_site_ip_max_in_flight": b.cfg.Concurrency.Caps.SiteIPMaxInFlight,
+	}, result)
+	if err != nil {
+		return nil, classifyAcquireConflict(err)
+	}
+	serviceResult := (&acquireWireResult{
+		Result:      result.Result,
+		LeaseID:     result.LeaseID,
+		LeaseToken:  result.LeaseToken,
+		ExpiresAtMs: result.ExpiresAtMs,
+		WaitToken:   result.WaitToken,
+		Scope:       result.Scope,
+		Reason:      result.Reason,
+		RetryAfter:  result.RetryAfter,
+	}).toServiceResult()
+	if err := validateAcquireResult(AcquireRequest{HardExpireAtMs: req.HardExpireAtMs}, serviceResult); err != nil {
+		return nil, err
+	}
+	return serviceResult, nil
+}
+
+func (b *postgrestBackend) Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error) {
+	result := &struct {
+		Result string `json:"result"`
+		Reason string `json:"reason"`
+	}{}
+	err := b.doRPC(ctx, fixedCancelFunc, map[string]any{
+		"p_request_id":        req.RequestID,
+		"p_hostname_hash":     req.HostnameHash,
+		"p_site_bucket":       canonicalBucket(req.SiteBucket),
+		"p_ip_bucket":         canonicalBucket(req.IPBucket),
+		"p_hard_expire_at_ms": req.HardExpireAtMs,
+		"p_reason":            req.Reason,
+		"p_now_ms":            req.NowMs,
+	}, result)
+	if err != nil {
+		return nil, classifyCancelConflict(err)
+	}
+	serviceResult := &CancelResult{Result: result.Result, Reason: result.Reason}
+	if err := validateCancelResult(serviceResult); err != nil {
 		return nil, err
 	}
 	return serviceResult, nil
@@ -216,7 +279,10 @@ func (b *postgrestBackend) ExpireScope(ctx context.Context, req ExpireScopeReque
 	if _, err := validatedIdentifier(b.cfg.Concurrency.RPC.ExpireFunc); err != nil {
 		return nil, err
 	}
-	var expired int
+	type expireScopeRow struct {
+		RequestID string `json:"request_id"`
+	}
+	var payload any
 	if err := b.doRPC(ctx, b.cfg.Concurrency.RPC.ExpireFunc, map[string]any{
 		"p_scope":         req.Scope,
 		"p_hostname_hash": req.HostnameHash,
@@ -224,14 +290,125 @@ func (b *postgrestBackend) ExpireScope(ctx context.Context, req ExpireScopeReque
 		"p_ip_bucket":     canonicalBucket(req.IPBucket),
 		"p_now_ms":        req.NowMs,
 		"p_limit":         boundedExpireLimit(req.Limit, b.cfg.Concurrency.Sweep.BatchSize),
-	}, &expired); err != nil {
+	}, &payload); err != nil {
 		return nil, err
 	}
-	result := &ExpireScopeResult{ExpiredCount: expired}
+	rows := make([]expireScopeRow, 0, 1)
+	switch typed := payload.(type) {
+	case map[string]any:
+		data, err := json.Marshal(typed)
+		if err != nil {
+			return nil, err
+		}
+		var row expireScopeRow
+		if err := json.Unmarshal(data, &row); err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+	case []any:
+		data, err := json.Marshal(typed)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &rows); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unexpected expire scope payload type %T", payload)
+	}
+	result := &ExpireScopeResult{ExpiredRequestIDs: make([]string, 0, len(rows))}
+	for _, row := range rows {
+		result.ExpiredRequestIDs = append(result.ExpiredRequestIDs, row.RequestID)
+	}
+	result.ExpiredCount = len(result.ExpiredRequestIDs)
 	if err := validateExpireScopeResult(result); err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+func (b *postgrestBackend) LoadWaitingRequests(ctx context.Context) ([]requestSnapshot, error) {
+	params := url.Values{}
+	params.Set("select", "request_id,hostname,hostname_hash,site_bucket,ip_bucket,wait_token,first_wait_at_ms,waiter_lease_until_ms,hard_expire_at_ms")
+	params.Set("state", "eq.waiting")
+	params.Set("order", "hostname_hash.asc,first_wait_at_ms.asc,request_id.asc")
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, b.baseURL+"/concurrency_requests?"+params.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header = b.buildHeaders()
+	response, err := b.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+		return nil, fmt.Errorf("postgrest waiting recovery query failed: status=%d body=%s", response.StatusCode, string(data))
+	}
+	var rows []struct {
+		RequestID          string `json:"request_id"`
+		Hostname           string `json:"hostname"`
+		HostnameHash       string `json:"hostname_hash"`
+		SiteBucket         string `json:"site_bucket"`
+		IPBucket           string `json:"ip_bucket"`
+		WaitToken          string `json:"wait_token"`
+		FirstWaitAtMs      int64  `json:"first_wait_at_ms"`
+		WaiterLeaseUntilMs int64  `json:"waiter_lease_until_ms"`
+		HardExpireAtMs     int64  `json:"hard_expire_at_ms"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&rows); err != nil {
+		return nil, err
+	}
+	snapshots := make([]requestSnapshot, 0, len(rows))
+	for _, row := range rows {
+		snapshots = append(snapshots, requestSnapshot{
+			RequestID:          row.RequestID,
+			Hostname:           row.Hostname,
+			HostnameHash:       row.HostnameHash,
+			SiteBucket:         row.SiteBucket,
+			IPBucket:           row.IPBucket,
+			State:              "waiting",
+			WaitToken:          row.WaitToken,
+			FirstWaitAtMs:      row.FirstWaitAtMs,
+			WaiterLeaseUntilMs: row.WaiterLeaseUntilMs,
+			HardExpireAtMs:     row.HardExpireAtMs,
+			TupleKey:           makeTupleKey(row.HostnameHash, row.SiteBucket, row.IPBucket),
+		})
+	}
+	return snapshots, nil
+}
+
+func (b *postgrestBackend) LoadActiveRequestIDs(ctx context.Context) ([]string, error) {
+	params := url.Values{}
+	params.Set("select", "request_id")
+	params.Set("state", "eq.active")
+	params.Set("order", "request_id.asc")
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, b.baseURL+"/concurrency_requests?"+params.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header = b.buildHeaders()
+	response, err := b.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+		return nil, fmt.Errorf("postgrest active recovery query failed: status=%d body=%s", response.StatusCode, string(data))
+	}
+	var rows []struct {
+		RequestID string `json:"request_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&rows); err != nil {
+		return nil, err
+	}
+	requestIDs := make([]string, 0, len(rows))
+	for _, row := range rows {
+		requestIDs = append(requestIDs, row.RequestID)
+	}
+	return requestIDs, nil
 }
 
 func newBackend(cfg Config) (Backend, error) {

@@ -17,6 +17,12 @@ const readFunctionBody = (functionName) => {
   return match[0];
 };
 
+const expectPatternIndex = (text, pattern, message) => {
+  const index = text.search(pattern);
+  expect(index, message).toBeGreaterThan(-1);
+  return index;
+};
+
 describe('init.sql breaker RPC definitions', () => {
   it('defines breaker warmup runtime columns', () => {
     expect(initSql).toMatch(/"SAMPLES_SINCE_RESET"\s+INTEGER\s+NOT NULL DEFAULT 0/i);
@@ -232,47 +238,61 @@ describe('init.sql breaker RPC definitions', () => {
     expect(functionBody).toMatch(/if\s+v_site_slot_id\s*=\s*0\s+then[\s\S]*?PERFORM\s+func_release_host_slot\(v_host_slot_id,\s*FALSE\);[\s\S]*?status\s*:=\s*'IP_TOO_MANY'[\s\S]*?slot_token\s*:=\s*NULL[\s\S]*?retry_after\s*:=\s*NULL[\s\S]*?attempt_version\s*:=\s*NULL[\s\S]*?attempt_ticket\s*:=\s*NULL[\s\S]*?return next;[\s\S]*?continue;[\s\S]*?elsif\s+v_site_slot_id\s*<\s*0\s+then/i);
   });
 
-  it('defines true-concurrency lease tables and rpc entrypoints', () => {
+  it('defines true-concurrency request-ledger tables and rpc entrypoints', () => {
     expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_leases/i);
+    expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_requests/i);
     expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_host_counters/i);
     expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_site_counters/i);
     expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_site_ip_counters/i);
     expect(initSql).toMatch(/CREATE UNIQUE INDEX IF NOT EXISTS\s+concurrency_leases_request_id_idx\s+ON\s+concurrency_leases\s*\(request_id\)/i);
-    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_precheck\(/i);
+    expect(initSql).toMatch(/CREATE INDEX IF NOT EXISTS\s+concurrency_requests_waiting_host_idx/i);
+    expect(initSql).not.toMatch(/CREATE OR REPLACE FUNCTION\s+cq_precheck\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_expire_scope\(/i);
-    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_acquire\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_release\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_cancel\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_promote_waiting_request\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_acquire\(/i);
+    expect(initSql).not.toMatch(/CREATE OR REPLACE FUNCTION\s+cq_release_by_request\(/i);
   });
 
-  it('uses database-authoritative time for cq_precheck lease visibility and retry_after', () => {
-    const precheckBody = readFunctionBody('cq_precheck');
-
-    expect(precheckBody).toMatch(/clock_timestamp\(\)/i);
-    expect(precheckBody).not.toMatch(/p_now_ms/i);
-    expect(precheckBody).toMatch(/expires_at_ms\s*>\s*v_now_ms/i);
-    expect(precheckBody).toMatch(/retry_after\s*:=\s*CASE/i);
-  });
-
-  it('documents acquire replay rejection and release idempotency', () => {
+  it('encodes waiting-model acquire timing and wait-token replay in cq_acquire', () => {
     const acquireBody = readFunctionBody('cq_acquire');
+
+    expect(acquireBody).toMatch(/p_wait_token\s+text DEFAULT NULL/i);
+    expect(acquireBody).toMatch(/p_wait_poll_window_ms\s+integer DEFAULT 0/i);
+    expect(acquireBody).toMatch(/p_wait_reconnect_grace_ms\s+integer DEFAULT 0/i);
+    expect(acquireBody).toMatch(/v_now_ms\s+bigint := COALESCE\(p_now_ms, \(EXTRACT\(EPOCH FROM clock_timestamp\(\)\) \* 1000\)::bigint\)/i);
+    expect(acquireBody).toMatch(/v_waiter_lease_until_ms := v_now_ms[\s\S]*?p_wait_poll_window_ms[\s\S]*?p_wait_reconnect_grace_ms/i);
+    expect(acquireBody).toMatch(/WHERE concurrency_requests\.wait_token = v_wait_token_input/i);
+    expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire stale wait token'/i);
+    expect(acquireBody).toMatch(/IF v_wait_token_input IS NOT NULL THEN[\s\S]*?UPDATE concurrency_requests[\s\S]*?SET waiter_lease_until_ms = v_waiter_lease_until_ms/i);
+    expect(acquireBody).toMatch(/INSERT INTO concurrency_requests[\s\S]*?state,[\s\S]*?'waiting'[\s\S]*?wait_token,[\s\S]*?waiter_lease_until_ms/i);
+  });
+
+  it('documents request-ledger replay, cancel tombstones, and release idempotency', () => {
+    const acquireBody = readFunctionBody('cq_acquire');
+    const cancelBody = readFunctionBody('cq_cancel');
     const releaseBody = readFunctionBody('cq_release');
     const expireBody = readFunctionBody('cq_expire_scope');
 
     expect(acquireBody).toMatch(/request_id/i);
-    expect(acquireBody).toMatch(/hard_expire_at_ms/i);
-    expect(acquireBody).toMatch(/expires_at_ms/i);
+    expect(acquireBody).toMatch(/wait_token/i);
+    expect(acquireBody).toMatch(/waiter_lease_until_ms/i);
     expect(acquireBody).toMatch(/FOR UPDATE/i);
-    expect(acquireBody).toMatch(/state\s*=\s*'active'/i);
     expect(acquireBody).toMatch(/tuple/i);
     expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire request_id tuple mismatch'/i);
-    expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire request_id replay is no longer active'/i);
-    expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire hard_expire_at_ms is already in the past'/i);
-    expect(acquireBody).toMatch(/FROM\s+concurrency_host_counters[\s\S]*?FOR UPDATE/i);
-    expect(acquireBody).toMatch(/FROM\s+concurrency_site_counters[\s\S]*?FOR UPDATE/i);
-    expect(acquireBody).toMatch(/FROM\s+concurrency_site_ip_counters[\s\S]*?FOR UPDATE/i);
-    expect(acquireBody.indexOf('FROM concurrency_host_counters')).toBeLessThan(acquireBody.indexOf('FROM concurrency_site_counters'));
-    expect(acquireBody.indexOf('FROM concurrency_site_counters')).toBeLessThan(acquireBody.indexOf('FROM concurrency_site_ip_counters'));
-    expect(acquireBody).toMatch(/v_expires_at_ms\s*:=\s*p_hard_expire_at_ms/i);
+    expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire stale wait token'/i);
+    expect(acquireBody).toMatch(/WHEN 'active' THEN[\s\S]*?result := 'granted'/i);
+    expect(acquireBody).toMatch(/WHEN 'released' THEN[\s\S]*?result := 'released'/i);
+    expect(acquireBody).toMatch(/WHEN 'cancelled' THEN[\s\S]*?result := 'cancelled'/i);
+    expect(acquireBody).toMatch(/WHEN 'expired' THEN[\s\S]*?result := 'expired'/i);
+    expect(acquireBody).toMatch(/IF p_hard_expire_at_ms IS NULL OR p_hard_expire_at_ms <= v_now_ms THEN[\s\S]*?result := 'expired'/i);
+
+    expect(cancelBody).toMatch(/INSERT INTO concurrency_requests/i);
+    expect(cancelBody).toMatch(/VALUES \([\s\S]*?'cancelled'[\s\S]*?'request_cancelled'/i);
+    expect(cancelBody).toMatch(/RAISE EXCEPTION 'cq_cancel request_id tuple mismatch'/i);
+    expect(cancelBody).toMatch(/RAISE EXCEPTION 'cq_cancel must release active lease'/i);
+    expect(cancelBody).toMatch(/result := 'noop';[\s\S]*?reason := 'already_terminal'/i);
 
     expect(releaseBody).toMatch(/lease_token/i);
     expect(releaseBody).toMatch(/state\s*=\s*'released'/i);
@@ -304,47 +324,58 @@ describe('init.sql breaker RPC definitions', () => {
     expect(expireBody).not.toMatch(/SELECT\s+1\s+FROM\s+concurrency_host_counters[\s\S]*?FOR UPDATE;/i);
   });
 
-  it('serializes request_id before tuple-scoped counter locks', () => {
+  it('serializes request_id before request-ledger lookup and tuple-scoped counter locks', () => {
     const acquireBody = readFunctionBody('cq_acquire');
     const requestLockIndex = acquireBody.search(/pg_advisory_xact_lock\(\s*3\s*,\s*hashtext\(v_request_id\)\s*\)/i);
     const hostLockIndex = acquireBody.search(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = v_hostname_hash\s+FOR UPDATE;/i);
-    const existingLeaseIndex = acquireBody.search(/FROM\s+concurrency_leases\s+WHERE request_id = v_request_id\s+FOR UPDATE/i);
+    const requestRowIndex = acquireBody.search(/FROM\s+concurrency_requests\s+WHERE request_id = v_request_id\s+FOR UPDATE/i);
 
     expect(requestLockIndex).toBeGreaterThan(-1);
     expect(hostLockIndex).toBeGreaterThan(requestLockIndex);
-    expect(existingLeaseIndex).toBeGreaterThan(requestLockIndex);
+    expect(requestRowIndex).toBeGreaterThan(requestLockIndex);
   });
 
-  it('locks host-scope and site-scope expiry counters before lease rows', () => {
+  it('locks scope-appropriate expiry counters before scanning expired lease rows', () => {
     const expireBody = readFunctionBody('cq_expire_scope');
-    const hostBranch = expireBody.match(/IF v_scope = 'host' THEN([\s\S]*?)ELSIF v_scope = 'site' THEN/i)?.[1] ?? '';
-    const siteBranch = expireBody.match(/ELSIF v_scope = 'site' THEN([\s\S]*?)ELSE/i)?.[1] ?? '';
+    const hostLockIndex = expireBody.search(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = p_hostname_hash\s+FOR UPDATE;/i);
+    const expiredRowsIndex = expireBody.search(/WITH\s+expired_rows\s+AS\s*\(/i);
 
-    expect(hostBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = p_hostname_hash\s+FOR UPDATE;/i);
-    expect(hostBranch).toMatch(/SELECT DISTINCT\s+site_bucket\s+FROM\s*\(\s*SELECT\s+site_bucket,\s+ip_bucket\s+FROM\s+concurrency_leases/i);
-    expect(hostBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_counters\s+WHERE hostname_hash = p_hostname_hash\s+AND site_bucket = v_site_lock\.site_bucket\s+FOR UPDATE;/i);
-    expect(hostBranch).toMatch(/SELECT DISTINCT\s+site_bucket,\s+ip_bucket\s+FROM\s*\(\s*SELECT\s+site_bucket,\s+ip_bucket\s+FROM\s+concurrency_leases/i);
-    expect(hostBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_ip_counters\s+WHERE hostname_hash = p_hostname_hash\s+AND site_bucket = v_site_ip_lock\.site_bucket\s+AND ip_bucket = v_site_ip_lock\.ip_bucket\s+FOR UPDATE;/i);
-
-    expect(siteBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = p_hostname_hash\s+FOR UPDATE;/i);
-    expect(siteBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_counters\s+WHERE hostname_hash = p_hostname_hash\s+AND site_bucket = p_site_bucket\s+FOR UPDATE;/i);
-    expect(siteBranch).toMatch(/SELECT DISTINCT\s+ip_bucket\s+FROM\s*\(\s*SELECT\s+ip_bucket\s+FROM\s+concurrency_leases/i);
-    expect(siteBranch).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_ip_counters\s+WHERE hostname_hash = p_hostname_hash\s+AND site_bucket = p_site_bucket\s+AND ip_bucket = v_site_ip_lock\.ip_bucket\s+FOR UPDATE;/i);
+    expect(hostLockIndex).toBeGreaterThan(-1);
+    expect(expiredRowsIndex).toBeGreaterThan(hostLockIndex);
+    expect(expireBody).toMatch(/IF v_scope = 'site' THEN[\s\S]*?FROM\s+concurrency_site_counters[\s\S]*?site_bucket = p_site_bucket[\s\S]*?FOR UPDATE/i);
+    expect(expireBody).toMatch(/ELSIF v_scope = 'site_ip' THEN[\s\S]*?FROM\s+concurrency_site_counters[\s\S]*?site_bucket = p_site_bucket[\s\S]*?FOR UPDATE[\s\S]*?FROM\s+concurrency_site_ip_counters[\s\S]*?ip_bucket = p_ip_bucket[\s\S]*?FOR UPDATE/i);
+    expect(expireBody).toMatch(/ELSE[\s\S]*?PERFORM\s+1[\s\S]*?FROM\s+concurrency_site_counters[\s\S]*?hostname_hash = p_hostname_hash[\s\S]*?FOR UPDATE;[\s\S]*?PERFORM\s+1[\s\S]*?FROM\s+concurrency_site_ip_counters[\s\S]*?hostname_hash = p_hostname_hash[\s\S]*?FOR UPDATE;/i);
   });
 
   it('locks cq_release shared counters before the lease row', () => {
     const releaseBody = readFunctionBody('cq_release');
-    const hostLockIndex = releaseBody.search(/FROM concurrency_host_counters/i);
-    const siteLockIndex = releaseBody.search(/FROM concurrency_site_counters/i);
-    const siteIpLockIndex = releaseBody.search(/FROM concurrency_site_ip_counters/i);
-    const leaseLockIndex = releaseBody.search(/FROM concurrency_leases\s+WHERE lease_id = p_lease_id\s+FOR UPDATE/i);
+    const releaseScopeLookupIndex = expectPatternIndex(
+      releaseBody,
+      /SELECT\s+lease_id,\s*(?:concurrency_leases\.)?request_id,\s*hostname_hash,\s*site_bucket,\s*ip_bucket\s+INTO\s+v_release_scope\s+FROM\s+concurrency_leases\s+WHERE lease_id = p_lease_id;/i,
+      'expected cq_release to lookup release scope before locking shared counters',
+    );
+    const hostLockIndex = expectPatternIndex(
+      releaseBody,
+      /PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = v_release_scope\.hostname_hash\s+FOR UPDATE;/i,
+      'expected cq_release to lock host counters after the release-scope lookup',
+    );
+    const siteLockIndex = expectPatternIndex(
+      releaseBody,
+      /PERFORM\s+1\s+FROM\s+concurrency_site_counters\s+WHERE hostname_hash = v_release_scope\.hostname_hash\s+AND site_bucket = v_release_scope\.site_bucket\s+FOR UPDATE;/i,
+      'expected cq_release to lock site counters after the host counter lock',
+    );
+    const siteIpLockIndex = expectPatternIndex(
+      releaseBody,
+      /PERFORM\s+1\s+FROM\s+concurrency_site_ip_counters\s+WHERE hostname_hash = v_release_scope\.hostname_hash\s+AND site_bucket = v_release_scope\.site_bucket\s+AND ip_bucket = v_release_scope\.ip_bucket\s+FOR UPDATE;/i,
+      'expected cq_release to lock site_ip counters after the site counter lock',
+    );
+    const leaseLockIndex = expectPatternIndex(
+      releaseBody,
+      /SELECT\s+\*\s+INTO\s+v_locked_lease\s+FROM\s+concurrency_leases\s+WHERE lease_id = p_lease_id\s+FOR UPDATE;/i,
+      'expected cq_release to lock the lease row after shared counter locks',
+    );
 
-    expect(releaseBody).toMatch(/SELECT\s+lease_id,\s*hostname_hash,\s*site_bucket,\s*ip_bucket\s+INTO\s+v_release_scope\s+FROM concurrency_leases\s+WHERE lease_id = p_lease_id;/i);
-    expect(releaseBody).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = v_release_scope\.hostname_hash\s+FOR UPDATE;/i);
-    expect(releaseBody).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_counters\s+WHERE hostname_hash = v_release_scope\.hostname_hash\s+AND site_bucket = v_release_scope\.site_bucket\s+FOR UPDATE;/i);
-    expect(releaseBody).toMatch(/PERFORM\s+1\s+FROM\s+concurrency_site_ip_counters\s+WHERE hostname_hash = v_release_scope\.hostname_hash\s+AND site_bucket = v_release_scope\.site_bucket\s+AND ip_bucket = v_release_scope\.ip_bucket\s+FOR UPDATE;/i);
-    expect(releaseBody).toMatch(/SELECT\s+\*\s+INTO\s+v_locked_lease\s+FROM concurrency_leases\s+WHERE lease_id = p_lease_id\s+FOR UPDATE;/i);
-
+    expect(hostLockIndex).toBeGreaterThan(releaseScopeLookupIndex);
     expect(hostLockIndex).toBeGreaterThan(-1);
     expect(siteLockIndex).toBeGreaterThan(hostLockIndex);
     expect(siteIpLockIndex).toBeGreaterThan(siteLockIndex);
@@ -353,9 +384,21 @@ describe('init.sql breaker RPC definitions', () => {
 
   it('runs host-scope targeted expiry cleanup on the release hot path before locking the addressed lease', () => {
     const releaseBody = readFunctionBody('cq_release');
-    const releaseScopeLookupIndex = releaseBody.search(/SELECT\s+lease_id,\s*hostname_hash,\s*site_bucket,\s*ip_bucket\s+INTO\s+v_release_scope/i);
-    const expireIndex = releaseBody.search(/PERFORM\s+cq_expire_scope\(\s*'host'\s*,\s*v_release_scope\.hostname_hash\s*,\s*NULL\s*,\s*NULL\s*,\s*v_now_ms\s*,\s*500\s*\);/i);
-    const leaseLockIndex = releaseBody.search(/FROM concurrency_leases\s+WHERE lease_id = p_lease_id\s+FOR UPDATE/i);
+    const releaseScopeLookupIndex = expectPatternIndex(
+      releaseBody,
+      /SELECT\s+lease_id,\s*(?:concurrency_leases\.)?request_id,\s*hostname_hash,\s*site_bucket,\s*ip_bucket\s+INTO\s+v_release_scope\s+FROM\s+concurrency_leases\s+WHERE lease_id = p_lease_id;/i,
+      'expected cq_release to lookup release scope before targeted expiry cleanup',
+    );
+    const expireIndex = expectPatternIndex(
+      releaseBody,
+      /PERFORM\s+cq_expire_scope\(\s*'host'\s*,\s*v_release_scope\.hostname_hash\s*,\s*NULL\s*,\s*NULL\s*,\s*v_now_ms\s*,\s*500\s*\);/i,
+      'expected cq_release to run host-scope targeted expiry cleanup on the hot path',
+    );
+    const leaseLockIndex = expectPatternIndex(
+      releaseBody,
+      /SELECT\s+\*\s+INTO\s+v_locked_lease\s+FROM\s+concurrency_leases\s+WHERE lease_id = p_lease_id\s+FOR UPDATE;/i,
+      'expected cq_release to lock the addressed lease after targeted expiry cleanup',
+    );
 
     expect(expireIndex).toBeGreaterThan(releaseScopeLookupIndex);
     expect(leaseLockIndex).toBeGreaterThan(expireIndex);

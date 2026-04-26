@@ -63,7 +63,7 @@ const buildSignedWorkerRequest = async (pathname = '/downloads/test.bin') => {
   });
 };
 
-const buildRuntimeBootstrap = ({ fairQueueHostPatterns = [], throttleHostPatterns = [] } = {}) => ({
+const buildRuntimeBootstrap = ({ fairQueueHostPatterns = [], throttleHostPatterns = [], trueConcurrencyHostPatterns = [] } = {}) => ({
   configVersion: 'task1-admission-mode',
   ttlSeconds: 300,
   global: {
@@ -119,6 +119,14 @@ const buildRuntimeBootstrap = ({ fairQueueHostPatterns = [], throttleHostPattern
       slotHandlerAuthKey: 'slot-secret',
       slotHandlerAuthHeader: 'X-FQ-Auth',
     },
+    ...(trueConcurrencyHostPatterns.length > 0 ? {
+      trueConcurrency: {
+        enabled: true,
+        hostPatterns: trueConcurrencyHostPatterns,
+        handlerUrl: 'https://cq.example.test',
+        handlerAuthKey: 'cq-secret',
+      },
+    } : {}),
   },
 });
 
@@ -131,8 +139,8 @@ const buildEnv = () => ({
   BOOTSTRAP_CACHE_MODE: 'direct',
 });
 
-const createModeHarness = ({ fairQueueHostPatterns = [], throttleHostPatterns = [] } = {}) => {
-  const bootstrap = buildRuntimeBootstrap({ fairQueueHostPatterns, throttleHostPatterns });
+const createModeHarness = ({ fairQueueHostPatterns = [], throttleHostPatterns = [], trueConcurrencyHostPatterns = [] } = {}) => {
+  const bootstrap = buildRuntimeBootstrap({ fairQueueHostPatterns, throttleHostPatterns, trueConcurrencyHostPatterns });
   const config = resolveConfig({}, bootstrap, { download: {} });
   return {
     bootstrap,
@@ -143,6 +151,7 @@ const createModeHarness = ({ fairQueueHostPatterns = [], throttleHostPatterns = 
 const runModeScenario = async ({
   fairQueueHostPatterns = [],
   throttleHostPatterns = [],
+  trueConcurrencyHostPatterns = [],
   slotHandlerResponse = {
     result: 'granted',
     queryToken: 'query-mode-default',
@@ -150,18 +159,24 @@ const runModeScenario = async ({
     slotToken: 'slot-1',
   },
 } = {}) => {
-  const { bootstrap } = createModeHarness({ fairQueueHostPatterns, throttleHostPatterns });
+  const { bootstrap } = createModeHarness({ fairQueueHostPatterns, throttleHostPatterns, trueConcurrencyHostPatterns });
   const calls = {
     acquire: 0,
     release: 0,
     snapshot: 0,
     authorize: 0,
     report: 0,
+    concurrencyAcquire: 0,
+    concurrencyRelease: 0,
+    concurrencyCancel: 0,
   };
   const acquireBodies = [];
   const authorizeBodies = [];
   const reportBodies = [];
   const releaseBodies = [];
+  const concurrencyAcquireBodies = [];
+  const concurrencyReleaseBodies = [];
+  const concurrencyCancelBodies = [];
   const waitUntilPromises = [];
   const originalFetch = globalThis.fetch;
 
@@ -238,6 +253,29 @@ const runModeScenario = async ({
       return createJsonResponse({ result: 'ok' });
     }
 
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.concurrencyAcquire += 1;
+      concurrencyAcquireBodies.push(JSON.parse(init.body));
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-mode-1',
+        leaseToken: 'token-mode-1',
+        expiresAtMs: Date.now() + 1000,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.concurrencyRelease += 1;
+      concurrencyReleaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
+      calls.concurrencyCancel += 1;
+      concurrencyCancelBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'cancelled' });
+    }
+
     if (url === 'https://tenant.sharepoint.com/file') {
       return new Response('ok', {
         status: 200,
@@ -262,6 +300,9 @@ const runModeScenario = async ({
       authorizeBodies,
       reportBodies,
       releaseBodies,
+      concurrencyAcquireBodies,
+      concurrencyReleaseBodies,
+      concurrencyCancelBodies,
     };
   } finally {
     globalThis.fetch = originalFetch;
@@ -303,6 +344,7 @@ test('breaker_only calls authorize/report but never slot-handler', async () => {
 test('queue_only calls slot-handler but never breaker RPCs', async () => {
   const { config } = createModeHarness({
     fairQueueHostPatterns: ['*.sharepoint.com'],
+    trueConcurrencyHostPatterns: ['*.sharepoint.com'],
   });
 
   assert.equal(typeof resolveAdmissionMode, 'function');
@@ -310,11 +352,13 @@ test('queue_only calls slot-handler but never breaker RPCs', async () => {
 
   const { response, calls } = await runModeScenario({
     fairQueueHostPatterns: ['*.sharepoint.com'],
+    trueConcurrencyHostPatterns: ['*.sharepoint.com'],
   });
   assert.equal(response.status, 200);
   assert.equal(calls.acquire, 1);
   assert.equal(calls.authorize, 0);
   assert.equal(calls.report, 0);
+  assert.equal(calls.concurrencyAcquire, 1);
 });
 
 test('queue_breaker uses slot-handler READY attempt tokens and skips authorize RPC', async () => {
@@ -370,4 +414,118 @@ test('queue_breaker has no post-slot authorize fallback branch', async () => {
     /requestAdmissionMode === 'queue_breaker'[\s\S]*authorizeBreakerAttemptIfNeeded\(requestHostname\)/.test(source),
     false,
   );
+});
+
+test('queue_only with true concurrency wait path never calls breaker RPCs', async () => {
+  const { config } = createModeHarness({
+    fairQueueHostPatterns: ['*.sharepoint.com'],
+    trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+  });
+
+  assert.equal(resolveAdmissionMode(config, 'tenant.sharepoint.com'), 'queue_only');
+
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const calls = [];
+  let acquireCallCount = 0;
+
+  delete globalThis.bootstrapCache;
+  __fairQueueTestHooks.clearOverloadedByHost?.();
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-mode-wait',
+        invocationEpoch: 1,
+        slotToken: 'slot-mode-wait',
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      acquireCallCount += 1;
+      calls.push(`concurrency-acquire-${acquireCallCount}`);
+      if (acquireCallCount === 1) {
+        return createJsonResponse({
+          result: 'wait',
+          waitToken: 'wait-mode-1',
+          scope: 'host',
+          retryAfter: 1,
+        });
+      }
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-mode-wait',
+        leaseToken: 'token-mode-wait',
+        expiresAtMs: Date.now() + 1000,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('mode-wait-ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\//.test(url)) {
+      throw new Error(`breaker RPC should not run in queue_only wait path: ${url}`);
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildEnv(), {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+    assert.equal(await response.text(), 'mode-wait-ok');
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls, [
+      'fairqueue-acquire',
+      'concurrency-acquire-1',
+      'fairqueue-release',
+      'concurrency-acquire-2',
+      'origin-fetch',
+      'concurrency-release',
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+    __fairQueueTestHooks.clearOverloadedByHost?.();
+  }
 });

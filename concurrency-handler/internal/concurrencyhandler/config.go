@@ -52,6 +52,7 @@ type PostgresConfig struct {
 type ConcurrencyConfig struct {
 	Caps  ConcurrencyCapsConfig  `json:"caps"`
 	Lease ConcurrencyLeaseConfig `json:"lease"`
+	Wait  ConcurrencyWaitConfig  `json:"wait"`
 	Sweep ConcurrencySweepConfig `json:"sweep"`
 	RPC   ConcurrencyRPCConfig   `json:"rpc"`
 }
@@ -64,6 +65,11 @@ type ConcurrencyCapsConfig struct {
 
 type ConcurrencyLeaseConfig struct {
 	RequireHardExpiry bool `json:"requireHardExpiry"`
+}
+
+type ConcurrencyWaitConfig struct {
+	WaitPollWindowMs     int `json:"waitPollWindowMs"`
+	WaitReconnectGraceMs int `json:"waitReconnectGraceMs"`
 }
 
 type ConcurrencySweepConfig struct {
@@ -152,6 +158,12 @@ func (c *Config) Validate() error {
 	}
 	if !c.Concurrency.Lease.RequireHardExpiry {
 		return errors.New("concurrency.lease.requireHardExpiry must be true in v1")
+	}
+	if c.Concurrency.Wait.WaitPollWindowMs <= 0 {
+		return errors.New("concurrency.wait.waitPollWindowMs is required")
+	}
+	if c.Concurrency.Wait.WaitReconnectGraceMs <= 0 {
+		return errors.New("concurrency.wait.waitReconnectGraceMs is required")
 	}
 	if c.Concurrency.Sweep.IntervalSeconds <= 0 {
 		return errors.New("concurrency.sweep.intervalSeconds is required")

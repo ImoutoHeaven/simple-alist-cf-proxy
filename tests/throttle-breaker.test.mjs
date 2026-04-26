@@ -1722,6 +1722,443 @@ test('worker authorizes and reports refreshed external redirects with attempt ti
   }
 });
 
+test('queue_breaker settles old attempt before CQ wait and reauthorizes after CQ grant', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const calls = [];
+  const settleBodies = [];
+  const authorizeBodies = [];
+  const fairQueueReleaseBodies = [];
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse({
+        ...buildRuntimeBootstrap({ fairQueueHostPatterns: ['*.sharepoint.com'] }),
+        download: {
+          ...buildRuntimeBootstrap({ fairQueueHostPatterns: ['*.sharepoint.com'] }).download,
+          trueConcurrency: {
+            enabled: true,
+            hostPatterns: ['*.sharepoint.com'],
+            handlerUrl: 'https://cq.example.test',
+            handlerAuthKey: 'cq-secret',
+          },
+        },
+      });
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-qb-wait',
+        invocationEpoch: 1,
+        slotToken: 'slot-qb-wait',
+        meta: {
+          attemptVersion: 44,
+          attemptTicket: 6,
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
+      if (!body.waitToken) {
+        return createJsonResponse({
+          result: 'wait',
+          waitToken: 'wait-qb-1',
+          scope: 'host',
+          retryAfter: 1,
+        });
+      }
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-qb-1',
+        leaseToken: 'token-qb-1',
+        expiresAtMs: body.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 44,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      fairQueueReleaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      authorizeBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 45,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 8,
+      }]);
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('qb-wait-ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      calls.push('breaker-report');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 46,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/qb-cq-wait.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'qb-wait-ok');
+    assert.deepEqual(calls, [
+      'fairqueue-acquire',
+      'concurrency-acquire-fast',
+      'breaker-settle',
+      'fairqueue-release',
+      'concurrency-acquire-continue',
+      'breaker-authorize',
+      'origin-fetch',
+      'breaker-report',
+      'concurrency-release',
+    ]);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 44);
+    assert.equal(settleBodies[0].p_attempt_ticket, 6);
+    assert.equal(authorizeBodies.length, 1);
+    assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_breaker cancels CQ wait when old attempt settlement fails before continue-wait', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const calls = [];
+  const cancelBodies = [];
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse({
+        ...buildRuntimeBootstrap({ fairQueueHostPatterns: ['*.sharepoint.com'] }),
+        download: {
+          ...buildRuntimeBootstrap({ fairQueueHostPatterns: ['*.sharepoint.com'] }).download,
+          trueConcurrency: {
+            enabled: true,
+            hostPatterns: ['*.sharepoint.com'],
+            handlerUrl: 'https://cq.example.test',
+            handlerAuthKey: 'cq-secret',
+          },
+        },
+      });
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-qb-settle-fail',
+        invocationEpoch: 1,
+        slotToken: 'slot-qb-settle-fail',
+        meta: {
+          attemptVersion: 64,
+          attemptTicket: 11,
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
+      if (!body.waitToken) {
+        return createJsonResponse({
+          result: 'wait',
+          waitToken: 'wait-qb-settle-fail-1',
+          scope: 'host',
+          retryAfter: 1,
+        });
+      }
+      throw new Error('worker must not continue CQ wait after settle failure');
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      throw new Error('settle unavailable');
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
+      calls.push('concurrency-cancel');
+      cancelBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'cancelled' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      throw new Error('origin fetch should not run after breaker settle failure');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/qb-cq-settle-fail.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    const body = await response.json();
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 503);
+    assert.match(body.message, /attempt settlement/i);
+    assert.deepEqual(calls, [
+      'fairqueue-acquire',
+      'concurrency-acquire-fast',
+      'breaker-settle',
+      'fairqueue-release',
+      'concurrency-cancel',
+    ]);
+    assert.equal(cancelBodies.length, 1);
+    assert.equal(cancelBodies[0].reason, 'worker_aborted');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_breaker releases CQ lease and returns breaker terminal response when fresh authorize denies after wait grant', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const calls = [];
+  const fairQueueReleaseBodies = [];
+  const concurrencyReleaseBodies = [];
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse({
+        ...buildRuntimeBootstrap({ fairQueueHostPatterns: ['*.sharepoint.com'] }),
+        download: {
+          ...buildRuntimeBootstrap({ fairQueueHostPatterns: ['*.sharepoint.com'] }).download,
+          trueConcurrency: {
+            enabled: true,
+            hostPatterns: ['*.sharepoint.com'],
+            handlerUrl: 'https://cq.example.test',
+            handlerAuthKey: 'cq-secret',
+          },
+        },
+      });
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-qb-deny-after-wait',
+        invocationEpoch: 1,
+        slotToken: 'slot-qb-deny-after-wait',
+        meta: {
+          attemptVersion: 54,
+          attemptTicket: 9,
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
+      if (!body.waitToken) {
+        return createJsonResponse({
+          result: 'wait',
+          waitToken: 'wait-qb-deny-1',
+          scope: 'host',
+          retryAfter: 1,
+        });
+      }
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-qb-deny-1',
+        leaseToken: 'token-qb-deny-1',
+        expiresAtMs: body.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 54,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      fairQueueReleaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 55,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      concurrencyReleaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      throw new Error('origin fetch should not run after fresh breaker deny');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/qb-cq-deny-after-wait.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 429);
+    assert.deepEqual(calls, [
+      'fairqueue-acquire',
+      'concurrency-acquire-fast',
+      'breaker-settle',
+      'fairqueue-release',
+      'concurrency-acquire-continue',
+      'breaker-authorize',
+      'concurrency-release',
+    ]);
+    assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
+    assert.equal(concurrencyReleaseBodies.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('worker blocks same-host refresh when a new authorize call returns reopened state', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];

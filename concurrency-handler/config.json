@@ -35,6 +35,10 @@
     "lease": {
       "requireHardExpiry": true
     },
+    "wait": {
+      "waitPollWindowMs": 10000,
+      "waitReconnectGraceMs": 1500
+    },
     "sweep": {
       "enabled": true,
       "intervalSeconds": 300,

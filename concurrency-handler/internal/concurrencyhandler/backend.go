@@ -2,25 +2,11 @@ package concurrencyhandler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 )
-
-type PrecheckRequest struct {
-	Hostname     string `json:"hostname"`
-	HostnameHash string `json:"hostnameHash"`
-	SiteBucket   string `json:"siteBucket"`
-	IPBucket     string `json:"ipBucket"`
-	NowMs        int64  `json:"nowMs"`
-}
-
-type PrecheckResult struct {
-	Result     string `json:"result"`
-	Scope      string `json:"scope,omitempty"`
-	Reason     string `json:"reason,omitempty"`
-	RetryAfter int    `json:"retryAfter,omitempty"`
-}
 
 type AcquireRequest struct {
 	Hostname       string `json:"hostname"`
@@ -30,6 +16,7 @@ type AcquireRequest struct {
 	RequestID      string `json:"requestId"`
 	HardExpireAtMs int64  `json:"hardExpireAtMs"`
 	NowMs          int64  `json:"nowMs"`
+	WaitToken      string `json:"waitToken,omitempty"`
 }
 
 type AcquireResult struct {
@@ -37,24 +24,45 @@ type AcquireResult struct {
 	LeaseID     string `json:"leaseId,omitempty"`
 	LeaseToken  string `json:"leaseToken,omitempty"`
 	ExpiresAtMs int64  `json:"expiresAtMs,omitempty"`
+	WaitToken   string `json:"waitToken,omitempty"`
 	Scope       string `json:"scope,omitempty"`
 	Reason      string `json:"reason,omitempty"`
 	RetryAfter  int    `json:"retryAfter,omitempty"`
 }
 
 type ReleaseRequest struct {
-	LeaseID        string `json:"leaseId,omitempty"`
-	LeaseToken     string `json:"leaseToken,omitempty"`
-	RequestID      string `json:"requestId,omitempty"`
-	HostnameHash   string `json:"hostnameHash,omitempty"`
-	SiteBucket     string `json:"siteBucket,omitempty"`
-	IPBucket       string `json:"ipBucket,omitempty"`
-	HardExpireAtMs int64  `json:"hardExpireAtMs,omitempty"`
+	LeaseID    string `json:"leaseId"`
+	LeaseToken string `json:"leaseToken"`
+	Reason     string `json:"reason"`
+	NowMs      int64  `json:"nowMs"`
+}
+
+type ReleaseResult struct {
+	Result    string `json:"result"`
+	Reason    string `json:"reason,omitempty"`
+	RequestID string `json:"requestId,omitempty"`
+}
+
+type PromoteWaitingRequest struct {
+	RequestID      string
+	HostnameHash   string
+	SiteBucket     string
+	IPBucket       string
+	HardExpireAtMs int64
+	NowMs          int64
+}
+
+type CancelRequest struct {
+	RequestID      string `json:"requestId"`
+	HostnameHash   string `json:"hostnameHash"`
+	SiteBucket     string `json:"siteBucket"`
+	IPBucket       string `json:"ipBucket"`
+	HardExpireAtMs int64  `json:"hardExpireAtMs"`
 	Reason         string `json:"reason"`
 	NowMs          int64  `json:"nowMs"`
 }
 
-type ReleaseResult struct {
+type CancelResult struct {
 	Result string `json:"result"`
 	Reason string `json:"reason,omitempty"`
 }
@@ -69,14 +77,37 @@ type ExpireScopeRequest struct {
 }
 
 type ExpireScopeResult struct {
-	ExpiredCount int `json:"expiredCount"`
+	ExpiredCount      int      `json:"expiredCount"`
+	ExpiredRequestIDs []string `json:"expiredRequestIds,omitempty"`
 }
 
 const (
-	fixedPrecheckFunc                             = "cq_precheck"
-	fixedReleaseByRequestFunc                     = "cq_release_by_request"
-	acquireConflictReasonRequestIDTupleMismatch   = "request_id_tuple_mismatch"
-	acquireConflictReasonRequestIDReplayNotActive = "request_id_replay_not_active"
+	fixedContinueWaitProbeFunc                  = "cq_continue_wait_probe"
+	fixedPromoteWaitingFunc                     = "cq_promote_waiting_request"
+	fixedCancelFunc                            = "cq_cancel"
+	acquireConflictReasonRequestIDTupleMismatch = "request_id_tuple_mismatch"
+	acquireConflictReasonStaleWaitToken         = "stale_wait_token"
+	acquireConflictReasonWaiterAlreadyAttached  = "waiter_already_attached"
+	cancelConflictReasonMustReleaseActiveLease  = "must_release_active_lease"
+	observabilityAcquireFastGranted             = "acquire_fast_granted"
+	observabilityAcquireFastWait                = "acquire_fast_wait"
+	observabilityAcquireReplayWait              = "acquire_replay_wait"
+	observabilityAcquireReplayActive            = "acquire_replay_active"
+	observabilityContinueWaitAttached           = "continue_wait_attached"
+	observabilityContinueWaitTimeout            = "continue_wait_timeout"
+	observabilityGrantPromoted                  = "grant_promoted"
+	observabilityGrantDeliveryFailed            = "grant_delivery_failed"
+	observabilityCancelled                      = "cancelled"
+	observabilityExpiredHard                    = "expired_hard"
+	observabilityExpiredWaiterDetached          = "expired_waiter_detached"
+	observabilityReleaseReleased                = "release_released"
+	observabilityReleaseNoop                    = "release_noop"
+	observabilityConflictTupleMismatch          = "conflict_tuple_mismatch"
+	observabilityConflictWaiterAlreadyAttached  = "conflict_waiter_already_attached"
+	observabilityConflictStaleWaitToken         = "conflict_stale_wait_token"
+	observabilityDenyHost                       = "deny_host"
+	observabilityDenySite                       = "deny_site"
+	observabilityDenySiteIP                     = "deny_site_ip"
 )
 
 type acquireConflictError struct {
@@ -101,11 +132,83 @@ func (e *acquireConflictError) Unwrap() error {
 	return e.cause
 }
 
+type cancelConflictError struct {
+	Reason string
+	cause  error
+}
+
+func (e *cancelConflictError) Error() string {
+	if e == nil {
+		return "cancel conflict"
+	}
+	if e.cause != nil {
+		return e.cause.Error()
+	}
+	return "cancel conflict: " + e.Reason
+}
+
+func (e *cancelConflictError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
 type Backend interface {
-	Precheck(ctx context.Context, req PrecheckRequest) (*PrecheckResult, error)
 	Acquire(ctx context.Context, req AcquireRequest) (*AcquireResult, error)
 	Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error)
+	PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error)
+	Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error)
 	ExpireScope(ctx context.Context, req ExpireScopeRequest) (*ExpireScopeResult, error)
+}
+
+type continueWaitProber interface {
+	ProbeContinueWait(ctx context.Context, req AcquireRequest) (*AcquireResult, error)
+}
+
+type acquireWireResult struct {
+	Result      string  `json:"result"`
+	LeaseID     *string `json:"lease_id"`
+	LeaseToken  *string `json:"lease_token"`
+	ExpiresAtMs *int64  `json:"expires_at_ms"`
+	WaitToken   *string `json:"wait_token"`
+	Scope       *string `json:"scope"`
+	Reason      *string `json:"reason"`
+	RetryAfter  *int    `json:"retry_after"`
+}
+
+func (w acquireWireResult) toServiceResult() *AcquireResult {
+	result := &AcquireResult{Result: w.Result}
+	if w.LeaseID != nil {
+		result.LeaseID = *w.LeaseID
+	}
+	if w.LeaseToken != nil {
+		result.LeaseToken = *w.LeaseToken
+	}
+	if w.ExpiresAtMs != nil {
+		result.ExpiresAtMs = *w.ExpiresAtMs
+	}
+	if w.WaitToken != nil {
+		result.WaitToken = *w.WaitToken
+	}
+	if w.Scope != nil {
+		result.Scope = *w.Scope
+	}
+	if w.Reason != nil {
+		result.Reason = *w.Reason
+	}
+	if w.RetryAfter != nil {
+		result.RetryAfter = *w.RetryAfter
+	}
+	return result
+}
+
+func decodeAcquireJSONResult(raw []byte) (*AcquireResult, error) {
+	var wire acquireWireResult
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, err
+	}
+	return wire.toServiceResult(), nil
 }
 
 func canonicalBucket(value string) string {
@@ -125,31 +228,6 @@ func boundedExpireLimit(limit int, fallback int) int {
 	return limit
 }
 
-func validatePrecheckResult(result *PrecheckResult) error {
-	if result == nil {
-		return errors.New("missing precheck result")
-	}
-	switch result.Result {
-	case "allow":
-		return nil
-	case "deny":
-		switch result.Scope {
-		case "host", "site", "site_ip":
-		default:
-			return fmt.Errorf("invalid precheck deny scope %q", result.Scope)
-		}
-		if result.Reason != "full" {
-			return fmt.Errorf("invalid precheck deny reason %q", result.Reason)
-		}
-		if result.RetryAfter <= 0 {
-			return errors.New("incomplete precheck deny result")
-		}
-		return nil
-	default:
-		return fmt.Errorf("invalid precheck result %q", result.Result)
-	}
-}
-
 func validateAcquireResult(req AcquireRequest, result *AcquireResult) error {
 	if result == nil {
 		return errors.New("missing acquire result")
@@ -162,17 +240,28 @@ func validateAcquireResult(req AcquireRequest, result *AcquireResult) error {
 		if req.HardExpireAtMs > 0 && result.ExpiresAtMs > req.HardExpireAtMs {
 			return fmt.Errorf("acquire granted result exceeds hardExpireAtMs: expiresAtMs=%d hardExpireAtMs=%d", result.ExpiresAtMs, req.HardExpireAtMs)
 		}
-	case "deny":
+	case "wait":
 		switch result.Scope {
 		case "host", "site", "site_ip":
 		default:
-			return fmt.Errorf("invalid acquire deny scope %q", result.Scope)
+			return fmt.Errorf("invalid acquire wait scope %q", result.Scope)
 		}
-		if result.Reason != "full" {
-			return fmt.Errorf("invalid acquire deny reason %q", result.Reason)
+		if strings.TrimSpace(result.WaitToken) == "" || result.RetryAfter <= 0 {
+			return errors.New("incomplete acquire wait result")
 		}
-		if result.RetryAfter <= 0 {
-			return errors.New("incomplete acquire deny result")
+	case "released":
+		if result.Reason != "already_released" {
+			return fmt.Errorf("invalid acquire released reason %q", result.Reason)
+		}
+	case "cancelled":
+		if result.Reason != "request_cancelled" {
+			return fmt.Errorf("invalid acquire cancelled reason %q", result.Reason)
+		}
+	case "expired":
+		switch result.Reason {
+		case "hard_expired", "waiter_detached_timeout":
+		default:
+			return fmt.Errorf("invalid acquire expired reason %q", result.Reason)
 		}
 	default:
 		return fmt.Errorf("invalid acquire result %q", result.Result)
@@ -188,8 +277,25 @@ func classifyAcquireConflict(err error) error {
 	switch {
 	case strings.Contains(message, "cq_acquire request_id tuple mismatch"):
 		return &acquireConflictError{Reason: acquireConflictReasonRequestIDTupleMismatch, cause: err}
-	case strings.Contains(message, "cq_acquire request_id replay is no longer active"):
-		return &acquireConflictError{Reason: acquireConflictReasonRequestIDReplayNotActive, cause: err}
+	case strings.Contains(message, "cq_acquire stale wait token"):
+		return &acquireConflictError{Reason: acquireConflictReasonStaleWaitToken, cause: err}
+	case strings.Contains(message, "cq_acquire waiter already attached"):
+		return &acquireConflictError{Reason: acquireConflictReasonWaiterAlreadyAttached, cause: err}
+	default:
+		return err
+	}
+}
+
+func classifyCancelConflict(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(message, "cq_cancel request_id tuple mismatch"):
+		return &cancelConflictError{Reason: acquireConflictReasonRequestIDTupleMismatch, cause: err}
+	case strings.Contains(message, "cq_cancel must release active lease"):
+		return &cancelConflictError{Reason: cancelConflictReasonMustReleaseActiveLease, cause: err}
 	default:
 		return err
 	}
@@ -201,10 +307,18 @@ func validateReleaseResult(result *ReleaseResult) error {
 	}
 	switch result.Result {
 	case "released":
+		if strings.TrimSpace(result.RequestID) == "" {
+			return errors.New("released result missing authoritative requestId")
+		}
 		return nil
 	case "noop":
 		switch result.Reason {
-		case "already_released", "expired", "not_found", "token_mismatch":
+		case "already_released", "expired":
+			if strings.TrimSpace(result.RequestID) == "" {
+				return fmt.Errorf("noop %s result missing authoritative requestId", result.Reason)
+			}
+			return nil
+		case "not_found", "token_mismatch":
 			return nil
 		default:
 			return fmt.Errorf("invalid release noop reason %q", result.Reason)
@@ -214,16 +328,21 @@ func validateReleaseResult(result *ReleaseResult) error {
 	}
 }
 
-func releaseRequestHasLeaseIdentity(req ReleaseRequest) bool {
-	return strings.TrimSpace(req.LeaseID) != "" || strings.TrimSpace(req.LeaseToken) != ""
-}
-
-func releaseRequestHasRecoveryIdentity(req ReleaseRequest) bool {
-	return strings.TrimSpace(req.RequestID) != "" ||
-		strings.TrimSpace(req.HostnameHash) != "" ||
-		strings.TrimSpace(req.SiteBucket) != "" ||
-		strings.TrimSpace(req.IPBucket) != "" ||
-		req.HardExpireAtMs > 0
+func validateCancelResult(result *CancelResult) error {
+	if result == nil {
+		return errors.New("missing cancel result")
+	}
+	switch result.Result {
+	case "cancelled":
+		return nil
+	case "noop":
+		if result.Reason != "already_terminal" {
+			return fmt.Errorf("invalid cancel noop reason %q", result.Reason)
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid cancel result %q", result.Result)
+	}
 }
 
 func validateExpireScopeResult(result *ExpireScopeResult) error {

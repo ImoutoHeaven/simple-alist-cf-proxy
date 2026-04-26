@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -49,9 +50,18 @@ func TestPostgrestAcquireNormalizesGrantedResultAndUsesConfiguredRPC(t *testing.
 	}
 }
 
-func TestPostgrestAcquireRejectsEmptySuccessfulPayload(t *testing.T) {
+func TestPostgrestAcquireNormalizesWaitResult(t *testing.T) {
+	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"wait","wait_token":"wait-1","scope":"site_ip","retry_after":2}]`))
 	}))
 	defer srv.Close()
 
@@ -61,16 +71,32 @@ func TestPostgrestAcquireRejectsEmptySuccessfulPayload(t *testing.T) {
 	cfg.Backend.Postgrest.BaseURL = srv.URL
 	backend := newPostgrestBackend(cfg, srv.Client())
 
-	_, err := backend.Acquire(context.Background(), validAcquireRequest())
-	if err == nil {
-		t.Fatal("expected error for empty 2xx acquire payload")
+	result, err := backend.Acquire(context.Background(), validAcquireRequest())
+	if err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if result.Result != "wait" || result.WaitToken != "wait-1" || result.Scope != "site_ip" || result.RetryAfter != 2 {
+		t.Fatalf("unexpected wait result: %+v", result)
+	}
+	if _, ok := gotBody["p_wait_token"]; ok {
+		t.Fatalf("did not expect wait token on fast acquire payload, got %v", gotBody)
 	}
 }
 
-func TestPostgrestAcquireRejectsSchemaIncompleteSuccessfulPayload(t *testing.T) {
+func TestPostgrestAcquireIncludesWaitTokenWhenProvided(t *testing.T) {
+	req := validAcquireRequest()
+	req.WaitToken = "wait-1"
+	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"lease_id":"lease-1"}]`))
+		_, _ = w.Write([]byte(`[{"result":"wait","wait_token":"wait-1","scope":"host","retry_after":1}]`))
 	}))
 	defer srv.Close()
 
@@ -80,16 +106,74 @@ func TestPostgrestAcquireRejectsSchemaIncompleteSuccessfulPayload(t *testing.T) 
 	cfg.Backend.Postgrest.BaseURL = srv.URL
 	backend := newPostgrestBackend(cfg, srv.Client())
 
-	_, err := backend.Acquire(context.Background(), validAcquireRequest())
-	if err == nil {
-		t.Fatal("expected error for schema-incomplete 2xx acquire payload")
+	if _, err := backend.Acquire(context.Background(), req); err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if gotBody["p_wait_token"] != "wait-1" {
+		t.Fatalf("expected wait token payload, got %v", gotBody)
 	}
 }
 
-func TestPostgrestAcquireRejectsInvalidSuccessfulResult(t *testing.T) {
+func TestPostgrestAcquireIncludesWaitTimingConfig(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"wait","wait_token":"wait-1","scope":"host","retry_after":1}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	cfg.Concurrency.Wait.WaitPollWindowMs = 12000
+	cfg.Concurrency.Wait.WaitReconnectGraceMs = 1800
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	if _, err := backend.Acquire(context.Background(), validAcquireRequest()); err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if gotBody["p_wait_poll_window_ms"] != float64(12000) {
+		t.Fatalf("expected wait poll window payload, got %v", gotBody)
+	}
+	if gotBody["p_wait_reconnect_grace_ms"] != float64(1800) {
+		t.Fatalf("expected wait reconnect grace payload, got %v", gotBody)
+	}
+}
+
+func TestPostgrestAcquireTerminalReplayMaps410Result(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"result":"released","lease_id":"lease-1","lease_token":"token-1","expires_at_ms":2500}]`))
+		_, _ = w.Write([]byte(`[{"result":"cancelled","reason":"request_cancelled"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.Acquire(context.Background(), validAcquireRequest())
+	if err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if result.Result != "cancelled" || result.Reason != "request_cancelled" {
+		t.Fatalf("unexpected terminal replay result: %+v", result)
+	}
+}
+
+func TestPostgrestAcquireRejectsLegacyDenyResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"deny","scope":"host","reason":"full","retry_after":1}]`))
 	}))
 	defer srv.Close()
 
@@ -101,7 +185,7 @@ func TestPostgrestAcquireRejectsInvalidSuccessfulResult(t *testing.T) {
 
 	_, err := backend.Acquire(context.Background(), validAcquireRequest())
 	if err == nil {
-		t.Fatal("expected error for invalid acquire result")
+		t.Fatal("expected error for legacy deny acquire result")
 	}
 }
 
@@ -129,11 +213,11 @@ func TestPostgrestAcquireClassifiesTupleMismatchAsConflict(t *testing.T) {
 	}
 }
 
-func TestPostgrestAcquireClassifiesInactiveReplayAsConflict(t *testing.T) {
+func TestPostgrestAcquireClassifiesWaiterAlreadyAttachedAsConflict(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"message":"cq_acquire request_id replay is no longer active"}`))
+		_, _ = w.Write([]byte(`{"message":"cq_acquire waiter already attached"}`))
 	}))
 	defer srv.Close()
 
@@ -148,68 +232,12 @@ func TestPostgrestAcquireClassifiesInactiveReplayAsConflict(t *testing.T) {
 	if !errors.As(err, &conflictErr) {
 		t.Fatalf("expected acquireConflictError, got %v", err)
 	}
-	if conflictErr.Reason != acquireConflictReasonRequestIDReplayNotActive {
-		t.Fatalf("expected replay-not-active reason, got %+v", conflictErr)
+	if conflictErr.Reason != acquireConflictReasonWaiterAlreadyAttached {
+		t.Fatalf("expected waiter_already_attached reason, got %+v", conflictErr)
 	}
 }
 
-func TestPostgrestReleaseRejectsEmptySuccessfulPayload(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	cfg := validTestConfig()
-	cfg.Backend.Mode = "postgrest"
-	cfg.Backend.Postgres.DSN = ""
-	cfg.Backend.Postgrest.BaseURL = srv.URL
-	backend := newPostgrestBackend(cfg, srv.Client())
-
-	_, err := backend.Release(context.Background(), validReleaseRequest())
-	if err == nil {
-		t.Fatal("expected error for empty 2xx release payload")
-	}
-}
-
-func TestPostgrestReleaseRejectsSchemaIncompleteSuccessfulPayload(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"reason":"expired"}]`))
-	}))
-	defer srv.Close()
-
-	cfg := validTestConfig()
-	cfg.Backend.Mode = "postgrest"
-	cfg.Backend.Postgres.DSN = ""
-	cfg.Backend.Postgrest.BaseURL = srv.URL
-	backend := newPostgrestBackend(cfg, srv.Client())
-
-	_, err := backend.Release(context.Background(), validReleaseRequest())
-	if err == nil {
-		t.Fatal("expected error for schema-incomplete 2xx release payload")
-	}
-}
-
-func TestPostgrestReleaseRejectsInvalidSuccessfulResult(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"result":"foo"}]`))
-	}))
-	defer srv.Close()
-
-	cfg := validTestConfig()
-	cfg.Backend.Mode = "postgrest"
-	cfg.Backend.Postgres.DSN = ""
-	cfg.Backend.Postgrest.BaseURL = srv.URL
-	backend := newPostgrestBackend(cfg, srv.Client())
-
-	_, err := backend.Release(context.Background(), validReleaseRequest())
-	if err == nil {
-		t.Fatal("expected error for invalid release result")
-	}
-}
-
-func TestPostgrestReleaseByRequestUsesFixedDatabaseAuthoritativeRPC(t *testing.T) {
+func TestPostgrestReleaseNormalizesNoopResultAndUsesConfiguredRPC(t *testing.T) {
 	var gotPath string
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -222,77 +250,7 @@ func TestPostgrestReleaseByRequestUsesFixedDatabaseAuthoritativeRPC(t *testing.T
 			t.Fatalf("decode body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"result":"released"}]`))
-	}))
-	defer srv.Close()
-
-	cfg := validTestConfig()
-	cfg.Backend.Mode = "postgrest"
-	cfg.Backend.Postgres.DSN = ""
-	cfg.Backend.Postgrest.BaseURL = srv.URL
-	backend := newPostgrestBackend(cfg, srv.Client())
-
-	result, err := backend.Release(context.Background(), validRecoveryReleaseRequest())
-	if err != nil {
-		t.Fatalf("Release error: %v", err)
-	}
-	if gotPath != "/rpc/cq_release_by_request" {
-		t.Fatalf("expected fixed recovery release rpc path, got %s", gotPath)
-	}
-	if gotBody["p_request_id"] != "request-1" || gotBody["p_hard_expire_at_ms"] != float64(5000) {
-		t.Fatalf("expected request tuple payload, got %v", gotBody)
-	}
-	if result.Result != "released" {
-		t.Fatalf("unexpected release result: %+v", result)
-	}
-}
-
-func TestPostgrestPrecheckUsesFixedDatabaseAuthoritativeRPC(t *testing.T) {
-	var gotPath string
-	var gotBody map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body: %v", err)
-		}
-		if len(body) > 0 {
-			if err := json.Unmarshal(body, &gotBody); err != nil {
-				t.Fatalf("decode body: %v", err)
-			}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"result":"allow"}]`))
-	}))
-	defer srv.Close()
-
-	cfg := validTestConfig()
-	cfg.Backend.Mode = "postgrest"
-	cfg.Backend.Postgres.DSN = ""
-	cfg.Backend.Postgrest.BaseURL = srv.URL
-	backend := newPostgrestBackend(cfg, srv.Client())
-
-	result, err := backend.Precheck(context.Background(), validPrecheckRequest())
-	if err != nil {
-		t.Fatalf("Precheck error: %v", err)
-	}
-	if gotPath != "/rpc/cq_precheck" {
-		t.Fatalf("expected fixed precheck rpc path, got %s", gotPath)
-	}
-	if _, ok := gotBody["p_now_ms"]; ok {
-		t.Fatalf("precheck must not forward caller nowMs, got payload %v", gotBody)
-	}
-	if result.Result != "allow" {
-		t.Fatalf("unexpected precheck result: %+v", result)
-	}
-}
-
-func TestPostgrestReleaseNormalizesNoopResultAndUsesConfiguredRPC(t *testing.T) {
-	var gotPath string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"result":"noop","reason":"expired"}]`))
+		_, _ = w.Write([]byte(`[{"result":"noop","reason":"expired","request_id":"request-1"}]`))
 	}))
 	defer srv.Close()
 
@@ -310,8 +268,192 @@ func TestPostgrestReleaseNormalizesNoopResultAndUsesConfiguredRPC(t *testing.T) 
 	if gotPath != "/rpc/custom_release" {
 		t.Fatalf("expected release rpc path, got %s", gotPath)
 	}
-	if result.Result != "noop" || result.Reason != "expired" {
+	if _, ok := gotBody["p_request_id"]; ok {
+		t.Fatalf("release must not send request-level recovery payload, got %v", gotBody)
+	}
+	if result.Result != "noop" || result.Reason != "expired" || result.RequestID != "request-1" {
 		t.Fatalf("unexpected release result: %+v", result)
+	}
+}
+
+func TestPostgrestReleaseReturnsAuthoritativeRequestIDWhenPresent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"released","request_id":"request-1"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.Release(context.Background(), validReleaseRequest())
+	if err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+	if result.RequestID != "request-1" {
+		t.Fatalf("expected authoritative request id, got %+v", result)
+	}
+}
+
+func TestPostgrestReleaseRejectsExpiredNoopWithoutAuthoritativeRequestID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"noop","reason":"expired","request_id":null}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	if _, err := backend.Release(context.Background(), validReleaseRequest()); err == nil {
+		t.Fatal("expected noop expired validation error when authoritative request id is missing")
+	}
+}
+
+func TestPostgrestReleaseRejectsAlreadyReleasedNoopWithoutAuthoritativeRequestID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"noop","reason":"already_released","request_id":null}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	if _, err := backend.Release(context.Background(), validReleaseRequest()); err == nil {
+		t.Fatal("expected noop already_released validation error when authoritative request id is missing")
+	}
+}
+
+func TestPostgrestPromoteWaitingUsesFixedRPCAndNormalizesGrantedResult(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-2","lease_token":"token-2","expires_at_ms":2400}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.PromoteWaiting(context.Background(), PromoteWaitingRequest{
+		RequestID:      "waiting-request",
+		HostnameHash:   "host-hash",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		HardExpireAtMs: 5000,
+		NowMs:          1000,
+	})
+	if err != nil {
+		t.Fatalf("PromoteWaiting error: %v", err)
+	}
+	if gotPath != "/rpc/cq_promote_waiting_request" {
+		t.Fatalf("expected fixed promote rpc path, got %s", gotPath)
+	}
+	if gotBody["p_request_id"] != "waiting-request" || gotBody["p_host_max_in_flight"] != float64(64) {
+		t.Fatalf("expected promote tuple/cap payload, got %v", gotBody)
+	}
+	if result.Result != "granted" || result.LeaseID != "lease-2" || result.LeaseToken != "token-2" {
+		t.Fatalf("unexpected promote result: %+v", result)
+	}
+}
+
+func TestPostgrestCancelUsesFixedRPC(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"cancelled"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.Cancel(context.Background(), CancelRequest{
+		RequestID:      "request-1",
+		HostnameHash:   "host-hash",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		HardExpireAtMs: 5000,
+		Reason:         "worker_aborted",
+		NowMs:          1000,
+	})
+	if err != nil {
+		t.Fatalf("Cancel error: %v", err)
+	}
+	if gotPath != "/rpc/cq_cancel" {
+		t.Fatalf("expected fixed cancel rpc path, got %s", gotPath)
+	}
+	if gotBody["p_request_id"] != "request-1" || gotBody["p_hard_expire_at_ms"] != float64(5000) {
+		t.Fatalf("expected cancel tuple payload, got %v", gotBody)
+	}
+	if result.Result != "cancelled" {
+		t.Fatalf("unexpected cancel result: %+v", result)
+	}
+}
+
+func TestPostgrestCancelClassifiesActiveLeaseConflict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"message":"cq_cancel must release active lease"}`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	_, err := backend.Cancel(context.Background(), CancelRequest{
+		RequestID:      "request-1",
+		HostnameHash:   "host-hash",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		HardExpireAtMs: 5000,
+		Reason:         "worker_aborted",
+		NowMs:          1000,
+	})
+	var conflictErr *cancelConflictError
+	if !errors.As(err, &conflictErr) {
+		t.Fatalf("expected cancelConflictError, got %v", err)
+	}
+	if conflictErr.Reason != cancelConflictReasonMustReleaseActiveLease {
+		t.Fatalf("expected must_release_active_lease reason, got %+v", conflictErr)
 	}
 }
 
@@ -326,7 +468,7 @@ func TestPostgrestExpireScopeUsesConfiguredRPCAndBoundedLimit(t *testing.T) {
 			t.Fatalf("decode body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`17`))
+		_, _ = w.Write([]byte(`[{"request_id":"expired-request-1"},{"request_id":"expired-request-2"}]`))
 	}))
 	defer srv.Close()
 
@@ -344,14 +486,25 @@ func TestPostgrestExpireScopeUsesConfiguredRPCAndBoundedLimit(t *testing.T) {
 	if gotBody["p_limit"] != float64(500) {
 		t.Fatalf("expected bounded limit 500, got %v", gotBody["p_limit"])
 	}
-	if result.ExpiredCount != 17 {
+	if result.ExpiredCount != 2 {
 		t.Fatalf("expected expired count 17, got %+v", result)
+	}
+	if len(result.ExpiredRequestIDs) != 2 || result.ExpiredRequestIDs[0] != "expired-request-1" || result.ExpiredRequestIDs[1] != "expired-request-2" {
+		t.Fatalf("expected authoritative expired request ids, got %+v", result)
 	}
 }
 
-func TestPostgrestExpireScopeRejectsEmptySuccessfulPayload(t *testing.T) {
+func TestPostgrestLoadWaitingRequestsUsesRecoveryQueryAndBuildsSnapshots(t *testing.T) {
+	var gotPath string
+	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		gotPath = r.URL.String()
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"request_id":"request-1","hostname":"example.com","hostname_hash":"host-hash","site_bucket":"site-a","ip_bucket":"ip-a","wait_token":"wait-1","first_wait_at_ms":100,"waiter_lease_until_ms":250,"hard_expire_at_ms":1000},
+			{"request_id":"request-2","hostname":"example.com","hostname_hash":"host-hash","site_bucket":"site-b","ip_bucket":"ip-b","wait_token":"","first_wait_at_ms":200,"waiter_lease_until_ms":0,"hard_expire_at_ms":2000}
+		]`))
 	}))
 	defer srv.Close()
 
@@ -359,10 +512,62 @@ func TestPostgrestExpireScopeRejectsEmptySuccessfulPayload(t *testing.T) {
 	cfg.Backend.Mode = "postgrest"
 	cfg.Backend.Postgres.DSN = ""
 	cfg.Backend.Postgrest.BaseURL = srv.URL
+	cfg.Backend.Postgrest.AuthHeader = "Bearer secret"
 	backend := newPostgrestBackend(cfg, srv.Client())
 
-	_, err := backend.ExpireScope(context.Background(), ExpireScopeRequest{Scope: "host", HostnameHash: "host-hash", Limit: 1})
-	if err == nil {
-		t.Fatal("expected error for empty 2xx expire payload")
+	results, err := backend.LoadWaitingRequests(context.Background())
+	if err != nil {
+		t.Fatalf("LoadWaitingRequests error: %v", err)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Fatalf("expected auth header on waiting recovery query, got %q", gotAuth)
+	}
+	if !strings.Contains(gotPath, "/concurrency_requests?") || !strings.Contains(gotPath, "state=eq.waiting") || !strings.Contains(gotPath, "order=hostname_hash.asc%2Cfirst_wait_at_ms.asc%2Crequest_id.asc") {
+		t.Fatalf("expected ordered waiting recovery query, got %s", gotPath)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 waiting snapshots, got %+v", results)
+	}
+	if results[0].RequestID != "request-1" || results[0].State != "waiting" || results[0].WaitToken != "wait-1" || results[0].TupleKey != makeTupleKey("host-hash", "site-a", "ip-a") {
+		t.Fatalf("unexpected first waiting snapshot: %+v", results[0])
+	}
+	if results[1].RequestID != "request-2" || results[1].TupleKey != makeTupleKey("host-hash", "site-b", "ip-b") {
+		t.Fatalf("unexpected second waiting snapshot: %+v", results[1])
+	}
+}
+
+func TestPostgrestLoadActiveRequestIDsUsesRecoveryQueryAndReturnsOrderedIDs(t *testing.T) {
+	var gotPath string
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.String()
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"request_id":"active-request-1"},
+			{"request_id":"active-request-2"}
+		]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	cfg.Backend.Postgrest.AuthHeader = "Bearer secret"
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	results, err := backend.LoadActiveRequestIDs(context.Background())
+	if err != nil {
+		t.Fatalf("LoadActiveRequestIDs error: %v", err)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Fatalf("expected auth header on active recovery query, got %q", gotAuth)
+	}
+	if !strings.Contains(gotPath, "/concurrency_requests?") || !strings.Contains(gotPath, "select=request_id") || !strings.Contains(gotPath, "state=eq.active") || !strings.Contains(gotPath, "order=request_id.asc") {
+		t.Fatalf("expected ordered active recovery query, got %s", gotPath)
+	}
+	if len(results) != 2 || results[0] != "active-request-1" || results[1] != "active-request-2" {
+		t.Fatalf("unexpected active request ids: %+v", results)
 	}
 }

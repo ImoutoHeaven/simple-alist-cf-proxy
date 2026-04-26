@@ -680,9 +680,16 @@ func TestHandleReleaseFailsClosedForUnknownValidSlotTokenWithoutProof(t *testing
 }
 
 func TestReleaseAfterGrantedReattachClearsServerState(t *testing.T) {
-	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 2)}
+	minHoldMs := int64(80)
+	smoothMs := int64(120)
+	backend := &releaseRecordingBackend{
+		released:   make(chan ReleaseRequest, 2),
+		calledAtCh: make(chan time.Time, 1),
+	}
 	s := newTestServer()
 	cfg := testConfigForAcquire(25*time.Millisecond, 700*time.Millisecond)
+	cfg.FairQueue.MinSlotHoldMs = minHoldMs
+	cfg.FairQueue.SmoothReleaseIntervalMs = &smoothMs
 	s.updateRuntime(cfg, backend, "test", true)
 	s.flowStore.afterFunc = nil
 	s.activeSlots = newActiveTracker()
@@ -734,8 +741,27 @@ func TestReleaseAfterGrantedReattachClearsServerState(t *testing.T) {
 		t.Fatalf("expected granted reattach flow to stay outside detached reconnect state before after-use release cleanup, got %v", got)
 	}
 	s.activeSlots.AddLease(acquireResp.SlotToken, "h1", "s1", "ip-release-reattach", 30*time.Second, now)
+	releaseStartedAt := time.Now()
+	releaser := s.getSmoothReleaser(req.HostnameHash, req.Hostname)
+	releaser.mu.Lock()
+	releaser.lastReleaseAt = releaseStartedAt.Add(250 * time.Millisecond)
+	releaser.mu.Unlock()
 
-	rec := handleReleaseJSONRequest(t, s, `{"hostname":"example.com","hostnameHash":"h1","ipBucket":"ip-release-reattach","siteBucket":"s1","slotToken":"`+acquireResp.SlotToken+`","queryToken":"`+tok+`","invocationEpoch":`+mustMarshalJSONForTest(t, acquireResp.InvocationEpoch)+`,"releaseOwnerRequired":true,"hitUpstreamAtMs":0,"now":0}`)
+	recCh := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recCh <- handleReleaseJSONRequest(t, s, `{"hostname":"example.com","hostnameHash":"h1","ipBucket":"ip-release-reattach","siteBucket":"s1","slotToken":"`+acquireResp.SlotToken+`","queryToken":"`+tok+`","invocationEpoch":`+mustMarshalJSONForTest(t, acquireResp.InvocationEpoch)+`,"releaseOwnerRequired":true,"hitUpstreamAtMs":0,"now":0}`)
+	}()
+
+	select {
+	case calledAt := <-backend.calledAtCh:
+		if delay := calledAt.Sub(releaseStartedAt); delay > 50*time.Millisecond {
+			t.Fatalf("expected unused-grant /release path to bypass hold and smooth spacing, got backend release after %s", delay)
+		}
+	case <-time.After(120 * time.Millisecond):
+		t.Fatalf("expected unused-grant /release path to reach backend immediately")
+	}
+
+	rec := <-recCh
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected release success status, got %d body=%q", rec.Code, rec.Body.String())
 	}

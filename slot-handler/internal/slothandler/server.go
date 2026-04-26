@@ -2179,10 +2179,13 @@ func (s *server) runAfterUseReleaseTiming(req ReleaseRequest) (time.Time, error)
 	if cfg == nil {
 		return time.Time{}, errors.New("config not loaded")
 	}
+	if req.HitUpstreamAt == 0 {
+		return time.Now(), nil
+	}
 
 	minHoldMs := cfg.FairQueue.minHold(0)
 	hitAt := time.UnixMilli(req.HitUpstreamAt)
-	if req.HitUpstreamAt == 0 || hitAt.IsZero() {
+	if hitAt.IsZero() {
 		hitAt = time.Now()
 	}
 

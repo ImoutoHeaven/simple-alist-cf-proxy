@@ -11,7 +11,15 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 
 `slot-handler` 只负责 fairqueue，不负责 true in-flight concurrency。true concurrency 由独立的 `concurrency-handler` 服务处理，slot-handler 不创建 true-concurrency lease，也不维护 true-concurrency 计数或续租。
 
-当目标同时启用 fairqueue 与 true concurrency 时，worker 的固定顺序是：先调用 `concurrency-handler` 的 advisory `precheck`，再进入 `slot-handler` 的 fairqueue acquire；fairqueue grant 成功后，worker 才会调用 `concurrency-handler` 的 `acquire`，然后再发起 origin fetch。slot-handler 在这个组合模式里仍然只承担公平排队与 slot release。
+当目标同时启用 fairqueue 与 true concurrency 时，worker 的固定顺序已经切到新的 wait-token 合同：
+
+- `fairqueue acquire`
+- `concurrency-handler acquire(fast)`
+- 若 CQ 返回 `granted`：发起 origin fetch，拿到上游响应头后尽早释放 fairqueue，最终在流结束时 best-effort `release` CQ lease
+- 若 CQ 返回 `wait`：立刻按 unused-grant 语义释放物理 fairqueue slot（`hitUpstreamAtMs=0`），保留已经消费的一次 fairness debit，然后用稳定 `waitToken` 继续 CQ wait；worker 不会重新进入 fairqueue
+- 若 CQ 在 wait 之后返回 terminal：worker 释放 unused fairqueue grant，并对 waiting/pre-active CQ request 走 `cancel`
+
+在 `queue_breaker` 组合模式下，CQ 返回 `wait` 之前由 slot-handler 发出的 breaker attempt metadata 会先被 worker settle；wait 之后若 CQ 再次 `granted`，worker 会重新向 breaker authority 做 fresh authorize，而不是复用旧 attempt。slot-handler 在整个组合模式里仍然只承担公平排队、READY/slot 生命周期与 breaker atomic admission metadata 透传。
 
 ---
 
