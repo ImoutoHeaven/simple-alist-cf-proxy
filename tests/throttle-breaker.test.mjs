@@ -2504,6 +2504,176 @@ test('worker ignores unified-check open breaker rows for unmanaged hosts', async
   }
 });
 
+test('unified breaker lookup collapses recognized Google Drive hosts into the logical google bucket', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const googleAuthorityHash = await decodeHostnameHash('google');
+  const unifiedBodies = [];
+  const authorizeBodies = [];
+  const reportBodies = [];
+  const breakerStateByHash = new Map();
+  let originFetches = 0;
+  let linkCallCount = 0;
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: [
+          'drive.google.com',
+          '*.googleapis.com',
+          '*.googleusercontent.com',
+        ],
+        rateLimit: {
+          enabled: true,
+          windowSeconds: 60,
+          limit: 10,
+        },
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      linkCallCount += 1;
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: linkCallCount === 1
+            ? 'https://drive.google.com/uc?id=unified-test&export=download'
+            : 'https://www.googleapis.com/drive/v3/files/unified-test?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_unified_check') {
+      const body = JSON.parse(init.body);
+      unifiedBodies.push(body);
+      const snapshot = breakerStateByHash.get(body.p_throttle_hostname_hash);
+      return createJsonResponse([{
+        cache_link_data: null,
+        cache_timestamp: null,
+        cache_hostname_hash: null,
+        rate_access_count: 0,
+        rate_last_window_time: Math.floor(Date.now() / 1000),
+        rate_block_until: null,
+        throttle_record_exists: Boolean(snapshot),
+        throttle_state: snapshot?.STATE || null,
+        throttle_open_until: snapshot?.OPEN_UNTIL || null,
+        throttle_reason: snapshot?.OPEN_REASON || null,
+        throttle_version: snapshot?.VERSION || null,
+        throttle_last_error_code: snapshot?.LAST_ERROR_CODE || null,
+        active_last_access_time: null,
+        active_total_access_count: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      const body = JSON.parse(init.body);
+      reportBodies.push(body);
+      breakerStateByHash.set(body.p_hostname_hash, {
+        STATE: 'open',
+        OPEN_UNTIL: Math.floor(Date.now() / 1000) + 30,
+        OPEN_REASON: `http_${body.p_status_code}`,
+        VERSION: 5,
+        LAST_ERROR_CODE: body.p_status_code,
+      });
+      return createJsonResponse([{
+        STATE: 'open',
+        OPEN_UNTIL: Math.floor(Date.now() / 1000) + 30,
+        OPEN_REASON: `http_${body.p_status_code}`,
+        VERSION: 5,
+        LAST_ERROR_CODE: body.p_status_code,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      const body = JSON.parse(init.body);
+      authorizeBodies.push(body);
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 5,
+        LAST_ERROR_CODE: null,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
+      }]);
+    }
+
+    if (url === 'https://drive.google.com/uc?id=unified-test&export=download') {
+      originFetches += 1;
+      return new Response('protected', {
+        status: 429,
+        headers: {
+          'content-type': 'text/plain',
+          'Retry-After': '8',
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/unified-test?alt=media') {
+      originFetches += 1;
+      return new Response('unexpected', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const firstResponse = await worker.fetch(await buildSignedWorkerRequest('/downloads/unified-google-drive.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+    assert.equal(firstResponse.status, 429);
+
+    const secondResponse = await worker.fetch(await buildSignedWorkerRequest('/downloads/unified-google-api.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+    assert.equal(secondResponse.status, 429);
+
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.deepEqual(
+      unifiedBodies.map((body) => body.p_throttle_hostname_hash),
+      [googleAuthorityHash, googleAuthorityHash],
+    );
+    assert.deepEqual(
+      authorizeBodies.map((body) => body.p_hostname),
+      ['google'],
+    );
+    assert.deepEqual(
+      reportBodies.map((body) => ({ hostname: body.p_hostname, hostnameHash: body.p_hostname_hash })),
+      [{ hostname: 'google', hostnameHash: googleAuthorityHash }],
+    );
+    assert.equal(originFetches, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('queue_breaker ignores unified-check breaker rows and still reaches atomic slot admission', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
@@ -3003,6 +3173,1099 @@ test('queue_breaker redirects reacquire atomic attempts on managed host changes'
     delete globalThis.bootstrapCache;
   }
 });
+
+test('queue_breaker preserves one grouped google authority attempt across recognized cross-host redirects', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const googleAuthorityHash = await decodeHostnameHash('google');
+  const acquireBodies = [];
+  const releaseBodies = [];
+  const reportBodies = [];
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: [
+          'drive.google.com',
+          '*.googleapis.com',
+          '*.googleusercontent.com',
+        ],
+        fairQueueHostPatterns: [
+          'drive.google.com',
+          '*.googleapis.com',
+          '*.googleusercontent.com',
+        ],
+        fairQueueSiteBucket: {
+          modes: ['googledrive'],
+        },
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://drive.google.com/uc?id=grouped-redirect&export=download',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      const body = JSON.parse(init.body);
+      acquireBodies.push(body);
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: `query-google-${acquireBodies.length}`,
+        invocationEpoch: acquireBodies.length,
+        slotToken: `slot-google-${acquireBodies.length}`,
+        ...(body.breakerEnabled === true ? {
+          meta: {
+            attemptVersion: 800 + acquireBodies.length,
+            attemptTicket: acquireBodies.length,
+          },
+        } : {}),
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      throw new Error('queue_breaker redirect lifecycle should not call direct breaker authorize');
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      reportBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: reportBodies.length,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://drive.google.com/uc?id=grouped-redirect&export=download') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://www.googleapis.com/drive/v3/files/grouped-redirect?alt=media' },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/grouped-redirect?alt=media') {
+      return new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/queue-breaker-google-grouped-redirect.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.all(waitUntilPromises);
+
+    assert.equal(response.status, 200);
+    assert.equal(acquireBodies.length, 2);
+    assert.equal(acquireBodies[0].hostname, 'drive.google.com');
+    assert.equal(acquireBodies[1].hostname, 'www.googleapis.com');
+    assert.equal(acquireBodies[0].breakerEnabled, true);
+    assert.equal(acquireBodies[1].breakerEnabled, undefined);
+    assert.equal(acquireBodies[1].halfOpenMaxProbeCount, undefined);
+    assert.equal(acquireBodies[1].halfOpenMaxSeconds, undefined);
+    assert.equal(acquireBodies[1].halfOpenTimeoutMode, undefined);
+    assert.equal(acquireBodies[0].siteBucket, acquireBodies[1].siteBucket);
+    assert.deepEqual(
+      releaseBodies.map((body) => body.hostname),
+      ['drive.google.com', 'www.googleapis.com'],
+    );
+    assert.deepEqual(
+      reportBodies.map((body) => ({
+        hostname: body.p_hostname,
+        hostnameHash: body.p_hostname_hash,
+        statusCode: body.p_status_code,
+        attemptVersion: body.p_attempt_version,
+        attemptTicket: body.p_attempt_ticket,
+      })),
+      [{
+        hostname: 'google',
+        hostnameHash: googleAuthorityHash,
+        statusCode: 200,
+        attemptVersion: 801,
+        attemptTicket: 1,
+      }],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_breaker flushes the carried grouped google attempt when redirected reacquire throttles before fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const googleAuthorityHash = await decodeHostnameHash('google');
+  const acquireBodies = [];
+  const releaseBodies = [];
+  const reportBodies = [];
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: [
+          'drive.google.com',
+          '*.googleapis.com',
+          '*.googleusercontent.com',
+        ],
+        fairQueueHostPatterns: [
+          'drive.google.com',
+          '*.googleapis.com',
+          '*.googleusercontent.com',
+        ],
+        fairQueueSiteBucket: {
+          modes: ['googledrive'],
+        },
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://drive.google.com/uc?id=grouped-redirect-throttled&export=download',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      const body = JSON.parse(init.body);
+      acquireBodies.push(body);
+      if (acquireBodies.length === 1) {
+        return createJsonResponse({
+          result: 'granted',
+          queryToken: 'query-google-throttled-1',
+          invocationEpoch: 1,
+          slotToken: 'slot-google-throttled-1',
+          meta: {
+            attemptVersion: 801,
+            attemptTicket: 1,
+          },
+        });
+      }
+
+      return createJsonResponse({
+        result: 'throttled',
+        queryToken: 'query-google-throttled-2',
+        invocationEpoch: 2,
+        throttleCode: 429,
+        breakerOpenUntil: Math.floor(Date.now() / 1000) + 30,
+        breakerReason: 'http_429',
+        breakerVersion: 17,
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      throw new Error('queue_breaker grouped carryover should not call direct breaker authorize');
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      reportBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: reportBodies.length,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://drive.google.com/uc?id=grouped-redirect-throttled&export=download') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://www.googleapis.com/drive/v3/files/grouped-redirect-throttled?alt=media' },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/grouped-redirect-throttled?alt=media') {
+      throw new Error('redirected Google target should not be fetched after reacquire throttle');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/queue-breaker-google-grouped-redirect-throttled.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.all(waitUntilPromises);
+
+    assert.equal(response.status, 429);
+    assert.equal(acquireBodies.length, 2);
+    assert.equal(acquireBodies[0].breakerEnabled, true);
+    assert.equal(acquireBodies[1].breakerEnabled, undefined);
+    assert.equal(acquireBodies[1].halfOpenMaxProbeCount, undefined);
+    assert.deepEqual(
+      releaseBodies.map((body) => body.hostname),
+      ['drive.google.com'],
+    );
+    assert.deepEqual(
+      reportBodies.map((body) => ({
+        hostname: body.p_hostname,
+        hostnameHash: body.p_hostname_hash,
+        statusCode: body.p_status_code,
+        attemptVersion: body.p_attempt_version,
+        attemptTicket: body.p_attempt_ticket,
+      })),
+      [{
+        hostname: 'google',
+        hostnameHash: googleAuthorityHash,
+        statusCode: 302,
+        attemptVersion: 801,
+        attemptTicket: 1,
+      }],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_breaker dual mode flushes the carried grouped google attempt when redirected fairqueue reacquire throttles before fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const googleAuthorityHash = await decodeHostnameHash('google');
+  const fairQueueAcquireBodies = [];
+  const fairQueueReleaseBodies = [];
+  const concurrencyAcquireBodies = [];
+  const concurrencyReleaseBodies = [];
+  const reportBodies = [];
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse({
+        ...buildRuntimeBootstrap({
+          hostPatterns: [
+            'drive.google.com',
+            '*.googleapis.com',
+            '*.googleusercontent.com',
+          ],
+          fairQueueHostPatterns: [
+            'drive.google.com',
+            '*.googleapis.com',
+            '*.googleusercontent.com',
+          ],
+          fairQueueSiteBucket: {
+            modes: ['googledrive'],
+          },
+        }),
+        download: {
+          ...buildRuntimeBootstrap({
+            hostPatterns: [
+              'drive.google.com',
+              '*.googleapis.com',
+              '*.googleusercontent.com',
+            ],
+            fairQueueHostPatterns: [
+              'drive.google.com',
+              '*.googleapis.com',
+              '*.googleusercontent.com',
+            ],
+            fairQueueSiteBucket: {
+              modes: ['googledrive'],
+            },
+          }).download,
+          trueConcurrency: {
+            enabled: true,
+            hostPatterns: [
+              'drive.google.com',
+              '*.googleapis.com',
+              '*.googleusercontent.com',
+            ],
+            siteBucket: {
+              modes: ['googledrive'],
+            },
+            handlerUrl: 'https://cq.example.test',
+            handlerAuthKey: 'cq-secret',
+          },
+        },
+      });
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://drive.google.com/uc?id=grouped-dual-redirect-throttled&export=download',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      const body = JSON.parse(init.body);
+      fairQueueAcquireBodies.push(body);
+      if (fairQueueAcquireBodies.length === 1) {
+        return createJsonResponse({
+          result: 'granted',
+          queryToken: 'query-google-dual-throttled-1',
+          invocationEpoch: 1,
+          slotToken: 'slot-google-dual-throttled-1',
+          meta: {
+            attemptVersion: 801,
+            attemptTicket: 1,
+          },
+        });
+      }
+
+      return createJsonResponse({
+        result: 'throttled',
+        queryToken: 'query-google-dual-throttled-2',
+        invocationEpoch: 2,
+        throttleCode: 429,
+        breakerOpenUntil: Math.floor(Date.now() / 1000) + 30,
+        breakerReason: 'http_429',
+        breakerVersion: 17,
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      fairQueueReleaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      concurrencyAcquireBodies.push(body);
+      if (concurrencyAcquireBodies.length > 1) {
+        throw new Error('redirected Google target should not continue into CQ acquire after fairqueue throttle');
+      }
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-google-dual-throttled-1',
+        leaseToken: 'token-google-dual-throttled-1',
+        expiresAtMs: body.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      concurrencyReleaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      throw new Error('queue_breaker grouped carryover should not call direct breaker authorize');
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      reportBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: reportBodies.length,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://drive.google.com/uc?id=grouped-dual-redirect-throttled&export=download') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://www.googleapis.com/drive/v3/files/grouped-dual-redirect-throttled?alt=media' },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/grouped-dual-redirect-throttled?alt=media') {
+      throw new Error('redirected Google target should not be fetched after fairqueue throttle');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/queue-breaker-google-grouped-dual-redirect-throttled.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.all(waitUntilPromises);
+
+    assert.equal(response.status, 429);
+    assert.equal(fairQueueAcquireBodies.length, 2);
+    assert.equal(concurrencyAcquireBodies.length, 1);
+    assert.equal(fairQueueAcquireBodies[0].breakerEnabled, true);
+    assert.equal(fairQueueAcquireBodies[1].breakerEnabled, undefined);
+    assert.deepEqual(
+      fairQueueReleaseBodies.map((body) => body.hostname),
+      ['drive.google.com'],
+    );
+    assert.equal(concurrencyReleaseBodies.length, 1);
+    assert.deepEqual(
+      reportBodies.map((body) => ({
+        hostname: body.p_hostname,
+        hostnameHash: body.p_hostname_hash,
+        statusCode: body.p_status_code,
+        attemptVersion: body.p_attempt_version,
+        attemptTicket: body.p_attempt_ticket,
+      })),
+      [{
+        hostname: 'google',
+        hostnameHash: googleAuthorityHash,
+        statusCode: 302,
+        attemptVersion: 801,
+        attemptTicket: 1,
+      }],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_breaker dual mode reports the carried grouped google redirect when CQ expires before second-hop fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const googleAuthorityHash = await decodeHostnameHash('google');
+  const fairQueueAcquireBodies = [];
+  const fairQueueReleaseBodies = [];
+  const concurrencyAcquireBodies = [];
+  const concurrencyReleaseBodies = [];
+  const reportBodies = [];
+  const settleBodies = [];
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse({
+        ...buildRuntimeBootstrap({
+          hostPatterns: [
+            'drive.google.com',
+            '*.googleapis.com',
+            '*.googleusercontent.com',
+          ],
+          fairQueueHostPatterns: [
+            'drive.google.com',
+            '*.googleapis.com',
+            '*.googleusercontent.com',
+          ],
+          fairQueueSiteBucket: {
+            modes: ['googledrive'],
+          },
+        }),
+        download: {
+          ...buildRuntimeBootstrap({
+            hostPatterns: [
+              'drive.google.com',
+              '*.googleapis.com',
+              '*.googleusercontent.com',
+            ],
+            fairQueueHostPatterns: [
+              'drive.google.com',
+              '*.googleapis.com',
+              '*.googleusercontent.com',
+            ],
+            fairQueueSiteBucket: {
+              modes: ['googledrive'],
+            },
+          }).download,
+          trueConcurrency: {
+            enabled: true,
+            hostPatterns: [
+              'drive.google.com',
+              '*.googleapis.com',
+              '*.googleusercontent.com',
+            ],
+            siteBucket: {
+              modes: ['googledrive'],
+            },
+            handlerUrl: 'https://cq.example.test',
+            handlerAuthKey: 'cq-secret',
+          },
+        },
+      });
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://drive.google.com/uc?id=grouped-dual-cq-expired&export=download',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      const body = JSON.parse(init.body);
+      fairQueueAcquireBodies.push(body);
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: `query-google-dual-cq-expired-${fairQueueAcquireBodies.length}`,
+        invocationEpoch: fairQueueAcquireBodies.length,
+        slotToken: `slot-google-dual-cq-expired-${fairQueueAcquireBodies.length}`,
+        ...(fairQueueAcquireBodies.length === 1 ? {
+          meta: {
+            attemptVersion: 801,
+            attemptTicket: 1,
+          },
+        } : {}),
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      fairQueueReleaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      concurrencyAcquireBodies.push(body);
+      if (concurrencyAcquireBodies.length === 1) {
+        return createJsonResponse({
+          result: 'granted',
+          leaseId: 'lease-google-dual-cq-expired-1',
+          leaseToken: 'token-google-dual-cq-expired-1',
+          expiresAtMs: body.hardExpireAtMs,
+        });
+      }
+
+      return createJsonResponse({
+        result: 'expired',
+        reason: 'hard_expired',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      concurrencyReleaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      throw new Error('queue_breaker grouped carryover should not call direct breaker authorize');
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 1,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      reportBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: reportBodies.length,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://drive.google.com/uc?id=grouped-dual-cq-expired&export=download') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://www.googleapis.com/drive/v3/files/grouped-dual-cq-expired?alt=media' },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/grouped-dual-cq-expired?alt=media') {
+      throw new Error('redirected Google target should not be fetched after CQ terminal response');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/queue-breaker-google-grouped-dual-cq-expired.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.all(waitUntilPromises);
+
+    assert.equal(response.status, 401);
+    assert.equal(fairQueueAcquireBodies.length, 2);
+    assert.equal(concurrencyAcquireBodies.length, 2);
+    assert.equal(fairQueueAcquireBodies[0].breakerEnabled, true);
+    assert.equal(fairQueueAcquireBodies[1].breakerEnabled, undefined);
+    assert.deepEqual(
+      fairQueueReleaseBodies.map((body) => body.hostname),
+      ['drive.google.com', 'www.googleapis.com'],
+    );
+    assert.equal(concurrencyReleaseBodies.length, 1);
+    assert.deepEqual(
+      settleBodies,
+      [],
+    );
+    assert.deepEqual(
+      reportBodies.map((body) => ({
+        hostname: body.p_hostname,
+        hostnameHash: body.p_hostname_hash,
+        statusCode: body.p_status_code,
+        attemptVersion: body.p_attempt_version,
+        attemptTicket: body.p_attempt_ticket,
+      })),
+      [{
+        hostname: 'google',
+        hostnameHash: googleAuthorityHash,
+        statusCode: 302,
+        attemptVersion: 801,
+        attemptTicket: 1,
+      }],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_breaker dual mode reports the carried grouped google redirect when CQ wait later expires before second-hop fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const googleAuthorityHash = await decodeHostnameHash('google');
+  const fairQueueAcquireBodies = [];
+  const fairQueueReleaseBodies = [];
+  const concurrencyAcquireBodies = [];
+  const concurrencyReleaseBodies = [];
+  const concurrencyCancelBodies = [];
+  const reportBodies = [];
+  const settleBodies = [];
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse({
+        ...buildRuntimeBootstrap({
+          hostPatterns: [
+            'drive.google.com',
+            '*.googleapis.com',
+            '*.googleusercontent.com',
+          ],
+          fairQueueHostPatterns: [
+            'drive.google.com',
+            '*.googleapis.com',
+            '*.googleusercontent.com',
+          ],
+          fairQueueSiteBucket: {
+            modes: ['googledrive'],
+          },
+        }),
+        download: {
+          ...buildRuntimeBootstrap({
+            hostPatterns: [
+              'drive.google.com',
+              '*.googleapis.com',
+              '*.googleusercontent.com',
+            ],
+            fairQueueHostPatterns: [
+              'drive.google.com',
+              '*.googleapis.com',
+              '*.googleusercontent.com',
+            ],
+            fairQueueSiteBucket: {
+              modes: ['googledrive'],
+            },
+          }).download,
+          trueConcurrency: {
+            enabled: true,
+            hostPatterns: [
+              'drive.google.com',
+              '*.googleapis.com',
+              '*.googleusercontent.com',
+            ],
+            siteBucket: {
+              modes: ['googledrive'],
+            },
+            handlerUrl: 'https://cq.example.test',
+            handlerAuthKey: 'cq-secret',
+          },
+        },
+      });
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://drive.google.com/uc?id=grouped-dual-cq-wait-expired&export=download',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      const body = JSON.parse(init.body);
+      fairQueueAcquireBodies.push(body);
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: `query-google-dual-cq-wait-expired-${fairQueueAcquireBodies.length}`,
+        invocationEpoch: fairQueueAcquireBodies.length,
+        slotToken: `slot-google-dual-cq-wait-expired-${fairQueueAcquireBodies.length}`,
+        ...(fairQueueAcquireBodies.length === 1 ? {
+          meta: {
+            attemptVersion: 801,
+            attemptTicket: 1,
+          },
+        } : {}),
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      fairQueueReleaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      concurrencyAcquireBodies.push(body);
+      if (concurrencyAcquireBodies.length === 1) {
+        return createJsonResponse({
+          result: 'granted',
+          leaseId: 'lease-google-dual-cq-wait-expired-1',
+          leaseToken: 'token-google-dual-cq-wait-expired-1',
+          expiresAtMs: body.hardExpireAtMs,
+        });
+      }
+
+      if (concurrencyAcquireBodies.length === 2) {
+        return createJsonResponse({
+          result: 'wait',
+          waitToken: 'wait-google-dual-cq-wait-expired-1',
+          scope: 'host',
+          retryAfter: 1,
+        });
+      }
+
+      return createJsonResponse({
+        result: 'expired',
+        reason: 'hard_expired',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      concurrencyReleaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
+      concurrencyCancelBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'cancelled' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      throw new Error('queue_breaker grouped carryover should not call direct breaker authorize');
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 1,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      reportBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: reportBodies.length,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://drive.google.com/uc?id=grouped-dual-cq-wait-expired&export=download') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://www.googleapis.com/drive/v3/files/grouped-dual-cq-wait-expired?alt=media' },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/grouped-dual-cq-wait-expired?alt=media') {
+      throw new Error('redirected Google target should not be fetched after CQ wait terminal response');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/queue-breaker-google-grouped-dual-cq-wait-expired.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.all(waitUntilPromises);
+
+    assert.equal(response.status, 401);
+    assert.equal(fairQueueAcquireBodies.length, 2);
+    assert.equal(concurrencyAcquireBodies.length, 3);
+    assert.equal(fairQueueAcquireBodies[0].breakerEnabled, true);
+    assert.equal(fairQueueAcquireBodies[1].breakerEnabled, undefined);
+    assert.deepEqual(
+      fairQueueReleaseBodies.map((body) => body.hostname),
+      ['drive.google.com', 'www.googleapis.com'],
+    );
+    assert.equal(concurrencyReleaseBodies.length, 1);
+    assert.equal(concurrencyCancelBodies.length, 1);
+    assert.deepEqual(
+      settleBodies,
+      [],
+    );
+    assert.deepEqual(
+      reportBodies.map((body) => ({
+        hostname: body.p_hostname,
+        hostnameHash: body.p_hostname_hash,
+        statusCode: body.p_status_code,
+        attemptVersion: body.p_attempt_version,
+        attemptTicket: body.p_attempt_ticket,
+      })),
+      [{
+        hostname: 'google',
+        hostnameHash: googleAuthorityHash,
+        statusCode: 302,
+        attemptVersion: 801,
+        attemptTicket: 1,
+      }],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+for (const terminalCase of [
+  {
+    name: 'timeout',
+    buildAcquireResponse: () => createJsonResponse({
+      result: 'timeout',
+    }),
+  },
+  {
+    name: 'conflict',
+    buildAcquireResponse: () => new Response(JSON.stringify({
+      result: 'conflict',
+    }), {
+      status: 409,
+      headers: { 'content-type': 'application/json' },
+    }),
+  },
+]) {
+  test(`queue_breaker flushes the carried grouped google attempt when redirected reacquire ${terminalCase.name}s before fetch`, async () => {
+    const originalFetch = globalThis.fetch;
+    const waitUntilPromises = [];
+    const googleAuthorityHash = await decodeHostnameHash('google');
+    const acquireBodies = [];
+    const releaseBodies = [];
+    const reportBodies = [];
+    delete globalThis.bootstrapCache;
+
+    globalThis.fetch = async (input, init = {}) => {
+      const url = typeof input === 'string' ? input : input.url;
+
+      if (url === 'https://controller.example.test/api/v0/bootstrap') {
+        return createJsonResponse(buildRuntimeBootstrap({
+          hostPatterns: [
+            'drive.google.com',
+            '*.googleapis.com',
+            '*.googleusercontent.com',
+          ],
+          fairQueueHostPatterns: [
+            'drive.google.com',
+            '*.googleapis.com',
+            '*.googleusercontent.com',
+          ],
+          fairQueueSiteBucket: {
+            modes: ['googledrive'],
+          },
+        }));
+      }
+
+      if (url === 'https://alist.example.com/api/fs/link') {
+        return createJsonResponse({
+          code: 200,
+          data: {
+            url: `https://drive.google.com/uc?id=grouped-redirect-${terminalCase.name}&export=download`,
+            header: {},
+          },
+        });
+      }
+
+      if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+        const body = JSON.parse(init.body);
+        acquireBodies.push(body);
+        if (acquireBodies.length === 1) {
+          return createJsonResponse({
+            result: 'granted',
+            queryToken: `query-google-${terminalCase.name}-1`,
+            invocationEpoch: 1,
+            slotToken: `slot-google-${terminalCase.name}-1`,
+            meta: {
+              attemptVersion: 801,
+              attemptTicket: 1,
+            },
+          });
+        }
+
+        return terminalCase.buildAcquireResponse();
+      }
+
+      if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+        releaseBodies.push(JSON.parse(init.body));
+        return createJsonResponse({ result: 'ok' });
+      }
+
+      if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+        throw new Error('queue_breaker grouped carryover should not call direct breaker authorize');
+      }
+
+      if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+        reportBodies.push(JSON.parse(init.body));
+        return createJsonResponse([{
+          STATE: 'closed',
+          OPEN_UNTIL: null,
+          OPEN_REASON: null,
+          VERSION: reportBodies.length,
+          LAST_ERROR_CODE: null,
+        }]);
+      }
+
+      if (url === `https://drive.google.com/uc?id=grouped-redirect-${terminalCase.name}&export=download`) {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: `https://www.googleapis.com/drive/v3/files/grouped-redirect-${terminalCase.name}?alt=media` },
+        });
+      }
+
+      if (url === `https://www.googleapis.com/drive/v3/files/grouped-redirect-${terminalCase.name}?alt=media`) {
+        throw new Error('redirected Google target should not be fetched after reacquire terminal response');
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url}`);
+    };
+
+    try {
+      const response = await worker.fetch(await buildSignedWorkerRequest(`/downloads/queue-breaker-google-grouped-redirect-${terminalCase.name}.bin`), {
+        CONTROLLER_URL: 'https://controller.example.test',
+        CONTROLLER_API_TOKEN: 'controller-token',
+        ENV: 'test',
+        ROLE: 'download',
+        INSTANCE_ID: 'worker-1',
+        BOOTSTRAP_CACHE_MODE: 'direct',
+      }, {
+        waitUntil(promise) {
+          waitUntilPromises.push(promise);
+        },
+      });
+
+      await Promise.all(waitUntilPromises);
+
+      assert.equal(response.status, 503);
+      assert.equal(acquireBodies.length, 2);
+      assert.equal(acquireBodies[0].breakerEnabled, true);
+      assert.equal(acquireBodies[1].breakerEnabled, undefined);
+      assert.deepEqual(
+        releaseBodies.map((body) => body.hostname),
+        ['drive.google.com'],
+      );
+      assert.deepEqual(
+        reportBodies.map((body) => ({
+          hostname: body.p_hostname,
+          hostnameHash: body.p_hostname_hash,
+          statusCode: body.p_status_code,
+          attemptVersion: body.p_attempt_version,
+          attemptTicket: body.p_attempt_ticket,
+        })),
+        [{
+          hostname: 'google',
+          hostnameHash: googleAuthorityHash,
+          statusCode: 302,
+          attemptVersion: 801,
+          attemptTicket: 1,
+        }],
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete globalThis.bootstrapCache;
+    }
+  });
+}
 
 test('queue_breaker redirects reacquire when site buckets change on same host', async () => {
   const originalFetch = globalThis.fetch;

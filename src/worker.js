@@ -64,18 +64,78 @@ const idle410Cache = {
 };
 
 const GOOGLE_DRIVE_HEAD_PROBE_RANGE = 'bytes=0-0';
+const SITE_BUCKET_MODES = new Set(['sharepoint', 'googledrive']);
 
 const nowMs = () => Date.now();
 
-const isGoogleDriveDownloadHostname = (hostname) => {
-  const host = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
-  if (!host) {
-    return false;
+const normalizeHostnameValue = (hostname) => {
+  if (typeof hostname !== 'string') {
+    return '';
   }
-  return host === 'drive.google.com'
-    || host === 'www.googleapis.com'
-    || host === 'drive.usercontent.google.com'
-    || host.endsWith('.googleusercontent.com');
+  return hostname.trim().toLowerCase();
+};
+
+const normalizeSiteBucketModeToken = (value) => {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.trim().toLowerCase();
+};
+
+const normalizeSiteBucketConfig = (siteBucketConfig, fieldName = 'controller siteBucket') => {
+  const rawConfig = siteBucketConfig && typeof siteBucketConfig === 'object'
+    ? siteBucketConfig
+    : {};
+  const normalizedModes = [];
+  const seenModes = new Set();
+  const rawModes = Array.isArray(rawConfig.modes) ? rawConfig.modes : [];
+
+  for (const rawMode of rawModes) {
+    const mode = normalizeSiteBucketModeToken(rawMode);
+    if (!mode || seenModes.has(mode)) {
+      continue;
+    }
+    if (!SITE_BUCKET_MODES.has(mode)) {
+      throw new Error(`Invalid ${fieldName}: unsupported siteBucket mode ${rawMode}`);
+    }
+    seenModes.add(mode);
+    normalizedModes.push(mode);
+  }
+
+  const normalizedMode = normalizeSiteBucketModeToken(rawConfig.mode);
+  if (normalizedMode && !SITE_BUCKET_MODES.has(normalizedMode)) {
+    throw new Error(`Invalid ${fieldName}: unsupported siteBucket mode ${rawConfig.mode}`);
+  }
+
+  const effectiveModes = normalizedModes.length > 0
+    ? normalizedModes
+    : normalizedMode
+      ? [normalizedMode]
+      : ['sharepoint'];
+
+  return {
+    mode: effectiveModes[0],
+    modes: effectiveModes,
+  };
+};
+
+const detectSiteBucketProvider = (hostname) => {
+  const host = normalizeHostnameValue(hostname);
+  if (!host) {
+    return 'unknown';
+  }
+  if (host.endsWith('.sharepoint.com')) {
+    return 'sharepoint';
+  }
+  if (host === 'drive.google.com' || host.endsWith('.googleapis.com') || host.endsWith('.googleusercontent.com')) {
+    return 'googledrive';
+  }
+  return 'unknown';
+};
+
+const isGoogleDriveDownloadHostname = (hostname) => {
+  const host = normalizeHostnameValue(hostname);
+  return detectSiteBucketProvider(host) === 'googledrive' || host === 'drive.usercontent.google.com';
 };
 
 const parseContentRangeTotal = (contentRangeValue) => {
@@ -110,17 +170,44 @@ const extractPathname = (urlValue) => {
   }
 };
 
-const deriveSiteKey = (hostname, pathname) => {
-  const lowerHost = (hostname || '').toLowerCase();
+const deriveSharePointSiteKey = (pathname) => {
   const segments = typeof pathname === 'string'
     ? pathname.toLowerCase().split('/').filter((segment) => segment.length > 0)
     : [];
+  if (segments[0] === 'personal' && segments[1]) return `personal:${segments[1]}`;
+  if (segments[0] === 'sites' && segments[1]) return `sites:${segments[1]}`;
+  if (segments[0] === 'teams' && segments[1]) return `teams:${segments[1]}`;
+  return 'unknown';
+};
 
-  if (lowerHost.endsWith('.sharepoint.com')) {
-    if (segments[0] === 'personal' && segments[1]) return `personal:${segments[1]}`;
-    if (segments[0] === 'sites' && segments[1]) return `sites:${segments[1]}`;
-    if (segments[0] === 'teams' && segments[1]) return `teams:${segments[1]}`;
-    return 'unknown';
+const deriveProviderHostBucket = (hostname) => {
+  const provider = detectSiteBucketProvider(hostname);
+  if (provider === 'googledrive') {
+    return 'google';
+  }
+  const host = normalizeHostnameValue(hostname);
+  return host || 'unknown';
+};
+
+const deriveThrottleAuthorityHostname = (hostname) => {
+  const host = normalizeHostnameValue(hostname);
+  if (!host) {
+    return '';
+  }
+  return detectSiteBucketProvider(host) === 'googledrive' ? 'google' : host;
+};
+
+const deriveSiteKey = (hostname, pathname, siteBucketConfig) => {
+  const lowerHost = normalizeHostnameValue(hostname);
+  const provider = detectSiteBucketProvider(lowerHost);
+  const { modes } = normalizeSiteBucketConfig(siteBucketConfig);
+
+  if (provider === 'sharepoint' && modes.includes('sharepoint')) {
+    return deriveSharePointSiteKey(pathname);
+  }
+
+  if (provider === 'googledrive' && modes.includes('googledrive')) {
+    return 'googledrive:unspecified';
   }
 
   if (lowerHost) {
@@ -131,11 +218,8 @@ const deriveSiteKey = (hostname, pathname) => {
 };
 
 const deriveSiteBucket = async (hostname, urlValue, siteBucketConfig) => {
-  const mode = normalizeStringValue(siteBucketConfig?.mode, 'sharepoint').toLowerCase();
   const path = extractPathname(urlValue);
-  const siteKey = mode === 'sharepoint'
-    ? deriveSiteKey(hostname, path)
-    : (hostname ? `host:${hostname.toLowerCase()}` : 'unknown');
+  const siteKey = deriveSiteKey(hostname, path, siteBucketConfig);
   const hash = await sha256Hash(siteKey || 'unknown');
   return hash || '';
 };
@@ -513,7 +597,7 @@ const normalizeHeaderMap = (value) => {
 };
 
 function markHostOverloaded(hostname, retryAfterMs) {
-  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
+  const hostKey = deriveProviderHostBucket(hostname);
   if (!hostKey) {
     return;
   }
@@ -536,7 +620,7 @@ function buildScopedOverloadKey(parts) {
 }
 
 function buildSiteOverloadKey(hostname, siteBucket) {
-  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
+  const hostKey = deriveProviderHostBucket(hostname);
   if (!hostKey) {
     return '';
   }
@@ -547,7 +631,7 @@ function buildSiteOverloadKey(hostname, siteBucket) {
 }
 
 function buildIpOverloadKey(hostname, siteBucket, ipBucket) {
-  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
+  const hostKey = deriveProviderHostBucket(hostname);
   if (!hostKey) {
     return '';
   }
@@ -601,7 +685,7 @@ function markScopedOverloaded(store, key, retryAfterMs) {
 }
 
 function getHostOverloadedRemainingMs(hostname, now = nowMs()) {
-  const hostKey = typeof hostname === 'string' ? hostname.trim() : '';
+  const hostKey = deriveProviderHostBucket(hostname);
   if (!hostKey) {
     return 0;
   }
@@ -1103,9 +1187,10 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   if (fairQueueEnabled && !slotHandlerUrl) {
     throw new Error('controller fairQueue.slotHandlerUrl is required when fairQueue.enabled is true');
   }
-  const fairQueueSiteBucket = fairQueueConfigRaw.siteBucket && typeof fairQueueConfigRaw.siteBucket === 'object'
-    ? fairQueueConfigRaw.siteBucket
-    : {};
+  const fairQueueSiteBucket = normalizeSiteBucketConfig(
+    fairQueueConfigRaw.siteBucket,
+    'controller fairQueue.siteBucket',
+  );
   const slotHandlerConfig = {
     url: slotHandlerUrl,
     totalMaxWaitMs: slotHandlerTimeoutMs,
@@ -1140,13 +1225,10 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   if (trueConcurrencyEnabled && !concurrencyHandlerAuthKey) {
     throw new Error('controller trueConcurrency.handlerAuthKey is required when trueConcurrency.enabled is true');
   }
-  const trueConcurrencySiteBucketRaw = trueConcurrencyConfigRaw.siteBucket && typeof trueConcurrencyConfigRaw.siteBucket === 'object'
-    ? trueConcurrencyConfigRaw.siteBucket
-    : {};
-  const trueConcurrencySiteBucketMode = normalizeString(trueConcurrencySiteBucketRaw.mode, 'sharepoint').toLowerCase();
-  if (trueConcurrencySiteBucketMode !== 'sharepoint') {
-    throw new Error('controller trueConcurrency.siteBucket.mode must be "sharepoint" in V1');
-  }
+  const trueConcurrencySiteBucket = normalizeSiteBucketConfig(
+    trueConcurrencyConfigRaw.siteBucket,
+    'controller trueConcurrency.siteBucket',
+  );
   const concurrencyHandlerConfig = {
     url: concurrencyHandlerUrl,
     authKey: concurrencyHandlerAuthKey,
@@ -1214,7 +1296,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     fairQueueSiteBucket: fairQueueContext.fairQueueSiteBucket,
     trueConcurrencyEnabled,
     trueConcurrencyHostnamePatterns,
-    trueConcurrencySiteBucket: { mode: trueConcurrencySiteBucketMode },
+    trueConcurrencySiteBucket,
     concurrencyHandlerConfig,
   };
 };
@@ -2041,7 +2123,10 @@ const buildFinalCleanupGroups = (cleanupContexts) => {
   const groupsByHostKey = new Map();
 
   for (const cleanupContext of dedupedContexts) {
-    const hostGroupKey = cleanupContext.hostnameHash || cleanupContext.hostname;
+    const providerHostBucket = deriveProviderHostBucket(cleanupContext?.hostname);
+    const hostGroupKey = providerHostBucket === 'google'
+      ? providerHostBucket
+      : cleanupContext.hostnameHash || providerHostBucket;
     let group = groupsByHostKey.get(hostGroupKey);
     if (!group) {
       group = [];
@@ -2060,10 +2145,15 @@ const clearReleasedFairQueueMetadata = (fqContext) => {
   }
 
   clearFairQueueOwnershipMetadata(fqContext);
-  if (!fqContext.deferredReportArmed) {
-    fqContext.attemptVersion = null;
-    fqContext.attemptTicket = null;
+  if (fqContext.deferredReportArmed) {
+    return;
   }
+  fqContext.attemptVersion = null;
+  fqContext.attemptTicket = null;
+  fqContext.deferredReportStatusCode = null;
+  fqContext.deferredReportArmed = false;
+  fqContext.preserveAttemptMetadataOnGrant = false;
+  fqContext.groupedGoogleCarryoverPendingReport = false;
 };
 
 const clearAbandonedFairQueueMetadata = (fqContext) => {
@@ -2072,10 +2162,16 @@ const clearAbandonedFairQueueMetadata = (fqContext) => {
   }
 
   clearFairQueueOwnershipMetadata(fqContext);
+  if (fqContext.preserveAttemptMetadataOnGrant === true) {
+    fqContext.preserveAttemptMetadataOnGrant = false;
+    return;
+  }
   fqContext.attemptVersion = null;
   fqContext.attemptTicket = null;
-  fqContext.deferredReportArmed = false;
   fqContext.deferredReportStatusCode = null;
+  fqContext.deferredReportArmed = false;
+  fqContext.preserveAttemptMetadataOnGrant = false;
+  fqContext.groupedGoogleCarryoverPendingReport = false;
 };
 
 const finalizeFairQueueContext = async ({ fairQueueClient, ctx, fqContext, phase }) => {
@@ -2327,7 +2423,7 @@ const createSlotHandlerClient = (config) => {
   return {
     async waitForSlot(ctx, fqContext, signal) {
       const maxAttempts = computeMaxAttempts();
-      const hostKey = fqContext?.hostname || '';
+      const hostKey = deriveProviderHostBucket(fqContext?.hostname);
       let queryToken = typeof fqContext?.queryToken === 'string' && fqContext.queryToken
         ? fqContext.queryToken
         : null;
@@ -2496,8 +2592,15 @@ const createSlotHandlerClient = (config) => {
               fqContext.slotToken = data.slotToken;
               fqContext.releaseOwnerRequired = responseReleaseOwnerRequired ? true : undefined;
               fqContext.slotAcquiredAt = Date.now();
-              fqContext.attemptVersion = attemptVersion;
-              fqContext.attemptTicket = attemptTicket;
+              if (Number.isFinite(attemptVersion) && Number.isFinite(attemptTicket)) {
+                fqContext.attemptVersion = attemptVersion;
+                fqContext.attemptTicket = attemptTicket;
+              } else if (fqContext.preserveAttemptMetadataOnGrant === true) {
+                fqContext.preserveAttemptMetadataOnGrant = false;
+              } else {
+                fqContext.attemptVersion = null;
+                fqContext.attemptTicket = null;
+              }
               if (typeof testHooks?.onGrantPromotion === 'function') {
                 testHooks.onGrantPromotion(fqContext);
               }
@@ -3287,8 +3390,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   if (supportsUnifiedCheck && !config.cacheEnabled && !unifiedResult) {
     const throttleHostnameRaw = extractHostname(downloadUrl);
     unifiedThrottleHostname = throttleHostnameRaw ? throttleHostnameRaw.toLowerCase() : null;
-    const throttleHostnameHash = admissionMode === 'breaker_only' && unifiedThrottleHostname
-      ? await sha256Hash(unifiedThrottleHostname)
+    const unifiedThrottleAuthorityHostname = admissionMode === 'breaker_only' && unifiedThrottleHostname
+      ? deriveThrottleAuthorityHostname(unifiedThrottleHostname)
+      : null;
+    const throttleHostnameHash = unifiedThrottleAuthorityHostname
+      ? await sha256Hash(unifiedThrottleAuthorityHostname)
       : null;
     unifiedThrottleHostnameHash = throttleHostnameHash || null;
 
@@ -3310,13 +3416,20 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const throttleCheckEnabled = config.throttleEnabled && throttleManager;
   const isThrottleManagedHostname = (hostname) => isManagedThrottleHost(hostname, config.throttleHostnamePatterns);
+  const getThrottleAuthorityHostname = (hostname) => {
+    if (!isThrottleManagedHostname(hostname)) {
+      return null;
+    }
+    return deriveThrottleAuthorityHostname(hostname);
+  };
   const readAuthoritySnapshotForHostname = async (hostname) => {
-    if (!throttleCheckEnabled || !hostname || !isThrottleManagedHostname(hostname)) {
+    const authorityHostname = getThrottleAuthorityHostname(hostname);
+    if (!throttleCheckEnabled || !authorityHostname) {
       return null;
     }
 
     try {
-      const snapshot = await throttleManager.getBreakerState(hostname, { ...config.throttleConfig, ctx });
+      const snapshot = await throttleManager.getBreakerState(authorityHostname, { ...config.throttleConfig, ctx });
       if (!snapshot) {
         console.error('[Throttle] Snapshot read returned no authority state');
         return createBreakerAuthorityUnavailableResponse(origin, 'snapshot read');
@@ -3360,7 +3473,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   }
 
   const authorizeBreakerAttempt = async (hostname) => {
-    if (!throttleCheckEnabled || !hostname || !isThrottleManagedHostname(hostname)) {
+    const authorityHostname = getThrottleAuthorityHostname(hostname);
+    if (!throttleCheckEnabled || !authorityHostname) {
       return {
         blockedResponse: null,
         attemptVersion: null,
@@ -3369,7 +3483,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     try {
-      const attemptSnapshot = await throttleManager.authorizeBreakerAttempt(hostname, { ...config.throttleConfig, ctx });
+      const attemptSnapshot = await throttleManager.authorizeBreakerAttempt(authorityHostname, { ...config.throttleConfig, ctx });
       if (!attemptSnapshot) {
         console.error('[Throttle] Attempt authorize returned no authority state');
         return {
@@ -3452,7 +3566,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     try {
-      const snapshot = await throttleManager.settleBreakerAttempt(hostname, {
+      const authorityHostname = getThrottleAuthorityHostname(hostname);
+      if (!authorityHostname) {
+        return null;
+      }
+
+      const snapshot = await throttleManager.settleBreakerAttempt(authorityHostname, {
         attemptVersion,
         attemptTicket,
       }, { ...config.throttleConfig, ctx });
@@ -3479,6 +3598,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return;
     }
     fqContext.deferredReportArmed = false;
+    fqContext.groupedGoogleCarryoverPendingReport = false;
   };
 
   const clearDeferredQueueBreakerReport = () => {
@@ -3487,6 +3607,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
     fqContext.deferredReportStatusCode = null;
     fqContext.deferredReportArmed = false;
+    fqContext.preserveAttemptMetadataOnGrant = false;
+    fqContext.groupedGoogleCarryoverPendingReport = false;
   };
 
   const readQueueBreakerAttempt = (hostname, hostnameAdmissionMode) => {
@@ -3567,7 +3689,17 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     const redirectHostnameRaw = extractHostname(redirectUrl);
     const redirectHostname = redirectHostnameRaw ? redirectHostnameRaw.toLowerCase() : null;
-    if (!redirectHostname || redirectHostname !== fqContext.hostname) {
+    if (!redirectHostname) {
+      return false;
+    }
+
+    const currentAuthorityHostname = getThrottleAuthorityHostname(hostname);
+    const redirectAuthorityHostname = getThrottleAuthorityHostname(redirectHostname);
+    if (!currentAuthorityHostname || currentAuthorityHostname !== redirectAuthorityHostname) {
+      return false;
+    }
+
+    if (redirectHostname !== fqContext.hostname && currentAuthorityHostname !== 'google') {
       return false;
     }
 
@@ -3577,6 +3709,53 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     const redirectSiteBucket = await deriveSiteBucket(redirectHostname, redirectUrl, config.fairQueueSiteBucket);
     return redirectSiteBucket === fqContext.siteBucket;
+  };
+
+  const readGroupedGoogleQueueBreakerCarryover = (nextHostname, nextSiteBucket) => {
+    if (!fqContext || !fqContext.deferredReportArmed || !Number.isFinite(fqContext.deferredReportStatusCode)) {
+      return null;
+    }
+
+    if (resolveAdmissionMode(config, nextHostname) !== 'queue_breaker') {
+      return null;
+    }
+
+    const currentAuthorityHostname = getThrottleAuthorityHostname(fqContext.hostname);
+    const nextAuthorityHostname = getThrottleAuthorityHostname(nextHostname);
+    if (currentAuthorityHostname !== 'google' || nextAuthorityHostname !== currentAuthorityHostname) {
+      return null;
+    }
+
+    if (nextSiteBucket !== fqContext.siteBucket) {
+      return null;
+    }
+
+    return {
+      deferredReportStatusCode: fqContext.deferredReportStatusCode,
+      attemptVersion: Number.isFinite(fqContext.attemptVersion) ? Math.trunc(fqContext.attemptVersion) : null,
+      attemptTicket: Number.isFinite(fqContext.attemptTicket) ? Math.trunc(fqContext.attemptTicket) : null,
+      preserveAttemptMetadataOnGrant: true,
+      groupedGoogleCarryoverPendingReport: true,
+    };
+  };
+
+  const flushGroupedGoogleCarryoverReportBeforeSettleIfNeeded = async (hostname) => {
+    if (
+      resolveAdmissionMode(config, hostname) !== 'queue_breaker'
+      || !fqContext
+      || hostname !== fqContext.hostname
+      || fqContext.groupedGoogleCarryoverPendingReport !== true
+      || fqContext.deferredReportArmed !== true
+      || !Number.isFinite(fqContext.deferredReportStatusCode)
+      || fqContext.hitUpstreamAtMs
+    ) {
+      return { handled: false, response: null };
+    }
+
+    return {
+      handled: true,
+      response: await flushDeferredQueueBreakerReportIfNeeded(),
+    };
   };
 
   const reportBreakerResponseIfNeeded = async (hostname, response, requestUrl, attempt = null) => {
@@ -3630,8 +3809,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         console.log(`[Throttle] Error ${statusCode} from ${hostname}, reporting breaker sample`);
       }
 
+      const authorityHostname = getThrottleAuthorityHostname(hostname);
+      if (!authorityHostname) {
+        return;
+      }
+
       const snapshot = await throttleManager.reportBreakerSample(
-        hostname,
+        authorityHostname,
         {
           sample,
           statusCode,
@@ -3686,6 +3870,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     nowMs: Date.now(),
     deferredReportStatusCode: null,
     deferredReportArmed: false,
+    preserveAttemptMetadataOnGrant: false,
+    groupedGoogleCarryoverPendingReport: false,
     cleanupRetired: false,
     ...buildFairQueueAdmissionFields(mode),
   });
@@ -3743,7 +3929,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     try {
-      const snapshot = await throttleManager.settleBreakerAttempt(hostname, {
+      const authorityHostname = getThrottleAuthorityHostname(hostname);
+      if (!authorityHostname) {
+        clearPendingBreakerOnlyAttempt();
+        return null;
+      }
+
+      const snapshot = await throttleManager.settleBreakerAttempt(authorityHostname, {
         attemptVersion,
         attemptTicket,
       }, { ...config.throttleConfig, ctx });
@@ -3757,6 +3949,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   };
 
   const settleBreakerAttemptIfNeeded = async (hostname) => {
+    const groupedGoogleCarryoverReport = await flushGroupedGoogleCarryoverReportBeforeSettleIfNeeded(hostname);
+    if (groupedGoogleCarryoverReport.handled) {
+      return groupedGoogleCarryoverReport.response;
+    }
+
     const queueBreakerSettlement = await settleQueueBreakerAttemptIfNeeded(hostname);
     if (queueBreakerSettlement instanceof Response) {
       return queueBreakerSettlement;
@@ -4074,12 +4271,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   };
 
-  const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
-    if (!response || !fqContext || !fairQueueClient) {
-      return response;
-    }
+const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
+  if (!response || !fqContext || !fairQueueClient) {
+    return response;
+  }
 
-    fqContext.cleanupRetired = true;
+  const deferredReportResponse = await flushDeferredQueueBreakerReportIfNeeded();
+  const responseToReturn = deferredReportResponse || response;
+
+  fqContext.cleanupRetired = true;
 
     const cleanupPromise = (async () => {
       const finalized = await finalizeFairQueueContext({
@@ -4101,11 +4301,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     if (ctx && typeof ctx.waitUntil === 'function') {
       ctx.waitUntil(cleanupPromise);
-      return response;
+      return responseToReturn;
     }
 
     await cleanupPromise;
-    return response;
+    return responseToReturn;
   };
 
   const prepareFairQueueContextForTarget = async (targetUrl, phase) => {
@@ -4119,6 +4319,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     const updatedSiteBucket = needFairQueue
       ? await deriveSiteBucket(updatedHostname, targetUrl, config.fairQueueSiteBucket)
       : null;
+    const groupedGoogleCarryover = readGroupedGoogleQueueBreakerCarryover(updatedHostname, updatedSiteBucket);
     const fairQueueIdentityChanged = !fqContext
       || updatedHostname !== fqContext.hostname
       || updatedSiteBucket !== fqContext.siteBucket;
@@ -4162,9 +4363,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     if (fqContext) {
-      const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
-      if (deferredReportResponse) {
-        return deferredReportResponse;
+      if (!groupedGoogleCarryover) {
+        const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+        if (deferredReportResponse) {
+          return deferredReportResponse;
+        }
       }
       const previousFairQueueContext = fqContext;
       await reconcileFairQueueContextForTarget({
@@ -4188,6 +4391,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       updatedAdmissionMode,
     );
     fqContext.targetUrl = normalizedTargetUrl;
+    if (groupedGoogleCarryover) {
+      fqContext.breakerEnabled = undefined;
+      fqContext.halfOpenMaxProbeCount = undefined;
+      fqContext.halfOpenMaxSeconds = undefined;
+      fqContext.halfOpenTimeoutMode = undefined;
+      fqContext.deferredReportStatusCode = groupedGoogleCarryover.deferredReportStatusCode;
+      fqContext.deferredReportArmed = true;
+      fqContext.attemptVersion = groupedGoogleCarryover.attemptVersion;
+      fqContext.attemptTicket = groupedGoogleCarryover.attemptTicket;
+      fqContext.preserveAttemptMetadataOnGrant = groupedGoogleCarryover.preserveAttemptMetadataOnGrant === true;
+      fqContext.groupedGoogleCarryoverPendingReport = groupedGoogleCarryover.groupedGoogleCarryoverPendingReport === true;
+    }
 
     return {
       targetHostname: updatedHostname,
@@ -4286,7 +4501,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         if (acquireResult.result === 'wait') {
           cqPlan.waitToken = acquireResult.waitToken;
           if (resolveAdmissionMode(config, cqPlan.hostname) === 'queue_breaker') {
-            const settleResponse = await settleQueueBreakerAttemptIfNeeded(cqPlan.hostname);
+            const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
             if (settleResponse instanceof Response) {
               const fairQueueReleased = await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq wait settle failure`);
               await ensureCurrentTrueConcurrencyCancelled('worker_aborted');

@@ -2,8 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { __fairQueueTestHooks } from '../src/worker.js';
 import { encryptBindingPayload } from '../src/origin-binding.js';
+import { sha256Hash } from '../src/utils.js';
 
-const { createConcurrencyReleaseController } = __fairQueueTestHooks;
+const {
+  buildFinalCleanupGroups,
+  clearOverloadedByHost,
+  createConcurrencyReleaseController,
+  createSlotHandlerClient,
+} = __fairQueueTestHooks;
 
 const createJsonResponse = (payload, init = {}) => new Response(JSON.stringify(payload), {
   status: init.status ?? 200,
@@ -42,7 +48,9 @@ const signPayload = async (payload, expire, token) => {
 
 const buildRuntimeBootstrap = ({
   fairQueueHostPatterns = [],
+  fairQueueSiteBucket = undefined,
   trueConcurrencyHostPatterns = [],
+  trueConcurrencySiteBucket = undefined,
   throttleHostPatterns = [],
 } = {}) => ({
   configVersion: 'task-group-4-runtime',
@@ -101,6 +109,7 @@ const buildRuntimeBootstrap = ({
         slotHandlerUrl: 'https://slot-handler.example.test',
         slotHandlerAuthKey: 'slot-secret',
         slotHandlerAuthHeader: 'X-FQ-Auth',
+        ...(fairQueueSiteBucket !== undefined ? { siteBucket: fairQueueSiteBucket } : {}),
       },
     } : {}),
     ...(trueConcurrencyHostPatterns.length > 0 ? {
@@ -109,6 +118,7 @@ const buildRuntimeBootstrap = ({
         hostPatterns: trueConcurrencyHostPatterns,
         handlerUrl: 'https://cq.example.test',
         handlerAuthKey: 'cq-secret',
+        ...(trueConcurrencySiteBucket !== undefined ? { siteBucket: trueConcurrencySiteBucket } : {}),
       },
     } : {}),
   },
@@ -167,6 +177,115 @@ const createTestContext = () => {
     },
     waitUntilPromises,
   };
+};
+
+const GOOGLE_DRIVE_HOST_PATTERNS = [
+  'drive.google.com',
+  '*.googleapis.com',
+  '*.googleusercontent.com',
+];
+
+const hashSiteKey = async (siteKey) => sha256Hash(siteKey);
+
+const captureAdmissionPayloads = async ({
+  targetUrl,
+  fairQueueHostPatterns = [],
+  fairQueueSiteBucket = undefined,
+  trueConcurrencyHostPatterns = [],
+  trueConcurrencySiteBucket = undefined,
+}) => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let fairQueueAcquireBody = null;
+  let fairQueueReleaseBody = null;
+  let concurrencyAcquireBody = null;
+  let concurrencyReleaseBody = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns,
+        fairQueueSiteBucket,
+        trueConcurrencyHostPatterns,
+        trueConcurrencySiteBucket,
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: targetUrl,
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      fairQueueAcquireBody = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-sitebucket',
+        invocationEpoch: 1,
+        slotToken: 'slot-sitebucket',
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      fairQueueReleaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      concurrencyAcquireBody = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-sitebucket',
+        leaseToken: 'token-sitebucket',
+        expiresAtMs: concurrencyAcquireBody.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      concurrencyReleaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === targetUrl) {
+      calls.push('origin-fetch');
+      return new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const bodyText = await response.text();
+    await Promise.allSettled(waitUntilPromises);
+    return {
+      bodyText,
+      calls,
+      concurrencyAcquireBody,
+      concurrencyReleaseBody,
+      fairQueueAcquireBody,
+      fairQueueReleaseBody,
+      status: response.status,
+    };
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
 };
 
 test('dual mode performs fairqueue acquire before concurrency acquire and origin fetch', async () => {
@@ -3738,4 +3857,390 @@ test('Non-Google-Drive HEAD requests are forwarded without range probe rewrite',
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
+});
+
+test('mode-only siteBucket payload keeps SharePoint site buckets aligned across fairqueue and true concurrency', async () => {
+  const expectedSiteBucket = await hashSiteKey('sites:demo');
+
+  const result = await captureAdmissionPayloads({
+    targetUrl: 'https://tenant.sharepoint.com/sites/demo/file',
+    fairQueueHostPatterns: ['*.sharepoint.com'],
+    fairQueueSiteBucket: { mode: 'sharepoint' },
+    trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+    trueConcurrencySiteBucket: { mode: 'sharepoint' },
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.bodyText, 'ok');
+  assert.equal(result.fairQueueAcquireBody?.siteBucket, expectedSiteBucket);
+  assert.equal(result.concurrencyAcquireBody?.siteBucket, expectedSiteBucket);
+  assert.deepEqual(result.calls.slice(0, 3), ['fairqueue-acquire', 'concurrency-acquire', 'origin-fetch']);
+});
+
+test('modes-only siteBucket payload derives one stable Google Drive site bucket across Google host families', async () => {
+  const expectedSiteBucket = await hashSiteKey('googledrive:unspecified');
+  const googleDriveUrls = [
+    'https://drive.google.com/uc?id=test-file&export=download',
+    'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+    'https://lh3.googleusercontent.com/test-file',
+  ];
+
+  for (const targetUrl of googleDriveUrls) {
+    const result = await captureAdmissionPayloads({
+      targetUrl,
+      fairQueueHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      fairQueueSiteBucket: { modes: ['sharepoint', 'googledrive'] },
+      trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      trueConcurrencySiteBucket: { modes: ['sharepoint', 'googledrive'] },
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.bodyText, 'ok');
+    assert.equal(result.fairQueueAcquireBody?.siteBucket, expectedSiteBucket);
+    assert.equal(result.concurrencyAcquireBody?.siteBucket, expectedSiteBucket);
+  }
+});
+
+test('combined siteBucket payload prefers modes over mode for Google Drive requests', async () => {
+  const expectedSiteBucket = await hashSiteKey('googledrive:unspecified');
+
+  const result = await captureAdmissionPayloads({
+    targetUrl: 'https://drive.google.com/uc?id=test-file&export=download',
+    fairQueueHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+    fairQueueSiteBucket: {
+      mode: 'sharepoint',
+      modes: ['googledrive'],
+    },
+    trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+    trueConcurrencySiteBucket: {
+      mode: 'sharepoint',
+      modes: ['googledrive'],
+    },
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.fairQueueAcquireBody?.siteBucket, expectedSiteBucket);
+  assert.equal(result.concurrencyAcquireBody?.siteBucket, expectedSiteBucket);
+});
+
+test('SharePoint site bucket derivation keeps /personal, /sites, and /teams identities unchanged', async () => {
+  const personalResult = await captureAdmissionPayloads({
+    targetUrl: 'https://tenant.sharepoint.com/personal/demo/file',
+    trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+    trueConcurrencySiteBucket: { mode: 'sharepoint' },
+  });
+  const sitesResult = await captureAdmissionPayloads({
+    targetUrl: 'https://tenant.sharepoint.com/sites/demo/file',
+    trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+    trueConcurrencySiteBucket: { mode: 'sharepoint' },
+  });
+  const teamsResult = await captureAdmissionPayloads({
+    targetUrl: 'https://tenant.sharepoint.com/teams/demo/file',
+    trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+    trueConcurrencySiteBucket: { mode: 'sharepoint' },
+  });
+
+  assert.equal(personalResult.status, 200);
+  assert.equal(sitesResult.status, 200);
+  assert.equal(teamsResult.status, 200);
+  assert.equal(personalResult.concurrencyAcquireBody?.siteBucket, await hashSiteKey('personal:demo'));
+  assert.equal(sitesResult.concurrencyAcquireBody?.siteBucket, await hashSiteKey('sites:demo'));
+  assert.equal(teamsResult.concurrencyAcquireBody?.siteBucket, await hashSiteKey('teams:demo'));
+  assert.notEqual(personalResult.concurrencyAcquireBody?.siteBucket, sitesResult.concurrencyAcquireBody?.siteBucket);
+  assert.notEqual(personalResult.concurrencyAcquireBody?.siteBucket, teamsResult.concurrencyAcquireBody?.siteBucket);
+  assert.notEqual(sitesResult.concurrencyAcquireBody?.siteBucket, teamsResult.concurrencyAcquireBody?.siteBucket);
+});
+
+test('disabled googledrive mode falls back to host-derived site bucket without throwing', async () => {
+  const expectedSiteBucket = await hashSiteKey('host:drive.google.com');
+
+  const result = await captureAdmissionPayloads({
+    targetUrl: 'https://drive.google.com/uc?id=test-file&export=download',
+    fairQueueHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+    fairQueueSiteBucket: { mode: 'sharepoint' },
+    trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+    trueConcurrencySiteBucket: { mode: 'sharepoint' },
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.bodyText, 'ok');
+  assert.equal(result.fairQueueAcquireBody?.siteBucket, expectedSiteBucket);
+  assert.equal(result.concurrencyAcquireBody?.siteBucket, expectedSiteBucket);
+});
+
+test('breaker authority collapses recognized Google Drive hosts into the logical google bucket', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const googleAuthorityHash = await sha256Hash('google');
+  const snapshotHashes = [];
+  const authorizeBodies = [];
+  const reportBodies = [];
+  const concurrencyBodies = [];
+  const originHosts = [];
+  const breakerStateByHash = new Map();
+  let linkCallCount = 0;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+        throttleHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      linkCallCount += 1;
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: linkCallCount === 1
+            ? 'https://drive.google.com/uc?id=test-file&export=download'
+            : 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      const match = url.match(/HOSTNAME_HASH=eq\.([0-9a-f]+)/i);
+      const requestedHash = match ? match[1] : '';
+      snapshotHashes.push(requestedHash);
+      const snapshot = breakerStateByHash.get(requestedHash);
+      if (!snapshot) {
+        return createJsonResponse([]);
+      }
+      return createJsonResponse([snapshot]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 1,
+        LAST_ERROR_CODE: null,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      concurrencyBodies.push(body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: `lease-google-${concurrencyBodies.length}`,
+        leaseToken: `token-google-${concurrencyBodies.length}`,
+        expiresAtMs: body.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      const body = JSON.parse(init.body);
+      reportBodies.push(body);
+      breakerStateByHash.set(body.p_hostname_hash, {
+        STATE: 'open',
+        OPEN_UNTIL: Math.floor(Date.now() / 1000) + 30,
+        OPEN_REASON: `http_${body.p_status_code}`,
+        VERSION: 7,
+        LAST_ERROR_CODE: body.p_status_code,
+      });
+      return createJsonResponse([{
+        STATE: 'open',
+        OPEN_UNTIL: Math.floor(Date.now() / 1000) + 30,
+        OPEN_REASON: `http_${body.p_status_code}`,
+        VERSION: 7,
+        LAST_ERROR_CODE: body.p_status_code,
+      }]);
+    }
+
+    if (url === 'https://drive.google.com/uc?id=test-file&export=download') {
+      originHosts.push('drive.google.com');
+      return new Response('protected', {
+        status: 429,
+        headers: {
+          'content-type': 'text/plain',
+          'Retry-After': '8',
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      originHosts.push('www.googleapis.com');
+      return new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const firstCtx = createTestContext();
+    const firstResponse = await worker.fetch(
+      await buildSignedWorkerRequest({ pathname: '/downloads/google-breaker-drive.bin' }),
+      buildWorkerEnv(),
+      firstCtx.ctx,
+    );
+    waitUntilPromises.push(...firstCtx.waitUntilPromises);
+    assert.equal(firstResponse.status, 429);
+
+    const secondCtx = createTestContext();
+    const secondResponse = await worker.fetch(
+      await buildSignedWorkerRequest({ pathname: '/downloads/google-breaker-api.bin' }),
+      buildWorkerEnv(),
+      secondCtx.ctx,
+    );
+    waitUntilPromises.push(...secondCtx.waitUntilPromises);
+    assert.equal(secondResponse.status, 429);
+
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.deepEqual(snapshotHashes, [googleAuthorityHash, googleAuthorityHash]);
+    assert.deepEqual(authorizeBodies.map((body) => body.p_hostname), ['google']);
+    assert.deepEqual(
+      reportBodies.map((body) => ({
+        hostname: body.p_hostname,
+        hostnameHash: body.p_hostname_hash,
+        statusCode: body.p_status_code,
+      })),
+      [{
+        hostname: 'google',
+        hostnameHash: googleAuthorityHash,
+        statusCode: 429,
+      }],
+    );
+    assert.equal(concurrencyBodies.length, 1);
+    assert.deepEqual(originHosts, ['drive.google.com']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('recognized Google host overload suppresses other Google Drive host-family acquires', async () => {
+  clearOverloadedByHost();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.test',
+      totalMaxWaitMs: 300,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 8,
+      authKey: '',
+    },
+  });
+
+  const googleSiteBucket = await hashSiteKey('googledrive:unspecified');
+  const driveContext = {
+    hostname: 'drive.google.com',
+    hostnameHash: 'drive-host-hash',
+    ipBucket: 'google-ip-bucket',
+    siteBucket: googleSiteBucket,
+  };
+  const googleApisContext = {
+    hostname: 'www.googleapis.com',
+    hostnameHash: 'googleapis-host-hash',
+    ipBucket: 'google-ip-bucket',
+    siteBucket: googleSiteBucket,
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return createJsonResponse({
+        result: 'overloaded',
+        reason: 'overload_host',
+      });
+    }
+    return createJsonResponse({
+      result: 'granted',
+      queryToken: 'google-overload-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-google-overload',
+    });
+  };
+
+  try {
+    const first = await client.waitForSlot({}, driveContext);
+    assert.equal(first.kind, 'timeout');
+
+    const second = await client.waitForSlot({}, googleApisContext);
+    assert.equal(second.kind, 'timeout');
+    assert.equal(fetchCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearOverloadedByHost();
+  }
+});
+
+test('final cleanup groups recognized Google Drive hosts into one logical Google bucket instead of unknown', () => {
+  const cleanupGroups = buildFinalCleanupGroups([
+    {
+      hostname: 'drive.google.com',
+      hostnameHash: 'drive-host-hash',
+      queryToken: 'google-drive-query',
+      invocationEpoch: 1,
+    },
+    {
+      hostname: 'www.googleapis.com',
+      hostnameHash: 'googleapis-host-hash',
+      queryToken: 'google-api-query',
+      invocationEpoch: 2,
+    },
+    {
+      hostname: 'lh3.googleusercontent.com',
+      hostnameHash: 'googleusercontent-host-hash',
+      queryToken: 'googleusercontent-query',
+      invocationEpoch: 3,
+    },
+    {
+      hostname: 'files.example.com',
+      hostnameHash: 'unknown-host-hash',
+      queryToken: 'unknown-query',
+      invocationEpoch: 4,
+    },
+  ]);
+
+  assert.equal(cleanupGroups.length, 2);
+  assert.deepEqual(
+    cleanupGroups.map((group) => group.map((context) => context.queryToken)),
+    [
+      ['google-drive-query', 'google-api-query', 'googleusercontent-query'],
+      ['unknown-query'],
+    ],
+  );
+});
+
+test('final cleanup keeps SharePoint host grouping unchanged', () => {
+  const cleanupGroups = buildFinalCleanupGroups([
+    {
+      hostname: 'tenant-a.sharepoint.com',
+      hostnameHash: 'sharepoint-host-a',
+      queryToken: 'sharepoint-query-a',
+      invocationEpoch: 1,
+    },
+    {
+      hostname: 'tenant-b.sharepoint.com',
+      hostnameHash: 'sharepoint-host-b',
+      queryToken: 'sharepoint-query-b',
+      invocationEpoch: 2,
+    },
+  ]);
+
+  assert.equal(cleanupGroups.length, 2);
+  assert.deepEqual(
+    cleanupGroups.map((group) => group.map((context) => context.queryToken)),
+    [['sharepoint-query-a'], ['sharepoint-query-b']],
+  );
 });

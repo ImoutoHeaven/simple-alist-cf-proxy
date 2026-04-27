@@ -44,7 +44,10 @@ test('resolveConfig exposes true concurrency config with deterministic defaults'
 
   assert.equal(config.trueConcurrencyEnabled, true);
   assert.deepEqual(config.trueConcurrencyHostnamePatterns, ['*.sharepoint.com']);
-  assert.deepEqual(config.trueConcurrencySiteBucket, { mode: 'sharepoint' });
+  assert.deepEqual(config.trueConcurrencySiteBucket, {
+    mode: 'sharepoint',
+    modes: ['sharepoint'],
+  });
   assert.deepEqual(config.concurrencyHandlerConfig, {
     url: 'https://cq.example.test/',
     authKey: 'cq-secret',
@@ -104,7 +107,7 @@ test('resolveConfig rejects unsupported true concurrency site bucket modes', () 
       handlerAuthKey: 'cq-secret',
       siteBucket: { mode: 'host' },
     }), { download: {} }),
-    /sharepoint/
+    /unsupported siteBucket mode host/
   );
 });
 
