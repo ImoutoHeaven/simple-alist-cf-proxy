@@ -3838,6 +3838,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   };
 
   const createTrueConcurrencyTerminalResponse = (result, reason = '') => {
+    if (result === 'expired' && reason === 'hard_expired') {
+      return createUnauthorizedResponse(origin, 'link expired');
+    }
     const suffix = reason ? ` (${reason})` : '';
     return createTrueConcurrencyUnavailableResponse(origin, `True concurrency ${result}${suffix}`);
   };

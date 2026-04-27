@@ -198,3 +198,40 @@ func TestParseConfigBytesPreservesWaitingTimingValues(t *testing.T) {
 		t.Fatalf("expected waitReconnectGraceMs 1800, got %d", cfg.Concurrency.Wait.WaitReconnectGraceMs)
 	}
 }
+
+func TestParseConfigBytesIgnoresLegacyCancelFuncField(t *testing.T) {
+	data := []byte(`{
+		"controller": {},
+		"auth": {"enabled": true, "token": "secret"},
+		"backend": {
+			"mode": "postgrest",
+			"postgrest": {"baseUrl": "https://postgrest.example.test"}
+		},
+		"concurrency": {
+			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
+			"lease": {"requireHardExpiry": true},
+			"wait": {"waitPollWindowMs": 12000, "waitReconnectGraceMs": 1800},
+			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
+			"rpc": {
+				"acquireFunc": "cq_acquire",
+				"releaseFunc": "cq_release",
+				"cancelFunc": "legacy_cancel_name",
+				"expireFunc": "cq_expire_scope"
+			}
+		}
+	}`)
+
+	cfg, err := ParseConfigBytes(data)
+	if err != nil {
+		t.Fatalf("ParseConfigBytes error: %v", err)
+	}
+	if cfg.Concurrency.RPC.AcquireFunc != "cq_acquire" {
+		t.Fatalf("expected acquireFunc preserved, got %q", cfg.Concurrency.RPC.AcquireFunc)
+	}
+	if cfg.Concurrency.RPC.ReleaseFunc != "cq_release" {
+		t.Fatalf("expected releaseFunc preserved, got %q", cfg.Concurrency.RPC.ReleaseFunc)
+	}
+	if cfg.Concurrency.RPC.ExpireFunc != "cq_expire_scope" {
+		t.Fatalf("expected expireFunc preserved, got %q", cfg.Concurrency.RPC.ExpireFunc)
+	}
+}

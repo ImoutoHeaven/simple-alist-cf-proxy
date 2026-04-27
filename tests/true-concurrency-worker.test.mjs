@@ -275,7 +275,7 @@ test('dual mode performs fairqueue acquire before concurrency acquire and origin
   }
 });
 
-test('dual mode fast terminal CQ result releases fairqueue and returns terminal response', async () => {
+test('dual mode fast terminal CQ hard expiry releases fairqueue and returns link expired', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
 
@@ -329,9 +329,79 @@ test('dual mode fast terminal CQ result releases fairqueue and returns terminal 
   try {
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), createTestContext().ctx);
     const body = await readJson(response);
-    assert.equal(response.status, 503);
-    assert.match(body.message, /true concurrency expired/i);
+    assert.equal(response.status, 401);
+    assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, ['fairqueue-acquire', 'concurrency-acquire', 'fairqueue-release']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('dual mode fast expired CQ result returns link expired after releasing fairqueue', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-expired-terminal',
+        invocationEpoch: 1,
+        slotToken: 'slot-expired-terminal',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      return new Response(JSON.stringify({ result: 'expired', reason: 'hard_expired' }), {
+        status: 410,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+
+    assert.equal(response.status, 401);
+    const body = await readJson(response);
+    assert.equal(body.message, 'link expired');
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(calls, [
+      'fairqueue-acquire',
+      'concurrency-acquire',
+      'fairqueue-release',
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -434,7 +504,7 @@ test('dual mode proceeds without precheck and still completes fairqueue then con
   }
 });
 
-test('dual mode fast terminal CQ result releases fairqueue and returns 503', async () => {
+test('dual mode fast terminal CQ hard expiry returns link expired after waiting for cleanup tasks', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
 
@@ -489,7 +559,9 @@ test('dual mode fast terminal CQ result releases fairqueue and returns 503', asy
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
+    const body = await readJson(response);
+    assert.equal(response.status, 401);
+    assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, ['fairqueue-acquire', 'concurrency-acquire', 'fairqueue-release']);
   } finally {
     globalThis.fetch = originalFetch;
@@ -497,7 +569,7 @@ test('dual mode fast terminal CQ result releases fairqueue and returns 503', asy
   }
 });
 
-test('queue_breaker dual mode settles breaker attempt before returning fast terminal CQ result', async () => {
+test('queue_breaker dual mode settles breaker attempt before returning link expired on CQ hard expiry', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const reportBodies = [];
@@ -568,8 +640,10 @@ test('queue_breaker dual mode settles breaker attempt before returning fast term
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
+    assert.equal(response.status, 401);
+    assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, [
       'fairqueue-acquire',
       'concurrency-acquire',
@@ -1516,6 +1590,69 @@ test('true concurrency only skips precheck and fairqueue', async () => {
     assert.deepEqual(calls.slice(0, 2), ['concurrency-acquire', 'origin-fetch']);
     assert.equal(calls.includes('precheck'), false);
     assert.equal(calls.includes('fairqueue-acquire'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency only fast hard expiry returns link expired without fairqueue cleanup', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      return new Response(JSON.stringify({ result: 'expired', reason: 'hard_expired' }), {
+        status: 410,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
+      calls.push('concurrency-cancel');
+      throw new Error('cancel should not run for direct expired terminal response');
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      throw new Error('release should not run for direct expired terminal response');
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire' || url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      throw new Error('fairqueue should not be involved for true-concurrency-only expiry');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 401);
+    assert.equal(body.message, 'link expired');
+    assert.deepEqual(calls, ['concurrency-acquire']);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -3374,7 +3511,7 @@ test('queue_only aborts CQ wait and cancels request when unused fairqueue releas
   }
 });
 
-test('queue_only wait terminal cancels CQ request after unused fairqueue release', async () => {
+test('queue_only wait hard expiry cancels CQ request after unused fairqueue release and returns link expired', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const fairQueueReleaseBodies = [];
@@ -3457,8 +3594,8 @@ test('queue_only wait terminal cancels CQ request after unused fairqueue release
     const body = await readJson(response);
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
-    assert.match(body.message, /true concurrency/i);
+    assert.equal(response.status, 401);
+    assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, [
       'fairqueue-acquire',
       'concurrency-acquire-fast',

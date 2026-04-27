@@ -97,10 +97,11 @@ Both modes normalize to the same service-level waiting contract: `granted|wait|c
 - `sweep.batchSize`
 - `rpc.acquireFunc`
 - `rpc.releaseFunc`
-- `rpc.cancelFunc`
 - `rpc.expireFunc`
 
 `wait.waitPollWindowMs` and `wait.waitReconnectGraceMs` define the waiting-request attach lifetime used to compute `waiter_lease_until_ms`.
+
+`cancel` is fixed to the authoritative V1 database function `cq_cancel`; it is not user-configurable.
 
 There is no user-configurable precheck RPC in V1 because the redesign removes `precheck` entirely.
 
