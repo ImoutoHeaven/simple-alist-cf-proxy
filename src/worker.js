@@ -63,7 +63,32 @@ const idle410Cache = {
   entries: new Map(),
 };
 
+const GOOGLE_DRIVE_HEAD_PROBE_RANGE = 'bytes=0-0';
+
 const nowMs = () => Date.now();
+
+const isGoogleDriveDownloadHostname = (hostname) => {
+  const host = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+  if (!host) {
+    return false;
+  }
+  return host === 'drive.google.com'
+    || host === 'www.googleapis.com'
+    || host === 'drive.usercontent.google.com'
+    || host.endsWith('.googleusercontent.com');
+};
+
+const parseContentRangeTotal = (contentRangeValue) => {
+  if (typeof contentRangeValue !== 'string') {
+    return null;
+  }
+  const match = contentRangeValue.trim().match(/^bytes\s+(?:\d+-\d+|\*)\/(\d+|\*)$/i);
+  if (!match || match[1] === '*') {
+    return null;
+  }
+  const total = Number.parseInt(match[1], 10);
+  return Number.isFinite(total) && total >= 0 ? total : null;
+};
 
 const normalizeStringValue = (value, fallback = '') => {
   if (typeof value !== 'string') {
@@ -4397,6 +4422,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         });
       });
     }
+    const upstreamHostname = extractHostname(urlValue)?.toLowerCase() || '';
+    if (originalRequest.method === 'HEAD' && isGoogleDriveDownloadHostname(upstreamHostname)) {
+      upstreamRequest.headers.set('range', GOOGLE_DRIVE_HEAD_PROBE_RANGE);
+      return new Request(upstreamRequest, { method: 'GET' });
+    }
     return upstreamRequest;
   };
 
@@ -4624,6 +4654,33 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     });
   };
 
+  const buildHeadProbeResponse = async (upstreamResponse, requestToWrap) => {
+    const safeHeaders = buildSafeResponseHeaders(upstreamResponse, requestToWrap);
+    const totalSize = parseContentRangeTotal(upstreamResponse.headers.get('content-range'));
+    if (totalSize !== null) {
+      safeHeaders.set('content-length', String(totalSize));
+    }
+    safeHeaders.set('accept-ranges', 'bytes');
+    safeHeaders.delete('content-range');
+
+    if (cqReleaseController && !cqCleanupBoundToStream) {
+      await ensureCurrentTrueConcurrencyReleased('head_probe_complete', true);
+    }
+    if (needFairQueue && fqContext?.slotToken) {
+      if (fqContext.headerReleasePromise) {
+        await fqContext.headerReleasePromise;
+      } else {
+        await finalizeFairQueueOnFailure('head probe complete');
+      }
+    }
+
+    return new Response(null, {
+      status: 200,
+      statusText: 'OK',
+      headers: safeHeaders,
+    });
+  };
+
   const releaseAdmissionBeforeTerminalResponse = async (response, reason) => {
     if (cqReleaseController && !cqCleanupBoundToStream) {
       await ensureCurrentTrueConcurrencyReleased(reason, true);
@@ -4761,6 +4818,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     releaseFairQueueAfterHeadersIfNeeded();
+
+    const shouldRewriteHeadProbeResponse = originalRequest.method === 'HEAD'
+      && isGoogleDriveDownloadHostname(extractHostname(request.url)?.toLowerCase() || '')
+      && request.headers.get('range') === GOOGLE_DRIVE_HEAD_PROBE_RANGE
+      && response.status === 206
+      && Boolean(response.headers.get('content-range'));
+
+    if (shouldRewriteHeadProbeResponse) {
+      return await buildHeadProbeResponse(response, request);
+    }
 
     const safeResponse = needTrueConcurrency
       ? buildManagedConcurrencyResponse(response, request)

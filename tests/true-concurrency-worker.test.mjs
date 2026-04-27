@@ -3611,3 +3611,131 @@ test('queue_only wait hard expiry cancels CQ request after unused fairqueue rele
     delete globalThis.bootstrapCache;
   }
 });
+
+test('Google Drive HEAD requests use GET range probe and expose resumable headers', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+  const originUrls = new Set([
+    'https://drive.google.com/uc?id=test-file&export=download',
+    'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+  ]);
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: originCalls.length === 0
+            ? 'https://drive.google.com/uc?id=test-file&export=download'
+            : 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (originUrls.has(url)) {
+      originCalls.push({ method, range: headers.get('range') });
+      return new Response('x', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="probe.bin"',
+          'content-range': 'bytes 0-0/100',
+          'content-length': '1',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    for (let i = 0; i < 2; i += 1) {
+      const baseRequest = await buildSignedWorkerRequest();
+      const request = new Request(baseRequest.url, {
+        method: 'HEAD',
+        headers: baseRequest.headers,
+      });
+
+      const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
+
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('accept-ranges'), 'bytes');
+      assert.equal(response.headers.get('content-length'), '100');
+      assert.equal(response.headers.get('content-range'), null);
+      assert.equal(response.headers.get('content-type'), 'application/octet-stream');
+      assert.equal(await response.text(), '');
+    }
+
+    assert.deepEqual(originCalls, [
+      { method: 'GET', range: 'bytes=0-0' },
+      { method: 'GET', range: 'bytes=0-0' },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Non-Google-Drive HEAD requests are forwarded without range probe rewrite', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
+      originCalls.push({ method, range: headers.get('range') });
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '123',
+          'accept-ranges': 'bytes',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest();
+    const request = new Request(baseRequest.url, {
+      method: 'HEAD',
+      headers: baseRequest.headers,
+    });
+
+    const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.equal(response.headers.get('content-length'), '123');
+    assert.deepEqual(originCalls, [{ method: 'HEAD', range: null }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
