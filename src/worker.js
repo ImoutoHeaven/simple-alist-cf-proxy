@@ -150,6 +150,54 @@ const parseContentRangeTotal = (contentRangeValue) => {
   return Number.isFinite(total) && total >= 0 ? total : null;
 };
 
+const parseContentLengthHeader = (contentLengthValue) => {
+  if (typeof contentLengthValue !== 'string') {
+    return null;
+  }
+  const trimmed = contentLengthValue.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+};
+
+const buildGoogleDriveFullRangeHeader = (totalSize) => {
+  if (!Number.isFinite(totalSize) || totalSize <= 0) {
+    return null;
+  }
+  return `bytes=0-${Math.trunc(totalSize) - 1}`;
+};
+
+const isExactGoogleDriveFullRangeMatch = (requestedRangeHeader, contentRangeHeader) => {
+  if (typeof requestedRangeHeader !== 'string' || typeof contentRangeHeader !== 'string') {
+    return false;
+  }
+  const requestedMatch = requestedRangeHeader.trim().match(/^bytes=(\d+)-(\d+)$/i);
+  const contentMatch = contentRangeHeader.trim().match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+  if (!requestedMatch || !contentMatch || contentMatch[3] === '*') {
+    return false;
+  }
+  return requestedMatch[1] === contentMatch[1]
+    && requestedMatch[2] === contentMatch[2]
+    && contentMatch[1] === '0'
+    && Number.parseInt(contentMatch[2], 10) + 1 === Number.parseInt(contentMatch[3], 10);
+};
+
+const shouldSynthesizeGoogleDriveAcceptRanges = (responseToWrap, requestToWrap) => {
+  if (responseToWrap.headers.get('accept-ranges')) {
+    return false;
+  }
+  const upstreamHostname = extractHostname(requestToWrap?.url || '')?.toLowerCase() || '';
+  if (!isGoogleDriveDownloadHostname(upstreamHostname)) {
+    return false;
+  }
+  if (responseToWrap.status === 206) {
+    return Boolean(responseToWrap.headers.get('content-range'));
+  }
+  return responseToWrap.status === 200;
+};
+
 const normalizeStringValue = (value, fallback = '') => {
   if (typeof value !== 'string') {
     return fallback;
@@ -4625,6 +4673,8 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     return null;
   };
 
+  const readKnownGoogleDriveDownloadSize = () => readPayloadFileSize(payloadData) ?? readPayloadFileSize(res?.data);
+
   const buildUpstreamRequest = (urlValue, headerConfig) => {
     const upstreamRequest = new Request(urlValue, originalRequest);
     if (headerConfig && typeof headerConfig === 'object') {
@@ -4642,7 +4692,64 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       upstreamRequest.headers.set('range', GOOGLE_DRIVE_HEAD_PROBE_RANGE);
       return new Request(upstreamRequest, { method: 'GET' });
     }
+    if (
+      originalRequest.method === 'GET'
+      && !originalRequest.headers.get('range')
+      && isGoogleDriveDownloadHostname(upstreamHostname)
+    ) {
+      const fileSize = readKnownGoogleDriveDownloadSize();
+      const fullRangeHeader = buildGoogleDriveFullRangeHeader(fileSize);
+      if (fullRangeHeader) {
+        upstreamRequest.headers.set('range', fullRangeHeader);
+      }
+    }
     return upstreamRequest;
+  };
+
+  const probeGoogleDriveDownloadSize = async (requestToProbe) => {
+    try {
+      const headProbeRequest = new Request(requestToProbe, { method: 'HEAD' });
+      const headProbeResponse = await fetch(headProbeRequest);
+
+      const headProbeSize = parseContentLengthHeader(headProbeResponse.headers.get('content-length'));
+      if (headProbeSize !== null) {
+        return headProbeSize;
+      }
+    } catch (_error) {
+      // fall through to the range probe before giving up
+    }
+
+    try {
+      const rangeProbeRequest = new Request(requestToProbe);
+      rangeProbeRequest.headers.set('range', GOOGLE_DRIVE_HEAD_PROBE_RANGE);
+      const rangeProbeResponse = await fetch(rangeProbeRequest);
+
+      return parseContentRangeTotal(rangeProbeResponse.headers.get('content-range'));
+    } catch (_error) {
+      return null;
+    }
+  };
+
+  const maybeApplyGoogleDriveFullDownloadTranslation = async (requestToTranslate) => {
+    const upstreamHostname = extractHostname(requestToTranslate?.url || '')?.toLowerCase() || '';
+    if (
+      originalRequest.method !== 'GET'
+      || originalRequest.headers.get('range')
+      || !isGoogleDriveDownloadHostname(upstreamHostname)
+      || requestToTranslate.headers.get('range')
+    ) {
+      return requestToTranslate;
+    }
+
+    const fileSize = readKnownGoogleDriveDownloadSize() ?? await probeGoogleDriveDownloadSize(requestToTranslate);
+    const fullRangeHeader = buildGoogleDriveFullRangeHeader(fileSize);
+    if (!fullRangeHeader) {
+      return requestToTranslate;
+    }
+
+    const translatedRequest = new Request(requestToTranslate);
+    translatedRequest.headers.set('range', fullRangeHeader);
+    return translatedRequest;
   };
 
   const resolveRedirectLocation = (location, baseUrl) => new URL(location, baseUrl).toString();
@@ -4776,6 +4883,10 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       }
     });
 
+    if (shouldSynthesizeGoogleDriveAcceptRanges(responseToWrap, requestToWrap)) {
+      safeHeaders.set('accept-ranges', 'bytes');
+    }
+
     if (isCryptedDownload) {
       const derivedName = deriveFileNameFromPath(path);
       const encryptedFileName = ensureEncryptedFileName(derivedName);
@@ -4803,8 +4914,10 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     return safeHeaders;
   };
 
-  const buildManagedConcurrencyResponse = (upstreamResponse, requestToWrap) => {
-    const safeHeaders = buildSafeResponseHeaders(upstreamResponse, requestToWrap);
+  const buildManagedConcurrencyResponse = (upstreamResponse, requestToWrap, responseInitOverrides = null) => {
+    const safeHeaders = responseInitOverrides?.headers instanceof Headers
+      ? responseInitOverrides.headers
+      : buildSafeResponseHeaders(upstreamResponse, requestToWrap);
 
     if (!upstreamResponse.body) {
       if (cqReleaseController) {
@@ -4817,14 +4930,21 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       });
     }
 
-    const streamPair = new TransformStream({
-      transform(chunk, controller) {
-        controller.enqueue(chunk);
-      },
-      async flush() {
-        await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
-      },
-    });
+    const contentLengthHeader = responseInitOverrides?.headers instanceof Headers
+      ? responseInitOverrides.headers.get('content-length')
+      : upstreamResponse.headers.get('content-length');
+    const contentLength = parseContentLengthHeader(contentLengthHeader);
+    const useFixedLengthStream = contentLength !== null && typeof FixedLengthStream === 'function';
+    const streamPair = useFixedLengthStream
+      ? new FixedLengthStream(contentLength)
+      : new TransformStream({
+        transform(chunk, controller) {
+          controller.enqueue(chunk);
+        },
+        async flush() {
+          await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
+        },
+      });
     const abortController = new AbortController();
     const msUntilExpire = Math.max(0, hardExpireAtMs - Date.now());
     const expireTimer = setTimeout(() => abortController.abort(), msUntilExpire);
@@ -4845,6 +4965,10 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       preventAbort: false,
       preventCancel: false,
       preventClose: false,
+    }).then(async () => {
+      if (useFixedLengthStream) {
+        await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
+      }
     }).catch(async (error) => {
       const reason = didClientAbort()
         ? 'client_disconnect'
@@ -4863,8 +4987,8 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
 
     cqCleanupBoundToStream = true;
     return new Response(streamPair.readable, {
-      status: upstreamResponse.status,
-      statusText: upstreamResponse.statusText,
+      status: responseInitOverrides?.status ?? upstreamResponse.status,
+      statusText: responseInitOverrides?.statusText ?? upstreamResponse.statusText,
       headers: safeHeaders,
     });
   };
@@ -4896,6 +5020,27 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     });
   };
 
+  const buildGoogleDriveFullDownloadResponseInit = (upstreamResponse, requestToWrap) => {
+    const safeHeaders = buildSafeResponseHeaders(upstreamResponse, requestToWrap);
+    const totalSize = parseContentRangeTotal(upstreamResponse.headers.get('content-range'));
+    if (totalSize !== null) {
+      safeHeaders.set('content-length', String(totalSize));
+    }
+    safeHeaders.set('accept-ranges', 'bytes');
+    safeHeaders.delete('content-range');
+
+    return {
+      status: 200,
+      statusText: 'OK',
+      headers: safeHeaders,
+    };
+  };
+
+  const buildGoogleDriveFullDownloadResponse = (upstreamResponse, requestToWrap) => {
+    const responseInit = buildGoogleDriveFullDownloadResponseInit(upstreamResponse, requestToWrap);
+    return new Response(upstreamResponse.body, responseInit);
+  };
+
   const releaseAdmissionBeforeTerminalResponse = async (response, reason) => {
     if (cqReleaseController && !cqCleanupBoundToStream) {
       await ensureCurrentTrueConcurrencyReleased(reason, true);
@@ -4915,7 +5060,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       return initialPrepareResponse;
     }
 
-    request = buildUpstreamRequest(downloadUrl, res.data.header);
+    request = await maybeApplyGoogleDriveFullDownloadTranslation(buildUpstreamRequest(downloadUrl, res.data.header));
     let { blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request);
     if (blockedResponse) {
       return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
@@ -4937,7 +5082,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           if (targetPrepareResponse) {
             return targetPrepareResponse;
           }
-          request = new Request(resolvedLocation, request);
+          request = await maybeApplyGoogleDriveFullDownloadTranslation(new Request(resolvedLocation, request));
           ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
           if (blockedResponse) {
             return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
@@ -4974,7 +5119,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         if (targetPrepareResponse) {
           return targetPrepareResponse;
         }
-        request = buildUpstreamRequest(downloadUrl, res.data.header);
+        request = await maybeApplyGoogleDriveFullDownloadTranslation(buildUpstreamRequest(downloadUrl, res.data.header));
         ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
         if (blockedResponse) {
           return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
@@ -4995,7 +5140,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
               if (redirectPrepareResponse) {
                 return redirectPrepareResponse;
               }
-              request = new Request(resolvedLocation, request);
+              request = await maybeApplyGoogleDriveFullDownloadTranslation(new Request(resolvedLocation, request));
               ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
               if (blockedResponse) {
                 return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
@@ -5044,8 +5189,29 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       return await buildHeadProbeResponse(response, request);
     }
 
+    const shouldRewriteGoogleDriveFullDownloadResponse = originalRequest.method === 'GET'
+      && !originalRequest.headers.get('range')
+      && isGoogleDriveDownloadHostname(extractHostname(request.url)?.toLowerCase() || '')
+      && response.status === 206
+      && Boolean(request.headers.get('range'))
+      && request.headers.get('range') !== GOOGLE_DRIVE_HEAD_PROBE_RANGE
+      && isExactGoogleDriveFullRangeMatch(
+        request.headers.get('range'),
+        response.headers.get('content-range'),
+      );
+
+    if (shouldRewriteGoogleDriveFullDownloadResponse && !needTrueConcurrency) {
+      return buildGoogleDriveFullDownloadResponse(response, request);
+    }
+
     const safeResponse = needTrueConcurrency
-      ? buildManagedConcurrencyResponse(response, request)
+      ? buildManagedConcurrencyResponse(
+        response,
+        request,
+        shouldRewriteGoogleDriveFullDownloadResponse
+          ? buildGoogleDriveFullDownloadResponseInit(response, request)
+          : null,
+      )
       : new Response(response.body, {
         status: response.status,
         statusText: response.statusText,

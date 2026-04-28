@@ -115,7 +115,8 @@ const buildRuntimeBootstrap = (options = {}) => ({
   },
 });
 
-const buildSignedWorkerRequest = async (pathname = '/downloads/test.bin') => {
+const buildSignedWorkerRequest = async (pathname = '/downloads/test.bin', options = {}) => {
+  const { payloadFileSize = undefined } = options;
   const token = 'bootstrap-token';
   const expire = Math.floor(Date.now() / 1000) + 300;
   const encryptedBinding = await encryptBindingPayload({
@@ -127,6 +128,7 @@ const buildSignedWorkerRequest = async (pathname = '/downloads/test.bin') => {
     v: 1,
     expireTime: expire,
     encrypt: encryptedBinding,
+    ...(payloadFileSize !== undefined ? { filesize: payloadFileSize } : {}),
   }));
   const payloadSign = await signPayload(payload, expire, token);
   const url = new URL(pathname, 'https://worker.example.com');
@@ -2517,7 +2519,8 @@ test('unified breaker lookup collapses recognized Google Drive hosts into the lo
   delete globalThis.bootstrapCache;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url } = request;
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2625,7 +2628,9 @@ test('unified breaker lookup collapses recognized Google Drive hosts into the lo
   };
 
   try {
-    const firstResponse = await worker.fetch(await buildSignedWorkerRequest('/downloads/unified-google-drive.bin'), {
+    const firstResponse = await worker.fetch(await buildSignedWorkerRequest('/downloads/unified-google-drive.bin', {
+      payloadFileSize: 13,
+    }), {
       CONTROLLER_URL: 'https://controller.example.test',
       CONTROLLER_API_TOKEN: 'controller-token',
       ENV: 'test',
@@ -2639,7 +2644,9 @@ test('unified breaker lookup collapses recognized Google Drive hosts into the lo
     });
     assert.equal(firstResponse.status, 429);
 
-    const secondResponse = await worker.fetch(await buildSignedWorkerRequest('/downloads/unified-google-api.bin'), {
+    const secondResponse = await worker.fetch(await buildSignedWorkerRequest('/downloads/unified-google-api.bin', {
+      payloadFileSize: 13,
+    }), {
       CONTROLLER_URL: 'https://controller.example.test',
       CONTROLLER_API_TOKEN: 'controller-token',
       ENV: 'test',

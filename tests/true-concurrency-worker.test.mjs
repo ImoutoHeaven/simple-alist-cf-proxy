@@ -138,6 +138,7 @@ const buildSignedWorkerRequest = async ({
   expireOffsetSeconds = 300,
   payloadExpireTime = null,
   payloadSignExpire = null,
+  payloadFileSize = undefined,
   signal = undefined,
 } = {}) => {
   const token = 'bootstrap-token';
@@ -151,6 +152,7 @@ const buildSignedWorkerRequest = async ({
     v: 1,
     expireTime: payloadExpireTime ?? expire,
     encrypt: encryptedBinding,
+    ...(payloadFileSize !== undefined ? { filesize: payloadFileSize } : {}),
   }));
   const payloadSign = await signPayload(payload, expire, token);
   const url = new URL(pathname, 'https://worker.example.com');
@@ -3859,6 +3861,725 @@ test('Non-Google-Drive HEAD requests are forwarded without range probe rewrite',
   }
 });
 
+test('Google Drive GET downloads prefer payload filesize for full-range translation and expose accept-ranges on rewritten 200 responses', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      originCalls.push({ method, range: headers.get('range') });
+      return new Response('download-body', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '13',
+          'content-range': 'bytes 0-12/13',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest({ payloadFileSize: 13 }),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.equal(response.headers.get('content-length'), '13');
+    assert.equal(response.headers.get('content-range'), null);
+    assert.equal(response.headers.get('content-type'), 'application/octet-stream');
+    assert.equal(await response.text(), 'download-body');
+    assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive GET downloads without client range rewrite full-file 206 responses into fixed-length 200 responses when payload filesize is known', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+          filesize: 13,
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      originCalls.push({ method, range: headers.get('range') });
+      return new Response('download-body', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '13',
+          'content-range': 'bytes 0-12/13',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-length'), '13');
+    assert.equal(response.headers.get('content-range'), null);
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.equal(await response.text(), 'download-body');
+    assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive GET downloads without payload filesize probe HEAD first and rewrite full-file 206 responses into fixed-length 200 responses', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      originCalls.push({ method, range: headers.get('range') });
+      if (method === 'HEAD') {
+        return new Response(null, {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': '13',
+          },
+        });
+      }
+      return new Response('download-body', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '13',
+          'content-range': 'bytes 0-12/13',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-length'), '13');
+    assert.equal(response.headers.get('content-range'), null);
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.equal(await response.text(), 'download-body');
+    assert.deepEqual(originCalls, [
+      { method: 'HEAD', range: null },
+      { method: 'GET', range: 'bytes=0-12' },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive GET downloads without payload filesize fall back to a 0-0 range probe when HEAD does not expose content-length', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      originCalls.push({ method, range: headers.get('range') });
+      if (method === 'HEAD') {
+        return new Response(null, {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+          },
+        });
+      }
+      if (headers.get('range') === 'bytes=0-0') {
+        return new Response('x', {
+          status: 206,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': '1',
+            'content-range': 'bytes 0-0/13',
+          },
+        });
+      }
+      return new Response('download-body', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '13',
+          'content-range': 'bytes 0-12/13',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-length'), '13');
+    assert.equal(response.headers.get('content-range'), null);
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.equal(await response.text(), 'download-body');
+    assert.deepEqual(originCalls, [
+      { method: 'HEAD', range: null },
+      { method: 'GET', range: 'bytes=0-0' },
+      { method: 'GET', range: 'bytes=0-12' },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive GET downloads do not rewrite partial 206 responses that do not match the requested full-file range', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+          filesize: 13,
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      originCalls.push({ method, range: headers.get('range') });
+      return new Response('partial-body', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '12',
+          'content-range': 'bytes 1-12/13',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest({ payloadFileSize: 13 }),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get('content-range'), 'bytes 1-12/13');
+    assert.equal(response.headers.get('content-length'), '12');
+    assert.equal(await response.text(), 'partial-body');
+    assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive GET downloads fail open to the original GET path when HEAD and 0-0 probes both fail', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      originCalls.push({ method, range: headers.get('range') });
+      if (method === 'HEAD') {
+        throw new Error('HEAD probe failed');
+      }
+      if (headers.get('range') === 'bytes=0-0') {
+        throw new Error('range probe failed');
+      }
+      return new Response('download-body', {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '13',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-length'), '13');
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.equal(await response.text(), 'download-body');
+    assert.deepEqual(originCalls, [
+      { method: 'HEAD', range: null },
+      { method: 'GET', range: 'bytes=0-0' },
+      { method: 'GET', range: null },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency known-length downloads use FixedLengthStream to preserve content-length', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalFixedLengthStream = globalThis.FixedLengthStream;
+  const calls = [];
+  const fixedLengthCalls = [];
+
+  globalThis.FixedLengthStream = class FakeFixedLengthStream {
+    constructor(length) {
+      fixedLengthCalls.push(length);
+      const inner = new TransformStream();
+      this.writable = inner.writable;
+      this.readable = inner.readable;
+    }
+  };
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-fixed-length',
+        leaseToken: 'token-fixed-length',
+        expiresAtMs: body.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      calls.push('origin-fetch');
+      return new Response('download-body', {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '13',
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest({ payloadFileSize: 13 }),
+      buildWorkerEnv(),
+      ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-length'), '13');
+    assert.equal(await response.text(), 'download-body');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(calls, ['concurrency-acquire', 'origin-fetch', 'concurrency-release']);
+    assert.deepEqual(fixedLengthCalls, [13]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.FixedLengthStream = originalFixedLengthStream;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency malformed content-length falls back to generic managed streaming', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalFixedLengthStream = globalThis.FixedLengthStream;
+  const calls = [];
+  const fixedLengthCalls = [];
+
+  globalThis.FixedLengthStream = class FakeFixedLengthStream {
+    constructor(length) {
+      fixedLengthCalls.push(length);
+      const inner = new TransformStream();
+      this.writable = inner.writable;
+      this.readable = inner.readable;
+    }
+  };
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-invalid-length',
+        leaseToken: 'token-invalid-length',
+        expiresAtMs: body.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      calls.push('origin-fetch');
+      return new Response('download-body', {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '13junk',
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest({ payloadFileSize: 13 }),
+      buildWorkerEnv(),
+      ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'download-body');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(calls, ['concurrency-acquire', 'origin-fetch', 'concurrency-release']);
+    assert.deepEqual(fixedLengthCalls, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.FixedLengthStream = originalFixedLengthStream;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency rewrites exact Google full-file 206 responses into fixed-length 200 responses', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalFixedLengthStream = globalThis.FixedLengthStream;
+  const calls = [];
+  const originCalls = [];
+  const fixedLengthCalls = [];
+
+  globalThis.FixedLengthStream = class FakeFixedLengthStream {
+    constructor(length) {
+      fixedLengthCalls.push(length);
+      const inner = new TransformStream();
+      this.writable = inner.writable;
+      this.readable = inner.readable;
+    }
+  };
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+          filesize: 13,
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-rewrite-length',
+        leaseToken: 'token-rewrite-length',
+        expiresAtMs: body.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      originCalls.push({ method, range: headers.get('range') });
+      calls.push('origin-fetch');
+      return new Response('download-body', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '13',
+          'content-range': 'bytes 0-12/13',
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest({ payloadFileSize: 13 }),
+      buildWorkerEnv(),
+      ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-length'), '13');
+    assert.equal(response.headers.get('content-range'), null);
+    assert.equal(await response.text(), 'download-body');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
+    assert.deepEqual(calls, ['concurrency-acquire', 'origin-fetch', 'concurrency-release']);
+    assert.deepEqual(fixedLengthCalls, [13]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.FixedLengthStream = originalFixedLengthStream;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive ranged GET downloads synthesize accept-ranges from 206 content-range responses', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      originCalls.push({ method, range: headers.get('range') });
+      return new Response('x', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '1',
+          'content-range': 'bytes 0-0/13',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest();
+    const rangedRequest = new Request(baseRequest.url, {
+      method: 'GET',
+      headers: new Headers(baseRequest.headers),
+    });
+    rangedRequest.headers.set('range', 'bytes=0-0');
+
+    const response = await worker.fetch(
+      rangedRequest,
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.equal(response.headers.get('content-range'), 'bytes 0-0/13');
+    assert.equal(response.headers.get('content-length'), '1');
+    assert.equal(await response.text(), 'x');
+    assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-0' }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('mode-only siteBucket payload keeps SharePoint site buckets aligned across fairqueue and true concurrency', async () => {
   const expectedSiteBucket = await hashSiteKey('sites:demo');
 
@@ -4086,7 +4807,7 @@ test('breaker authority collapses recognized Google Drive hosts into the logical
   try {
     const firstCtx = createTestContext();
     const firstResponse = await worker.fetch(
-      await buildSignedWorkerRequest({ pathname: '/downloads/google-breaker-drive.bin' }),
+      await buildSignedWorkerRequest({ pathname: '/downloads/google-breaker-drive.bin', payloadFileSize: 13 }),
       buildWorkerEnv(),
       firstCtx.ctx,
     );
@@ -4095,7 +4816,7 @@ test('breaker authority collapses recognized Google Drive hosts into the logical
 
     const secondCtx = createTestContext();
     const secondResponse = await worker.fetch(
-      await buildSignedWorkerRequest({ pathname: '/downloads/google-breaker-api.bin' }),
+      await buildSignedWorkerRequest({ pathname: '/downloads/google-breaker-api.bin', payloadFileSize: 13 }),
       buildWorkerEnv(),
       secondCtx.ctx,
     );
