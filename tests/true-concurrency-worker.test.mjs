@@ -870,6 +870,7 @@ test('breaker_only with true concurrency authorizes breaker before CQ acquire', 
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'ok');
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls.slice(0, 4), [
       'breaker-snapshot',
@@ -1707,6 +1708,7 @@ test('true concurrency only skips precheck and fairqueue', async () => {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'ok');
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls.slice(0, 2), ['concurrency-acquire', 'origin-fetch']);
     assert.equal(calls.includes('precheck'), false);
@@ -2471,6 +2473,77 @@ test('true concurrency managed streaming releases after body completion and does
   }
 });
 
+test('true concurrency managed streaming binds CQ cleanup to waitUntil for post-return client cancellation', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-waituntil-1',
+        leaseToken: 'token-waituntil-1',
+        expiresAtMs: body.hardExpireAtMs,
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('managed-stream-chunk'));
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    assert.equal(waitUntilPromises.length, 1);
+
+    const reader = response.body.getReader();
+    const firstChunk = await reader.read();
+    assert.equal(new TextDecoder().decode(firstChunk.value), 'managed-stream-chunk');
+    await reader.cancel('client closed download');
+
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-release']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('true concurrency header-only response releases immediately', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
@@ -2820,7 +2893,9 @@ test('true concurrency managed streaming releases when client is already aborted
 
 test('true concurrency managed streaming releases on hard-expiry cutoff', async () => {
   const originalFetch = globalThis.fetch;
-  const calls = [];
+  let acquireCalled = false;
+  let releaseCalled = false;
+  let releaseBody = null;
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -2842,7 +2917,7 @@ test('true concurrency managed streaming releases on hard-expiry cutoff', async 
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      calls.push('concurrency-acquire');
+      acquireCalled = true;
       const body = JSON.parse(init.body);
       return createJsonResponse({
         result: 'granted',
@@ -2862,7 +2937,8 @@ test('true concurrency managed streaming releases on hard-expiry cutoff', async 
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
-      calls.push('concurrency-release');
+      releaseCalled = true;
+      releaseBody = JSON.parse(init.body);
       return createJsonResponse({ result: 'released' });
     }
 
@@ -2878,7 +2954,9 @@ test('true concurrency managed streaming releases on hard-expiry cutoff', async 
     const reader = response.body.getReader();
     await new Promise((resolve) => setTimeout(resolve, 1300));
     await assert.rejects(() => reader.read(), /aborted/i);
-    assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-release']);
+    assert.equal(releaseBody.reason, 'hard_expiry');
+    assert.equal(acquireCalled, true);
+    assert.equal(releaseCalled, true);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -4813,6 +4891,7 @@ test('breaker authority collapses recognized Google Drive hosts into the logical
     );
     waitUntilPromises.push(...firstCtx.waitUntilPromises);
     assert.equal(firstResponse.status, 429);
+    await firstResponse.text();
 
     const secondCtx = createTestContext();
     const secondResponse = await worker.fetch(
@@ -4822,6 +4901,7 @@ test('breaker authority collapses recognized Google Drive hosts into the logical
     );
     waitUntilPromises.push(...secondCtx.waitUntilPromises);
     assert.equal(secondResponse.status, 429);
+    await secondResponse.text();
 
     await Promise.allSettled(waitUntilPromises);
 

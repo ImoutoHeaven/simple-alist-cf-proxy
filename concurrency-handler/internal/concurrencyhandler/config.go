@@ -63,6 +63,12 @@ type ConcurrencyCapsConfig struct {
 	SiteIPMaxInFlight int `json:"siteIpMaxInFlight"`
 }
 
+type concurrencyCapsConfigWire struct {
+	HostMaxInFlight   *int `json:"hostMaxInFlight"`
+	SiteMaxInFlight   *int `json:"siteMaxInFlight"`
+	SiteIPMaxInFlight *int `json:"siteIpMaxInFlight"`
+}
+
 type ConcurrencyLeaseConfig struct {
 	RequireHardExpiry bool `json:"requireHardExpiry"`
 }
@@ -89,6 +95,17 @@ func ParseConfigBytes(data []byte) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
+	var wire struct {
+		Concurrency struct {
+			Caps concurrencyCapsConfigWire `json:"caps"`
+		} `json:"concurrency"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return Config{}, err
+	}
+	if err := wire.Concurrency.Caps.validateRequired(); err != nil {
+		return Config{}, err
+	}
 	if cfg.Listen == "" {
 		cfg.Listen = ":8081"
 	}
@@ -113,6 +130,19 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, err
 	}
 	return ParseConfigBytes(data)
+}
+
+func (c concurrencyCapsConfigWire) validateRequired() error {
+	if c.HostMaxInFlight == nil {
+		return errors.New("concurrency.caps.hostMaxInFlight is missing")
+	}
+	if c.SiteMaxInFlight == nil {
+		return errors.New("concurrency.caps.siteMaxInFlight is missing")
+	}
+	if c.SiteIPMaxInFlight == nil {
+		return errors.New("concurrency.caps.siteIpMaxInFlight is missing")
+	}
+	return nil
 }
 
 func (c *Config) Validate() error {
@@ -147,14 +177,14 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.Concurrency.Caps.HostMaxInFlight <= 0 {
-		return errors.New("concurrency.caps.hostMaxInFlight is required")
+	if c.Concurrency.Caps.HostMaxInFlight < 0 {
+		return errors.New("concurrency.caps.hostMaxInFlight must be >= 0")
 	}
-	if c.Concurrency.Caps.SiteMaxInFlight <= 0 {
-		return errors.New("concurrency.caps.siteMaxInFlight is required")
+	if c.Concurrency.Caps.SiteMaxInFlight < 0 {
+		return errors.New("concurrency.caps.siteMaxInFlight must be >= 0")
 	}
-	if c.Concurrency.Caps.SiteIPMaxInFlight <= 0 {
-		return errors.New("concurrency.caps.siteIpMaxInFlight is required")
+	if c.Concurrency.Caps.SiteIPMaxInFlight < 0 {
+		return errors.New("concurrency.caps.siteIpMaxInFlight must be >= 0")
 	}
 	if !c.Concurrency.Lease.RequireHardExpiry {
 		return errors.New("concurrency.lease.requireHardExpiry must be true in v1")

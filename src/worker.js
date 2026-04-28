@@ -4985,6 +4985,10 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       }
     });
 
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(pipePromise);
+    }
+
     cqCleanupBoundToStream = true;
     return new Response(streamPair.readable, {
       status: responseInitOverrides?.status ?? upstreamResponse.status,

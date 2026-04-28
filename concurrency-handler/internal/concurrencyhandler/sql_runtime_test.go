@@ -288,11 +288,23 @@ type runtimeAcquireResult struct {
 	RetryAfter  sql.NullInt64
 }
 
-func execRuntimeAcquire(ctx context.Context, db *sql.DB, req runtimeAcquireCall) (*runtimeAcquireResult, error) {
-	hostMaxInFlight := req.HostMaxInFlight
-	if hostMaxInFlight <= 0 {
-		hostMaxInFlight = 64
+func seedRuntimeActiveLeases(t *testing.T, db *sql.DB, base runtimeAcquireCall, count int) {
+	t.Helper()
+	for i := 0; i < count; i++ {
+		req := base
+		req.RequestID = fmt.Sprintf("%s-%d", base.RequestID, i+1)
+		req.NowMs = base.NowMs + int64(i)
+		result, err := execRuntimeAcquire(context.Background(), db, req)
+		if err != nil {
+			t.Fatalf("seed active lease %d: %v", i+1, err)
+		}
+		if result.Result != "granted" {
+			t.Fatalf("expected seed active lease %d granted, got %+v", i+1, result)
+		}
 	}
+}
+
+func execRuntimeAcquire(ctx context.Context, db *sql.DB, req runtimeAcquireCall) (*runtimeAcquireResult, error) {
 	waitPollWindowMs := req.WaitPollWindowMs
 	if waitPollWindowMs <= 0 {
 		waitPollWindowMs = 10000
@@ -300,14 +312,6 @@ func execRuntimeAcquire(ctx context.Context, db *sql.DB, req runtimeAcquireCall)
 	waitReconnectMs := req.WaitReconnectMs
 	if waitReconnectMs <= 0 {
 		waitReconnectMs = 1500
-	}
-	siteMaxInFlight := req.SiteMaxInFlight
-	if siteMaxInFlight <= 0 {
-		siteMaxInFlight = 32
-	}
-	siteIPMaxInFlight := req.SiteIPMaxInFlight
-	if siteIPMaxInFlight <= 0 {
-		siteIPMaxInFlight = 4
 	}
 	cleanupLimit := req.CleanupLimit
 	if cleanupLimit <= 0 {
@@ -336,9 +340,9 @@ func execRuntimeAcquire(ctx context.Context, db *sql.DB, req runtimeAcquireCall)
 		req.WaitToken,
 		waitPollWindowMs,
 		waitReconnectMs,
-		hostMaxInFlight,
-		siteMaxInFlight,
-		siteIPMaxInFlight,
+		req.HostMaxInFlight,
+		req.SiteMaxInFlight,
+		req.SiteIPMaxInFlight,
 		cleanupLimit,
 	).Scan(
 		&result.Result,
@@ -768,6 +772,156 @@ func TestRuntimePromoteWaitingRequestGrantsWhenCapacityFrees(t *testing.T) {
 	}
 	if requestState != "active" || strings.TrimSpace(leaseID) == "" {
 		t.Fatalf("expected waiting request promoted to active with lease, got state=%q leaseID=%q", requestState, leaseID)
+	}
+}
+
+func TestPromoteWaitingZeroCapsUseFirstDenyingEnabledLayer(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+
+	for _, tc := range []struct {
+		name          string
+		waitingSite   string
+		waitingIP     string
+		hostCap       int
+		siteCap       int
+		siteIPCap     int
+		wantWaitScope string
+	}{
+		{
+			name:          "host cap disabled promotes site denial",
+			waitingSite:   "site-a",
+			waitingIP:     "ip-b",
+			hostCap:       0,
+			siteCap:       1,
+			siteIPCap:     2,
+			wantWaitScope: "site",
+		},
+		{
+			name:          "site cap disabled keeps host denial first",
+			waitingSite:   "site-b",
+			waitingIP:     "ip-b",
+			hostCap:       1,
+			siteCap:       0,
+			siteIPCap:     2,
+			wantWaitScope: "host",
+		},
+		{
+			name:          "host cap disabled promotes site ip denial",
+			waitingSite:   "site-a",
+			waitingIP:     "ip-a",
+			hostCap:       0,
+			siteCap:       2,
+			siteIPCap:     1,
+			wantWaitScope: "site_ip",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nowMs := time.Now().UnixMilli()
+			nameSlug := strings.ReplaceAll(tc.name, " ", "-")
+			hostnameHash := "promote-zero-caps-" + nameSlug
+			hostname := hostnameHash + ".example.com"
+
+			busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+				HostnameHash:      hostnameHash,
+				Hostname:          hostname,
+				SiteBucket:        "site-a",
+				IPBucket:          "ip-a",
+				RequestID:         hostnameHash + "-busy",
+				HardExpireMs:      nowMs + 120_000,
+				NowMs:             nowMs,
+				HostMaxInFlight:   64,
+				SiteMaxInFlight:   32,
+				SiteIPMaxInFlight: 4,
+			})
+			if err != nil {
+				t.Fatalf("seed busy lease: %v", err)
+			}
+			if busy.Result != "granted" {
+				t.Fatalf("expected busy lease granted, got %+v", busy)
+			}
+
+			waitingRequestID := hostnameHash + "-waiting"
+			waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+				HostnameHash:      hostnameHash,
+				Hostname:          hostname,
+				SiteBucket:        tc.waitingSite,
+				IPBucket:          tc.waitingIP,
+				RequestID:         waitingRequestID,
+				HardExpireMs:      nowMs + 120_000,
+				NowMs:             nowMs + 1,
+				HostMaxInFlight:   1,
+				SiteMaxInFlight:   1,
+				SiteIPMaxInFlight: 1,
+			})
+			if err != nil {
+				t.Fatalf("seed waiting request: %v", err)
+			}
+			if waiting.Result != "wait" {
+				t.Fatalf("expected waiting request, got %+v", waiting)
+			}
+
+			cfg := validTestConfig()
+			cfg.Concurrency.Caps.HostMaxInFlight = tc.hostCap
+			cfg.Concurrency.Caps.SiteMaxInFlight = tc.siteCap
+			cfg.Concurrency.Caps.SiteIPMaxInFlight = tc.siteIPCap
+
+			result, err := execRuntimePromoteWaiting(context.Background(), db, PromoteWaitingRequest{
+				RequestID:      waitingRequestID,
+				HostnameHash:   hostnameHash,
+				SiteBucket:     tc.waitingSite,
+				IPBucket:       tc.waitingIP,
+				HardExpireAtMs: nowMs + 120_000,
+				NowMs:          nowMs + 2,
+			}, cfg)
+			if err != nil {
+				t.Fatalf("promote waiting request: %v", err)
+			}
+			if result.Result != "wait" {
+				t.Fatalf("expected wait, got %+v", result)
+			}
+			if !result.Scope.Valid || result.Scope.String != tc.wantWaitScope {
+				t.Fatalf("expected scope=%s, got %+v", tc.wantWaitScope, result)
+			}
+		})
+	}
+}
+
+func TestRuntimeAcquireZeroCapsReachSQLUnchanged(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	hostnameHash := "runtime-zero-caps"
+	hostname := hostnameHash + ".example.com"
+
+	seedRuntimeActiveLeases(t, db, runtimeAcquireCall{
+		HostnameHash:      hostnameHash,
+		Hostname:          hostname,
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         hostnameHash + "-busy",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   64,
+		SiteMaxInFlight:   32,
+		SiteIPMaxInFlight: 4,
+	}, 4)
+
+	result, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      hostnameHash,
+		Hostname:          hostname,
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         hostnameHash + "-next",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs + 10,
+		HostMaxInFlight:   0,
+		SiteMaxInFlight:   0,
+		SiteIPMaxInFlight: 0,
+	})
+	if err != nil {
+		t.Fatalf("runtime acquire with explicit zero caps: %v", err)
+	}
+	if result.Result == "wait" {
+		t.Fatalf("expected explicit zero caps to reach SQL unchanged, got %+v", result)
 	}
 }
 

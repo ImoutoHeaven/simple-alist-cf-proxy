@@ -381,6 +381,399 @@ func TestAcquireReturnsWaitWithStableToken(t *testing.T) {
 	}
 }
 
+func TestAcquireZeroHostCapStillAllowsSiteScopeWait(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+
+	for _, tc := range []struct {
+		name      string
+		siteCap   int
+		siteIPCap int
+		requestIP string
+		wantScope string
+	}{
+		{
+			name:      "site cap still denies",
+			siteCap:   1,
+			siteIPCap: 2,
+			requestIP: "ip-b",
+			wantScope: "site",
+		},
+		{
+			name:      "site ip cap still denies",
+			siteCap:   2,
+			siteIPCap: 1,
+			requestIP: "ip-a",
+			wantScope: "site_ip",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nowMs := time.Now().UnixMilli()
+			nameSlug := strings.ReplaceAll(tc.name, " ", "-")
+			hostnameHash := "zero-host-cap-" + nameSlug
+			hostname := hostnameHash + ".example.com"
+
+			seeded, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+				HostnameHash:      hostnameHash,
+				Hostname:          hostname,
+				SiteBucket:        "site-a",
+				IPBucket:          "ip-a",
+				RequestID:         hostnameHash + "-busy",
+				HardExpireMs:      nowMs + 120_000,
+				NowMs:             nowMs,
+				HostMaxInFlight:   64,
+				SiteMaxInFlight:   tc.siteCap,
+				SiteIPMaxInFlight: tc.siteIPCap,
+			})
+			if err != nil {
+				t.Fatalf("seed busy lease: %v", err)
+			}
+			if seeded.Result != "granted" {
+				t.Fatalf("expected busy lease granted, got %+v", seeded)
+			}
+
+			cfg := validTestConfig()
+			cfg.Concurrency.Caps.HostMaxInFlight = 0
+			cfg.Concurrency.Caps.SiteMaxInFlight = tc.siteCap
+			cfg.Concurrency.Caps.SiteIPMaxInFlight = tc.siteIPCap
+			handler := newTestServerInstanceWithConfig(t, cfg, &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}}).Handler()
+
+			rec := postJSON(t, handler, acquirePath, AcquireRequest{
+				Hostname:       hostname,
+				HostnameHash:   hostnameHash,
+				SiteBucket:     "site-a",
+				IPBucket:       tc.requestIP,
+				RequestID:      hostnameHash + "-next",
+				HardExpireAtMs: nowMs + 120_000,
+				NowMs:          nowMs + 1,
+			}, "secret")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			body := decodeBody(t, rec)
+			if body["result"] != "wait" {
+				t.Fatalf("expected wait, got %v", body)
+			}
+			if body["scope"] != tc.wantScope {
+				t.Fatalf("expected scope=%s, got %v", tc.wantScope, body)
+			}
+		})
+	}
+}
+
+func TestAcquireZeroSiteCapStillAllowsHostOrSiteIPScopeWait(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+
+	for _, tc := range []struct {
+		name        string
+		hostCap     int
+		siteIPCap   int
+		requestSite string
+		requestIP   string
+		wantScope   string
+	}{
+		{
+			name:        "host cap still denies",
+			hostCap:     1,
+			siteIPCap:   2,
+			requestSite: "site-b",
+			requestIP:   "ip-b",
+			wantScope:   "host",
+		},
+		{
+			name:        "site ip cap still denies",
+			hostCap:     2,
+			siteIPCap:   1,
+			requestSite: "site-a",
+			requestIP:   "ip-a",
+			wantScope:   "site_ip",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nowMs := time.Now().UnixMilli()
+			nameSlug := strings.ReplaceAll(tc.name, " ", "-")
+			hostnameHash := "zero-site-cap-" + nameSlug
+			hostname := hostnameHash + ".example.com"
+
+			seeded, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+				HostnameHash:      hostnameHash,
+				Hostname:          hostname,
+				SiteBucket:        "site-a",
+				IPBucket:          "ip-a",
+				RequestID:         hostnameHash + "-busy",
+				HardExpireMs:      nowMs + 120_000,
+				NowMs:             nowMs,
+				HostMaxInFlight:   tc.hostCap,
+				SiteMaxInFlight:   32,
+				SiteIPMaxInFlight: tc.siteIPCap,
+			})
+			if err != nil {
+				t.Fatalf("seed busy lease: %v", err)
+			}
+			if seeded.Result != "granted" {
+				t.Fatalf("expected busy lease granted, got %+v", seeded)
+			}
+
+			cfg := validTestConfig()
+			cfg.Concurrency.Caps.HostMaxInFlight = tc.hostCap
+			cfg.Concurrency.Caps.SiteMaxInFlight = 0
+			cfg.Concurrency.Caps.SiteIPMaxInFlight = tc.siteIPCap
+			handler := newTestServerInstanceWithConfig(t, cfg, &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}}).Handler()
+
+			rec := postJSON(t, handler, acquirePath, AcquireRequest{
+				Hostname:       hostname,
+				HostnameHash:   hostnameHash,
+				SiteBucket:     tc.requestSite,
+				IPBucket:       tc.requestIP,
+				RequestID:      hostnameHash + "-next",
+				HardExpireAtMs: nowMs + 120_000,
+				NowMs:          nowMs + 1,
+			}, "secret")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			body := decodeBody(t, rec)
+			if body["result"] != "wait" {
+				t.Fatalf("expected wait, got %v", body)
+			}
+			if body["scope"] != tc.wantScope {
+				t.Fatalf("expected scope=%s, got %v", tc.wantScope, body)
+			}
+		})
+	}
+}
+
+func TestAcquireZeroSiteIPCapRemovesSiteIPDenials(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+
+	for _, tc := range []struct {
+		name        string
+		hostCap     int
+		siteCap     int
+		requestSite string
+		requestIP   string
+		wantResult  string
+		wantScope   string
+	}{
+		{
+			name:        "host cap still denies",
+			hostCap:     1,
+			siteCap:     2,
+			requestSite: "site-b",
+			requestIP:   "ip-b",
+			wantResult:  "wait",
+			wantScope:   "host",
+		},
+		{
+			name:        "site cap still denies",
+			hostCap:     2,
+			siteCap:     1,
+			requestSite: "site-a",
+			requestIP:   "ip-b",
+			wantResult:  "wait",
+			wantScope:   "site",
+		},
+		{
+			name:        "site ip only pressure grants",
+			hostCap:     2,
+			siteCap:     2,
+			requestSite: "site-a",
+			requestIP:   "ip-a",
+			wantResult:  "granted",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nowMs := time.Now().UnixMilli()
+			nameSlug := strings.ReplaceAll(tc.name, " ", "-")
+			hostnameHash := "zero-site-ip-cap-" + nameSlug
+			hostname := hostnameHash + ".example.com"
+
+			seeded, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+				HostnameHash:      hostnameHash,
+				Hostname:          hostname,
+				SiteBucket:        "site-a",
+				IPBucket:          "ip-a",
+				RequestID:         hostnameHash + "-busy",
+				HardExpireMs:      nowMs + 120_000,
+				NowMs:             nowMs,
+				HostMaxInFlight:   tc.hostCap,
+				SiteMaxInFlight:   tc.siteCap,
+				SiteIPMaxInFlight: 4,
+			})
+			if err != nil {
+				t.Fatalf("seed busy lease: %v", err)
+			}
+			if seeded.Result != "granted" {
+				t.Fatalf("expected busy lease granted, got %+v", seeded)
+			}
+
+			cfg := validTestConfig()
+			cfg.Concurrency.Caps.HostMaxInFlight = tc.hostCap
+			cfg.Concurrency.Caps.SiteMaxInFlight = tc.siteCap
+			cfg.Concurrency.Caps.SiteIPMaxInFlight = 0
+			handler := newTestServerInstanceWithConfig(t, cfg, &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}}).Handler()
+
+			rec := postJSON(t, handler, acquirePath, AcquireRequest{
+				Hostname:       hostname,
+				HostnameHash:   hostnameHash,
+				SiteBucket:     tc.requestSite,
+				IPBucket:       tc.requestIP,
+				RequestID:      hostnameHash + "-next",
+				HardExpireAtMs: nowMs + 120_000,
+				NowMs:          nowMs + 1,
+			}, "secret")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			body := decodeBody(t, rec)
+			if body["result"] != tc.wantResult {
+				t.Fatalf("expected result=%s, got %v", tc.wantResult, body)
+			}
+			if tc.wantScope != "" && body["scope"] != tc.wantScope {
+				t.Fatalf("expected scope=%s, got %v", tc.wantScope, body)
+			}
+		})
+	}
+}
+
+func TestAcquireAllZeroCapsDoNotProduceCapWait(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	hostnameHash := "all-zero-caps"
+	hostname := hostnameHash + ".example.com"
+
+	seedRuntimeActiveLeases(t, db, runtimeAcquireCall{
+		HostnameHash:      hostnameHash,
+		Hostname:          hostname,
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         hostnameHash + "-busy",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   64,
+		SiteMaxInFlight:   32,
+		SiteIPMaxInFlight: 4,
+	}, 4)
+
+	cfg := validTestConfig()
+	cfg.Concurrency.Caps.HostMaxInFlight = 0
+	cfg.Concurrency.Caps.SiteMaxInFlight = 0
+	cfg.Concurrency.Caps.SiteIPMaxInFlight = 0
+	handler := newTestServerInstanceWithConfig(t, cfg, &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}}).Handler()
+
+	rec := postJSON(t, handler, acquirePath, AcquireRequest{
+		Hostname:       hostname,
+		HostnameHash:   hostnameHash,
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      hostnameHash + "-next",
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 10,
+	}, "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["result"] != "granted" {
+		t.Fatalf("expected granted result with all zero caps, got %v", body)
+	}
+	leaseID, ok := body["leaseId"].(string)
+	if !ok || strings.TrimSpace(leaseID) == "" {
+		t.Fatalf("expected leaseId in granted response, got %v", body)
+	}
+	leaseToken, ok := body["leaseToken"].(string)
+	if !ok || strings.TrimSpace(leaseToken) == "" {
+		t.Fatalf("expected leaseToken in granted response, got %v", body)
+	}
+	expiresAtMs, ok := body["expiresAtMs"].(float64)
+	if !ok || expiresAtMs <= 0 {
+		t.Fatalf("expected expiresAtMs in granted response, got %v", body)
+	}
+
+	releaseRec := postJSON(t, handler, releasePath, ReleaseRequest{
+		LeaseID:    leaseID,
+		LeaseToken: leaseToken,
+		Reason:     "stream_complete",
+		NowMs:      nowMs + 11,
+	}, "secret")
+	if releaseRec.Code != http.StatusOK {
+		t.Fatalf("expected release 200, got %d body=%s", releaseRec.Code, releaseRec.Body.String())
+	}
+	releaseBody := decodeBody(t, releaseRec)
+	if releaseBody["result"] != "released" {
+		t.Fatalf("expected release to complete CQ lease lifecycle, got %v", releaseBody)
+	}
+}
+
+func TestAcquireReplayWaitPreservesGenericHostScope(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	hostnameHash := "replay-generic-host-scope"
+	hostname := hostnameHash + ".example.com"
+
+	seeded, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      hostnameHash,
+		Hostname:          hostname,
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         hostnameHash + "-busy",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   64,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 2,
+	})
+	if err != nil {
+		t.Fatalf("seed busy lease: %v", err)
+	}
+	if seeded.Result != "granted" {
+		t.Fatalf("expected busy lease granted, got %+v", seeded)
+	}
+
+	cfg := validTestConfig()
+	cfg.Concurrency.Caps.HostMaxInFlight = 0
+	cfg.Concurrency.Caps.SiteMaxInFlight = 1
+	cfg.Concurrency.Caps.SiteIPMaxInFlight = 2
+	handler := newTestServerInstanceWithConfig(t, cfg, &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}}).Handler()
+
+	requestID := hostnameHash + "-waiting"
+	firstRec := postJSON(t, handler, acquirePath, AcquireRequest{
+		Hostname:       hostname,
+		HostnameHash:   hostnameHash,
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-b",
+		RequestID:      requestID,
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 1,
+	}, "secret")
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("expected first wait 200, got %d body=%s", firstRec.Code, firstRec.Body.String())
+	}
+	firstBody := decodeBody(t, firstRec)
+	if firstBody["result"] != "wait" || firstBody["scope"] != "site" {
+		t.Fatalf("expected initial site wait body, got %v", firstBody)
+	}
+
+	replayRec := postJSON(t, handler, acquirePath, AcquireRequest{
+		Hostname:       hostname,
+		HostnameHash:   hostnameHash,
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-b",
+		RequestID:      requestID,
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 2,
+	}, "secret")
+	if replayRec.Code != http.StatusOK {
+		t.Fatalf("expected replay wait 200, got %d body=%s", replayRec.Code, replayRec.Body.String())
+	}
+	replayBody := decodeBody(t, replayRec)
+	if replayBody["result"] != "wait" {
+		t.Fatalf("expected wait, got %v", replayBody)
+	}
+	if replayBody["scope"] != "host" {
+		t.Fatalf("expected scope=host, got %v", replayBody)
+	}
+}
+
 func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 	t.Run("probe short-circuit replay outcomes", func(t *testing.T) {
 		nowMs := time.Now().UnixMilli()

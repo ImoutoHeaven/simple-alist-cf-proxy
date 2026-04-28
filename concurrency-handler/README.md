@@ -99,11 +99,21 @@ Both modes normalize to the same service-level waiting contract: `granted|wait|c
 - `rpc.releaseFunc`
 - `rpc.expireFunc`
 
+The cap fields are required and each accepts integers `>= 0`.
+
+- `0` disables only that cap layer.
+- Positive values keep that layer enabled at the configured maximum.
+- Each layer is evaluated independently.
+- `host=0, site=32, siteIp=4` means host is unlimited while site and site+ip caps still gate admission.
+- `host=0, site=0, siteIp=0` removes cap-based waiting, but does not disable CQ acquire, release, cancel, request-ledger, or sweep behavior.
+
 `wait.waitPollWindowMs` and `wait.waitReconnectGraceMs` define the waiting-request attach lifetime used to compute `waiter_lease_until_ms`.
 
 `cancel` is fixed to the authoritative V1 database function `cq_cancel`; it is not user-configurable.
 
 There is no user-configurable precheck RPC in V1 because the redesign removes `precheck` entirely.
+
+Dense and sparse heartbeat remain out of scope for this change. `hardExpireAtMs` remains the hard cutoff for active streams, and Worker still releases the active lease with reason `hard_expiry` when that cutoff is reached.
 
 ## Running
 

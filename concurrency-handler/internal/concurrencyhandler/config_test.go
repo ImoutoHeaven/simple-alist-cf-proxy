@@ -131,6 +131,101 @@ func TestParseConfigBytesAppliesDefaults(t *testing.T) {
 	}
 }
 
+func TestValidate_AllowsZeroConcurrencyCaps(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Concurrency.Caps.HostMaxInFlight = 0
+	cfg.Concurrency.Caps.SiteMaxInFlight = 0
+	cfg.Concurrency.Caps.SiteIPMaxInFlight = 0
+
+	err := cfg.Validate()
+
+	if err != nil {
+		t.Fatalf("expected zero-valued caps to be valid, got %v", err)
+	}
+}
+
+func TestValidate_RejectsNegativeConcurrencyCaps(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		field  string
+	}{
+		{
+			name: "negative host cap",
+			mutate: func(cfg *Config) {
+				cfg.Concurrency.Caps.HostMaxInFlight = -1
+			},
+			field: "hostMaxInFlight",
+		},
+		{
+			name: "negative site cap",
+			mutate: func(cfg *Config) {
+				cfg.Concurrency.Caps.SiteMaxInFlight = -1
+			},
+			field: "siteMaxInFlight",
+		},
+		{
+			name: "negative site ip cap",
+			mutate: func(cfg *Config) {
+				cfg.Concurrency.Caps.SiteIPMaxInFlight = -1
+			},
+			field: "siteIpMaxInFlight",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validTestConfig()
+			tc.mutate(&cfg)
+
+			err := cfg.Validate()
+
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("expected %s error, got %v", tc.field, err)
+			}
+		})
+	}
+}
+
+func TestParseConfigBytesRejectsMissingConcurrencyCapFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		json  string
+		field string
+	}{
+		{
+			name:  "missing hostMaxInFlight",
+			field: "hostMaxInFlight",
+			json:  `{"controller":{},"auth":{"enabled":true,"token":"secret"},"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://postgrest.example.test"}},"concurrency":{"caps":{"siteMaxInFlight":32,"siteIpMaxInFlight":4},"lease":{"requireHardExpiry":true},"wait":{"waitPollWindowMs":10000,"waitReconnectGraceMs":1500},"sweep":{"enabled":true,"intervalSeconds":300,"batchSize":500},"rpc":{"acquireFunc":"cq_acquire","releaseFunc":"cq_release","expireFunc":"cq_expire_scope"}}}`,
+		},
+		{
+			name:  "missing siteMaxInFlight",
+			field: "siteMaxInFlight",
+			json:  `{"controller":{},"auth":{"enabled":true,"token":"secret"},"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://postgrest.example.test"}},"concurrency":{"caps":{"hostMaxInFlight":64,"siteIpMaxInFlight":4},"lease":{"requireHardExpiry":true},"wait":{"waitPollWindowMs":10000,"waitReconnectGraceMs":1500},"sweep":{"enabled":true,"intervalSeconds":300,"batchSize":500},"rpc":{"acquireFunc":"cq_acquire","releaseFunc":"cq_release","expireFunc":"cq_expire_scope"}}}`,
+		},
+		{
+			name:  "missing siteIpMaxInFlight",
+			field: "siteIpMaxInFlight",
+			json:  `{"controller":{},"auth":{"enabled":true,"token":"secret"},"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://postgrest.example.test"}},"concurrency":{"caps":{"hostMaxInFlight":64,"siteMaxInFlight":32},"lease":{"requireHardExpiry":true},"wait":{"waitPollWindowMs":10000,"waitReconnectGraceMs":1500},"sweep":{"enabled":true,"intervalSeconds":300,"batchSize":500},"rpc":{"acquireFunc":"cq_acquire","releaseFunc":"cq_release","expireFunc":"cq_expire_scope"}}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseConfigBytes([]byte(tc.json))
+			if err == nil {
+				t.Fatalf("expected missing cap field error")
+			}
+			if !strings.Contains(err.Error(), tc.field) || !strings.Contains(err.Error(), "missing") {
+				t.Fatalf("expected missing-field error for %s, got %v", tc.field, err)
+			}
+		})
+	}
+}
+
 func TestConfigValidateRequiresConcurrencyContractFields(t *testing.T) {
 	cfg := validTestConfig()
 	cfg.Concurrency.RPC.AcquireFunc = ""

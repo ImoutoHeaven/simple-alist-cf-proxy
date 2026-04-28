@@ -28,7 +28,7 @@
   },
   "concurrency": {
     "caps": {
-      "hostMaxInFlight": 64,
+      "hostMaxInFlight": 0,
       "siteMaxInFlight": 32,
       "siteIpMaxInFlight": 4
     },
