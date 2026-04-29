@@ -167,6 +167,7 @@ const runModeScenario = async ({
     authorize: 0,
     report: 0,
     concurrencyAcquire: 0,
+    concurrencyClaim: 0,
     concurrencyRelease: 0,
     concurrencyCancel: 0,
   };
@@ -256,6 +257,18 @@ const runModeScenario = async ({
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
       calls.concurrencyAcquire += 1;
       concurrencyAcquireBodies.push(JSON.parse(init.body));
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-mode-1',
+        leaseToken: 'token-mode-1',
+        expiresAtMs: Date.now() + 1000,
+        claimToken: 'claim-token-mode-1',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.concurrencyClaim += 1;
+      const body = JSON.parse(init.body);
       return createJsonResponse({
         result: 'granted',
         leaseId: 'lease-mode-1',
@@ -484,6 +497,17 @@ test('queue_only with true concurrency wait path never calls breaker RPCs', asyn
         leaseId: 'lease-mode-wait',
         leaseToken: 'token-mode-wait',
         expiresAtMs: Date.now() + 1000,
+        claimToken: 'claim-token-mode-wait',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-mode-wait',
+        leaseToken: 'token-mode-wait',
+        expiresAtMs: Date.now() + 1000,
       });
     }
 
@@ -521,6 +545,7 @@ test('queue_only with true concurrency wait path never calls breaker RPCs', asyn
       'concurrency-acquire-1',
       'fairqueue-release',
       'concurrency-acquire-2',
+      'concurrency-claim',
       'origin-fetch',
       'concurrency-release',
     ]);

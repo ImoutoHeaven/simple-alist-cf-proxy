@@ -1,6 +1,7 @@
 package concurrencyhandler
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -242,6 +243,25 @@ func TestWaitingRuntimeDeliversOnlyToCurrentAttachedWaiter(t *testing.T) {
 	}
 }
 
+func TestWaitingRuntimeDeliverFailsAfterWaiterReleased(t *testing.T) {
+	runtime := newWaitingRuntime()
+	waiter, ok := runtime.tryAttach("wait-race")
+	if !ok || waiter == nil {
+		t.Fatal("expected attach to succeed")
+	}
+	runtime.release(waiter)
+
+	result := &AcquireResult{Result: "granted", LeaseID: "lease-race", LeaseToken: "token-race", ExpiresAtMs: 1234}
+	if runtime.deliver("wait-race", result) {
+		t.Fatal("expected delivery to fail after waiter release")
+	}
+	select {
+	case got := <-waiter.resultCh:
+		t.Fatalf("expected released waiter channel to remain empty, got %+v", got)
+	default:
+	}
+}
+
 func TestWaitingRuntimeSnapshotAttachedExcludesReleasedWaiters(t *testing.T) {
 	runtime := newWaitingRuntime()
 	first, ok := runtime.tryAttach("wait-1")
@@ -257,6 +277,91 @@ func TestWaitingRuntimeSnapshotAttachedExcludesReleasedWaiters(t *testing.T) {
 	if len(attached) != 1 || attached[0] != second {
 		t.Fatalf("expected only second waiter attached, got %+v", attached)
 	}
+}
+
+func TestWaitingRuntimeSnapshotAttachedRequestsCopiesRequest(t *testing.T) {
+	runtime := newWaitingRuntime()
+	baseNowMs := time.Now().UnixMilli()
+	waiter, ok := runtime.tryAttach("wait-snapshot")
+	if !ok || waiter == nil {
+		t.Fatal("expected attach to succeed")
+	}
+	req := AcquireRequest{
+		Hostname:       "snapshot.example.com",
+		HostnameHash:   "host-hash",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "request-snapshot",
+		HardExpireAtMs: baseNowMs + 60_000,
+		NowMs:          baseNowMs,
+		WaitToken:      "wait-snapshot",
+	}
+	runtime.setRequest(waiter, req)
+
+	snapshots := runtime.snapshotAttachedRequests()
+	if len(snapshots) != 1 {
+		t.Fatalf("expected one attached request snapshot, got %d", len(snapshots))
+	}
+	if snapshots[0].WaitToken != "wait-snapshot" {
+		t.Fatalf("expected wait token snapshot, got %+v", snapshots[0])
+	}
+	if snapshots[0].Request.HostnameHash != "host-hash" {
+		t.Fatalf("expected populated request snapshot, got %+v", snapshots[0].Request)
+	}
+
+	runtime.setRequest(waiter, AcquireRequest{HostnameHash: "mutated-host", RequestID: "mutated-request", WaitToken: "wait-snapshot"})
+	if snapshots[0].Request.HostnameHash != "host-hash" || snapshots[0].Request.RequestID != "request-snapshot" {
+		t.Fatalf("expected immutable request copy, got %+v", snapshots[0].Request)
+	}
+
+	runtime.release(waiter)
+	if got := runtime.snapshotAttachedRequests(); len(got) != 0 {
+		t.Fatalf("expected released waiter excluded from request snapshots, got %+v", got)
+	}
+}
+
+func TestWaitingRuntimeAttachedRequestSnapshotConcurrentAccess(t *testing.T) {
+	runtime := newWaitingRuntime()
+	waiter, ok := runtime.tryAttach("wait-race")
+	if !ok || waiter == nil {
+		t.Fatal("expected attach to succeed")
+	}
+	baseNowMs := time.Now().UnixMilli()
+	result := &AcquireResult{Result: "wait", WaitToken: "wait-race", Scope: "host", RetryAfter: 1}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		i := i
+		wg.Add(4)
+		go func() {
+			defer wg.Done()
+			runtime.setRequest(waiter, AcquireRequest{
+				Hostname:       "race.example.com",
+				HostnameHash:   "race-host",
+				SiteBucket:     "site-a",
+				IPBucket:       "ip-a",
+				RequestID:      "request-race",
+				HardExpireAtMs: baseNowMs + 60_000,
+				NowMs:          baseNowMs + int64(i),
+				WaitToken:      "wait-race",
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			_ = runtime.snapshotAttachedRequests()
+		}()
+		go func() {
+			defer wg.Done()
+			_ = runtime.deliver("wait-race", result)
+		}()
+		go func() {
+			defer wg.Done()
+			if i == 63 {
+				runtime.release(waiter)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestWaitingRuntimeMarksWaitTokenAsReplayAfterFirstObservation(t *testing.T) {

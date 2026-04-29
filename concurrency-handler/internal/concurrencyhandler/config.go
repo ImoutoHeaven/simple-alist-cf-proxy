@@ -162,8 +162,11 @@ func (c *Config) Validate() error {
 	}
 	c.Backend.Mode = mode
 
-	if c.Auth.Enabled && strings.TrimSpace(c.Auth.Token) == "" {
-		return errors.New("auth.token is required when auth.enabled is true")
+	if !c.Auth.Enabled {
+		return errors.New("auth.enabled must be true")
+	}
+	if strings.TrimSpace(c.Auth.Token) == "" {
+		return errors.New("auth.token is required")
 	}
 
 	switch c.Backend.Mode {

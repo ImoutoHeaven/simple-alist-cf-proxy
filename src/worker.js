@@ -64,7 +64,17 @@ const idle410Cache = {
 };
 
 const GOOGLE_DRIVE_HEAD_PROBE_RANGE = 'bytes=0-0';
-const SITE_BUCKET_MODES = new Set(['sharepoint', 'googledrive']);
+const HOP_BY_HOP_RESPONSE_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+const SITE_BUCKET_MODES = new Set(['host', 'sharepoint', 'googledrive']);
 
 const nowMs = () => Date.now();
 
@@ -127,7 +137,12 @@ const detectSiteBucketProvider = (hostname) => {
   if (host.endsWith('.sharepoint.com')) {
     return 'sharepoint';
   }
-  if (host === 'drive.google.com' || host.endsWith('.googleapis.com') || host.endsWith('.googleusercontent.com')) {
+  if (
+    host === 'drive.google.com'
+    || host === 'drive.usercontent.google.com'
+    || host.endsWith('.googleapis.com')
+    || host.endsWith('.googleusercontent.com')
+  ) {
     return 'googledrive';
   }
   return 'unknown';
@@ -148,6 +163,18 @@ const parseContentRangeTotal = (contentRangeValue) => {
   }
   const total = Number.parseInt(match[1], 10);
   return Number.isFinite(total) && total >= 0 ? total : null;
+};
+
+const cancelResponseBody = async (response) => {
+  if (!response?.body || typeof response.body.cancel !== 'function') {
+    return;
+  }
+  try {
+    await response.body.cancel();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn('[Upstream] Failed to cancel unused response body:', message);
+  }
 };
 
 const parseContentLengthHeader = (contentLengthValue) => {
@@ -229,20 +256,13 @@ const deriveSharePointSiteKey = (pathname) => {
 };
 
 const deriveProviderHostBucket = (hostname) => {
-  const provider = detectSiteBucketProvider(hostname);
-  if (provider === 'googledrive') {
-    return 'google';
-  }
   const host = normalizeHostnameValue(hostname);
-  return host || 'unknown';
+  return host || '';
 };
 
 const deriveThrottleAuthorityHostname = (hostname) => {
   const host = normalizeHostnameValue(hostname);
-  if (!host) {
-    return '';
-  }
-  return detectSiteBucketProvider(host) === 'googledrive' ? 'google' : host;
+  return host || '';
 };
 
 const deriveSiteKey = (hostname, pathname, siteBucketConfig) => {
@@ -250,15 +270,15 @@ const deriveSiteKey = (hostname, pathname, siteBucketConfig) => {
   const provider = detectSiteBucketProvider(lowerHost);
   const { modes } = normalizeSiteBucketConfig(siteBucketConfig);
 
-  if (provider === 'sharepoint' && modes.includes('sharepoint')) {
-    return deriveSharePointSiteKey(pathname);
-  }
-
   if (provider === 'googledrive' && modes.includes('googledrive')) {
     return 'googledrive:unspecified';
   }
 
-  if (lowerHost) {
+  if (provider === 'sharepoint' && modes.includes('sharepoint')) {
+    return deriveSharePointSiteKey(pathname);
+  }
+
+  if (modes.includes('host') && lowerHost) {
     return `host:${lowerHost}`;
   }
 
@@ -1701,6 +1721,7 @@ const normalizePostgrestBaseUrl = (url) => {
 };
 
 const TRUE_CONCURRENCY_ACQUIRE_RESULTS = new Set(['granted', 'wait', 'conflict', 'released', 'cancelled', 'expired']);
+const TRUE_CONCURRENCY_CLAIM_RESULTS = new Set(['granted', 'conflict', 'released', 'cancelled', 'expired']);
 const TRUE_CONCURRENCY_RELEASE_RESULTS = new Set(['released', 'noop']);
 const TRUE_CONCURRENCY_CANCEL_RESULTS = new Set(['cancelled', 'noop', 'conflict']);
 const TRUE_CONCURRENCY_WAIT_SCOPES = new Set(['host', 'site', 'site_ip']);
@@ -1708,6 +1729,8 @@ const TRUE_CONCURRENCY_ACQUIRE_CONFLICT_REASONS = new Set([
   'request_id_tuple_mismatch',
   'waiter_already_attached',
   'stale_wait_token',
+  'grant_unclaimed',
+  'grant_already_claimed',
 ]);
 const TRUE_CONCURRENCY_CANCEL_CONFLICT_REASONS = new Set([
   'request_id_tuple_mismatch',
@@ -1718,6 +1741,8 @@ const TRUE_CONCURRENCY_TERMINAL_REASONS = new Set([
   'request_cancelled',
   'hard_expired',
   'waiter_detached_timeout',
+  'grant_delivery_failed',
+  'acquire_delivery_failed',
 ]);
 const TRUE_CONCURRENCY_RELEASE_NOOP_REASONS = new Set([
   'already_released',
@@ -1737,6 +1762,8 @@ const isTrueConcurrencyLeaseIdentity = (lease) => (
 const isTrueConcurrencyRequestIdentity = (requestIdentity) => (
   typeof requestIdentity?.requestId === 'string'
   && requestIdentity.requestId
+  && typeof requestIdentity?.hostname === 'string'
+  && requestIdentity.hostname
   && typeof requestIdentity?.hostnameHash === 'string'
   && requestIdentity.hostnameHash
   && typeof requestIdentity?.siteBucket === 'string'
@@ -1764,6 +1791,7 @@ const buildTrueConcurrencyCancelPayload = (requestIdentity, reason) => {
   if (isTrueConcurrencyRequestIdentity(requestIdentity)) {
     return {
       requestId: requestIdentity.requestId,
+      hostname: requestIdentity.hostname,
       hostnameHash: requestIdentity.hostnameHash,
       siteBucket: requestIdentity.siteBucket,
       ipBucket: requestIdentity.ipBucket,
@@ -1801,11 +1829,15 @@ const normalizeTrueConcurrencyAcquireResult = (data, options = {}) => {
     if (Number.isFinite(options.hardExpireAtMs) && expiresAtMs > options.hardExpireAtMs) {
       throw new Error('[CQ] acquire granted response exceeds hardExpireAtMs');
     }
+    if (typeof data?.claimToken !== 'string' || !data.claimToken) {
+      throw new Error('[CQ] acquire granted response missing claimToken');
+    }
     return {
       result: 'granted',
       leaseId: data.leaseId,
       leaseToken: data.leaseToken,
       expiresAtMs,
+      claimToken: data.claimToken,
     };
   }
 
@@ -1854,6 +1886,50 @@ const normalizeTrueConcurrencyAcquireResult = (data, options = {}) => {
     result,
     reason: data.reason,
   };
+};
+
+const normalizeTrueConcurrencyClaimResult = (data, options = {}) => {
+  const result = readTrueConcurrencyResult('claim', data, TRUE_CONCURRENCY_CLAIM_RESULTS);
+
+  if (result === 'granted') {
+    if (typeof data?.leaseId !== 'string' || !data.leaseId) {
+      throw new Error('[CQ] claim granted response missing leaseId');
+    }
+    if (typeof data?.leaseToken !== 'string' || !data.leaseToken) {
+      throw new Error('[CQ] claim granted response missing leaseToken');
+    }
+    const expiresAtMs = Number(data?.expiresAtMs);
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= 0) {
+      throw new Error('[CQ] claim granted response missing expiresAtMs');
+    }
+    if (Number.isFinite(options.hardExpireAtMs) && expiresAtMs > options.hardExpireAtMs) {
+      throw new Error('[CQ] claim granted response exceeds hardExpireAtMs');
+    }
+    return {
+      result: 'granted',
+      leaseId: data.leaseId,
+      leaseToken: data.leaseToken,
+      expiresAtMs,
+    };
+  }
+
+  if (result === 'conflict') {
+    if (typeof data?.reason !== 'string' || !data.reason) {
+      throw new Error('[CQ] claim conflict response missing reason');
+    }
+    if (!TRUE_CONCURRENCY_ACQUIRE_CONFLICT_REASONS.has(data.reason)) {
+      throw new Error('[CQ] claim conflict response has unsupported reason');
+    }
+    return { result: 'conflict', reason: data.reason };
+  }
+
+  if (typeof data?.reason !== 'string' || !data.reason) {
+    throw new Error(`[CQ] claim ${result} response missing reason`);
+  }
+  if (!TRUE_CONCURRENCY_TERMINAL_REASONS.has(data.reason)) {
+    throw new Error(`[CQ] claim ${result} response has unsupported reason`);
+  }
+  return { result, reason: data.reason };
 };
 
 const normalizeTrueConcurrencyReleaseResult = (data) => {
@@ -1912,6 +1988,7 @@ const createConcurrencyHandlerClient = (config) => {
   const authKey = normalizeStringValue(handlerCfg.authKey);
   const authHeader = normalizeStringValue(handlerCfg.authHeader, DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER);
   const acquireUrl = `${baseUrl}/api/v1/concurrency/acquire`;
+  const claimUrl = `${baseUrl}/api/v1/concurrency/claim`;
   const releaseUrl = `${baseUrl}/api/v1/concurrency/release`;
   const cancelUrl = `${baseUrl}/api/v1/concurrency/cancel`;
   const acquireTimeoutMs = normalizePositiveMs(
@@ -2009,6 +2086,25 @@ const createConcurrencyHandlerClient = (config) => {
         },
       );
       return normalizeTrueConcurrencyReleaseResult(data);
+    },
+
+    async claim(_ctx, claim, signal) {
+      const { data } = await postJson(
+        claimUrl,
+        {
+          requestId: claim.requestId,
+          claimToken: claim.claimToken,
+          nowMs: claim.nowMs,
+        },
+        {
+          timeoutMs: acquireTimeoutMs,
+          signal,
+          allowedStatuses: [200, 409, 410],
+        },
+      );
+      return normalizeTrueConcurrencyClaimResult(data, {
+        hardExpireAtMs: claim.hardExpireAtMs,
+      });
     },
 
     async cancel(_ctx, requestIdentity, reason, signal) {
@@ -2181,9 +2277,7 @@ const buildFinalCleanupGroups = (cleanupContexts) => {
 
   for (const cleanupContext of dedupedContexts) {
     const providerHostBucket = deriveProviderHostBucket(cleanupContext?.hostname);
-    const hostGroupKey = providerHostBucket === 'google'
-      ? providerHostBucket
-      : cleanupContext.hostnameHash || providerHostBucket;
+    const hostGroupKey = cleanupContext.hostnameHash || providerHostBucket;
     let group = groupsByHostKey.get(hostGroupKey);
     if (!group) {
       group = [];
@@ -2209,8 +2303,6 @@ const clearReleasedFairQueueMetadata = (fqContext) => {
   fqContext.attemptTicket = null;
   fqContext.deferredReportStatusCode = null;
   fqContext.deferredReportArmed = false;
-  fqContext.preserveAttemptMetadataOnGrant = false;
-  fqContext.groupedGoogleCarryoverPendingReport = false;
 };
 
 const clearAbandonedFairQueueMetadata = (fqContext) => {
@@ -2219,16 +2311,10 @@ const clearAbandonedFairQueueMetadata = (fqContext) => {
   }
 
   clearFairQueueOwnershipMetadata(fqContext);
-  if (fqContext.preserveAttemptMetadataOnGrant === true) {
-    fqContext.preserveAttemptMetadataOnGrant = false;
-    return;
-  }
   fqContext.attemptVersion = null;
   fqContext.attemptTicket = null;
   fqContext.deferredReportStatusCode = null;
   fqContext.deferredReportArmed = false;
-  fqContext.preserveAttemptMetadataOnGrant = false;
-  fqContext.groupedGoogleCarryoverPendingReport = false;
 };
 
 const finalizeFairQueueContext = async ({ fairQueueClient, ctx, fqContext, phase }) => {
@@ -2649,15 +2735,12 @@ const createSlotHandlerClient = (config) => {
               fqContext.slotToken = data.slotToken;
               fqContext.releaseOwnerRequired = responseReleaseOwnerRequired ? true : undefined;
               fqContext.slotAcquiredAt = Date.now();
-              if (Number.isFinite(attemptVersion) && Number.isFinite(attemptTicket)) {
-                fqContext.attemptVersion = attemptVersion;
-                fqContext.attemptTicket = attemptTicket;
-              } else if (fqContext.preserveAttemptMetadataOnGrant === true) {
-                fqContext.preserveAttemptMetadataOnGrant = false;
-              } else {
-                fqContext.attemptVersion = null;
-                fqContext.attemptTicket = null;
-              }
+              fqContext.attemptVersion = Number.isFinite(attemptVersion) && Number.isFinite(attemptTicket)
+                ? attemptVersion
+                : null;
+              fqContext.attemptTicket = Number.isFinite(attemptVersion) && Number.isFinite(attemptTicket)
+                ? attemptTicket
+                : null;
               if (typeof testHooks?.onGrantPromotion === 'function') {
                 testHooks.onGrantPromotion(fqContext);
               }
@@ -3655,7 +3738,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return;
     }
     fqContext.deferredReportArmed = false;
-    fqContext.groupedGoogleCarryoverPendingReport = false;
   };
 
   const clearDeferredQueueBreakerReport = () => {
@@ -3664,8 +3746,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
     fqContext.deferredReportStatusCode = null;
     fqContext.deferredReportArmed = false;
-    fqContext.preserveAttemptMetadataOnGrant = false;
-    fqContext.groupedGoogleCarryoverPendingReport = false;
   };
 
   const readQueueBreakerAttempt = (hostname, hostnameAdmissionMode) => {
@@ -3756,7 +3836,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return false;
     }
 
-    if (redirectHostname !== fqContext.hostname && currentAuthorityHostname !== 'google') {
+    if (redirectHostname !== fqContext.hostname) {
       return false;
     }
 
@@ -3766,53 +3846,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     const redirectSiteBucket = await deriveSiteBucket(redirectHostname, redirectUrl, config.fairQueueSiteBucket);
     return redirectSiteBucket === fqContext.siteBucket;
-  };
-
-  const readGroupedGoogleQueueBreakerCarryover = (nextHostname, nextSiteBucket) => {
-    if (!fqContext || !fqContext.deferredReportArmed || !Number.isFinite(fqContext.deferredReportStatusCode)) {
-      return null;
-    }
-
-    if (resolveAdmissionMode(config, nextHostname) !== 'queue_breaker') {
-      return null;
-    }
-
-    const currentAuthorityHostname = getThrottleAuthorityHostname(fqContext.hostname);
-    const nextAuthorityHostname = getThrottleAuthorityHostname(nextHostname);
-    if (currentAuthorityHostname !== 'google' || nextAuthorityHostname !== currentAuthorityHostname) {
-      return null;
-    }
-
-    if (nextSiteBucket !== fqContext.siteBucket) {
-      return null;
-    }
-
-    return {
-      deferredReportStatusCode: fqContext.deferredReportStatusCode,
-      attemptVersion: Number.isFinite(fqContext.attemptVersion) ? Math.trunc(fqContext.attemptVersion) : null,
-      attemptTicket: Number.isFinite(fqContext.attemptTicket) ? Math.trunc(fqContext.attemptTicket) : null,
-      preserveAttemptMetadataOnGrant: true,
-      groupedGoogleCarryoverPendingReport: true,
-    };
-  };
-
-  const flushGroupedGoogleCarryoverReportBeforeSettleIfNeeded = async (hostname) => {
-    if (
-      resolveAdmissionMode(config, hostname) !== 'queue_breaker'
-      || !fqContext
-      || hostname !== fqContext.hostname
-      || fqContext.groupedGoogleCarryoverPendingReport !== true
-      || fqContext.deferredReportArmed !== true
-      || !Number.isFinite(fqContext.deferredReportStatusCode)
-      || fqContext.hitUpstreamAtMs
-    ) {
-      return { handled: false, response: null };
-    }
-
-    return {
-      handled: true,
-      response: await flushDeferredQueueBreakerReportIfNeeded(),
-    };
   };
 
   const reportBreakerResponseIfNeeded = async (hostname, response, requestUrl, attempt = null) => {
@@ -3927,8 +3960,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     nowMs: Date.now(),
     deferredReportStatusCode: null,
     deferredReportArmed: false,
-    preserveAttemptMetadataOnGrant: false,
-    groupedGoogleCarryoverPendingReport: false,
     cleanupRetired: false,
     ...buildFairQueueAdmissionFields(mode),
   });
@@ -4006,11 +4037,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   };
 
   const settleBreakerAttemptIfNeeded = async (hostname) => {
-    const groupedGoogleCarryoverReport = await flushGroupedGoogleCarryoverReportBeforeSettleIfNeeded(hostname);
-    if (groupedGoogleCarryoverReport.handled) {
-      return groupedGoogleCarryoverReport.response;
-    }
-
     const queueBreakerSettlement = await settleQueueBreakerAttemptIfNeeded(hostname);
     if (queueBreakerSettlement instanceof Response) {
       return queueBreakerSettlement;
@@ -4159,6 +4185,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
     return {
       requestId: cqPlan.requestId,
+      hostname: cqPlan.hostname,
       hostnameHash: cqPlan.hostnameHash,
       siteBucket: cqPlan.siteBucket,
       ipBucket: cqPlan.ipBucket,
@@ -4376,7 +4403,6 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     const updatedSiteBucket = needFairQueue
       ? await deriveSiteBucket(updatedHostname, targetUrl, config.fairQueueSiteBucket)
       : null;
-    const groupedGoogleCarryover = readGroupedGoogleQueueBreakerCarryover(updatedHostname, updatedSiteBucket);
     const fairQueueIdentityChanged = !fqContext
       || updatedHostname !== fqContext.hostname
       || updatedSiteBucket !== fqContext.siteBucket;
@@ -4420,11 +4446,9 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     }
 
     if (fqContext) {
-      if (!groupedGoogleCarryover) {
-        const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
-        if (deferredReportResponse) {
-          return deferredReportResponse;
-        }
+      const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+      if (deferredReportResponse) {
+        return deferredReportResponse;
       }
       const previousFairQueueContext = fqContext;
       await reconcileFairQueueContextForTarget({
@@ -4448,18 +4472,6 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       updatedAdmissionMode,
     );
     fqContext.targetUrl = normalizedTargetUrl;
-    if (groupedGoogleCarryover) {
-      fqContext.breakerEnabled = undefined;
-      fqContext.halfOpenMaxProbeCount = undefined;
-      fqContext.halfOpenMaxSeconds = undefined;
-      fqContext.halfOpenTimeoutMode = undefined;
-      fqContext.deferredReportStatusCode = groupedGoogleCarryover.deferredReportStatusCode;
-      fqContext.deferredReportArmed = true;
-      fqContext.attemptVersion = groupedGoogleCarryover.attemptVersion;
-      fqContext.attemptTicket = groupedGoogleCarryover.attemptTicket;
-      fqContext.preserveAttemptMetadataOnGrant = groupedGoogleCarryover.preserveAttemptMetadataOnGrant === true;
-      fqContext.groupedGoogleCarryoverPendingReport = groupedGoogleCarryover.groupedGoogleCarryoverPendingReport === true;
-    }
 
     return {
       targetHostname: updatedHostname,
@@ -4557,7 +4569,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
 
         if (acquireResult.result === 'wait') {
           cqPlan.waitToken = acquireResult.waitToken;
-          if (resolveAdmissionMode(config, cqPlan.hostname) === 'queue_breaker') {
+          if (resolveAdmissionMode(config, cqPlan.hostname) === 'queue_breaker' || !needFairQueue) {
             const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
             if (settleResponse instanceof Response) {
               const fairQueueReleased = await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq wait settle failure`);
@@ -4603,6 +4615,65 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           }
           return createTrueConcurrencyTerminalResponse(acquireResult.result, acquireResult.reason);
         }
+
+        let claimedResult;
+        try {
+          claimedResult = await concurrencyClient.claim(ctx, {
+            requestId: cqPlan.requestId,
+            claimToken: acquireResult.claimToken,
+            nowMs: Date.now(),
+            hardExpireAtMs: cqPlan.hardExpireAtMs,
+          }, clientSignal);
+        } catch (error) {
+          const releaseLease = {
+            ...acquireResult,
+            requestId: cqPlan.requestId,
+            hostname: cqPlan.hostname,
+            hostnameHash: cqPlan.hostnameHash,
+            siteBucket: cqPlan.siteBucket,
+            ipBucket: cqPlan.ipBucket,
+            hardExpireAtMs: cqPlan.hardExpireAtMs,
+          };
+          const releaseController = createConcurrencyReleaseController({
+            client: concurrencyClient,
+            ctx,
+            lease: releaseLease,
+            label: cqPlan.hostname,
+          });
+          await releaseController.releaseImmediately('acquire_delivery_failed');
+          const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(`[CQ] claim failed during ${phase}:`, message);
+          if (settleResponse instanceof Response) {
+            if (needFairQueue) {
+              await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq claim settle failure`);
+            }
+            return settleResponse;
+          }
+          if (needFairQueue) {
+            await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq claim failure`);
+          }
+          return createTrueConcurrencyUnavailableResponse(origin);
+        }
+
+        if (claimedResult.result !== 'granted') {
+          const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
+          if (settleResponse instanceof Response) {
+            if (needFairQueue) {
+              await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq claim terminal settle failure`);
+            }
+            return settleResponse;
+          }
+          if (needFairQueue) {
+            await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq claim terminal release`);
+          }
+          return createTrueConcurrencyTerminalResponse(claimedResult.result, claimedResult.reason);
+        }
+
+        acquireResult = {
+          ...claimedResult,
+          claimToken: acquireResult.claimToken,
+        };
 
         if (resolveAdmissionMode(config, cqPlan.hostname) === 'queue_breaker' && needFairQueue && !fqContext?.slotToken) {
           const breakerAttempt = await authorizeBreakerAttempt(cqPlan.hostname);
@@ -4721,6 +4792,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       const headProbeResponse = await fetch(headProbeRequest);
 
       const headProbeSize = parseContentLengthHeader(headProbeResponse.headers.get('content-length'));
+      await cancelResponseBody(headProbeResponse);
       if (headProbeSize !== null) {
         return headProbeSize;
       }
@@ -4733,7 +4805,9 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       rangeProbeRequest.headers.set('range', GOOGLE_DRIVE_HEAD_PROBE_RANGE);
       const rangeProbeResponse = await fetch(rangeProbeRequest);
 
-      return parseContentRangeTotal(rangeProbeResponse.headers.get('content-range'));
+      const rangeProbeSize = parseContentRangeTotal(rangeProbeResponse.headers.get('content-range'));
+      await cancelResponseBody(rangeProbeResponse);
+      return rangeProbeSize;
     } catch (_error) {
       return null;
     }
@@ -4874,7 +4948,6 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       'content-encoding',
       'accept-ranges',
       'content-range',
-      'transfer-encoding',
       'content-language',
       'expires',
       'pragma',
@@ -4886,7 +4959,13 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       if (header === 'content-disposition' && isCryptedDownload) {
         return;
       }
+      if (HOP_BY_HOP_RESPONSE_HEADERS.has(header)) {
+        return;
+      }
       const value = responseToWrap.headers.get(header);
+      if (header === 'content-length' && parseContentLengthHeader(value) === null) {
+        return;
+      }
       if (value) {
         safeHeaders.set(header, value);
       }
@@ -4943,6 +5022,9 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       ? responseInitOverrides.headers.get('content-length')
       : upstreamResponse.headers.get('content-length');
     const contentLength = parseContentLengthHeader(contentLengthHeader);
+    if (contentLength === null) {
+      safeHeaders.delete('content-length');
+    }
     const useFixedLengthStream = contentLength !== null && typeof FixedLengthStream === 'function';
     const streamPair = useFixedLengthStream
       ? new FixedLengthStream(contentLength)
@@ -4954,9 +5036,13 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
         },
       });
-    const abortController = new AbortController();
-    const msUntilExpire = Math.max(0, hardExpireAtMs - Date.now());
-    const expireTimer = setTimeout(() => abortController.abort(), msUntilExpire);
+	const abortController = new AbortController();
+	const msUntilExpire = Math.max(0, hardExpireAtMs - Date.now());
+	let hardExpiryAbort = false;
+	const expireTimer = setTimeout(() => {
+	  hardExpiryAbort = true;
+	  abortController.abort();
+	}, msUntilExpire);
     if (typeof expireTimer?.unref === 'function') {
       expireTimer.unref();
     }
@@ -4979,9 +5065,9 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
       }
     }).catch(async (error) => {
-      const reason = didClientAbort()
-        ? 'client_disconnect'
-        : (Date.now() >= hardExpireAtMs ? 'hard_expiry' : 'upstream_failure');
+		const reason = didClientAbort()
+		  ? 'client_disconnect'
+		  : (hardExpiryAbort || Date.now() >= hardExpireAtMs ? 'hard_expiry' : 'upstream_failure');
       await ensureCurrentTrueConcurrencyReleased(reason, true);
       if (!isAbortError(error)) {
         const message = error instanceof Error ? error.message : String(error);
@@ -5025,6 +5111,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         await finalizeFairQueueOnFailure('head probe complete');
       }
     }
+    await cancelResponseBody(upstreamResponse);
 
     return new Response(null, {
       status: 200,
@@ -5059,7 +5146,10 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       await ensureCurrentTrueConcurrencyReleased(reason, true);
     }
     if (needFairQueue && fqContext?.slotToken) {
-      await finalizeFairQueueOnFailure(reason);
+      const headerReleased = await waitForInFlightFairQueueHeaderRelease(fqContext);
+      if (!headerReleased && fqContext?.slotToken) {
+        await finalizeFairQueueOnFailure(reason);
+      }
     }
     return response;
   };
@@ -5196,22 +5286,44 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       && isGoogleDriveDownloadHostname(extractHostname(request.url)?.toLowerCase() || '')
       && request.headers.get('range') === GOOGLE_DRIVE_HEAD_PROBE_RANGE
       && response.status === 206
-      && Boolean(response.headers.get('content-range'));
+      && parseContentRangeTotal(response.headers.get('content-range')) !== null;
 
     if (shouldRewriteHeadProbeResponse) {
       return await buildHeadProbeResponse(response, request);
     }
 
-    const shouldRewriteGoogleDriveFullDownloadResponse = originalRequest.method === 'GET'
+    const isGoogleDriveSyntheticFullRangeRequest = originalRequest.method === 'GET'
       && !originalRequest.headers.get('range')
       && isGoogleDriveDownloadHostname(extractHostname(request.url)?.toLowerCase() || '')
       && response.status === 206
       && Boolean(request.headers.get('range'))
-      && request.headers.get('range') !== GOOGLE_DRIVE_HEAD_PROBE_RANGE
+      && request.headers.get('range') !== GOOGLE_DRIVE_HEAD_PROBE_RANGE;
+
+    const shouldRewriteGoogleDriveFullDownloadResponse = isGoogleDriveSyntheticFullRangeRequest
       && isExactGoogleDriveFullRangeMatch(
         request.headers.get('range'),
         response.headers.get('content-range'),
       );
+
+    const isHeadProbeRequest = originalRequest.method === 'HEAD'
+      && isGoogleDriveDownloadHostname(extractHostname(request.url)?.toLowerCase() || '')
+      && request.headers.get('range') === GOOGLE_DRIVE_HEAD_PROBE_RANGE;
+
+    if (isHeadProbeRequest && !shouldRewriteHeadProbeResponse) {
+      await cancelResponseBody(response);
+      return await releaseAdmissionBeforeTerminalResponse(
+        createErrorResponse(origin, 502, 'Google Drive HEAD probe invalid'),
+        'head_probe_invalid',
+      );
+    }
+
+    if (isGoogleDriveSyntheticFullRangeRequest && !shouldRewriteGoogleDriveFullDownloadResponse) {
+      await cancelResponseBody(response);
+      return await releaseAdmissionBeforeTerminalResponse(
+        createErrorResponse(origin, 502, 'Google Drive range mismatch'),
+        'google_drive_range_mismatch',
+      );
+    }
 
     if (shouldRewriteGoogleDriveFullDownloadResponse && !needTrueConcurrency) {
       return buildGoogleDriveFullDownloadResponse(response, request);

@@ -14,7 +14,7 @@
   "auth": {
     "enabled": true,
     "header": "X-CQ-Auth",
-    "token": "change-me"
+    "token": "replace-with-cq-auth-token"
   },
   "backend": {
     "mode": "postgres",

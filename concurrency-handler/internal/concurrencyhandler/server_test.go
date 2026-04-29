@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +18,9 @@ type stubBackend struct {
 	acquireResult *AcquireResult
 	acquireErr    error
 	acquireFn     func(context.Context, AcquireRequest) (*AcquireResult, error)
+	claimResult   *ClaimGrantResult
+	claimErr      error
+	claimFn       func(context.Context, ClaimGrantRequest) (*ClaimGrantResult, error)
 	releaseResult *ReleaseResult
 	releaseErr    error
 	releaseFn     func(context.Context, ReleaseRequest) (*ReleaseResult, error)
@@ -67,6 +69,12 @@ type activeReplayCleanupBackend struct {
 	*stubBackend
 }
 
+type failingResponseWriter struct {
+	header http.Header
+	status int
+	writes int
+}
+
 func (b *firstContinueWaitBlocksBackend) Acquire(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
 	if strings.TrimSpace(req.WaitToken) == strings.TrimSpace(b.waitToken) {
 		b.mu.Lock()
@@ -93,6 +101,10 @@ func (b *firstContinueWaitBlocksBackend) ProbeContinueWait(ctx context.Context, 
 
 func (b *firstContinueWaitBlocksBackend) Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
 	return b.inner.Release(ctx, req)
+}
+
+func (b *firstContinueWaitBlocksBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error) {
+	return b.inner.ClaimGrant(ctx, req)
 }
 
 func (b *firstContinueWaitBlocksBackend) PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
@@ -129,6 +141,10 @@ func (b *continueWaitSignalsBackend) Release(ctx context.Context, req ReleaseReq
 	return b.inner.Release(ctx, req)
 }
 
+func (b *continueWaitSignalsBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error) {
+	return b.inner.ClaimGrant(ctx, req)
+}
+
 func (b *continueWaitSignalsBackend) PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
 	return b.inner.PromoteWaiting(ctx, req)
 }
@@ -163,6 +179,10 @@ func (b *promoteBlocksAfterCommitBackend) Release(ctx context.Context, req Relea
 	return b.inner.Release(ctx, req)
 }
 
+func (b *promoteBlocksAfterCommitBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error) {
+	return b.inner.ClaimGrant(ctx, req)
+}
+
 func (b *promoteBlocksAfterCommitBackend) PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
 	result, err := b.inner.PromoteWaiting(ctx, req)
 	if err == nil && result != nil && result.Result == "granted" {
@@ -189,9 +209,26 @@ func (b *probingBackend) ProbeContinueWait(ctx context.Context, req AcquireReque
 	return &AcquireResult{Result: "wait", WaitToken: req.WaitToken, Scope: "host", RetryAfter: 1}, nil
 }
 
+func (w *failingResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *failingResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *failingResponseWriter) Write([]byte) (int, error) {
+	w.writes++
+	return 0, errors.New("forced write failure")
+}
+
 type recordingPromoteBackend struct {
 	mu            sync.Mutex
 	promoteCalls  []PromoteWaitingRequest
+	releaseCalls  []ReleaseRequest
 	resultsByID   map[string]*AcquireResult
 	probeResults  map[string]*AcquireResult
 	defaultResult *AcquireResult
@@ -211,8 +248,15 @@ func (b *recordingPromoteBackend) ProbeContinueWait(_ context.Context, req Acqui
 	return &AcquireResult{Result: "wait", WaitToken: req.WaitToken, Scope: "host", RetryAfter: 1}, nil
 }
 
-func (b *recordingPromoteBackend) Release(context.Context, ReleaseRequest) (*ReleaseResult, error) {
-	return &ReleaseResult{Result: "released"}, nil
+func (b *recordingPromoteBackend) Release(_ context.Context, req ReleaseRequest) (*ReleaseResult, error) {
+	b.mu.Lock()
+	b.releaseCalls = append(b.releaseCalls, req)
+	b.mu.Unlock()
+	return &ReleaseResult{Result: "released", RequestID: "released-request"}, nil
+}
+
+func (b *recordingPromoteBackend) ClaimGrant(context.Context, ClaimGrantRequest) (*ClaimGrantResult, error) {
+	return &ClaimGrantResult{Result: "granted", LeaseID: "lease-claim", LeaseToken: "token-claim", ExpiresAtMs: time.Now().UnixMilli() + 60_000}, nil
 }
 
 func (b *recordingPromoteBackend) PromoteWaiting(_ context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
@@ -243,6 +287,12 @@ func (b *recordingPromoteBackend) snapshotPromoteCalls() []PromoteWaitingRequest
 	return append([]PromoteWaitingRequest(nil), b.promoteCalls...)
 }
 
+func (b *recordingPromoteBackend) snapshotReleaseCalls() []ReleaseRequest {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]ReleaseRequest(nil), b.releaseCalls...)
+}
+
 func cloneAcquireResult(result *AcquireResult) *AcquireResult {
 	if result == nil {
 		return nil
@@ -256,6 +306,13 @@ func (s *stubBackend) Acquire(ctx context.Context, req AcquireRequest) (*Acquire
 		return s.acquireFn(ctx, req)
 	}
 	return s.acquireResult, s.acquireErr
+}
+
+func (s *stubBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error) {
+	if s.claimFn != nil {
+		return s.claimFn(ctx, req)
+	}
+	return s.claimResult, s.claimErr
 }
 
 func (s *stubBackend) Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
@@ -358,15 +415,103 @@ func assertObservabilityCount(t *testing.T, counts map[string]int, name string, 
 }
 
 func TestAcquireReturnsGrantedBody(t *testing.T) {
-	handler := newTestServer(t, &stubBackend{acquireResult: &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: 2000}})
+	handler := newTestServer(t, &stubBackend{acquireResult: &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: 2000, ClaimToken: "claim-1"}})
 	rec := postJSON(t, handler, "/api/v1/concurrency/acquire", validAcquireRequest(), "secret")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	body := decodeBody(t, rec)
-	if body["result"] != "granted" || body["leaseId"] != "lease-1" {
+	if body["result"] != "granted" || body["leaseId"] != "lease-1" || body["claimToken"] != "claim-1" {
 		t.Fatalf("expected granted body, got %v", body)
 	}
+}
+
+func TestAcquireRejectsGrantedResultWithoutClaimToken(t *testing.T) {
+	handler := newTestServer(t, &stubBackend{acquireResult: &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: 2000}})
+	rec := postJSON(t, handler, acquirePath, validAcquireRequest(), "secret")
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected missing claim token to be rejected with 503, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestClaimGrantEndpointUsesAuthAndNormalizesResults(t *testing.T) {
+	nowMs := time.Now().UnixMilli()
+	backend := &stubBackend{claimFn: func(_ context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error) {
+		if req.RequestID != "req-1" || req.ClaimToken != "claim-token" || req.NowMs != nowMs {
+			t.Fatalf("unexpected claim request: %+v", req)
+		}
+		return &ClaimGrantResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: nowMs + 60_000}, nil
+	}}
+	server := newTestServerInstance(t, backend)
+	handler := server.Handler()
+
+	unauthorized := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: "claim-token", NowMs: nowMs}, "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("expected missing auth 401, got %d", unauthorized.Code)
+	}
+
+	rec := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: "claim-token", NowMs: nowMs}, "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected claim 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["result"] != "granted" || body["leaseId"] != "lease-1" || body["leaseToken"] != "token-1" {
+		t.Fatalf("expected claim granted body, got %v", body)
+	}
+
+	backend.claimFn = func(context.Context, ClaimGrantRequest) (*ClaimGrantResult, error) {
+		return &ClaimGrantResult{Result: "conflict", Reason: "grant_already_claimed"}, nil
+	}
+	conflict := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: "claim-token", NowMs: nowMs + 1}, "secret")
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("expected duplicate claim 409, got %d body=%s", conflict.Code, conflict.Body.String())
+	}
+	conflictBody := decodeBody(t, conflict)
+	if conflictBody["result"] != "conflict" || conflictBody["reason"] != "grant_already_claimed" || conflictBody["leaseToken"] != nil {
+		t.Fatalf("expected terminal duplicate claim conflict without lease identity, got %v", conflictBody)
+	}
+}
+
+func TestReleaseAttachedWaiterCompensatesBufferedGrantedResultOnDisconnect(t *testing.T) {
+	backend := &recordingPromoteBackend{}
+	server := newTestServerInstance(t, backend)
+	nowMs := time.Now().UnixMilli()
+
+	waiter, ok := server.waitingRuntime.tryAttach("wait-disconnect")
+	if !ok || waiter == nil {
+		t.Fatal("expected attached waiter")
+	}
+	req := AcquireRequest{
+		Hostname:       "disconnect.example.com",
+		HostnameHash:   "disconnect-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "disconnect-request",
+		HardExpireAtMs: nowMs + 60_000,
+		NowMs:          nowMs,
+		WaitToken:      "wait-disconnect",
+	}
+	server.waitingRuntime.upsertWaitingRequest(req, req.WaitToken, waiter, server.cfg)
+	granted := &AcquireResult{Result: "granted", LeaseID: "lease-disconnect", LeaseToken: "token-disconnect", ExpiresAtMs: nowMs + 60_000}
+	if !server.waitingRuntime.deliver(req.WaitToken, granted) {
+		t.Fatal("expected buffered grant delivery to attached waiter")
+	}
+
+	server.releaseAttachedWaiter(waiter, req)
+
+	releases := backend.snapshotReleaseCalls()
+	if len(releases) != 1 {
+		t.Fatalf("expected one compensating release, got %+v", releases)
+	}
+	if releases[0].LeaseID != "lease-disconnect" || releases[0].LeaseToken != "token-disconnect" || releases[0].Reason != releaseReasonGrantDeliveryFailed {
+		t.Fatalf("expected disconnect compensation release, got %+v", releases[0])
+	}
+	if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("expected waiter to be detached after disconnect cleanup")
+	}
+	counts := snapshotObservabilityCounts(t, server)
+	assertObservabilityCount(t, counts, observabilityGrantDeliveryFailed, 1)
 }
 
 func TestAcquireReturnsWaitWithStableToken(t *testing.T) {
@@ -783,7 +928,7 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 			probeFn: func(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
 				switch req.RequestID {
 				case "probe-granted-request":
-					return &AcquireResult{Result: "granted", LeaseID: "probe-lease", LeaseToken: "probe-token", ExpiresAtMs: req.NowMs + 5_000}, nil
+					return &AcquireResult{Result: "granted", LeaseID: "probe-lease", LeaseToken: "probe-token", ExpiresAtMs: req.NowMs + 5_000, ClaimToken: "probe-claim"}, nil
 				case "probe-expired-hard-request":
 					return &AcquireResult{Result: "expired", Reason: "hard_expired"}, nil
 				case "probe-expired-detached-request":
@@ -821,13 +966,13 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 			INSERT INTO concurrency_requests (
 				request_id, hostname_hash, hostname, site_bucket, ip_bucket, hard_expire_at_ms,
 				state, wait_token, first_wait_at_ms, waiter_lease_until_ms,
-				lease_id, lease_token, lease_expires_at_ms, created_at_ms, updated_at_ms
+				lease_id, lease_token, lease_expires_at_ms, claim_token, claim_state, claim_claimed_at_ms, created_at_ms, updated_at_ms
 			) VALUES
-				($1, $2, $3, $4, $5, $6, 'waiting', $7, $8, $9, NULL, NULL, NULL, $8, $8),
-				($10, $11, $12, $13, $14, $15, 'active', NULL, NULL, NULL, $16::uuid, $17, $18, $19, $19)
+				($1, $2, $3, $4, $5, $6, 'waiting', $7, $8, $9, NULL, NULL, NULL, NULL, NULL, NULL, $8, $8),
+				($10, $11, $12, $13, $14, $15, 'active', NULL, NULL, NULL, $16::uuid, $17, $18, $19, 'unclaimed', NULL, $20, $20)
 		`,
 			"restart-wait-request", "restart-host", "restart.example.com", "site-a", "ip-a", nowMs+120_000, "wait-restart", nowMs-1_000, nowMs+60_000,
-			"restart-active-request", "restart-host", "restart.example.com", "site-b", "ip-b", nowMs+120_000, "11111111-1111-1111-1111-111111111111", "restart-active-token", leaseExpiresAtMs, nowMs-500,
+			"restart-active-request", "restart-host", "restart.example.com", "site-b", "ip-b", nowMs+120_000, "11111111-1111-1111-1111-111111111111", "restart-active-token", leaseExpiresAtMs, "restart-claim-token", nowMs-500,
 		); err != nil {
 			t.Fatalf("seed restart replay rows: %v", err)
 		}
@@ -851,17 +996,17 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 
 		activeReplayReq := AcquireRequest{Hostname: "restart.example.com", HostnameHash: "restart-host", SiteBucket: "site-b", IPBucket: "ip-b", RequestID: "restart-active-request", HardExpireAtMs: nowMs + 120_000, NowMs: nowMs + 2}
 		activeReplayRec := postJSON(t, handler, acquirePath, activeReplayReq, "secret")
-		if activeReplayRec.Code != http.StatusOK {
-			t.Fatalf("expected post-restart active replay 200, got %d body=%s", activeReplayRec.Code, activeReplayRec.Body.String())
+		if activeReplayRec.Code != http.StatusConflict {
+			t.Fatalf("expected post-restart active replay conflict 409, got %d body=%s", activeReplayRec.Code, activeReplayRec.Body.String())
 		}
 		activeReplayBody := decodeBody(t, activeReplayRec)
-		if activeReplayBody["result"] != "granted" {
-			t.Fatalf("expected post-restart active replay body, got %v", activeReplayBody)
+		if activeReplayBody["result"] != "conflict" || activeReplayBody["reason"] != "grant_unclaimed" || activeReplayBody["leaseToken"] != nil {
+			t.Fatalf("expected post-restart active replay conflict body without lease, got %v", activeReplayBody)
 		}
 
 		counts := snapshotObservabilityCounts(t, server)
 		assertObservabilityCount(t, counts, observabilityAcquireReplayWait, 1)
-		assertObservabilityCount(t, counts, observabilityAcquireReplayActive, 1)
+		assertObservabilityCount(t, counts, observabilityAcquireReplayActive, 0)
 		assertObservabilityCount(t, counts, observabilityAcquireFastWait, 0)
 		assertObservabilityCount(t, counts, observabilityAcquireFastGranted, 0)
 	})
@@ -887,10 +1032,8 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 				_, _ = w.Write([]byte(`[]`))
 			case r.Method == http.MethodPost && r.URL.Path == "/rpc/custom_acquire":
 				_, _ = w.Write([]byte(`[{
-					"result":"granted",
-					"lease_id":"11111111-1111-1111-1111-111111111111",
-					"lease_token":"postgrest-active-token",
-					"expires_at_ms":` + strconv.FormatInt(nowMs+30_000, 10) + `
+					"result":"conflict",
+					"reason":"grant_unclaimed"
 				}]`))
 			default:
 				t.Fatalf("unexpected postgrest request: method=%s path=%s query=%s", r.Method, r.URL.Path, r.URL.RawQuery)
@@ -912,16 +1055,16 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 
 		activeReplayReq := AcquireRequest{Hostname: "postgrest.example.com", HostnameHash: "postgrest-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "postgrest-active-request", HardExpireAtMs: nowMs + 120_000, NowMs: nowMs + 1}
 		activeReplayRec := postJSON(t, handler, acquirePath, activeReplayReq, "secret")
-		if activeReplayRec.Code != http.StatusOK {
-			t.Fatalf("expected postgrest post-restart active replay 200, got %d body=%s", activeReplayRec.Code, activeReplayRec.Body.String())
+		if activeReplayRec.Code != http.StatusConflict {
+			t.Fatalf("expected postgrest post-restart active replay conflict 409, got %d body=%s", activeReplayRec.Code, activeReplayRec.Body.String())
 		}
 		activeReplayBody := decodeBody(t, activeReplayRec)
-		if activeReplayBody["result"] != "granted" {
-			t.Fatalf("expected postgrest post-restart active replay body, got %v", activeReplayBody)
+		if activeReplayBody["result"] != "conflict" || activeReplayBody["reason"] != "grant_unclaimed" || activeReplayBody["leaseToken"] != nil {
+			t.Fatalf("expected postgrest post-restart active replay conflict body without lease, got %v", activeReplayBody)
 		}
 
 		counts := snapshotObservabilityCounts(t, server)
-		assertObservabilityCount(t, counts, observabilityAcquireReplayActive, 1)
+		assertObservabilityCount(t, counts, observabilityAcquireReplayActive, 0)
 		assertObservabilityCount(t, counts, observabilityAcquireFastGranted, 0)
 		if queryCount == 0 {
 			t.Fatal("expected postgrest startup recovery requests to run")
@@ -971,7 +1114,7 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 	server := newTestServerInstance(t, &stubBackend{acquireFn: func(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
 		switch req.RequestID {
 		case grantReq.RequestID:
-			return &AcquireResult{Result: "granted", LeaseID: "lease-grant", LeaseToken: "token-grant", ExpiresAtMs: req.NowMs + 5_000}, nil
+			return &AcquireResult{Result: "granted", LeaseID: "lease-grant", LeaseToken: "token-grant", ExpiresAtMs: req.NowMs + 5_000, ClaimToken: "claim-grant"}, nil
 		case waitReq.RequestID:
 			return &AcquireResult{Result: "wait", WaitToken: "wait-token", Scope: "host", RetryAfter: 1}, nil
 		default:
@@ -1164,9 +1307,16 @@ func TestObservabilityCountsContinueWaitAttachTimeoutAndPromotion(t *testing.T) 
 
 		counts := snapshotObservabilityCounts(t, server)
 		assertObservabilityCount(t, counts, "grant_promoted", 2)
-		assertObservabilityCount(t, counts, "grant_delivery_failed", 1)
+		assertObservabilityCount(t, counts, "grant_delivery_failed", 2)
 		assertObservabilityCount(t, counts, "expired_hard", 1)
 		assertObservabilityCount(t, counts, "expired_waiter_detached", 1)
+		releases := backend.snapshotReleaseCalls()
+		if len(releases) != 1 {
+			t.Fatalf("expected one compensating release, got %+v", releases)
+		}
+		if releases[0].LeaseID != "lease-dropped" || releases[0].LeaseToken != "token-dropped" || releases[0].Reason != releaseReasonGrantDeliveryFailed {
+			t.Fatalf("expected grant delivery compensation release, got %+v", releases[0])
+		}
 	})
 }
 
@@ -1311,7 +1461,7 @@ func TestObservabilityCountsConflictAndDenyReasons(t *testing.T) {
 		if rec := postJSON(t, handler, releasePath, validReleaseRequest(), "secret"); rec.Code != http.StatusOK {
 			t.Fatalf("expected noop response 200, got %d body=%s", rec.Code, rec.Body.String())
 		}
-		if rec := postJSON(t, handler, cancelPath, CancelRequest{RequestID: "cancelled-request", HostnameHash: "host-hash", SiteBucket: "site-a", IPBucket: "ip-a", HardExpireAtMs: 50_000, Reason: "worker_aborted", NowMs: 5_000}, "secret"); rec.Code != http.StatusOK {
+		if rec := postJSON(t, handler, cancelPath, CancelRequest{RequestID: "cancelled-request", Hostname: "cancel.example.com", HostnameHash: "host-hash", SiteBucket: "site-a", IPBucket: "ip-a", HardExpireAtMs: 50_000, Reason: "worker_aborted", NowMs: 5_000}, "secret"); rec.Code != http.StatusOK {
 			t.Fatalf("expected cancelled response 200, got %d body=%s", rec.Code, rec.Body.String())
 		}
 
@@ -1888,8 +2038,8 @@ func TestContinueWaitRealPathPreservesTerminalReplayPrecedenceOverAttachConflict
 	var cancelReason sql.NullString
 	if err := db.QueryRowContext(context.Background(), `
 		SELECT result, reason
-		FROM cq_cancel($1, $2, $3, $4, $5, $6, $7)
-	`, "waiting-request", "terminal-host", "site-b", "ip-b", nowMs+120_000, "worker_aborted", nowMs+2).Scan(&cancelResult, &cancelReason); err != nil {
+		FROM cq_cancel($1, $2, $3, $4, $5, $6, $7, $8)
+	`, "waiting-request", "terminal.example.com", "terminal-host", "site-b", "ip-b", nowMs+120_000, "worker_aborted", nowMs+2).Scan(&cancelResult, &cancelReason); err != nil {
 		t.Fatalf("cancel waiting request: %v", err)
 	}
 	if cancelResult != "cancelled" {
@@ -2014,7 +2164,52 @@ func TestContinueWaitRealPathDeliversGrantedAfterCapacityFrees(t *testing.T) {
 	}
 }
 
-func TestContinueWaitRealPathKeepsLeaseActiveWhenGrantDeliveryFails(t *testing.T) {
+func TestContinueWaitCompensatesPromotedGrantWhenHTTPDeliveryFails(t *testing.T) {
+	nowMs := time.Now().UnixMilli()
+	var releaseCalls []ReleaseRequest
+	var mu sync.Mutex
+	backend := &stubBackend{
+		acquireFn: func(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
+			if strings.TrimSpace(req.WaitToken) == "" {
+				return &AcquireResult{Result: "wait", WaitToken: "wait-http-fail", Scope: "host", RetryAfter: 1}, nil
+			}
+			return &AcquireResult{Result: "wait", WaitToken: req.WaitToken, Scope: "host", RetryAfter: 1}, nil
+		},
+		releaseFn: func(_ context.Context, req ReleaseRequest) (*ReleaseResult, error) {
+			mu.Lock()
+			releaseCalls = append(releaseCalls, req)
+			mu.Unlock()
+			return &ReleaseResult{Result: "released", RequestID: "request-http-fail"}, nil
+		},
+	}
+	server := newTestServerInstance(t, backend)
+	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "http-fail.example.com", HostnameHash: "http-fail-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "request-http-fail", HardExpireAtMs: nowMs + 60_000, NowMs: nowMs, WaitToken: "wait-http-fail"}, "wait-http-fail", nil, validTestConfig())
+	waiter, ok := server.waitingRuntime.tryAttach("wait-http-fail")
+	if !ok || waiter == nil {
+		t.Fatal("expected waiter attach")
+	}
+	server.waitingRuntime.setRequest(waiter, AcquireRequest{Hostname: "http-fail.example.com", HostnameHash: "http-fail-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "request-http-fail", HardExpireAtMs: nowMs + 60_000, NowMs: nowMs, WaitToken: "wait-http-fail"})
+
+	server.handleHostPassResult(requestSnapshot{RequestID: "request-http-fail", WaitToken: "wait-http-fail"}, &AcquireResult{Result: "granted", LeaseID: "lease-http-fail", LeaseToken: "token-http-fail", ExpiresAtMs: nowMs + 60_000, ClaimToken: "claim-http-fail"})
+	delivered := consumeWaiterDelivery(waiter)
+	if delivered == nil || delivered.Result != "granted" {
+		t.Fatalf("expected local waiter delivery before HTTP write, got %+v", delivered)
+	}
+
+	failingWriter := &failingResponseWriter{}
+	server.writeAcquireResultWithCompensation(context.Background(), failingWriter, AcquireRequest{RequestID: "request-http-fail", NowMs: nowMs + 1}, delivered, releaseReasonGrantDeliveryFailed)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(releaseCalls) != 1 {
+		t.Fatalf("expected one compensating release after failed HTTP delivery, got %+v", releaseCalls)
+	}
+	if releaseCalls[0].LeaseID != "lease-http-fail" || releaseCalls[0].LeaseToken != "token-http-fail" || releaseCalls[0].Reason != releaseReasonGrantDeliveryFailed {
+		t.Fatalf("expected grant delivery failed release, got %+v", releaseCalls[0])
+	}
+}
+
+func TestContinueWaitRealPathCompensatesDeliveredGrantOnDisconnect(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 
@@ -2142,20 +2337,20 @@ func TestContinueWaitRealPathKeepsLeaseActiveWhenGrantDeliveryFails(t *testing.T
 	if err != nil {
 		t.Fatalf("replay acquire after delivery failure: %v", err)
 	}
-	if replay.Result != "granted" || replay.LeaseID == "" || replay.LeaseToken == "" {
-		t.Fatalf("expected active replay grant after delivery failure, got %+v", replay)
+	if replay.Result != "released" || replay.Reason.String != releaseReasonGrantDeliveryFailed || strings.TrimSpace(replay.LeaseToken) != "" {
+		t.Fatalf("expected compensated released replay without lease after delivery failure, got %+v", replay)
 	}
 
-	var requestState string
+	var requestState, terminalReason string
 	if err := db.QueryRowContext(context.Background(), `
-		SELECT state
+		SELECT state, COALESCE(terminal_reason, '')
 		FROM concurrency_requests
 		WHERE request_id = $1
-	`, "waiting-request").Scan(&requestState); err != nil {
+	`, "waiting-request").Scan(&requestState, &terminalReason); err != nil {
 		t.Fatalf("read request state after delivery failure: %v", err)
 	}
-	if requestState != "active" {
-		t.Fatalf("expected request to remain active after delivery failure, got %q", requestState)
+	if requestState != "released" || terminalReason != releaseReasonGrantDeliveryFailed {
+		t.Fatalf("expected request compensated released after delivery failure, got state=%q reason=%q", requestState, terminalReason)
 	}
 }
 
@@ -2536,6 +2731,7 @@ func TestCancelImmediatelyAdvancesNextAttachedHeadAfterHostDeny(t *testing.T) {
 
 	cancelRec := postJSON(t, handler, cancelPath, CancelRequest{
 		RequestID:      "waiting-request-1",
+		Hostname:       "cancel-advance.example.com",
 		HostnameHash:   "cancel-advance-host",
 		SiteBucket:     "site-a",
 		IPBucket:       "ip-a1",
@@ -3077,6 +3273,7 @@ func TestCancelReturnsConflictForActiveLease(t *testing.T) {
 	handler := newTestServer(t, &stubBackend{cancelErr: &cancelConflictError{Reason: "must_release_active_lease"}})
 	rec := postJSON(t, handler, "/api/v1/concurrency/cancel", map[string]any{
 		"requestId":      "request-1",
+		"hostname":       "example.com",
 		"hostnameHash":   "host-hash",
 		"siteBucket":     "site-a",
 		"ipBucket":       "ip-a",
@@ -3090,6 +3287,25 @@ func TestCancelReturnsConflictForActiveLease(t *testing.T) {
 	body := decodeBody(t, rec)
 	if body["result"] != "conflict" || body["reason"] != "must_release_active_lease" {
 		t.Fatalf("expected active lease conflict body, got %v", body)
+	}
+}
+
+func TestCancelRejectsMissingHostname(t *testing.T) {
+	handler := newTestServer(t, &stubBackend{})
+	rec := postJSON(t, handler, cancelPath, map[string]any{
+		"requestId":      "request-1",
+		"hostnameHash":   "host-hash",
+		"siteBucket":     "site-a",
+		"ipBucket":       "ip-a",
+		"hardExpireAtMs": 5000,
+		"reason":         "worker_aborted",
+		"nowMs":          1000,
+	}, "secret")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "hostname is required") {
+		t.Fatalf("expected hostname validation error, got %s", rec.Body.String())
 	}
 }
 

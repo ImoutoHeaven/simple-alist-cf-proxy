@@ -106,21 +106,22 @@ func (b *postgrestBackend) Acquire(ctx context.Context, req AcquireRequest) (*Ac
 		Scope       *string `json:"scope"`
 		Reason      *string `json:"reason"`
 		RetryAfter  *int    `json:"retry_after"`
+		ClaimToken  *string `json:"claim_token"`
 	}{}
 	payload := map[string]any{
-		"p_hostname_hash":         req.HostnameHash,
-		"p_hostname":              req.Hostname,
-		"p_site_bucket":           canonicalBucket(req.SiteBucket),
-		"p_ip_bucket":             canonicalBucket(req.IPBucket),
-		"p_request_id":            req.RequestID,
-		"p_hard_expire_at_ms":     req.HardExpireAtMs,
-		"p_now_ms":                req.NowMs,
-		"p_wait_poll_window_ms":   b.cfg.Concurrency.Wait.WaitPollWindowMs,
+		"p_hostname_hash":           req.HostnameHash,
+		"p_hostname":                req.Hostname,
+		"p_site_bucket":             canonicalBucket(req.SiteBucket),
+		"p_ip_bucket":               canonicalBucket(req.IPBucket),
+		"p_request_id":              req.RequestID,
+		"p_hard_expire_at_ms":       req.HardExpireAtMs,
+		"p_now_ms":                  req.NowMs,
+		"p_wait_poll_window_ms":     b.cfg.Concurrency.Wait.WaitPollWindowMs,
 		"p_wait_reconnect_grace_ms": b.cfg.Concurrency.Wait.WaitReconnectGraceMs,
-		"p_host_max_in_flight":    b.cfg.Concurrency.Caps.HostMaxInFlight,
-		"p_site_max_in_flight":    b.cfg.Concurrency.Caps.SiteMaxInFlight,
-		"p_site_ip_max_in_flight": b.cfg.Concurrency.Caps.SiteIPMaxInFlight,
-		"p_cleanup_limit":         boundedExpireLimit(b.cfg.Concurrency.Sweep.BatchSize, 500),
+		"p_host_max_in_flight":      b.cfg.Concurrency.Caps.HostMaxInFlight,
+		"p_site_max_in_flight":      b.cfg.Concurrency.Caps.SiteMaxInFlight,
+		"p_site_ip_max_in_flight":   b.cfg.Concurrency.Caps.SiteIPMaxInFlight,
+		"p_cleanup_limit":           boundedExpireLimit(b.cfg.Concurrency.Sweep.BatchSize, 500),
 	}
 	if strings.TrimSpace(req.WaitToken) != "" {
 		payload["p_wait_token"] = req.WaitToken
@@ -138,6 +139,7 @@ func (b *postgrestBackend) Acquire(ctx context.Context, req AcquireRequest) (*Ac
 		Scope:       result.Scope,
 		Reason:      result.Reason,
 		RetryAfter:  result.RetryAfter,
+		ClaimToken:  result.ClaimToken,
 	}).toServiceResult()
 	if err := validateAcquireResult(req, serviceResult); err != nil {
 		return nil, err
@@ -155,6 +157,7 @@ func (b *postgrestBackend) ProbeContinueWait(ctx context.Context, req AcquireReq
 		Scope       *string `json:"scope"`
 		Reason      *string `json:"reason"`
 		RetryAfter  *int    `json:"retry_after"`
+		ClaimToken  *string `json:"claim_token"`
 	}{}
 	err := b.doRPC(ctx, fixedContinueWaitProbeFunc, map[string]any{
 		"p_hostname_hash":     req.HostnameHash,
@@ -178,8 +181,32 @@ func (b *postgrestBackend) ProbeContinueWait(ctx context.Context, req AcquireReq
 		Scope:       result.Scope,
 		Reason:      result.Reason,
 		RetryAfter:  result.RetryAfter,
+		ClaimToken:  result.ClaimToken,
 	}).toServiceResult()
 	if err := validateAcquireResult(req, serviceResult); err != nil {
+		return nil, err
+	}
+	return serviceResult, nil
+}
+
+func (b *postgrestBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error) {
+	result := &struct {
+		Result      string `json:"result"`
+		LeaseID     string `json:"lease_id"`
+		LeaseToken  string `json:"lease_token"`
+		ExpiresAtMs int64  `json:"expires_at_ms"`
+		Reason      string `json:"reason"`
+	}{}
+	err := b.doRPC(ctx, fixedClaimGrantFunc, map[string]any{
+		"p_request_id":  req.RequestID,
+		"p_claim_token": req.ClaimToken,
+		"p_now_ms":      req.NowMs,
+	}, result)
+	if err != nil {
+		return nil, err
+	}
+	serviceResult := &ClaimGrantResult{Result: result.Result, LeaseID: result.LeaseID, LeaseToken: result.LeaseToken, ExpiresAtMs: result.ExpiresAtMs, Reason: result.Reason}
+	if err := validateClaimGrantResult(serviceResult); err != nil {
 		return nil, err
 	}
 	return serviceResult, nil
@@ -220,16 +247,17 @@ func (b *postgrestBackend) PromoteWaiting(ctx context.Context, req PromoteWaitin
 		Scope       *string `json:"scope"`
 		Reason      *string `json:"reason"`
 		RetryAfter  *int    `json:"retry_after"`
+		ClaimToken  *string `json:"claim_token"`
 	}{}
 	err := b.doRPC(ctx, fixedPromoteWaitingFunc, map[string]any{
-		"p_request_id":         req.RequestID,
-		"p_hostname_hash":      req.HostnameHash,
-		"p_site_bucket":        canonicalBucket(req.SiteBucket),
-		"p_ip_bucket":          canonicalBucket(req.IPBucket),
-		"p_hard_expire_at_ms":  req.HardExpireAtMs,
-		"p_now_ms":             req.NowMs,
-		"p_host_max_in_flight": b.cfg.Concurrency.Caps.HostMaxInFlight,
-		"p_site_max_in_flight": b.cfg.Concurrency.Caps.SiteMaxInFlight,
+		"p_request_id":            req.RequestID,
+		"p_hostname_hash":         req.HostnameHash,
+		"p_site_bucket":           canonicalBucket(req.SiteBucket),
+		"p_ip_bucket":             canonicalBucket(req.IPBucket),
+		"p_hard_expire_at_ms":     req.HardExpireAtMs,
+		"p_now_ms":                req.NowMs,
+		"p_host_max_in_flight":    b.cfg.Concurrency.Caps.HostMaxInFlight,
+		"p_site_max_in_flight":    b.cfg.Concurrency.Caps.SiteMaxInFlight,
 		"p_site_ip_max_in_flight": b.cfg.Concurrency.Caps.SiteIPMaxInFlight,
 	}, result)
 	if err != nil {
@@ -244,6 +272,7 @@ func (b *postgrestBackend) PromoteWaiting(ctx context.Context, req PromoteWaitin
 		Scope:       result.Scope,
 		Reason:      result.Reason,
 		RetryAfter:  result.RetryAfter,
+		ClaimToken:  result.ClaimToken,
 	}).toServiceResult()
 	if err := validateAcquireResult(AcquireRequest{HardExpireAtMs: req.HardExpireAtMs}, serviceResult); err != nil {
 		return nil, err
@@ -258,6 +287,7 @@ func (b *postgrestBackend) Cancel(ctx context.Context, req CancelRequest) (*Canc
 	}{}
 	err := b.doRPC(ctx, fixedCancelFunc, map[string]any{
 		"p_request_id":        req.RequestID,
+		"p_hostname":          req.Hostname,
 		"p_hostname_hash":     req.HostnameHash,
 		"p_site_bucket":       canonicalBucket(req.SiteBucket),
 		"p_ip_bucket":         canonicalBucket(req.IPBucket),

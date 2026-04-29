@@ -286,6 +286,7 @@ type runtimeAcquireResult struct {
 	Scope       sql.NullString
 	Reason      sql.NullString
 	RetryAfter  sql.NullInt64
+	ClaimToken  sql.NullString
 }
 
 func seedRuntimeActiveLeases(t *testing.T, db *sql.DB, base runtimeAcquireCall, count int) {
@@ -327,7 +328,8 @@ func execRuntimeAcquire(ctx context.Context, db *sql.DB, req runtimeAcquireCall)
 		       wait_token,
 		       scope,
 		       reason,
-		       retry_after
+		       retry_after,
+		       claim_token
 		FROM cq_acquire($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	`,
 		req.HostnameHash,
@@ -353,6 +355,7 @@ func execRuntimeAcquire(ctx context.Context, db *sql.DB, req runtimeAcquireCall)
 		&result.Scope,
 		&result.Reason,
 		&result.RetryAfter,
+		&result.ClaimToken,
 	)
 	if err != nil {
 		return nil, err
@@ -370,7 +373,8 @@ func execRuntimePromoteWaiting(ctx context.Context, db *sql.DB, req PromoteWaiti
 		       wait_token,
 		       scope,
 		       reason,
-		       retry_after
+		       retry_after,
+		       claim_token
 		FROM cq_promote_waiting_request($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`,
 		req.RequestID,
@@ -391,6 +395,7 @@ func execRuntimePromoteWaiting(ctx context.Context, db *sql.DB, req PromoteWaiti
 		&result.Scope,
 		&result.Reason,
 		&result.RetryAfter,
+		&result.ClaimToken,
 	)
 	if err != nil {
 		return nil, err
@@ -499,6 +504,146 @@ func TestRuntimeAcquireCreatesWaitingRequestWithStableWaitToken(t *testing.T) {
 	}
 }
 
+func TestRuntimeAcquireGrantMustBeClaimedOnce(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "claim-host",
+		Hostname:          "claim.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "claim-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	if grant.Result != "granted" || strings.TrimSpace(grant.LeaseToken) == "" || !grant.ClaimToken.Valid || strings.TrimSpace(grant.ClaimToken.String) == "" {
+		t.Fatalf("expected granted acquire with lease and claim token, got %+v", grant)
+	}
+
+	replay, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "claim-host",
+		Hostname:          "claim.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "claim-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs + 1,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("active replay before claim: %v", err)
+	}
+	if replay.Result != "conflict" || replay.Reason.String != "grant_unclaimed" || strings.TrimSpace(replay.LeaseToken) != "" {
+		t.Fatalf("expected unclaimed conflict without lease token, got %+v", replay)
+	}
+
+	var claimResult string
+	var claimLeaseID, claimLeaseToken, claimReason sql.NullString
+	var claimExpires sql.NullInt64
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, lease_id::text, lease_token, expires_at_ms, reason
+		FROM cq_claim_grant($1, $2, $3)
+	`, "claim-request", grant.ClaimToken.String, nowMs+2).Scan(&claimResult, &claimLeaseID, &claimLeaseToken, &claimExpires, &claimReason); err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if claimResult != "granted" || claimLeaseID.String != grant.LeaseID || claimLeaseToken.String != grant.LeaseToken || claimExpires.Int64 != grant.ExpiresAtMs {
+		t.Fatalf("expected one claim to return original lease identity, got result=%q lease=%q token=%q expires=%d", claimResult, claimLeaseID.String, claimLeaseToken.String, claimExpires.Int64)
+	}
+
+	var duplicateResult string
+	var duplicateLeaseID, duplicateLeaseToken, duplicateReason sql.NullString
+	var duplicateExpires sql.NullInt64
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, lease_id::text, lease_token, expires_at_ms, reason
+		FROM cq_claim_grant($1, $2, $3)
+	`, "claim-request", grant.ClaimToken.String, nowMs+3).Scan(&duplicateResult, &duplicateLeaseID, &duplicateLeaseToken, &duplicateExpires, &duplicateReason); err != nil {
+		t.Fatalf("duplicate claim grant: %v", err)
+	}
+	if duplicateResult != "conflict" || duplicateReason.String != "grant_already_claimed" || duplicateLeaseToken.Valid {
+		t.Fatalf("expected duplicate claim conflict without lease identity, got result=%q reason=%q leaseToken=%q", duplicateResult, duplicateReason.String, duplicateLeaseToken.String)
+	}
+
+	replayAfterClaim, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash: "claim-host",
+		Hostname:     "claim.example.com",
+		SiteBucket:   "site-a",
+		IPBucket:     "ip-a",
+		RequestID:    "claim-request",
+		HardExpireMs: nowMs + 120_000,
+		NowMs:        nowMs + 4,
+	})
+	if err != nil {
+		t.Fatalf("active replay after claim: %v", err)
+	}
+	if replayAfterClaim.Result != "conflict" || replayAfterClaim.Reason.String != "grant_already_claimed" || strings.TrimSpace(replayAfterClaim.LeaseToken) != "" {
+		t.Fatalf("expected already-claimed replay conflict without lease token, got %+v", replayAfterClaim)
+	}
+}
+
+func TestRuntimeClaimGrantExpiresHardExpiredActiveLease(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "claim-expired-host",
+		Hostname:          "claim-expired.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "claim-expired-request",
+		HardExpireMs:      nowMs + 5,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	if grant.Result != "granted" || !grant.ClaimToken.Valid || strings.TrimSpace(grant.ClaimToken.String) == "" {
+		t.Fatalf("expected granted acquire with claim token, got %+v", grant)
+	}
+
+	var claimResult string
+	var claimLeaseID, claimLeaseToken, claimReason sql.NullString
+	var claimExpires sql.NullInt64
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, lease_id::text, lease_token, expires_at_ms, reason
+		FROM cq_claim_grant($1, $2, $3)
+	`, "claim-expired-request", grant.ClaimToken.String, nowMs+10).Scan(&claimResult, &claimLeaseID, &claimLeaseToken, &claimExpires, &claimReason); err != nil {
+		t.Fatalf("claim expired grant: %v", err)
+	}
+	if claimResult != "expired" || claimReason.String != "hard_expired" || claimLeaseToken.Valid || claimLeaseID.Valid || claimExpires.Valid {
+		t.Fatalf("expected expired claim without lease identity, got result=%q reason=%q leaseID=%q leaseToken=%q expires=%d", claimResult, claimReason.String, claimLeaseID.String, claimLeaseToken.String, claimExpires.Int64)
+	}
+
+	var requestState, terminalReason string
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT state, COALESCE(terminal_reason, '')
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, "claim-expired-request").Scan(&requestState, &terminalReason); err != nil {
+		t.Fatalf("read expired claim request: %v", err)
+	}
+	if requestState != "expired" || terminalReason != "hard_expired" {
+		t.Fatalf("expected claim to make request expired, got state=%q reason=%q", requestState, terminalReason)
+	}
+
+	var hostActiveCount int
+	if err := db.QueryRowContext(context.Background(), `SELECT active_count FROM concurrency_host_counters WHERE hostname_hash = $1`, "claim-expired-host").Scan(&hostActiveCount); err != nil {
+		t.Fatalf("read host counter: %v", err)
+	}
+	if hostActiveCount != 0 {
+		t.Fatalf("expected expired claim to decrement active count, got %d", hostActiveCount)
+	}
+}
+
 func TestRuntimeCancelAbsentRowCreatesCancelledTombstone(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
@@ -507,24 +652,27 @@ func TestRuntimeCancelAbsentRowCreatesCancelledTombstone(t *testing.T) {
 	var cancelReason sql.NullString
 	if err := db.QueryRowContext(context.Background(), `
 		SELECT result, reason
-		FROM cq_cancel($1, $2, $3, $4, $5, $6, $7)
-	`, "cancelled-request", "cancel-host", "site-a", "ip-a", nowMs+60_000, "worker_aborted", nowMs).Scan(&cancelResult, &cancelReason); err != nil {
+		FROM cq_cancel($1, $2, $3, $4, $5, $6, $7, $8)
+	`, "cancelled-request", "cancel.example.com", "cancel-host", "site-a", "ip-a", nowMs+60_000, "worker_aborted", nowMs).Scan(&cancelResult, &cancelReason); err != nil {
 		t.Fatalf("cancel absent row: %v", err)
 	}
 	if cancelResult != "cancelled" {
 		t.Fatalf("expected cancelled result, got result=%q reason=%q", cancelResult, cancelReason.String)
 	}
 
-	var state, terminalReason string
+	var state, terminalReason, hostname string
 	if err := db.QueryRowContext(context.Background(), `
-		SELECT state, terminal_reason
+		SELECT state, terminal_reason, hostname
 		FROM concurrency_requests
 		WHERE request_id = $1
-	`, "cancelled-request").Scan(&state, &terminalReason); err != nil {
+	`, "cancelled-request").Scan(&state, &terminalReason, &hostname); err != nil {
 		t.Fatalf("read cancelled tombstone: %v", err)
 	}
 	if state != "cancelled" || terminalReason != "request_cancelled" {
 		t.Fatalf("expected cancelled tombstone, got state=%q terminal_reason=%q", state, terminalReason)
+	}
+	if hostname != "cancel.example.com" {
+		t.Fatalf("expected cancelled tombstone hostname to persist actual host, got %q", hostname)
 	}
 
 	replay, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
@@ -1153,6 +1301,58 @@ func TestRuntimeReleaseMarksRequestReleasedWithoutCreatingNewLease(t *testing.T)
 	}
 	if requestState != "released" || terminalReason != "already_released" {
 		t.Fatalf("expected released request tombstone, got state=%q terminal_reason=%q", requestState, terminalReason)
+	}
+}
+
+func TestRuntimeCompensationReleaseReasonsPersist(t *testing.T) {
+	for _, reason := range []string{releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed} {
+		t.Run(reason, func(t *testing.T) {
+			db := requireRuntimeConcurrencyDB(t)
+			nowMs := time.Now().UnixMilli()
+			lease, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+				HostnameHash:      "compensate-host-" + reason,
+				Hostname:          "compensate.example.com",
+				SiteBucket:        "site-a",
+				IPBucket:          "ip-a",
+				RequestID:         "compensate-request-" + reason,
+				HardExpireMs:      nowMs + 60_000,
+				NowMs:             nowMs,
+				HostMaxInFlight:   1,
+				SiteMaxInFlight:   1,
+				SiteIPMaxInFlight: 1,
+			})
+			if err != nil {
+				t.Fatalf("seed acquire: %v", err)
+			}
+			if lease.Result != "granted" {
+				t.Fatalf("expected granted seed lease, got %+v", lease)
+			}
+			var releaseResult string
+			var releaseReason, releaseRequestID sql.NullString
+			if err := db.QueryRowContext(context.Background(), `
+				SELECT result, reason, request_id
+				FROM cq_release($1::uuid, $2, $3, $4)
+			`, lease.LeaseID, lease.LeaseToken, reason, nowMs+1).Scan(&releaseResult, &releaseReason, &releaseRequestID); err != nil {
+				t.Fatalf("release compensation: %v", err)
+			}
+			if releaseResult != "released" {
+				t.Fatalf("expected released compensation, got result=%q reason=%q", releaseResult, releaseReason.String)
+			}
+			var requestState, terminalReason string
+			if err := db.QueryRowContext(context.Background(), `
+				SELECT state, terminal_reason
+				FROM concurrency_requests
+				WHERE request_id = $1
+			`, "compensate-request-"+reason).Scan(&requestState, &terminalReason); err != nil {
+				t.Fatalf("read compensated request: %v", err)
+			}
+			if requestState != "released" || terminalReason != reason {
+				t.Fatalf("expected compensation reason persisted, got state=%q reason=%q", requestState, terminalReason)
+			}
+			if terminalReason == "stream_complete" || terminalReason == "already_released" {
+				t.Fatalf("compensation reason collapsed to %q", terminalReason)
+			}
+		})
 	}
 }
 

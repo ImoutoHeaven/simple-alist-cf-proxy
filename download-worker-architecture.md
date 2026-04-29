@@ -62,6 +62,8 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 - `download.throttleProfiles.<name>`：只定义 breaker profile，canonical 字段固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`closeThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`、`protectHttpCodes`
 - controller 只新增 `halfOpenMaxProbeCount` 并移除 `probeLeaseSeconds`；worker 在解析 bootstrap 时会校验 `halfOpenSuccessThreshold <= halfOpenMaxProbeCount`，并拒绝 `halfOpenMaxProbeCount > 63`，因为 SQL 用 signed `BIGINT` bitmap 记录 half-open attempt 回报；`halfOpenTimeoutMode` 继续决定 half-open timeout 后的终态
 - `download.fairQueue.*`：slot-handler 地址、鉴权 key、鉴权 header 名、等待超时、轮询策略、siteBucket 计算方式等（worker 侧解析字段）；其中 `slotHandlerAuthHeader` 由 controller 同步下发，默认值为 `X-FQ-Auth`
+- `download.fairQueue.siteBucket` / `download.trueConcurrency.siteBucket` 共用同一套归一化规则：`mode` / `modes` 仅接受 `host`、`sharepoint`、`googledrive`；`modes` 去掉空白项后只要还有至少一个有效值就覆盖 `mode`，重复值按首次出现保留；若 `modes` 缺失、不是数组或清理后为空，则回退到 `mode`；若两者都为空，则默认启用 `['sharepoint']`
+- `download.trueConcurrency.*`：`concurrency-handler` 地址、`handlerAuthKey`、`handlerAuthHeader`、`acquireTimeoutMs`、`releaseTimeoutMs` 与 `siteBucket` 计算方式；`siteBucket` 归一化后按 `googledrive -> sharepoint -> host -> unknown` 取值，provider-specific 模式优先于 host fallback
 - slot-handler in-flight limits（slot-handler 配置项，写在 slot-handler 的 config 中，worker 不解析）：
   - `globalMaxInFlightFlow`：slot-handler 全局 in-flight 上限，超过则返回 `overloaded`
   - `hostMaxInFlightFlow`：按 hostname 维度的 in-flight 上限
@@ -162,14 +164,22 @@ admission 固定为四种显式运行模式：
     - 多实例 slot-handler 需要 sticky 路由：同一 `queryToken` 的轮询应稳定落到同一实例，否则会出现 `query_token_stale`/`timeout`，worker 侧退化为 `503`。
     - `release` 只在 claimed-path owner tuple 存在时需要 owner-routing：LB 至少要能基于 `X-FQ-Owner-Token`（或 request body 中的 `queryToken`）把这类 after-use cleanup 路由回 claim owner；如果做不到，slot-handler 会把 owner route miss 显式返回 `503`，而不是静默吞掉本地 cleanup miss。
 
-11. **上游请求与响应封装**
+11. **True Concurrency（concurrency-handler）**
+    - Breaker、FairQueue、true-concurrency 与缓存 unified-check 都按真实上游 hostname 与对应 hash 作为 authority。
+    - worker 发给 `concurrency-handler` 的 `acquire` / continue-wait payload 固定携带 actual `hostname`、`hostnameHash`、`siteBucket`、`ipBucket`、`requestId` 与 `hardExpireAtMs`。
+    - `acquire` 返回 `granted` 时，worker 会用 `requestId + claimToken` 调用 `POST /api/v1/concurrency/claim` 绑定 active lease，再发起 origin fetch；返回 `wait` 时使用稳定 `waitToken` 续连，直到后续 `granted` 后再进入 `/claim`。
+    - 当 fairqueue 与 true-concurrency 同时启用时，执行顺序固定为 `FairQueue acquire -> true-concurrency acquire -> /api/v1/concurrency/claim -> origin fetch -> FairQueue release after headers -> true-concurrency release on stream lifecycle`。
+    - `concurrency-handler` 在生产环境必须对同一 `waitToken` 做 sticky routing；否则 wait continuation 会退化为失败。
+    - `concurrency-handler` HTTP auth 是必需项；worker 使用 `handlerAuthHeader` 发送 `handlerAuthKey`，`acquireTimeoutMs` 定义 `/acquire` 与 `/claim` 超时，`releaseTimeoutMs` 定义 `/release` 与 `/cancel` 超时。
+
+12. **上游请求与响应封装**
     - 支持 3xx 重定向与 401/410 触发的 refresh（`refresh=true`）重试一次。
     - 只保留安全的响应头（Content-Type/Disposition/Length/Range 等）。
     - `payload.isCrypted=true` 时强制设置附件名为 `*.enc`。
     - 按 `download.overrideCacheControl` 与 `payload.filesize` 覆盖 Cache-Control。
     - 统一附加下载 CORS 头。
 
-12. **Last Active 更新与清理**
+13. **Last Active 更新与清理**
     - `idleTimeoutSeconds > 0` 时更新 `DOWNLOAD_LAST_ACTIVE_TABLE`（后台 `waitUntil`）。
     - `scheduleAllCleanups` 按概率清理缓存/限流/Last Active。
 

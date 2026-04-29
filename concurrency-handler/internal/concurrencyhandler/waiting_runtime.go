@@ -7,15 +7,15 @@ import (
 )
 
 type waitingRuntime struct {
-	mu               sync.Mutex
-	requestsByID     map[string]*requestSnapshot
-	requestIDByToken map[string]string
-	observedWaitTokens map[string]struct{}
+	mu                       sync.Mutex
+	requestsByID             map[string]*requestSnapshot
+	requestIDByToken         map[string]string
+	observedWaitTokens       map[string]struct{}
 	observedActiveRequestIDs map[string]struct{}
-	tupleQueues      map[string][]string
-	hostTupleQueues  map[string]map[string]struct{}
-	waiters          map[string]*attachedWaiter
-	hostReactors     map[string]*hostReactor
+	tupleQueues              map[string][]string
+	hostTupleQueues          map[string]map[string]struct{}
+	waiters                  map[string]*attachedWaiter
+	hostReactors             map[string]*hostReactor
 }
 
 type requestSnapshot struct {
@@ -40,6 +40,11 @@ type attachedWaiter struct {
 	released  bool
 }
 
+type attachedWaiterSnapshot struct {
+	WaitToken string
+	Request   AcquireRequest
+}
+
 type hostReactor struct {
 	hostnameHash string
 	wakeCh       chan struct{}
@@ -49,14 +54,14 @@ type hostReactor struct {
 
 func newWaitingRuntime() *waitingRuntime {
 	return &waitingRuntime{
-		requestsByID:     make(map[string]*requestSnapshot),
-		requestIDByToken: make(map[string]string),
-		observedWaitTokens: make(map[string]struct{}),
+		requestsByID:             make(map[string]*requestSnapshot),
+		requestIDByToken:         make(map[string]string),
+		observedWaitTokens:       make(map[string]struct{}),
 		observedActiveRequestIDs: make(map[string]struct{}),
-		tupleQueues:      make(map[string][]string),
-		hostTupleQueues:  make(map[string]map[string]struct{}),
-		waiters:          make(map[string]*attachedWaiter),
-		hostReactors:     make(map[string]*hostReactor),
+		tupleQueues:              make(map[string][]string),
+		hostTupleQueues:          make(map[string]map[string]struct{}),
+		waiters:                  make(map[string]*attachedWaiter),
+		hostReactors:             make(map[string]*hostReactor),
 	}
 }
 
@@ -154,13 +159,13 @@ func (r *waitingRuntime) setRequest(waiter *attachedWaiter, req AcquireRequest) 
 	if r == nil || waiter == nil {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	token := strings.TrimSpace(waiter.waitToken)
 	if token == "" {
 		token = strings.TrimSpace(req.WaitToken)
 	}
-	r.mu.Lock()
 	if waiter.released {
-		r.mu.Unlock()
 		return
 	}
 	waiter.request = req
@@ -178,7 +183,6 @@ func (r *waitingRuntime) setRequest(waiter *attachedWaiter, req AcquireRequest) 
 			snap.HardExpireAtMs = req.HardExpireAtMs
 		}
 	}
-	r.mu.Unlock()
 }
 
 func (r *waitingRuntime) upsertWaitingRequest(req AcquireRequest, waitToken string, waiter *attachedWaiter, cfg Config) {
@@ -290,14 +294,19 @@ func (r *waitingRuntime) restoreWaitingRequest(snap requestSnapshot) {
 	r.refreshHostNextWakeLocked(hostnameHash)
 }
 
-func (r *waitingRuntime) release(waiter *attachedWaiter) {
+func (r *waitingRuntime) release(waiter *attachedWaiter) *AcquireResult {
 	if r == nil || waiter == nil {
-		return
+		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if waiter.released {
-		return
+		return nil
+	}
+	var delivered *AcquireResult
+	select {
+	case delivered = <-waiter.resultCh:
+	default:
 	}
 	waiter.released = true
 	delete(r.waiters, waiter.waitToken)
@@ -305,6 +314,7 @@ func (r *waitingRuntime) release(waiter *attachedWaiter) {
 		r.refreshHostNextWakeLocked(waiter.request.HostnameHash)
 	}
 	close(waiter.doneCh)
+	return delivered
 }
 
 func (r *waitingRuntime) deliver(waitToken string, result *AcquireResult) bool {
@@ -317,9 +327,9 @@ func (r *waitingRuntime) deliver(waitToken string, result *AcquireResult) bool {
 	}
 
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	waiter := r.waiters[token]
-	r.mu.Unlock()
-	if waiter == nil {
+	if waiter == nil || waiter.released {
 		return false
 	}
 
@@ -359,6 +369,34 @@ func (r *waitingRuntime) snapshotAttached() []*attachedWaiter {
 		out = append(out, waiter)
 	}
 	return out
+}
+
+func (r *waitingRuntime) snapshotAttachedRequests() []attachedWaiterSnapshot {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]attachedWaiterSnapshot, 0, len(r.waiters))
+	for _, waiter := range r.waiters {
+		if waiter == nil || waiter.released {
+			continue
+		}
+		out = append(out, attachedWaiterSnapshot{WaitToken: waiter.waitToken, Request: waiter.request})
+	}
+	return out
+}
+
+func (r *waitingRuntime) snapshotAttachedRequest(waiter *attachedWaiter) (attachedWaiterSnapshot, bool) {
+	if r == nil || waiter == nil {
+		return attachedWaiterSnapshot{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if waiter.released {
+		return attachedWaiterSnapshot{}, false
+	}
+	return attachedWaiterSnapshot{WaitToken: waiter.waitToken, Request: waiter.request}, true
 }
 
 func (r *waitingRuntime) grantEligibleHeads(hostnameHash string, nowMs int64) []requestSnapshot {

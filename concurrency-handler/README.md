@@ -7,11 +7,14 @@
 It is responsible only for:
 
 - wait-token aware `acquire`
+- grant-binding `claim`
 - active-lease `release`
 - request-level `cancel`
 - bounded expiry cleanup through `ExpireScope`
 
-It does not do fairqueue scheduling, but in V1 it does own server-side waiting semantics for true-concurrency admission: fast acquire may return `wait`, the worker reconnects with a stable `waitToken`, and CQ later replays `granted` or terminal outcomes from the request ledger.
+It does not do fairqueue scheduling, but it does own server-side waiting semantics for true-concurrency admission: fast acquire may return `wait`, the worker reconnects with a stable `waitToken`, and CQ later replays `granted` or terminal outcomes from the request ledger.
+
+Production deployments require sticky routing for `waitToken` continuation. All HTTP endpoints require auth; `auth.enabled` must be `true` and `auth.token` must be set.
 
 ## Worker Coordination
 
@@ -20,41 +23,53 @@ When a target enables true concurrency only, Worker runs:
 1. compute `hardExpireAtMs`
 2. `acquire(fast)`
 3. if CQ returns `wait`, continue waiting with the returned `waitToken`
-4. once CQ returns `granted`, origin fetch
-5. managed streaming response
-6. best-effort `release`
+4. once CQ returns `granted`, call `claim`
+5. if `claim` returns `granted`, origin fetch
+6. managed streaming response
+7. best-effort `release`
 
 When a target enables both fairqueue and true concurrency, Worker runs:
 
 1. compute `hardExpireAtMs`
 2. `slot-handler` fairqueue acquire
 3. `concurrency-handler acquire(fast)`
-4. if CQ returns `granted`, origin fetch
-5. if CQ returns `wait`, release the physical fairqueue slot immediately with unused-grant semantics and continue waiting through the stable `waitToken`
-6. once CQ returns `granted`, origin fetch
+4. if CQ returns `wait`, release the physical fairqueue slot immediately with unused-grant semantics and continue waiting through the stable `waitToken`
+5. once CQ returns `granted`, call `claim`
+6. if `claim` returns `granted`, origin fetch
 7. fairqueue early release after upstream headers when a physical slot is still held
 8. managed streaming response
 9. best-effort true-concurrency `release`
 
-Worker binds active-lease release to stream completion, upstream failure, client disconnect, hard expiry, and target rotation. For waiting-only or ambiguous pre-active cleanup it uses request-level `cancel` instead of request-level release recovery. The release retry schedule is fixed in V1: immediate, then `2s`, `4s`, and `8s`.
+Worker binds active-lease release to stream completion, upstream failure, client disconnect, hard expiry, and target rotation. For waiting-only or ambiguous pre-active cleanup it uses request-level `cancel` instead of request-level release recovery. The release retry schedule is immediate, then `2s`, `4s`, and `8s`.
+
+The Worker-side client contract is: send `handlerAuthKey` in `handlerAuthHeader` (default `X-CQ-Auth`), use `acquireTimeoutMs` for `/acquire` and `/claim`, and use `releaseTimeoutMs` for `/release` and `/cancel`.
 
 ## HTTP API
 
 - `POST /api/v1/concurrency/acquire`
+- `POST /api/v1/concurrency/claim`
 - `POST /api/v1/concurrency/release`
 - `POST /api/v1/concurrency/cancel`
-
-There is no public `precheck` endpoint in the waiting redesign.
 
 `acquire` serves both:
 
 - initial fast acquire
 - continue-wait attach/replay via `waitToken`
 
+Granted `acquire` results include a `claimToken`. Worker must call `claim` before origin fetch.
+
 `acquire` returns exactly these normalized outcomes:
 
 - `200 granted`
 - `200 wait`
+- `409 conflict`
+- `410 released`
+- `410 cancelled`
+- `410 expired`
+
+`claim` finalizes delivery of a granted lease before origin fetch. It returns exactly these normalized outcomes:
+
+- `200 granted`
 - `409 conflict`
 - `410 released`
 - `410 cancelled`
@@ -99,6 +114,8 @@ Both modes normalize to the same service-level waiting contract: `granted|wait|c
 - `rpc.releaseFunc`
 - `rpc.expireFunc`
 
+`auth.enabled` must be `true`, `auth.token` is required, and `auth.header` defaults to `X-CQ-Auth`.
+
 The cap fields are required and each accepts integers `>= 0`.
 
 - `0` disables only that cap layer.
@@ -109,11 +126,9 @@ The cap fields are required and each accepts integers `>= 0`.
 
 `wait.waitPollWindowMs` and `wait.waitReconnectGraceMs` define the waiting-request attach lifetime used to compute `waiter_lease_until_ms`.
 
-`cancel` is fixed to the authoritative V1 database function `cq_cancel`; it is not user-configurable.
+`claim` and `cancel` are fixed to the authoritative database functions `cq_claim_grant` and `cq_cancel`; they are not user-configurable.
 
-There is no user-configurable precheck RPC in V1 because the redesign removes `precheck` entirely.
-
-Dense and sparse heartbeat remain out of scope for this change. `hardExpireAtMs` remains the hard cutoff for active streams, and Worker still releases the active lease with reason `hard_expiry` when that cutoff is reached.
+`hardExpireAtMs` is the hard cutoff for active streams, and Worker releases the active lease with reason `hard_expiry` when that cutoff is reached.
 
 ## Running
 

@@ -105,7 +105,10 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
   - `download.db.rateLimit.*`（`windowSeconds` / `limit` / `blockSeconds` / `pgErrorHandle` 等）
 - `download.throttleProfiles` + `decision.download.throttleProfile`：SharePoint breaker profile 与 selector；canonical 字段固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`closeThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`、`protectHttpCodes`。controller 只新增 `halfOpenMaxProbeCount` 并移除 `probeLeaseSeconds`，worker 会拒绝 `halfOpenSuccessThreshold > halfOpenMaxProbeCount` 的无效 bootstrap，也会拒绝 `halfOpenMaxProbeCount > 63`，因为 SQL 用 signed `BIGINT` bitmap 记录 half-open attempt 回报；`halfOpenCloseMode=and|or` 控制 half-open 关闭条件按“成功次数 + EWMA 阈值”取交集或并集，`halfOpenTimeoutMode=open|close|partial-close` 控制 half-open 超时后的终态；运行时状态固定落在 `THROTTLE_PROTECTION`，worker/slot-handler 都不保留本地 breaker 权威，未知 selector 直接报错
 - `download.fairQueue.*`：公平排队开关与等待策略（含 siteBucket 计算）
-- `download.trueConcurrency.*`：true-concurrency 开关、`hostPatterns`、`handlerUrl`、`handlerAuthKey`、请求超时，以及固定为 `sharepoint` 的 `siteBucket.mode`
+- `download.trueConcurrency.*`：true-concurrency 开关、`hostPatterns`、`handlerUrl`、`handlerAuthKey`、`handlerAuthHeader`、`acquireTimeoutMs`、`releaseTimeoutMs` 与 `siteBucket`
+- Breaker、FairQueue、true-concurrency 与缓存 unified check 都使用真实上游 hostname 与对应的 hostname hash
+- `download.fairQueue.siteBucket` / `download.trueConcurrency.siteBucket`：`mode` / `modes` 只接受 `host`、`sharepoint`、`googledrive`；`modes` 去掉空白项后只要还有至少一个有效值就覆盖 `mode`，重复值按首次出现保留；若 `modes` 缺失、不是数组或清理后为空，则回退到 `mode`；若两者都为空，则默认启用 `['sharepoint']`
+- `siteBucket` 归一化后按 `googledrive -> sharepoint -> host -> unknown` 取值：Google Drive 返回 `googledrive:unspecified`，SharePoint 返回 site key，其余仅在启用 `host` 且存在规范化 hostname 时返回 `host:<hostname>`；provider-specific 模式优先于 host fallback，否则 bucket 为 `unknown`
 - `decision.download.pathAction` / `decision.download.checkOriginMode`：单路径策略与 bindingStr 绑定字段
 
 ## 请求流程概要
@@ -119,15 +122,18 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - admission 固定为四种显式路径：`none -> fetch only`、`breaker_only -> authorize -> fetch -> report`、`queue_only -> admit(queue only) -> fetch -> release`、`queue_breaker -> admit(queue + breaker) -> fetch -> report -> release`
 - 命中托管 breaker hostname 时，`breaker_only` 先按权威快照对 `open` 立即 fail-fast，并在实际 fetch 前调用 `download_authorize_breaker_attempt`；`queue_breaker` 不再在拿到 slot 后二次 authorize，而是直接消费 slot-handler 返回的 `attemptVersion` / `attemptTicket` 并在响应后回写 `download_report_breaker_sample`。`half_open` 继续按小批次 epoch 记账收敛：首个受保护错误立即重新 `open`，成功数满足 close rule 时关闭，整批 attempt 都已发出且全部回报后仍证据不足则重新 `open`，超时仍按 `halfOpenTimeoutMode` 处理；由于 SQL 用 signed `BIGINT` bitmap 记录 attempt 回报，`halfOpenMaxProbeCount` 的有效范围固定为 `1..63`。
 - 可选 Fair Queue（slot-handler）获取 slot；slot-handler 只透传 backend `THROTTLED` 元数据，不在本地维护 breaker 运行时状态
-- 可选 True Concurrency（`concurrency-handler`）负责真实 in-flight 并发；它与 fairqueue 拆分部署，V1 不做 heartbeat 或 renew，而是依赖 `hardExpireAtMs`、hot-path expiry cleanup 与 sweep 回收 lease
-- 当 fairqueue 与 true concurrency 同时启用时，worker 固定按 `precheck -> fairqueue acquire -> true-concurrency acquire -> origin fetch` 的顺序执行；拿到上游响应头后立即尝试 fairqueue early release，最终响应走 managed streaming，并把 true-concurrency release 绑定到流生命周期
+- 可选 True Concurrency（`concurrency-handler`）负责真实 in-flight 并发；它与 fairqueue 拆分部署，依赖 `hardExpireAtMs`、hot-path expiry cleanup 与 sweep 回收 lease
+- 当 fairqueue 与 true concurrency 同时启用时，worker 固定按 `fairqueue acquire -> true-concurrency acquire -> /api/v1/concurrency/claim -> origin fetch -> fairqueue release after headers -> true-concurrency release on stream lifecycle` 的主顺序执行；若 `acquire` 先返回 `wait`，则继续用稳定 `waitToken` 续连，直到拿到 `granted` 后再调用 `/claim`
 - true-concurrency release 是 best-effort：worker 固定按 `立即一次 + 2s + 4s + 8s` 重试；触发条件包括正常结束、上游失败、客户端断开、hard expiry，以及 redirect/refresh 目标切换
 - 转发上游响应，裁剪/补充 headers 并返回
 
 ## Fair Queue 与 True Concurrency
 
 - `slot-handler` 仍是 fairqueue、长轮询和 queue-side release 的唯一权威。
-- `concurrency-handler` 是独立 Go 服务，只负责 advisory `precheck`、DB-authoritative `acquire`、idempotent `release` 和 expiry cleanup。
+- `concurrency-handler` 是独立 Go 服务，只负责 true-concurrency 的 DB-authoritative `acquire`、`claim`、`release`、`cancel` 和 expiry cleanup。
+- `concurrency-handler` 在生产环境要求按 `waitToken` 做 sticky routing，否则等待中的继续请求不会稳定回到原实例。
+- `concurrency-handler` HTTP auth 是必需项；`auth.enabled` 必须为 `true`，且 `auth.token` 必须配置。
+- Worker 侧 true-concurrency client contract 由 `handlerAuthKey`、`handlerAuthHeader`、`acquireTimeoutMs` 与 `releaseTimeoutMs` 定义。
 - `concurrency-handler` 的 `backend.mode` 支持 `postgres` 与 `postgrest`，两种模式暴露相同的 true-concurrency 语义，只改变 handler 到数据库的传输方式。
 
 ## 内部控制接口

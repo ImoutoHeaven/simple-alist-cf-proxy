@@ -289,9 +289,13 @@ describe('init.sql breaker RPC definitions', () => {
     expect(acquireBody).toMatch(/IF p_hard_expire_at_ms IS NULL OR p_hard_expire_at_ms <= v_now_ms THEN[\s\S]*?result := 'expired'/i);
 
     expect(cancelBody).toMatch(/INSERT INTO concurrency_requests/i);
+    expect(cancelBody).toMatch(/p_hostname\s+text/i);
     expect(cancelBody).toMatch(/VALUES \([\s\S]*?'cancelled'[\s\S]*?'request_cancelled'/i);
+    expect(cancelBody).toMatch(/v_hostname\s+text := BTRIM\(COALESCE\(p_hostname, ''\)\)/i);
+    expect(cancelBody).toMatch(/v_request\.hostname IS DISTINCT FROM v_hostname/i);
     expect(cancelBody).toMatch(/RAISE EXCEPTION 'cq_cancel request_id tuple mismatch'/i);
     expect(cancelBody).toMatch(/RAISE EXCEPTION 'cq_cancel must release active lease'/i);
+    expect(cancelBody).not.toMatch(/v_hostname_hash,\s*\n\s*v_hostname_hash/i);
     expect(cancelBody).toMatch(/result := 'noop';[\s\S]*?reason := 'already_terminal'/i);
 
     expect(releaseBody).toMatch(/lease_token/i);

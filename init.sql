@@ -1684,10 +1684,17 @@ CREATE TABLE IF NOT EXISTS concurrency_requests (
   lease_id uuid,
   lease_token text,
   lease_expires_at_ms bigint,
+  claim_token text,
+  claim_state text CHECK (claim_state IN ('unclaimed', 'claimed', 'compensated')),
+  claim_claimed_at_ms bigint,
   terminal_reason text,
   created_at_ms bigint NOT NULL,
   updated_at_ms bigint NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS concurrency_requests_claim_token_idx
+  ON concurrency_requests (claim_token)
+  WHERE claim_token IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS concurrency_requests_waiting_host_idx
   ON concurrency_requests (hostname_hash, site_bucket, ip_bucket, first_wait_at_ms, request_id)
@@ -1948,7 +1955,8 @@ BEGIN
 
   UPDATE concurrency_requests
   SET state = 'released',
-      terminal_reason = 'already_released',
+      terminal_reason = CASE WHEN p_reason IN ('grant_delivery_failed', 'acquire_delivery_failed') THEN p_reason ELSE 'already_released' END,
+      claim_state = CASE WHEN p_reason IN ('grant_delivery_failed', 'acquire_delivery_failed') THEN 'compensated' ELSE claim_state END,
       updated_at_ms = v_now_ms
   WHERE concurrency_requests.request_id = v_locked_lease.request_id
     AND state = 'active';
@@ -1980,6 +1988,7 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION cq_cancel(
   p_request_id text,
+  p_hostname text,
   p_hostname_hash text,
   p_site_bucket text,
   p_ip_bucket text,
@@ -1991,13 +2000,14 @@ RETURNS TABLE(result text, reason text) AS $$
 DECLARE
   v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
   v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_hostname text := BTRIM(COALESCE(p_hostname, ''));
   v_hostname_hash text := BTRIM(COALESCE(p_hostname_hash, ''));
   v_site_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_site_bucket, '')), ''), 'unknown');
   v_ip_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_ip_bucket, '')), ''), 'unknown');
   v_request record;
   v_request_row_count bigint := 0;
 BEGIN
-  IF v_request_id = '' OR v_hostname_hash = '' OR p_hard_expire_at_ms IS NULL OR p_hard_expire_at_ms <= 0 THEN
+  IF v_request_id = '' OR v_hostname = '' OR v_hostname_hash = '' OR p_hard_expire_at_ms IS NULL OR p_hard_expire_at_ms <= 0 THEN
     result := 'noop';
     reason := 'already_terminal';
     RETURN NEXT;
@@ -2029,7 +2039,7 @@ BEGIN
     ) VALUES (
       v_request_id,
       v_hostname_hash,
-      v_hostname_hash,
+      v_hostname,
       v_site_bucket,
       v_ip_bucket,
       p_hard_expire_at_ms,
@@ -2045,6 +2055,7 @@ BEGIN
   END IF;
 
   IF v_request.hostname_hash IS DISTINCT FROM v_hostname_hash
+    OR v_request.hostname IS DISTINCT FROM v_hostname
     OR v_request.site_bucket IS DISTINCT FROM v_site_bucket
     OR v_request.ip_bucket IS DISTINCT FROM v_ip_bucket
     OR v_request.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms THEN
@@ -2084,7 +2095,7 @@ CREATE OR REPLACE FUNCTION cq_promote_waiting_request(
   p_site_max_in_flight integer DEFAULT 0,
   p_site_ip_max_in_flight integer DEFAULT 0
 )
-RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, wait_token text, scope text, reason text, retry_after integer) AS $$
+RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, wait_token text, scope text, reason text, retry_after integer, claim_token text) AS $$
 DECLARE
   v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
   v_request_id text := BTRIM(COALESCE(p_request_id, ''));
@@ -2102,6 +2113,7 @@ DECLARE
   v_lease_seed text;
   v_new_lease_token text;
   v_new_lease_id uuid;
+  v_new_claim_token text;
 BEGIN
   IF v_request_id = '' THEN
     RAISE EXCEPTION 'cq_promote_waiting_request request_id is required';
@@ -2134,14 +2146,15 @@ BEGIN
 
   CASE v_request.state
     WHEN 'active' THEN
-      result := 'granted';
-      lease_id := v_request.lease_id;
-      lease_token := v_request.lease_token;
-      expires_at_ms := v_request.lease_expires_at_ms;
+      result := 'conflict';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
       wait_token := NULL;
       scope := NULL;
-      reason := NULL;
+      reason := CASE WHEN v_request.claim_state = 'claimed' THEN 'grant_already_claimed' ELSE 'grant_unclaimed' END;
       retry_after := NULL;
+      claim_token := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'released' THEN
@@ -2151,8 +2164,9 @@ BEGIN
       expires_at_ms := NULL;
       wait_token := NULL;
       scope := NULL;
-      reason := 'already_released';
+      reason := COALESCE(v_request.terminal_reason, 'already_released');
       retry_after := NULL;
+      claim_token := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'cancelled' THEN
@@ -2164,6 +2178,7 @@ BEGIN
       scope := NULL;
       reason := 'request_cancelled';
       retry_after := NULL;
+      claim_token := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'expired' THEN
@@ -2175,6 +2190,7 @@ BEGIN
       scope := NULL;
       reason := COALESCE(v_request.terminal_reason, 'hard_expired');
       retry_after := NULL;
+      claim_token := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'waiting' THEN
@@ -2198,6 +2214,7 @@ BEGIN
     scope := NULL;
     reason := 'hard_expired';
     retry_after := NULL;
+    claim_token := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -2217,6 +2234,7 @@ BEGIN
     scope := NULL;
     reason := 'waiter_detached_timeout';
     retry_after := NULL;
+    claim_token := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -2311,6 +2329,7 @@ BEGIN
     scope := v_wait_scope;
     reason := NULL;
     retry_after := v_retry_after;
+    claim_token := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -2318,6 +2337,7 @@ BEGIN
   v_lease_seed := v_request_id || '|' || v_hostname_hash || '|' || v_site_bucket || '|' || v_ip_bucket || '|' || p_hard_expire_at_ms::text;
   v_new_lease_token := md5(v_lease_seed || '|token');
   v_new_lease_id := cq_make_uuid(v_lease_seed || '|lease_id');
+  v_new_claim_token := md5(v_lease_seed || '|claim|' || v_now_ms::text);
 
   INSERT INTO concurrency_leases (
     lease_id,
@@ -2356,6 +2376,9 @@ BEGIN
       lease_id = v_new_lease_id,
       lease_token = v_new_lease_token,
       lease_expires_at_ms = p_hard_expire_at_ms,
+      claim_token = v_new_claim_token,
+      claim_state = 'unclaimed',
+      claim_claimed_at_ms = NULL,
       terminal_reason = NULL,
       updated_at_ms = v_now_ms
   WHERE request_id = v_request_id;
@@ -2386,6 +2409,7 @@ BEGIN
   scope := NULL;
   reason := NULL;
   retry_after := NULL;
+  claim_token := v_new_claim_token;
   RETURN NEXT;
 END;
 $$ LANGUAGE plpgsql;
@@ -2406,7 +2430,7 @@ CREATE OR REPLACE FUNCTION cq_acquire(
   p_site_ip_max_in_flight integer DEFAULT 0,
   p_cleanup_limit integer DEFAULT 500
 )
-RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, wait_token text, scope text, reason text, retry_after integer) AS $$
+RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, wait_token text, scope text, reason text, retry_after integer, claim_token text) AS $$
 DECLARE
   v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
   v_site_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_site_bucket, '')), ''), 'unknown');
@@ -2421,6 +2445,7 @@ DECLARE
   v_new_wait_token text;
   v_new_lease_token text;
   v_new_lease_id uuid;
+  v_new_claim_token text;
   v_retry_after integer := 1;
   v_waiter_lease_until_ms bigint := 0;
   v_host_count integer := 0;
@@ -2476,14 +2501,15 @@ BEGIN
 
     CASE v_request.state
       WHEN 'active' THEN
-        result := 'granted';
-        lease_id := v_request.lease_id;
-        lease_token := v_request.lease_token;
-        expires_at_ms := v_request.lease_expires_at_ms;
+        result := 'conflict';
+        lease_id := NULL;
+        lease_token := NULL;
+        expires_at_ms := NULL;
         wait_token := NULL;
         scope := NULL;
-        reason := NULL;
+        reason := CASE WHEN v_request.claim_state = 'claimed' THEN 'grant_already_claimed' ELSE 'grant_unclaimed' END;
         retry_after := NULL;
+        claim_token := NULL;
         RETURN NEXT;
         RETURN;
       WHEN 'released' THEN
@@ -2493,8 +2519,9 @@ BEGIN
         expires_at_ms := NULL;
         wait_token := NULL;
         scope := NULL;
-        reason := 'already_released';
+        reason := COALESCE(v_request.terminal_reason, 'already_released');
         retry_after := NULL;
+        claim_token := NULL;
         RETURN NEXT;
         RETURN;
       WHEN 'cancelled' THEN
@@ -2506,6 +2533,7 @@ BEGIN
         scope := NULL;
         reason := 'request_cancelled';
         retry_after := NULL;
+        claim_token := NULL;
         RETURN NEXT;
         RETURN;
       WHEN 'expired' THEN
@@ -2517,6 +2545,7 @@ BEGIN
         scope := NULL;
         reason := COALESCE(v_request.terminal_reason, 'hard_expired');
         retry_after := NULL;
+        claim_token := NULL;
         RETURN NEXT;
         RETURN;
       WHEN 'waiting' THEN
@@ -2535,6 +2564,7 @@ BEGIN
           scope := NULL;
           reason := 'hard_expired';
           retry_after := NULL;
+          claim_token := NULL;
           RETURN NEXT;
           RETURN;
         END IF;
@@ -2554,6 +2584,7 @@ BEGIN
           scope := NULL;
           reason := 'waiter_detached_timeout';
           retry_after := NULL;
+          claim_token := NULL;
           RETURN NEXT;
           RETURN;
         END IF;
@@ -2573,6 +2604,7 @@ BEGIN
         scope := 'host';
         reason := NULL;
         retry_after := 1;
+        claim_token := NULL;
         RETURN NEXT;
         RETURN;
     END CASE;
@@ -2587,6 +2619,7 @@ BEGIN
     scope := NULL;
     reason := 'hard_expired';
     retry_after := NULL;
+    claim_token := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -2714,6 +2747,7 @@ BEGIN
     scope := v_wait_scope;
     reason := NULL;
     retry_after := v_retry_after;
+    claim_token := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -2721,6 +2755,7 @@ BEGIN
   v_lease_seed := v_request_id || '|' || v_hostname_hash || '|' || v_site_bucket || '|' || v_ip_bucket || '|' || p_hard_expire_at_ms::text;
   v_new_lease_token := md5(v_lease_seed || '|token');
   v_new_lease_id := cq_make_uuid(v_lease_seed || '|lease_id');
+  v_new_claim_token := md5(v_lease_seed || '|claim|' || v_now_ms::text);
 
   INSERT INTO concurrency_leases (
     lease_id,
@@ -2765,6 +2800,9 @@ BEGIN
     lease_id,
     lease_token,
     lease_expires_at_ms,
+    claim_token,
+    claim_state,
+    claim_claimed_at_ms,
     created_at_ms,
     updated_at_ms
   ) VALUES (
@@ -2778,6 +2816,9 @@ BEGIN
     v_new_lease_id,
     v_new_lease_token,
     p_hard_expire_at_ms,
+    v_new_claim_token,
+    'unclaimed',
+    NULL,
     v_now_ms,
     v_now_ms
   );
@@ -2808,7 +2849,173 @@ BEGIN
   scope := NULL;
   reason := NULL;
   retry_after := NULL;
+  claim_token := v_new_claim_token;
   RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_claim_grant(
+  p_request_id text,
+  p_claim_token text,
+  p_now_ms bigint DEFAULT NULL
+)
+RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, reason text) AS $$
+DECLARE
+  v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
+  v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_claim_token text := BTRIM(COALESCE(p_claim_token, ''));
+  v_request record;
+  v_request_row_count bigint := 0;
+BEGIN
+  IF v_request_id = '' OR v_claim_token = '' THEN
+    result := 'conflict';
+    lease_id := NULL;
+    lease_token := NULL;
+    expires_at_ms := NULL;
+    reason := 'grant_unclaimed';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+
+  SELECT *
+    INTO v_request
+  FROM concurrency_requests
+  WHERE request_id = v_request_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
+
+  IF v_request_row_count = 0 THEN
+    result := 'conflict';
+    lease_id := NULL;
+    lease_token := NULL;
+    expires_at_ms := NULL;
+    reason := 'grant_unclaimed';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  CASE v_request.state
+    WHEN 'active' THEN
+      IF v_request.claim_token IS DISTINCT FROM v_claim_token THEN
+        result := 'conflict';
+        lease_id := NULL;
+        lease_token := NULL;
+        expires_at_ms := NULL;
+        reason := CASE WHEN v_request.claim_state = 'claimed' THEN 'grant_already_claimed' ELSE 'grant_unclaimed' END;
+        RETURN NEXT;
+        RETURN;
+      END IF;
+
+      IF v_request.hard_expire_at_ms <= v_now_ms OR v_request.lease_expires_at_ms <= v_now_ms THEN
+        UPDATE concurrency_requests
+        SET state = 'expired',
+            terminal_reason = 'hard_expired',
+            updated_at_ms = v_now_ms
+        WHERE request_id = v_request_id;
+
+        UPDATE concurrency_leases
+        SET state = 'expired',
+            released_at = COALESCE(released_at, to_timestamp(v_now_ms / 1000.0)),
+            updated_at = to_timestamp(v_now_ms / 1000.0)
+        WHERE request_id = v_request_id
+          AND state = 'active';
+
+        UPDATE concurrency_host_counters
+        SET active_count = GREATEST(active_count - 1, 0),
+            updated_at = to_timestamp(v_now_ms / 1000.0)
+        WHERE hostname_hash = v_request.hostname_hash;
+
+        UPDATE concurrency_site_counters
+        SET active_count = GREATEST(active_count - 1, 0),
+            updated_at = to_timestamp(v_now_ms / 1000.0)
+        WHERE hostname_hash = v_request.hostname_hash
+          AND site_bucket = v_request.site_bucket;
+
+        UPDATE concurrency_site_ip_counters
+        SET active_count = GREATEST(active_count - 1, 0),
+            updated_at = to_timestamp(v_now_ms / 1000.0)
+        WHERE hostname_hash = v_request.hostname_hash
+          AND site_bucket = v_request.site_bucket
+          AND ip_bucket = v_request.ip_bucket;
+
+        result := 'expired';
+        lease_id := NULL;
+        lease_token := NULL;
+        expires_at_ms := NULL;
+        reason := 'hard_expired';
+        RETURN NEXT;
+        RETURN;
+      END IF;
+
+      IF v_request.claim_state = 'claimed' THEN
+        result := 'conflict';
+        lease_id := NULL;
+        lease_token := NULL;
+        expires_at_ms := NULL;
+        reason := 'grant_already_claimed';
+        RETURN NEXT;
+        RETURN;
+      END IF;
+
+      IF v_request.claim_state IS DISTINCT FROM 'unclaimed' THEN
+        result := 'conflict';
+        lease_id := NULL;
+        lease_token := NULL;
+        expires_at_ms := NULL;
+        reason := 'grant_already_claimed';
+        RETURN NEXT;
+        RETURN;
+      END IF;
+
+      UPDATE concurrency_requests
+      SET claim_state = 'claimed',
+          claim_claimed_at_ms = v_now_ms,
+          updated_at_ms = v_now_ms
+      WHERE request_id = v_request_id;
+
+      result := 'granted';
+      lease_id := v_request.lease_id;
+      lease_token := v_request.lease_token;
+      expires_at_ms := v_request.lease_expires_at_ms;
+      reason := NULL;
+      RETURN NEXT;
+      RETURN;
+    WHEN 'released' THEN
+      result := 'released';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      reason := COALESCE(v_request.terminal_reason, 'already_released');
+      RETURN NEXT;
+      RETURN;
+    WHEN 'cancelled' THEN
+      result := 'cancelled';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      reason := 'request_cancelled';
+      RETURN NEXT;
+      RETURN;
+    WHEN 'expired' THEN
+      result := 'expired';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      reason := COALESCE(v_request.terminal_reason, 'hard_expired');
+      RETURN NEXT;
+      RETURN;
+    ELSE
+      result := 'conflict';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      reason := 'grant_unclaimed';
+      RETURN NEXT;
+      RETURN;
+  END CASE;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -2822,7 +3029,7 @@ CREATE OR REPLACE FUNCTION cq_continue_wait_probe(
   p_now_ms bigint,
   p_wait_token text
 )
-RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, wait_token text, scope text, reason text, retry_after integer) AS $$
+RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, wait_token text, scope text, reason text, retry_after integer, claim_token text) AS $$
 DECLARE
   v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
   v_site_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_site_bucket, '')), ''), 'unknown');
@@ -2861,14 +3068,15 @@ BEGIN
 
   CASE v_request.state
     WHEN 'active' THEN
-      result := 'granted';
-      lease_id := v_request.lease_id;
-      lease_token := v_request.lease_token;
-      expires_at_ms := v_request.lease_expires_at_ms;
+      result := 'conflict';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
       wait_token := NULL;
       scope := NULL;
-      reason := NULL;
+      reason := CASE WHEN v_request.claim_state = 'claimed' THEN 'grant_already_claimed' ELSE 'grant_unclaimed' END;
       retry_after := NULL;
+      claim_token := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'released' THEN
@@ -2878,8 +3086,9 @@ BEGIN
       expires_at_ms := NULL;
       wait_token := NULL;
       scope := NULL;
-      reason := 'already_released';
+      reason := COALESCE(v_request.terminal_reason, 'already_released');
       retry_after := NULL;
+      claim_token := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'cancelled' THEN
@@ -2891,6 +3100,7 @@ BEGIN
       scope := NULL;
       reason := 'request_cancelled';
       retry_after := NULL;
+      claim_token := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'expired' THEN
@@ -2902,6 +3112,7 @@ BEGIN
       scope := NULL;
       reason := COALESCE(v_request.terminal_reason, 'hard_expired');
       retry_after := NULL;
+      claim_token := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'waiting' THEN
@@ -2920,6 +3131,7 @@ BEGIN
         scope := NULL;
         reason := 'hard_expired';
         retry_after := NULL;
+        claim_token := NULL;
         RETURN NEXT;
         RETURN;
       END IF;
@@ -2939,6 +3151,7 @@ BEGIN
         scope := NULL;
         reason := 'waiter_detached_timeout';
         retry_after := NULL;
+        claim_token := NULL;
         RETURN NEXT;
         RETURN;
       END IF;
@@ -2951,6 +3164,7 @@ BEGIN
       scope := 'host';
       reason := NULL;
       retry_after := 1;
+      claim_token := NULL;
       RETURN NEXT;
       RETURN;
   END CASE;

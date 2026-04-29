@@ -169,6 +169,17 @@ const buildSignedWorkerRequest = async ({
 
 const readJson = async (response) => JSON.parse(await response.text());
 
+const createClaimGrantResponseFromRequest = (init) => {
+  const body = JSON.parse(init.body);
+  const suffix = body.claimToken.replace(/^claim-token-?/, '') || '1';
+  return createJsonResponse({
+    result: 'granted',
+    leaseId: `lease-${suffix}`,
+    leaseToken: `token-${suffix}`,
+    expiresAtMs: Date.now() + 60_000,
+  });
+};
+
 const createTestContext = () => {
   const waitUntilPromises = [];
   return {
@@ -181,10 +192,35 @@ const createTestContext = () => {
   };
 };
 
+const createTrackedTextBody = (text) => {
+  const encoded = new TextEncoder().encode(text);
+  let pulled = false;
+  let cancelled = false;
+
+  return {
+    stream: new ReadableStream({
+      pull(controller) {
+        if (!pulled) {
+          controller.enqueue(encoded);
+          pulled = true;
+        }
+        controller.close();
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }),
+    get cancelled() {
+      return cancelled;
+    },
+  };
+};
+
 const GOOGLE_DRIVE_HOST_PATTERNS = [
   'drive.google.com',
   '*.googleapis.com',
   '*.googleusercontent.com',
+  'drive.usercontent.google.com',
 ];
 
 const hashSiteKey = async (siteKey) => sha256Hash(siteKey);
@@ -250,6 +286,15 @@ const captureAdmissionPayloads = async ({
         leaseId: 'lease-sitebucket',
         leaseToken: 'token-sitebucket',
         expiresAtMs: concurrencyAcquireBody.hardExpireAtMs,
+        claimToken: 'claim-token-sitebucket',
+      });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-1',
+        leaseToken: 'token-1',
+        expiresAtMs: Date.now() + 1_000,
       });
     }
 
@@ -341,6 +386,7 @@ test('dual mode performs fairqueue acquire before concurrency acquire and origin
         leaseId: 'lease-1',
         leaseToken: 'token-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
       });
     }
 
@@ -367,6 +413,10 @@ test('dual mode performs fairqueue acquire before concurrency acquire and origin
       calls.push('fairqueue-release');
       return createJsonResponse({ result: 'ok' });
     }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
@@ -386,8 +436,8 @@ test('dual mode performs fairqueue acquire before concurrency acquire and origin
     assert.deepEqual(calls.slice(0, 4), [
       'fairqueue-acquire',
       'concurrency-acquire',
+      'concurrency-claim',
       'origin-fetch',
-      'breaker-report',
     ]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -572,6 +622,7 @@ test('dual mode proceeds without precheck and still completes fairqueue then con
         leaseId: 'lease-malformed-precheck',
         leaseToken: 'token-malformed-precheck',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-malformed-precheck',
       });
     }
 
@@ -598,6 +649,10 @@ test('dual mode proceeds without precheck and still completes fairqueue then con
       calls.push('fairqueue-release');
       return createJsonResponse({ result: 'ok' });
     }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
@@ -616,8 +671,8 @@ test('dual mode proceeds without precheck and still completes fairqueue then con
     assert.deepEqual(calls.slice(0, 4), [
       'fairqueue-acquire',
       'concurrency-acquire',
+      'concurrency-claim',
       'origin-fetch',
-      'breaker-report',
     ]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -836,6 +891,7 @@ test('breaker_only with true concurrency authorizes breaker before CQ acquire', 
         leaseId: 'lease-breaker-only',
         leaseToken: 'token-breaker-only',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-breaker-only',
       });
     }
 
@@ -857,6 +913,10 @@ test('breaker_only with true concurrency authorizes breaker before CQ acquire', 
         LAST_ERROR_CODE: null,
       }]);
     }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
@@ -876,7 +936,7 @@ test('breaker_only with true concurrency authorizes breaker before CQ acquire', 
       'breaker-snapshot',
       'breaker-authorize',
       'concurrency-acquire',
-      'origin-fetch',
+      'concurrency-claim',
     ]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1031,6 +1091,7 @@ test('breaker_only with true concurrency settles granted attempt before auth ref
         leaseId: 'lease-breaker-refresh',
         leaseToken: 'token-breaker-refresh',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-breaker-refresh',
       });
     }
 
@@ -1053,6 +1114,10 @@ test('breaker_only with true concurrency settles granted attempt before auth ref
         LAST_ERROR_CODE: 429,
       }]);
     }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
@@ -1073,6 +1138,7 @@ test('breaker_only with true concurrency settles granted attempt before auth ref
       'breaker-snapshot',
       'breaker-authorize',
       'concurrency-acquire',
+      'concurrency-claim',
       'origin-fetch-401',
       'breaker-settle',
       'link-api',
@@ -1256,6 +1322,457 @@ test('breaker_only with true concurrency settles granted attempt on client-abort
     assert.equal(settleBodies.length, 1);
     assert.equal(settleBodies[0].p_attempt_version, 52);
     assert.equal(settleBodies[0].p_attempt_ticket, 9);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency settles authorized attempt before CQ wait continuation', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const settleBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 71,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('authorize-breaker-attempt');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 72,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 11,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
+      if (!body.waitToken) {
+        return createJsonResponse({
+          result: 'wait',
+          waitToken: 'breaker-only-wait-token',
+          scope: 'host',
+          retryAfter: 1,
+        });
+      }
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-breaker-only-wait',
+        leaseToken: 'token-breaker-only-wait',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-breaker-only-wait',
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('settle-breaker-attempt');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 72,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('wait-ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      calls.push('breaker-report');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 73,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    assert.equal(await response.text(), 'wait-ok');
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(calls.slice(0, 4), [
+      'authorize-breaker-attempt',
+      'concurrency-acquire-fast',
+      'settle-breaker-attempt',
+      'concurrency-acquire-continue',
+    ]);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 72);
+    assert.equal(settleBodies[0].p_attempt_ticket, 11);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency settles authorized attempt before terminal CQ response', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const settleBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 81,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('authorize-breaker-attempt');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 82,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 12,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      return createJsonResponse({ result: 'expired', reason: 'hard_expired' }, { status: 410 });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('settle-breaker-attempt');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 82,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      throw new Error('origin fetch should not run after terminal CQ response');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), createTestContext().ctx);
+    const body = await readJson(response);
+    assert.equal(response.status, 401);
+    assert.equal(body.message, 'link expired');
+    assert.deepEqual(calls, [
+      'authorize-breaker-attempt',
+      'concurrency-acquire-fast',
+      'settle-breaker-attempt',
+    ]);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 82);
+    assert.equal(settleBodies[0].p_attempt_ticket, 12);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency settles authorized attempt before acquire failure cleanup', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalRandomUUID = crypto.randomUUID;
+  const calls = [];
+  const settleBodies = [];
+  let acquireBody = null;
+  let cancelBody = null;
+
+  crypto.randomUUID = () => 'req-breaker-only-acquire-failure';
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 91,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('authorize-breaker-attempt');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 92,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 13,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      acquireBody = JSON.parse(init.body);
+      throw new TypeError('fetch failed');
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('settle-breaker-attempt');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 92,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
+      calls.push('concurrency-cancel');
+      cancelBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'cancelled' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      throw new Error('origin fetch should not run after acquire failure');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.match(body.message, /true concurrency unavailable/i);
+    assert.deepEqual(calls, [
+      'authorize-breaker-attempt',
+      'concurrency-acquire-fast',
+      'settle-breaker-attempt',
+      'concurrency-cancel',
+    ]);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 92);
+    assert.equal(settleBodies[0].p_attempt_ticket, 13);
+    assert.equal(cancelBody?.requestId, acquireBody?.requestId);
+    assert.equal(cancelBody?.hostname, acquireBody?.hostname);
+  } finally {
+    globalThis.fetch = originalFetch;
+    crypto.randomUUID = originalRandomUUID;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency settles authorized attempt after claim transport failure before returning', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const settleBodies = [];
+  let releaseBody = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 101,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 102,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 14,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-breaker-only-claim-fail',
+        leaseToken: 'token-breaker-only-claim-fail',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-breaker-only-claim-fail',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      throw new Error('claim transport failed');
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 102,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('should-not-fetch', { status: 200 });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.deepEqual(calls, [
+      'breaker-snapshot',
+      'breaker-authorize',
+      'concurrency-acquire-fast',
+      'concurrency-claim',
+      'concurrency-release',
+      'breaker-settle',
+    ]);
+    assert.equal(releaseBody.leaseToken, 'token-breaker-only-claim-fail');
+    assert.equal(releaseBody.reason, 'acquire_delivery_failed');
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 102);
+    assert.equal(settleBodies[0].p_attempt_ticket, 14);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -1497,6 +2014,7 @@ test('true concurrency malformed acquire response still triggers best-effort can
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-cancel']);
     assert.equal(cancelBody?.requestId, acquireBody?.requestId);
+    assert.equal(cancelBody?.hostname, acquireBody?.hostname);
     assert.equal(cancelBody?.hostnameHash, acquireBody?.hostnameHash);
     assert.equal(cancelBody?.siteBucket, acquireBody?.siteBucket);
     assert.equal(cancelBody?.ipBucket, acquireBody?.ipBucket);
@@ -1565,6 +2083,7 @@ test('true concurrency acquire fetch rejection after dispatch still triggers bes
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-cancel']);
     assert.equal(cancelBody?.requestId, acquireBody?.requestId);
+    assert.equal(cancelBody?.hostname, acquireBody?.hostname);
     assert.equal(cancelBody?.hostnameHash, acquireBody?.hostnameHash);
     assert.equal(cancelBody?.siteBucket, acquireBody?.siteBucket);
     assert.equal(cancelBody?.ipBucket, acquireBody?.ipBucket);
@@ -1633,6 +2152,7 @@ test('true concurrency non-200 acquire response after dispatch still triggers be
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-cancel']);
     assert.equal(cancelBody?.requestId, acquireBody?.requestId);
+    assert.equal(cancelBody?.hostname, acquireBody?.hostname);
     assert.equal(cancelBody?.hostnameHash, acquireBody?.hostnameHash);
     assert.equal(cancelBody?.siteBucket, acquireBody?.siteBucket);
     assert.equal(cancelBody?.ipBucket, acquireBody?.ipBucket);
@@ -1685,6 +2205,7 @@ test('true concurrency only skips precheck and fairqueue', async () => {
         leaseId: 'lease-1',
         leaseToken: 'token-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
       });
     }
 
@@ -1694,6 +2215,10 @@ test('true concurrency only skips precheck and fairqueue', async () => {
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -1710,9 +2235,99 @@ test('true concurrency only skips precheck and fairqueue', async () => {
     assert.equal(response.status, 200);
     assert.equal(await response.text(), 'ok');
     await Promise.allSettled(waitUntilPromises);
-    assert.deepEqual(calls.slice(0, 2), ['concurrency-acquire', 'origin-fetch']);
+    assert.deepEqual(calls.slice(0, 3), ['concurrency-acquire', 'concurrency-claim', 'origin-fetch']);
     assert.equal(calls.includes('precheck'), false);
     assert.equal(calls.includes('fairqueue-acquire'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency claim failure releases acquired lease before origin fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let releaseBody = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+    }
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({ result: 'granted', leaseId: 'lease-claim-fail', leaseToken: 'token-claim-fail', expiresAtMs: body.hardExpireAtMs, claimToken: 'claim-token-fail' });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      throw new Error('claim transport failed');
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('should-not-fetch', { status: 200 });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-release']);
+    assert.equal(releaseBody.leaseToken, 'token-claim-fail');
+    assert.equal(releaseBody.reason, 'acquire_delivery_failed');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency claim terminal response does not fetch origin', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+    }
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({ result: 'granted', leaseId: 'lease-claim-terminal', leaseToken: 'token-claim-terminal', expiresAtMs: body.hardExpireAtMs, claimToken: 'claim-token-terminal' });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return new Response(JSON.stringify({ result: 'conflict', reason: 'grant_already_claimed' }), { status: 409, headers: { 'content-type': 'application/json' } });
+    }
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('should-not-fetch', { status: 200 });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim']);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -1753,6 +2368,9 @@ test('true concurrency only fast hard expiry returns link expired without fairqu
     if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
       calls.push('concurrency-cancel');
       throw new Error('cancel should not run for direct expired terminal response');
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -2025,6 +2643,9 @@ test('non-positive payloadSign expiry is rejected before admission handlers run'
     if (url === 'https://tenant.sharepoint.com/file') {
       throw new Error('origin fetch should not run for invalid payloadSign expiry');
     }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       throw new Error('concurrency release should not run for invalid payloadSign expiry');
@@ -2265,12 +2886,16 @@ test('true concurrency acquire success followed by origin fetch failure releases
         leaseId: 'lease-1',
         leaseToken: 'token-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
       });
     }
 
     if (url === 'https://tenant.sharepoint.com/file') {
       calls.push('origin-fetch');
       throw new Error('origin fetch failed before response delivery');
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -2352,6 +2977,7 @@ test('dual mode attempts early fairqueue release after origin headers and falls 
         leaseId: 'lease-1',
         leaseToken: 'token-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
       });
     }
 
@@ -2371,6 +2997,9 @@ test('dual mode attempts early fairqueue release after origin headers and falls 
         return new Response('fail once', { status: 500 });
       }
       return createJsonResponse({ result: 'ok' });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -2435,6 +3064,7 @@ test('true concurrency managed streaming releases after body completion and does
         leaseId: 'lease-1',
         leaseToken: 'token-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
       });
     }
 
@@ -2449,6 +3079,9 @@ test('true concurrency managed streaming releases after body completion and does
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -2504,6 +3137,7 @@ test('true concurrency managed streaming binds CQ cleanup to waitUntil for post-
         leaseId: 'lease-waituntil-1',
         leaseToken: 'token-waituntil-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-waituntil-1',
       });
     }
 
@@ -2516,6 +3150,9 @@ test('true concurrency managed streaming binds CQ cleanup to waitUntil for post-
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -2575,6 +3212,7 @@ test('true concurrency header-only response releases immediately', async () => {
         leaseId: 'lease-1',
         leaseToken: 'token-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
       });
     }
 
@@ -2583,6 +3221,9 @@ test('true concurrency header-only response releases immediately', async () => {
         status: 204,
         headers: { 'content-type': 'application/octet-stream' },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -2705,6 +3346,7 @@ test('true concurrency managed streaming releases on client abort', async () => 
         leaseId: 'lease-1',
         leaseToken: 'token-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
       });
     }
 
@@ -2715,6 +3357,9 @@ test('true concurrency managed streaming releases on client abort', async () => 
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -2784,6 +3429,9 @@ test('true concurrency acquire abort returns 499 client abort response', async (
       calls.push('origin-fetch');
       throw new Error('origin fetch should not run after acquire-stage client abort');
     }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
@@ -2847,6 +3495,7 @@ test('true concurrency managed streaming releases when client is already aborted
         leaseId: 'lease-1',
         leaseToken: 'token-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
       });
     }
 
@@ -2859,6 +3508,9 @@ test('true concurrency managed streaming releases when client is already aborted
       });
       abortController.abort();
       return response;
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -2893,9 +3545,36 @@ test('true concurrency managed streaming releases when client is already aborted
 
 test('true concurrency managed streaming releases on hard-expiry cutoff', async () => {
   const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
   let acquireCalled = false;
   let releaseCalled = false;
   let releaseBody = null;
+  let hardExpireAtMs = 0;
+  const timeoutCallbacks = [];
+  const { ctx, waitUntilPromises } = createTestContext();
+  let pulledResolve;
+  const pulledPromise = new Promise((resolve) => {
+    pulledResolve = resolve;
+  });
+
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay <= 2_000) {
+      const handle = { cleared: false };
+      timeoutCallbacks.push(() => {
+        if (!handle.cleared) callback(...args);
+      });
+      return handle;
+    }
+    return originalSetTimeout(callback, delay, ...args);
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (handle && typeof handle === 'object' && 'cleared' in handle) {
+      handle.cleared = true;
+      return;
+    }
+    originalClearTimeout(handle);
+  };
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -2919,20 +3598,37 @@ test('true concurrency managed streaming releases on hard-expiry cutoff', async 
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
       acquireCalled = true;
       const body = JSON.parse(init.body);
+      hardExpireAtMs = body.hardExpireAtMs;
       return createJsonResponse({
         result: 'granted',
         leaseId: 'lease-1',
         leaseToken: 'token-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
       });
     }
 
     if (url === 'https://tenant.sharepoint.com/file') {
+      let sentChunk = false;
       return new Response(new ReadableStream({
-        start() {},
+        pull(controller) {
+          if (!sentChunk) {
+            sentChunk = true;
+            controller.enqueue(new TextEncoder().encode('slow-body'));
+            pulledResolve();
+          }
+        },
       }), {
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-1',
+        leaseToken: 'token-1',
+        expiresAtMs: hardExpireAtMs,
       });
     }
 
@@ -2950,14 +3646,20 @@ test('true concurrency managed streaming releases on hard-expiry cutoff', async 
       expireOffsetSeconds: 1,
       payloadExpireTime: Math.floor(Date.now() / 1000) + 1,
     });
-    const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
+    const response = await worker.fetch(request, buildWorkerEnv(), ctx);
     const reader = response.body.getReader();
-    await new Promise((resolve) => setTimeout(resolve, 1300));
+    const firstRead = reader.read();
+    await pulledPromise;
+    await firstRead;
+    timeoutCallbacks.splice(0).forEach((callback) => callback());
     await assert.rejects(() => reader.read(), /aborted/i);
+    await Promise.allSettled(waitUntilPromises);
     assert.equal(releaseBody.reason, 'hard_expiry');
     assert.equal(acquireCalled, true);
     assert.equal(releaseCalled, true);
   } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
@@ -3014,6 +3716,7 @@ test('redirect to new target releases old lease and reruns target admission with
         leaseId: `lease-${requestIds.length}`,
         leaseToken: `token-${requestIds.length}`,
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: `claim-token-${requestIds.length}`,
       });
     }
 
@@ -3031,6 +3734,9 @@ test('redirect to new target releases old lease and reruns target admission with
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -3119,12 +3825,16 @@ test('same-host redirect still rotates admission state and reacquires with a new
         leaseId: `lease-${concurrencyRequestIds.length}`,
         leaseToken: `token-${concurrencyRequestIds.length}`,
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: `claim-token-${concurrencyRequestIds.length}`,
       });
     }
 
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       fairQueueReleaseBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'ok' });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -3230,12 +3940,16 @@ test('relative redirect resolves to an absolute upstream target before target pr
         leaseId: `lease-relative-${concurrencyRequestIds.length}`,
         leaseToken: `token-relative-${concurrencyRequestIds.length}`,
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: `claim-token-relative-${concurrencyRequestIds.length}`,
       });
     }
 
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       fairQueueReleaseBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'ok' });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -3348,6 +4062,7 @@ test('same-origin worker redirect releases old admission state before recursion'
         leaseId: `lease-recursive-${concurrencyAcquireCount}`,
         leaseToken: `token-recursive-${concurrencyAcquireCount}`,
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: `claim-token-recursive-${concurrencyAcquireCount}`,
       });
     }
 
@@ -3355,6 +4070,9 @@ test('same-origin worker redirect releases old admission state before recursion'
       const body = JSON.parse(init.body);
       calls.push(`fairqueue-release:${body.slotToken}`);
       return createJsonResponse({ result: 'ok' });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -3456,6 +4174,7 @@ test('queue_only fast wait releases unused fairqueue grant before continue-wait 
         leaseId: 'lease-wait-1',
         leaseToken: 'token-wait-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-wait-1',
       });
     }
 
@@ -3471,6 +4190,9 @@ test('queue_only fast wait releases unused fairqueue grant before continue-wait 
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -3565,6 +4287,7 @@ test('queue_only replays acquire after continue-wait timeout abort and recovers 
         leaseId: 'lease-replay-1',
         leaseToken: 'token-replay-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-replay-1',
       });
     }
 
@@ -3579,6 +4302,9 @@ test('queue_only replays acquire after continue-wait timeout abort and recovers 
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -3774,6 +4500,9 @@ test('queue_only wait hard expiry cancels CQ request after unused fairqueue rele
       cancelBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'cancelled' });
     }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
@@ -3883,6 +4612,287 @@ test('Google Drive HEAD requests use GET range probe and expose resumable header
   }
 });
 
+test('Google Drive HEAD range probes fail safely and cancel body when upstream returns 200', async () => {
+  const originalFetch = globalThis.fetch;
+  const originBody = createTrackedTextBody('unsafe-head-body');
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      assert.equal(method, 'GET');
+      assert.equal(headers.get('range'), 'bytes=0-0');
+      return new Response(originBody.stream, {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '16',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest();
+    const request = new Request(baseRequest.url, {
+      method: 'HEAD',
+      headers: baseRequest.headers,
+    });
+
+    const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
+    assert.notEqual(response.status, 200);
+    assert.equal(await response.text(), JSON.stringify({
+      code: 502,
+      message: 'Google Drive HEAD probe invalid',
+    }));
+    assert.equal(originBody.cancelled, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive HEAD range probes fail safely and cancel body when Content-Range is missing', async () => {
+  const originalFetch = globalThis.fetch;
+  const originBody = createTrackedTextBody('unsafe-head-body');
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      return new Response(originBody.stream, {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '1',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest();
+    const request = new Request(baseRequest.url, {
+      method: 'HEAD',
+      headers: baseRequest.headers,
+    });
+
+    const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
+    assert.notEqual(response.status, 200);
+    assert.equal(await response.text(), JSON.stringify({
+      code: 502,
+      message: 'Google Drive HEAD probe invalid',
+    }));
+    assert.equal(originBody.cancelled, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive HEAD range probes fail safely and cancel body when Content-Range total is invalid', async () => {
+  const originalFetch = globalThis.fetch;
+  const originBody = createTrackedTextBody('unsafe-head-body');
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      return new Response(originBody.stream, {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '1',
+          'content-range': 'bytes 0-0/*',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest();
+    const request = new Request(baseRequest.url, {
+      method: 'HEAD',
+      headers: baseRequest.headers,
+    });
+
+    const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
+    assert.notEqual(response.status, 200);
+    assert.equal(await response.text(), JSON.stringify({
+      code: 502,
+      message: 'Google Drive HEAD probe invalid',
+    }));
+    assert.equal(originBody.cancelled, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive HEAD probe failure waits for in-flight fairqueue header release before terminal cleanup', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const releaseBodies = [];
+  let releaseStarted = null;
+  let finishHeaderRelease = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+        trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-invalid-head',
+        invocationEpoch: 1,
+        slotToken: 'slot-invalid-head',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-invalid-head',
+        leaseToken: 'token-invalid-head',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-invalid-head',
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      calls.push('origin-fetch');
+      assert.equal(method, 'GET');
+      assert.equal(headers.get('range'), 'bytes=0-0');
+      return new Response('unsafe-head-body', {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '16',
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      releaseBodies.push(JSON.parse(init.body));
+      releaseStarted?.();
+      await new Promise((resolve) => {
+        finishHeaderRelease = resolve;
+      });
+      return createJsonResponse({ result: 'ok' });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest();
+    const request = new Request(baseRequest.url, {
+      method: 'HEAD',
+      headers: baseRequest.headers,
+    });
+    const { ctx, waitUntilPromises } = createTestContext();
+    const responsePromise = worker.fetch(request, buildWorkerEnv(), ctx);
+    await new Promise((resolve) => {
+      releaseStarted = resolve;
+    });
+
+    assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
+
+    finishHeaderRelease();
+    const response = await responsePromise;
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 502);
+    assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
+    assert.equal(releaseBodies.length, 1);
+    assert.equal(releaseBodies[0].slotToken, 'slot-invalid-head');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('Non-Google-Drive HEAD requests are forwarded without range probe rewrite', async () => {
   const originalFetch = globalThis.fetch;
   const originCalls = [];
@@ -3933,6 +4943,61 @@ test('Non-Google-Drive HEAD requests are forwarded without range probe rewrite',
     assert.equal(response.headers.get('accept-ranges'), 'bytes');
     assert.equal(response.headers.get('content-length'), '123');
     assert.deepEqual(originCalls, [{ method: 'HEAD', range: null }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('generic Worker-created responses strip invalid content-length and transfer-encoding while preserving the body', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
+      originCalls.push({ method, range: headers.get('range') });
+      return new Response('download-body', {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '13junk',
+          'transfer-encoding': 'chunked',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-length'), null);
+    assert.equal(response.headers.get('transfer-encoding'), null);
+    assert.equal(await response.text(), 'download-body');
+    assert.deepEqual(originCalls, [{ method: 'GET', range: null }]);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -3991,6 +5056,61 @@ test('Google Drive GET downloads prefer payload filesize for full-range translat
     assert.equal(response.headers.get('content-type'), 'application/octet-stream');
     assert.equal(await response.text(), 'download-body');
     assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive synthetic full-download responses strip transfer-encoding and preserve content-length', async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+          filesize: 13,
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      assert.equal(headers.get('range'), 'bytes=0-12');
+      return new Response('download-body', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '13',
+          'content-range': 'bytes 0-12/13',
+          'transfer-encoding': 'chunked',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('transfer-encoding'), null);
+    assert.equal(response.headers.get('content-length'), '13');
+    assert.equal(await response.text(), 'download-body');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -4127,6 +5247,8 @@ test('Google Drive GET downloads without payload filesize probe HEAD first and r
 test('Google Drive GET downloads without payload filesize fall back to a 0-0 range probe when HEAD does not expose content-length', async () => {
   const originalFetch = globalThis.fetch;
   const originCalls = [];
+  const headProbeBody = createTrackedTextBody('head-probe-body');
+  const rangeProbeBody = createTrackedTextBody('range-probe-body');
 
   globalThis.fetch = async (input, init = {}) => {
     const request = input instanceof Request ? input : new Request(input, init);
@@ -4149,7 +5271,7 @@ test('Google Drive GET downloads without payload filesize fall back to a 0-0 ran
     if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
       originCalls.push({ method, range: headers.get('range') });
       if (method === 'HEAD') {
-        return new Response(null, {
+        return new Response(headProbeBody.stream, {
           status: 200,
           headers: {
             'content-type': 'application/octet-stream',
@@ -4157,7 +5279,7 @@ test('Google Drive GET downloads without payload filesize fall back to a 0-0 ran
         });
       }
       if (headers.get('range') === 'bytes=0-0') {
-        return new Response('x', {
+        return new Response(rangeProbeBody.stream, {
           status: 206,
           headers: {
             'content-type': 'application/octet-stream',
@@ -4197,6 +5319,8 @@ test('Google Drive GET downloads without payload filesize fall back to a 0-0 ran
       { method: 'GET', range: 'bytes=0-0' },
       { method: 'GET', range: 'bytes=0-12' },
     ]);
+    assert.equal(headProbeBody.cancelled, true);
+    assert.equal(rangeProbeBody.cancelled, true);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -4249,11 +5373,180 @@ test('Google Drive GET downloads do not rewrite partial 206 responses that do no
       createTestContext().ctx,
     );
 
-    assert.equal(response.status, 206);
-    assert.equal(response.headers.get('content-range'), 'bytes 1-12/13');
-    assert.equal(response.headers.get('content-length'), '12');
-    assert.equal(await response.text(), 'partial-body');
+    assert.notEqual(response.status, 206);
+    assert.notEqual(await response.text(), 'partial-body');
     assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive GET downloads reject synthetic full-range 206 responses with mismatched totals', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+  const originBody = createTrackedTextBody('partial-body');
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+          filesize: 13,
+        },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      originCalls.push({ method, range: headers.get('range') });
+      return new Response(originBody.stream, {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="download.bin"',
+          'content-length': '13',
+          'content-range': 'bytes 0-12/20',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest({ payloadFileSize: 13 }),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.notEqual(response.status, 206);
+    assert.notEqual(await response.text(), 'partial-body');
+    assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
+    assert.equal(originBody.cancelled, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google Drive full-range mismatch waits for in-flight fairqueue header release before terminal cleanup', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const releaseBodies = [];
+  let releaseStarted = null;
+  let finishHeaderRelease = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+        trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+          filesize: 13,
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-range-mismatch',
+        invocationEpoch: 1,
+        slotToken: 'slot-range-mismatch',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-range-mismatch',
+        leaseToken: 'token-range-mismatch',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-range-mismatch',
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      calls.push('origin-fetch');
+      assert.equal(method, 'GET');
+      assert.equal(headers.get('range'), 'bytes=0-12');
+      return new Response('partial-body', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '13',
+          'content-range': 'bytes 0-12/20',
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      releaseBodies.push(JSON.parse(init.body));
+      releaseStarted?.();
+      await new Promise((resolve) => {
+        finishHeaderRelease = resolve;
+      });
+      return createJsonResponse({ result: 'ok' });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const responsePromise = worker.fetch(
+      await buildSignedWorkerRequest({ payloadFileSize: 13 }),
+      buildWorkerEnv(),
+      ctx,
+    );
+    await new Promise((resolve) => {
+      releaseStarted = resolve;
+    });
+
+    assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
+
+    finishHeaderRelease();
+    const response = await responsePromise;
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 502);
+    assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
+    assert.equal(releaseBodies.length, 1);
+    assert.equal(releaseBodies[0].slotToken, 'slot-range-mismatch');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -4368,6 +5661,7 @@ test('true concurrency known-length downloads use FixedLengthStream to preserve 
         leaseId: 'lease-fixed-length',
         leaseToken: 'token-fixed-length',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-fixed-length',
       });
     }
 
@@ -4381,6 +5675,9 @@ test('true concurrency known-length downloads use FixedLengthStream to preserve 
           'content-length': '13',
         },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -4406,6 +5703,95 @@ test('true concurrency known-length downloads use FixedLengthStream to preserve 
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls, ['concurrency-acquire', 'origin-fetch', 'concurrency-release']);
     assert.deepEqual(fixedLengthCalls, [13]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.FixedLengthStream = originalFixedLengthStream;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency managed streaming strips transfer-encoding and preserves content-length', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalFixedLengthStream = globalThis.FixedLengthStream;
+  const calls = [];
+
+  globalThis.FixedLengthStream = class FakeFixedLengthStream {
+    constructor() {
+      const inner = new TransformStream();
+      this.writable = inner.writable;
+      this.readable = inner.readable;
+    }
+  };
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-hop-by-hop',
+        leaseToken: 'token-hop-by-hop',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-hop-by-hop',
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('managed-stream', {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '14',
+          'transfer-encoding': 'chunked',
+        },
+      });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('transfer-encoding'), null);
+    assert.equal(response.headers.get('content-length'), '14');
+    assert.equal(await response.text(), 'managed-stream');
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(calls, ['concurrency-acquire', 'origin-fetch', 'concurrency-release']);
   } finally {
     globalThis.fetch = originalFetch;
     globalThis.FixedLengthStream = originalFixedLengthStream;
@@ -4456,6 +5842,7 @@ test('true concurrency malformed content-length falls back to generic managed st
         leaseId: 'lease-invalid-length',
         leaseToken: 'token-invalid-length',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-invalid-length',
       });
     }
 
@@ -4469,6 +5856,9 @@ test('true concurrency malformed content-length falls back to generic managed st
           'content-length': '13junk',
         },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -4488,6 +5878,7 @@ test('true concurrency malformed content-length falls back to generic managed st
     );
 
     assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-length'), null);
     assert.equal(await response.text(), 'download-body');
     await new Promise((resolve) => setTimeout(resolve, 0));
     await Promise.allSettled(waitUntilPromises);
@@ -4545,6 +5936,7 @@ test('true concurrency rewrites exact Google full-file 206 responses into fixed-
         leaseId: 'lease-rewrite-length',
         leaseToken: 'token-rewrite-length',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-rewrite-length',
       });
     }
 
@@ -4560,6 +5952,9 @@ test('true concurrency rewrites exact Google full-file 206 responses into fixed-
           'content-range': 'bytes 0-12/13',
         },
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -4682,6 +6077,7 @@ test('modes-only siteBucket payload derives one stable Google Drive site bucket 
     'https://drive.google.com/uc?id=test-file&export=download',
     'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
     'https://lh3.googleusercontent.com/test-file',
+    'https://drive.usercontent.google.com/download?id=test-file',
   ];
 
   for (const targetUrl of googleDriveUrls) {
@@ -4751,7 +6147,7 @@ test('SharePoint site bucket derivation keeps /personal, /sites, and /teams iden
 });
 
 test('disabled googledrive mode falls back to host-derived site bucket without throwing', async () => {
-  const expectedSiteBucket = await hashSiteKey('host:drive.google.com');
+  const expectedSiteBucket = await hashSiteKey('unknown');
 
   const result = await captureAdmissionPayloads({
     targetUrl: 'https://drive.google.com/uc?id=test-file&export=download',
@@ -4767,10 +6163,55 @@ test('disabled googledrive mode falls back to host-derived site bucket without t
   assert.equal(result.concurrencyAcquireBody?.siteBucket, expectedSiteBucket);
 });
 
-test('breaker authority collapses recognized Google Drive hosts into the logical google bucket', async () => {
+test('host siteBucket fallback derives plain host bucket when provider modes do not match', async () => {
+  const result = await captureAdmissionPayloads({
+    targetUrl: 'https://files.example.com/download.bin',
+    fairQueueHostPatterns: ['*.example.com'],
+    fairQueueSiteBucket: { modes: ['host', 'sharepoint'] },
+    trueConcurrencyHostPatterns: ['*.example.com'],
+    trueConcurrencySiteBucket: { modes: ['host', 'sharepoint'] },
+  });
+
+  const expectedSiteBucket = await hashSiteKey('host:files.example.com');
+  assert.equal(result.status, 200);
+  assert.equal(result.fairQueueAcquireBody?.siteBucket, expectedSiteBucket);
+  assert.equal(result.concurrencyAcquireBody?.siteBucket, expectedSiteBucket);
+});
+
+test('actual host admission payloads are preserved across Google host families', async () => {
+  const googleFamilyHosts = [
+    'www.googleapis.com',
+    'drive.google.com',
+    'content.googleapis.com',
+    'lh3.googleusercontent.com',
+    'drive.usercontent.google.com',
+  ];
+
+  for (const host of googleFamilyHosts) {
+    const result = await captureAdmissionPayloads({
+      targetUrl: `https://${host}/download.bin`,
+      fairQueueHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      fairQueueSiteBucket: { modes: ['googledrive'] },
+      trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      trueConcurrencySiteBucket: { modes: ['googledrive'] },
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.fairQueueAcquireBody?.hostname, host);
+    assert.equal(result.fairQueueAcquireBody?.hostnameHash, await sha256Hash(host));
+    assert.equal(result.concurrencyAcquireBody?.hostname, host);
+    assert.equal(result.concurrencyAcquireBody?.hostnameHash, await sha256Hash(host));
+    assert.notEqual(result.fairQueueAcquireBody?.hostnameHash, await sha256Hash('google'));
+    assert.notEqual(result.concurrencyAcquireBody?.hostnameHash, await sha256Hash('google'));
+  }
+});
+
+test('breaker authority uses actual Google Drive hostnames', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const googleAuthorityHash = await sha256Hash('google');
+  const driveHostHash = await sha256Hash('drive.google.com');
+  const googleApiHostHash = await sha256Hash('www.googleapis.com');
   const snapshotHashes = [];
   const authorizeBodies = [];
   const reportBodies = [];
@@ -4834,7 +6275,11 @@ test('breaker authority collapses recognized Google Drive hosts into the logical
         leaseId: `lease-google-${concurrencyBodies.length}`,
         leaseToken: `token-google-${concurrencyBodies.length}`,
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: `claim-token-google-${concurrencyBodies.length}`,
       });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -4900,34 +6345,44 @@ test('breaker authority collapses recognized Google Drive hosts into the logical
       secondCtx.ctx,
     );
     waitUntilPromises.push(...secondCtx.waitUntilPromises);
-    assert.equal(secondResponse.status, 429);
+    assert.equal(secondResponse.status, 200);
     await secondResponse.text();
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.deepEqual(snapshotHashes, [googleAuthorityHash, googleAuthorityHash]);
-    assert.deepEqual(authorizeBodies.map((body) => body.p_hostname), ['google']);
+    assert.deepEqual(snapshotHashes, [driveHostHash, googleApiHostHash]);
+    assert.notDeepEqual(snapshotHashes, [googleAuthorityHash, googleAuthorityHash]);
+    assert.deepEqual(authorizeBodies.map((body) => body.p_hostname), ['drive.google.com', 'www.googleapis.com']);
     assert.deepEqual(
       reportBodies.map((body) => ({
         hostname: body.p_hostname,
         hostnameHash: body.p_hostname_hash,
         statusCode: body.p_status_code,
       })),
-      [{
-        hostname: 'google',
-        hostnameHash: googleAuthorityHash,
-        statusCode: 429,
-      }],
+      [
+        {
+          hostname: 'drive.google.com',
+          hostnameHash: driveHostHash,
+          statusCode: 429,
+        },
+        {
+          hostname: 'www.googleapis.com',
+          hostnameHash: googleApiHostHash,
+          statusCode: 200,
+        },
+      ],
     );
-    assert.equal(concurrencyBodies.length, 1);
-    assert.deepEqual(originHosts, ['drive.google.com']);
+    assert.notEqual(reportBodies[0].p_hostname_hash, googleAuthorityHash);
+    assert.notEqual(reportBodies[1].p_hostname_hash, googleAuthorityHash);
+    assert.equal(concurrencyBodies.length, 2);
+    assert.deepEqual(originHosts, ['drive.google.com', 'www.googleapis.com']);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('recognized Google host overload suppresses other Google Drive host-family acquires', async () => {
+test('recognized Google host overload stays scoped to actual host authority', async () => {
   clearOverloadedByHost();
 
   const client = createSlotHandlerClient({
@@ -4977,15 +6432,15 @@ test('recognized Google host overload suppresses other Google Drive host-family 
     assert.equal(first.kind, 'timeout');
 
     const second = await client.waitForSlot({}, googleApisContext);
-    assert.equal(second.kind, 'timeout');
-    assert.equal(fetchCalls, 1);
+    assert.equal(second.kind, 'granted');
+    assert.equal(fetchCalls, 2);
   } finally {
     globalThis.fetch = originalFetch;
     clearOverloadedByHost();
   }
 });
 
-test('final cleanup groups recognized Google Drive hosts into one logical Google bucket instead of unknown', () => {
+test('final cleanup groups recognized Google Drive hosts by actual host authority', () => {
   const cleanupGroups = buildFinalCleanupGroups([
     {
       hostname: 'drive.google.com',
@@ -5013,11 +6468,13 @@ test('final cleanup groups recognized Google Drive hosts into one logical Google
     },
   ]);
 
-  assert.equal(cleanupGroups.length, 2);
+  assert.equal(cleanupGroups.length, 4);
   assert.deepEqual(
     cleanupGroups.map((group) => group.map((context) => context.queryToken)),
     [
-      ['google-drive-query', 'google-api-query', 'googleusercontent-query'],
+      ['google-drive-query'],
+      ['google-api-query'],
+      ['googleusercontent-query'],
       ['unknown-query'],
     ],
   );

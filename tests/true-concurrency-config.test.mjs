@@ -98,6 +98,62 @@ test('resolveConfig requires true concurrency hostPatterns handlerUrl and handle
   );
 });
 
+test('resolveConfig accepts host site bucket mode', () => {
+  const config = resolveConfig({}, buildBootstrap({
+    enabled: true,
+    hostPatterns: ['*.example.com'],
+    handlerUrl: 'https://cq.example.test',
+    handlerAuthKey: 'cq-secret',
+    siteBucket: { mode: 'host' },
+  }), { download: {} });
+
+  assert.deepEqual(config.trueConcurrencySiteBucket, {
+    mode: 'host',
+    modes: ['host'],
+  });
+});
+
+test('resolveConfig normalizes true concurrency site bucket modes with precedence and fallback', () => {
+  const modesWin = resolveConfig({}, buildBootstrap({
+    enabled: true,
+    hostPatterns: ['*.example.com'],
+    handlerUrl: 'https://cq.example.test',
+    handlerAuthKey: 'cq-secret',
+    siteBucket: { mode: 'googledrive', modes: ['', 'host', 'host', 'sharepoint'] },
+  }), { download: {} });
+
+  assert.deepEqual(modesWin.trueConcurrencySiteBucket, {
+    mode: 'host',
+    modes: ['host', 'sharepoint'],
+  });
+
+  const emptyModesFallback = resolveConfig({}, buildBootstrap({
+    enabled: true,
+    hostPatterns: ['*.example.com'],
+    handlerUrl: 'https://cq.example.test',
+    handlerAuthKey: 'cq-secret',
+    siteBucket: { mode: 'googledrive', modes: ['', '   '] },
+  }), { download: {} });
+
+  assert.deepEqual(emptyModesFallback.trueConcurrencySiteBucket, {
+    mode: 'googledrive',
+    modes: ['googledrive'],
+  });
+
+  const defaultModes = resolveConfig({}, buildBootstrap({
+    enabled: true,
+    hostPatterns: ['*.example.com'],
+    handlerUrl: 'https://cq.example.test',
+    handlerAuthKey: 'cq-secret',
+    siteBucket: {},
+  }), { download: {} });
+
+  assert.deepEqual(defaultModes.trueConcurrencySiteBucket, {
+    mode: 'sharepoint',
+    modes: ['sharepoint'],
+  });
+});
+
 test('resolveConfig rejects unsupported true concurrency site bucket modes', () => {
   assert.throws(
     () => resolveConfig({}, buildBootstrap({
@@ -105,9 +161,9 @@ test('resolveConfig rejects unsupported true concurrency site bucket modes', () 
       hostPatterns: ['*.sharepoint.com'],
       handlerUrl: 'https://cq.example.test',
       handlerAuthKey: 'cq-secret',
-      siteBucket: { mode: 'host' },
+      siteBucket: { modes: ['sharepoint', 'other'] },
     }), { download: {} }),
-    /unsupported siteBucket mode host/
+    /unsupported siteBucket mode other/
   );
 });
 
@@ -189,6 +245,7 @@ test('concurrency client normalizes granted acquire responses', async () => {
       leaseId: 'lease-1',
       leaseToken: 'token-1',
       expiresAtMs: 4999,
+      claimToken: 'claim-token-1',
     }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -219,6 +276,7 @@ test('concurrency client normalizes granted acquire responses', async () => {
       leaseId: 'lease-1',
       leaseToken: 'token-1',
       expiresAtMs: 4999,
+      claimToken: 'claim-token-1',
     });
   } finally {
     globalThis.fetch = originalFetch;
@@ -373,6 +431,7 @@ test('concurrency client rejects acquire granted payloads beyond hard expiry', a
     leaseId: 'lease-1',
     leaseToken: 'token-1',
     expiresAtMs: 5001,
+    claimToken: 'claim-token-1',
   }), {
     status: 200,
     headers: { 'content-type': 'application/json' },
@@ -584,6 +643,7 @@ test('concurrency client normalizes wait responses and forwards waitToken on con
       leaseId: 'lease-1',
       leaseToken: 'token-1',
       expiresAtMs: 5000,
+      claimToken: 'claim-token-1',
     }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -630,6 +690,7 @@ test('concurrency client normalizes wait responses and forwards waitToken on con
       leaseId: 'lease-1',
       leaseToken: 'token-1',
       expiresAtMs: 5000,
+      claimToken: 'claim-token-1',
     });
 
     assert.equal(Object.hasOwn(seenBodies[0], 'waitToken'), false);
@@ -649,6 +710,7 @@ test('concurrency client sends cancel payload and parses cancelled results', asy
     assert.equal(init.headers['X-CQ-Auth'], 'cq-secret');
     assert.deepEqual(JSON.parse(init.body), {
       requestId: 'req-1',
+      hostname: 'tenant.sharepoint.com',
       hostnameHash: 'host-hash',
       siteBucket: 'site-hash',
       ipBucket: 'ip-hash',
@@ -673,6 +735,7 @@ test('concurrency client sends cancel payload and parses cancelled results', asy
 
     const result = await client.cancel(null, {
       requestId: 'req-1',
+      hostname: 'tenant.sharepoint.com',
       hostnameHash: 'host-hash',
       siteBucket: 'site-hash',
       ipBucket: 'ip-hash',

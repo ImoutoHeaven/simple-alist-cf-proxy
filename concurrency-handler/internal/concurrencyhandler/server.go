@@ -23,6 +23,7 @@ import (
 
 const (
 	acquirePath = "/api/v1/concurrency/acquire"
+	claimPath   = "/api/v1/concurrency/claim"
 	releasePath = "/api/v1/concurrency/release"
 	cancelPath  = "/api/v1/concurrency/cancel"
 )
@@ -190,6 +191,7 @@ func (s *Server) Close() error {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc(acquirePath, s.handleAcquire)
+	s.mux.HandleFunc(claimPath, s.handleClaim)
 	s.mux.HandleFunc(releasePath, s.handleRelease)
 	s.mux.HandleFunc(cancelPath, s.handleCancel)
 }
@@ -431,9 +433,6 @@ func (s *Server) defaultSweepTargetSource(ctx context.Context, nowMs int64, batc
 }
 
 func (s *Server) checkAuth(r *http.Request) (bool, int) {
-	if !s.cfg.Auth.Enabled {
-		return true, 0
-	}
 	headerValue := strings.TrimSpace(r.Header.Get(s.cfg.Auth.Header))
 	if headerValue == "" {
 		return false, http.StatusUnauthorized
@@ -461,6 +460,32 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+func writeJSONTracked(w http.ResponseWriter, status int, body any) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	return json.NewEncoder(w).Encode(body)
+}
+
+type deliveryTrackingResponseWriter struct {
+	http.ResponseWriter
+	wrote bool
+	err   error
+}
+
+func (w *deliveryTrackingResponseWriter) WriteHeader(status int) {
+	w.wrote = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *deliveryTrackingResponseWriter) Write(data []byte) (int, error) {
+	w.wrote = true
+	n, err := w.ResponseWriter.Write(data)
+	if err != nil {
+		w.err = err
+	}
+	return n, err
 }
 
 func (s *Server) observabilitySnapshot() map[string]int {
@@ -537,6 +562,9 @@ func (s *Server) recordAcquireOutcome(req AcquireRequest, result *AcquireResult)
 				s.recordObservability(observabilityAcquireFastWait, "request_id="+requestID, "wait_token="+strings.TrimSpace(result.WaitToken))
 			}
 			s.waitingRuntime.markWaitTokenObserved(result.WaitToken)
+		case "conflict":
+			s.recordAcquireConflict(result.Reason, req)
+			s.clearActiveReplayState(requestID)
 		case "expired":
 			s.recordAcquireTerminalObservability(result, requestID)
 		}
@@ -551,6 +579,9 @@ func (s *Server) recordAcquireOutcome(req AcquireRequest, result *AcquireResult)
 	case "wait":
 		s.recordObservability(observabilityContinueWaitAttached, "request_id="+requestID, "wait_token="+strings.TrimSpace(result.WaitToken))
 		s.waitingRuntime.markWaitTokenObserved(result.WaitToken)
+	case "conflict":
+		s.recordAcquireConflict(result.Reason, req)
+		s.clearActiveReplayState(requestID)
 	case "expired":
 		s.recordAcquireTerminalObservability(result, requestID)
 	}
@@ -561,6 +592,10 @@ func writeAcquireConflict(w http.ResponseWriter, reason string) {
 		"result": "conflict",
 		"reason": reason,
 	})
+}
+
+func writeClaimConflict(w http.ResponseWriter, reason string) {
+	writeJSON(w, http.StatusConflict, &ClaimGrantResult{Result: "conflict", Reason: reason})
 }
 
 func writeCancelConflict(w http.ResponseWriter, reason string) {
@@ -574,6 +609,21 @@ func acquireResultStatus(result string) (int, bool) {
 	switch result {
 	case "granted", "wait":
 		return http.StatusOK, true
+	case "conflict":
+		return http.StatusConflict, true
+	case "released", "cancelled", "expired":
+		return http.StatusGone, true
+	default:
+		return 0, false
+	}
+}
+
+func claimGrantResultStatus(result string) (int, bool) {
+	switch result {
+	case "granted":
+		return http.StatusOK, true
+	case "conflict":
+		return http.StatusConflict, true
 	case "released", "cancelled", "expired":
 		return http.StatusGone, true
 	default:
@@ -625,6 +675,9 @@ func validateReleaseRequest(req ReleaseRequest) error {
 func validateCancelRequest(req CancelRequest) error {
 	if strings.TrimSpace(req.RequestID) == "" {
 		return errors.New("requestId is required")
+	}
+	if strings.TrimSpace(req.Hostname) == "" {
+		return errors.New("hostname is required")
 	}
 	if strings.TrimSpace(req.HostnameHash) == "" {
 		return errors.New("hostnameHash is required")
@@ -683,6 +736,10 @@ func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 				return
 			}
+			if err := validateAcquireResult(req, probeResult); err != nil {
+				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			if probeResult.Result != "wait" {
 				s.recordAcquireOutcome(req, probeResult)
 				status, ok := acquireResultStatus(probeResult.Result)
@@ -701,7 +758,7 @@ func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 			writeAcquireConflict(w, acquireConflictReasonWaiterAlreadyAttached)
 			return
 		}
-		defer s.waitingRuntime.release(attachedWaiter)
+		defer s.releaseAttachedWaiter(attachedWaiter, req)
 	}
 	result, err := s.backend.Acquire(r.Context(), req)
 	if err != nil {
@@ -715,6 +772,10 @@ func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if result == nil {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err := validateAcquireResult(req, result); err != nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -733,12 +794,7 @@ func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		s.runHostPass(r.Context(), req.HostnameHash)
 		s.wakeHostReactor(req.HostnameHash)
 		if promoted := consumeWaiterDelivery(attachedWaiter); promoted != nil {
-			status, ok := acquireResultStatus(promoted.Result)
-			if !ok {
-				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-				return
-			}
-			writeJSON(w, status, promoted)
+			s.writeAcquireResultWithCompensation(r.Context(), w, req, promoted, releaseReasonGrantDeliveryFailed)
 			return
 		}
 		pollWindow := time.Duration(s.cfg.Concurrency.Wait.WaitPollWindowMs) * time.Millisecond
@@ -747,7 +803,8 @@ func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		}
 		pollTimer := time.NewTimer(pollWindow)
 		defer pollTimer.Stop()
-		deadlineTimer, deadlineCh := s.newAttachedWaiterDeadlineTimer(attachedWaiter.request, pollWindow)
+		waiterSnap, _ := s.waitingRuntime.snapshotAttachedRequest(attachedWaiter)
+		deadlineTimer, deadlineCh := s.newAttachedWaiterDeadlineTimer(waiterSnap.Request, pollWindow)
 		if deadlineTimer != nil {
 			defer deadlineTimer.Stop()
 		}
@@ -758,42 +815,93 @@ func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 					return
 				}
-				status, ok := acquireResultStatus(delivered.Result)
-				if !ok {
-					http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-					return
-				}
-				writeJSON(w, status, delivered)
+				s.writeAcquireResultWithCompensation(r.Context(), w, req, delivered, releaseReasonGrantDeliveryFailed)
 				return
 			case <-deadlineCh:
 				deadlineCh = nil
 				if deadlineResult := s.resolveAttachedWaiterDeadline(r.Context(), attachedWaiter); deadlineResult != nil {
-					status, ok := acquireResultStatus(deadlineResult.Result)
-					if !ok {
-						http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-						return
-					}
-					writeJSON(w, status, deadlineResult)
+					s.writeAcquireResultWithCompensation(r.Context(), w, req, deadlineResult, releaseReasonGrantDeliveryFailed)
 					return
 				}
 			case <-pollTimer.C:
 				finalResult := s.finalizePollWindowResult(r.Context(), attachedWaiter, result)
 				if finalResult != nil && finalResult.Result == "wait" {
-					s.recordObservability(observabilityContinueWaitTimeout, "request_id="+strings.TrimSpace(attachedWaiter.request.RequestID), "wait_token="+strings.TrimSpace(attachedWaiter.waitToken))
+					waiterSnap, _ := s.waitingRuntime.snapshotAttachedRequest(attachedWaiter)
+					s.recordObservability(observabilityContinueWaitTimeout, "request_id="+strings.TrimSpace(waiterSnap.Request.RequestID), "wait_token="+strings.TrimSpace(waiterSnap.WaitToken))
 				}
-				status, ok := acquireResultStatus(finalResult.Result)
-				if !ok {
-					http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-					return
-				}
-				writeJSON(w, status, finalResult)
+				s.writeAcquireResultWithCompensation(r.Context(), w, req, finalResult, releaseReasonGrantDeliveryFailed)
 				return
 			case <-r.Context().Done():
 				return
 			}
 		}
 	}
+	s.writeAcquireResultWithCompensation(r.Context(), w, req, result, releaseReasonAcquireDeliveryFailed)
+}
+
+func (s *Server) releaseAttachedWaiter(waiter *attachedWaiter, req AcquireRequest) {
+	if s == nil || waiter == nil {
+		return
+	}
+	delivered := s.waitingRuntime.release(waiter)
+	if delivered == nil || delivered.Result != "granted" {
+		return
+	}
+	s.compensateGrantDelivery(context.Background(), strings.TrimSpace(req.RequestID), delivered, releaseReasonGrantDeliveryFailed, 0)
+}
+
+func (s *Server) writeAcquireResultWithCompensation(ctx context.Context, w http.ResponseWriter, req AcquireRequest, result *AcquireResult, compensationReason string) bool {
+	if err := validateAcquireResult(req, result); err != nil {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return false
+	}
 	status, ok := acquireResultStatus(result.Result)
+	if !ok {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return false
+	}
+	trackingWriter := &deliveryTrackingResponseWriter{ResponseWriter: w}
+	err := writeJSONTracked(trackingWriter, status, result)
+	if result.Result == "granted" && (err != nil || trackingWriter.err != nil || ctx.Err() != nil) {
+		s.compensateGrantDelivery(context.Background(), req.RequestID, result, compensationReason, req.NowMs)
+		return false
+	}
+	return err == nil && trackingWriter.err == nil
+}
+
+func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if ok, code := s.checkAuth(r); !ok {
+		http.Error(w, http.StatusText(code), code)
+		return
+	}
+	var req ClaimGrantRequest
+	if err := decodeJSON(r, &req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if err := validateClaimGrantRequest(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	result, err := s.backend.ClaimGrant(r.Context(), req)
+	if err != nil || result == nil {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err := validateClaimGrantResult(result); err != nil {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if result.Result == "granted" {
+		s.recordObservability(observabilityClaimGranted, "request_id="+strings.TrimSpace(req.RequestID))
+	} else if result.Result == "conflict" {
+		s.recordObservability(observabilityClaimConflict, "request_id="+strings.TrimSpace(req.RequestID), "reason="+strings.TrimSpace(result.Reason))
+	}
+	status, ok := claimGrantResultStatus(result.Result)
 	if !ok {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
@@ -892,10 +1000,11 @@ func (s *Server) tryPromoteWaiter(ctx context.Context, waiter *attachedWaiter, n
 	if !ok {
 		return nil
 	}
-	if !s.waitingRuntime.hasAttachedWaiter(waiter.waitToken) {
+	waiterSnap, ok := s.waitingRuntime.snapshotAttachedRequest(waiter)
+	if !ok || !s.waitingRuntime.hasAttachedWaiter(waiterSnap.WaitToken) {
 		return nil
 	}
-	req := waiter.request
+	req := waiterSnap.Request
 	result, err := promoter.PromoteWaiting(ctx, PromoteWaitingRequest{
 		RequestID:      req.RequestID,
 		HostnameHash:   req.HostnameHash,
@@ -908,8 +1017,10 @@ func (s *Server) tryPromoteWaiter(ctx context.Context, waiter *attachedWaiter, n
 		return nil
 	}
 	if result.Result == "granted" || result.Result == "released" || result.Result == "cancelled" || result.Result == "expired" {
-		s.waitingRuntime.finishByWaitToken(waiter.waitToken, result)
-		s.waitingRuntime.deliver(waiter.waitToken, result)
+		s.waitingRuntime.finishByWaitToken(waiterSnap.WaitToken, result)
+		if !s.waitingRuntime.deliver(waiterSnap.WaitToken, result) && result.Result == "granted" {
+			s.compensateGrantDelivery(ctx, req.RequestID, result, releaseReasonGrantDeliveryFailed, nowMs)
+		}
 		return result
 	}
 	return nil
@@ -917,8 +1028,8 @@ func (s *Server) tryPromoteWaiter(ctx context.Context, waiter *attachedWaiter, n
 
 func (s *Server) wakeAttachedWaiters(ctx context.Context) {
 	hosts := make(map[string]struct{})
-	for _, waiter := range s.waitingRuntime.snapshotAttached() {
-		hostnameHash := strings.TrimSpace(waiter.request.HostnameHash)
+	for _, waiterSnap := range s.waitingRuntime.snapshotAttachedRequests() {
+		hostnameHash := strings.TrimSpace(waiterSnap.Request.HostnameHash)
 		if hostnameHash == "" {
 			continue
 		}
@@ -932,11 +1043,13 @@ func (s *Server) wakeAttachedWaiters(ctx context.Context) {
 }
 
 func (s *Server) deliverTerminalToAttachedWaiters(ctx context.Context, nowMs int64) {
-	for _, waiter := range s.waitingRuntime.snapshotAttached() {
-		result, err := s.probeAttachedWaiter(ctx, waiter, nowMs)
+	for _, waiterSnap := range s.waitingRuntime.snapshotAttachedRequests() {
+		result, err := s.probeAttachedWaiterSnapshot(ctx, waiterSnap, nowMs)
 		if err == nil && result != nil && result.Result != "wait" {
-			s.waitingRuntime.finishByWaitToken(waiter.waitToken, result)
-			s.waitingRuntime.deliver(waiter.waitToken, result)
+			s.waitingRuntime.finishByWaitToken(waiterSnap.WaitToken, result)
+			if !s.waitingRuntime.deliver(waiterSnap.WaitToken, result) && result.Result == "granted" {
+				s.compensateGrantDelivery(ctx, waiterSnap.Request.RequestID, result, releaseReasonGrantDeliveryFailed, nowMs)
+			}
 		}
 	}
 }
@@ -946,21 +1059,25 @@ func (s *Server) finalizePollWindowResult(ctx context.Context, waiter *attachedW
 		return delivered
 	}
 	finalResult := fallback
-	if probed, err := s.probeAttachedWaiter(ctx, waiter, time.Now().UnixMilli()); err == nil && probed != nil {
+	waiterSnap, ok := s.waitingRuntime.snapshotAttachedRequest(waiter)
+	if !ok {
+		return finalResult
+	}
+	if probed, err := s.probeAttachedWaiterSnapshot(ctx, waiterSnap, time.Now().UnixMilli()); err == nil && probed != nil {
 		finalResult = probed
 	}
 	if finalResult != nil && finalResult.Result != "wait" {
-		s.recordAcquireTerminalObservability(finalResult, waiter.request.RequestID)
+		s.recordAcquireTerminalObservability(finalResult, waiterSnap.Request.RequestID)
 		if finalResult.Result == "granted" {
-			s.recordObservability(observabilityAcquireReplayActive, "request_id="+strings.TrimSpace(waiter.request.RequestID), "wait_token="+strings.TrimSpace(waiter.waitToken))
-			s.observability.markActiveRequest(waiter.request.RequestID)
-			s.waitingRuntime.markActiveRequestObserved(waiter.request.RequestID)
+			s.recordObservability(observabilityAcquireReplayActive, "request_id="+strings.TrimSpace(waiterSnap.Request.RequestID), "wait_token="+strings.TrimSpace(waiterSnap.WaitToken))
+			s.observability.markActiveRequest(waiterSnap.Request.RequestID)
+			s.waitingRuntime.markActiveRequestObserved(waiterSnap.Request.RequestID)
 		} else {
-			s.clearActiveReplayState(waiter.request.RequestID)
+			s.clearActiveReplayState(waiterSnap.Request.RequestID)
 		}
 	}
 	if finalResult != nil && finalResult.Result != "wait" {
-		s.waitingRuntime.finishByWaitToken(waiter.waitToken, finalResult)
+		s.waitingRuntime.finishByWaitToken(waiterSnap.WaitToken, finalResult)
 	}
 	if delivered := consumeWaiterDelivery(waiter); delivered != nil {
 		return delivered
@@ -972,19 +1089,23 @@ func (s *Server) resolveAttachedWaiterDeadline(ctx context.Context, waiter *atta
 	if delivered := consumeWaiterDelivery(waiter); delivered != nil {
 		return delivered
 	}
-	deadlineResult, err := s.probeAttachedWaiter(ctx, waiter, time.Now().UnixMilli())
+	waiterSnap, ok := s.waitingRuntime.snapshotAttachedRequest(waiter)
+	if !ok {
+		return nil
+	}
+	deadlineResult, err := s.probeAttachedWaiterSnapshot(ctx, waiterSnap, time.Now().UnixMilli())
 	if err != nil || deadlineResult == nil || deadlineResult.Result == "wait" {
 		return consumeWaiterDelivery(waiter)
 	}
-	s.recordAcquireTerminalObservability(deadlineResult, waiter.request.RequestID)
+	s.recordAcquireTerminalObservability(deadlineResult, waiterSnap.Request.RequestID)
 	if deadlineResult.Result == "granted" {
-		s.recordObservability(observabilityAcquireReplayActive, "request_id="+strings.TrimSpace(waiter.request.RequestID), "wait_token="+strings.TrimSpace(waiter.waitToken))
-		s.observability.markActiveRequest(waiter.request.RequestID)
-		s.waitingRuntime.markActiveRequestObserved(waiter.request.RequestID)
+		s.recordObservability(observabilityAcquireReplayActive, "request_id="+strings.TrimSpace(waiterSnap.Request.RequestID), "wait_token="+strings.TrimSpace(waiterSnap.WaitToken))
+		s.observability.markActiveRequest(waiterSnap.Request.RequestID)
+		s.waitingRuntime.markActiveRequestObserved(waiterSnap.Request.RequestID)
 	} else {
-		s.clearActiveReplayState(waiter.request.RequestID)
+		s.clearActiveReplayState(waiterSnap.Request.RequestID)
 	}
-	s.waitingRuntime.finishByWaitToken(waiter.waitToken, deadlineResult)
+	s.waitingRuntime.finishByWaitToken(waiterSnap.WaitToken, deadlineResult)
 	if delivered := consumeWaiterDelivery(waiter); delivered != nil {
 		return delivered
 	}
@@ -1147,6 +1268,7 @@ func (s *Server) handleHostPassResult(snap requestSnapshot, result *AcquireResul
 		if snap.WaitToken != "" {
 			if !s.waitingRuntime.deliver(snap.WaitToken, result) && result.Result == "granted" {
 				s.recordObservability(observabilityGrantDeliveryFailed, "request_id="+snap.RequestID, "wait_token="+strings.TrimSpace(snap.WaitToken))
+				s.compensateGrantDelivery(context.Background(), snap.RequestID, result, releaseReasonGrantDeliveryFailed, time.Now().UnixMilli())
 			}
 		}
 	}
@@ -1156,20 +1278,44 @@ func (s *Server) probeAttachedWaiter(ctx context.Context, waiter *attachedWaiter
 	if waiter == nil {
 		return nil, nil
 	}
+	waiterSnap, ok := s.waitingRuntime.snapshotAttachedRequest(waiter)
+	if !ok {
+		return nil, nil
+	}
+	return s.probeAttachedWaiterSnapshot(ctx, waiterSnap, nowMs)
+}
+
+func (s *Server) probeAttachedWaiterSnapshot(ctx context.Context, waiterSnap attachedWaiterSnapshot, nowMs int64) (*AcquireResult, error) {
 	prober, ok := s.backend.(continueWaitProber)
 	if !ok {
 		return nil, nil
 	}
 	return prober.ProbeContinueWait(ctx, AcquireRequest{
-		Hostname:       waiter.request.Hostname,
-		HostnameHash:   waiter.request.HostnameHash,
-		SiteBucket:     waiter.request.SiteBucket,
-		IPBucket:       waiter.request.IPBucket,
-		RequestID:      waiter.request.RequestID,
-		HardExpireAtMs: waiter.request.HardExpireAtMs,
+		Hostname:       waiterSnap.Request.Hostname,
+		HostnameHash:   waiterSnap.Request.HostnameHash,
+		SiteBucket:     waiterSnap.Request.SiteBucket,
+		IPBucket:       waiterSnap.Request.IPBucket,
+		RequestID:      waiterSnap.Request.RequestID,
+		HardExpireAtMs: waiterSnap.Request.HardExpireAtMs,
 		NowMs:          nowMs,
-		WaitToken:      waiter.waitToken,
+		WaitToken:      waiterSnap.WaitToken,
 	})
+}
+
+func (s *Server) compensateGrantDelivery(ctx context.Context, requestID string, result *AcquireResult, reason string, nowMs int64) {
+	if result == nil || result.Result != "granted" || strings.TrimSpace(result.LeaseID) == "" || strings.TrimSpace(result.LeaseToken) == "" {
+		return
+	}
+	if nowMs <= 0 {
+		nowMs = time.Now().UnixMilli()
+	}
+	_, _ = s.backend.Release(ctx, ReleaseRequest{LeaseID: result.LeaseID, LeaseToken: result.LeaseToken, Reason: reason, NowMs: nowMs})
+	if reason == releaseReasonAcquireDeliveryFailed {
+		s.recordObservability(observabilityAcquireDeliveryFailed, "request_id="+strings.TrimSpace(requestID))
+	} else {
+		s.recordObservability(observabilityGrantDeliveryFailed, "request_id="+strings.TrimSpace(requestID))
+	}
+	s.clearActiveReplayState(requestID)
 }
 
 func (s *Server) newAttachedWaiterDeadlineTimer(req AcquireRequest, pollWindow time.Duration) (*time.Timer, <-chan time.Time) {

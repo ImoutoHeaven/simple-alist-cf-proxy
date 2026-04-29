@@ -24,7 +24,7 @@ func TestPostgrestAcquireNormalizesGrantedResultAndUsesConfiguredRPC(t *testing.
 			t.Fatalf("decode body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-1","lease_token":"token-1","expires_at_ms":2500}]`))
+		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-1","lease_token":"token-1","expires_at_ms":2500,"claim_token":"claim-1"}]`))
 	}))
 	defer srv.Close()
 
@@ -45,8 +45,65 @@ func TestPostgrestAcquireNormalizesGrantedResultAndUsesConfiguredRPC(t *testing.
 	if gotBody["p_request_id"] != "request-1" {
 		t.Fatalf("expected request id payload, got %v", gotBody)
 	}
-	if result.Result != "granted" || result.LeaseID != "lease-1" || result.LeaseToken != "token-1" {
+	if result.Result != "granted" || result.LeaseID != "lease-1" || result.LeaseToken != "token-1" || result.ClaimToken != "claim-1" {
 		t.Fatalf("unexpected acquire result: %+v", result)
+	}
+}
+
+func TestPostgrestAcquireRejectsGrantedResultWithoutClaimToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-1","lease_token":"token-1","expires_at_ms":2500}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	_, err := backend.Acquire(context.Background(), validAcquireRequest())
+	if err == nil || !strings.Contains(err.Error(), "claimToken") {
+		t.Fatalf("expected missing claimToken validation error, got %v", err)
+	}
+}
+
+func TestPostgrestClaimGrantUsesFixedRPCAndNormalizesResult(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-1","lease_token":"token-1","expires_at_ms":2500}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.ClaimGrant(context.Background(), ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("ClaimGrant error: %v", err)
+	}
+	if gotPath != "/rpc/cq_claim_grant" {
+		t.Fatalf("expected fixed claim rpc path, got %s", gotPath)
+	}
+	if gotBody["p_request_id"] != "request-1" || gotBody["p_claim_token"] != "claim-1" {
+		t.Fatalf("expected claim payload, got %v", gotBody)
+	}
+	if result.Result != "granted" || result.LeaseID != "lease-1" || result.LeaseToken != "token-1" {
+		t.Fatalf("unexpected claim result: %+v", result)
 	}
 }
 
@@ -347,7 +404,7 @@ func TestPostgrestPromoteWaitingUsesFixedRPCAndNormalizesGrantedResult(t *testin
 			t.Fatalf("decode body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-2","lease_token":"token-2","expires_at_ms":2400}]`))
+		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-2","lease_token":"token-2","expires_at_ms":2400,"claim_token":"claim-2"}]`))
 	}))
 	defer srv.Close()
 
@@ -374,8 +431,27 @@ func TestPostgrestPromoteWaitingUsesFixedRPCAndNormalizesGrantedResult(t *testin
 	if gotBody["p_request_id"] != "waiting-request" || gotBody["p_host_max_in_flight"] != float64(64) {
 		t.Fatalf("expected promote tuple/cap payload, got %v", gotBody)
 	}
-	if result.Result != "granted" || result.LeaseID != "lease-2" || result.LeaseToken != "token-2" {
+	if result.Result != "granted" || result.LeaseID != "lease-2" || result.LeaseToken != "token-2" || result.ClaimToken != "claim-2" {
 		t.Fatalf("unexpected promote result: %+v", result)
+	}
+}
+
+func TestPostgrestPromoteWaitingRejectsGrantedResultWithoutClaimToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-2","lease_token":"token-2","expires_at_ms":2400}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	_, err := backend.PromoteWaiting(context.Background(), PromoteWaitingRequest{RequestID: "waiting-request", HostnameHash: "host-hash", SiteBucket: "site-a", IPBucket: "ip-a", HardExpireAtMs: 5000, NowMs: 1000})
+	if err == nil || !strings.Contains(err.Error(), "claimToken") {
+		t.Fatalf("expected missing claimToken validation error, got %v", err)
 	}
 }
 
@@ -404,6 +480,7 @@ func TestPostgrestCancelUsesFixedRPC(t *testing.T) {
 
 	result, err := backend.Cancel(context.Background(), CancelRequest{
 		RequestID:      "request-1",
+		Hostname:       "example.com",
 		HostnameHash:   "host-hash",
 		SiteBucket:     "site-a",
 		IPBucket:       "ip-a",
@@ -417,7 +494,7 @@ func TestPostgrestCancelUsesFixedRPC(t *testing.T) {
 	if gotPath != "/rpc/cq_cancel" {
 		t.Fatalf("expected fixed cancel rpc path, got %s", gotPath)
 	}
-	if gotBody["p_request_id"] != "request-1" || gotBody["p_hard_expire_at_ms"] != float64(5000) {
+	if gotBody["p_request_id"] != "request-1" || gotBody["p_hostname"] != "example.com" || gotBody["p_hard_expire_at_ms"] != float64(5000) {
 		t.Fatalf("expected cancel tuple payload, got %v", gotBody)
 	}
 	if result.Result != "cancelled" {
@@ -441,6 +518,7 @@ func TestPostgrestCancelClassifiesActiveLeaseConflict(t *testing.T) {
 
 	_, err := backend.Cancel(context.Background(), CancelRequest{
 		RequestID:      "request-1",
+		Hostname:       "example.com",
 		HostnameHash:   "host-hash",
 		SiteBucket:     "site-a",
 		IPBucket:       "ip-a",

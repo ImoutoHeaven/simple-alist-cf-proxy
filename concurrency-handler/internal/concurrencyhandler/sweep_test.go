@@ -37,6 +37,10 @@ func (b *sweepRecordingBackend) Release(context.Context, ReleaseRequest) (*Relea
 	return &ReleaseResult{Result: "released"}, nil
 }
 
+func (b *sweepRecordingBackend) ClaimGrant(context.Context, ClaimGrantRequest) (*ClaimGrantResult, error) {
+	return &ClaimGrantResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: time.Now().Add(time.Minute).UnixMilli()}, nil
+}
+
 func (b *sweepRecordingBackend) PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
 	if b.promoteFn != nil {
 		return b.promoteFn(ctx, req)

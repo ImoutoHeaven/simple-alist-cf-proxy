@@ -1791,6 +1791,17 @@ test('queue_breaker settles old attempt before CQ wait and reauthorizes after CQ
         leaseId: 'lease-qb-1',
         leaseToken: 'token-qb-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-qb-1',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-qb-1',
+        leaseToken: 'token-qb-1',
+        expiresAtMs: Date.now() + 1000,
       });
     }
 
@@ -1877,6 +1888,7 @@ test('queue_breaker settles old attempt before CQ wait and reauthorizes after CQ
       'breaker-settle',
       'fairqueue-release',
       'concurrency-acquire-continue',
+      'concurrency-claim',
       'breaker-authorize',
       'origin-fetch',
       'breaker-report',
@@ -2079,6 +2091,17 @@ test('queue_breaker releases CQ lease and returns breaker terminal response when
         leaseId: 'lease-qb-deny-1',
         leaseToken: 'token-qb-deny-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-qb-deny-1',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-qb-deny-1',
+        leaseToken: 'token-qb-deny-1',
+        expiresAtMs: Date.now() + 1000,
       });
     }
 
@@ -2149,6 +2172,7 @@ test('queue_breaker releases CQ lease and returns breaker terminal response when
       'breaker-settle',
       'fairqueue-release',
       'concurrency-acquire-continue',
+      'concurrency-claim',
       'breaker-authorize',
       'concurrency-release',
     ]);
@@ -2505,10 +2529,12 @@ test('worker ignores unified-check open breaker rows for unmanaged hosts', async
   }
 });
 
-test('unified breaker lookup collapses recognized Google Drive hosts into the logical google bucket', async () => {
+test('unified breaker lookup uses actual Google-family host authority', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const googleAuthorityHash = await decodeHostnameHash('google');
+  const driveHostHash = await decodeHostnameHash('drive.google.com');
+  const googleApiHostHash = await decodeHostnameHash('www.googleapis.com');
   const unifiedBodies = [];
   const authorizeBodies = [];
   const reportBodies = [];
@@ -2657,23 +2683,126 @@ test('unified breaker lookup collapses recognized Google Drive hosts into the lo
         waitUntilPromises.push(promise);
       },
     });
-    assert.equal(secondResponse.status, 429);
+    assert.equal(secondResponse.status, 200);
 
     await Promise.allSettled(waitUntilPromises);
 
     assert.deepEqual(
       unifiedBodies.map((body) => body.p_throttle_hostname_hash),
+      [driveHostHash, googleApiHostHash],
+    );
+    assert.notDeepEqual(
+      unifiedBodies.map((body) => body.p_throttle_hostname_hash),
       [googleAuthorityHash, googleAuthorityHash],
     );
     assert.deepEqual(
       authorizeBodies.map((body) => body.p_hostname),
-      ['google'],
+      ['drive.google.com', 'www.googleapis.com'],
     );
     assert.deepEqual(
       reportBodies.map((body) => ({ hostname: body.p_hostname, hostnameHash: body.p_hostname_hash })),
-      [{ hostname: 'google', hostnameHash: googleAuthorityHash }],
+      [
+        { hostname: 'drive.google.com', hostnameHash: driveHostHash },
+        { hostname: 'www.googleapis.com', hostnameHash: googleApiHostHash },
+      ],
     );
-    assert.equal(originFetches, 1);
+    assert.equal(reportBodies[0].p_hostname_hash, await decodeHostnameHash('drive.google.com'));
+    assert.notEqual(reportBodies[0].p_hostname_hash, googleAuthorityHash);
+    assert.notEqual(reportBodies[1].p_hostname_hash, googleAuthorityHash);
+    assert.equal(originFetches, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('cache-hit unified breaker lookup uses cached actual Google API host hash', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const unifiedBodies = [];
+  const googleAuthorityHash = await decodeHostnameHash('google');
+  const googleApiHostHash = await decodeHostnameHash('www.googleapis.com');
+  let originFetches = 0;
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        cacheEnabled: true,
+        hostPatterns: [
+          'drive.google.com',
+          '*.googleapis.com',
+          '*.googleusercontent.com',
+        ],
+        rateLimit: {
+          enabled: true,
+          windowSeconds: 60,
+          limit: 10,
+        },
+      }));
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_unified_check') {
+      const body = JSON.parse(init.body);
+      unifiedBodies.push(body);
+      assert.equal(body.p_throttle_hostname_hash, null);
+      return createJsonResponse([{
+        cache_link_data: JSON.stringify({
+          url: 'https://www.googleapis.com/drive/v3/files/cache-hit?alt=media',
+          header: {},
+        }),
+        cache_timestamp: Math.floor(Date.now() / 1000),
+        cache_hostname_hash: googleApiHostHash,
+        rate_access_count: 0,
+        rate_last_window_time: Math.floor(Date.now() / 1000),
+        rate_block_until: null,
+        throttle_record_exists: true,
+        throttle_state: 'open',
+        throttle_open_until: Math.floor(Date.now() / 1000) + 30,
+        throttle_reason: 'http_429',
+        throttle_version: 9,
+        throttle_last_error_code: 429,
+        active_last_access_time: null,
+        active_total_access_count: null,
+      }]);
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/cache-hit?alt=media') {
+      originFetches += 1;
+      return new Response('unexpected', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/unified-cache-hit-google-api.bin', {
+      payloadFileSize: 13,
+    }), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 429);
+    assert.equal(unifiedBodies.length, 1);
+    assert.equal(googleApiHostHash, await decodeHostnameHash('www.googleapis.com'));
+    assert.notEqual(googleApiHostHash, googleAuthorityHash);
+    assert.equal(originFetches, 0);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -3180,10 +3309,12 @@ test('queue_breaker redirects reacquire atomic attempts on managed host changes'
   }
 });
 
-test('queue_breaker preserves one grouped google authority attempt across recognized cross-host redirects', async () => {
+test('queue_breaker reacquires and reports actual Google-family host attempts across cross-host redirects', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const googleAuthorityHash = await decodeHostnameHash('google');
+  const driveHostHash = await decodeHostnameHash('drive.google.com');
+  const googleApiHostHash = await decodeHostnameHash('www.googleapis.com');
   const acquireBodies = [];
   const releaseBodies = [];
   const reportBodies = [];
@@ -3295,10 +3426,10 @@ test('queue_breaker preserves one grouped google authority attempt across recogn
     assert.equal(acquireBodies[0].hostname, 'drive.google.com');
     assert.equal(acquireBodies[1].hostname, 'www.googleapis.com');
     assert.equal(acquireBodies[0].breakerEnabled, true);
-    assert.equal(acquireBodies[1].breakerEnabled, undefined);
-    assert.equal(acquireBodies[1].halfOpenMaxProbeCount, undefined);
-    assert.equal(acquireBodies[1].halfOpenMaxSeconds, undefined);
-    assert.equal(acquireBodies[1].halfOpenTimeoutMode, undefined);
+    assert.equal(acquireBodies[1].breakerEnabled, true);
+    assert.equal(acquireBodies[1].halfOpenMaxProbeCount, 4);
+    assert.equal(acquireBodies[1].halfOpenMaxSeconds, 15);
+    assert.equal(acquireBodies[1].halfOpenTimeoutMode, 'partial-close');
     assert.equal(acquireBodies[0].siteBucket, acquireBodies[1].siteBucket);
     assert.deepEqual(
       releaseBodies.map((body) => body.hostname),
@@ -3312,24 +3443,36 @@ test('queue_breaker preserves one grouped google authority attempt across recogn
         attemptVersion: body.p_attempt_version,
         attemptTicket: body.p_attempt_ticket,
       })),
-      [{
-        hostname: 'google',
-        hostnameHash: googleAuthorityHash,
-        statusCode: 200,
-        attemptVersion: 801,
-        attemptTicket: 1,
-      }],
+      [
+        {
+          hostname: 'drive.google.com',
+          hostnameHash: driveHostHash,
+          statusCode: 302,
+          attemptVersion: 801,
+          attemptTicket: 1,
+        },
+        {
+          hostname: 'www.googleapis.com',
+          hostnameHash: googleApiHostHash,
+          statusCode: 200,
+          attemptVersion: 802,
+          attemptTicket: 2,
+        },
+      ],
     );
+    assert.notEqual(reportBodies[0].p_hostname_hash, googleAuthorityHash);
+    assert.notEqual(reportBodies[1].p_hostname_hash, googleAuthorityHash);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('queue_breaker flushes the carried grouped google attempt when redirected reacquire throttles before fetch', async () => {
+test('queue_breaker reports actual Google redirect before redirected reacquire throttles', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const googleAuthorityHash = await decodeHostnameHash('google');
+  const driveHostHash = await decodeHostnameHash('drive.google.com');
   const acquireBodies = [];
   const releaseBodies = [];
   const reportBodies = [];
@@ -3399,7 +3542,7 @@ test('queue_breaker flushes the carried grouped google attempt when redirected r
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
-      throw new Error('queue_breaker grouped carryover should not call direct breaker authorize');
+      throw new Error('queue_breaker redirect lifecycle should not call direct breaker authorize');
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
@@ -3446,8 +3589,8 @@ test('queue_breaker flushes the carried grouped google attempt when redirected r
     assert.equal(response.status, 429);
     assert.equal(acquireBodies.length, 2);
     assert.equal(acquireBodies[0].breakerEnabled, true);
-    assert.equal(acquireBodies[1].breakerEnabled, undefined);
-    assert.equal(acquireBodies[1].halfOpenMaxProbeCount, undefined);
+    assert.equal(acquireBodies[1].breakerEnabled, true);
+    assert.equal(acquireBodies[1].halfOpenMaxProbeCount, 4);
     assert.deepEqual(
       releaseBodies.map((body) => body.hostname),
       ['drive.google.com'],
@@ -3461,23 +3604,25 @@ test('queue_breaker flushes the carried grouped google attempt when redirected r
         attemptTicket: body.p_attempt_ticket,
       })),
       [{
-        hostname: 'google',
-        hostnameHash: googleAuthorityHash,
+        hostname: 'drive.google.com',
+        hostnameHash: driveHostHash,
         statusCode: 302,
         attemptVersion: 801,
         attemptTicket: 1,
       }],
     );
+    assert.notEqual(reportBodies[0].p_hostname_hash, googleAuthorityHash);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('queue_breaker dual mode flushes the carried grouped google attempt when redirected fairqueue reacquire throttles before fetch', async () => {
+test('queue_breaker dual mode reports actual Google redirect before fairqueue reacquire throttles', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const googleAuthorityHash = await decodeHostnameHash('google');
+  const driveHostHash = await decodeHostnameHash('drive.google.com');
   const fairQueueAcquireBodies = [];
   const fairQueueReleaseBodies = [];
   const concurrencyAcquireBodies = [];
@@ -3591,6 +3736,16 @@ test('queue_breaker dual mode flushes the carried grouped google attempt when re
         leaseId: 'lease-google-dual-throttled-1',
         leaseToken: 'token-google-dual-throttled-1',
         expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-google-dual-throttled-1',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-google-dual-throttled-1',
+        leaseToken: 'token-google-dual-throttled-1',
+        expiresAtMs: Date.now() + 1000,
       });
     }
 
@@ -3600,7 +3755,7 @@ test('queue_breaker dual mode flushes the carried grouped google attempt when re
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
-      throw new Error('queue_breaker grouped carryover should not call direct breaker authorize');
+      throw new Error('queue_breaker redirect lifecycle should not call direct breaker authorize');
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
@@ -3648,7 +3803,7 @@ test('queue_breaker dual mode flushes the carried grouped google attempt when re
     assert.equal(fairQueueAcquireBodies.length, 2);
     assert.equal(concurrencyAcquireBodies.length, 1);
     assert.equal(fairQueueAcquireBodies[0].breakerEnabled, true);
-    assert.equal(fairQueueAcquireBodies[1].breakerEnabled, undefined);
+    assert.equal(fairQueueAcquireBodies[1].breakerEnabled, true);
     assert.deepEqual(
       fairQueueReleaseBodies.map((body) => body.hostname),
       ['drive.google.com'],
@@ -3663,23 +3818,25 @@ test('queue_breaker dual mode flushes the carried grouped google attempt when re
         attemptTicket: body.p_attempt_ticket,
       })),
       [{
-        hostname: 'google',
-        hostnameHash: googleAuthorityHash,
+        hostname: 'drive.google.com',
+        hostnameHash: driveHostHash,
         statusCode: 302,
         attemptVersion: 801,
         attemptTicket: 1,
       }],
     );
+    assert.notEqual(reportBodies[0].p_hostname_hash, googleAuthorityHash);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('queue_breaker dual mode reports the carried grouped google redirect when CQ expires before second-hop fetch', async () => {
+test('queue_breaker dual mode reports actual Google redirect when CQ expires before second-hop fetch', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const googleAuthorityHash = await decodeHostnameHash('google');
+  const driveHostHash = await decodeHostnameHash('drive.google.com');
   const fairQueueAcquireBodies = [];
   const fairQueueReleaseBodies = [];
   const concurrencyAcquireBodies = [];
@@ -3782,6 +3939,7 @@ test('queue_breaker dual mode reports the carried grouped google redirect when C
           leaseId: 'lease-google-dual-cq-expired-1',
           leaseToken: 'token-google-dual-cq-expired-1',
           expiresAtMs: body.hardExpireAtMs,
+          claimToken: 'claim-token-google-dual-cq-expired-1',
         });
       }
 
@@ -3796,8 +3954,17 @@ test('queue_breaker dual mode reports the carried grouped google redirect when C
       return createJsonResponse({ result: 'released' });
     }
 
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-google-dual-cq-expired-1',
+        leaseToken: 'token-google-dual-cq-expired-1',
+        expiresAtMs: Date.now() + 1000,
+      });
+    }
+
     if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
-      throw new Error('queue_breaker grouped carryover should not call direct breaker authorize');
+      throw new Error('queue_breaker redirect lifecycle should not call direct breaker authorize');
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
@@ -3856,7 +4023,7 @@ test('queue_breaker dual mode reports the carried grouped google redirect when C
     assert.equal(fairQueueAcquireBodies.length, 2);
     assert.equal(concurrencyAcquireBodies.length, 2);
     assert.equal(fairQueueAcquireBodies[0].breakerEnabled, true);
-    assert.equal(fairQueueAcquireBodies[1].breakerEnabled, undefined);
+    assert.equal(fairQueueAcquireBodies[1].breakerEnabled, true);
     assert.deepEqual(
       fairQueueReleaseBodies.map((body) => body.hostname),
       ['drive.google.com', 'www.googleapis.com'],
@@ -3875,23 +4042,25 @@ test('queue_breaker dual mode reports the carried grouped google redirect when C
         attemptTicket: body.p_attempt_ticket,
       })),
       [{
-        hostname: 'google',
-        hostnameHash: googleAuthorityHash,
+        hostname: 'drive.google.com',
+        hostnameHash: driveHostHash,
         statusCode: 302,
         attemptVersion: 801,
         attemptTicket: 1,
       }],
     );
+    assert.notEqual(reportBodies[0].p_hostname_hash, googleAuthorityHash);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('queue_breaker dual mode reports the carried grouped google redirect when CQ wait later expires before second-hop fetch', async () => {
+test('queue_breaker dual mode reports actual Google redirect when CQ wait later expires before second-hop fetch', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const googleAuthorityHash = await decodeHostnameHash('google');
+  const driveHostHash = await decodeHostnameHash('drive.google.com');
   const fairQueueAcquireBodies = [];
   const fairQueueReleaseBodies = [];
   const concurrencyAcquireBodies = [];
@@ -3995,6 +4164,7 @@ test('queue_breaker dual mode reports the carried grouped google redirect when C
           leaseId: 'lease-google-dual-cq-wait-expired-1',
           leaseToken: 'token-google-dual-cq-wait-expired-1',
           expiresAtMs: body.hardExpireAtMs,
+          claimToken: 'claim-token-google-dual-cq-wait-expired-1',
         });
       }
 
@@ -4018,13 +4188,22 @@ test('queue_breaker dual mode reports the carried grouped google redirect when C
       return createJsonResponse({ result: 'released' });
     }
 
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-google-dual-cq-wait-expired-1',
+        leaseToken: 'token-google-dual-cq-wait-expired-1',
+        expiresAtMs: Date.now() + 1000,
+      });
+    }
+
     if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
       concurrencyCancelBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'cancelled' });
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
-      throw new Error('queue_breaker grouped carryover should not call direct breaker authorize');
+      throw new Error('queue_breaker redirect lifecycle should not call direct breaker authorize');
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
@@ -4083,7 +4262,7 @@ test('queue_breaker dual mode reports the carried grouped google redirect when C
     assert.equal(fairQueueAcquireBodies.length, 2);
     assert.equal(concurrencyAcquireBodies.length, 3);
     assert.equal(fairQueueAcquireBodies[0].breakerEnabled, true);
-    assert.equal(fairQueueAcquireBodies[1].breakerEnabled, undefined);
+    assert.equal(fairQueueAcquireBodies[1].breakerEnabled, true);
     assert.deepEqual(
       fairQueueReleaseBodies.map((body) => body.hostname),
       ['drive.google.com', 'www.googleapis.com'],
@@ -4103,13 +4282,14 @@ test('queue_breaker dual mode reports the carried grouped google redirect when C
         attemptTicket: body.p_attempt_ticket,
       })),
       [{
-        hostname: 'google',
-        hostnameHash: googleAuthorityHash,
+        hostname: 'drive.google.com',
+        hostnameHash: driveHostHash,
         statusCode: 302,
         attemptVersion: 801,
         attemptTicket: 1,
       }],
     );
+    assert.notEqual(reportBodies[0].p_hostname_hash, googleAuthorityHash);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -4133,10 +4313,11 @@ for (const terminalCase of [
     }),
   },
 ]) {
-  test(`queue_breaker flushes the carried grouped google attempt when redirected reacquire ${terminalCase.name}s before fetch`, async () => {
+  test(`queue_breaker reports actual Google redirect when redirected reacquire ${terminalCase.name}s before fetch`, async () => {
     const originalFetch = globalThis.fetch;
     const waitUntilPromises = [];
     const googleAuthorityHash = await decodeHostnameHash('google');
+    const driveHostHash = await decodeHostnameHash('drive.google.com');
     const acquireBodies = [];
     const releaseBodies = [];
     const reportBodies = [];
@@ -4198,7 +4379,7 @@ for (const terminalCase of [
       }
 
       if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
-        throw new Error('queue_breaker grouped carryover should not call direct breaker authorize');
+        throw new Error('queue_breaker redirect lifecycle should not call direct breaker authorize');
       }
 
       if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
@@ -4245,7 +4426,7 @@ for (const terminalCase of [
       assert.equal(response.status, 503);
       assert.equal(acquireBodies.length, 2);
       assert.equal(acquireBodies[0].breakerEnabled, true);
-      assert.equal(acquireBodies[1].breakerEnabled, undefined);
+      assert.equal(acquireBodies[1].breakerEnabled, true);
       assert.deepEqual(
         releaseBodies.map((body) => body.hostname),
         ['drive.google.com'],
@@ -4259,13 +4440,14 @@ for (const terminalCase of [
           attemptTicket: body.p_attempt_ticket,
         })),
         [{
-          hostname: 'google',
-          hostnameHash: googleAuthorityHash,
+          hostname: 'drive.google.com',
+          hostnameHash: driveHostHash,
           statusCode: 302,
           attemptVersion: 801,
           attemptTicket: 1,
         }],
       );
+      assert.notEqual(reportBodies[0].p_hostname_hash, googleAuthorityHash);
     } finally {
       globalThis.fetch = originalFetch;
       delete globalThis.bootstrapCache;

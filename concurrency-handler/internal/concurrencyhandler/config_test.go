@@ -99,6 +99,58 @@ func TestConfigValidateRejectsUnsupportedBackendMode(t *testing.T) {
 	}
 }
 
+func TestConfigValidateRequiresAuthEnabled(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Auth.Enabled = false
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected auth.enabled validation error")
+	}
+	if !strings.Contains(err.Error(), "auth.enabled") {
+		t.Fatalf("expected auth.enabled error, got %v", err)
+	}
+}
+
+func TestConfigValidateRequiresAuthToken(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Auth.Token = "  "
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected auth.token validation error")
+	}
+	if !strings.Contains(err.Error(), "auth.token") {
+		t.Fatalf("expected auth.token error, got %v", err)
+	}
+}
+
+func TestParseConfigBytesRequiresAuthEnabled(t *testing.T) {
+	data := []byte(`{
+		"controller": {},
+		"auth": {"token": "secret"},
+		"backend": {
+			"mode": "postgrest",
+			"postgrest": {"baseUrl": "https://postgrest.example.test"}
+		},
+		"concurrency": {
+			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
+			"lease": {"requireHardExpiry": true},
+			"wait": {"waitPollWindowMs": 10000, "waitReconnectGraceMs": 1500},
+			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
+			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
+		}
+	}`)
+
+	_, err := ParseConfigBytes(data)
+	if err == nil {
+		t.Fatal("expected auth.enabled parse validation error")
+	}
+	if !strings.Contains(err.Error(), "auth.enabled") {
+		t.Fatalf("expected auth.enabled error, got %v", err)
+	}
+}
+
 func TestParseConfigBytesAppliesDefaults(t *testing.T) {
 	data := []byte(`{
 		"controller": {},

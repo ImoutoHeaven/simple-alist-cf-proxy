@@ -28,6 +28,21 @@ type AcquireResult struct {
 	Scope       string `json:"scope,omitempty"`
 	Reason      string `json:"reason,omitempty"`
 	RetryAfter  int    `json:"retryAfter,omitempty"`
+	ClaimToken  string `json:"claimToken,omitempty"`
+}
+
+type ClaimGrantRequest struct {
+	RequestID  string `json:"requestId"`
+	ClaimToken string `json:"claimToken"`
+	NowMs      int64  `json:"nowMs"`
+}
+
+type ClaimGrantResult struct {
+	Result      string `json:"result"`
+	LeaseID     string `json:"leaseId,omitempty"`
+	LeaseToken  string `json:"leaseToken,omitempty"`
+	ExpiresAtMs int64  `json:"expiresAtMs,omitempty"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 type ReleaseRequest struct {
@@ -54,6 +69,7 @@ type PromoteWaitingRequest struct {
 
 type CancelRequest struct {
 	RequestID      string `json:"requestId"`
+	Hostname       string `json:"hostname"`
 	HostnameHash   string `json:"hostnameHash"`
 	SiteBucket     string `json:"siteBucket"`
 	IPBucket       string `json:"ipBucket"`
@@ -84,11 +100,16 @@ type ExpireScopeResult struct {
 const (
 	fixedContinueWaitProbeFunc                  = "cq_continue_wait_probe"
 	fixedPromoteWaitingFunc                     = "cq_promote_waiting_request"
-	fixedCancelFunc                            = "cq_cancel"
+	fixedClaimGrantFunc                         = "cq_claim_grant"
+	fixedCancelFunc                             = "cq_cancel"
 	acquireConflictReasonRequestIDTupleMismatch = "request_id_tuple_mismatch"
 	acquireConflictReasonStaleWaitToken         = "stale_wait_token"
 	acquireConflictReasonWaiterAlreadyAttached  = "waiter_already_attached"
+	acquireConflictReasonGrantUnclaimed         = "grant_unclaimed"
+	acquireConflictReasonGrantAlreadyClaimed    = "grant_already_claimed"
 	cancelConflictReasonMustReleaseActiveLease  = "must_release_active_lease"
+	releaseReasonGrantDeliveryFailed            = "grant_delivery_failed"
+	releaseReasonAcquireDeliveryFailed          = "acquire_delivery_failed"
 	observabilityAcquireFastGranted             = "acquire_fast_granted"
 	observabilityAcquireFastWait                = "acquire_fast_wait"
 	observabilityAcquireReplayWait              = "acquire_replay_wait"
@@ -97,6 +118,9 @@ const (
 	observabilityContinueWaitTimeout            = "continue_wait_timeout"
 	observabilityGrantPromoted                  = "grant_promoted"
 	observabilityGrantDeliveryFailed            = "grant_delivery_failed"
+	observabilityAcquireDeliveryFailed          = "acquire_delivery_failed"
+	observabilityClaimGranted                   = "claim_granted"
+	observabilityClaimConflict                  = "claim_conflict"
 	observabilityCancelled                      = "cancelled"
 	observabilityExpiredHard                    = "expired_hard"
 	observabilityExpiredWaiterDetached          = "expired_waiter_detached"
@@ -156,6 +180,7 @@ func (e *cancelConflictError) Unwrap() error {
 
 type Backend interface {
 	Acquire(ctx context.Context, req AcquireRequest) (*AcquireResult, error)
+	ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error)
 	Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error)
 	PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error)
 	Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error)
@@ -175,6 +200,7 @@ type acquireWireResult struct {
 	Scope       *string `json:"scope"`
 	Reason      *string `json:"reason"`
 	RetryAfter  *int    `json:"retry_after"`
+	ClaimToken  *string `json:"claim_token"`
 }
 
 func (w acquireWireResult) toServiceResult() *AcquireResult {
@@ -199,6 +225,9 @@ func (w acquireWireResult) toServiceResult() *AcquireResult {
 	}
 	if w.RetryAfter != nil {
 		result.RetryAfter = *w.RetryAfter
+	}
+	if w.ClaimToken != nil {
+		result.ClaimToken = *w.ClaimToken
 	}
 	return result
 }
@@ -237,6 +266,9 @@ func validateAcquireResult(req AcquireRequest, result *AcquireResult) error {
 		if strings.TrimSpace(result.LeaseID) == "" || strings.TrimSpace(result.LeaseToken) == "" || result.ExpiresAtMs <= 0 {
 			return errors.New("incomplete acquire granted result")
 		}
+		if strings.TrimSpace(result.ClaimToken) == "" {
+			return errors.New("incomplete acquire granted result: claimToken is required")
+		}
 		if req.HardExpireAtMs > 0 && result.ExpiresAtMs > req.HardExpireAtMs {
 			return fmt.Errorf("acquire granted result exceeds hardExpireAtMs: expiresAtMs=%d hardExpireAtMs=%d", result.ExpiresAtMs, req.HardExpireAtMs)
 		}
@@ -249,8 +281,19 @@ func validateAcquireResult(req AcquireRequest, result *AcquireResult) error {
 		if strings.TrimSpace(result.WaitToken) == "" || result.RetryAfter <= 0 {
 			return errors.New("incomplete acquire wait result")
 		}
+	case "conflict":
+		switch result.Reason {
+		case acquireConflictReasonGrantUnclaimed, acquireConflictReasonGrantAlreadyClaimed, acquireConflictReasonRequestIDTupleMismatch, acquireConflictReasonStaleWaitToken, acquireConflictReasonWaiterAlreadyAttached:
+			if strings.TrimSpace(result.LeaseID) != "" || strings.TrimSpace(result.LeaseToken) != "" {
+				return errors.New("acquire conflict result must not include lease identity")
+			}
+		default:
+			return fmt.Errorf("invalid acquire conflict reason %q", result.Reason)
+		}
 	case "released":
-		if result.Reason != "already_released" {
+		switch result.Reason {
+		case "already_released", releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed:
+		default:
 			return fmt.Errorf("invalid acquire released reason %q", result.Reason)
 		}
 	case "cancelled":
@@ -267,6 +310,63 @@ func validateAcquireResult(req AcquireRequest, result *AcquireResult) error {
 		return fmt.Errorf("invalid acquire result %q", result.Result)
 	}
 	return nil
+}
+
+func validateClaimGrantRequest(req ClaimGrantRequest) error {
+	if strings.TrimSpace(req.RequestID) == "" {
+		return errors.New("requestId is required")
+	}
+	if strings.TrimSpace(req.ClaimToken) == "" {
+		return errors.New("claimToken is required")
+	}
+	if req.NowMs <= 0 {
+		return errors.New("nowMs is required")
+	}
+	return nil
+}
+
+func validateClaimGrantResult(result *ClaimGrantResult) error {
+	if result == nil {
+		return errors.New("missing claim grant result")
+	}
+	switch result.Result {
+	case "granted":
+		if strings.TrimSpace(result.LeaseID) == "" || strings.TrimSpace(result.LeaseToken) == "" || result.ExpiresAtMs <= 0 {
+			return errors.New("incomplete claim granted result")
+		}
+		return nil
+	case "conflict":
+		switch result.Reason {
+		case acquireConflictReasonGrantUnclaimed, acquireConflictReasonGrantAlreadyClaimed:
+			if strings.TrimSpace(result.LeaseID) != "" || strings.TrimSpace(result.LeaseToken) != "" {
+				return errors.New("claim conflict result must not include lease identity")
+			}
+			return nil
+		default:
+			return fmt.Errorf("invalid claim conflict reason %q", result.Reason)
+		}
+	case "released":
+		switch result.Reason {
+		case "already_released", releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed:
+		default:
+			return fmt.Errorf("invalid claim released reason %q", result.Reason)
+		}
+		return nil
+	case "cancelled":
+		if result.Reason != "request_cancelled" {
+			return fmt.Errorf("invalid claim cancelled reason %q", result.Reason)
+		}
+		return nil
+	case "expired":
+		switch result.Reason {
+		case "hard_expired", "waiter_detached_timeout":
+			return nil
+		default:
+			return fmt.Errorf("invalid claim expired reason %q", result.Reason)
+		}
+	default:
+		return fmt.Errorf("invalid claim result %q", result.Result)
+	}
 }
 
 func classifyAcquireConflict(err error) error {

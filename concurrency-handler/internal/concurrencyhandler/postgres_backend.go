@@ -189,6 +189,37 @@ func (p *postgresBackend) ProbeContinueWait(ctx context.Context, req AcquireRequ
 	return result, rows.Err()
 }
 
+func (p *postgresBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error) {
+	query, err := rpcSelectAll(fixedClaimGrantFunc, 3)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := p.db.Query(ctx, query, req.RequestID, req.ClaimToken, req.NowMs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, errors.New("empty claim grant result")
+	}
+	result := &ClaimGrantResult{}
+	var leaseID sql.NullString
+	var leaseToken sql.NullString
+	var expiresAtMs sql.NullInt64
+	var reason sql.NullString
+	if err := rows.Scan(&result.Result, &leaseID, &leaseToken, &expiresAtMs, &reason); err != nil {
+		return nil, err
+	}
+	result.LeaseID = leaseID.String
+	result.LeaseToken = leaseToken.String
+	result.ExpiresAtMs = expiresAtMs.Int64
+	result.Reason = reason.String
+	if err := validateClaimGrantResult(result); err != nil {
+		return nil, err
+	}
+	return result, rows.Err()
+}
+
 func (p *postgresBackend) Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
 	query, err := rpcSelectAll(p.cfg.Concurrency.RPC.ReleaseFunc, 4)
 	if err != nil {
@@ -256,7 +287,7 @@ func (p *postgresBackend) PromoteWaiting(ctx context.Context, req PromoteWaiting
 }
 
 func (p *postgresBackend) Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error) {
-	query, err := rpcSelectAll(fixedCancelFunc, 7)
+	query, err := rpcSelectAll(fixedCancelFunc, 8)
 	if err != nil {
 		return nil, err
 	}
@@ -264,6 +295,7 @@ func (p *postgresBackend) Cancel(ctx context.Context, req CancelRequest) (*Cance
 		ctx,
 		query,
 		req.RequestID,
+		req.Hostname,
 		req.HostnameHash,
 		canonicalBucket(req.SiteBucket),
 		canonicalBucket(req.IPBucket),
