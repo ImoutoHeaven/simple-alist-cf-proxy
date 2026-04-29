@@ -3106,6 +3106,91 @@ test('true concurrency managed streaming releases after body completion and does
   }
 });
 
+test('true concurrency managed streaming prefers IdentityTransformStream fallback and releases on completion', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalIdentityTransformStream = globalThis.IdentityTransformStream;
+  const identityCalls = [];
+  const calls = [];
+
+  globalThis.IdentityTransformStream = class FakeIdentityTransformStream {
+    constructor() {
+      identityCalls.push('identity-transform');
+      const inner = new TransformStream();
+      this.writable = inner.writable;
+      this.readable = inner.readable;
+    }
+  };
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-identity-1',
+        leaseToken: 'token-identity-1',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-identity-1',
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('identity-stream-body', {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': 'not-a-number',
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    assert.equal(response.headers.get('content-length'), null);
+    assert.equal(await response.text(), 'identity-stream-body');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(identityCalls, ['identity-transform']);
+    assert.deepEqual(calls, ['concurrency-acquire', 'origin-fetch', 'concurrency-release']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.IdentityTransformStream = originalIdentityTransformStream;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('true concurrency managed streaming binds CQ cleanup to waitUntil for post-return client cancellation', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];

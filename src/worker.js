@@ -5028,14 +5028,11 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     const useFixedLengthStream = contentLength !== null && typeof FixedLengthStream === 'function';
     const streamPair = useFixedLengthStream
       ? new FixedLengthStream(contentLength)
-      : new TransformStream({
+      : (typeof IdentityTransformStream === 'function' ? new IdentityTransformStream() : new TransformStream({
         transform(chunk, controller) {
           controller.enqueue(chunk);
         },
-        async flush() {
-          await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
-        },
-      });
+      }));
 	const abortController = new AbortController();
 	const msUntilExpire = Math.max(0, hardExpireAtMs - Date.now());
 	let hardExpiryAbort = false;
@@ -5061,9 +5058,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       preventCancel: false,
       preventClose: false,
     }).then(async () => {
-      if (useFixedLengthStream) {
-        await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
-      }
+      await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
     }).catch(async (error) => {
 		const reason = didClientAbort()
 		  ? 'client_disconnect'
