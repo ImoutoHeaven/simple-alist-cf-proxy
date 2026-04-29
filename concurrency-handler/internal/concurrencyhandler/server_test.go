@@ -1547,6 +1547,8 @@ func TestObservabilityCountsConflictAndDenyReasons(t *testing.T) {
 		cfg.Concurrency.Caps.HostMaxInFlight = 1
 		cfg.Concurrency.Caps.SiteMaxInFlight = 1
 		cfg.Concurrency.Caps.SiteIPMaxInFlight = 1
+		cfg.Concurrency.Wait.WaitPollWindowMs = 20
+		cfg.Concurrency.Wait.WaitReconnectGraceMs = 60000
 		blockingBackend := &firstContinueWaitBlocksBackend{
 			inner:        &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}},
 			waitToken:    waiting.WaitToken.String,
@@ -2047,6 +2049,8 @@ func TestContinueWaitRealPathRejectsConcurrentAttachWithoutRefreshingLease(t *te
 	cfg.Concurrency.Caps.HostMaxInFlight = 1
 	cfg.Concurrency.Caps.SiteMaxInFlight = 1
 	cfg.Concurrency.Caps.SiteIPMaxInFlight = 1
+	cfg.Concurrency.Wait.WaitPollWindowMs = 20
+	cfg.Concurrency.Wait.WaitReconnectGraceMs = 60000
 	realBackend := &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}}
 	blockingBackend := &firstContinueWaitBlocksBackend{
 		inner:        realBackend,
@@ -2054,7 +2058,7 @@ func TestContinueWaitRealPathRejectsConcurrentAttachWithoutRefreshingLease(t *te
 		firstEntered: make(chan struct{}),
 		releaseFirst: make(chan struct{}),
 	}
-	handler := newTestServer(t, blockingBackend)
+	handler := newTestServerInstanceWithConfig(t, cfg, blockingBackend).Handler()
 
 	firstReq := AcquireRequest{
 		Hostname:       "attach.example.com",
@@ -2156,13 +2160,15 @@ func TestContinueWaitRealPathPreservesTupleMismatchPrecedenceOverAttachConflict(
 	cfg.Concurrency.Caps.HostMaxInFlight = 1
 	cfg.Concurrency.Caps.SiteMaxInFlight = 1
 	cfg.Concurrency.Caps.SiteIPMaxInFlight = 1
+	cfg.Concurrency.Wait.WaitPollWindowMs = 20
+	cfg.Concurrency.Wait.WaitReconnectGraceMs = 60000
 	blockingBackend := &firstContinueWaitBlocksBackend{
 		inner:        &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}},
 		waitToken:    waiting.WaitToken.String,
 		firstEntered: make(chan struct{}),
 		releaseFirst: make(chan struct{}),
 	}
-	handler := newTestServer(t, blockingBackend)
+	handler := newTestServerInstanceWithConfig(t, cfg, blockingBackend).Handler()
 
 	firstReq := AcquireRequest{
 		Hostname:       "precedence.example.com",
@@ -2247,13 +2253,15 @@ func TestContinueWaitRealPathPreservesTerminalReplayPrecedenceOverAttachConflict
 	cfg.Concurrency.Caps.HostMaxInFlight = 1
 	cfg.Concurrency.Caps.SiteMaxInFlight = 1
 	cfg.Concurrency.Caps.SiteIPMaxInFlight = 1
+	cfg.Concurrency.Wait.WaitPollWindowMs = 20
+	cfg.Concurrency.Wait.WaitReconnectGraceMs = 60000
 	blockingBackend := &firstContinueWaitBlocksBackend{
 		inner:        &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}},
 		waitToken:    waiting.WaitToken.String,
 		firstEntered: make(chan struct{}),
 		releaseFirst: make(chan struct{}),
 	}
-	handler := newTestServer(t, blockingBackend)
+	handler := newTestServerInstanceWithConfig(t, cfg, blockingBackend).Handler()
 
 	firstReq := AcquireRequest{
 		Hostname:       "terminal.example.com",

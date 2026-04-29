@@ -19,6 +19,19 @@ import (
 
 const runtimePostgresImage = "postgres:16-alpine"
 
+var (
+	runtimePostgresMu          sync.Mutex
+	runtimePostgresContainerID string
+	runtimePostgresAddr        string
+	runtimePostgresTemplateDB  string
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	cleanupSharedRuntimeConcurrencyPostgres()
+	os.Exit(code)
+}
+
 func concurrencyModuleRootDir(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -64,7 +77,31 @@ func requireRuntimeConcurrencyDB(t *testing.T) *sql.DB {
 		t.Skipf("docker daemon unavailable: %v (%s)", err, strings.TrimSpace(string(out)))
 	}
 
+	containerID, addr, templateDB := requireSharedRuntimeConcurrencyPostgres(t)
 	dbName := fmt.Sprintf("concurrency_sql_%d", time.Now().UnixNano())
+	cloneRuntimeConcurrencyTemplateDB(t, containerID, addr, templateDB, dbName)
+
+	dsn := fmt.Sprintf("postgres://postgres:postgres@%s/%s?sslmode=disable", addr, dbName)
+	db := waitForRuntimeConcurrencyPostgresReady(t, containerID, dsn)
+	t.Cleanup(func() {
+		_ = dropRuntimeConcurrencyDB(addr, dbName)
+	})
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	return db
+}
+
+func requireSharedRuntimeConcurrencyPostgres(t *testing.T) (containerID, addr, templateDB string) {
+	t.Helper()
+
+	runtimePostgresMu.Lock()
+	defer runtimePostgresMu.Unlock()
+
+	if runtimePostgresContainerID != "" && runtimePostgresAddr != "" && runtimePostgresTemplateDB != "" {
+		return runtimePostgresContainerID, runtimePostgresAddr, runtimePostgresTemplateDB
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -75,7 +112,6 @@ func requireRuntimeConcurrencyDB(t *testing.T) *sql.DB {
 		"--rm",
 		"-d",
 		"-e", "POSTGRES_PASSWORD=postgres",
-		"-e", "POSTGRES_DB="+dbName,
 		"-p", "127.0.0.1::5432",
 		runtimePostgresImage,
 	)
@@ -83,23 +119,78 @@ func requireRuntimeConcurrencyDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Skipf("start postgres container: %v (%s)", err, strings.TrimSpace(string(runOut)))
 	}
-	containerID := normalizeRuntimeContainerID(string(runOut))
+	containerID = normalizeRuntimeContainerID(string(runOut))
 	if containerID == "" {
 		t.Fatalf("docker run returned no container id: %s", strings.TrimSpace(string(runOut)))
 	}
-	t.Cleanup(func() {
-		_ = exec.Command("docker", "rm", "-f", containerID).Run()
-	})
 
-	addr := waitForRuntimeConcurrencyPostgresPort(t, containerID)
-	dsn := fmt.Sprintf("postgres://postgres:postgres@%s/%s?sslmode=disable", addr, dbName)
-	db := waitForRuntimeConcurrencyPostgresReady(t, containerID, dsn)
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
+	addr = waitForRuntimeConcurrencyPostgresPort(t, containerID)
+	templateDB = fmt.Sprintf("concurrency_template_%d", time.Now().UnixNano())
+	createRuntimeConcurrencyDB(t, containerID, addr, templateDB, "")
+	applyRuntimeConcurrencyInitSQL(t, containerID, templateDB)
 
-	applyRuntimeConcurrencyInitSQL(t, containerID, dbName)
-	return db
+	runtimePostgresContainerID = containerID
+	runtimePostgresAddr = addr
+	runtimePostgresTemplateDB = templateDB
+	return runtimePostgresContainerID, runtimePostgresAddr, runtimePostgresTemplateDB
+}
+
+func createRuntimeConcurrencyDB(t *testing.T, containerID, addr, dbName, templateDB string) {
+	t.Helper()
+
+	adminDSN := fmt.Sprintf("postgres://postgres:postgres@%s/postgres?sslmode=disable", addr)
+	adminDB := waitForRuntimeConcurrencyPostgresReady(t, containerID, adminDSN)
+	defer func() {
+		_ = adminDB.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stmt := "CREATE DATABASE " + dbName
+	if templateDB != "" {
+		stmt += " TEMPLATE " + templateDB
+	}
+	if _, err := adminDB.ExecContext(ctx, stmt); err != nil {
+		t.Fatalf("create runtime database %s: %v", dbName, err)
+	}
+}
+
+func cloneRuntimeConcurrencyTemplateDB(t *testing.T, containerID, addr, templateDB, dbName string) {
+	t.Helper()
+	createRuntimeConcurrencyDB(t, containerID, addr, dbName, templateDB)
+}
+
+func dropRuntimeConcurrencyDB(addr, dbName string) error {
+	if strings.TrimSpace(addr) == "" || strings.TrimSpace(dbName) == "" {
+		return nil
+	}
+	adminDB, err := sql.Open("pgx", fmt.Sprintf("postgres://postgres:postgres@%s/postgres?sslmode=disable", addr))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = adminDB.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = adminDB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+dbName+" WITH (FORCE)")
+	return err
+}
+
+func cleanupSharedRuntimeConcurrencyPostgres() {
+	runtimePostgresMu.Lock()
+	containerID := runtimePostgresContainerID
+	runtimePostgresContainerID = ""
+	runtimePostgresAddr = ""
+	runtimePostgresTemplateDB = ""
+	runtimePostgresMu.Unlock()
+
+	if containerID == "" {
+		return
+	}
+	_ = exec.Command("docker", "rm", "-f", containerID).Run()
 }
 
 func waitForRuntimeConcurrencyPostgresPort(t *testing.T, containerID string) string {
