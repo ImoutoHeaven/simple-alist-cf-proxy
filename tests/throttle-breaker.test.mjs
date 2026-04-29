@@ -1868,10 +1868,9 @@ test('queue_breaker settles old attempt before CQ wait and reauthorizes after CQ
       },
     });
 
-    await Promise.allSettled(waitUntilPromises);
-
     assert.equal(response.status, 200);
     assert.equal(await response.text(), 'qb-wait-ok');
+    await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls, [
       'fairqueue-acquire',
       'concurrency-acquire-fast',

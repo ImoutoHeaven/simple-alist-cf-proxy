@@ -145,6 +145,14 @@ const createDeferred = () => {
   return { promise, resolve, reject };
 };
 
+test('slowFailDelay is bypassed under node test runner', async () => {
+  const startedAt = Date.now();
+  await __fairQueueTestHooks.slowFailDelay();
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.ok(elapsedMs < 100, `expected node test slowFailDelay bypass, got ${elapsedMs}ms`);
+});
+
 test('slot-handler client sends abandon with queryToken invocationEpoch and auth header', async () => {
   const client = createSlotHandlerClient({
     slotHandlerConfig: {

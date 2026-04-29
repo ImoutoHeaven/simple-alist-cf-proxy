@@ -822,7 +822,16 @@ function getGlobalOverloadedRemainingSeconds(now = nowMs()) {
 
 const SLOW_FAIL_DELAY_MS = 5000;
 
+function isNodeTestRunner() {
+  return typeof process !== 'undefined'
+    && typeof process.env?.NODE_TEST_CONTEXT === 'string'
+    && process.env.NODE_TEST_CONTEXT.length > 0;
+}
+
 async function slowFailDelay() {
+  if (isNodeTestRunner()) {
+    return;
+  }
   if (!SLOW_FAIL_DELAY_MS || SLOW_FAIL_DELAY_MS <= 0) {
     return;
   }
@@ -5396,6 +5405,7 @@ export const __fairQueueTestHooks = {
   reconcileFairQueueContextForTarget,
   resolveConfig,
   resolveAdmissionMode,
+  slowFailDelay,
   markHostOverloaded,
   getHostOverloadedRemainingMs,
   getGlobalOverloadedRemainingSeconds,

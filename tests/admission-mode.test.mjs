@@ -292,6 +292,7 @@ const runModeScenario = async ({
         waitUntilPromises.push(promise);
       },
     });
+    await response.arrayBuffer();
     await Promise.allSettled(waitUntilPromises);
     return {
       response,
