@@ -331,9 +331,9 @@ describe('init.sql breaker RPC definitions', () => {
 
   it('serializes request_id before request-ledger lookup and tuple-scoped counter locks', () => {
     const acquireBody = readFunctionBody('cq_acquire');
-    const requestLockIndex = acquireBody.search(/pg_advisory_xact_lock\(\s*3\s*,\s*hashtext\(v_request_id\)\s*\)/i);
+    const requestLockIndex = acquireBody.search(/pg_advisory_xact_lock\(\s*3\s*,\s*hashtext\(v_authoritative_request_id\)\s*\)/i);
     const hostLockIndex = acquireBody.search(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = v_hostname_hash\s+FOR UPDATE;/i);
-    const requestRowIndex = acquireBody.search(/FROM\s+concurrency_requests\s+WHERE request_id = v_request_id\s+FOR UPDATE/i);
+    const requestRowIndex = acquireBody.search(/FROM\s+concurrency_requests\s+WHERE request_id = v_authoritative_request_id\s+FOR UPDATE/i);
 
     expect(requestLockIndex).toBeGreaterThan(-1);
     expect(hostLockIndex).toBeGreaterThan(requestLockIndex);
@@ -424,5 +424,50 @@ describe('init.sql breaker RPC definitions', () => {
     expect(requestLockIndex).toBeGreaterThan(releaseScopeLookupIndex);
     expect(requestRowIndex).toBeGreaterThan(requestLockIndex);
     expect(leaseLockIndex).toBeGreaterThan(requestLockIndex);
+  });
+
+  it('resolves authoritative wait-token request ids before entering request advisory locking in reconnect paths', () => {
+    const acquireBody = readFunctionBody('cq_acquire');
+    const probeBody = readFunctionBody('cq_continue_wait_probe');
+
+    const acquireResolveIndex = expectPatternIndex(
+      acquireBody,
+      /SELECT\s+concurrency_requests\.request_id\s+INTO\s+v_authoritative_request_id\s+FROM\s+concurrency_requests\s+WHERE concurrency_requests\.wait_token = v_wait_token_input/i,
+      'expected cq_acquire to resolve the authoritative request id from wait_token before advisory locking',
+    );
+    const acquireLockIndex = expectPatternIndex(
+      acquireBody,
+      /pg_advisory_xact_lock\(3, hashtext\(v_authoritative_request_id\)\)/i,
+      'expected cq_acquire to enter request advisory locking with the authoritative request id',
+    );
+    const acquireRequestRowIndex = expectPatternIndex(
+      acquireBody,
+      /FROM\s+concurrency_requests\s+WHERE request_id = v_authoritative_request_id\s+FOR UPDATE/i,
+      'expected cq_acquire to lock the authoritative request row after entering advisory locking',
+    );
+
+    expect(acquireLockIndex).toBeGreaterThan(acquireResolveIndex);
+    expect(acquireRequestRowIndex).toBeGreaterThan(acquireLockIndex);
+    expect(acquireBody).not.toMatch(/pg_advisory_xact_lock\(3, hashtext\(v_request_id\)\)/i);
+
+    const probeResolveIndex = expectPatternIndex(
+      probeBody,
+      /SELECT\s+concurrency_requests\.request_id\s+INTO\s+v_authoritative_request_id\s+FROM\s+concurrency_requests\s+WHERE concurrency_requests\.wait_token = v_wait_token_input/i,
+      'expected cq_continue_wait_probe to resolve the authoritative request id from wait_token before advisory locking',
+    );
+    const probeLockIndex = expectPatternIndex(
+      probeBody,
+      /pg_advisory_xact_lock\(3, hashtext\(v_authoritative_request_id\)\)/i,
+      'expected cq_continue_wait_probe to enter request advisory locking with the authoritative request id',
+    );
+    const probeRequestRowIndex = expectPatternIndex(
+      probeBody,
+      /FROM\s+concurrency_requests\s+WHERE request_id = v_authoritative_request_id\s+FOR UPDATE/i,
+      'expected cq_continue_wait_probe to lock the authoritative request row after entering advisory locking',
+    );
+
+    expect(probeLockIndex).toBeGreaterThan(probeResolveIndex);
+    expect(probeRequestRowIndex).toBeGreaterThan(probeLockIndex);
+    expect(probeBody).not.toMatch(/pg_advisory_xact_lock\(3, hashtext\(v_request_id\)\)/i);
   });
 });

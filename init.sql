@@ -2536,6 +2536,7 @@ DECLARE
   v_hostname_hash text := BTRIM(COALESCE(p_hostname_hash, ''));
   v_hostname text := COALESCE(NULLIF(BTRIM(COALESCE(p_hostname, '')), ''), v_hostname_hash);
   v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_authoritative_request_id text := v_request_id;
   v_wait_token_input text := NULLIF(BTRIM(COALESCE(p_wait_token, '')), '');
   v_request record;
   v_request_row_count bigint := 0;
@@ -2567,18 +2568,31 @@ BEGIN
     + GREATEST(COALESCE(p_wait_poll_window_ms, 0), 1)
     + GREATEST(COALESCE(p_wait_reconnect_grace_ms, 0), 1);
 
-  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
-
   IF v_wait_token_input IS NOT NULL THEN
-	SELECT *
-	  INTO v_request
-	FROM concurrency_requests
-	WHERE concurrency_requests.wait_token = v_wait_token_input
-	FOR UPDATE;
+    SELECT concurrency_requests.request_id
+      INTO v_authoritative_request_id
+    FROM concurrency_requests
+    WHERE concurrency_requests.wait_token = v_wait_token_input;
 
     GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
 
     IF v_request_row_count = 0 THEN
+      RAISE EXCEPTION 'cq_acquire stale wait token';
+    END IF;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_authoritative_request_id));
+
+  IF v_wait_token_input IS NOT NULL THEN
+    SELECT *
+      INTO v_request
+    FROM concurrency_requests
+    WHERE request_id = v_authoritative_request_id
+    FOR UPDATE;
+
+    GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
+
+    IF v_request_row_count = 0 OR v_request.wait_token IS DISTINCT FROM v_wait_token_input THEN
       RAISE EXCEPTION 'cq_acquire stale wait token';
     END IF;
   ELSE
@@ -3145,6 +3159,7 @@ DECLARE
   v_ip_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_ip_bucket, '')), ''), 'unknown');
   v_hostname_hash text := BTRIM(COALESCE(p_hostname_hash, ''));
   v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_authoritative_request_id text := NULL;
   v_wait_token_input text := NULLIF(BTRIM(COALESCE(p_wait_token, '')), '');
   v_request record;
   v_request_row_count bigint := 0;
@@ -3156,17 +3171,28 @@ BEGIN
     RAISE EXCEPTION 'cq_acquire stale wait token';
   END IF;
 
-  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
-
-  SELECT *
-    INTO v_request
+  SELECT concurrency_requests.request_id
+    INTO v_authoritative_request_id
   FROM concurrency_requests
-  WHERE concurrency_requests.wait_token = v_wait_token_input
-  FOR UPDATE;
+  WHERE concurrency_requests.wait_token = v_wait_token_input;
 
   GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
 
   IF v_request_row_count = 0 THEN
+    RAISE EXCEPTION 'cq_acquire stale wait token';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_authoritative_request_id));
+
+  SELECT *
+    INTO v_request
+  FROM concurrency_requests
+  WHERE request_id = v_authoritative_request_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
+
+  IF v_request_row_count = 0 OR v_request.wait_token IS DISTINCT FROM v_wait_token_input THEN
     RAISE EXCEPTION 'cq_acquire stale wait token';
   END IF;
 

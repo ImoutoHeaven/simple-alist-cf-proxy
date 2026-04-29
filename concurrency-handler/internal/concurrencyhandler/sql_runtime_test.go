@@ -260,6 +260,32 @@ func waitForRequestIDAdvisoryLock(t *testing.T, db *sql.DB, requestID string) {
 	}
 }
 
+func holdRequestIDAdvisoryLock(t *testing.T, db *sql.DB, requestID string) (*sql.Conn, *sql.Tx) {
+	t.Helper()
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open advisory lock connection: %v", err)
+	}
+
+	tx, err := conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("begin advisory lock transaction: %v", err)
+	}
+
+	if _, err := tx.ExecContext(context.Background(), `
+		SELECT pg_advisory_xact_lock(3, hashtext($1))
+	`, requestID); err != nil {
+		_ = tx.Rollback()
+		_ = conn.Close()
+		t.Fatalf("hold advisory lock for request_id %q: %v", requestID, err)
+	}
+
+	waitForRequestIDAdvisoryLock(t, db, requestID)
+	return conn, tx
+}
+
 type runtimeAcquireCall struct {
 	HostnameHash      string
 	Hostname          string
@@ -2088,5 +2114,238 @@ func TestRuntimeAcquireSerializesRequestIDAcrossTuplesAndRejectsConflictingReuse
 	}
 	if leaseCount != 1 {
 		t.Fatalf("expected one lease row for request_id, got %d", leaseCount)
+	}
+}
+
+func TestRuntimeAcquireWaitTokenReconnectLocksAuthoritativeRequestID(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	hardExpireMs := nowMs + 120_000
+	authoritativeRequestID := "acquire-wait-lock-authoritative"
+	fakeRequestID := "acquire-wait-lock-fake"
+
+	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "acquire-wait-lock-host",
+		Hostname:          "acquire-wait-lock.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "acquire-wait-lock-busy",
+		HardExpireMs:      hardExpireMs,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed busy lease: %v", err)
+	}
+	if busy.Result != "granted" {
+		t.Fatalf("expected granted busy seed, got %+v", busy)
+	}
+
+	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "acquire-wait-lock-host",
+		Hostname:          "acquire-wait-lock.example.com",
+		SiteBucket:        "site-b",
+		IPBucket:          "ip-b",
+		RequestID:         authoritativeRequestID,
+		HardExpireMs:      hardExpireMs,
+		NowMs:             nowMs + 1,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed waiting request: %v", err)
+	}
+	if waiting.Result != "wait" || !waiting.WaitToken.Valid {
+		t.Fatalf("expected waiting request with token, got %+v", waiting)
+	}
+
+	type acquireOutcome struct {
+		result *runtimeAcquireResult
+		err    error
+	}
+
+	reconnect := func(requestID string) <-chan acquireOutcome {
+		ch := make(chan acquireOutcome, 1)
+		go func() {
+			result, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+				HostnameHash:      "acquire-wait-lock-host",
+				Hostname:          "acquire-wait-lock.example.com",
+				SiteBucket:        "site-b",
+				IPBucket:          "ip-b",
+				RequestID:         requestID,
+				HardExpireMs:      hardExpireMs,
+				NowMs:             nowMs + 2,
+				WaitToken:         waiting.WaitToken.String,
+				HostMaxInFlight:   1,
+				SiteMaxInFlight:   1,
+				SiteIPMaxInFlight: 1,
+			})
+			ch <- acquireOutcome{result: result, err: err}
+		}()
+		return ch
+	}
+
+	fakeConn, fakeTx := holdRequestIDAdvisoryLock(t, db, fakeRequestID)
+	fakeOutcomeCh := reconnect(fakeRequestID)
+	select {
+	case outcome := <-fakeOutcomeCh:
+		if outcome.err == nil || !strings.Contains(outcome.err.Error(), "cq_acquire request_id tuple mismatch") {
+			_ = fakeTx.Rollback()
+			_ = fakeConn.Close()
+			t.Fatalf("expected reconnect tuple mismatch after ignoring caller lock, got result=%+v err=%v", outcome.result, outcome.err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		if err := fakeTx.Rollback(); err != nil {
+			t.Fatalf("release fake advisory lock: %v", err)
+		}
+		if err := fakeConn.Close(); err != nil {
+			t.Fatalf("close fake advisory lock connection: %v", err)
+		}
+		outcome := <-fakeOutcomeCh
+		t.Fatalf("expected reconnect to ignore caller-supplied advisory lock, but it blocked until fake lock released; result=%+v err=%v", outcome.result, outcome.err)
+	}
+	if err := fakeTx.Rollback(); err != nil {
+		t.Fatalf("release fake advisory lock after early tuple mismatch: %v", err)
+	}
+	if err := fakeConn.Close(); err != nil {
+		t.Fatalf("close fake advisory lock connection after early tuple mismatch: %v", err)
+	}
+
+	authConn, authTx := holdRequestIDAdvisoryLock(t, db, authoritativeRequestID)
+	authOutcomeCh := reconnect(fakeRequestID)
+	select {
+	case outcome := <-authOutcomeCh:
+		_ = authTx.Rollback()
+		_ = authConn.Close()
+		t.Fatalf("expected reconnect to block on the authoritative request_id lock, got early result=%+v err=%v", outcome.result, outcome.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := authTx.Rollback(); err != nil {
+		t.Fatalf("release authoritative advisory lock: %v", err)
+	}
+	if err := authConn.Close(); err != nil {
+		t.Fatalf("close authoritative advisory lock connection: %v", err)
+	}
+	authOutcome := <-authOutcomeCh
+	if authOutcome.err == nil || !strings.Contains(authOutcome.err.Error(), "cq_acquire request_id tuple mismatch") {
+		t.Fatalf("expected authoritative-lock reconnect to finish with tuple mismatch after unlock, got result=%+v err=%v", authOutcome.result, authOutcome.err)
+	}
+}
+
+func TestRuntimeContinueWaitProbeLocksAuthoritativeRequestID(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	hardExpireMs := nowMs + 120_000
+	authoritativeRequestID := "continue-wait-lock-authoritative"
+	fakeRequestID := "continue-wait-lock-fake"
+
+	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "continue-wait-lock-host",
+		Hostname:          "continue-wait-lock.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "continue-wait-lock-busy",
+		HardExpireMs:      hardExpireMs,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed busy lease: %v", err)
+	}
+	if busy.Result != "granted" {
+		t.Fatalf("expected granted busy seed, got %+v", busy)
+	}
+
+	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "continue-wait-lock-host",
+		Hostname:          "continue-wait-lock.example.com",
+		SiteBucket:        "site-b",
+		IPBucket:          "ip-b",
+		RequestID:         authoritativeRequestID,
+		HardExpireMs:      hardExpireMs,
+		NowMs:             nowMs + 1,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed waiting request: %v", err)
+	}
+	if waiting.Result != "wait" || !waiting.WaitToken.Valid {
+		t.Fatalf("expected waiting request with token, got %+v", waiting)
+	}
+
+	type probeOutcome struct {
+		result *runtimeAcquireResult
+		err    error
+	}
+
+	probe := func(requestID string) <-chan probeOutcome {
+		ch := make(chan probeOutcome, 1)
+		go func() {
+			result, err := execRuntimeContinueWaitProbe(context.Background(), db, AcquireRequest{
+				HostnameHash:   "continue-wait-lock-host",
+				Hostname:       "continue-wait-lock.example.com",
+				SiteBucket:     "site-b",
+				IPBucket:       "ip-b",
+				RequestID:      requestID,
+				HardExpireAtMs: hardExpireMs,
+				NowMs:          nowMs + 2,
+				WaitToken:      waiting.WaitToken.String,
+			})
+			ch <- probeOutcome{result: result, err: err}
+		}()
+		return ch
+	}
+
+	fakeConn, fakeTx := holdRequestIDAdvisoryLock(t, db, fakeRequestID)
+	fakeOutcomeCh := probe(fakeRequestID)
+	select {
+	case outcome := <-fakeOutcomeCh:
+		if outcome.err == nil || !strings.Contains(outcome.err.Error(), "cq_acquire request_id tuple mismatch") {
+			_ = fakeTx.Rollback()
+			_ = fakeConn.Close()
+			t.Fatalf("expected continue wait probe tuple mismatch after ignoring caller lock, got result=%+v err=%v", outcome.result, outcome.err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		if err := fakeTx.Rollback(); err != nil {
+			t.Fatalf("release fake advisory lock: %v", err)
+		}
+		if err := fakeConn.Close(); err != nil {
+			t.Fatalf("close fake advisory lock connection: %v", err)
+		}
+		outcome := <-fakeOutcomeCh
+		t.Fatalf("expected continue wait probe to ignore caller-supplied advisory lock, but it blocked until fake lock released; result=%+v err=%v", outcome.result, outcome.err)
+	}
+	if err := fakeTx.Rollback(); err != nil {
+		t.Fatalf("release fake advisory lock after early tuple mismatch: %v", err)
+	}
+	if err := fakeConn.Close(); err != nil {
+		t.Fatalf("close fake advisory lock connection after early tuple mismatch: %v", err)
+	}
+
+	authConn, authTx := holdRequestIDAdvisoryLock(t, db, authoritativeRequestID)
+	authOutcomeCh := probe(fakeRequestID)
+	select {
+	case outcome := <-authOutcomeCh:
+		_ = authTx.Rollback()
+		_ = authConn.Close()
+		t.Fatalf("expected continue wait probe to block on the authoritative request_id lock, got early result=%+v err=%v", outcome.result, outcome.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := authTx.Rollback(); err != nil {
+		t.Fatalf("release authoritative advisory lock: %v", err)
+	}
+	if err := authConn.Close(); err != nil {
+		t.Fatalf("close authoritative advisory lock connection: %v", err)
+	}
+	authOutcome := <-authOutcomeCh
+	if authOutcome.err == nil || !strings.Contains(authOutcome.err.Error(), "cq_acquire request_id tuple mismatch") {
+		t.Fatalf("expected authoritative-lock continue wait probe to finish with tuple mismatch after unlock, got result=%+v err=%v", authOutcome.result, authOutcome.err)
 	}
 }
