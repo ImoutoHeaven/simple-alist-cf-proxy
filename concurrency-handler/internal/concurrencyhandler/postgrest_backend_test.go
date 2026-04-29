@@ -355,6 +355,28 @@ func TestPostgrestReleaseReturnsAuthoritativeRequestIDWhenPresent(t *testing.T) 
 	}
 }
 
+func TestPostgrestReleaseAcceptsExpiredResultWithAuthoritativeRequestID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"expired","reason":"hard_expired","request_id":"request-1"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.Release(context.Background(), validReleaseRequest())
+	if err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+	if result.Result != "expired" || result.Reason != "hard_expired" || result.RequestID != "request-1" {
+		t.Fatalf("unexpected release result: %+v", result)
+	}
+}
+
 func TestPostgrestReleaseRejectsExpiredNoopWithoutAuthoritativeRequestID(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

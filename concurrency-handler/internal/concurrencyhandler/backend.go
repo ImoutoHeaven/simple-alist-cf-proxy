@@ -411,6 +411,14 @@ func validateReleaseResult(result *ReleaseResult) error {
 			return errors.New("released result missing authoritative requestId")
 		}
 		return nil
+	case "expired":
+		if result.Reason != "hard_expired" {
+			return fmt.Errorf("invalid release expired reason %q", result.Reason)
+		}
+		if strings.TrimSpace(result.RequestID) == "" {
+			return errors.New("expired result missing authoritative requestId")
+		}
+		return nil
 	case "noop":
 		switch result.Reason {
 		case "already_released", "expired":

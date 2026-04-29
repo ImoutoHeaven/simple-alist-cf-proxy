@@ -293,6 +293,21 @@ func TestPostgresReleaseReturnsAuthoritativeRequestIDWhenPresent(t *testing.T) {
 	}
 }
 
+func TestPostgresReleaseAcceptsExpiredResultWithAuthoritativeRequestID(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{"expired", "hard_expired", "request-1"}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.Release(context.Background(), validReleaseRequest())
+	if err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+	if result.Result != "expired" || result.Reason != "hard_expired" || result.RequestID != "request-1" {
+		t.Fatalf("unexpected release result: %+v", result)
+	}
+}
+
 func TestPostgresReleaseRejectsReleasedResultWithoutAuthoritativeRequestID(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
 		return &stubRows{rows: [][]any{{"released", nil, nil}}}, nil

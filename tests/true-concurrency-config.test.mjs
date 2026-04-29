@@ -323,6 +323,33 @@ test('concurrency client sends required release payload and parses noop results'
   }
 });
 
+test('concurrency client parses direct expired release results', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ result: 'expired', reason: 'hard_expired' }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  try {
+    const client = createConcurrencyHandlerClient({
+      concurrencyHandlerConfig: {
+        url: 'https://cq.example.test/',
+        authKey: 'cq-secret',
+        releaseTimeoutMs: 1500,
+      },
+    });
+
+    const result = await client.release(null, {
+      leaseId: 'lease-1',
+      leaseToken: 'token-1',
+    }, 'client_disconnect');
+
+    assert.deepEqual(result, { result: 'expired', reason: 'hard_expired' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('concurrency client throws on malformed success payloads', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({ result: 'granted' }), {

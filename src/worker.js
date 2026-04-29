@@ -1722,7 +1722,7 @@ const normalizePostgrestBaseUrl = (url) => {
 
 const TRUE_CONCURRENCY_ACQUIRE_RESULTS = new Set(['granted', 'wait', 'conflict', 'released', 'cancelled', 'expired']);
 const TRUE_CONCURRENCY_CLAIM_RESULTS = new Set(['granted', 'conflict', 'released', 'cancelled', 'expired']);
-const TRUE_CONCURRENCY_RELEASE_RESULTS = new Set(['released', 'noop']);
+const TRUE_CONCURRENCY_RELEASE_RESULTS = new Set(['released', 'noop', 'expired']);
 const TRUE_CONCURRENCY_CANCEL_RESULTS = new Set(['cancelled', 'noop', 'conflict']);
 const TRUE_CONCURRENCY_WAIT_SCOPES = new Set(['host', 'site', 'site_ip']);
 const TRUE_CONCURRENCY_ACQUIRE_CONFLICT_REASONS = new Set([
@@ -1936,6 +1936,18 @@ const normalizeTrueConcurrencyReleaseResult = (data) => {
   const result = readTrueConcurrencyResult('release', data, TRUE_CONCURRENCY_RELEASE_RESULTS);
   if (result === 'released') {
     return { result: 'released' };
+  }
+  if (result === 'expired') {
+    if (typeof data?.reason !== 'string' || !data.reason) {
+      throw new Error('[CQ] release expired response missing reason');
+    }
+    if (data.reason !== 'hard_expired') {
+      throw new Error('[CQ] release expired response has unsupported reason');
+    }
+    return {
+      result: 'expired',
+      reason: data.reason,
+    };
   }
   if (typeof data?.reason !== 'string' || !data.reason) {
     throw new Error('[CQ] release noop response missing reason');
@@ -2160,7 +2172,7 @@ const createConcurrencyReleaseController = ({ client, ctx, lease, label }) => {
     }
     try {
       const result = await client.release(ctx, lease, reason);
-      if (result?.result === 'released' || result?.result === 'noop') {
+      if (result?.result === 'released' || result?.result === 'noop' || result?.result === 'expired') {
         settled = true;
         return true;
       }
@@ -4617,6 +4629,15 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         }
 
         let claimedResult;
+        const buildClaimReleaseLease = () => ({
+          ...acquireResult,
+          requestId: cqPlan.requestId,
+          hostname: cqPlan.hostname,
+          hostnameHash: cqPlan.hostnameHash,
+          siteBucket: cqPlan.siteBucket,
+          ipBucket: cqPlan.ipBucket,
+          hardExpireAtMs: cqPlan.hardExpireAtMs,
+        });
         try {
           claimedResult = await concurrencyClient.claim(ctx, {
             requestId: cqPlan.requestId,
@@ -4625,19 +4646,10 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
             hardExpireAtMs: cqPlan.hardExpireAtMs,
           }, clientSignal);
         } catch (error) {
-          const releaseLease = {
-            ...acquireResult,
-            requestId: cqPlan.requestId,
-            hostname: cqPlan.hostname,
-            hostnameHash: cqPlan.hostnameHash,
-            siteBucket: cqPlan.siteBucket,
-            ipBucket: cqPlan.ipBucket,
-            hardExpireAtMs: cqPlan.hardExpireAtMs,
-          };
           const releaseController = createConcurrencyReleaseController({
             client: concurrencyClient,
             ctx,
-            lease: releaseLease,
+            lease: buildClaimReleaseLease(),
             label: cqPlan.hostname,
           });
           await releaseController.releaseImmediately('acquire_delivery_failed');
@@ -4657,6 +4669,15 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         }
 
         if (claimedResult.result !== 'granted') {
+          if (claimedResult.result === 'conflict' && claimedResult.reason === 'grant_unclaimed') {
+            const releaseController = createConcurrencyReleaseController({
+              client: concurrencyClient,
+              ctx,
+              lease: buildClaimReleaseLease(),
+              label: cqPlan.hostname,
+            });
+            await releaseController.releaseImmediately('acquire_delivery_failed');
+          }
           const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
           if (settleResponse instanceof Response) {
             if (needFairQueue) {

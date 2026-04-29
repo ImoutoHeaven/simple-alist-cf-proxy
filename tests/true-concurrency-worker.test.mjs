@@ -2246,47 +2246,84 @@ test('true concurrency only skips precheck and fairqueue', async () => {
 
 test('true concurrency claim failure releases acquired lease before origin fetch', async () => {
   const originalFetch = globalThis.fetch;
-  const calls = [];
-  let releaseBody = null;
-
-  globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
-
-    if (url === 'https://controller.example.test/api/v0/bootstrap') {
-      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
-    }
-    if (url === 'https://alist.example.com/api/fs/link') {
-      return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
-    }
-    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      calls.push('concurrency-acquire-fast');
-      const body = JSON.parse(init.body);
-      return createJsonResponse({ result: 'granted', leaseId: 'lease-claim-fail', leaseToken: 'token-claim-fail', expiresAtMs: body.hardExpireAtMs, claimToken: 'claim-token-fail' });
-    }
-    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
-      calls.push('concurrency-claim');
-      throw new Error('claim transport failed');
-    }
-    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
-      calls.push('concurrency-release');
-      releaseBody = JSON.parse(init.body);
-      return createJsonResponse({ result: 'released' });
-    }
-    if (url === 'https://tenant.sharepoint.com/file') {
-      calls.push('origin-fetch');
-      return new Response('should-not-fetch', { status: 200 });
-    }
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
-  };
+  const scenarios = [
+    {
+      name: 'transport failure',
+      respondToClaim() {
+        throw new Error('claim transport failed');
+      },
+    },
+    {
+      name: 'availability failure',
+      respondToClaim() {
+        return new Response(JSON.stringify({ code: 503, message: 'claim unavailable' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    },
+    {
+      name: 'malformed-success normalization failure',
+      respondToClaim() {
+        return createJsonResponse({
+          result: 'granted',
+          leaseId: 'lease-claim-fail',
+          expiresAtMs: Date.now() + 1_000,
+        });
+      },
+    },
+  ];
 
   try {
-    const { ctx, waitUntilPromises } = createTestContext();
-    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
-    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-release']);
-    assert.equal(releaseBody.leaseToken, 'token-claim-fail');
-    assert.equal(releaseBody.reason, 'acquire_delivery_failed');
+    for (const scenario of scenarios) {
+      const calls = [];
+      let releaseBody = null;
+
+      globalThis.fetch = async (input, init = {}) => {
+        const url = typeof input === 'string' ? input : input.url;
+
+        if (url === 'https://controller.example.test/api/v0/bootstrap') {
+          return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+        }
+        if (url === 'https://alist.example.com/api/fs/link') {
+          return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+          calls.push('concurrency-acquire-fast');
+          const body = JSON.parse(init.body);
+          return createJsonResponse({ result: 'granted', leaseId: 'lease-claim-fail', leaseToken: 'token-claim-fail', expiresAtMs: body.hardExpireAtMs, claimToken: 'claim-token-fail' });
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+          calls.push('concurrency-claim');
+          return scenario.respondToClaim(init);
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+          calls.push('concurrency-release');
+          releaseBody = JSON.parse(init.body);
+          return createJsonResponse({ result: 'released' });
+        }
+        if (url === 'https://tenant.sharepoint.com/file') {
+          calls.push('origin-fetch');
+          return new Response('should-not-fetch', { status: 200 });
+        }
+        throw new Error(`Unexpected fetch URL in test: ${url}`);
+      };
+
+      try {
+        const { ctx, waitUntilPromises } = createTestContext();
+        const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+        const body = await readJson(response);
+        await Promise.allSettled(waitUntilPromises);
+        assert.equal(response.status, 503, scenario.name);
+        assert.equal(body.message, 'True concurrency unavailable', scenario.name);
+        assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-release'], scenario.name);
+        assert.equal(releaseBody.leaseId, 'lease-claim-fail', scenario.name);
+        assert.equal(releaseBody.leaseToken, 'token-claim-fail', scenario.name);
+        assert.equal(releaseBody.reason, 'acquire_delivery_failed', scenario.name);
+      } finally {
+        delete globalThis.bootstrapCache;
+      }
+    }
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -2315,6 +2352,10 @@ test('true concurrency claim terminal response does not fetch origin', async () 
       calls.push('concurrency-claim');
       return new Response(JSON.stringify({ result: 'conflict', reason: 'grant_already_claimed' }), { status: 409, headers: { 'content-type': 'application/json' } });
     }
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
     if (url === 'https://tenant.sharepoint.com/file') {
       calls.push('origin-fetch');
       return new Response('should-not-fetch', { status: 200 });
@@ -2328,6 +2369,58 @@ test('true concurrency claim terminal response does not fetch origin', async () 
     await Promise.allSettled(waitUntilPromises);
     assert.equal(response.status, 503);
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency claim conflict grant_unclaimed releases acquired lease before origin fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let releaseBody = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+    }
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({ result: 'granted', leaseId: 'lease-claim-conflict', leaseToken: 'token-claim-conflict', expiresAtMs: body.hardExpireAtMs, claimToken: 'claim-token-conflict' });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return new Response(JSON.stringify({ result: 'conflict', reason: 'grant_unclaimed' }), { status: 409, headers: { 'content-type': 'application/json' } });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('should-not-fetch', { status: 200 });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.equal(body.message, 'True concurrency conflict (grant_unclaimed)');
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-release']);
+    assert.equal(releaseBody.leaseId, 'lease-claim-conflict');
+    assert.equal(releaseBody.leaseToken, 'token-claim-conflict');
+    assert.equal(releaseBody.reason, 'acquire_delivery_failed');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -3396,6 +3489,30 @@ test('concurrency release controller is single-flight across repeated triggers',
     controller.ensureReleased('hard_expiry'),
   ]);
 
+  assert.deepEqual(reasons, ['stream_complete']);
+});
+
+test('concurrency release controller treats direct expired release as settled', async () => {
+  const reasons = [];
+  const controller = createConcurrencyReleaseController({
+    client: {
+      async release(_ctx, _lease, reason) {
+        reasons.push(reason);
+        return { result: 'expired', reason: 'hard_expired' };
+      },
+    },
+    ctx: { waitUntil() {} },
+    lease: {
+      leaseId: 'lease-1',
+      leaseToken: 'token-1',
+    },
+    label: 'expired-terminal-test',
+  });
+
+  const released = await controller.releaseImmediately('stream_complete');
+
+  assert.equal(released, true);
+  assert.equal(controller.isSettled(), true);
   assert.deepEqual(reasons, ['stream_complete']);
 });
 

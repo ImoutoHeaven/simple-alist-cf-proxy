@@ -898,6 +898,10 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	if result.Result == "granted" {
 		s.recordObservability(observabilityClaimGranted, "request_id="+strings.TrimSpace(req.RequestID))
+	} else if result.Result == "released" || result.Result == "cancelled" || result.Result == "expired" {
+		s.clearActiveReplayState(req.RequestID)
+		s.wakeAttachedWaiters(context.Background())
+		s.deliverTerminalToAttachedWaiters(context.Background(), time.Now().UnixMilli())
 	} else if result.Result == "conflict" {
 		s.recordObservability(observabilityClaimConflict, "request_id="+strings.TrimSpace(req.RequestID), "reason="+strings.TrimSpace(result.Reason))
 	}
@@ -934,6 +938,9 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	if result.Result == "released" {
 		s.recordObservability(observabilityReleaseReleased, "lease_id="+strings.TrimSpace(req.LeaseID))
+		s.clearActiveReplayState(result.RequestID)
+	} else if result.Result == "expired" {
+		s.recordObservability(observabilityExpiredHard, "request_id="+strings.TrimSpace(result.RequestID))
 		s.clearActiveReplayState(result.RequestID)
 	} else if result.Result == "noop" {
 		s.recordObservability(observabilityReleaseNoop, "lease_id="+strings.TrimSpace(req.LeaseID), "reason="+strings.TrimSpace(result.Reason))

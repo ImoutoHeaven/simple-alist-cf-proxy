@@ -403,6 +403,45 @@ func execRuntimePromoteWaiting(ctx context.Context, db *sql.DB, req PromoteWaiti
 	return result, nil
 }
 
+func execRuntimeContinueWaitProbe(ctx context.Context, db *sql.DB, req AcquireRequest) (*runtimeAcquireResult, error) {
+	result := &runtimeAcquireResult{}
+	err := db.QueryRowContext(ctx, `
+		SELECT result,
+		       COALESCE(lease_id::text, ''),
+		       COALESCE(lease_token, ''),
+		       COALESCE(expires_at_ms, 0),
+		       wait_token,
+		       scope,
+		       reason,
+		       retry_after,
+		       claim_token
+		FROM cq_continue_wait_probe($1, $2, $3, $4, $5, $6, $7, $8)
+	`,
+		req.HostnameHash,
+		req.Hostname,
+		canonicalBucket(req.SiteBucket),
+		canonicalBucket(req.IPBucket),
+		req.RequestID,
+		req.HardExpireAtMs,
+		req.NowMs,
+		strings.TrimSpace(req.WaitToken),
+	).Scan(
+		&result.Result,
+		&result.LeaseID,
+		&result.LeaseToken,
+		&result.ExpiresAtMs,
+		&result.WaitToken,
+		&result.Scope,
+		&result.Reason,
+		&result.RetryAfter,
+		&result.ClaimToken,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func TestRuntimeAcquireReturnsExpiredWhenNowPastHardExpiry(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
@@ -567,8 +606,8 @@ func TestRuntimeAcquireGrantMustBeClaimedOnce(t *testing.T) {
 	`, "claim-request", grant.ClaimToken.String, nowMs+3).Scan(&duplicateResult, &duplicateLeaseID, &duplicateLeaseToken, &duplicateExpires, &duplicateReason); err != nil {
 		t.Fatalf("duplicate claim grant: %v", err)
 	}
-	if duplicateResult != "conflict" || duplicateReason.String != "grant_already_claimed" || duplicateLeaseToken.Valid {
-		t.Fatalf("expected duplicate claim conflict without lease identity, got result=%q reason=%q leaseToken=%q", duplicateResult, duplicateReason.String, duplicateLeaseToken.String)
+	if duplicateResult != "granted" || duplicateLeaseID.String != grant.LeaseID || duplicateLeaseToken.String != grant.LeaseToken || duplicateExpires.Int64 != grant.ExpiresAtMs || duplicateReason.Valid {
+		t.Fatalf("expected duplicate claim replay to return original lease identity, got result=%q lease=%q token=%q expires=%d reason=%q", duplicateResult, duplicateLeaseID.String, duplicateLeaseToken.String, duplicateExpires.Int64, duplicateReason.String)
 	}
 
 	replayAfterClaim, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
@@ -584,7 +623,371 @@ func TestRuntimeAcquireGrantMustBeClaimedOnce(t *testing.T) {
 		t.Fatalf("active replay after claim: %v", err)
 	}
 	if replayAfterClaim.Result != "conflict" || replayAfterClaim.Reason.String != "grant_already_claimed" || strings.TrimSpace(replayAfterClaim.LeaseToken) != "" {
-		t.Fatalf("expected already-claimed replay conflict without lease token, got %+v", replayAfterClaim)
+		t.Fatalf("expected mismatched acquire replay to remain conflict after claim, got %+v", replayAfterClaim)
+	}
+}
+
+func TestRuntimeAcquireReturnsExpiredBeforeReplayConflictForExpiredActiveRequest(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "active-expired-acquire-host",
+		Hostname:          "active-expired-acquire.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "active-expired-acquire-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed active acquire: %v", err)
+	}
+	if grant.Result != "granted" {
+		t.Fatalf("expected granted seed acquire, got %+v", grant)
+	}
+
+	pastMs := nowMs - 1_000
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_leases
+		SET hard_expire_at_ms = $2::bigint,
+		    expires_at_ms = $2::bigint,
+		    expires_at = to_timestamp(($2::bigint) / 1000.0)
+		WHERE lease_id = $1::uuid
+	`, grant.LeaseID, pastMs); err != nil {
+		t.Fatalf("age active lease into expired state: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_requests
+		SET lease_expires_at_ms = $2::bigint,
+		    updated_at_ms = $2::bigint
+		WHERE request_id = $1
+	`, "active-expired-acquire-request", pastMs); err != nil {
+		t.Fatalf("age active request into expired state: %v", err)
+	}
+
+	replay, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "active-expired-acquire-host",
+		Hostname:          "active-expired-acquire.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "active-expired-acquire-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs + 10,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("replay expired active acquire: %v", err)
+	}
+	if replay.Result != "expired" || replay.Reason.String != "hard_expired" {
+		t.Fatalf("expected expired replay before conflict, got %+v", replay)
+	}
+}
+
+func TestRuntimeContinueWaitProbeReturnsExpiredBeforeReplayConflictForExpiredActiveRequest(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "continue-wait-expired-host",
+		Hostname:          "continue-wait-expired.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "continue-wait-expired-busy",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed busy lease: %v", err)
+	}
+	if busy.Result != "granted" {
+		t.Fatalf("expected granted busy seed, got %+v", busy)
+	}
+
+	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "continue-wait-expired-host",
+		Hostname:          "continue-wait-expired.example.com",
+		SiteBucket:        "site-b",
+		IPBucket:          "ip-b",
+		RequestID:         "continue-wait-expired-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs + 1,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed waiting request: %v", err)
+	}
+	if waiting.Result != "wait" || !waiting.WaitToken.Valid {
+		t.Fatalf("expected waiting acquire with token, got %+v", waiting)
+	}
+
+	var releaseResult string
+	var releaseReason, releaseRequestID sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason, request_id
+		FROM cq_release($1::uuid, $2, $3, $4)
+	`, busy.LeaseID, busy.LeaseToken, "stream_complete", nowMs+2).Scan(&releaseResult, &releaseReason, &releaseRequestID); err != nil {
+		t.Fatalf("release busy lease: %v", err)
+	}
+	if releaseResult != "released" {
+		t.Fatalf("expected busy lease release before promotion, got result=%q reason=%q", releaseResult, releaseReason.String)
+	}
+
+	promoted, err := execRuntimePromoteWaiting(context.Background(), db, PromoteWaitingRequest{
+		RequestID:      "continue-wait-expired-request",
+		HostnameHash:   "continue-wait-expired-host",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 3,
+	}, validTestConfig())
+	if err != nil {
+		t.Fatalf("promote waiting request: %v", err)
+	}
+	if promoted.Result != "granted" {
+		t.Fatalf("expected promoted request granted, got %+v", promoted)
+	}
+
+	pastMs := nowMs - 1_000
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_leases
+		SET hard_expire_at_ms = $2::bigint,
+		    expires_at_ms = $2::bigint,
+		    expires_at = to_timestamp(($2::bigint) / 1000.0)
+		WHERE lease_id = $1::uuid
+	`, promoted.LeaseID, pastMs); err != nil {
+		t.Fatalf("age promoted lease into expired state: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_requests
+		SET lease_expires_at_ms = $2::bigint,
+		    updated_at_ms = $3::bigint
+		WHERE request_id = $1
+	`, "continue-wait-expired-request", pastMs, nowMs-500); err != nil {
+		t.Fatalf("age promoted request into expired active state: %v", err)
+	}
+
+	probe, err := execRuntimeContinueWaitProbe(context.Background(), db, AcquireRequest{
+		HostnameHash:   "continue-wait-expired-host",
+		Hostname:       "continue-wait-expired.example.com",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		RequestID:      "continue-wait-expired-request",
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 10,
+		WaitToken:      waiting.WaitToken.String,
+	})
+	if err != nil {
+		t.Fatalf("continue wait probe on expired active request: %v", err)
+	}
+	if probe.Result != "expired" || probe.Reason.String != "hard_expired" {
+		t.Fatalf("expected continue wait probe expired before conflict, got %+v", probe)
+	}
+}
+
+func TestRuntimePromoteWaitingRequestReturnsExpiredBeforeReplayConflictForExpiredActiveRequest(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "promote-expired-host",
+		Hostname:          "promote-expired.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "promote-expired-busy",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed busy lease: %v", err)
+	}
+	if busy.Result != "granted" {
+		t.Fatalf("expected granted busy seed, got %+v", busy)
+	}
+
+	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "promote-expired-host",
+		Hostname:          "promote-expired.example.com",
+		SiteBucket:        "site-b",
+		IPBucket:          "ip-b",
+		RequestID:         "promote-expired-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs + 1,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed waiting request: %v", err)
+	}
+	if waiting.Result != "wait" {
+		t.Fatalf("expected waiting seed request, got %+v", waiting)
+	}
+
+	var releaseResult string
+	var releaseReason, releaseRequestID sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason, request_id
+		FROM cq_release($1::uuid, $2, $3, $4)
+	`, busy.LeaseID, busy.LeaseToken, "stream_complete", nowMs+2).Scan(&releaseResult, &releaseReason, &releaseRequestID); err != nil {
+		t.Fatalf("release busy lease: %v", err)
+	}
+	if releaseResult != "released" {
+		t.Fatalf("expected release before first promotion, got result=%q reason=%q", releaseResult, releaseReason.String)
+	}
+
+	promoted, err := execRuntimePromoteWaiting(context.Background(), db, PromoteWaitingRequest{
+		RequestID:      "promote-expired-request",
+		HostnameHash:   "promote-expired-host",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 3,
+	}, validTestConfig())
+	if err != nil {
+		t.Fatalf("first promote waiting request: %v", err)
+	}
+	if promoted.Result != "granted" {
+		t.Fatalf("expected first promotion granted, got %+v", promoted)
+	}
+
+	pastMs := nowMs - 1_000
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_leases
+		SET hard_expire_at_ms = $2::bigint,
+		    expires_at_ms = $2::bigint,
+		    expires_at = to_timestamp(($2::bigint) / 1000.0)
+		WHERE lease_id = $1::uuid
+	`, promoted.LeaseID, pastMs); err != nil {
+		t.Fatalf("age promoted lease into expired state: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_requests
+		SET state = 'active',
+		    lease_expires_at_ms = $2::bigint,
+		    claim_state = 'claimed',
+		    claim_claimed_at_ms = $3::bigint,
+		    updated_at_ms = $3::bigint
+		WHERE request_id = $1
+	`, "promote-expired-request", pastMs, nowMs-500); err != nil {
+		t.Fatalf("age promoted request into expired active state: %v", err)
+	}
+
+	result, err := execRuntimePromoteWaiting(context.Background(), db, PromoteWaitingRequest{
+		RequestID:      "promote-expired-request",
+		HostnameHash:   "promote-expired-host",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 10,
+	}, validTestConfig())
+	if err != nil {
+		t.Fatalf("promote waiting request against expired active row: %v", err)
+	}
+	if result.Result != "expired" || result.Reason.String != "hard_expired" {
+		t.Fatalf("expected promote expired before conflict, got %+v", result)
+	}
+}
+
+func TestRuntimeDuplicateCleanupDoesNotDoubleDecrementCounters(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "duplicate-cleanup-host",
+		Hostname:          "duplicate-cleanup.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "duplicate-cleanup-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed active lease: %v", err)
+	}
+	if grant.Result != "granted" {
+		t.Fatalf("expected granted seed lease, got %+v", grant)
+	}
+
+	readCounters := func() (int, int, int) {
+		t.Helper()
+		var hostCount, siteCount, siteIPCount int
+		if err := db.QueryRowContext(context.Background(), `
+			SELECT active_count
+			FROM concurrency_host_counters
+			WHERE hostname_hash = $1
+		`, "duplicate-cleanup-host").Scan(&hostCount); err != nil {
+			t.Fatalf("read host counter: %v", err)
+		}
+		if err := db.QueryRowContext(context.Background(), `
+			SELECT active_count
+			FROM concurrency_site_counters
+			WHERE hostname_hash = $1 AND site_bucket = $2
+		`, "duplicate-cleanup-host", "site-a").Scan(&siteCount); err != nil {
+			t.Fatalf("read site counter: %v", err)
+		}
+		if err := db.QueryRowContext(context.Background(), `
+			SELECT active_count
+			FROM concurrency_site_ip_counters
+			WHERE hostname_hash = $1 AND site_bucket = $2 AND ip_bucket = $3
+		`, "duplicate-cleanup-host", "site-a", "ip-a").Scan(&siteIPCount); err != nil {
+			t.Fatalf("read site_ip counter: %v", err)
+		}
+		return hostCount, siteCount, siteIPCount
+	}
+
+	hostCount, siteCount, siteIPCount := readCounters()
+	if hostCount != 1 || siteCount != 1 || siteIPCount != 1 {
+		t.Fatalf("expected one active lease before cleanup, got host=%d site=%d site_ip=%d", hostCount, siteCount, siteIPCount)
+	}
+
+	var firstResult string
+	var firstReason, firstRequestID sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason, request_id
+		FROM cq_release($1::uuid, $2, $3, $4)
+	`, grant.LeaseID, grant.LeaseToken, "stream_complete", nowMs+1).Scan(&firstResult, &firstReason, &firstRequestID); err != nil {
+		t.Fatalf("first release: %v", err)
+	}
+	if firstResult != "released" || !firstRequestID.Valid || firstRequestID.String != "duplicate-cleanup-request" {
+		t.Fatalf("expected first release to release authoritative request, got result=%q reason=%q request=%q", firstResult, firstReason.String, firstRequestID.String)
+	}
+
+	hostCount, siteCount, siteIPCount = readCounters()
+	if hostCount != 0 || siteCount != 0 || siteIPCount != 0 {
+		t.Fatalf("expected first cleanup to decrement counters once, got host=%d site=%d site_ip=%d", hostCount, siteCount, siteIPCount)
+	}
+
+	var secondResult string
+	var secondReason, secondRequestID sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason, request_id
+		FROM cq_release($1::uuid, $2, $3, $4)
+	`, grant.LeaseID, grant.LeaseToken, "stream_complete", nowMs+2).Scan(&secondResult, &secondReason, &secondRequestID); err != nil {
+		t.Fatalf("second release: %v", err)
+	}
+	if secondResult != "noop" || secondReason.String == "" {
+		t.Fatalf("expected repeated cleanup to become idempotent noop, got result=%q reason=%q request=%q", secondResult, secondReason.String, secondRequestID.String)
+	}
+
+	hostCount, siteCount, siteIPCount = readCounters()
+	if hostCount != 0 || siteCount != 0 || siteIPCount != 0 {
+		t.Fatalf("expected duplicate cleanup to avoid double decrement, got host=%d site=%d site_ip=%d", hostCount, siteCount, siteIPCount)
 	}
 }
 
@@ -836,6 +1239,136 @@ func TestExpireActiveLeaseMarksRequestExpiredAndDecrementsCounters(t *testing.T)
 	}
 	if hostCount != 0 || siteCount != 0 || siteIPCount != 0 {
 		t.Fatalf("expected counters decremented after active expiry, got host=%d site=%d site_ip=%d", hostCount, siteCount, siteIPCount)
+	}
+}
+
+func TestRuntimeExpireScopeSkipsBusyRequestScopedExpiryUntilRequestLockReleases(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	requestID := "expire-scope-busy-request"
+	hostnameHash := "expire-scope-busy-host"
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      hostnameHash,
+		Hostname:          "expire-scope-busy.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         requestID,
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed active lease: %v", err)
+	}
+	if grant.Result != "granted" {
+		t.Fatalf("expected granted seed lease, got %+v", grant)
+	}
+
+	pastMs := nowMs - 1_000
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_leases
+		SET hard_expire_at_ms = $2::bigint,
+		    expires_at_ms = $2::bigint,
+		    expires_at = to_timestamp(($2::bigint) / 1000.0)
+		WHERE lease_id = $1::uuid
+	`, grant.LeaseID, pastMs); err != nil {
+		t.Fatalf("age addressed lease into expired state: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_requests
+		SET hard_expire_at_ms = $2::bigint,
+		    lease_expires_at_ms = $2::bigint,
+		    updated_at_ms = $2::bigint
+		WHERE request_id = $1
+	`, requestID, pastMs); err != nil {
+		t.Fatalf("age authoritative request into expired state: %v", err)
+	}
+
+	requestConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open request lock connection: %v", err)
+	}
+	defer requestConn.Close()
+
+	requestTx, err := requestConn.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin request lock transaction: %v", err)
+	}
+	defer requestTx.Rollback()
+
+	if _, err := requestTx.ExecContext(context.Background(), `
+		SELECT pg_advisory_xact_lock(3, hashtext($1))
+	`, requestID); err != nil {
+		t.Fatalf("hold authoritative request advisory lock: %v", err)
+	}
+
+	expireConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open expire scope connection: %v", err)
+	}
+	defer expireConn.Close()
+
+	expireTx, err := expireConn.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin expire scope transaction: %v", err)
+	}
+	defer expireTx.Rollback()
+
+	if _, err := expireTx.ExecContext(context.Background(), `SET LOCAL statement_timeout = '250ms'`); err != nil {
+		t.Fatalf("set statement timeout: %v", err)
+	}
+
+	rows, err := expireTx.QueryContext(context.Background(), `
+		SELECT request_id
+		FROM cq_expire_scope($1, $2, $3, $4, $5, $6)
+	`, "host", hostnameHash, nil, nil, nowMs+10, 500)
+	if err != nil {
+		t.Fatalf("expire scope while authoritative request lock busy: %v", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var expiredRequestID string
+		if err := rows.Scan(&expiredRequestID); err != nil {
+			t.Fatalf("scan skipped expire scope row: %v", err)
+		}
+		t.Fatalf("expected busy request-scoped expiry to skip locked request, got %q", expiredRequestID)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate expire scope rows while lock busy: %v", err)
+	}
+	if err := expireTx.Commit(); err != nil {
+		t.Fatalf("commit skipped expire scope transaction: %v", err)
+	}
+
+	var lockedState string
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT state
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, requestID).Scan(&lockedState); err != nil {
+		t.Fatalf("read request state while advisory lock held: %v", err)
+	}
+	if lockedState != "active" {
+		t.Fatalf("expected busy request to remain active until advisory lock releases, got %q", lockedState)
+	}
+
+	if err := requestTx.Rollback(); err != nil {
+		t.Fatalf("release authoritative request advisory lock: %v", err)
+	}
+
+	var expiredRequestID string
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT request_id
+		FROM cq_expire_scope($1, $2, $3, $4, $5, $6)
+	`, "host", hostnameHash, nil, nil, nowMs+11, 500).Scan(&expiredRequestID); err != nil {
+		t.Fatalf("expire scope after advisory lock release: %v", err)
+	}
+	if expiredRequestID != requestID {
+		t.Fatalf("expected expire scope to process request after advisory lock release, got %q", expiredRequestID)
 	}
 }
 
@@ -1162,7 +1695,7 @@ func TestRuntimeAcquireCleansExpiredCapacityUsingRequestClock(t *testing.T) {
 	}
 }
 
-func TestRuntimeReleaseExpiresStaleHostScopeUsingRequestClock(t *testing.T) {
+func TestRuntimeReleaseOnlyMutatesAuthoritativeRequestLifecycle(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 
@@ -1222,8 +1755,8 @@ func TestRuntimeReleaseExpiresStaleHostScopeUsingRequestClock(t *testing.T) {
 	if err := db.QueryRowContext(context.Background(), `SELECT state FROM concurrency_leases WHERE lease_id = $1::uuid`, releaseLease.LeaseID).Scan(&releasedState); err != nil {
 		t.Fatalf("read released lease state: %v", err)
 	}
-	if staleState != "expired" {
-		t.Fatalf("expected stale lease expired during release cleanup, got %q", staleState)
+	if staleState != "active" {
+		t.Fatalf("expected unrelated stale lease to remain outside release authority, got %q", staleState)
 	}
 	if releasedState != "released" {
 		t.Fatalf("expected addressed lease released, got %q", releasedState)
@@ -1237,8 +1770,8 @@ func TestRuntimeReleaseExpiresStaleHostScopeUsingRequestClock(t *testing.T) {
 	`, "release-host").Scan(&hostCount); err != nil {
 		t.Fatalf("read host counter: %v", err)
 	}
-	if hostCount != 0 {
-		t.Fatalf("expected host counter drained after release cleanup, got %d", hostCount)
+	if hostCount != 1 {
+		t.Fatalf("expected host counter to reflect one remaining active request, got %d", hostCount)
 	}
 }
 
@@ -1301,6 +1834,117 @@ func TestRuntimeReleaseMarksRequestReleasedWithoutCreatingNewLease(t *testing.T)
 	}
 	if requestState != "released" || terminalReason != "already_released" {
 		t.Fatalf("expected released request tombstone, got state=%q terminal_reason=%q", requestState, terminalReason)
+	}
+}
+
+func TestRuntimeReleaseReturnsExpiredWhenAddressedActiveLeaseIsAlreadyExpired(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	lease, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash: "release-expired-host",
+		Hostname:     "release-expired.example.com",
+		SiteBucket:   "site-a",
+		IPBucket:     "ip-a",
+		RequestID:    "release-expired-request",
+		HardExpireMs: nowMs + 60_000,
+		NowMs:        nowMs,
+	})
+	if err != nil {
+		t.Fatalf("seed acquire: %v", err)
+	}
+	if lease.Result != "granted" {
+		t.Fatalf("expected granted seed lease, got %+v", lease)
+	}
+
+	pastMs := nowMs - 1_000
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_leases
+		SET hard_expire_at_ms = $2::bigint,
+		    expires_at_ms = $2::bigint,
+		    expires_at = to_timestamp(($2::bigint) / 1000.0)
+		WHERE lease_id = $1::uuid
+	`, lease.LeaseID, pastMs); err != nil {
+		t.Fatalf("age addressed lease into expired state: %v", err)
+	}
+
+	var releaseResult string
+	var releaseReason sql.NullString
+	var releaseRequestID sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason, request_id
+		FROM cq_release($1::uuid, $2, $3, $4)
+	`, lease.LeaseID, lease.LeaseToken, "stream_complete", nowMs+1).Scan(&releaseResult, &releaseReason, &releaseRequestID); err != nil {
+		t.Fatalf("release expired addressed lease: %v", err)
+	}
+	if releaseResult != "expired" || releaseReason.String != "hard_expired" || releaseRequestID.String != "release-expired-request" {
+		t.Fatalf("expected release to return expired authoritative outcome, got result=%q reason=%q request=%q", releaseResult, releaseReason.String, releaseRequestID.String)
+	}
+
+	var requestState, terminalReason string
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT state, terminal_reason
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, "release-expired-request").Scan(&requestState, &terminalReason); err != nil {
+		t.Fatalf("read expired release request state: %v", err)
+	}
+	if requestState != "expired" || terminalReason != "hard_expired" {
+		t.Fatalf("expected release to terminalize request as expired, got state=%q terminal_reason=%q", requestState, terminalReason)
+	}
+}
+
+func TestRuntimeReleaseReturnsExpiredBeforeWrongTokenConflictForExpiredActiveLease(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	lease, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash: "release-wrong-token-expired-host",
+		Hostname:     "release-wrong-token-expired.example.com",
+		SiteBucket:   "site-a",
+		IPBucket:     "ip-a",
+		RequestID:    "release-wrong-token-expired-request",
+		HardExpireMs: nowMs + 60_000,
+		NowMs:        nowMs,
+	})
+	if err != nil {
+		t.Fatalf("seed acquire: %v", err)
+	}
+	if lease.Result != "granted" {
+		t.Fatalf("expected granted seed lease, got %+v", lease)
+	}
+
+	pastMs := nowMs - 1_000
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_leases
+		SET hard_expire_at_ms = $2::bigint,
+		    expires_at_ms = $2::bigint,
+		    expires_at = to_timestamp(($2::bigint) / 1000.0)
+		WHERE lease_id = $1::uuid
+	`, lease.LeaseID, pastMs); err != nil {
+		t.Fatalf("age addressed lease into expired state: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE concurrency_requests
+		SET hard_expire_at_ms = $2::bigint,
+		    lease_expires_at_ms = $2::bigint,
+		    updated_at_ms = $2::bigint
+		WHERE request_id = $1
+	`, "release-wrong-token-expired-request", pastMs); err != nil {
+		t.Fatalf("age authoritative request into expired state: %v", err)
+	}
+
+	var releaseResult string
+	var releaseReason sql.NullString
+	var releaseRequestID sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason, request_id
+		FROM cq_release($1::uuid, $2, $3, $4)
+	`, lease.LeaseID, "wrong-lease-token", "stream_complete", nowMs+1).Scan(&releaseResult, &releaseReason, &releaseRequestID); err != nil {
+		t.Fatalf("release expired addressed lease with wrong token: %v", err)
+	}
+	if releaseResult != "expired" || releaseReason.String != "hard_expired" || releaseRequestID.String != "release-wrong-token-expired-request" {
+		t.Fatalf("expected release expiry precedence before wrong-token conflict, got result=%q reason=%q request=%q", releaseResult, releaseReason.String, releaseRequestID.String)
 	}
 }
 

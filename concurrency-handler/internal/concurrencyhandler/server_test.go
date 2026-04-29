@@ -437,39 +437,219 @@ func TestAcquireRejectsGrantedResultWithoutClaimToken(t *testing.T) {
 
 func TestClaimGrantEndpointUsesAuthAndNormalizesResults(t *testing.T) {
 	nowMs := time.Now().UnixMilli()
-	backend := &stubBackend{claimFn: func(_ context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error) {
-		if req.RequestID != "req-1" || req.ClaimToken != "claim-token" || req.NowMs != nowMs {
-			t.Fatalf("unexpected claim request: %+v", req)
-		}
-		return &ClaimGrantResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: nowMs + 60_000}, nil
-	}}
-	server := newTestServerInstance(t, backend)
+	db := requireRuntimeConcurrencyDB(t)
+	cfg := validTestConfig()
+	cfg.Concurrency.Caps.HostMaxInFlight = 1
+	cfg.Concurrency.Caps.SiteMaxInFlight = 1
+	cfg.Concurrency.Caps.SiteIPMaxInFlight = 1
+	server := newTestServerInstanceWithConfig(t, cfg, &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}})
 	handler := server.Handler()
+	acquireReq := AcquireRequest{
+		Hostname:       "claim-endpoint.example.com",
+		HostnameHash:   "claim-endpoint-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "req-1",
+		HardExpireAtMs: nowMs + 60_000,
+		NowMs:          nowMs,
+	}
+	acquireRec := postJSON(t, handler, acquirePath, acquireReq, "secret")
+	if acquireRec.Code != http.StatusOK {
+		t.Fatalf("expected acquire 200, got %d body=%s", acquireRec.Code, acquireRec.Body.String())
+	}
+	acquireBody := decodeBody(t, acquireRec)
+	if acquireBody["result"] != "granted" {
+		t.Fatalf("expected granted acquire body, got %v", acquireBody)
+	}
+	claimToken, ok := acquireBody["claimToken"].(string)
+	if !ok || strings.TrimSpace(claimToken) == "" {
+		t.Fatalf("expected acquire claim token, got %v", acquireBody)
+	}
 
-	unauthorized := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: "claim-token", NowMs: nowMs}, "")
+	unauthorized := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: claimToken, NowMs: nowMs + 1}, "")
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("expected missing auth 401, got %d", unauthorized.Code)
 	}
 
-	rec := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: "claim-token", NowMs: nowMs}, "secret")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected claim 200, got %d body=%s", rec.Code, rec.Body.String())
+	firstClaim := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: claimToken, NowMs: nowMs + 1}, "secret")
+	if firstClaim.Code != http.StatusOK {
+		t.Fatalf("expected first claim 200, got %d body=%s", firstClaim.Code, firstClaim.Body.String())
 	}
-	body := decodeBody(t, rec)
-	if body["result"] != "granted" || body["leaseId"] != "lease-1" || body["leaseToken"] != "token-1" {
-		t.Fatalf("expected claim granted body, got %v", body)
+	firstClaimBody := decodeBody(t, firstClaim)
+	if firstClaimBody["result"] != "granted" || firstClaimBody["leaseId"] != acquireBody["leaseId"] || firstClaimBody["leaseToken"] != acquireBody["leaseToken"] {
+		t.Fatalf("expected first claim to return acquired lease identity, got %v (acquire=%v)", firstClaimBody, acquireBody)
 	}
 
-	backend.claimFn = func(context.Context, ClaimGrantRequest) (*ClaimGrantResult, error) {
-		return &ClaimGrantResult{Result: "conflict", Reason: "grant_already_claimed"}, nil
+	duplicate := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: claimToken, NowMs: nowMs + 2}, "secret")
+	if duplicate.Code != http.StatusOK {
+		t.Fatalf("expected duplicate same-token claim 200, got %d body=%s", duplicate.Code, duplicate.Body.String())
 	}
-	conflict := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: "claim-token", NowMs: nowMs + 1}, "secret")
+	duplicateBody := decodeBody(t, duplicate)
+	if duplicateBody["result"] != "granted" || duplicateBody["leaseId"] != firstClaimBody["leaseId"] || duplicateBody["leaseToken"] != firstClaimBody["leaseToken"] || duplicateBody["expiresAtMs"] != firstClaimBody["expiresAtMs"] {
+		t.Fatalf("expected duplicate claim replay to preserve lease identity, got %v (first=%v)", duplicateBody, firstClaimBody)
+	}
+
+	conflict := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: "wrong-claim-token", NowMs: nowMs + 3}, "secret")
 	if conflict.Code != http.StatusConflict {
-		t.Fatalf("expected duplicate claim 409, got %d body=%s", conflict.Code, conflict.Body.String())
+		t.Fatalf("expected mismatched token claim 409, got %d body=%s", conflict.Code, conflict.Body.String())
 	}
 	conflictBody := decodeBody(t, conflict)
 	if conflictBody["result"] != "conflict" || conflictBody["reason"] != "grant_already_claimed" || conflictBody["leaseToken"] != nil {
-		t.Fatalf("expected terminal duplicate claim conflict without lease identity, got %v", conflictBody)
+		t.Fatalf("expected mismatched token claim conflict without lease identity, got %v", conflictBody)
+	}
+}
+
+func TestHandleClaimClearsReplayStateOnExpiredResult(t *testing.T) {
+	server := newTestServerInstance(t, &activeReplayCleanupBackend{
+		stubBackend: &stubBackend{claimResult: &ClaimGrantResult{Result: "expired", Reason: "hard_expired"}},
+	})
+	server.observability.markActiveRequest("expired-active-request")
+	server.waitingRuntime.markActiveRequestObserved("expired-active-request")
+
+	rec := postJSON(t, server.Handler(), claimPath, ClaimGrantRequest{RequestID: "expired-active-request", ClaimToken: "claim-token", NowMs: 1000}, "secret")
+	if rec.Code != http.StatusGone {
+		t.Fatalf("expected expired claim response 410, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["result"] != "expired" || body["reason"] != "hard_expired" {
+		t.Fatalf("expected expired claim body, got %v", body)
+	}
+	if server.observability.hasActiveRequest("expired-active-request") {
+		t.Fatal("expected expired claim to clear observability active replay state")
+	}
+	if server.waitingRuntime.isReplayActiveRequest("expired-active-request") {
+		t.Fatal("expected expired claim to clear runtime active replay state")
+	}
+}
+
+func TestHandleClaimWakesAndDeliversTerminalWaitersOnReleasedOrCancelledOrExpired(t *testing.T) {
+	tests := []struct {
+		name         string
+		claimResult  *ClaimGrantResult
+		waiterResult *AcquireResult
+	}{
+		{
+			name:         "released",
+			claimResult:  &ClaimGrantResult{Result: "released", Reason: "already_released"},
+			waiterResult: &AcquireResult{Result: "released", Reason: "already_released"},
+		},
+		{
+			name:         "cancelled",
+			claimResult:  &ClaimGrantResult{Result: "cancelled", Reason: "request_cancelled"},
+			waiterResult: &AcquireResult{Result: "cancelled", Reason: "request_cancelled"},
+		},
+		{
+			name:         "expired",
+			claimResult:  &ClaimGrantResult{Result: "expired", Reason: "hard_expired"},
+			waiterResult: &AcquireResult{Result: "expired", Reason: "hard_expired"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			nowMs := time.Now().UnixMilli()
+			var promoteCalls int
+			var probeCalls int
+			backend := &probingBackend{
+				stubBackend: &stubBackend{
+					claimResult: tc.claimResult,
+					promoteFn: func(_ context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+						promoteCalls++
+						if req.RequestID != "waiting-request" {
+							t.Fatalf("unexpected promote request: %+v", req)
+						}
+						return &AcquireResult{Result: "wait", WaitToken: "wait-terminal", Scope: "host", RetryAfter: 1}, nil
+					},
+				},
+				probeFn: func(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
+					probeCalls++
+					if req.RequestID != "waiting-request" || req.WaitToken != "wait-terminal" {
+						t.Fatalf("unexpected probe request: %+v", req)
+					}
+					return cloneAcquireResult(tc.waiterResult), nil
+				},
+			}
+			cfg := validTestConfig()
+			server := newTestServerInstanceWithConfig(t, cfg, backend)
+			waiter, ok := server.waitingRuntime.tryAttach("wait-terminal")
+			if !ok || waiter == nil {
+				t.Fatal("expected attached waiter")
+			}
+			server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "claim-terminal.example.com", HostnameHash: "claim-terminal-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "waiting-request", HardExpireAtMs: nowMs + 60_000, NowMs: nowMs, WaitToken: "wait-terminal"}, "wait-terminal", waiter, cfg)
+
+			rec := postJSON(t, server.Handler(), claimPath, ClaimGrantRequest{RequestID: "active-request", ClaimToken: "claim-token", NowMs: nowMs + 1}, "secret")
+			if rec.Code != http.StatusGone {
+				t.Fatalf("expected terminal claim response 410, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			body := decodeBody(t, rec)
+			if body["result"] != tc.claimResult.Result || body["reason"] != tc.claimResult.Reason {
+				t.Fatalf("expected terminal claim body %q/%q, got %v", tc.claimResult.Result, tc.claimResult.Reason, body)
+			}
+			if promoteCalls == 0 {
+				t.Fatal("expected terminal claim to wake attached waiters via host pass")
+			}
+			if probeCalls == 0 {
+				t.Fatal("expected terminal claim to probe attached waiters for terminal delivery")
+			}
+			delivered := consumeWaiterDelivery(waiter)
+			if delivered == nil || delivered.Result != tc.waiterResult.Result || delivered.Reason != tc.waiterResult.Reason {
+				t.Fatalf("expected terminal waiter delivery %+v, got %+v", tc.waiterResult, delivered)
+			}
+			if snap, ok := server.waitingRuntime.snapshotForWaitToken("wait-terminal"); ok {
+				t.Fatalf("expected terminal waiter snapshot removal, got %+v", snap)
+			}
+		})
+	}
+}
+
+func TestHandleClaimConflictDoesNotClearReplayState(t *testing.T) {
+	var promoteCalls int
+	var probeCalls int
+	backend := &probingBackend{
+		stubBackend: &stubBackend{
+			claimResult: &ClaimGrantResult{Result: "conflict", Reason: "grant_already_claimed"},
+			promoteFn: func(context.Context, PromoteWaitingRequest) (*AcquireResult, error) {
+				promoteCalls++
+				return &AcquireResult{Result: "wait", WaitToken: "wait-conflict", Scope: "host", RetryAfter: 1}, nil
+			},
+		},
+		probeFn: func(context.Context, AcquireRequest) (*AcquireResult, error) {
+			probeCalls++
+			return &AcquireResult{Result: "expired", Reason: "hard_expired"}, nil
+		},
+	}
+	cfg := validTestConfig()
+	server := newTestServerInstanceWithConfig(t, cfg, backend)
+	server.observability.markActiveRequest("conflict-active-request")
+	server.waitingRuntime.markActiveRequestObserved("conflict-active-request")
+	waiter, ok := server.waitingRuntime.tryAttach("wait-conflict")
+	if !ok || waiter == nil {
+		t.Fatal("expected attached waiter")
+	}
+	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "claim-conflict.example.com", HostnameHash: "claim-conflict-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "waiting-conflict-request", HardExpireAtMs: time.Now().UnixMilli() + 60_000, NowMs: time.Now().UnixMilli(), WaitToken: "wait-conflict"}, "wait-conflict", waiter, cfg)
+
+	rec := postJSON(t, server.Handler(), claimPath, ClaimGrantRequest{RequestID: "conflict-active-request", ClaimToken: "wrong-claim-token", NowMs: 1000}, "secret")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected claim conflict 409, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["result"] != "conflict" || body["reason"] != "grant_already_claimed" {
+		t.Fatalf("expected claim conflict body, got %v", body)
+	}
+	if !server.observability.hasActiveRequest("conflict-active-request") {
+		t.Fatal("expected conflict claim to preserve observability active replay state")
+	}
+	if !server.waitingRuntime.isReplayActiveRequest("conflict-active-request") {
+		t.Fatal("expected conflict claim to preserve runtime active replay state")
+	}
+	if promoteCalls != 0 || probeCalls != 0 {
+		t.Fatalf("expected conflict claim to skip terminal waiter cleanup, got promote=%d probe=%d", promoteCalls, probeCalls)
+	}
+	if delivered := consumeWaiterDelivery(waiter); delivered != nil {
+		t.Fatalf("expected no terminal waiter delivery on claim conflict, got %+v", delivered)
+	}
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken("wait-conflict"); !ok || snap.RequestID != "waiting-conflict-request" {
+		t.Fatalf("expected waiter snapshot to remain after claim conflict, got %+v ok=%v", snap, ok)
 	}
 }
 
@@ -1522,6 +1702,29 @@ func TestReleaseClearsActiveReplayState(t *testing.T) {
 	}
 }
 
+func TestReleaseClearsActiveReplayStateForDirectExpiredResult(t *testing.T) {
+	server := newTestServerInstance(t, &activeReplayCleanupBackend{
+		stubBackend: &stubBackend{releaseResult: &ReleaseResult{Result: "expired", Reason: "hard_expired", RequestID: "expired-active-request"}},
+	})
+	server.observability.markActiveRequest("expired-active-request")
+	server.waitingRuntime.markActiveRequestObserved("expired-active-request")
+
+	rec := postJSON(t, server.Handler(), releasePath, ReleaseRequest{LeaseID: "lease-1", LeaseToken: "lease-token", Reason: "stream_complete", NowMs: 1000}, "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected expired response 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["result"] != "expired" || body["reason"] != "hard_expired" {
+		t.Fatalf("expected expired release body, got %v", body)
+	}
+	if server.observability.hasActiveRequest("expired-active-request") {
+		t.Fatal("expected direct expired release to clear observability active replay state")
+	}
+	if server.waitingRuntime.isReplayActiveRequest("expired-active-request") {
+		t.Fatal("expected direct expired release to clear runtime active replay state")
+	}
+}
+
 func TestReleaseResponseDoesNotExposeInternalRequestID(t *testing.T) {
 	handler := newTestServer(t, &stubBackend{releaseResult: &ReleaseResult{Result: "released", RequestID: "internal-request"}})
 	rec := postJSON(t, handler, releasePath, validReleaseRequest(), "secret")
@@ -1597,6 +1800,42 @@ func TestReleaseClearsActiveReplayStateWithPostgrestAuthoritativeRequestID(t *te
 	}
 	if server.waitingRuntime.isReplayActiveRequest("released-active-request") {
 		t.Fatal("expected postgrest release to clear runtime active replay state")
+	}
+}
+
+func TestReleaseClearsActiveReplayStateWithPostgrestDirectExpiredAuthoritativeRequestID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/concurrency_requests"):
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/concurrency_leases"):
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/rpc/cq_release":
+			_, _ = w.Write([]byte(`[{"result":"expired","reason":"hard_expired","request_id":"expired-active-request"}]`))
+		default:
+			t.Fatalf("unexpected postgrest request: method=%s path=%s query=%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	server := newTestServerInstanceWithConfig(t, cfg, newPostgrestBackend(cfg, srv.Client()))
+	server.observability.markActiveRequest("expired-active-request")
+	server.waitingRuntime.markActiveRequestObserved("expired-active-request")
+
+	rec := postJSON(t, server.Handler(), releasePath, ReleaseRequest{LeaseID: "lease-1", LeaseToken: "lease-token", Reason: "stream_complete", NowMs: 1000}, "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected expired response 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if server.observability.hasActiveRequest("expired-active-request") {
+		t.Fatal("expected postgrest direct expired release to clear observability active replay state")
+	}
+	if server.waitingRuntime.isReplayActiveRequest("expired-active-request") {
+		t.Fatal("expected postgrest direct expired release to clear runtime active replay state")
 	}
 }
 
