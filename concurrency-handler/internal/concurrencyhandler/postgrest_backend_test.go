@@ -69,6 +69,28 @@ func TestPostgrestAcquireRejectsGrantedResultWithoutClaimToken(t *testing.T) {
 	}
 }
 
+func TestPostgrestAcquireAllowsClaimHandoffTimeoutReleasedResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"released","reason":"claim_handoff_timeout"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.Acquire(context.Background(), validAcquireRequest())
+	if err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if result.Result != "released" || result.Reason != "claim_handoff_timeout" {
+		t.Fatalf("unexpected acquire released result: %+v", result)
+	}
+}
+
 func TestPostgrestClaimGrantUsesFixedRPCAndNormalizesResult(t *testing.T) {
 	var gotPath string
 	var gotBody map[string]any
@@ -82,7 +104,7 @@ func TestPostgrestClaimGrantUsesFixedRPCAndNormalizesResult(t *testing.T) {
 			t.Fatalf("decode body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-1","lease_token":"token-1","expires_at_ms":2500}]`))
+		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-1","lease_token":"token-1","expires_at_ms":2500,"handoff_token":"handoff-1","handoff_deadline_ms":2400}]`))
 	}))
 	defer srv.Close()
 
@@ -102,8 +124,175 @@ func TestPostgrestClaimGrantUsesFixedRPCAndNormalizesResult(t *testing.T) {
 	if gotBody["p_request_id"] != "request-1" || gotBody["p_claim_token"] != "claim-1" {
 		t.Fatalf("expected claim payload, got %v", gotBody)
 	}
-	if result.Result != "granted" || result.LeaseID != "lease-1" || result.LeaseToken != "token-1" {
+	if result.Result != "granted" || result.LeaseID != "lease-1" || result.LeaseToken != "token-1" || result.HandoffToken != "handoff-1" || result.HandoffDeadlineMs != 2400 {
 		t.Fatalf("unexpected claim result: %+v", result)
+	}
+}
+
+func TestPostgrestBackendClaimGrantReturnsHandoffPayload(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"granted","lease_id":"lease-1","lease_token":"token-1","expires_at_ms":2500,"handoff_token":"handoff-1","handoff_deadline_ms":2400}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.ClaimGrant(context.Background(), ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("ClaimGrant error: %v", err)
+	}
+	if gotPath != "/rpc/cq_claim_grant" {
+		t.Fatalf("expected fixed claim rpc path, got %s", gotPath)
+	}
+	if gotBody["p_request_id"] != "request-1" || gotBody["p_claim_token"] != "claim-1" || gotBody["p_now_ms"] != float64(1000) {
+		t.Fatalf("expected claim payload, got %v", gotBody)
+	}
+	if result.Result != "granted" || result.LeaseID != "lease-1" || result.LeaseToken != "token-1" || result.ExpiresAtMs != 2500 {
+		t.Fatalf("expected claim grant lease identity, got %+v", result)
+	}
+	if result.HandoffToken != "handoff-1" || result.HandoffDeadlineMs != 2400 {
+		t.Fatalf("expected claim grant handoff payload, got %+v", result)
+	}
+}
+
+func TestPostgrestClaimGrantAllowsClaimHandoffTimeoutReleasedResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"released","reason":"claim_handoff_timeout"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.ClaimGrant(context.Background(), ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("ClaimGrant error: %v", err)
+	}
+	if result.Result != "released" || result.Reason != "claim_handoff_timeout" {
+		t.Fatalf("unexpected released claim result: %+v", result)
+	}
+}
+
+func TestPostgrestBackendClaimGrantTerminalAllowsClaimHandoffTimeoutReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"released","reason":"claim_handoff_timeout"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.ClaimGrant(context.Background(), ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("ClaimGrant error: %v", err)
+	}
+	if result.Result != "released" || result.Reason != "claim_handoff_timeout" {
+		t.Fatalf("expected claim_handoff_timeout terminal replay, got %+v", result)
+	}
+}
+
+func TestPostgrestBackendAckHandoffAcknowledged(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"acknowledged"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("AckHandoff error: %v", err)
+	}
+	if gotPath != "/rpc/cq_ack_handoff" {
+		t.Fatalf("expected fixed ack handoff rpc path, got %s", gotPath)
+	}
+	if gotBody["p_request_id"] != "request-1" || gotBody["p_handoff_token"] != "handoff-1" || gotBody["p_now_ms"] != float64(1000) {
+		t.Fatalf("expected ack handoff payload, got %v", gotBody)
+	}
+	if result.Result != "acknowledged" || result.Reason != "" {
+		t.Fatalf("expected acknowledged ack handoff result, got %+v", result)
+	}
+}
+
+func TestPostgrestBackendAckHandoffConflictRequiresStableReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"conflict","reason":"handoff_token_mismatch"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "wrong-token", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("AckHandoff error: %v", err)
+	}
+	if result.Result != "conflict" || result.Reason != "handoff_token_mismatch" {
+		t.Fatalf("expected stable conflict reason, got %+v", result)
+	}
+}
+
+func TestPostgrestBackendAckHandoffTerminalRequiresReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"released","reason":"claim_handoff_timeout"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("AckHandoff error: %v", err)
+	}
+	if result.Result != "released" || result.Reason != "claim_handoff_timeout" {
+		t.Fatalf("expected terminal ack handoff reason, got %+v", result)
 	}
 }
 
@@ -669,5 +858,41 @@ func TestPostgrestLoadActiveRequestIDsUsesRecoveryQueryAndReturnsOrderedIDs(t *t
 	}
 	if len(results) != 2 || results[0] != "active-request-1" || results[1] != "active-request-2" {
 		t.Fatalf("unexpected active request ids: %+v", results)
+	}
+}
+
+func TestPostgrestLoadOverdueHandoffPendingRequestIDsUsesRecoveryQueryAndReturnsOrderedIDs(t *testing.T) {
+	var gotPath string
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.String()
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"request_id":"handoff-request-1"},
+			{"request_id":"handoff-request-2"}
+		]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	cfg.Backend.Postgrest.AuthHeader = "Bearer secret"
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	results, err := backend.LoadOverdueHandoffPendingRequestIDs(context.Background(), 1000, 3)
+	if err != nil {
+		t.Fatalf("LoadOverdueHandoffPendingRequestIDs error: %v", err)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Fatalf("expected auth header on overdue handoff recovery query, got %q", gotAuth)
+	}
+	if !strings.Contains(gotPath, "/concurrency_requests?") || !strings.Contains(gotPath, "select=request_id") || !strings.Contains(gotPath, "state=eq.active") || !strings.Contains(gotPath, "handoff_state=eq.pending") || !strings.Contains(gotPath, "handoff_deadline_ms=lte.1000") || !strings.Contains(gotPath, "hard_expire_at_ms=gt.1000") || !strings.Contains(gotPath, "lease_expires_at_ms=gt.1000") || !strings.Contains(gotPath, "order=handoff_deadline_ms.asc%2Crequest_id.asc") || !strings.Contains(gotPath, "limit=3") {
+		t.Fatalf("expected overdue handoff recovery query, got %s", gotPath)
+	}
+	if len(results) != 2 || results[0] != "handoff-request-1" || results[1] != "handoff-request-2" {
+		t.Fatalf("unexpected overdue handoff request ids: %+v", results)
 	}
 }

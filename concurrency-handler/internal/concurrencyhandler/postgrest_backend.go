@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -191,11 +192,13 @@ func (b *postgrestBackend) ProbeContinueWait(ctx context.Context, req AcquireReq
 
 func (b *postgrestBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error) {
 	result := &struct {
-		Result      string `json:"result"`
-		LeaseID     string `json:"lease_id"`
-		LeaseToken  string `json:"lease_token"`
-		ExpiresAtMs int64  `json:"expires_at_ms"`
-		Reason      string `json:"reason"`
+		Result            string `json:"result"`
+		LeaseID           string `json:"lease_id"`
+		LeaseToken        string `json:"lease_token"`
+		ExpiresAtMs       int64  `json:"expires_at_ms"`
+		HandoffToken      string `json:"handoff_token"`
+		HandoffDeadlineMs int64  `json:"handoff_deadline_ms"`
+		Reason            string `json:"reason"`
 	}{}
 	err := b.doRPC(ctx, fixedClaimGrantFunc, map[string]any{
 		"p_request_id":  req.RequestID,
@@ -205,8 +208,36 @@ func (b *postgrestBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest
 	if err != nil {
 		return nil, err
 	}
-	serviceResult := &ClaimGrantResult{Result: result.Result, LeaseID: result.LeaseID, LeaseToken: result.LeaseToken, ExpiresAtMs: result.ExpiresAtMs, Reason: result.Reason}
+	serviceResult := &ClaimGrantResult{
+		Result:            result.Result,
+		LeaseID:           result.LeaseID,
+		LeaseToken:        result.LeaseToken,
+		ExpiresAtMs:       result.ExpiresAtMs,
+		HandoffToken:      result.HandoffToken,
+		HandoffDeadlineMs: result.HandoffDeadlineMs,
+		Reason:            result.Reason,
+	}
 	if err := validateClaimGrantResult(serviceResult); err != nil {
+		return nil, err
+	}
+	return serviceResult, nil
+}
+
+func (b *postgrestBackend) AckHandoff(ctx context.Context, req AckHandoffRequest) (*AckHandoffResult, error) {
+	result := &struct {
+		Result string `json:"result"`
+		Reason string `json:"reason"`
+	}{}
+	err := b.doRPC(ctx, fixedAckHandoffFunc, map[string]any{
+		"p_request_id":    req.RequestID,
+		"p_handoff_token": req.HandoffToken,
+		"p_now_ms":        req.NowMs,
+	}, result)
+	if err != nil {
+		return nil, err
+	}
+	serviceResult := &AckHandoffResult{Result: result.Result, Reason: result.Reason}
+	if err := validateAckHandoffResult(serviceResult); err != nil {
 		return nil, err
 	}
 	return serviceResult, nil
@@ -439,6 +470,55 @@ func (b *postgrestBackend) LoadActiveRequestIDs(ctx context.Context) ([]string, 
 		requestIDs = append(requestIDs, row.RequestID)
 	}
 	return requestIDs, nil
+}
+
+func (b *postgrestBackend) LoadOverdueHandoffPendingRequestIDs(ctx context.Context, nowMs int64, limit int) ([]string, error) {
+	params := url.Values{}
+	params.Set("select", "request_id")
+	params.Set("state", "eq.active")
+	params.Set("handoff_state", "eq.pending")
+	params.Set("handoff_deadline_ms", "lte."+strconv.FormatInt(nowMs, 10))
+	params.Set("hard_expire_at_ms", "gt."+strconv.FormatInt(nowMs, 10))
+	params.Set("lease_expires_at_ms", "gt."+strconv.FormatInt(nowMs, 10))
+	params.Set("order", "handoff_deadline_ms.asc,request_id.asc")
+	params.Set("limit", strconv.Itoa(boundedExpireLimit(limit, b.cfg.Concurrency.Sweep.BatchSize)))
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, b.baseURL+"/concurrency_requests?"+params.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header = b.buildHeaders()
+	response, err := b.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+		return nil, fmt.Errorf("postgrest overdue handoff recovery query failed: status=%d body=%s", response.StatusCode, string(data))
+	}
+	var rows []struct {
+		RequestID string `json:"request_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&rows); err != nil {
+		return nil, err
+	}
+	requestIDs := make([]string, 0, len(rows))
+	for _, row := range rows {
+		requestIDs = append(requestIDs, row.RequestID)
+	}
+	return requestIDs, nil
+}
+
+func (b *postgrestBackend) ExpireActiveRequestIfDue(ctx context.Context, requestID string, nowMs int64) (bool, error) {
+	var expired bool
+	err := b.doRPC(ctx, "cq_expire_active_request_if_due", map[string]any{
+		"p_request_id": requestID,
+		"p_now_ms":     nowMs,
+	}, &expired)
+	if err != nil {
+		return false, err
+	}
+	return expired, nil
 }
 
 func newBackend(cfg Config) (Backend, error) {

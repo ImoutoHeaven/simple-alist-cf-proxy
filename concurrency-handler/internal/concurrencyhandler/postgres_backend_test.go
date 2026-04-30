@@ -127,6 +127,21 @@ func TestPostgresAcquireRejectsGrantedResultWithoutClaimToken(t *testing.T) {
 	}
 }
 
+func TestPostgresAcquireAllowsClaimHandoffTimeoutReleasedResult(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{`{"result":"released","reason":"claim_handoff_timeout"}`}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.Acquire(context.Background(), validAcquireRequest())
+	if err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if result.Result != "released" || result.Reason != "claim_handoff_timeout" {
+		t.Fatalf("unexpected acquire released result: %+v", result)
+	}
+}
+
 func TestPostgresClaimGrantUsesFixedRPCAndNormalizesResult(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
 		if !strings.Contains(query, "FROM cq_claim_grant(") {
@@ -135,7 +150,28 @@ func TestPostgresClaimGrantUsesFixedRPCAndNormalizesResult(t *testing.T) {
 		if len(args) != 3 || args[0] != "request-1" || args[1] != "claim-1" {
 			t.Fatalf("unexpected claim args: %v", args)
 		}
-		return &stubRows{rows: [][]any{{"granted", "lease-1", "token-1", int64(2500), nil}}}, nil
+		return &stubRows{rows: [][]any{{"granted", "lease-1", "token-1", int64(2500), "handoff-1", int64(2400), nil}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.ClaimGrant(context.Background(), ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("ClaimGrant error: %v", err)
+	}
+	if result.Result != "granted" || result.LeaseID != "lease-1" || result.LeaseToken != "token-1" || result.ExpiresAtMs != 2500 || result.HandoffToken != "handoff-1" || result.HandoffDeadlineMs != 2400 {
+		t.Fatalf("unexpected claim result: %+v", result)
+	}
+}
+
+func TestPostgresBackendClaimGrantReturnsHandoffPayload(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "FROM cq_claim_grant(") {
+			t.Fatalf("claim grant must use fixed rpc, got %s", query)
+		}
+		if len(args) != 3 || args[0] != "request-1" || args[1] != "claim-1" || args[2] != int64(1000) {
+			t.Fatalf("unexpected claim args: %v", args)
+		}
+		return &stubRows{rows: [][]any{{"granted", "lease-1", "token-1", int64(2500), "handoff-1", int64(2400), nil}}}, nil
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
@@ -144,13 +180,97 @@ func TestPostgresClaimGrantUsesFixedRPCAndNormalizesResult(t *testing.T) {
 		t.Fatalf("ClaimGrant error: %v", err)
 	}
 	if result.Result != "granted" || result.LeaseID != "lease-1" || result.LeaseToken != "token-1" || result.ExpiresAtMs != 2500 {
-		t.Fatalf("unexpected claim result: %+v", result)
+		t.Fatalf("expected claim grant lease identity, got %+v", result)
+	}
+	if result.HandoffToken != "handoff-1" || result.HandoffDeadlineMs != 2400 {
+		t.Fatalf("expected claim grant handoff payload, got %+v", result)
+	}
+}
+
+func TestPostgresClaimGrantAllowsClaimHandoffTimeoutReleasedResult(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{"released", nil, nil, nil, nil, nil, "claim_handoff_timeout"}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.ClaimGrant(context.Background(), ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("ClaimGrant error: %v", err)
+	}
+	if result.Result != "released" || result.Reason != "claim_handoff_timeout" {
+		t.Fatalf("unexpected released claim result: %+v", result)
+	}
+}
+
+func TestPostgresBackendClaimGrantTerminalAllowsClaimHandoffTimeoutReason(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{"released", nil, nil, nil, nil, nil, "claim_handoff_timeout"}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.ClaimGrant(context.Background(), ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("ClaimGrant error: %v", err)
+	}
+	if result.Result != "released" || result.Reason != "claim_handoff_timeout" {
+		t.Fatalf("expected claim_handoff_timeout terminal replay, got %+v", result)
+	}
+}
+
+func TestPostgresBackendAckHandoffAcknowledged(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "FROM cq_ack_handoff(") {
+			t.Fatalf("ack handoff must use fixed rpc, got %s", query)
+		}
+		if len(args) != 3 || args[0] != "request-1" || args[1] != "handoff-1" || args[2] != int64(1000) {
+			t.Fatalf("unexpected ack handoff args: %v", args)
+		}
+		return &stubRows{rows: [][]any{{"acknowledged", nil}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("AckHandoff error: %v", err)
+	}
+	if result.Result != "acknowledged" || result.Reason != "" {
+		t.Fatalf("expected acknowledged ack handoff result, got %+v", result)
+	}
+}
+
+func TestPostgresBackendAckHandoffConflictRequiresStableReason(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{"conflict", "handoff_token_mismatch"}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "wrong-token", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("AckHandoff error: %v", err)
+	}
+	if result.Result != "conflict" || result.Reason != "handoff_token_mismatch" {
+		t.Fatalf("expected stable conflict reason, got %+v", result)
+	}
+}
+
+func TestPostgresBackendAckHandoffTerminalRequiresReason(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{"released", "claim_handoff_timeout"}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("AckHandoff error: %v", err)
+	}
+	if result.Result != "released" || result.Reason != "claim_handoff_timeout" {
+		t.Fatalf("expected terminal ack handoff reason, got %+v", result)
 	}
 }
 
 func TestPostgresClaimGrantNormalizesConflictWithoutLeaseIdentity(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		return &stubRows{rows: [][]any{{"conflict", nil, nil, nil, "grant_already_claimed"}}}, nil
+		return &stubRows{rows: [][]any{{"conflict", nil, nil, nil, nil, nil, "grant_already_claimed"}}}, nil
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
@@ -535,6 +655,30 @@ func TestPostgresLoadActiveRequestIDsReturnsOrderedIDs(t *testing.T) {
 	}
 	if len(results) != 2 || results[0] != "active-request-1" || results[1] != "active-request-2" {
 		t.Fatalf("unexpected active request ids: %+v", results)
+	}
+}
+
+func TestPostgresLoadOverdueHandoffPendingRequestIDsReturnsOrderedIDs(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if len(args) != 2 || args[0] != int64(1000) || args[1] != 3 {
+			t.Fatalf("expected overdue handoff query args [1000 3], got %v", args)
+		}
+		if !strings.Contains(query, "FROM concurrency_requests") || !strings.Contains(query, "state = 'active'") || !strings.Contains(query, "handoff_state = 'pending'") || !strings.Contains(query, "handoff_deadline_ms <= $1") {
+			t.Fatalf("expected overdue handoff recovery query over concurrency_requests, got %s", query)
+		}
+		if !strings.Contains(query, "hard_expire_at_ms > $1") || !strings.Contains(query, "lease_expires_at_ms > $1") || !strings.Contains(query, "ORDER BY handoff_deadline_ms, request_id") {
+			t.Fatalf("expected overdue handoff query to preserve request ordering and skip hard-expired rows, got %s", query)
+		}
+		return &stubRows{rows: [][]any{{"handoff-request-1"}, {"handoff-request-2"}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	results, err := backend.LoadOverdueHandoffPendingRequestIDs(context.Background(), 1000, 3)
+	if err != nil {
+		t.Fatalf("LoadOverdueHandoffPendingRequestIDs error: %v", err)
+	}
+	if len(results) != 2 || results[0] != "handoff-request-1" || results[1] != "handoff-request-2" {
+		t.Fatalf("unexpected overdue handoff request ids: %+v", results)
 	}
 }
 

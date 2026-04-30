@@ -24,6 +24,7 @@ import (
 const (
 	acquirePath = "/api/v1/concurrency/acquire"
 	claimPath   = "/api/v1/concurrency/claim"
+	ackPath     = "/api/v1/concurrency/ack_handoff"
 	releasePath = "/api/v1/concurrency/release"
 	cancelPath  = "/api/v1/concurrency/cancel"
 )
@@ -61,6 +62,14 @@ type startupWaitingLoader interface {
 
 type startupActiveRequestLoader interface {
 	LoadActiveRequestIDs(ctx context.Context) ([]string, error)
+}
+
+type overdueHandoffPendingLoader interface {
+	LoadOverdueHandoffPendingRequestIDs(ctx context.Context, nowMs int64, limit int) ([]string, error)
+}
+
+type activeRequestDueExpirer interface {
+	ExpireActiveRequestIfDue(ctx context.Context, requestID string, nowMs int64) (bool, error)
 }
 
 type realSweepTicker struct {
@@ -192,6 +201,7 @@ func (s *Server) Close() error {
 func (s *Server) routes() {
 	s.mux.HandleFunc(acquirePath, s.handleAcquire)
 	s.mux.HandleFunc(claimPath, s.handleClaim)
+	s.mux.HandleFunc(ackPath, s.handleAckHandoff)
 	s.mux.HandleFunc(releasePath, s.handleRelease)
 	s.mux.HandleFunc(cancelPath, s.handleCancel)
 }
@@ -229,13 +239,18 @@ func (s *Server) startSweepLoop(ctx context.Context) func() {
 }
 
 func (s *Server) runSweepPass(ctx context.Context) error {
-	expiredAny, err := s.runExpiryPassAt(ctx, time.Now().UnixMilli())
+	nowMs := time.Now().UnixMilli()
+	overdueAny, err := s.recoverOverdueHandoffPendingAt(ctx, nowMs)
 	if err != nil {
 		return err
 	}
-	if expiredAny {
+	expiredAny, err := s.runExpiryPassAt(ctx, nowMs)
+	if err != nil {
+		return err
+	}
+	if overdueAny || expiredAny {
 		s.wakeAttachedWaiters(ctx)
-		s.deliverTerminalToAttachedWaiters(ctx, time.Now().UnixMilli())
+		s.deliverTerminalToAttachedWaiters(ctx, nowMs)
 	}
 	return nil
 }
@@ -275,6 +290,9 @@ func (s *Server) recoverStartupState(ctx context.Context) error {
 	nowMs := time.Now().UnixMilli()
 	survivingHosts, err := s.recoverWaitingRequestsAt(ctx, nowMs)
 	if err != nil {
+		return err
+	}
+	if _, err := s.recoverOverdueHandoffPendingAt(ctx, nowMs); err != nil {
 		return err
 	}
 	if err := s.recoverExpiredActiveLeasesAt(ctx, nowMs); err != nil {
@@ -339,6 +357,53 @@ func (s *Server) recoverActiveReplayState(ctx context.Context) error {
 		s.waitingRuntime.markActiveRequestObserved(requestID)
 	}
 	return nil
+}
+
+func (s *Server) recoverOverdueHandoffPendingAt(ctx context.Context, nowMs int64) (bool, error) {
+	loader, ok := s.backend.(overdueHandoffPendingLoader)
+	if !ok {
+		return false, nil
+	}
+	expirer, ok := s.backend.(activeRequestDueExpirer)
+	if !ok {
+		return false, nil
+	}
+	limit := boundedExpireLimit(s.cfg.Concurrency.Sweep.BatchSize, s.cfg.Concurrency.Sweep.BatchSize)
+	if limit == 0 {
+		return false, nil
+	}
+
+	recoveredAny := false
+	for {
+		requestIDs, err := loader.LoadOverdueHandoffPendingRequestIDs(ctx, nowMs, limit)
+		if err != nil {
+			return recoveredAny, err
+		}
+		if len(requestIDs) == 0 {
+			return recoveredAny, nil
+		}
+
+		progressed := false
+		for _, requestID := range requestIDs {
+			requestID = strings.TrimSpace(requestID)
+			if requestID == "" {
+				continue
+			}
+			expired, err := expirer.ExpireActiveRequestIfDue(ctx, requestID, nowMs)
+			if err != nil {
+				return recoveredAny, err
+			}
+			if !expired {
+				continue
+			}
+			progressed = true
+			recoveredAny = true
+			s.clearActiveReplayState(requestID)
+		}
+		if !progressed || len(requestIDs) < limit {
+			return recoveredAny, nil
+		}
+	}
 }
 
 func (s *Server) defaultSweepTargetSource(ctx context.Context, nowMs int64, batchSize int) ([]ExpireScopeRequest, error) {
@@ -631,6 +696,19 @@ func claimGrantResultStatus(result string) (int, bool) {
 	}
 }
 
+func ackHandoffResultStatus(result string) (int, bool) {
+	switch result {
+	case "acknowledged":
+		return http.StatusOK, true
+	case "conflict":
+		return http.StatusConflict, true
+	case "released", "cancelled", "expired":
+		return http.StatusGone, true
+	default:
+		return 0, false
+	}
+}
+
 func validateAcquireRequest(req AcquireRequest) error {
 	if strings.TrimSpace(req.Hostname) == "" {
 		return errors.New("hostname is required")
@@ -698,6 +776,51 @@ func validateCancelRequest(req CancelRequest) error {
 		return errors.New("nowMs is required")
 	}
 	return nil
+}
+
+func (s *Server) handleAckHandoff(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if ok, code := s.checkAuth(r); !ok {
+		http.Error(w, http.StatusText(code), code)
+		return
+	}
+	var req AckHandoffRequest
+	if err := decodeJSON(r, &req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if err := validateAckHandoffRequest(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	backend, ok := s.backend.(ackHandoffer)
+	if !ok {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	result, err := backend.AckHandoff(r.Context(), req)
+	if err != nil || result == nil {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err := validateAckHandoffResult(result); err != nil {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if result.Result == "released" || result.Result == "cancelled" || result.Result == "expired" {
+		s.clearActiveReplayState(req.RequestID)
+		s.wakeAttachedWaiters(context.Background())
+		s.deliverTerminalToAttachedWaiters(context.Background(), time.Now().UnixMilli())
+	}
+	status, ok := ackHandoffResultStatus(result.Result)
+	if !ok {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, status, result)
 }
 
 func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {

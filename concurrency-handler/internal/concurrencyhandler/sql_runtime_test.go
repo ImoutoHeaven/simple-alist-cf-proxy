@@ -406,6 +406,32 @@ type runtimeAcquireResult struct {
 	ClaimToken  sql.NullString
 }
 
+type runtimeClaimGrantResult struct {
+	Result            string
+	LeaseID           string
+	LeaseToken        string
+	ExpiresAtMs       int64
+	HandoffToken      sql.NullString
+	HandoffDeadlineMs sql.NullInt64
+	Reason            sql.NullString
+}
+
+type runtimeAckHandoffResult struct {
+	Result string
+	Reason sql.NullString
+}
+
+type runtimeRequestState struct {
+	State             string
+	TerminalReason    sql.NullString
+	ClaimState        sql.NullString
+	ClaimClaimedAtMs  sql.NullInt64
+	HandoffState      sql.NullString
+	HandoffToken      sql.NullString
+	HandoffDeadlineMs sql.NullInt64
+	HandoffAckedAtMs  sql.NullInt64
+}
+
 func seedRuntimeActiveLeases(t *testing.T, db *sql.DB, base runtimeAcquireCall, count int) {
 	t.Helper()
 	for i := 0; i < count; i++ {
@@ -518,6 +544,104 @@ func execRuntimePromoteWaiting(ctx context.Context, db *sql.DB, req PromoteWaiti
 		return nil, err
 	}
 	return result, nil
+}
+
+func execRuntimeClaimGrant(ctx context.Context, db *sql.DB, requestID, claimToken string, nowMs int64) (*runtimeClaimGrantResult, error) {
+	result := &runtimeClaimGrantResult{}
+	err := db.QueryRowContext(ctx, `
+		SELECT result,
+		       COALESCE(lease_id::text, ''),
+		       COALESCE(lease_token, ''),
+		       COALESCE(expires_at_ms, 0),
+		       handoff_token,
+		       handoff_deadline_ms,
+		       reason
+		FROM cq_claim_grant($1, $2, $3)
+	`, requestID, claimToken, nowMs).Scan(
+		&result.Result,
+		&result.LeaseID,
+		&result.LeaseToken,
+		&result.ExpiresAtMs,
+		&result.HandoffToken,
+		&result.HandoffDeadlineMs,
+		&result.Reason,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func execRuntimeAckHandoff(ctx context.Context, db *sql.DB, requestID, handoffToken string, nowMs int64) (*runtimeAckHandoffResult, error) {
+	result := &runtimeAckHandoffResult{}
+	err := db.QueryRowContext(ctx, `
+		SELECT result, reason
+		FROM cq_ack_handoff($1, $2, $3)
+	`, requestID, handoffToken, nowMs).Scan(&result.Result, &result.Reason)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func readRuntimeRequestState(t *testing.T, db *sql.DB, requestID string) runtimeRequestState {
+	t.Helper()
+
+	var state runtimeRequestState
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT state,
+		       terminal_reason,
+		       claim_state,
+		       claim_claimed_at_ms,
+		       handoff_state,
+		       handoff_token,
+		       handoff_deadline_ms,
+		       handoff_acked_at_ms
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, requestID).Scan(
+		&state.State,
+		&state.TerminalReason,
+		&state.ClaimState,
+		&state.ClaimClaimedAtMs,
+		&state.HandoffState,
+		&state.HandoffToken,
+		&state.HandoffDeadlineMs,
+		&state.HandoffAckedAtMs,
+	); err != nil {
+		t.Fatalf("read request state for %q: %v", requestID, err)
+	}
+
+	return state
+}
+
+func readRuntimeActiveCounters(t *testing.T, db *sql.DB, hostnameHash, siteBucket, ipBucket string) (int, int, int) {
+	t.Helper()
+
+	var hostCount, siteCount, siteIPCount int
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT active_count
+		FROM concurrency_host_counters
+		WHERE hostname_hash = $1
+	`, hostnameHash).Scan(&hostCount); err != nil {
+		t.Fatalf("read host counter for %q: %v", hostnameHash, err)
+	}
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT active_count
+		FROM concurrency_site_counters
+		WHERE hostname_hash = $1 AND site_bucket = $2
+	`, hostnameHash, siteBucket).Scan(&siteCount); err != nil {
+		t.Fatalf("read site counter for %q/%q: %v", hostnameHash, siteBucket, err)
+	}
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT active_count
+		FROM concurrency_site_ip_counters
+		WHERE hostname_hash = $1 AND site_bucket = $2 AND ip_bucket = $3
+	`, hostnameHash, siteBucket, ipBucket).Scan(&siteIPCount); err != nil {
+		t.Fatalf("read site_ip counter for %q/%q/%q: %v", hostnameHash, siteBucket, ipBucket, err)
+	}
+
+	return hostCount, siteCount, siteIPCount
 }
 
 func execRuntimeContinueWaitProbe(ctx context.Context, db *sql.DB, req AcquireRequest) (*runtimeAcquireResult, error) {
@@ -741,6 +865,344 @@ func TestRuntimeAcquireGrantMustBeClaimedOnce(t *testing.T) {
 	}
 	if replayAfterClaim.Result != "conflict" || replayAfterClaim.Reason.String != "grant_already_claimed" || strings.TrimSpace(replayAfterClaim.LeaseToken) != "" {
 		t.Fatalf("expected mismatched acquire replay to remain conflict after claim, got %+v", replayAfterClaim)
+	}
+}
+
+func TestRuntimeClaimGrantTransitionsToHandoffPending(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "handoff-pending-host",
+		Hostname:          "handoff-pending.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "handoff-pending-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	if grant.Result != "granted" || !grant.ClaimToken.Valid || strings.TrimSpace(grant.ClaimToken.String) == "" {
+		t.Fatalf("expected granted acquire with claim token, got %+v", grant)
+	}
+
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "handoff-pending-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if claim.Result != "granted" {
+		t.Fatalf("expected granted claim result, got %+v", claim)
+	}
+	if claim.LeaseID != grant.LeaseID || claim.LeaseToken != grant.LeaseToken || claim.ExpiresAtMs != grant.ExpiresAtMs {
+		t.Fatalf("expected claim grant to preserve lease identity, got %+v grant=%+v", claim, grant)
+	}
+	if !claim.HandoffToken.Valid || strings.TrimSpace(claim.HandoffToken.String) == "" {
+		t.Fatalf("expected claim grant to return handoff token, got %+v", claim)
+	}
+	if !claim.HandoffDeadlineMs.Valid || claim.HandoffDeadlineMs.Int64 <= nowMs+1 || claim.HandoffDeadlineMs.Int64 >= grant.ExpiresAtMs {
+		t.Fatalf("expected handoff deadline between claim time and lease expiry, got %+v", claim)
+	}
+
+	request := readRuntimeRequestState(t, db, "handoff-pending-request")
+	if request.State != "active" {
+		t.Fatalf("expected request to remain active after claim grant, got %+v", request)
+	}
+	if request.ClaimState.String != "claimed" || !request.ClaimClaimedAtMs.Valid || request.ClaimClaimedAtMs.Int64 != nowMs+1 {
+		t.Fatalf("expected claim grant to persist claimed state and timestamp, got %+v", request)
+	}
+	if request.HandoffState.String != "pending" || request.HandoffToken.String != claim.HandoffToken.String || request.HandoffDeadlineMs.Int64 != claim.HandoffDeadlineMs.Int64 {
+		t.Fatalf("expected claim grant to persist handoff pending metadata, got %+v claim=%+v", request, claim)
+	}
+	if request.HandoffAckedAtMs.Valid {
+		t.Fatalf("expected handoff_acked_at_ms to remain null before ack, got %+v", request)
+	}
+}
+
+func TestRuntimeDuplicateClaimReplaysSameHandoffPayload(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "handoff-replay-host",
+		Hostname:          "handoff-replay.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "handoff-replay-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+
+	firstClaim, err := execRuntimeClaimGrant(context.Background(), db, "handoff-replay-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("first claim grant: %v", err)
+	}
+	duplicateClaim, err := execRuntimeClaimGrant(context.Background(), db, "handoff-replay-request", grant.ClaimToken.String, nowMs+2)
+	if err != nil {
+		t.Fatalf("duplicate claim grant: %v", err)
+	}
+
+	if duplicateClaim.Result != "granted" {
+		t.Fatalf("expected duplicate claim replay to stay granted, got %+v", duplicateClaim)
+	}
+	if duplicateClaim.LeaseID != firstClaim.LeaseID || duplicateClaim.LeaseToken != firstClaim.LeaseToken || duplicateClaim.ExpiresAtMs != firstClaim.ExpiresAtMs {
+		t.Fatalf("expected duplicate claim replay to preserve lease identity, first=%+v duplicate=%+v", firstClaim, duplicateClaim)
+	}
+	if duplicateClaim.HandoffToken.String != firstClaim.HandoffToken.String || duplicateClaim.HandoffDeadlineMs.Int64 != firstClaim.HandoffDeadlineMs.Int64 {
+		t.Fatalf("expected duplicate claim replay to preserve handoff payload, first=%+v duplicate=%+v", firstClaim, duplicateClaim)
+	}
+	if duplicateClaim.Reason.Valid {
+		t.Fatalf("expected duplicate claim replay without terminal reason, got %+v", duplicateClaim)
+	}
+}
+
+func TestRuntimeAckHandoffAcknowledgesPendingRequest(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "handoff-ack-host",
+		Hostname:          "handoff-ack.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "handoff-ack-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "handoff-ack-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+
+	ack, err := execRuntimeAckHandoff(context.Background(), db, "handoff-ack-request", claim.HandoffToken.String, nowMs+2)
+	if err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	if ack.Result != "acknowledged" || ack.Reason.Valid {
+		t.Fatalf("expected acknowledged ack_handoff result, got %+v", ack)
+	}
+
+	request := readRuntimeRequestState(t, db, "handoff-ack-request")
+	if request.HandoffState.String != "acknowledged" || !request.HandoffAckedAtMs.Valid || request.HandoffAckedAtMs.Int64 != nowMs+2 {
+		t.Fatalf("expected ack_handoff to persist acknowledged handoff state, got %+v", request)
+	}
+}
+
+func TestRuntimeDuplicateAckHandoffPreservesOriginalAckTimestamp(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "handoff-duplicate-ack-host",
+		Hostname:          "handoff-duplicate-ack.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "handoff-duplicate-ack-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "handoff-duplicate-ack-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "handoff-duplicate-ack-request", claim.HandoffToken.String, nowMs+2); err != nil {
+		t.Fatalf("first ack handoff: %v", err)
+	}
+
+	firstAck := readRuntimeRequestState(t, db, "handoff-duplicate-ack-request")
+	if !firstAck.HandoffAckedAtMs.Valid {
+		t.Fatalf("expected first ack to persist timestamp, got %+v", firstAck)
+	}
+
+	duplicateAck, err := execRuntimeAckHandoff(context.Background(), db, "handoff-duplicate-ack-request", claim.HandoffToken.String, nowMs+3)
+	if err != nil {
+		t.Fatalf("duplicate ack handoff: %v", err)
+	}
+	if duplicateAck.Result != "acknowledged" || duplicateAck.Reason.Valid {
+		t.Fatalf("expected duplicate ack replay to stay acknowledged, got %+v", duplicateAck)
+	}
+
+	secondAck := readRuntimeRequestState(t, db, "handoff-duplicate-ack-request")
+	if !secondAck.HandoffAckedAtMs.Valid || secondAck.HandoffAckedAtMs.Int64 != firstAck.HandoffAckedAtMs.Int64 {
+		t.Fatalf("expected duplicate ack to preserve original timestamp, first=%+v second=%+v", firstAck, secondAck)
+	}
+}
+
+func TestRuntimeOverdueHandoffPendingCompensatesBeforeReplay(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "handoff-timeout-host",
+		Hostname:          "handoff-timeout.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "handoff-timeout-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "handoff-timeout-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if !claim.HandoffDeadlineMs.Valid {
+		t.Fatalf("expected handoff deadline for timeout test, got %+v", claim)
+	}
+
+	overdueNow := claim.HandoffDeadlineMs.Int64
+	duplicateClaim, err := execRuntimeClaimGrant(context.Background(), db, "handoff-timeout-request", grant.ClaimToken.String, overdueNow)
+	if err != nil {
+		t.Fatalf("duplicate claim after overdue handoff: %v", err)
+	}
+	if duplicateClaim.Result != "released" || duplicateClaim.Reason.String != "claim_handoff_timeout" {
+		t.Fatalf("expected overdue duplicate claim to compensate before replay, got %+v", duplicateClaim)
+	}
+
+	request := readRuntimeRequestState(t, db, "handoff-timeout-request")
+	if request.State != "released" || request.TerminalReason.String != "claim_handoff_timeout" {
+		t.Fatalf("expected overdue handoff to transition request to released/claim_handoff_timeout, got %+v", request)
+	}
+	if request.ClaimState.String != "compensated" || request.HandoffState.String != "compensated" {
+		t.Fatalf("expected overdue handoff to mark compensated sub-states, got %+v", request)
+	}
+	if request.HandoffAckedAtMs.Valid {
+		t.Fatalf("expected timed out handoff to remain unacked, got %+v", request)
+	}
+
+	hostCount, siteCount, siteIPCount := readRuntimeActiveCounters(t, db, "handoff-timeout-host", "site-a", "ip-a")
+	if hostCount != 0 || siteCount != 0 || siteIPCount != 0 {
+		t.Fatalf("expected handoff-timeout compensation to decrement counters once, got host=%d site=%d site_ip=%d", hostCount, siteCount, siteIPCount)
+	}
+}
+
+func TestRuntimeLateAckAfterHandoffTimeoutReturnsTerminalWithoutResurrection(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "handoff-late-ack-host",
+		Hostname:          "handoff-late-ack.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "handoff-late-ack-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "handoff-late-ack-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+
+	overdueNow := claim.HandoffDeadlineMs.Int64
+	if _, err := execRuntimeClaimGrant(context.Background(), db, "handoff-late-ack-request", grant.ClaimToken.String, overdueNow); err != nil {
+		t.Fatalf("compensating duplicate claim: %v", err)
+	}
+
+	ack, err := execRuntimeAckHandoff(context.Background(), db, "handoff-late-ack-request", claim.HandoffToken.String, overdueNow+1)
+	if err != nil {
+		t.Fatalf("late ack after timeout compensation: %v", err)
+	}
+	if ack.Result != "released" || ack.Reason.String != "claim_handoff_timeout" {
+		t.Fatalf("expected late ack to replay terminal handoff-timeout result, got %+v", ack)
+	}
+
+	request := readRuntimeRequestState(t, db, "handoff-late-ack-request")
+	if request.State != "released" || request.TerminalReason.String != "claim_handoff_timeout" {
+		t.Fatalf("expected timed out request to stay terminal after late ack, got %+v", request)
+	}
+	if request.HandoffState.String == "acknowledged" || request.HandoffAckedAtMs.Valid {
+		t.Fatalf("expected late ack not to resurrect acknowledged handoff state, got %+v", request)
+	}
+}
+
+func TestRuntimeLateReleaseAfterHandoffTimeoutDoesNotDoubleDecrementCounters(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "handoff-late-release-host",
+		Hostname:          "handoff-late-release.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "handoff-late-release-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "handoff-late-release-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+
+	overdueNow := claim.HandoffDeadlineMs.Int64
+	if _, err := execRuntimeClaimGrant(context.Background(), db, "handoff-late-release-request", grant.ClaimToken.String, overdueNow); err != nil {
+		t.Fatalf("compensating duplicate claim: %v", err)
+	}
+
+	hostCount, siteCount, siteIPCount := readRuntimeActiveCounters(t, db, "handoff-late-release-host", "site-a", "ip-a")
+	if hostCount != 0 || siteCount != 0 || siteIPCount != 0 {
+		t.Fatalf("expected compensation to decrement counters before late release, got host=%d site=%d site_ip=%d", hostCount, siteCount, siteIPCount)
+	}
+
+	var releaseResult string
+	var releaseReason, releaseRequestID sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason, request_id
+		FROM cq_release($1::uuid, $2, $3, $4)
+	`, grant.LeaseID, grant.LeaseToken, "stream_complete", overdueNow+1).Scan(&releaseResult, &releaseReason, &releaseRequestID); err != nil {
+		t.Fatalf("late release after handoff timeout: %v", err)
+	}
+	if releaseResult != "noop" || releaseReason.String != "already_released" || releaseRequestID.String != "handoff-late-release-request" {
+		t.Fatalf("expected late release to stay idempotent after compensation, got result=%q reason=%q request=%q", releaseResult, releaseReason.String, releaseRequestID.String)
+	}
+
+	hostCount, siteCount, siteIPCount = readRuntimeActiveCounters(t, db, "handoff-late-release-host", "site-a", "ip-a")
+	if hostCount != 0 || siteCount != 0 || siteIPCount != 0 {
+		t.Fatalf("expected late release not to double decrement counters, got host=%d site=%d site_ip=%d", hostCount, siteCount, siteIPCount)
+	}
+
+	request := readRuntimeRequestState(t, db, "handoff-late-release-request")
+	if request.TerminalReason.String != "claim_handoff_timeout" || request.ClaimState.String != "compensated" || request.HandoffState.String != "compensated" {
+		t.Fatalf("expected late release not to erase timeout-compensation state, got %+v", request)
 	}
 }
 

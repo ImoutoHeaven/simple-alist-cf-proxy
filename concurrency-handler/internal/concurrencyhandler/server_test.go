@@ -21,6 +21,9 @@ type stubBackend struct {
 	claimResult   *ClaimGrantResult
 	claimErr      error
 	claimFn       func(context.Context, ClaimGrantRequest) (*ClaimGrantResult, error)
+	ackResult     *AckHandoffResult
+	ackErr        error
+	ackFn         func(context.Context, AckHandoffRequest) (*AckHandoffResult, error)
 	releaseResult *ReleaseResult
 	releaseErr    error
 	releaseFn     func(context.Context, ReleaseRequest) (*ReleaseResult, error)
@@ -256,7 +259,7 @@ func (b *recordingPromoteBackend) Release(_ context.Context, req ReleaseRequest)
 }
 
 func (b *recordingPromoteBackend) ClaimGrant(context.Context, ClaimGrantRequest) (*ClaimGrantResult, error) {
-	return &ClaimGrantResult{Result: "granted", LeaseID: "lease-claim", LeaseToken: "token-claim", ExpiresAtMs: time.Now().UnixMilli() + 60_000}, nil
+	return &ClaimGrantResult{Result: "granted", LeaseID: "lease-claim", LeaseToken: "token-claim", ExpiresAtMs: time.Now().UnixMilli() + 60_000, HandoffToken: "handoff-claim", HandoffDeadlineMs: time.Now().UnixMilli() + 5_000}, nil
 }
 
 func (b *recordingPromoteBackend) PromoteWaiting(_ context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
@@ -313,6 +316,13 @@ func (s *stubBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*C
 		return s.claimFn(ctx, req)
 	}
 	return s.claimResult, s.claimErr
+}
+
+func (s *stubBackend) AckHandoff(ctx context.Context, req AckHandoffRequest) (*AckHandoffResult, error) {
+	if s.ackFn != nil {
+		return s.ackFn(ctx, req)
+	}
+	return s.ackResult, s.ackErr
 }
 
 func (s *stubBackend) Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
@@ -479,13 +489,21 @@ func TestClaimGrantEndpointUsesAuthAndNormalizesResults(t *testing.T) {
 	if firstClaimBody["result"] != "granted" || firstClaimBody["leaseId"] != acquireBody["leaseId"] || firstClaimBody["leaseToken"] != acquireBody["leaseToken"] {
 		t.Fatalf("expected first claim to return acquired lease identity, got %v (acquire=%v)", firstClaimBody, acquireBody)
 	}
+	firstHandoffToken, ok := firstClaimBody["handoffToken"].(string)
+	if !ok || strings.TrimSpace(firstHandoffToken) == "" {
+		t.Fatalf("expected first claim handoffToken, got %v", firstClaimBody)
+	}
+	firstHandoffDeadline, ok := firstClaimBody["handoffDeadlineMs"].(float64)
+	if !ok || int64(firstHandoffDeadline) <= nowMs+1 || int64(firstHandoffDeadline) >= int64(acquireBody["expiresAtMs"].(float64)) {
+		t.Fatalf("expected first claim handoffDeadlineMs before lease expiry, got %v (acquire=%v)", firstClaimBody, acquireBody)
+	}
 
 	duplicate := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: claimToken, NowMs: nowMs + 2}, "secret")
 	if duplicate.Code != http.StatusOK {
 		t.Fatalf("expected duplicate same-token claim 200, got %d body=%s", duplicate.Code, duplicate.Body.String())
 	}
 	duplicateBody := decodeBody(t, duplicate)
-	if duplicateBody["result"] != "granted" || duplicateBody["leaseId"] != firstClaimBody["leaseId"] || duplicateBody["leaseToken"] != firstClaimBody["leaseToken"] || duplicateBody["expiresAtMs"] != firstClaimBody["expiresAtMs"] {
+	if duplicateBody["result"] != "granted" || duplicateBody["leaseId"] != firstClaimBody["leaseId"] || duplicateBody["leaseToken"] != firstClaimBody["leaseToken"] || duplicateBody["expiresAtMs"] != firstClaimBody["expiresAtMs"] || duplicateBody["handoffToken"] != firstClaimBody["handoffToken"] || duplicateBody["handoffDeadlineMs"] != firstClaimBody["handoffDeadlineMs"] {
 		t.Fatalf("expected duplicate claim replay to preserve lease identity, got %v (first=%v)", duplicateBody, firstClaimBody)
 	}
 
@@ -496,6 +514,164 @@ func TestClaimGrantEndpointUsesAuthAndNormalizesResults(t *testing.T) {
 	conflictBody := decodeBody(t, conflict)
 	if conflictBody["result"] != "conflict" || conflictBody["reason"] != "grant_already_claimed" || conflictBody["leaseToken"] != nil {
 		t.Fatalf("expected mismatched token claim conflict without lease identity, got %v", conflictBody)
+	}
+}
+
+func TestClaimGrantEndpointReturnsHandoffPayloadOnGrantedReplay(t *testing.T) {
+	nowMs := time.Now().UnixMilli()
+	db := requireRuntimeConcurrencyDB(t)
+	cfg := validTestConfig()
+	cfg.Concurrency.Caps.HostMaxInFlight = 1
+	cfg.Concurrency.Caps.SiteMaxInFlight = 1
+	cfg.Concurrency.Caps.SiteIPMaxInFlight = 1
+	server := newTestServerInstanceWithConfig(t, cfg, &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}})
+	handler := server.Handler()
+
+	acquireRec := postJSON(t, handler, acquirePath, AcquireRequest{
+		Hostname:       "claim-handoff.example.com",
+		HostnameHash:   "claim-handoff-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "claim-handoff-request",
+		HardExpireAtMs: nowMs + 60_000,
+		NowMs:          nowMs,
+	}, "secret")
+	if acquireRec.Code != http.StatusOK {
+		t.Fatalf("expected acquire 200, got %d body=%s", acquireRec.Code, acquireRec.Body.String())
+	}
+	acquireBody := decodeBody(t, acquireRec)
+	claimToken, ok := acquireBody["claimToken"].(string)
+	if !ok || strings.TrimSpace(claimToken) == "" {
+		t.Fatalf("expected acquire claim token, got %v", acquireBody)
+	}
+
+	firstClaim := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "claim-handoff-request", ClaimToken: claimToken, NowMs: nowMs + 1}, "secret")
+	if firstClaim.Code != http.StatusOK {
+		t.Fatalf("expected first claim 200, got %d body=%s", firstClaim.Code, firstClaim.Body.String())
+	}
+	firstClaimBody := decodeBody(t, firstClaim)
+	if firstClaimBody["result"] != "granted" || firstClaimBody["leaseId"] != acquireBody["leaseId"] || firstClaimBody["leaseToken"] != acquireBody["leaseToken"] || firstClaimBody["expiresAtMs"] != acquireBody["expiresAtMs"] {
+		t.Fatalf("expected first claim to preserve lease identity, got %v (acquire=%v)", firstClaimBody, acquireBody)
+	}
+	firstHandoffToken, ok := firstClaimBody["handoffToken"].(string)
+	if !ok || strings.TrimSpace(firstHandoffToken) == "" {
+		t.Fatalf("expected first claim handoff token, got %v", firstClaimBody)
+	}
+	firstHandoffDeadline, ok := firstClaimBody["handoffDeadlineMs"].(float64)
+	if !ok || int64(firstHandoffDeadline) <= nowMs+1 || int64(firstHandoffDeadline) >= int64(acquireBody["expiresAtMs"].(float64)) {
+		t.Fatalf("expected first claim handoff deadline before lease expiry, got %v (acquire=%v)", firstClaimBody, acquireBody)
+	}
+
+	duplicate := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "claim-handoff-request", ClaimToken: claimToken, NowMs: nowMs + 2}, "secret")
+	if duplicate.Code != http.StatusOK {
+		t.Fatalf("expected duplicate claim 200, got %d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	duplicateBody := decodeBody(t, duplicate)
+	if duplicateBody["result"] != "granted" || duplicateBody["leaseId"] != firstClaimBody["leaseId"] || duplicateBody["leaseToken"] != firstClaimBody["leaseToken"] || duplicateBody["expiresAtMs"] != firstClaimBody["expiresAtMs"] {
+		t.Fatalf("expected duplicate claim replay to preserve lease identity, got %v (first=%v)", duplicateBody, firstClaimBody)
+	}
+	if duplicateBody["handoffToken"] != firstClaimBody["handoffToken"] || duplicateBody["handoffDeadlineMs"] != firstClaimBody["handoffDeadlineMs"] {
+		t.Fatalf("expected duplicate claim replay to preserve handoff payload, got %v (first=%v)", duplicateBody, firstClaimBody)
+	}
+}
+
+func TestClaimGrantEndpointTerminalResponseAllowsClaimHandoffTimeoutReason(t *testing.T) {
+	handler := newTestServer(t, &stubBackend{claimResult: &ClaimGrantResult{Result: "released", Reason: "claim_handoff_timeout"}})
+	rec := postJSON(t, handler, claimPath, ClaimGrantRequest{RequestID: "req-1", ClaimToken: "claim-1", NowMs: 1000}, "secret")
+	if rec.Code != http.StatusGone {
+		t.Fatalf("expected released claim_handoff_timeout response 410, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["result"] != "released" || body["reason"] != "claim_handoff_timeout" {
+		t.Fatalf("expected released claim_handoff_timeout body, got %v", body)
+	}
+}
+
+func TestAckHandoffEndpointUsesAuthAndNormalizesResults(t *testing.T) {
+	var ackCalls []AckHandoffRequest
+	handler := newTestServer(t, &stubBackend{ackFn: func(_ context.Context, req AckHandoffRequest) (*AckHandoffResult, error) {
+		ackCalls = append(ackCalls, req)
+		switch len(ackCalls) {
+		case 1:
+			return &AckHandoffResult{Result: "acknowledged"}, nil
+		case 2:
+			return &AckHandoffResult{Result: "conflict", Reason: "handoff_token_mismatch"}, nil
+		case 3:
+			return &AckHandoffResult{Result: "released", Reason: "claim_handoff_timeout"}, nil
+		default:
+			t.Fatalf("unexpected extra ack handoff call: %+v", req)
+			return nil, nil
+		}
+	}})
+
+	unauthorized := postJSON(t, handler, "/api/v1/concurrency/ack_handoff", AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000}, "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("expected missing auth 401, got %d", unauthorized.Code)
+	}
+
+	acknowledged := postJSON(t, handler, "/api/v1/concurrency/ack_handoff", AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000}, "secret")
+	if acknowledged.Code != http.StatusOK {
+		t.Fatalf("expected acknowledged 200, got %d body=%s", acknowledged.Code, acknowledged.Body.String())
+	}
+	acknowledgedBody := decodeBody(t, acknowledged)
+	if len(acknowledgedBody) != 1 || acknowledgedBody["result"] != "acknowledged" {
+		t.Fatalf("expected acknowledged body without reason, got %v", acknowledgedBody)
+	}
+
+	conflict := postJSON(t, handler, "/api/v1/concurrency/ack_handoff", AckHandoffRequest{RequestID: "request-1", HandoffToken: "wrong-token", NowMs: 1001}, "secret")
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("expected conflict 409, got %d body=%s", conflict.Code, conflict.Body.String())
+	}
+	conflictBody := decodeBody(t, conflict)
+	if conflictBody["result"] != "conflict" || conflictBody["reason"] != "handoff_token_mismatch" {
+		t.Fatalf("expected stable conflict body, got %v", conflictBody)
+	}
+
+	terminal := postJSON(t, handler, "/api/v1/concurrency/ack_handoff", AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1002}, "secret")
+	if terminal.Code != http.StatusGone {
+		t.Fatalf("expected terminal 410, got %d body=%s", terminal.Code, terminal.Body.String())
+	}
+	terminalBody := decodeBody(t, terminal)
+	if terminalBody["result"] != "released" || terminalBody["reason"] != "claim_handoff_timeout" {
+		t.Fatalf("expected terminal ack handoff body, got %v", terminalBody)
+	}
+
+	if len(ackCalls) != 3 {
+		t.Fatalf("expected 3 authorized ack handoff calls, got %+v", ackCalls)
+	}
+	if ackCalls[0].RequestID != "request-1" || ackCalls[0].HandoffToken != "handoff-1" || ackCalls[0].NowMs != 1000 {
+		t.Fatalf("expected first ack handoff request forwarded to backend, got %+v", ackCalls[0])
+	}
+}
+
+func TestAckHandoffEndpointRejectsInvalidRequestContract(t *testing.T) {
+	var called bool
+	handler := newTestServer(t, &stubBackend{ackFn: func(_ context.Context, req AckHandoffRequest) (*AckHandoffResult, error) {
+		called = true
+		return &AckHandoffResult{Result: "acknowledged"}, nil
+	}})
+
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+		want string
+	}{
+		{name: "missing requestId", body: map[string]any{"handoffToken": "handoff-1", "nowMs": 1000}, want: "requestId is required"},
+		{name: "missing handoffToken", body: map[string]any{"requestId": "request-1", "nowMs": 1000}, want: "handoffToken is required"},
+		{name: "missing nowMs", body: map[string]any{"requestId": "request-1", "handoffToken": "handoff-1"}, want: "nowMs is required"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := postJSON(t, handler, "/api/v1/concurrency/ack_handoff", tc.body, "secret")
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Fatalf("expected validation error %q, got body=%s", tc.want, rec.Body.String())
+			}
+		})
+	}
+	if called {
+		t.Fatal("expected invalid ack handoff request to be rejected before backend call")
 	}
 }
 
@@ -1194,22 +1370,36 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 	t.Run("post-restart replay classification postgrest active only", func(t *testing.T) {
 		nowMs := time.Now().UnixMilli()
 		var queryCount int
+		var overdueHandoffQueryCount int
+		var expireIfDueCallCount int
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			queryCount++
 			w.Header().Set("Content-Type", "application/json")
 			switch {
 			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/concurrency_requests"):
-				if strings.Contains(r.URL.RawQuery, "state=eq.waiting") {
+				query := r.URL.Query()
+				if query.Get("state") == "eq.waiting" {
 					_, _ = w.Write([]byte(`[]`))
 					return
 				}
-				if strings.Contains(r.URL.RawQuery, "state=eq.active") {
+				if query.Get("state") == "eq.active" && query.Get("handoff_state") == "eq.pending" {
+					overdueHandoffQueryCount++
+					if query.Get("select") != "request_id" || !strings.HasPrefix(query.Get("handoff_deadline_ms"), "lte.") || !strings.HasPrefix(query.Get("hard_expire_at_ms"), "gt.") || !strings.HasPrefix(query.Get("lease_expires_at_ms"), "gt.") {
+						t.Fatalf("expected overdue handoff recovery query, got %s", r.URL.RawQuery)
+					}
+					_, _ = w.Write([]byte(`[]`))
+					return
+				}
+				if query.Get("state") == "eq.active" {
 					_, _ = w.Write([]byte(`[{"request_id":"postgrest-active-request"}]`))
 					return
 				}
 				t.Fatalf("unexpected concurrency_requests query: %s", r.URL.RawQuery)
 			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/concurrency_leases"):
 				_, _ = w.Write([]byte(`[]`))
+			case r.Method == http.MethodPost && r.URL.Path == "/rpc/cq_expire_active_request_if_due":
+				expireIfDueCallCount++
+				_, _ = w.Write([]byte(`false`))
 			case r.Method == http.MethodPost && r.URL.Path == "/rpc/custom_acquire":
 				_, _ = w.Write([]byte(`[{
 					"result":"conflict",
@@ -1246,6 +1436,12 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 		counts := snapshotObservabilityCounts(t, server)
 		assertObservabilityCount(t, counts, observabilityAcquireReplayActive, 0)
 		assertObservabilityCount(t, counts, observabilityAcquireFastGranted, 0)
+		if overdueHandoffQueryCount == 0 {
+			t.Fatal("expected startup recovery to probe overdue handoff query surface")
+		}
+		if expireIfDueCallCount != 0 {
+			t.Fatalf("expected no compensation RPC for empty overdue handoff query, got %d calls", expireIfDueCallCount)
+		}
 		if queryCount == 0 {
 			t.Fatal("expected postgrest startup recovery requests to run")
 		}
@@ -1894,6 +2090,21 @@ func TestAcquireReturnsTerminal410ForCancelledReplay(t *testing.T) {
 	body := decodeBody(t, rec)
 	if body["result"] != "cancelled" || body["reason"] != "request_cancelled" {
 		t.Fatalf("expected cancelled terminal body, got %v", body)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("expected json content-type, got %q", got)
+	}
+}
+
+func TestAcquireReturnsTerminal410ForClaimHandoffTimeoutReplay(t *testing.T) {
+	handler := newTestServer(t, &stubBackend{acquireResult: &AcquireResult{Result: "released", Reason: "claim_handoff_timeout"}})
+	rec := postJSON(t, handler, "/api/v1/concurrency/acquire", validAcquireRequest(), "secret")
+	if rec.Code != http.StatusGone {
+		t.Fatalf("expected 410, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["result"] != "released" || body["reason"] != "claim_handoff_timeout" {
+		t.Fatalf("expected released claim_handoff_timeout body, got %v", body)
 	}
 	if got := rec.Header().Get("Content-Type"); got != "application/json" {
 		t.Fatalf("expected json content-type, got %q", got)

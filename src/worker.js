@@ -1722,6 +1722,7 @@ const normalizePostgrestBaseUrl = (url) => {
 
 const TRUE_CONCURRENCY_ACQUIRE_RESULTS = new Set(['granted', 'wait', 'conflict', 'released', 'cancelled', 'expired']);
 const TRUE_CONCURRENCY_CLAIM_RESULTS = new Set(['granted', 'conflict', 'released', 'cancelled', 'expired']);
+const TRUE_CONCURRENCY_ACK_HANDOFF_RESULTS = new Set(['acknowledged', 'conflict', 'released', 'cancelled', 'expired']);
 const TRUE_CONCURRENCY_RELEASE_RESULTS = new Set(['released', 'noop', 'expired']);
 const TRUE_CONCURRENCY_CANCEL_RESULTS = new Set(['cancelled', 'noop', 'conflict']);
 const TRUE_CONCURRENCY_WAIT_SCOPES = new Set(['host', 'site', 'site_ip']);
@@ -1736,6 +1737,7 @@ const TRUE_CONCURRENCY_CANCEL_CONFLICT_REASONS = new Set([
   'request_id_tuple_mismatch',
   'must_release_active_lease',
 ]);
+const TRUE_CONCURRENCY_ACK_HANDOFF_CONFLICT_REASONS = new Set(['handoff_token_mismatch']);
 const TRUE_CONCURRENCY_TERMINAL_REASONS = new Set([
   'already_released',
   'request_cancelled',
@@ -1743,6 +1745,10 @@ const TRUE_CONCURRENCY_TERMINAL_REASONS = new Set([
   'waiter_detached_timeout',
   'grant_delivery_failed',
   'acquire_delivery_failed',
+  'claim_handoff_timeout',
+]);
+const TRUE_CONCURRENCY_CLAIM_TERMINAL_REASONS = new Set([
+  ...TRUE_CONCURRENCY_TERMINAL_REASONS,
 ]);
 const TRUE_CONCURRENCY_RELEASE_NOOP_REASONS = new Set([
   'already_released',
@@ -1905,11 +1911,23 @@ const normalizeTrueConcurrencyClaimResult = (data, options = {}) => {
     if (Number.isFinite(options.hardExpireAtMs) && expiresAtMs > options.hardExpireAtMs) {
       throw new Error('[CQ] claim granted response exceeds hardExpireAtMs');
     }
+    if (typeof data?.handoffToken !== 'string' || !data.handoffToken) {
+      throw new Error('[CQ] claim granted response missing handoffToken');
+    }
+    const handoffDeadlineMs = Number(data?.handoffDeadlineMs);
+    if (!Number.isFinite(handoffDeadlineMs) || handoffDeadlineMs <= 0) {
+      throw new Error('[CQ] claim granted response missing handoffDeadlineMs');
+    }
+    if (handoffDeadlineMs >= expiresAtMs) {
+      throw new Error('[CQ] claim granted response exceeds lease handoff window');
+    }
     return {
       result: 'granted',
       leaseId: data.leaseId,
       leaseToken: data.leaseToken,
       expiresAtMs,
+      handoffToken: data.handoffToken,
+      handoffDeadlineMs,
     };
   }
 
@@ -1926,10 +1944,45 @@ const normalizeTrueConcurrencyClaimResult = (data, options = {}) => {
   if (typeof data?.reason !== 'string' || !data.reason) {
     throw new Error(`[CQ] claim ${result} response missing reason`);
   }
-  if (!TRUE_CONCURRENCY_TERMINAL_REASONS.has(data.reason)) {
+  if (!TRUE_CONCURRENCY_CLAIM_TERMINAL_REASONS.has(data.reason)) {
     throw new Error(`[CQ] claim ${result} response has unsupported reason`);
   }
   return { result, reason: data.reason };
+};
+
+const normalizeTrueConcurrencyAckHandoffResult = (data) => {
+  const result = readTrueConcurrencyResult('ack_handoff', data, TRUE_CONCURRENCY_ACK_HANDOFF_RESULTS);
+
+  if (result === 'acknowledged') {
+    if (typeof data?.reason === 'string' && data.reason) {
+      throw new Error('[CQ] ack_handoff acknowledged response must not include reason');
+    }
+    return { result: 'acknowledged' };
+  }
+
+  if (result === 'conflict') {
+    if (typeof data?.reason !== 'string' || !data.reason) {
+      throw new Error('[CQ] ack_handoff conflict response missing reason');
+    }
+    if (!TRUE_CONCURRENCY_ACK_HANDOFF_CONFLICT_REASONS.has(data.reason)) {
+      throw new Error('[CQ] ack_handoff conflict response has unsupported reason');
+    }
+    return {
+      result: 'conflict',
+      reason: data.reason,
+    };
+  }
+
+  if (typeof data?.reason !== 'string' || !data.reason) {
+    throw new Error(`[CQ] ack_handoff ${result} response missing reason`);
+  }
+  if (!TRUE_CONCURRENCY_CLAIM_TERMINAL_REASONS.has(data.reason)) {
+    throw new Error(`[CQ] ack_handoff ${result} response has unsupported reason`);
+  }
+  return {
+    result,
+    reason: data.reason,
+  };
 };
 
 const normalizeTrueConcurrencyReleaseResult = (data) => {
@@ -2001,6 +2054,7 @@ const createConcurrencyHandlerClient = (config) => {
   const authHeader = normalizeStringValue(handlerCfg.authHeader, DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER);
   const acquireUrl = `${baseUrl}/api/v1/concurrency/acquire`;
   const claimUrl = `${baseUrl}/api/v1/concurrency/claim`;
+  const ackHandoffUrl = `${baseUrl}/api/v1/concurrency/ack_handoff`;
   const releaseUrl = `${baseUrl}/api/v1/concurrency/release`;
   const cancelUrl = `${baseUrl}/api/v1/concurrency/cancel`;
   const acquireTimeoutMs = normalizePositiveMs(
@@ -2117,6 +2171,23 @@ const createConcurrencyHandlerClient = (config) => {
       return normalizeTrueConcurrencyClaimResult(data, {
         hardExpireAtMs: claim.hardExpireAtMs,
       });
+    },
+
+    async ackHandoff(_ctx, handoff, signal) {
+      const { data } = await postJson(
+        ackHandoffUrl,
+        {
+          requestId: handoff.requestId,
+          handoffToken: handoff.handoffToken,
+          nowMs: handoff.nowMs,
+        },
+        {
+          timeoutMs: acquireTimeoutMs,
+          signal,
+          allowedStatuses: [200, 409, 410],
+        },
+      );
+      return normalizeTrueConcurrencyAckHandoffResult(data);
     },
 
     async cancel(_ctx, requestIdentity, reason, signal) {
@@ -4565,15 +4636,6 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           return createUnauthorizedResponse(origin, 'link expired');
         }
 
-      if (!needFairQueue) {
-        clearPendingBreakerOnlyAttempt();
-        const breakerAttempt = await authorizeBreakerOnlyAttemptIfNeeded(cqPlan.hostname);
-        if (breakerAttempt?.blockedResponse) {
-          return breakerAttempt.blockedResponse;
-        }
-        armPendingBreakerOnlyAttempt(cqPlan.hostname, breakerAttempt);
-      }
-
       try {
         cqPlan.nowMs = Date.now();
         cqAcquireDispatched = true;
@@ -4696,31 +4758,6 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           claimToken: acquireResult.claimToken,
         };
 
-        if (resolveAdmissionMode(config, cqPlan.hostname) === 'queue_breaker' && needFairQueue && !fqContext?.slotToken) {
-          const breakerAttempt = await authorizeBreakerAttempt(cqPlan.hostname);
-          if (breakerAttempt?.blockedResponse) {
-            cqLease = {
-              ...acquireResult,
-              requestId: cqPlan.requestId,
-              hostname: cqPlan.hostname,
-              hostnameHash: cqPlan.hostnameHash,
-              siteBucket: cqPlan.siteBucket,
-              ipBucket: cqPlan.ipBucket,
-              hardExpireAtMs: cqPlan.hardExpireAtMs,
-            };
-            cqReleaseController = createConcurrencyReleaseController({
-              client: concurrencyClient,
-              ctx,
-              lease: cqLease,
-              label: cqPlan.hostname,
-            });
-            await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
-            return breakerAttempt.blockedResponse;
-          }
-          fqContext.attemptVersion = breakerAttempt?.attemptVersion ?? null;
-          fqContext.attemptTicket = breakerAttempt?.attemptTicket ?? null;
-        }
-
         cqLease = {
           ...acquireResult,
           requestId: cqPlan.requestId,
@@ -4736,6 +4773,58 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           lease: cqLease,
           label: cqPlan.hostname,
         });
+
+        let ackHandoffResult;
+        try {
+          ackHandoffResult = await concurrencyClient.ackHandoff(ctx, {
+            requestId: cqPlan.requestId,
+            handoffToken: acquireResult.handoffToken,
+            nowMs: Date.now(),
+          }, clientSignal);
+        } catch (error) {
+          const claimHostname = cqPlan?.hostname;
+          await ensureCurrentTrueConcurrencyReleased('grant_delivery_failed', true);
+          const settleResponse = await settleBreakerAttemptIfNeeded(claimHostname);
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(`[CQ] ack_handoff failed during ${phase}:`, message);
+          if (settleResponse instanceof Response) {
+            if (needFairQueue) {
+              await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq ack_handoff settle failure`);
+            }
+            return settleResponse;
+          }
+          if (needFairQueue) {
+            await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq ack_handoff failure`);
+          }
+          return createTrueConcurrencyUnavailableResponse(origin);
+        }
+
+        if (ackHandoffResult.result !== 'acknowledged') {
+          const claimHostname = cqPlan.hostname;
+          clearCurrentTrueConcurrencyState();
+          const settleResponse = await settleBreakerAttemptIfNeeded(claimHostname);
+          if (settleResponse instanceof Response) {
+            if (needFairQueue) {
+              await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq ack_handoff terminal settle failure`);
+            }
+            return settleResponse;
+          }
+          if (needFairQueue) {
+            await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq ack_handoff terminal release`);
+          }
+          return createTrueConcurrencyTerminalResponse(ackHandoffResult.result, ackHandoffResult.reason);
+        }
+
+        if (resolveAdmissionMode(config, cqPlan.hostname) === 'queue_breaker' && needFairQueue && !fqContext?.slotToken) {
+          const breakerAttempt = await authorizeBreakerAttempt(cqPlan.hostname);
+          if (breakerAttempt?.blockedResponse) {
+            await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
+            return breakerAttempt.blockedResponse;
+          }
+          fqContext.attemptVersion = breakerAttempt?.attemptVersion ?? null;
+          fqContext.attemptTicket = breakerAttempt?.attemptTicket ?? null;
+        }
+
         cqAcquireDispatched = false;
         delete cqPlan.waitToken;
       } catch (error) {
