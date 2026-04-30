@@ -11,6 +11,23 @@ const createJsonResponse = (payload) => new Response(JSON.stringify(payload), {
   headers: { 'content-type': 'application/json' },
 });
 
+const ACK_HANDOFF_URL = 'https://cq.example.test/api/v1/concurrency/ack_handoff';
+
+const createClaimGrantResponse = ({
+  leaseId,
+  leaseToken,
+  expiresAtMs = Date.now() + 1_000,
+  handoffToken = `handoff-${leaseId}`,
+  handoffDeadlineMs = expiresAtMs - 1,
+}) => createJsonResponse({
+  result: 'granted',
+  leaseId,
+  leaseToken,
+  expiresAtMs,
+  handoffToken,
+  handoffDeadlineMs,
+});
+
 const encodeBase64Url = (input) => Buffer.from(input)
   .toString('base64')
   .replace(/\+/g, '-')
@@ -268,13 +285,14 @@ const runModeScenario = async ({
 
     if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
       calls.concurrencyClaim += 1;
-      const body = JSON.parse(init.body);
-      return createJsonResponse({
-        result: 'granted',
+      return createClaimGrantResponse({
         leaseId: 'lease-mode-1',
         leaseToken: 'token-mode-1',
-        expiresAtMs: Date.now() + 1000,
       });
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createJsonResponse({ result: 'acknowledged' });
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -503,12 +521,15 @@ test('queue_only with true concurrency wait path never calls breaker RPCs', asyn
 
     if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
       calls.push('concurrency-claim');
-      return createJsonResponse({
-        result: 'granted',
+      return createClaimGrantResponse({
         leaseId: 'lease-mode-wait',
         leaseToken: 'token-mode-wait',
-        expiresAtMs: Date.now() + 1000,
       });
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createJsonResponse({ result: 'acknowledged' });
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -546,6 +567,7 @@ test('queue_only with true concurrency wait path never calls breaker RPCs', asyn
       'fairqueue-release',
       'concurrency-acquire-2',
       'concurrency-claim',
+      'concurrency-ack-handoff',
       'origin-fetch',
       'concurrency-release',
     ]);

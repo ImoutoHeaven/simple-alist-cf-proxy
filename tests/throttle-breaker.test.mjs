@@ -19,6 +19,23 @@ const createJsonResponse = (payload) => new Response(JSON.stringify(payload), {
   headers: { 'content-type': 'application/json' },
 });
 
+const ACK_HANDOFF_URL = 'https://cq.example.test/api/v1/concurrency/ack_handoff';
+
+const createClaimGrantResponse = ({
+  leaseId,
+  leaseToken,
+  expiresAtMs = Date.now() + 1_000,
+  handoffToken = `handoff-${leaseId}`,
+  handoffDeadlineMs = expiresAtMs - 1,
+}) => createJsonResponse({
+  result: 'granted',
+  leaseId,
+  leaseToken,
+  expiresAtMs,
+  handoffToken,
+  handoffDeadlineMs,
+});
+
 const decodeHostnameHash = async (hostname) => {
   const data = new TextEncoder().encode(hostname);
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
@@ -1797,12 +1814,15 @@ test('queue_breaker settles old attempt before CQ wait and reauthorizes after CQ
 
     if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
       calls.push('concurrency-claim');
-      return createJsonResponse({
-        result: 'granted',
+      return createClaimGrantResponse({
         leaseId: 'lease-qb-1',
         leaseToken: 'token-qb-1',
-        expiresAtMs: Date.now() + 1000,
       });
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createJsonResponse({ result: 'acknowledged' });
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
@@ -1889,6 +1909,7 @@ test('queue_breaker settles old attempt before CQ wait and reauthorizes after CQ
       'fairqueue-release',
       'concurrency-acquire-continue',
       'concurrency-claim',
+      'concurrency-ack-handoff',
       'breaker-authorize',
       'origin-fetch',
       'breaker-report',
@@ -2097,12 +2118,15 @@ test('queue_breaker releases CQ lease and returns breaker terminal response when
 
     if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
       calls.push('concurrency-claim');
-      return createJsonResponse({
-        result: 'granted',
+      return createClaimGrantResponse({
         leaseId: 'lease-qb-deny-1',
         leaseToken: 'token-qb-deny-1',
-        expiresAtMs: Date.now() + 1000,
       });
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createJsonResponse({ result: 'acknowledged' });
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
@@ -2173,6 +2197,7 @@ test('queue_breaker releases CQ lease and returns breaker terminal response when
       'fairqueue-release',
       'concurrency-acquire-continue',
       'concurrency-claim',
+      'concurrency-ack-handoff',
       'breaker-authorize',
       'concurrency-release',
     ]);
@@ -3741,12 +3766,14 @@ test('queue_breaker dual mode reports actual Google redirect before fairqueue re
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
-      return createJsonResponse({
-        result: 'granted',
+      return createClaimGrantResponse({
         leaseId: 'lease-google-dual-throttled-1',
         leaseToken: 'token-google-dual-throttled-1',
-        expiresAtMs: Date.now() + 1000,
       });
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createJsonResponse({ result: 'acknowledged' });
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -3955,12 +3982,14 @@ test('queue_breaker dual mode reports actual Google redirect when CQ expires bef
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
-      return createJsonResponse({
-        result: 'granted',
+      return createClaimGrantResponse({
         leaseId: 'lease-google-dual-cq-expired-1',
         leaseToken: 'token-google-dual-cq-expired-1',
-        expiresAtMs: Date.now() + 1000,
       });
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createJsonResponse({ result: 'acknowledged' });
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
@@ -4189,12 +4218,14 @@ test('queue_breaker dual mode reports actual Google redirect when CQ wait later 
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
-      return createJsonResponse({
-        result: 'granted',
+      return createClaimGrantResponse({
         leaseId: 'lease-google-dual-cq-wait-expired-1',
         leaseToken: 'token-google-dual-cq-wait-expired-1',
-        expiresAtMs: Date.now() + 1000,
       });
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createJsonResponse({ result: 'acknowledged' });
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
