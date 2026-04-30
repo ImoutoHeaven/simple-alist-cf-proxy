@@ -4135,6 +4135,20 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   };
 
+  const retirePendingBreakerOnlyAttemptIfNeeded = async () => {
+    const pendingHostname = pendingBreakerOnlyAttempt?.hostname;
+    if (!pendingHostname) {
+      return null;
+    }
+
+    const settlement = await settleBreakerOnlyAttemptIfNeeded(pendingHostname);
+    if (settlement instanceof Response) {
+      return settlement;
+    }
+
+    return null;
+  };
+
   const settleBreakerAttemptIfNeeded = async (hostname) => {
     const queueBreakerSettlement = await settleQueueBreakerAttemptIfNeeded(hostname);
     if (queueBreakerSettlement instanceof Response) {
@@ -4579,6 +4593,11 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
   };
 
   const prepareTargetForFetch = async (targetUrl, phase) => {
+    const retireBreakerOnlyResponse = await retirePendingBreakerOnlyAttemptIfNeeded();
+    if (retireBreakerOnlyResponse) {
+      return retireBreakerOnlyResponse;
+    }
+
     const normalizedTargetUrl = String(targetUrl);
     const fairQueuePrepareResult = await prepareFairQueueContextForTarget(targetUrl, phase);
     if (fairQueuePrepareResult instanceof Response) {
@@ -4593,10 +4612,6 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     // queue_breaker + CQ: FQ acquire(granted + attempt) -> CQ fast acquire.
     // wait => settle old breaker attempt -> FQ immediate unused-grant release -> continue-wait.
     // granted after wait => fresh breaker authorize -> fetch or immediate CQ release on breaker deny.
-
-    if (needFairQueue || !needTrueConcurrency) {
-      clearPendingBreakerOnlyAttempt();
-    }
 
     let nextPlan = null;
     if (needTrueConcurrency) {
@@ -5039,11 +5054,15 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         try {
           upstreamResponse = await fetch(requestToFetch);
         } catch (error) {
+          const breakerOnlyRetirementResponse = await retirePendingBreakerOnlyAttemptIfNeeded();
           if (cqReleaseController) {
             await ensureCurrentTrueConcurrencyReleased('origin_fetch_failure', true);
           }
           if (needFairQueue) {
             await finalizeFairQueueOnFailure('origin fetch failure');
+          }
+          if (breakerOnlyRetirementResponse) {
+            throw breakerOnlyRetirementResponse;
           }
           throw error;
         }
@@ -5448,6 +5467,13 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
 
     if (shouldRewriteGoogleDriveFullDownloadResponse && !needTrueConcurrency) {
       return buildGoogleDriveFullDownloadResponse(response, request);
+    }
+
+    // Ordinary breaker_only terminal exits must retire before any managed stream
+    // binds concurrency cleanup to the response body.
+    const terminalBreakerOnlyRetirementResponse = await retirePendingBreakerOnlyAttemptIfNeeded();
+    if (terminalBreakerOnlyRetirementResponse) {
+      return await releaseAdmissionBeforeTerminalResponse(terminalBreakerOnlyRetirementResponse, 'prestream_terminal');
     }
 
     const safeResponse = needTrueConcurrency

@@ -169,6 +169,24 @@ const runModeScenario = async ({
   fairQueueHostPatterns = [],
   throttleHostPatterns = [],
   trueConcurrencyHostPatterns = [],
+  authorizeAttemptSnapshot = {
+    STATE: 'closed',
+    OPEN_UNTIL: null,
+    OPEN_REASON: null,
+    VERSION: 2,
+    LAST_ERROR_CODE: null,
+    ATTEMPT_GRANTED: false,
+    ATTEMPT_TICKET: null,
+  },
+  settleAttemptSnapshot = {
+    STATE: 'closed',
+    OPEN_UNTIL: null,
+    OPEN_REASON: null,
+    VERSION: 3,
+    LAST_ERROR_CODE: null,
+  },
+  settleError = null,
+  upstreamResponse = null,
   slotHandlerResponse = {
     result: 'granted',
     queryToken: 'query-mode-default',
@@ -183,6 +201,7 @@ const runModeScenario = async ({
     snapshot: 0,
     authorize: 0,
     report: 0,
+    settle: 0,
     concurrencyAcquire: 0,
     concurrencyClaim: 0,
     concurrencyRelease: 0,
@@ -191,6 +210,7 @@ const runModeScenario = async ({
   const acquireBodies = [];
   const authorizeBodies = [];
   const reportBodies = [];
+  const settleBodies = [];
   const releaseBodies = [];
   const concurrencyAcquireBodies = [];
   const concurrencyReleaseBodies = [];
@@ -232,15 +252,10 @@ const runModeScenario = async ({
     if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
       calls.authorize += 1;
       authorizeBodies.push(JSON.parse(init.body));
-      return createJsonResponse([{
-        STATE: 'closed',
-        OPEN_UNTIL: null,
-        OPEN_REASON: null,
-        VERSION: 2,
-        LAST_ERROR_CODE: null,
-        ATTEMPT_GRANTED: false,
-        ATTEMPT_TICKET: null,
-      }]);
+      const snapshot = typeof authorizeAttemptSnapshot === 'function'
+        ? await authorizeAttemptSnapshot({ calls, authorizeBodies, reportBodies, settleBodies })
+        : authorizeAttemptSnapshot;
+      return createJsonResponse([snapshot]);
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
@@ -253,6 +268,18 @@ const runModeScenario = async ({
         VERSION: 3,
         LAST_ERROR_CODE: null,
       }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.settle += 1;
+      settleBodies.push(JSON.parse(init.body));
+      if (settleError) {
+        throw settleError;
+      }
+      const snapshot = typeof settleAttemptSnapshot === 'function'
+        ? await settleAttemptSnapshot({ calls, authorizeBodies, reportBodies, settleBodies })
+        : settleAttemptSnapshot;
+      return createJsonResponse([snapshot]);
     }
 
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
@@ -308,6 +335,12 @@ const runModeScenario = async ({
     }
 
     if (url === 'https://tenant.sharepoint.com/file') {
+      if (upstreamResponse instanceof Response) {
+        return upstreamResponse;
+      }
+      if (typeof upstreamResponse === 'function') {
+        return upstreamResponse({ calls, authorizeBodies, reportBodies, settleBodies });
+      }
       return new Response('ok', {
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
@@ -323,14 +356,16 @@ const runModeScenario = async ({
         waitUntilPromises.push(promise);
       },
     });
-    await response.arrayBuffer();
+    const responseBodyText = await response.clone().text();
     await Promise.allSettled(waitUntilPromises);
     return {
       response,
+      responseBodyText,
       calls,
       acquireBodies,
       authorizeBodies,
       reportBodies,
+      settleBodies,
       releaseBodies,
       concurrencyAcquireBodies,
       concurrencyReleaseBodies,
@@ -371,6 +406,122 @@ test('breaker_only calls authorize/report but never slot-handler', async () => {
   assert.equal(calls.acquire, 0);
   assert.equal(calls.authorize, 1);
   assert.equal(calls.report, 1);
+  assert.equal(calls.settle, 0);
+});
+
+test('breaker_only explicitly settles authorized no-sample terminal responses before returning upstream status', async () => {
+  const { response, calls, reportBodies, settleBodies } = await runModeScenario({
+    throttleHostPatterns: ['*.sharepoint.com'],
+    authorizeAttemptSnapshot: {
+      STATE: 'half_open',
+      OPEN_UNTIL: null,
+      OPEN_REASON: 'http_429',
+      VERSION: 7,
+      LAST_ERROR_CODE: 429,
+      HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+      ATTEMPT_GRANTED: true,
+      ATTEMPT_TICKET: 2,
+    },
+    upstreamResponse: new Response('missing', {
+      status: 404,
+      headers: { 'content-type': 'text/plain' },
+    }),
+  });
+
+  assert.equal(response.status, 404);
+  assert.equal(calls.acquire, 0);
+  assert.equal(calls.authorize, 1);
+  assert.deepEqual(reportBodies, []);
+  assert.equal(calls.settle, 1);
+  assert.equal(settleBodies[0].p_attempt_version, 7);
+  assert.equal(settleBodies[0].p_attempt_ticket, 2);
+});
+
+test('breaker_only fails closed when settlement fails on authorized no-sample terminal response', async () => {
+  const { response, responseBodyText, calls, reportBodies, settleBodies } = await runModeScenario({
+    throttleHostPatterns: ['*.sharepoint.com'],
+    authorizeAttemptSnapshot: {
+      STATE: 'half_open',
+      OPEN_UNTIL: null,
+      OPEN_REASON: 'http_429',
+      VERSION: 9,
+      LAST_ERROR_CODE: 429,
+      HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+      ATTEMPT_GRANTED: true,
+      ATTEMPT_TICKET: 4,
+    },
+    settleError: new Error('settle unavailable'),
+    upstreamResponse: new Response('missing', {
+      status: 404,
+      headers: { 'content-type': 'text/plain' },
+    }),
+  });
+
+  assert.equal(response.status, 503);
+  assert.match(JSON.parse(responseBodyText).message, /attempt settlement/i);
+  assert.equal(calls.acquire, 0);
+  assert.equal(calls.authorize, 1);
+  assert.deepEqual(reportBodies, []);
+  assert.equal(calls.settle, 1);
+  assert.equal(settleBodies[0].p_attempt_version, 9);
+  assert.equal(settleBodies[0].p_attempt_ticket, 4);
+});
+
+test('breaker_only settles authorized origin fetch throws before returning the worker error contract', async () => {
+  const { response, responseBodyText, calls, reportBodies, settleBodies } = await runModeScenario({
+    throttleHostPatterns: ['*.sharepoint.com'],
+    authorizeAttemptSnapshot: {
+      STATE: 'half_open',
+      OPEN_UNTIL: null,
+      OPEN_REASON: 'http_429',
+      VERSION: 11,
+      LAST_ERROR_CODE: 429,
+      HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+      ATTEMPT_GRANTED: true,
+      ATTEMPT_TICKET: 6,
+    },
+    upstreamResponse: () => {
+      throw new Error('origin exploded');
+    },
+  });
+
+  assert.equal(response.status, 500);
+  assert.equal(JSON.parse(responseBodyText).message, 'origin exploded');
+  assert.equal(calls.acquire, 0);
+  assert.equal(calls.authorize, 1);
+  assert.deepEqual(reportBodies, []);
+  assert.equal(calls.settle, 1);
+  assert.equal(settleBodies[0].p_attempt_version, 11);
+  assert.equal(settleBodies[0].p_attempt_ticket, 6);
+});
+
+test('breaker_only fails closed when settlement fails after origin fetch throws before sampling', async () => {
+  const { response, responseBodyText, calls, reportBodies, settleBodies } = await runModeScenario({
+    throttleHostPatterns: ['*.sharepoint.com'],
+    authorizeAttemptSnapshot: {
+      STATE: 'half_open',
+      OPEN_UNTIL: null,
+      OPEN_REASON: 'http_429',
+      VERSION: 13,
+      LAST_ERROR_CODE: 429,
+      HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+      ATTEMPT_GRANTED: true,
+      ATTEMPT_TICKET: 8,
+    },
+    settleError: new Error('settle unavailable'),
+    upstreamResponse: () => {
+      throw new Error('origin exploded');
+    },
+  });
+
+  assert.equal(response.status, 503);
+  assert.match(JSON.parse(responseBodyText).message, /attempt settlement/i);
+  assert.equal(calls.acquire, 0);
+  assert.equal(calls.authorize, 1);
+  assert.deepEqual(reportBodies, []);
+  assert.equal(calls.settle, 1);
+  assert.equal(settleBodies[0].p_attempt_version, 13);
+  assert.equal(settleBodies[0].p_attempt_ticket, 8);
 });
 
 test('queue_only calls slot-handler but never breaker RPCs', async () => {

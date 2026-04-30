@@ -1226,6 +1226,123 @@ test('breaker_only with true concurrency authorizes after ack_handoff and settle
   }
 });
 
+test('breaker_only with true concurrency returns authority unavailable when no-sample settle fails during refresh retirement', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url.startsWith('https://alist.example.com/api/fs/link')) {
+      calls.push('link-api');
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 41,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 42,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 8,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-breaker-refresh-settle-fail',
+        leaseToken: 'token-breaker-refresh-settle-fail',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-breaker-refresh-settle-fail',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch-401');
+      return new Response('expired', {
+        status: 401,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      throw new Error('settle unavailable');
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.match(body.message, /attempt settlement/i);
+    assert.deepEqual(calls, [
+      'link-api',
+      'breaker-snapshot',
+      'concurrency-acquire',
+      'concurrency-claim',
+      'concurrency-ack-handoff',
+      'breaker-authorize',
+      'origin-fetch-401',
+      'breaker-settle',
+      'concurrency-release',
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('breaker_only with true concurrency checks handler readiness before authorizing breaker attempts', async () => {
   const originalFetch = globalThis.fetch;
   const originalDateNow = Date.now;
