@@ -38,11 +38,24 @@ type ClaimGrantRequest struct {
 }
 
 type ClaimGrantResult struct {
-	Result      string `json:"result"`
-	LeaseID     string `json:"leaseId,omitempty"`
-	LeaseToken  string `json:"leaseToken,omitempty"`
-	ExpiresAtMs int64  `json:"expiresAtMs,omitempty"`
-	Reason      string `json:"reason,omitempty"`
+	Result            string `json:"result"`
+	LeaseID           string `json:"leaseId,omitempty"`
+	LeaseToken        string `json:"leaseToken,omitempty"`
+	ExpiresAtMs       int64  `json:"expiresAtMs,omitempty"`
+	HandoffToken      string `json:"handoffToken,omitempty"`
+	HandoffDeadlineMs int64  `json:"handoffDeadlineMs,omitempty"`
+	Reason            string `json:"reason,omitempty"`
+}
+
+type AckHandoffRequest struct {
+	RequestID    string `json:"requestId"`
+	HandoffToken string `json:"handoffToken"`
+	NowMs        int64  `json:"nowMs"`
+}
+
+type AckHandoffResult struct {
+	Result string `json:"result"`
+	Reason string `json:"reason,omitempty"`
 }
 
 type ReleaseRequest struct {
@@ -101,12 +114,14 @@ const (
 	fixedContinueWaitProbeFunc                  = "cq_continue_wait_probe"
 	fixedPromoteWaitingFunc                     = "cq_promote_waiting_request"
 	fixedClaimGrantFunc                         = "cq_claim_grant"
+	fixedAckHandoffFunc                         = "cq_ack_handoff"
 	fixedCancelFunc                             = "cq_cancel"
 	acquireConflictReasonRequestIDTupleMismatch = "request_id_tuple_mismatch"
 	acquireConflictReasonStaleWaitToken         = "stale_wait_token"
 	acquireConflictReasonWaiterAlreadyAttached  = "waiter_already_attached"
 	acquireConflictReasonGrantUnclaimed         = "grant_unclaimed"
 	acquireConflictReasonGrantAlreadyClaimed    = "grant_already_claimed"
+	ackHandoffConflictReasonTokenMismatch       = "handoff_token_mismatch"
 	cancelConflictReasonMustReleaseActiveLease  = "must_release_active_lease"
 	releaseReasonGrantDeliveryFailed            = "grant_delivery_failed"
 	releaseReasonAcquireDeliveryFailed          = "acquire_delivery_failed"
@@ -189,6 +204,10 @@ type Backend interface {
 
 type continueWaitProber interface {
 	ProbeContinueWait(ctx context.Context, req AcquireRequest) (*AcquireResult, error)
+}
+
+type ackHandoffer interface {
+	AckHandoff(ctx context.Context, req AckHandoffRequest) (*AckHandoffResult, error)
 }
 
 type acquireWireResult struct {
@@ -292,7 +311,7 @@ func validateAcquireResult(req AcquireRequest, result *AcquireResult) error {
 		}
 	case "released":
 		switch result.Reason {
-		case "already_released", releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed:
+		case "already_released", releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed, "claim_handoff_timeout":
 		default:
 			return fmt.Errorf("invalid acquire released reason %q", result.Reason)
 		}
@@ -334,6 +353,12 @@ func validateClaimGrantResult(result *ClaimGrantResult) error {
 		if strings.TrimSpace(result.LeaseID) == "" || strings.TrimSpace(result.LeaseToken) == "" || result.ExpiresAtMs <= 0 {
 			return errors.New("incomplete claim granted result")
 		}
+		if strings.TrimSpace(result.HandoffToken) == "" || result.HandoffDeadlineMs <= 0 {
+			return errors.New("incomplete claim granted result: handoffToken and handoffDeadlineMs are required")
+		}
+		if result.HandoffDeadlineMs >= result.ExpiresAtMs {
+			return fmt.Errorf("invalid claim granted handoff deadline %d for lease expiry %d", result.HandoffDeadlineMs, result.ExpiresAtMs)
+		}
 		return nil
 	case "conflict":
 		switch result.Reason {
@@ -347,7 +372,7 @@ func validateClaimGrantResult(result *ClaimGrantResult) error {
 		}
 	case "released":
 		switch result.Reason {
-		case "already_released", releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed:
+		case "already_released", releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed, "claim_handoff_timeout":
 		default:
 			return fmt.Errorf("invalid claim released reason %q", result.Reason)
 		}
@@ -366,6 +391,58 @@ func validateClaimGrantResult(result *ClaimGrantResult) error {
 		}
 	default:
 		return fmt.Errorf("invalid claim result %q", result.Result)
+	}
+}
+
+func validateAckHandoffRequest(req AckHandoffRequest) error {
+	if strings.TrimSpace(req.RequestID) == "" {
+		return errors.New("requestId is required")
+	}
+	if strings.TrimSpace(req.HandoffToken) == "" {
+		return errors.New("handoffToken is required")
+	}
+	if req.NowMs <= 0 {
+		return errors.New("nowMs is required")
+	}
+	return nil
+}
+
+func validateAckHandoffResult(result *AckHandoffResult) error {
+	if result == nil {
+		return errors.New("missing ack handoff result")
+	}
+	switch result.Result {
+	case "acknowledged":
+		if strings.TrimSpace(result.Reason) != "" {
+			return errors.New("acknowledged ack handoff result must not include reason")
+		}
+		return nil
+	case "conflict":
+		if result.Reason != ackHandoffConflictReasonTokenMismatch {
+			return fmt.Errorf("invalid ack handoff conflict reason %q", result.Reason)
+		}
+		return nil
+	case "released":
+		switch result.Reason {
+		case "already_released", releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed, "claim_handoff_timeout":
+			return nil
+		default:
+			return fmt.Errorf("invalid ack handoff released reason %q", result.Reason)
+		}
+	case "cancelled":
+		if result.Reason != "request_cancelled" {
+			return fmt.Errorf("invalid ack handoff cancelled reason %q", result.Reason)
+		}
+		return nil
+	case "expired":
+		switch result.Reason {
+		case "hard_expired", "waiter_detached_timeout":
+			return nil
+		default:
+			return fmt.Errorf("invalid ack handoff expired reason %q", result.Reason)
+		}
+	default:
+		return fmt.Errorf("invalid ack handoff result %q", result.Result)
 	}
 }
 

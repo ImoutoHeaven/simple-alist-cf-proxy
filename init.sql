@@ -1687,6 +1687,10 @@ CREATE TABLE IF NOT EXISTS concurrency_requests (
   claim_token text,
   claim_state text CHECK (claim_state IN ('unclaimed', 'claimed', 'compensated')),
   claim_claimed_at_ms bigint,
+  handoff_state text CHECK (handoff_state IN ('none', 'pending', 'acknowledged', 'compensated')) NOT NULL DEFAULT 'none',
+  handoff_token text,
+  handoff_deadline_ms bigint,
+  handoff_acked_at_ms bigint,
   terminal_reason text,
   created_at_ms bigint NOT NULL,
   updated_at_ms bigint NOT NULL
@@ -1705,7 +1709,8 @@ CREATE OR REPLACE FUNCTION cq_apply_request_terminal_transition(
   p_terminal_state text,
   p_terminal_reason text,
   p_now_ms bigint,
-  p_claim_state text DEFAULT NULL
+  p_claim_state text DEFAULT NULL,
+  p_handoff_state text DEFAULT NULL
 )
 RETURNS boolean AS $$
 DECLARE
@@ -1748,6 +1753,7 @@ BEGIN
   SET state = v_terminal_state,
       terminal_reason = p_terminal_reason,
       claim_state = CASE WHEN p_claim_state IS NOT NULL THEN p_claim_state ELSE claim_state END,
+      handoff_state = CASE WHEN p_handoff_state IS NOT NULL THEN p_handoff_state ELSE handoff_state END,
       updated_at_ms = p_now_ms
   WHERE request_id = p_request_id
     AND state = 'active';
@@ -1830,6 +1836,12 @@ BEGIN
     RETURN cq_apply_request_terminal_transition(p_request_id, 'expired', 'hard_expired', p_now_ms);
   END IF;
 
+  IF v_request.handoff_state = 'pending'
+    AND v_request.handoff_deadline_ms IS NOT NULL
+    AND v_request.handoff_deadline_ms <= p_now_ms THEN
+    RETURN cq_apply_request_terminal_transition(p_request_id, 'released', 'claim_handoff_timeout', p_now_ms, 'compensated', 'compensated');
+  END IF;
+
   RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
@@ -1868,17 +1880,27 @@ BEGIN
 
   FOR v_row IN
     WITH expired_rows AS (
-      SELECT l.request_id
-      FROM concurrency_leases AS l
-      WHERE l.state = 'active'
-        AND l.hostname_hash = p_hostname_hash
-        AND l.expires_at_ms <= v_now_ms
+      SELECT r.request_id,
+             CASE
+               WHEN r.handoff_state = 'pending' AND r.handoff_deadline_ms IS NOT NULL AND r.handoff_deadline_ms <= v_now_ms THEN r.handoff_deadline_ms
+               ELSE l.expires_at_ms
+             END AS due_at_ms
+      FROM concurrency_requests AS r
+      LEFT JOIN concurrency_leases AS l
+        ON l.request_id = r.request_id
+       AND l.state = 'active'
+      WHERE r.state = 'active'
+        AND r.hostname_hash = p_hostname_hash
         AND (
           v_scope = 'host'
-          OR (v_scope = 'site' AND l.site_bucket = p_site_bucket)
-          OR (v_scope = 'site_ip' AND l.site_bucket = p_site_bucket AND l.ip_bucket = p_ip_bucket)
+          OR (v_scope = 'site' AND r.site_bucket = p_site_bucket)
+          OR (v_scope = 'site_ip' AND r.site_bucket = p_site_bucket AND r.ip_bucket = p_ip_bucket)
         )
-      ORDER BY l.expires_at_ms, l.request_id
+        AND (
+          (l.request_id IS NOT NULL AND l.expires_at_ms <= v_now_ms)
+          OR (r.handoff_state = 'pending' AND r.handoff_deadline_ms IS NOT NULL AND r.handoff_deadline_ms <= v_now_ms)
+        )
+      ORDER BY due_at_ms, r.request_id
       LIMIT v_limit
     )
     SELECT expired_rows.request_id
@@ -2477,6 +2499,10 @@ BEGIN
       claim_token = v_new_claim_token,
       claim_state = 'unclaimed',
       claim_claimed_at_ms = NULL,
+      handoff_state = 'none',
+      handoff_token = NULL,
+      handoff_deadline_ms = NULL,
+      handoff_acked_at_ms = NULL,
       terminal_reason = NULL,
       updated_at_ms = v_now_ms
   WHERE request_id = v_request_id;
@@ -2948,6 +2974,10 @@ BEGIN
     claim_token,
     claim_state,
     claim_claimed_at_ms,
+    handoff_state,
+    handoff_token,
+    handoff_deadline_ms,
+    handoff_acked_at_ms,
     created_at_ms,
     updated_at_ms
   ) VALUES (
@@ -2963,6 +2993,10 @@ BEGIN
     p_hard_expire_at_ms,
     v_new_claim_token,
     'unclaimed',
+    NULL,
+    'none',
+    NULL,
+    NULL,
     NULL,
     v_now_ms,
     v_now_ms
@@ -3004,7 +3038,7 @@ CREATE OR REPLACE FUNCTION cq_claim_grant(
   p_claim_token text,
   p_now_ms bigint DEFAULT NULL
 )
-RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, reason text) AS $$
+RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, handoff_token text, handoff_deadline_ms bigint, reason text) AS $$
 DECLARE
   v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
   v_request_id text := BTRIM(COALESCE(p_request_id, ''));
@@ -3014,12 +3048,19 @@ DECLARE
   v_request_row_count bigint := 0;
   v_active_lease_row_count bigint := 0;
   v_transitioned boolean := FALSE;
+  v_granted_lease_id uuid := NULL;
+  v_granted_lease_token text := NULL;
+  v_granted_expires_at_ms bigint := NULL;
+  v_new_handoff_token text := NULL;
+  v_new_handoff_deadline_ms bigint := NULL;
 BEGIN
   IF v_request_id = '' OR v_claim_token = '' THEN
     result := 'conflict';
     lease_id := NULL;
     lease_token := NULL;
     expires_at_ms := NULL;
+    handoff_token := NULL;
+    handoff_deadline_ms := NULL;
     reason := 'grant_unclaimed';
     RETURN NEXT;
     RETURN;
@@ -3040,6 +3081,8 @@ BEGIN
     lease_id := NULL;
     lease_token := NULL;
     expires_at_ms := NULL;
+    handoff_token := NULL;
+    handoff_deadline_ms := NULL;
     reason := 'grant_unclaimed';
     RETURN NEXT;
     RETURN;
@@ -3065,9 +3108,37 @@ BEGIN
         lease_id := NULL;
         lease_token := NULL;
         expires_at_ms := NULL;
+        handoff_token := NULL;
+        handoff_deadline_ms := NULL;
         reason := CASE
           WHEN v_transitioned THEN 'hard_expired'
           ELSE COALESCE(v_request.terminal_reason, 'hard_expired')
+        END;
+        RETURN NEXT;
+        RETURN;
+      END IF;
+
+      IF v_request.handoff_state = 'pending'
+        AND v_request.handoff_deadline_ms IS NOT NULL
+        AND v_request.handoff_deadline_ms <= v_now_ms THEN
+        v_transitioned := cq_apply_request_terminal_transition(
+          v_request_id,
+          'released',
+          'claim_handoff_timeout',
+          v_now_ms,
+          'compensated',
+          'compensated'
+        );
+
+        result := 'released';
+        lease_id := NULL;
+        lease_token := NULL;
+        expires_at_ms := NULL;
+        handoff_token := NULL;
+        handoff_deadline_ms := NULL;
+        reason := CASE
+          WHEN v_transitioned THEN 'claim_handoff_timeout'
+          ELSE COALESCE(v_request.terminal_reason, 'claim_handoff_timeout')
         END;
         RETURN NEXT;
         RETURN;
@@ -3078,31 +3149,52 @@ BEGIN
         lease_id := NULL;
         lease_token := NULL;
         expires_at_ms := NULL;
+        handoff_token := NULL;
+        handoff_deadline_ms := NULL;
         reason := CASE WHEN v_request.claim_state = 'claimed' THEN 'grant_already_claimed' ELSE 'grant_unclaimed' END;
         RETURN NEXT;
         RETURN;
       END IF;
 
+      v_granted_lease_id := CASE WHEN v_active_lease_row_count > 0 THEN v_active_lease.lease_id ELSE v_request.lease_id END;
+      v_granted_lease_token := CASE WHEN v_active_lease_row_count > 0 THEN v_active_lease.lease_token ELSE v_request.lease_token END;
+      v_granted_expires_at_ms := CASE WHEN v_active_lease_row_count > 0 THEN v_active_lease.expires_at_ms ELSE v_request.lease_expires_at_ms END;
+
       IF v_request.claim_state = 'unclaimed' THEN
+        v_new_handoff_token := md5(v_request_id || '|' || v_claim_token || '|handoff|' || v_now_ms::text);
+        v_new_handoff_deadline_ms := LEAST(v_granted_expires_at_ms - 1, v_request.hard_expire_at_ms - 1, v_now_ms + 5000);
+
         UPDATE concurrency_requests
         SET claim_state = 'claimed',
             claim_claimed_at_ms = v_now_ms,
+            handoff_state = 'pending',
+            handoff_token = v_new_handoff_token,
+            handoff_deadline_ms = v_new_handoff_deadline_ms,
+            handoff_acked_at_ms = NULL,
             updated_at_ms = v_now_ms
         WHERE request_id = v_request_id;
+
+        handoff_token := v_new_handoff_token;
+        handoff_deadline_ms := v_new_handoff_deadline_ms;
       ELSIF v_request.claim_state IS DISTINCT FROM 'claimed' THEN
         result := 'conflict';
         lease_id := NULL;
         lease_token := NULL;
         expires_at_ms := NULL;
+        handoff_token := NULL;
+        handoff_deadline_ms := NULL;
         reason := 'grant_already_claimed';
         RETURN NEXT;
         RETURN;
+      ELSE
+        handoff_token := v_request.handoff_token;
+        handoff_deadline_ms := v_request.handoff_deadline_ms;
       END IF;
 
       result := 'granted';
-      lease_id := CASE WHEN v_active_lease_row_count > 0 THEN v_active_lease.lease_id ELSE v_request.lease_id END;
-      lease_token := CASE WHEN v_active_lease_row_count > 0 THEN v_active_lease.lease_token ELSE v_request.lease_token END;
-      expires_at_ms := CASE WHEN v_active_lease_row_count > 0 THEN v_active_lease.expires_at_ms ELSE v_request.lease_expires_at_ms END;
+      lease_id := v_granted_lease_id;
+      lease_token := v_granted_lease_token;
+      expires_at_ms := v_granted_expires_at_ms;
       reason := NULL;
       RETURN NEXT;
       RETURN;
@@ -3111,6 +3203,8 @@ BEGIN
       lease_id := NULL;
       lease_token := NULL;
       expires_at_ms := NULL;
+      handoff_token := NULL;
+      handoff_deadline_ms := NULL;
       reason := COALESCE(v_request.terminal_reason, 'already_released');
       RETURN NEXT;
       RETURN;
@@ -3119,6 +3213,8 @@ BEGIN
       lease_id := NULL;
       lease_token := NULL;
       expires_at_ms := NULL;
+      handoff_token := NULL;
+      handoff_deadline_ms := NULL;
       reason := 'request_cancelled';
       RETURN NEXT;
       RETURN;
@@ -3127,6 +3223,8 @@ BEGIN
       lease_id := NULL;
       lease_token := NULL;
       expires_at_ms := NULL;
+      handoff_token := NULL;
+      handoff_deadline_ms := NULL;
       reason := COALESCE(v_request.terminal_reason, 'hard_expired');
       RETURN NEXT;
       RETURN;
@@ -3135,10 +3233,149 @@ BEGIN
       lease_id := NULL;
       lease_token := NULL;
       expires_at_ms := NULL;
+      handoff_token := NULL;
+      handoff_deadline_ms := NULL;
       reason := 'grant_unclaimed';
       RETURN NEXT;
       RETURN;
   END CASE;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_ack_handoff(
+  p_request_id text,
+  p_handoff_token text,
+  p_now_ms bigint DEFAULT NULL
+)
+RETURNS TABLE(result text, reason text) AS $$
+DECLARE
+  v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
+  v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_handoff_token text := BTRIM(COALESCE(p_handoff_token, ''));
+  v_request record;
+  v_active_lease concurrency_leases%ROWTYPE;
+  v_request_row_count bigint := 0;
+  v_active_lease_row_count bigint := 0;
+  v_transitioned boolean := FALSE;
+BEGIN
+  IF v_request_id = '' OR v_handoff_token = '' THEN
+    result := 'conflict';
+    reason := 'handoff_token_mismatch';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+
+  SELECT *
+    INTO v_request
+  FROM concurrency_requests
+  WHERE request_id = v_request_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
+
+  IF v_request_row_count = 0 THEN
+    result := 'conflict';
+    reason := 'handoff_token_mismatch';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  CASE v_request.state
+    WHEN 'released' THEN
+      result := 'released';
+      reason := COALESCE(v_request.terminal_reason, 'already_released');
+      RETURN NEXT;
+      RETURN;
+    WHEN 'cancelled' THEN
+      result := 'cancelled';
+      reason := 'request_cancelled';
+      RETURN NEXT;
+      RETURN;
+    WHEN 'expired' THEN
+      result := 'expired';
+      reason := COALESCE(v_request.terminal_reason, 'hard_expired');
+      RETURN NEXT;
+      RETURN;
+    WHEN 'active' THEN
+      NULL;
+    ELSE
+      result := 'conflict';
+      reason := 'handoff_token_mismatch';
+      RETURN NEXT;
+      RETURN;
+  END CASE;
+
+  SELECT *
+    INTO v_active_lease
+  FROM concurrency_leases
+  WHERE request_id = v_request_id
+    AND state = 'active'
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_active_lease_row_count = ROW_COUNT;
+
+  IF v_request.hard_expire_at_ms <= v_now_ms
+    OR COALESCE(v_request.lease_expires_at_ms, 0) <= v_now_ms
+    OR (v_active_lease_row_count > 0 AND (v_active_lease.hard_expire_at_ms <= v_now_ms OR v_active_lease.expires_at_ms <= v_now_ms)) THEN
+    v_transitioned := cq_apply_request_terminal_transition(v_request_id, 'expired', 'hard_expired', v_now_ms);
+
+    result := 'expired';
+    reason := CASE
+      WHEN v_transitioned THEN 'hard_expired'
+      ELSE COALESCE(v_request.terminal_reason, 'hard_expired')
+    END;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.handoff_state = 'pending'
+    AND v_request.handoff_deadline_ms IS NOT NULL
+    AND v_request.handoff_deadline_ms <= v_now_ms THEN
+    v_transitioned := cq_apply_request_terminal_transition(
+      v_request_id,
+      'released',
+      'claim_handoff_timeout',
+      v_now_ms,
+      'compensated',
+      'compensated'
+    );
+
+    result := 'released';
+    reason := CASE
+      WHEN v_transitioned THEN 'claim_handoff_timeout'
+      ELSE COALESCE(v_request.terminal_reason, 'claim_handoff_timeout')
+    END;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.handoff_token IS NOT DISTINCT FROM v_handoff_token
+    AND v_request.handoff_state = 'pending' THEN
+    UPDATE concurrency_requests
+    SET handoff_state = 'acknowledged',
+        handoff_acked_at_ms = v_now_ms,
+        updated_at_ms = v_now_ms
+    WHERE request_id = v_request_id;
+
+    result := 'acknowledged';
+    reason := NULL;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.handoff_token IS NOT DISTINCT FROM v_handoff_token
+    AND v_request.handoff_state = 'acknowledged' THEN
+    result := 'acknowledged';
+    reason := NULL;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  result := 'conflict';
+  reason := 'handoff_token_mismatch';
+  RETURN NEXT;
 END;
 $$ LANGUAGE plpgsql;
 

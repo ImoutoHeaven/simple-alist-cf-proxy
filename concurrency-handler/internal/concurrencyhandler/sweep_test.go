@@ -2,6 +2,7 @@ package concurrencyhandler
 
 import (
 	"context"
+	"database/sql"
 	"sync"
 	"testing"
 	"time"
@@ -72,6 +73,46 @@ func (b *sweepRecordingBackend) snapshot() []ExpireScopeRequest {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]ExpireScopeRequest(nil), b.requests...)
+}
+
+func seedOverdueHandoffPendingRequest(t *testing.T, db *sql.DB, hostnameHash, hostname, requestID string) runtimeClaimGrantResult {
+	t.Helper()
+
+	nowMs := time.Now().UnixMilli()
+	acquireNow := nowMs - 10_000
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      hostnameHash,
+		Hostname:          hostname,
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         requestID,
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             acquireNow,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed overdue handoff acquire: %v", err)
+	}
+	if grant.Result != "granted" || !grant.ClaimToken.Valid {
+		t.Fatalf("expected seeded overdue handoff acquire grant, got %+v", grant)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, requestID, grant.ClaimToken.String, acquireNow+1)
+	if err != nil {
+		t.Fatalf("seed overdue handoff claim: %v", err)
+	}
+	if claim.Result != "granted" || !claim.HandoffDeadlineMs.Valid {
+		t.Fatalf("expected seeded overdue handoff claim grant, got %+v", claim)
+	}
+	if claim.HandoffDeadlineMs.Int64 > nowMs {
+		t.Fatalf("expected seeded handoff to already be overdue, got %+v now=%d", claim, nowMs)
+	}
+	request := readRuntimeRequestState(t, db, requestID)
+	if request.State != "active" || request.HandoffState.String != "pending" {
+		t.Fatalf("expected seeded overdue handoff request to remain active/pending before recovery, got %+v", request)
+	}
+	return *claim
 }
 
 func TestSweepDisabledDoesNotStartLoop(t *testing.T) {
@@ -301,5 +342,51 @@ func TestStartupRecoveryExpiresActiveLeasesBeforeServing(t *testing.T) {
 	}
 	if server.waitingRuntime.isReplayActiveRequest("startup-active-request") {
 		t.Fatal("expected startup authoritative expiry to clear runtime active replay state")
+	}
+}
+
+func TestRunSweepPassCompensatesOverdueHandoffPendingRequests(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	seedOverdueHandoffPendingRequest(t, db, "sweep-handoff-host", "sweep-handoff.example.com", "sweep-handoff-request")
+
+	cfg := validTestConfig()
+	server := newTestServerInstanceWithConfig(t, cfg, &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}})
+
+	if err := server.runSweepPass(context.Background()); err != nil {
+		t.Fatalf("runSweepPass error: %v", err)
+	}
+
+	request := readRuntimeRequestState(t, db, "sweep-handoff-request")
+	if request.State != "released" || request.TerminalReason.String != "claim_handoff_timeout" {
+		t.Fatalf("expected sweep to compensate overdue handoff pending request, got %+v", request)
+	}
+	if request.ClaimState.String != "compensated" || request.HandoffState.String != "compensated" {
+		t.Fatalf("expected sweep compensation to mark compensated sub-states, got %+v", request)
+	}
+	if request.HandoffAckedAtMs.Valid {
+		t.Fatalf("expected sweep compensation not to acknowledge overdue handoff, got %+v", request)
+	}
+}
+
+func TestStartupRecoveryCompensatesOverdueHandoffPendingBeforeServing(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	seedOverdueHandoffPendingRequest(t, db, "startup-handoff-host", "startup-handoff.example.com", "startup-handoff-request")
+
+	cfg := validTestConfig()
+	server, err := NewServer(cfg, &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}})
+	if err != nil {
+		t.Fatalf("NewServer startup recovery error: %v", err)
+	}
+	defer func() { _ = server.Close() }()
+
+	request := readRuntimeRequestState(t, db, "startup-handoff-request")
+	if request.State != "released" || request.TerminalReason.String != "claim_handoff_timeout" {
+		t.Fatalf("expected startup recovery to compensate overdue handoff pending request, got %+v", request)
+	}
+	if request.ClaimState.String != "compensated" || request.HandoffState.String != "compensated" {
+		t.Fatalf("expected startup recovery compensation to mark compensated sub-states, got %+v", request)
+	}
+	if request.HandoffAckedAtMs.Valid {
+		t.Fatalf("expected startup recovery not to acknowledge overdue handoff, got %+v", request)
 	}
 }

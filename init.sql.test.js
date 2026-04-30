@@ -250,10 +250,28 @@ describe('init.sql breaker RPC definitions', () => {
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_expire_scope\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_release\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_claim_grant\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_ack_handoff\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_cancel\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_promote_waiting_request\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_acquire\(/i);
     expect(initSql).not.toMatch(/CREATE OR REPLACE FUNCTION\s+cq_release_by_request\(/i);
+  });
+
+  it('defines request-ledger handoff metadata for the active handoff sub-phase', () => {
+    expect(initSql).toMatch(/handoff_state\s+text\s+CHECK\s*\(handoff_state\s+IN\s*\('none',\s*'pending',\s*'acknowledged',\s*'compensated'\)\)/i);
+    expect(initSql).toMatch(/handoff_token\s+text/i);
+    expect(initSql).toMatch(/handoff_deadline_ms\s+bigint/i);
+    expect(initSql).toMatch(/handoff_acked_at_ms\s+bigint/i);
+  });
+
+  it('keeps handoff schema setup fresh-only without compatibility alter/backfill DDL', () => {
+    expect(initSql).not.toMatch(/ALTER TABLE\s+concurrency_requests\s+ADD COLUMN IF NOT EXISTS\s+handoff_state/i);
+    expect(initSql).not.toMatch(/ALTER TABLE\s+concurrency_requests\s+ADD COLUMN IF NOT EXISTS\s+handoff_token/i);
+    expect(initSql).not.toMatch(/ALTER TABLE\s+concurrency_requests\s+ADD COLUMN IF NOT EXISTS\s+handoff_deadline_ms/i);
+    expect(initSql).not.toMatch(/ALTER TABLE\s+concurrency_requests\s+ADD COLUMN IF NOT EXISTS\s+handoff_acked_at_ms/i);
+    expect(initSql).not.toMatch(/UPDATE\s+concurrency_requests\s+SET\s+handoff_state\s*=\s*'none'\s+WHERE\s+handoff_state\s+IS\s+NULL/i);
+    expect(initSql).not.toMatch(/ALTER TABLE\s+concurrency_requests\s+ALTER COLUMN\s+handoff_state\s+SET\s+DEFAULT\s+'none'/i);
+    expect(initSql).not.toMatch(/ALTER TABLE\s+concurrency_requests\s+ALTER COLUMN\s+handoff_state\s+SET\s+NOT\s+NULL/i);
   });
 
   it('encodes waiting-model acquire timing and wait-token replay in cq_acquire', () => {
@@ -277,6 +295,7 @@ describe('init.sql breaker RPC definitions', () => {
     const expireBody = readFunctionBody('cq_expire_scope');
     const expireActiveBody = readFunctionBody('cq_expire_active_request_if_due');
     const claimBody = readFunctionBody('cq_claim_grant');
+    const ackBody = readFunctionBody('cq_ack_handoff');
 
     expect(acquireBody).toMatch(/request_id/i);
     expect(acquireBody).toMatch(/wait_token/i);
@@ -293,6 +312,9 @@ describe('init.sql breaker RPC definitions', () => {
 
     expect(claimBody).toMatch(/WHEN 'active' THEN[\s\S]*?result := 'expired'[\s\S]*?v_request\.claim_token IS DISTINCT FROM v_claim_token[\s\S]*?result := 'conflict'[\s\S]*?result := 'granted'/i);
     expect(claimBody).toMatch(/claim_state = 'claimed'/i);
+    expect(claimBody).toMatch(/handoff_state = 'pending'/i);
+    expect(claimBody).toMatch(/handoff_token/i);
+    expect(claimBody).toMatch(/handoff_deadline_ms/i);
 
     expect(cancelBody).toMatch(/INSERT INTO concurrency_requests/i);
     expect(cancelBody).toMatch(/p_hostname\s+text/i);
@@ -316,6 +338,23 @@ describe('init.sql breaker RPC definitions', () => {
     expect(expireActiveBody).toMatch(/FROM concurrency_requests[\s\S]*?WHERE request_id = p_request_id[\s\S]*?FOR UPDATE/i);
     expect(expireActiveBody).toMatch(/FROM concurrency_leases[\s\S]*?WHERE request_id = p_request_id[\s\S]*?AND state = 'active'[\s\S]*?FOR UPDATE/i);
     expect(expireActiveBody).toMatch(/cq_apply_request_terminal_transition\(p_request_id, 'expired', 'hard_expired', p_now_ms\)/i);
+
+    expect(ackBody).toMatch(/handoff_token_mismatch/i);
+    expect(ackBody).toMatch(/handoff_state\s*=\s*'acknowledged'/i);
+    expect(ackBody).toMatch(/handoff_acked_at_ms\s*=\s*v_now_ms/i);
+  });
+
+  it('represents handoff-timeout compensation in claim replay, ack_handoff, and recovery SQL paths', () => {
+    const claimBody = readFunctionBody('cq_claim_grant');
+    const ackBody = readFunctionBody('cq_ack_handoff');
+    const expireBody = readFunctionBody('cq_expire_scope');
+    const expireActiveBody = readFunctionBody('cq_expire_active_request_if_due');
+
+    expect(initSql).toMatch(/claim_handoff_timeout/i);
+    expect(claimBody).toMatch(/handoff_state\s*=\s*'pending'[\s\S]*?handoff_deadline_ms\s*<=\s*v_now_ms[\s\S]*?claim_handoff_timeout/i);
+    expect(ackBody).toMatch(/handoff_deadline_ms\s*<=\s*v_now_ms[\s\S]*?claim_handoff_timeout/i);
+    expect(expireBody).toMatch(/handoff_deadline_ms/i);
+    expect(expireActiveBody).toMatch(/handoff_state\s*=\s*'pending'[\s\S]*?handoff_deadline_ms\s*<=\s*p_now_ms[\s\S]*?claim_handoff_timeout/i);
   });
 
   it('uses executable plpgsql lock statements for true-concurrency counters', () => {

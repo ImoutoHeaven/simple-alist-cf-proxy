@@ -206,15 +206,44 @@ func (p *postgresBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest)
 	var leaseID sql.NullString
 	var leaseToken sql.NullString
 	var expiresAtMs sql.NullInt64
+	var handoffToken sql.NullString
+	var handoffDeadlineMs sql.NullInt64
 	var reason sql.NullString
-	if err := rows.Scan(&result.Result, &leaseID, &leaseToken, &expiresAtMs, &reason); err != nil {
+	if err := rows.Scan(&result.Result, &leaseID, &leaseToken, &expiresAtMs, &handoffToken, &handoffDeadlineMs, &reason); err != nil {
 		return nil, err
 	}
 	result.LeaseID = leaseID.String
 	result.LeaseToken = leaseToken.String
 	result.ExpiresAtMs = expiresAtMs.Int64
+	result.HandoffToken = handoffToken.String
+	result.HandoffDeadlineMs = handoffDeadlineMs.Int64
 	result.Reason = reason.String
 	if err := validateClaimGrantResult(result); err != nil {
+		return nil, err
+	}
+	return result, rows.Err()
+}
+
+func (p *postgresBackend) AckHandoff(ctx context.Context, req AckHandoffRequest) (*AckHandoffResult, error) {
+	query, err := rpcSelectAll(fixedAckHandoffFunc, 3)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := p.db.Query(ctx, query, req.RequestID, req.HandoffToken, req.NowMs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, errors.New("empty ack handoff result")
+	}
+	result := &AckHandoffResult{}
+	var reason sql.NullString
+	if err := rows.Scan(&result.Result, &reason); err != nil {
+		return nil, err
+	}
+	result.Reason = reason.String
+	if err := validateAckHandoffResult(result); err != nil {
 		return nil, err
 	}
 	return result, rows.Err()
@@ -428,4 +457,51 @@ func (p *postgresBackend) LoadActiveRequestIDs(ctx context.Context) ([]string, e
 		return nil, err
 	}
 	return requestIDs, nil
+}
+
+func (p *postgresBackend) LoadOverdueHandoffPendingRequestIDs(ctx context.Context, nowMs int64, limit int) ([]string, error) {
+	rows, err := p.db.Query(ctx, `
+		SELECT request_id
+		FROM concurrency_requests
+		WHERE state = 'active'
+		  AND handoff_state = 'pending'
+		  AND handoff_deadline_ms IS NOT NULL
+		  AND handoff_deadline_ms <= $1
+		  AND hard_expire_at_ms > $1
+		  AND lease_expires_at_ms > $1
+		ORDER BY handoff_deadline_ms, request_id
+		LIMIT $2`, nowMs, boundedExpireLimit(limit, p.cfg.Concurrency.Sweep.BatchSize))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var requestIDs []string
+	for rows.Next() {
+		var requestID string
+		if err := rows.Scan(&requestID); err != nil {
+			return nil, err
+		}
+		requestIDs = append(requestIDs, requestID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return requestIDs, nil
+}
+
+func (p *postgresBackend) ExpireActiveRequestIfDue(ctx context.Context, requestID string, nowMs int64) (bool, error) {
+	rows, err := p.db.Query(ctx, "SELECT cq_expire_active_request_if_due($1, $2)", requestID, nowMs)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return false, errors.New("empty expire-active-request result")
+	}
+	var expired bool
+	if err := rows.Scan(&expired); err != nil {
+		return false, err
+	}
+	return expired, rows.Err()
 }

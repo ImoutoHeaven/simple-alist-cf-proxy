@@ -172,13 +172,75 @@ const readJson = async (response) => JSON.parse(await response.text());
 const createClaimGrantResponseFromRequest = (init) => {
   const body = JSON.parse(init.body);
   const suffix = body.claimToken.replace(/^claim-token-?/, '') || '1';
+  const expiresAtMs = Date.now() + 60_000;
   return createJsonResponse({
     result: 'granted',
     leaseId: `lease-${suffix}`,
     leaseToken: `token-${suffix}`,
-    expiresAtMs: Date.now() + 60_000,
+    expiresAtMs,
+    handoffToken: `handoff-${suffix}`,
+    handoffDeadlineMs: expiresAtMs - 1_000,
   });
 };
+
+const createAckHandoffResponse = (payload) => {
+  const status = payload?.result === 'acknowledged'
+    ? 200
+    : payload?.result === 'conflict'
+      ? 409
+      : 410;
+  return createJsonResponse(payload, { status });
+};
+
+const ACK_HANDOFF_URL = 'https://cq.example.test/api/v1/concurrency/ack_handoff';
+const wrappedFetch = globalThis.fetch;
+const wrappedFetchBound = typeof wrappedFetch === 'function' ? wrappedFetch.bind(globalThis) : wrappedFetch;
+let delegatedFetch = wrappedFetchBound;
+let ackHandoffMock = null;
+
+const setAckHandoffMock = (handler = null) => {
+  ackHandoffMock = typeof handler === 'function' ? handler : null;
+};
+
+const fetchWithDefaultAckHandoff = async (input, init = {}) => {
+  const url = typeof input === 'string' ? input : input.url;
+  if (url === ACK_HANDOFF_URL) {
+    if (ackHandoffMock) {
+      return ackHandoffMock(input, init);
+    }
+    if (typeof delegatedFetch === 'function') {
+      try {
+        return await delegatedFetch(input, init);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes(`Unexpected fetch URL in test: ${ACK_HANDOFF_URL}`)) {
+          throw error;
+        }
+      }
+    }
+    return createAckHandoffResponse({ result: 'acknowledged' });
+  }
+  if (typeof delegatedFetch !== 'function') {
+    throw new Error('global fetch handler not configured');
+  }
+  return delegatedFetch(input, init);
+};
+
+Object.defineProperty(globalThis, 'fetch', {
+  configurable: true,
+  enumerable: true,
+  get() {
+    return fetchWithDefaultAckHandoff;
+  },
+  set(value) {
+    ackHandoffMock = null;
+    if (value === fetchWithDefaultAckHandoff) {
+      delegatedFetch = wrappedFetchBound;
+      return;
+    }
+    delegatedFetch = value;
+  },
+});
 
 const createTestContext = () => {
   const waitUntilPromises = [];
@@ -290,12 +352,7 @@ const captureAdmissionPayloads = async ({
       });
     }
     if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
-      return createJsonResponse({
-        result: 'granted',
-        leaseId: 'lease-1',
-        leaseToken: 'token-1',
-        expiresAtMs: Date.now() + 1_000,
-      });
+      return createClaimGrantResponseFromRequest(init);
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -835,9 +892,10 @@ test('queue_breaker dual mode settles breaker attempt before returning link expi
   }
 });
 
-test('breaker_only with true concurrency authorizes breaker before CQ acquire', async () => {
+test('breaker_only with true concurrency authorizes breaker only after CQ claim and ack_handoff', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
+  let ackBody = null;
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -895,6 +953,12 @@ test('breaker_only with true concurrency authorizes breaker before CQ acquire', 
       });
     }
 
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      ackBody = JSON.parse(init.body);
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
     if (url === 'https://tenant.sharepoint.com/file') {
       calls.push('origin-fetch');
       return new Response('ok', {
@@ -932,19 +996,24 @@ test('breaker_only with true concurrency authorizes breaker before CQ acquire', 
     assert.equal(response.status, 200);
     assert.equal(await response.text(), 'ok');
     await Promise.allSettled(waitUntilPromises);
-    assert.deepEqual(calls.slice(0, 4), [
-      'breaker-snapshot',
-      'breaker-authorize',
-      'concurrency-acquire',
-      'concurrency-claim',
-    ]);
+    const acquireIndex = calls.indexOf('concurrency-acquire');
+    const claimIndex = calls.indexOf('concurrency-claim');
+    const ackIndex = calls.indexOf('concurrency-ack-handoff');
+    const authorizeIndex = calls.indexOf('breaker-authorize');
+    const originIndex = calls.indexOf('origin-fetch');
+    assert.ok(acquireIndex >= 0);
+    assert.ok(claimIndex > acquireIndex);
+    assert.ok(ackIndex > claimIndex);
+    assert.ok(authorizeIndex > ackIndex);
+    assert.ok(originIndex > authorizeIndex);
+    assert.equal(ackBody?.handoffToken, 'handoff-breaker-only');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('breaker_only with true concurrency settles breaker attempt when CQ deny happens after authorize', async () => {
+test('breaker_only with true concurrency does not authorize or settle before CQ deny', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const settleBodies = [];
@@ -1017,22 +1086,15 @@ test('breaker_only with true concurrency settles breaker attempt when CQ deny ha
   try {
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), createTestContext().ctx);
     assert.equal(response.status, 503);
-    assert.deepEqual(calls, [
-      'breaker-snapshot',
-      'breaker-authorize',
-      'concurrency-acquire',
-      'breaker-settle',
-    ]);
-    assert.equal(settleBodies.length, 1);
-    assert.equal(settleBodies[0].p_attempt_version, 22);
-    assert.equal(settleBodies[0].p_attempt_ticket, 4);
+    assert.deepEqual(calls, ['breaker-snapshot', 'concurrency-acquire']);
+    assert.equal(settleBodies.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('breaker_only with true concurrency settles granted attempt before auth refresh retries and releases CQ at terminal', async () => {
+test('breaker_only with true concurrency authorizes after ack_handoff and settles granted attempts across auth refresh retries', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const settleBodies = [];
@@ -1119,6 +1181,11 @@ test('breaker_only with true concurrency settles granted attempt before auth ref
       return createClaimGrantResponseFromRequest(init);
     }
 
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
       return createJsonResponse({ result: 'released' });
@@ -1136,9 +1203,10 @@ test('breaker_only with true concurrency settles granted attempt before auth ref
     assert.deepEqual(calls, [
       'link-api',
       'breaker-snapshot',
-      'breaker-authorize',
       'concurrency-acquire',
       'concurrency-claim',
+      'concurrency-ack-handoff',
+      'breaker-authorize',
       'origin-fetch-401',
       'breaker-settle',
       'link-api',
@@ -1237,7 +1305,7 @@ test('breaker_only with true concurrency checks handler readiness before authori
   }
 });
 
-test('breaker_only with true concurrency settles granted attempt on client-aborted CQ acquire', async () => {
+test('breaker_only with true concurrency does not authorize or settle on client-aborted CQ acquire', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const settleBodies = [];
@@ -1313,22 +1381,15 @@ test('breaker_only with true concurrency settles granted attempt on client-abort
     const request = await buildSignedWorkerRequest({ signal: abortController.signal });
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
     assert.equal(response.status, 499);
-    assert.deepEqual(calls, [
-      'breaker-snapshot',
-      'breaker-authorize',
-      'concurrency-acquire',
-      'breaker-settle',
-    ]);
-    assert.equal(settleBodies.length, 1);
-    assert.equal(settleBodies[0].p_attempt_version, 52);
-    assert.equal(settleBodies[0].p_attempt_ticket, 9);
+    assert.deepEqual(calls, ['breaker-snapshot', 'concurrency-acquire']);
+    assert.equal(settleBodies.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('breaker_only with true concurrency settles authorized attempt before CQ wait continuation', async () => {
+test('breaker_only with true concurrency waits and only authorizes after CQ claim and ack_handoff', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const settleBodies = [];
@@ -1432,6 +1493,11 @@ test('breaker_only with true concurrency settles authorized attempt before CQ wa
       return createClaimGrantResponseFromRequest(init);
     }
 
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
       return createJsonResponse({ result: 'released' });
@@ -1445,22 +1511,22 @@ test('breaker_only with true concurrency settles authorized attempt before CQ wa
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     assert.equal(await response.text(), 'wait-ok');
     await Promise.allSettled(waitUntilPromises);
-    assert.deepEqual(calls.slice(0, 4), [
-      'authorize-breaker-attempt',
+    assert.deepEqual(calls.slice(0, 6), [
       'concurrency-acquire-fast',
-      'settle-breaker-attempt',
       'concurrency-acquire-continue',
+      'concurrency-claim',
+      'concurrency-ack-handoff',
+      'authorize-breaker-attempt',
+      'origin-fetch',
     ]);
-    assert.equal(settleBodies.length, 1);
-    assert.equal(settleBodies[0].p_attempt_version, 72);
-    assert.equal(settleBodies[0].p_attempt_ticket, 11);
+    assert.equal(settleBodies.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('breaker_only with true concurrency settles authorized attempt before terminal CQ response', async () => {
+test('breaker_only with true concurrency does not authorize or settle before terminal CQ response', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const settleBodies = [];
@@ -1538,21 +1604,15 @@ test('breaker_only with true concurrency settles authorized attempt before termi
     const body = await readJson(response);
     assert.equal(response.status, 401);
     assert.equal(body.message, 'link expired');
-    assert.deepEqual(calls, [
-      'authorize-breaker-attempt',
-      'concurrency-acquire-fast',
-      'settle-breaker-attempt',
-    ]);
-    assert.equal(settleBodies.length, 1);
-    assert.equal(settleBodies[0].p_attempt_version, 82);
-    assert.equal(settleBodies[0].p_attempt_ticket, 12);
+    assert.deepEqual(calls, ['concurrency-acquire-fast']);
+    assert.equal(settleBodies.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('breaker_only with true concurrency settles authorized attempt before acquire failure cleanup', async () => {
+test('breaker_only with true concurrency does not authorize or settle before acquire failure cleanup', async () => {
   const originalFetch = globalThis.fetch;
   const originalRandomUUID = crypto.randomUUID;
   const calls = [];
@@ -1644,14 +1704,10 @@ test('breaker_only with true concurrency settles authorized attempt before acqui
     assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, [
-      'authorize-breaker-attempt',
       'concurrency-acquire-fast',
-      'settle-breaker-attempt',
       'concurrency-cancel',
     ]);
-    assert.equal(settleBodies.length, 1);
-    assert.equal(settleBodies[0].p_attempt_version, 92);
-    assert.equal(settleBodies[0].p_attempt_ticket, 13);
+    assert.equal(settleBodies.length, 0);
     assert.equal(cancelBody?.requestId, acquireBody?.requestId);
     assert.equal(cancelBody?.hostname, acquireBody?.hostname);
   } finally {
@@ -1661,7 +1717,7 @@ test('breaker_only with true concurrency settles authorized attempt before acqui
   }
 });
 
-test('breaker_only with true concurrency settles authorized attempt after claim transport failure before returning', async () => {
+test('breaker_only with true concurrency does not authorize or settle after claim transport failure before returning', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const settleBodies = [];
@@ -1762,17 +1818,13 @@ test('breaker_only with true concurrency settles authorized attempt after claim 
     assert.equal(response.status, 503);
     assert.deepEqual(calls, [
       'breaker-snapshot',
-      'breaker-authorize',
       'concurrency-acquire-fast',
       'concurrency-claim',
       'concurrency-release',
-      'breaker-settle',
     ]);
     assert.equal(releaseBody.leaseToken, 'token-breaker-only-claim-fail');
     assert.equal(releaseBody.reason, 'acquire_delivery_failed');
-    assert.equal(settleBodies.length, 1);
-    assert.equal(settleBodies[0].p_attempt_version, 102);
-    assert.equal(settleBodies[0].p_attempt_ticket, 14);
+    assert.equal(settleBodies.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -2164,9 +2216,10 @@ test('true concurrency non-200 acquire response after dispatch still triggers be
   }
 });
 
-test('true concurrency only skips precheck and fairqueue', async () => {
+test('true concurrency only skips precheck and fairqueue and acks handoff before origin fetch', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
+  let ackBody = null;
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -2221,6 +2274,12 @@ test('true concurrency only skips precheck and fairqueue', async () => {
       return createClaimGrantResponseFromRequest(init);
     }
 
+    if (url === 'https://cq.example.test/api/v1/concurrency/ack_handoff') {
+      calls.push('concurrency-ack-handoff');
+      ackBody = JSON.parse(init.body);
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
       return createJsonResponse({ result: 'released' });
@@ -2235,9 +2294,512 @@ test('true concurrency only skips precheck and fairqueue', async () => {
     assert.equal(response.status, 200);
     assert.equal(await response.text(), 'ok');
     await Promise.allSettled(waitUntilPromises);
-    assert.deepEqual(calls.slice(0, 3), ['concurrency-acquire', 'concurrency-claim', 'origin-fetch']);
+    assert.deepEqual(calls.slice(0, 4), ['concurrency-acquire', 'concurrency-claim', 'concurrency-ack-handoff', 'origin-fetch']);
+    assert.equal(typeof ackBody?.requestId, 'string');
+    assert.equal(ackBody?.handoffToken, 'handoff-1');
     assert.equal(calls.includes('precheck'), false);
     assert.equal(calls.includes('fairqueue-acquire'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency claim success must ack_handoff before queue_breaker authorize and origin fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const settleBodies = [];
+  const authorizeBodies = [];
+  let ackBody = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      calls.push('fairqueue-acquire');
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-handoff-queue-breaker',
+        invocationEpoch: 1,
+        slotToken: 'slot-handoff-queue-breaker',
+        meta: {
+          attemptVersion: 91,
+          attemptTicket: 12,
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
+      if (!body.waitToken) {
+        return createJsonResponse({
+          result: 'wait',
+          waitToken: 'wait-handoff-queue-breaker',
+          scope: 'host',
+          retryAfter: 1,
+        });
+      }
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-handoff-queue-breaker',
+        leaseToken: 'token-handoff-queue-breaker',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-handoff-queue-breaker',
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 91,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/ack_handoff') {
+      calls.push('concurrency-ack-handoff');
+      ackBody = JSON.parse(init.body);
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      authorizeBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 92,
+        LAST_ERROR_CODE: null,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
+      }]);
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
+      calls.push('origin-fetch');
+      return new Response('handoff-ok', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      calls.push('breaker-report');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 93,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'handoff-ok');
+    await Promise.allSettled(waitUntilPromises);
+
+    const claimIndex = calls.indexOf('concurrency-claim');
+    const ackIndex = calls.indexOf('concurrency-ack-handoff');
+    const authorizeIndex = calls.indexOf('breaker-authorize');
+    const originIndex = calls.indexOf('origin-fetch');
+    assert.ok(claimIndex >= 0);
+    assert.ok(ackIndex > claimIndex);
+    assert.ok(authorizeIndex > ackIndex);
+    assert.ok(originIndex > authorizeIndex);
+    assert.equal(ackBody?.handoffToken, 'handoff-handoff-queue-breaker');
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 91);
+    assert.equal(settleBodies[0].p_attempt_ticket, 12);
+    assert.equal(authorizeBodies.length, 1);
+    assert.equal(authorizeBodies[0].p_hostname, 'tenant.sharepoint.com');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency ack_handoff transport or availability or malformed-success failure releases lease and does not fetch origin', async () => {
+  const originalFetch = globalThis.fetch;
+  const scenarios = [
+    {
+      name: 'transport failure',
+      respondToAckHandoff() {
+        throw new Error('ack handoff transport failed');
+      },
+    },
+    {
+      name: 'availability failure',
+      respondToAckHandoff() {
+        return new Response(JSON.stringify({ code: 503, message: 'ack handoff unavailable' }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    },
+    {
+      name: 'malformed-success normalization failure',
+      respondToAckHandoff() {
+        return createAckHandoffResponse({ result: 'acknowledged', reason: 'unexpected_reason' });
+      },
+    },
+  ];
+
+  try {
+    for (const scenario of scenarios) {
+      const calls = [];
+      let releaseBody = null;
+
+      globalThis.fetch = async (input, init = {}) => {
+        const url = typeof input === 'string' ? input : input.url;
+
+        if (url === 'https://controller.example.test/api/v0/bootstrap') {
+          return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+        }
+        if (url === 'https://alist.example.com/api/fs/link') {
+          return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+          calls.push('concurrency-acquire-fast');
+          const body = JSON.parse(init.body);
+          return createJsonResponse({
+            result: 'granted',
+            leaseId: 'lease-ack-fail',
+            leaseToken: 'token-ack-fail',
+            expiresAtMs: body.hardExpireAtMs,
+            claimToken: 'claim-token-ack-fail',
+          });
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+          calls.push('concurrency-claim');
+          return createClaimGrantResponseFromRequest(init);
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/ack_handoff') {
+          calls.push('concurrency-ack-handoff');
+          return scenario.respondToAckHandoff(init);
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+          calls.push('concurrency-release');
+          releaseBody = JSON.parse(init.body);
+          return createJsonResponse({ result: 'released' });
+        }
+        if (url === 'https://tenant.sharepoint.com/file') {
+          calls.push('origin-fetch');
+          return new Response('should-not-fetch', { status: 200 });
+        }
+        throw new Error(`Unexpected fetch URL in test: ${url}`);
+      };
+
+      setAckHandoffMock((input, init = {}) => {
+        calls.push('concurrency-ack-handoff');
+        return scenario.respondToAckHandoff(input, init);
+      });
+
+      try {
+        const { ctx, waitUntilPromises } = createTestContext();
+        const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+        const body = await readJson(response);
+        await Promise.allSettled(waitUntilPromises);
+        assert.equal(response.status, 503, scenario.name);
+        assert.equal(body.message, 'True concurrency unavailable', scenario.name);
+        assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-ack-handoff', 'concurrency-release'], scenario.name);
+        assert.equal(releaseBody.leaseId, 'lease-ack-fail', scenario.name);
+        assert.equal(releaseBody.leaseToken, 'token-ack-fail', scenario.name);
+        assert.equal(releaseBody.reason, 'grant_delivery_failed', scenario.name);
+      } finally {
+        delete globalThis.bootstrapCache;
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency explicit ack_handoff terminal response does not release again and does not fetch origin', async () => {
+  const originalFetch = globalThis.fetch;
+  const scenarios = [
+    {
+      name: 'released',
+      ackPayload: { result: 'released', reason: 'claim_handoff_timeout' },
+      expectedStatus: 503,
+      expectedMessage: 'True concurrency released (claim_handoff_timeout)',
+    },
+    {
+      name: 'cancelled',
+      ackPayload: { result: 'cancelled', reason: 'request_cancelled' },
+      expectedStatus: 503,
+      expectedMessage: 'True concurrency cancelled (request_cancelled)',
+    },
+    {
+      name: 'expired',
+      ackPayload: { result: 'expired', reason: 'hard_expired' },
+      expectedStatus: 401,
+      expectedMessage: 'link expired',
+    },
+  ];
+
+  try {
+    for (const scenario of scenarios) {
+      const calls = [];
+
+      globalThis.fetch = async (input, init = {}) => {
+        const url = typeof input === 'string' ? input : input.url;
+
+        if (url === 'https://controller.example.test/api/v0/bootstrap') {
+          return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+        }
+        if (url === 'https://alist.example.com/api/fs/link') {
+          return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+          calls.push('concurrency-acquire-fast');
+          const body = JSON.parse(init.body);
+          return createJsonResponse({
+            result: 'granted',
+            leaseId: 'lease-ack-terminal',
+            leaseToken: 'token-ack-terminal',
+            expiresAtMs: body.hardExpireAtMs,
+            claimToken: 'claim-token-ack-terminal',
+          });
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+          calls.push('concurrency-claim');
+          return createClaimGrantResponseFromRequest(init);
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/ack_handoff') {
+          calls.push('concurrency-ack-handoff');
+          return createAckHandoffResponse(scenario.ackPayload);
+        }
+        if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+          calls.push('concurrency-release');
+          throw new Error('release should not run after explicit ack_handoff terminal response');
+        }
+        if (url === 'https://tenant.sharepoint.com/file') {
+          calls.push('origin-fetch');
+          return new Response('should-not-fetch', { status: 200 });
+        }
+        throw new Error(`Unexpected fetch URL in test: ${url}`);
+      };
+
+      setAckHandoffMock(() => {
+        calls.push('concurrency-ack-handoff');
+        return createAckHandoffResponse(scenario.ackPayload);
+      });
+
+      try {
+        const { ctx, waitUntilPromises } = createTestContext();
+        const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+        const bodyText = await response.text();
+        await Promise.allSettled(waitUntilPromises);
+        assert.equal(response.status, scenario.expectedStatus, scenario.name);
+        assert.match(bodyText, new RegExp(scenario.expectedMessage.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), scenario.name);
+        assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-ack-handoff'], scenario.name);
+      } finally {
+        delete globalThis.bootstrapCache;
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency explicit ack_handoff conflict fails closed and waits for timeout compensation instead of releasing', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+    }
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-ack-conflict',
+        leaseToken: 'token-ack-conflict',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-ack-conflict',
+      });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/ack_handoff') {
+      calls.push('concurrency-ack-handoff');
+      return createAckHandoffResponse({ result: 'conflict', reason: 'handoff_token_mismatch' });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      throw new Error('release should not run after explicit ack_handoff conflict');
+    }
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('should-not-fetch', { status: 200 });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  setAckHandoffMock(() => {
+    calls.push('concurrency-ack-handoff');
+    return createAckHandoffResponse({ result: 'conflict', reason: 'handoff_token_mismatch' });
+  });
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.equal(body.message, 'True concurrency conflict (handoff_token_mismatch)');
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-ack-handoff']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency claim terminal replay with claim_handoff_timeout fails closed and does not fetch origin', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+    }
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-claim-timeout',
+        leaseToken: 'token-claim-timeout',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-claim-timeout',
+      });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createJsonResponse({ result: 'released', reason: 'claim_handoff_timeout' }, { status: 410 });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      throw new Error('release should not run for claim_handoff_timeout terminal replay');
+    }
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('should-not-fetch', { status: 200 });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.equal(body.message, 'True concurrency released (claim_handoff_timeout)');
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency acquire terminal replay with claim_handoff_timeout fails closed and does not fetch origin', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+    }
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      return createJsonResponse({ result: 'released', reason: 'claim_handoff_timeout' }, { status: 410 });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      throw new Error('claim should not run for claim_handoff_timeout acquire replay');
+    }
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('should-not-fetch', { status: 200 });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.equal(body.message, 'True concurrency released (claim_handoff_timeout)');
+    assert.deepEqual(calls, ['concurrency-acquire-fast']);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -3831,6 +4393,8 @@ test('true concurrency managed streaming releases on hard-expiry cutoff', async 
         leaseId: 'lease-1',
         leaseToken: 'token-1',
         expiresAtMs: hardExpireAtMs,
+        handoffToken: 'handoff-1',
+        handoffDeadlineMs: hardExpireAtMs - 1,
       });
     }
 
