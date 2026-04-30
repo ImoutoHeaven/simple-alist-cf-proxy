@@ -327,6 +327,59 @@ func TestBackendParsesAttemptFieldsFromFqAdmitBatch(t *testing.T) {
 	}
 }
 
+func TestPostgrestAdmitBatchPayloadForwardsCanonicalBreakerTuple(t *testing.T) {
+	var got map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"status":"WAIT"}]`))
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		Backend: BackendConfig{
+			Postgrest: PostgrestConfig{BaseURL: srv.URL},
+		},
+		FairQueue: FairQueueConfig{
+			RPC: RPCConfig{TryAcquireFunc: "fq_admit_batch"},
+		},
+	}
+	backend := newPostgrestBackend(cfg, srv.Client(), newLogger("error"))
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	setAcquireRequestCanonicalBreakerTuple(t, &req, 60, 15, 2, "and")
+	req.Now = 123
+	req.HostMaxSlotPerHost = 1
+	req.HostMaxSlotPerIP = 1
+	req.SiteMaxSlotPerSite = 1
+	req.SiteMaxSlotPerIP = 1
+	req.ZombieTimeoutSeconds = 10
+	req.CooldownSeconds = 5
+
+	_, err := backend.AdmitBatch(context.Background(), []AcquireRequest{req})
+	if err != nil {
+		t.Fatalf("AdmitBatch error: %v", err)
+	}
+
+	if got["p_open_cap_seconds"] != float64(60) {
+		t.Fatalf("expected open cap seconds 60, got %v", got["p_open_cap_seconds"])
+	}
+	if got["p_close_threshold_percent"] != float64(15) {
+		t.Fatalf("expected close threshold percent 15, got %v", got["p_close_threshold_percent"])
+	}
+	if got["p_half_open_success_threshold"] != float64(2) {
+		t.Fatalf("expected half-open success threshold 2, got %v", got["p_half_open_success_threshold"])
+	}
+	if got["p_half_open_close_mode"] != "and" {
+		t.Fatalf("expected half-open close mode and, got %v", got["p_half_open_close_mode"])
+	}
+}
+
 func TestPostgrestAdmitBatchRejectsMixedInputs(t *testing.T) {
 	called := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -198,8 +198,8 @@ func TestInitSQLRuntimeAuthorizeAndReportRequireMatchingAttemptVersionAndTicket(
 	)
 	err = db.QueryRowContext(ctx, `
 		SELECT "STATE", "OPEN_UNTIL", "HALF_OPEN_DEADLINE", "VERSION", "ATTEMPT_GRANTED", "ATTEMPT_TICKET"
-		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6)
-	`, hostnameHash, hostname, now, 4, 15, "partial-close").Scan(
+		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, hostnameHash, hostname, now, 60, 15, 2, "and", 4, 15, "partial-close").Scan(
 		&authorizeState,
 		&authorizeOpenUntil,
 		&authorizeHalfOpenDeadline,
@@ -233,20 +233,20 @@ func TestInitSQLRuntimeAuthorizeAndReportRequireMatchingAttemptVersionAndTicket(
 		persistedHalfOpenSince    sql.NullInt64
 		persistedHalfOpenBudget   int
 		persistedHalfOpenIssued   int
-		persistedReportedMask     int64
-		persistedSuccessCount     int
+		persistedResolvedMask     int64
+		persistedSuccessMask      int64
 		persistedHalfOpenDeadline sql.NullInt64
 	)
 	err = db.QueryRowContext(ctx, `
-		SELECT "HALF_OPEN_SINCE", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT", "HALF_OPEN_DEADLINE"
+        SELECT "HALF_OPEN_SINCE", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK", "HALF_OPEN_DEADLINE"
 		FROM "THROTTLE_PROTECTION"
 		WHERE "HOSTNAME_HASH" = $1
 	`, hostnameHash).Scan(
 		&persistedHalfOpenSince,
 		&persistedHalfOpenBudget,
 		&persistedHalfOpenIssued,
-		&persistedReportedMask,
-		&persistedSuccessCount,
+		&persistedResolvedMask,
+		&persistedSuccessMask,
 		&persistedHalfOpenDeadline,
 	)
 	if err != nil {
@@ -258,8 +258,8 @@ func TestInitSQLRuntimeAuthorizeAndReportRequireMatchingAttemptVersionAndTicket(
 	if persistedHalfOpenBudget != 4 || persistedHalfOpenIssued != 1 {
 		t.Fatalf("expected half_open budget/issued = 4/1, got %d/%d", persistedHalfOpenBudget, persistedHalfOpenIssued)
 	}
-	if persistedReportedMask != 0 || persistedSuccessCount != 0 {
-		t.Fatalf("expected fresh half_open ticket accounting to start empty, got mask=%d success=%d", persistedReportedMask, persistedSuccessCount)
+	if persistedResolvedMask != 0 || persistedSuccessMask != 0 {
+		t.Fatalf("expected fresh half_open ticket accounting to start empty, got resolved=%d success=%d", persistedResolvedMask, persistedSuccessMask)
 	}
 	if !persistedHalfOpenDeadline.Valid || persistedHalfOpenDeadline.Int64 != now+15 {
 		t.Fatalf("expected persisted HALF_OPEN_DEADLINE %d, got %v", now+15, persistedHalfOpenDeadline)
@@ -312,11 +312,11 @@ func TestInitSQLRuntimeAuthorizeAndReportRequireMatchingAttemptVersionAndTicket(
 	var (
 		persistedStateAfter   string
 		persistedMaskAfter    int64
-		persistedSuccessAfter int
+		persistedSuccessAfter int64
 		persistedVersionAfter int64
 	)
 	err = db.QueryRowContext(ctx, `
-		SELECT "STATE", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT", "VERSION"
+        SELECT "STATE", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK", "VERSION"
 		FROM "THROTTLE_PROTECTION"
 		WHERE "HOSTNAME_HASH" = $1
 	`, hostnameHash).Scan(
@@ -329,7 +329,147 @@ func TestInitSQLRuntimeAuthorizeAndReportRequireMatchingAttemptVersionAndTicket(
 		t.Fatalf("query reported half_open row: %v", err)
 	}
 	if persistedStateAfter != "half_open" || persistedMaskAfter != 1 || persistedSuccessAfter != 1 || persistedVersionAfter != 8 {
-		t.Fatalf("accepted attempt report should persist half_open ticket accounting, got state=%q mask=%d success=%d version=%d", persistedStateAfter, persistedMaskAfter, persistedSuccessAfter, persistedVersionAfter)
+		t.Fatalf("accepted attempt report should persist half_open ticket accounting, got state=%q resolved=%d success=%d version=%d", persistedStateAfter, persistedMaskAfter, persistedSuccessAfter, persistedVersionAfter)
+	}
+}
+
+func TestInitSQLRuntimeAuthorizeUsesCanonicalResolvedAndSuccessMasks(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+	const (
+		hostnameHash = "runtime-mask-columns-host"
+		hostname     = "mask-columns.sharepoint.com"
+		now          = 1_700_000_050
+	)
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO "THROTTLE_PROTECTION" (
+			"HOSTNAME_HASH", "HOSTNAME", "STATE", "OPEN_UNTIL", "LAST_ERROR_CODE", "OPEN_REASON", "VERSION"
+		) VALUES ($1, $2, 'open', $3, 429, 'http_429', 7)
+	`, hostnameHash, hostname, now-1)
+	if err != nil {
+		t.Fatalf("seed breaker row: %v", err)
+	}
+
+	_, err = db.ExecContext(ctx, `
+		SELECT 1
+		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, hostnameHash, hostname, now, 60, 15, 2, "and", 4, 15, "partial-close")
+	if err != nil {
+		t.Fatalf("authorize breaker attempt: %v", err)
+	}
+
+	var resolvedMask, successMask int64
+	err = db.QueryRowContext(ctx, `
+		SELECT "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK"
+		FROM "THROTTLE_PROTECTION"
+		WHERE "HOSTNAME_HASH" = $1
+	`, hostnameHash).Scan(&resolvedMask, &successMask)
+	if err != nil {
+		t.Fatalf("query canonical half_open masks: %v", err)
+	}
+	if resolvedMask != 0 || successMask != 0 {
+		t.Fatalf("expected fresh half_open batch masks to start at 0/0, got resolved=%d success=%d", resolvedMask, successMask)
+	}
+}
+
+func TestInitSQLRuntimeAttemptTaggedReportDoesNotCreateMissingAuthorityRow(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+	const (
+		hostnameHash = "runtime-missing-attempt-report-host"
+		hostname     = "missing-attempt-report.sharepoint.com"
+		now          = 1_700_000_075
+	)
+
+	var (
+		state        string
+		openUntil    sql.NullInt64
+		totalSamples int
+		version      int64
+	)
+	err := db.QueryRowContext(ctx, `
+		SELECT "STATE", "OPEN_UNTIL", "TOTAL_SAMPLES", "VERSION"
+		FROM download_report_breaker_sample($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+	`, hostnameHash, hostname, now, 1, 503, 60, 20, 15, 8, 4, 8, 900, 2, "and", 15, "partial-close", nil, 9, 1).Scan(
+		&state,
+		&openUntil,
+		&totalSamples,
+		&version,
+	)
+	if err != nil {
+		t.Fatalf("report attempt-tagged missing authority row: %v", err)
+	}
+	if state != "closed" {
+		t.Fatalf("expected missing attempt-tagged report to return closed snapshot, got %q", state)
+	}
+	if openUntil.Valid {
+		t.Fatalf("expected missing attempt-tagged report to keep open_until null, got %v", openUntil)
+	}
+	if totalSamples != 0 || version != 0 {
+		t.Fatalf("expected missing attempt-tagged report to stay a no-op snapshot, got total=%d version=%d", totalSamples, version)
+	}
+
+	var authorityRows int
+	err = db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM "THROTTLE_PROTECTION"
+		WHERE "HOSTNAME_HASH" = $1
+	`, hostnameHash).Scan(&authorityRows)
+	if err != nil {
+		t.Fatalf("count report authority rows: %v", err)
+	}
+	if authorityRows != 0 {
+		t.Fatalf("expected missing attempt-tagged report to leave authority absent, found %d rows", authorityRows)
+	}
+}
+
+func TestInitSQLRuntimeAttemptTaggedSettleDoesNotCreateMissingAuthorityRow(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+	const (
+		hostnameHash = "runtime-missing-attempt-settle-host"
+		hostname     = "missing-attempt-settle.sharepoint.com"
+		now          = 1_700_000_076
+	)
+
+	var (
+		state     string
+		openUntil sql.NullInt64
+		version   int64
+	)
+	err := db.QueryRowContext(ctx, `
+		SELECT "STATE", "OPEN_UNTIL", "VERSION"
+		FROM download_settle_breaker_attempt($1, $2, $3, $4, $5)
+	`, hostnameHash, hostname, 9, 1, now).Scan(
+		&state,
+		&openUntil,
+		&version,
+	)
+	if err != nil {
+		t.Fatalf("settle attempt-tagged missing authority row: %v", err)
+	}
+	if state != "closed" {
+		t.Fatalf("expected missing attempt-tagged settle to return closed snapshot, got %q", state)
+	}
+	if openUntil.Valid {
+		t.Fatalf("expected missing attempt-tagged settle to keep open_until null, got %v", openUntil)
+	}
+	if version != 0 {
+		t.Fatalf("expected missing attempt-tagged settle to stay a no-op snapshot, got version=%d", version)
+	}
+
+	var authorityRows int
+	err = db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM "THROTTLE_PROTECTION"
+		WHERE "HOSTNAME_HASH" = $1
+	`, hostnameHash).Scan(&authorityRows)
+	if err != nil {
+		t.Fatalf("count settle authority rows: %v", err)
+	}
+	if authorityRows != 0 {
+		t.Fatalf("expected missing attempt-tagged settle to leave authority absent, found %d rows", authorityRows)
 	}
 }
 
@@ -389,8 +529,8 @@ func TestInitSQLRuntimeReportDoesNotPromoteExpiredOpenRow(t *testing.T) {
 	)
 	err = db.QueryRowContext(ctx, `
 		SELECT "STATE", "OPEN_UNTIL", "HALF_OPEN_DEADLINE", "VERSION", "ATTEMPT_GRANTED", "ATTEMPT_TICKET"
-		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6)
-	`, hostnameHash, hostname, now, 4, 15, "partial-close").Scan(
+		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, hostnameHash, hostname, now, 60, 15, 2, "and", 4, 15, "partial-close").Scan(
 		&authorizeState,
 		&authorizeOpenUntil,
 		&authorizeHalfOpenDeadline,
@@ -433,7 +573,7 @@ func TestInitSQLRuntimeAuthorizeIssuesNextTicketWithinLiveHalfOpenBudget(t *test
 
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO "THROTTLE_PROTECTION" (
-			"HOSTNAME_HASH", "HOSTNAME", "STATE", "OPEN_UNTIL", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_ERROR_CODE", "OPEN_REASON", "VERSION"
+            "HOSTNAME_HASH", "HOSTNAME", "STATE", "OPEN_UNTIL", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_ERROR_CODE", "OPEN_REASON", "VERSION"
 		) VALUES ($1, $2, 'half_open', NULL, 3, 1, 0, 0, $3, $4, 429, 'http_429', 10)
 	`, hostnameHash, hostname, now+15, halfOpenSince)
 	if err != nil {
@@ -450,8 +590,8 @@ func TestInitSQLRuntimeAuthorizeIssuesNextTicketWithinLiveHalfOpenBudget(t *test
 	)
 	err = db.QueryRowContext(ctx, `
 		SELECT "STATE", "OPEN_UNTIL", "HALF_OPEN_DEADLINE", "VERSION", "ATTEMPT_GRANTED", "ATTEMPT_TICKET"
-		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6)
-	`, hostnameHash, hostname, now, 3, 15, "partial-close").Scan(
+		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, hostnameHash, hostname, now, 60, 15, 2, "and", 3, 15, "partial-close").Scan(
 		&authorizeState,
 		&authorizeOpenUntil,
 		&authorizeHalfOpenDeadline,
@@ -542,8 +682,8 @@ func TestInitSQLRuntimeRejectsUnknownHalfOpenModes(t *testing.T) {
 		var state string
 		err := db.QueryRowContext(ctx, `
 			SELECT "STATE"
-			FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6)
-		`, hostnameHash, hostname, now, 4, 15, "linger").Scan(&state)
+			FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`, hostnameHash, hostname, now, 60, 15, 2, "and", 4, 15, "linger").Scan(&state)
 		if err == nil {
 			t.Fatalf("expected unknown p_half_open_timeout_mode to fail, got state %q", state)
 		}
@@ -808,7 +948,7 @@ func TestInitSQLRuntimeHalfOpenProtectedSampleReopensImmediately(t *testing.T) {
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO "THROTTLE_PROTECTION" (
 			"HOSTNAME_HASH", "HOSTNAME", "STATE", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
-			"CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "VERSION"
+            "CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "VERSION"
 		) VALUES ($1, $2, 'half_open', 0, 12, 0, 0, 0, 4, 1, 0, 0, $3, $4, $5, 11)
 	`, hostnameHash, hostname, now+15, now-2, now-30)
 	if err != nil {
@@ -869,7 +1009,7 @@ func TestInitSQLRuntimeHalfOpenCloseResetsBreakerBaseline(t *testing.T) {
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO "THROTTLE_PROTECTION" (
 			"HOSTNAME_HASH", "HOSTNAME", "STATE", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
-			"CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
+            "CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
 		) VALUES ($1, $2, 'half_open', $3, 25, 5, 2, 1, 2, 2, 1, 1, $4, $5, $6, 429, 'http_429', 8, 20)
 	`, hostnameHash, hostname, 0.01, now+15, now-2, now-30)
 	if err != nil {
@@ -961,7 +1101,7 @@ func TestInitSQLRuntimeHalfOpenCloseModeOrClosesOnFirstLowEWMASuccess(t *testing
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO "THROTTLE_PROTECTION" (
 			"HOSTNAME_HASH", "HOSTNAME", "STATE", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
-			"CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
+            "CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
 		) VALUES ($1, $2, 'half_open', 0.05, 10, 3, 0, 0, 2, 1, 0, 0, $3, $4, $5, 429, 'http_429', 8, 30)
 	`, hostnameHash, hostname, now+15, halfOpenSince, now-30)
 	if err != nil {
@@ -1026,7 +1166,7 @@ func TestInitSQLRuntimeHalfOpenCloseModeAndWaitsForSuccessThreshold(t *testing.T
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO "THROTTLE_PROTECTION" (
 			"HOSTNAME_HASH", "HOSTNAME", "STATE", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
-			"CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
+            "CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
 		) VALUES ($1, $2, 'half_open', 0.05, 10, 3, 0, 0, 2, 2, 0, 0, $3, $4, $5, 429, 'http_429', 8, 40)
 	`, hostnameHash, hostname, now+15, halfOpenSince, now-30)
 	if err != nil {
@@ -1040,8 +1180,8 @@ func TestInitSQLRuntimeHalfOpenCloseModeAndWaitsForSuccessThreshold(t *testing.T
 		successStreak          int
 		version                int64
 		persistedHalfOpenSince sql.NullInt64
-		persistedReportedMask  int64
-		persistedSuccessCount  int
+		persistedResolvedMask  int64
+		persistedSuccessMask   int64
 	)
 	err = db.QueryRowContext(ctx, `
 		SELECT "STATE", "OPEN_UNTIL", "HALF_OPEN_DEADLINE", "SUCCESS_STREAK", "VERSION"
@@ -1073,13 +1213,13 @@ func TestInitSQLRuntimeHalfOpenCloseModeAndWaitsForSuccessThreshold(t *testing.T
 	}
 
 	err = db.QueryRowContext(ctx, `
-		SELECT "HALF_OPEN_SINCE", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT"
+        SELECT "HALF_OPEN_SINCE", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK"
 		FROM "THROTTLE_PROTECTION"
 		WHERE "HOSTNAME_HASH" = $1
 	`, hostnameHash).Scan(
 		&persistedHalfOpenSince,
-		&persistedReportedMask,
-		&persistedSuccessCount,
+		&persistedResolvedMask,
+		&persistedSuccessMask,
 	)
 	if err != nil {
 		t.Fatalf("query close-mode and row: %v", err)
@@ -1087,8 +1227,8 @@ func TestInitSQLRuntimeHalfOpenCloseModeAndWaitsForSuccessThreshold(t *testing.T
 	if !persistedHalfOpenSince.Valid || persistedHalfOpenSince.Int64 != halfOpenSince {
 		t.Fatalf("expected close-mode and to preserve HALF_OPEN_SINCE %d, got %v", halfOpenSince, persistedHalfOpenSince)
 	}
-	if persistedReportedMask != 1 || persistedSuccessCount != 1 {
-		t.Fatalf("expected close-mode and to record ticket 1 success, got mask=%d success=%d", persistedReportedMask, persistedSuccessCount)
+	if persistedResolvedMask != 1 || persistedSuccessMask != 1 {
+		t.Fatalf("expected close-mode and to record ticket 1 success, got resolved=%d success=%d", persistedResolvedMask, persistedSuccessMask)
 	}
 }
 
@@ -1105,7 +1245,7 @@ func TestInitSQLRuntimeAuthorizeTimeoutModeOpenReopensTimedOutHalfOpen(t *testin
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO "THROTTLE_PROTECTION" (
 			"HOSTNAME_HASH", "HOSTNAME", "STATE", "OPEN_UNTIL", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
-			"SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
+            "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
 		) VALUES ($1, $2, 'half_open', NULL, 0.6, 10, 4, 0, 4, 2, 1, 0, $3, $4, $5, 429, 'http_429', 7, 50)
 	`, hostnameHash, hostname, now-1, halfOpenSince, now-30)
 	if err != nil {
@@ -1123,8 +1263,8 @@ func TestInitSQLRuntimeAuthorizeTimeoutModeOpenReopensTimedOutHalfOpen(t *testin
 	)
 	err = db.QueryRowContext(ctx, `
 		SELECT "STATE", "OPEN_UNTIL", "HALF_OPEN_DEADLINE", "VERSION", "ATTEMPT_GRANTED", "ATTEMPT_TICKET"
-		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6)
-	`, hostnameHash, hostname, now, 4, 15, "open").Scan(
+		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, hostnameHash, hostname, now, 60, 15, 2, "and", 4, 15, "open").Scan(
 		&state,
 		&openUntil,
 		&halfOpenDeadline,
@@ -1138,8 +1278,8 @@ func TestInitSQLRuntimeAuthorizeTimeoutModeOpenReopensTimedOutHalfOpen(t *testin
 	if state != "open" {
 		t.Fatalf("expected timeout mode open to reopen half_open row, got %q", state)
 	}
-	if !openUntil.Valid || openUntil.Int64 != now+7 {
-		t.Fatalf("expected timeout mode open to reuse last_open_seconds, got %v", openUntil)
+	if !openUntil.Valid || openUntil.Int64 != now+14 {
+		t.Fatalf("expected timeout mode open to recompute open duration through the normal rules, got %v", openUntil)
 	}
 	if halfOpenDeadline.Valid {
 		t.Fatalf("expected timeout mode open to clear half_open_deadline, got %v", halfOpenDeadline.Int64)
@@ -1180,7 +1320,7 @@ func TestInitSQLRuntimeAuthorizeTimeoutModeCloseForceClosesTimedOutHalfOpen(t *t
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO "THROTTLE_PROTECTION" (
 			"HOSTNAME_HASH", "HOSTNAME", "STATE", "OPEN_UNTIL", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
-			"CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
+            "CONSECUTIVE_ERROR_COUNT", "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
 		) VALUES ($1, $2, 'half_open', NULL, 0.42, 15, 6, 1, 0, 4, 2, 1, 0, $3, $4, $5, 429, 'http_429', 7, 60)
 	`, hostnameHash, hostname, now-1, halfOpenSince, now-40)
 	if err != nil {
@@ -1203,8 +1343,8 @@ func TestInitSQLRuntimeAuthorizeTimeoutModeCloseForceClosesTimedOutHalfOpen(t *t
 	)
 	err = db.QueryRowContext(ctx, `
 		SELECT "STATE", "OPEN_UNTIL", "VERSION", "ATTEMPT_GRANTED", "ATTEMPT_TICKET"
-		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6)
-	`, hostnameHash, hostname, now, 4, 15, "close").Scan(
+		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, hostnameHash, hostname, now, 60, 15, 2, "and", 4, 15, "close").Scan(
 		&state,
 		&openUntil,
 		&version,
@@ -1275,7 +1415,7 @@ func TestInitSQLRuntimeAuthorizeTimeoutModePartialCloseUsesSuccessfulEvidence(t 
 		hostnameHash         string
 		hostname             string
 		now                  int
-		successCount         int
+		successMask          int64
 		wantState            string
 		wantOpenUntil        sql.NullInt64
 		wantLastOpenSeconds  int
@@ -1287,7 +1427,7 @@ func TestInitSQLRuntimeAuthorizeTimeoutModePartialCloseUsesSuccessfulEvidence(t 
 			hostnameHash:         "runtime-half-open-timeout-partial-close-host",
 			hostname:             "partial-close.sharepoint.com",
 			now:                  1_700_000_900,
-			successCount:         1,
+			successMask:          1,
 			wantState:            "closed",
 			wantOpenUntil:        sql.NullInt64{},
 			wantLastOpenSeconds:  0,
@@ -1299,10 +1439,10 @@ func TestInitSQLRuntimeAuthorizeTimeoutModePartialCloseUsesSuccessfulEvidence(t 
 			hostnameHash:         "runtime-half-open-timeout-partial-open-host",
 			hostname:             "partial-open.sharepoint.com",
 			now:                  1_700_000_950,
-			successCount:         0,
+			successMask:          0,
 			wantState:            "open",
-			wantOpenUntil:        sql.NullInt64{Int64: 1_700_000_954, Valid: true},
-			wantLastOpenSeconds:  4,
+			wantOpenUntil:        sql.NullInt64{Int64: 1_700_000_958, Valid: true},
+			wantLastOpenSeconds:  8,
 			wantHalfOpenCleared:  true,
 			wantLastErrorCleared: false,
 		},
@@ -1315,9 +1455,9 @@ func TestInitSQLRuntimeAuthorizeTimeoutModePartialCloseUsesSuccessfulEvidence(t 
 			_, err := db.ExecContext(ctx, `
 				INSERT INTO "THROTTLE_PROTECTION" (
 					"HOSTNAME_HASH", "HOSTNAME", "STATE", "OPEN_UNTIL", "EWMA_SCORE", "TOTAL_SAMPLES", "SAMPLES_SINCE_RESET",
-					"SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_REPORTED_MASK", "HALF_OPEN_SUCCESS_COUNT", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
+                    "SUCCESS_STREAK", "HALF_OPEN_BUDGET", "HALF_OPEN_ISSUED", "HALF_OPEN_RESOLVED_MASK", "HALF_OPEN_SUCCESS_MASK", "HALF_OPEN_DEADLINE", "HALF_OPEN_SINCE", "LAST_SAMPLE_AT", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
 				) VALUES ($1, $2, 'half_open', NULL, 0.2, 9, 3, $3, 4, 2, 1, $4, $5, $6, $7, 429, 'http_429', 4, 70)
-			`, tc.hostnameHash, tc.hostname, tc.successCount, tc.successCount, tc.now-1, halfOpenSince, tc.now-30)
+			`, tc.hostnameHash, tc.hostname, tc.successMask, tc.successMask, tc.now-1, halfOpenSince, tc.now-30)
 			if err != nil {
 				t.Fatalf("seed timed-out half_open row for partial-close mode: %v", err)
 			}
@@ -1331,12 +1471,12 @@ func TestInitSQLRuntimeAuthorizeTimeoutModePartialCloseUsesSuccessfulEvidence(t 
 				lastOpenSeconds        int
 				lastErrorCode          sql.NullInt64
 				persistedHalfOpenSince sql.NullInt64
-				persistedSuccessCount  int
+				persistedSuccessMask   int64
 			)
 			err = db.QueryRowContext(ctx, `
 				SELECT "STATE", "OPEN_UNTIL", "VERSION", "ATTEMPT_GRANTED", "ATTEMPT_TICKET"
-				FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6)
-			`, tc.hostnameHash, tc.hostname, tc.now, 4, 15, "partial-close").Scan(
+				FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			`, tc.hostnameHash, tc.hostname, tc.now, 60, 15, 2, "and", 4, 15, "partial-close").Scan(
 				&state,
 				&openUntil,
 				&version,
@@ -1363,14 +1503,14 @@ func TestInitSQLRuntimeAuthorizeTimeoutModePartialCloseUsesSuccessfulEvidence(t 
 			}
 
 			err = db.QueryRowContext(ctx, `
-				SELECT "LAST_OPEN_SECONDS", "LAST_ERROR_CODE", "HALF_OPEN_SINCE", "HALF_OPEN_SUCCESS_COUNT"
+                SELECT "LAST_OPEN_SECONDS", "LAST_ERROR_CODE", "HALF_OPEN_SINCE", "HALF_OPEN_SUCCESS_MASK"
 				FROM "THROTTLE_PROTECTION"
 				WHERE "HOSTNAME_HASH" = $1
 			`, tc.hostnameHash).Scan(
 				&lastOpenSeconds,
 				&lastErrorCode,
 				&persistedHalfOpenSince,
-				&persistedSuccessCount,
+				&persistedSuccessMask,
 			)
 			if err != nil {
 				t.Fatalf("query partial-close row: %v", err)
@@ -1387,9 +1527,205 @@ func TestInitSQLRuntimeAuthorizeTimeoutModePartialCloseUsesSuccessfulEvidence(t 
 			if tc.wantHalfOpenCleared && persistedHalfOpenSince.Valid {
 				t.Fatalf("expected partial-close mode to clear HALF_OPEN_SINCE, got %v", persistedHalfOpenSince.Int64)
 			}
-			if persistedSuccessCount != 0 {
-				t.Fatalf("expected partial-close mode to clear HALF_OPEN_SUCCESS_COUNT, got %d", persistedSuccessCount)
+			if persistedSuccessMask != 0 {
+				t.Fatalf("expected partial-close mode to clear HALF_OPEN_SUCCESS_MASK, got %d", persistedSuccessMask)
 			}
 		})
+	}
+}
+
+func TestInitSQLRuntimeAdmitBatchOpenMetadataMatchesCanonicalAuthorizeAfterConcurrentOpenUpdate(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+	const (
+		hostnameHash = "runtime-fq-admit-open-metadata-host"
+		hostname     = "metadata.sharepoint.com"
+		now          = 1_700_001_000
+		oldOpenUntil = now + 12
+		newOpenUntil = now + 45
+		version      = 77
+	)
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO "THROTTLE_PROTECTION" (
+			"HOSTNAME_HASH", "HOSTNAME", "STATE", "OPEN_UNTIL", "LAST_ERROR_CODE", "OPEN_REASON", "LAST_OPEN_SECONDS", "VERSION"
+		) VALUES ($1, $2, 'open', $3, 429, 'http_429', 12, $4)
+	`, hostnameHash, hostname, oldOpenUntil, version)
+	if err != nil {
+		t.Fatalf("seed open breaker row: %v", err)
+	}
+
+	lockerConn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("open locker conn: %v", err)
+	}
+	defer lockerConn.Close()
+
+	admitConn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("open admit conn: %v", err)
+	}
+	defer admitConn.Close()
+
+	appName := fmt.Sprintf("runtime-fq-admit-open-metadata-%d", time.Now().UnixNano())
+	if _, err := admitConn.ExecContext(ctx, `SELECT set_config('application_name', $1, false)`, appName); err != nil {
+		t.Fatalf("set admit application_name: %v", err)
+	}
+
+	tx, err := lockerConn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin locker tx: %v", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE "THROTTLE_PROTECTION"
+		SET "OPEN_UNTIL" = $2,
+		    "LAST_ERROR_CODE" = 503,
+		    "OPEN_REASON" = 'http_503',
+		    "LAST_OPEN_SECONDS" = 45
+		WHERE "HOSTNAME_HASH" = $1
+	`, hostnameHash, newOpenUntil); err != nil {
+		t.Fatalf("stage concurrent open metadata update: %v", err)
+	}
+
+	type admitResult struct {
+		status           string
+		throttleCode     sql.NullInt64
+		breakerOpenUntil sql.NullInt64
+		breakerReason    sql.NullString
+		breakerVersion   sql.NullInt64
+		retryAfter       sql.NullInt64
+		attemptVersion   sql.NullInt64
+		attemptTicket    sql.NullInt64
+	}
+	type admitOutcome struct {
+		result admitResult
+		err    error
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	resultCh := make(chan admitOutcome, 1)
+	go func() {
+		var got admitResult
+		err := admitConn.QueryRowContext(queryCtx, `
+			SELECT status, throttle_code, breaker_open_until, breaker_reason, breaker_version, retry_after, attempt_version, attempt_ticket
+			FROM fq_admit_batch($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		`, hostnameHash, hostname, []string{"site-bucket"}, []string{"ip-bucket"}, int64(now*1000), 2, 1, 2, 1, 60, 0, true, 75, 19, 3, "or", 4, 15, "open").Scan(
+			&got.status,
+			&got.throttleCode,
+			&got.breakerOpenUntil,
+			&got.breakerReason,
+			&got.breakerVersion,
+			&got.retryAfter,
+			&got.attemptVersion,
+			&got.attemptTicket,
+		)
+		resultCh <- admitOutcome{result: got, err: err}
+	}()
+
+	activityDeadline := time.Now().Add(5 * time.Second)
+	queryObserved := false
+	for time.Now().Before(activityDeadline) {
+		var state string
+		var query string
+		var waitEventType sql.NullString
+		err := db.QueryRowContext(ctx, `
+			SELECT state, query, wait_event_type
+			FROM pg_stat_activity
+			WHERE application_name = $1
+		`, appName).Scan(&state, &query, &waitEventType)
+		if err == nil && strings.Contains(query, "fq_admit_batch") {
+			queryObserved = true
+			if state == "idle" || (waitEventType.Valid && waitEventType.String == "Lock") {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !queryObserved {
+		t.Fatalf("expected fq_admit_batch query to become observable in pg_stat_activity before commit")
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit concurrent open metadata update: %v", err)
+	}
+
+	outcome := <-resultCh
+	if outcome.err != nil {
+		t.Fatalf("fq_admit_batch returned error: %v", outcome.err)
+	}
+	if outcome.result.status != "THROTTLED" {
+		t.Fatalf("expected fq_admit_batch to stay throttled, got %+v", outcome.result)
+	}
+	if !outcome.result.throttleCode.Valid || outcome.result.throttleCode.Int64 != 503 {
+		t.Fatalf("expected fq_admit_batch throttle_code 503 from authoritative helper result, got %+v", outcome.result)
+	}
+	if !outcome.result.breakerOpenUntil.Valid || outcome.result.breakerOpenUntil.Int64 != newOpenUntil {
+		t.Fatalf("expected fq_admit_batch breaker_open_until %d from authoritative helper result, got %+v", newOpenUntil, outcome.result)
+	}
+	if !outcome.result.breakerReason.Valid || outcome.result.breakerReason.String != "http_503" {
+		t.Fatalf("expected fq_admit_batch breaker_reason http_503 from authoritative helper result, got %+v", outcome.result)
+	}
+	if !outcome.result.breakerVersion.Valid || outcome.result.breakerVersion.Int64 != version {
+		t.Fatalf("expected fq_admit_batch breaker_version %d, got %+v", version, outcome.result)
+	}
+	if outcome.result.retryAfter.Valid {
+		t.Fatalf("expected throttled queue_breaker result to omit retry_after, got %+v", outcome.result)
+	}
+	if outcome.result.attemptVersion.Valid || outcome.result.attemptTicket.Valid {
+		t.Fatalf("expected throttled queue_breaker result to omit attempt ownership, got %+v", outcome.result)
+	}
+
+	var (
+		authorizeState            string
+		authorizeOpenUntil        sql.NullInt64
+		authorizeReason           sql.NullString
+		authorizeLastErrorCode    sql.NullInt64
+		authorizeVersion          int64
+		authorizeHalfOpenDeadline sql.NullInt64
+		authorizeAttemptGranted   bool
+		authorizeAttemptTicket    sql.NullInt64
+	)
+	err = db.QueryRowContext(ctx, `
+		SELECT "STATE", "OPEN_UNTIL", "OPEN_REASON", "LAST_ERROR_CODE", "VERSION", "HALF_OPEN_DEADLINE", "ATTEMPT_GRANTED", "ATTEMPT_TICKET"
+		FROM download_authorize_breaker_attempt($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, hostnameHash, hostname, now, 75, 19, 3, "or", 4, 15, "open").Scan(
+		&authorizeState,
+		&authorizeOpenUntil,
+		&authorizeReason,
+		&authorizeLastErrorCode,
+		&authorizeVersion,
+		&authorizeHalfOpenDeadline,
+		&authorizeAttemptGranted,
+		&authorizeAttemptTicket,
+	)
+	if err != nil {
+		t.Fatalf("authorize breaker after concurrent open update: %v", err)
+	}
+	if authorizeState != "open" {
+		t.Fatalf("expected breaker_only authorize to stay open, got %q", authorizeState)
+	}
+	if !authorizeOpenUntil.Valid || authorizeOpenUntil.Int64 != newOpenUntil {
+		t.Fatalf("expected breaker_only authorize open_until %d, got %v", newOpenUntil, authorizeOpenUntil)
+	}
+	if !authorizeReason.Valid || authorizeReason.String != "http_503" {
+		t.Fatalf("expected breaker_only authorize reason http_503, got %v", authorizeReason)
+	}
+	if !authorizeLastErrorCode.Valid || authorizeLastErrorCode.Int64 != 503 {
+		t.Fatalf("expected breaker_only authorize last_error_code 503, got %v", authorizeLastErrorCode)
+	}
+	if authorizeVersion != version {
+		t.Fatalf("expected breaker_only authorize version %d, got %d", version, authorizeVersion)
+	}
+	if authorizeHalfOpenDeadline.Valid {
+		t.Fatalf("expected breaker_only authorize to leave half_open_deadline empty, got %v", authorizeHalfOpenDeadline)
+	}
+	if authorizeAttemptGranted {
+		t.Fatalf("expected breaker_only authorize to omit attempt grant while open")
+	}
+	if authorizeAttemptTicket.Valid {
+		t.Fatalf("expected breaker_only authorize to omit attempt ticket while open, got %v", authorizeAttemptTicket)
 	}
 }

@@ -51,6 +51,10 @@ type admitBatchPartitionKey struct {
 	hostnameHash          string
 	now                   int64
 	breakerEnabled        bool
+	openCapSeconds        int
+	closeThresholdPercent int
+	halfOpenSuccessThreshold int
+	halfOpenCloseMode     string
 	halfOpenMaxProbeCount int
 	halfOpenMaxSeconds    int
 	halfOpenTimeoutMode   string
@@ -909,6 +913,10 @@ func admitBatchPartitionKeyFor(req AcquireRequest) admitBatchPartitionKey {
 		hostnameHash:          req.HostnameHash,
 		now:                   req.Now,
 		breakerEnabled:        req.BreakerEnabled,
+		openCapSeconds:        req.OpenCapSeconds,
+		closeThresholdPercent: req.CloseThresholdPercent,
+		halfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
+		halfOpenCloseMode:     strings.TrimSpace(req.HalfOpenCloseMode),
 		halfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
 		halfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
 		halfOpenTimeoutMode:   strings.TrimSpace(req.HalfOpenTimeoutMode),

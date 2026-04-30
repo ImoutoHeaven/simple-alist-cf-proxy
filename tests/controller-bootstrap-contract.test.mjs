@@ -579,6 +579,15 @@ test('resolveConfig maps halfOpenMaxProbeCount and drops probeLeaseSeconds', () 
   assert.equal('probeLeaseSeconds' in config.throttleConfig, false);
 });
 
+test('resolveConfig preserves an explicit closeThresholdPercent of 0', () => {
+  const bootstrap = buildBootstrap();
+  bootstrap.download.throttleProfiles.default.closeThresholdPercent = 0;
+
+  const config = resolveConfig({}, bootstrap, { download: { throttleProfile: 'default' } });
+
+  assert.equal(config.throttleConfig.closeThresholdPercent, 0);
+});
+
 test('resolveConfig rejects controller throttle profiles with impossible half-open budgets', () => {
   const bootstrap = buildBootstrap();
   bootstrap.download.throttleProfiles.default.halfOpenSuccessThreshold = 5;

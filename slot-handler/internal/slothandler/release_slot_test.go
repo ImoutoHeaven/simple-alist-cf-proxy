@@ -701,17 +701,7 @@ func TestReleaseAfterGrantedReattachClearsServerState(t *testing.T) {
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 17, 3, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -801,17 +791,7 @@ func TestReleaseAfterUseOwnerRouteMissFailsClosed(t *testing.T) {
 	tok := createAcceptedDetachedFlow(t, owner.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, owner.flowStore, tok, validReleaseSlotToken(), 17, 3, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := owner.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := owner.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -857,17 +837,7 @@ func TestReleaseAfterDirectGrantedDeliveryDoesNotRequireOwnerTuple(t *testing.T)
 	errCh := make(chan error, 1)
 	respCh := make(chan *AcquireResponse, 1)
 	go func() {
-		resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-			Hostname:              req.Hostname,
-			HostnameHash:          req.HostnameHash,
-			IPBucket:              req.IPBucket,
-			SiteBucket:            req.SiteBucket,
-			BreakerEnabled:        req.BreakerEnabled,
-			HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-			HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-			HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-			QueryToken:            tok,
-		})
+		resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 		errCh <- err
 		respCh <- resp
 	}()
@@ -942,17 +912,7 @@ func TestReleaseAfterDirectGrantedDeliveryFailsClosedWhenOwnerTupleIsPresent(t *
 	errCh := make(chan error, 1)
 	respCh := make(chan *AcquireResponse, 1)
 	go func() {
-		resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-			Hostname:              req.Hostname,
-			HostnameHash:          req.HostnameHash,
-			IPBucket:              req.IPBucket,
-			SiteBucket:            req.SiteBucket,
-			BreakerEnabled:        req.BreakerEnabled,
-			HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-			HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-			HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-			QueryToken:            tok,
-		})
+		resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 		errCh <- err
 		respCh <- resp
 	}()
@@ -1057,17 +1017,7 @@ func TestReleaseAfterDirectGrantedDeliveryCancelCleanupConsumesProofAndLateRelea
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := s.handleAcquireSlot(ctx, AcquireRequest{
-			Hostname:              req.Hostname,
-			HostnameHash:          req.HostnameHash,
-			IPBucket:              req.IPBucket,
-			SiteBucket:            req.SiteBucket,
-			BreakerEnabled:        req.BreakerEnabled,
-			HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-			HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-			HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-			QueryToken:            tok,
-		})
+		_, err := s.handleAcquireSlot(ctx, acquireRequestWithQueryToken(req, tok))
 		errCh <- err
 	}()
 
@@ -1426,17 +1376,7 @@ func TestReleaseAfterUseConcurrentFollowerSeesLeaderFailedAfterBackend(t *testin
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 44, 11, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1511,17 +1451,7 @@ func TestReleaseAfterUseOwnerRoutedRetryStaysIdempotent(t *testing.T) {
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 23, 5, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1570,17 +1500,7 @@ func TestReleaseAfterUseOwnerRoutedConcurrentDuplicateStaysIdempotent(t *testing
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 29, 6, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1675,17 +1595,7 @@ func TestReleaseAfterUseOwnerRoutedCompletedDuplicateSkipsSmoothTiming(t *testin
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 30, 6, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1743,17 +1653,7 @@ func TestReleaseAfterUseOwnerRoutedPreparationReturnsCompletedAfterClaimedCleanu
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 31, 7, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1868,17 +1768,7 @@ func TestReleaseAfterUseCleanupRequiresFullClaimedIdentity(t *testing.T) {
 			tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 			commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 19, 4, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-			acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-				Hostname:              req.Hostname,
-				HostnameHash:          req.HostnameHash,
-				IPBucket:              req.IPBucket,
-				SiteBucket:            req.SiteBucket,
-				BreakerEnabled:        req.BreakerEnabled,
-				HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-				HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-				HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-				QueryToken:            tok,
-			})
+			acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1940,17 +1830,7 @@ func TestReleaseAfterGrantedReattachDoesNotCompensateOnDetachedExpiry(t *testing
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 17, 3, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2029,17 +1909,7 @@ func TestReleaseAfterUseCleanupDoesNotDeleteNewerCommittedReadyAfterSlotReuse(t 
 	tokA := createAcceptedDetachedFlow(t, s.flowStore, reqA, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tokA, reusedSlotToken, 17, 3, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	respA, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              reqA.Hostname,
-		HostnameHash:          reqA.HostnameHash,
-		IPBucket:              reqA.IPBucket,
-		SiteBucket:            reqA.SiteBucket,
-		BreakerEnabled:        reqA.BreakerEnabled,
-		HalfOpenMaxProbeCount: reqA.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    reqA.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   reqA.HalfOpenTimeoutMode,
-		QueryToken:            tokA,
-	})
+	respA, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(reqA, tokA))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2134,17 +2004,7 @@ func TestReleaseAfterUseClaimedTTLExpiryLateOwnerReleaseUsesCompletion(t *testin
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 41, 9, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2238,17 +2098,7 @@ func TestReleaseAfterUseClaimedTTLPruneDoesNotPoisonConcurrentOwnerRelease(t *te
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 42, 10, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2336,17 +2186,7 @@ func TestReleaseAfterUseClaimedTTLSuccessDoesNotReplayAfterCompletionWindowExpir
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 44, 11, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2432,17 +2272,7 @@ func TestReleaseAfterUseFailedAfterBackendDuplicateDoesNotReplayBackend(t *testi
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, validReleaseSlotToken(), 43, 10, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -160,8 +160,8 @@ CREATE TABLE IF NOT EXISTS "THROTTLE_PROTECTION" (
   "HALF_OPEN_SINCE" INTEGER,
   "HALF_OPEN_BUDGET" INTEGER NOT NULL DEFAULT 0,
   "HALF_OPEN_ISSUED" INTEGER NOT NULL DEFAULT 0,
-  "HALF_OPEN_REPORTED_MASK" BIGINT NOT NULL DEFAULT 0,
-  "HALF_OPEN_SUCCESS_COUNT" INTEGER NOT NULL DEFAULT 0,
+  "HALF_OPEN_RESOLVED_MASK" BIGINT NOT NULL DEFAULT 0,
+  "HALF_OPEN_SUCCESS_MASK" BIGINT NOT NULL DEFAULT 0,
   "HALF_OPEN_DEADLINE" INTEGER,
   "LAST_ERROR_CODE" INTEGER,
   "OPEN_REASON" TEXT,
@@ -179,10 +179,14 @@ CREATE INDEX IF NOT EXISTS idx_throttle_state
 -- ========================================
 -- PostgreSQL Stored Procedure: Authorize Breaker Attempt
 -- ========================================
-CREATE OR REPLACE FUNCTION download_authorize_breaker_attempt(
+CREATE OR REPLACE FUNCTION func_authorize_breaker_attempt(
   p_hostname_hash TEXT,
   p_hostname TEXT,
   p_now INTEGER,
+  p_open_cap_seconds INTEGER,
+  p_close_threshold_percent INTEGER,
+  p_half_open_success_threshold INTEGER,
+  p_half_open_close_mode TEXT,
   p_half_open_max_probe_count INTEGER,
   p_half_open_max_seconds INTEGER,
   p_half_open_timeout_mode TEXT
@@ -202,10 +206,18 @@ RETURNS TABLE(
 DECLARE
   v_now INTEGER := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::INTEGER);
   v_half_open_ticket_mask_limit CONSTANT INTEGER := 63;
+  v_open_cap_seconds INTEGER;
+  v_close_threshold NUMERIC;
+  v_half_open_success_threshold INTEGER;
+  v_half_open_close_mode TEXT;
   v_half_open_max_probe_count INTEGER;
   v_half_open_max_seconds INTEGER;
   v_half_open_timeout_mode TEXT;
   v_timeout_open_seconds INTEGER := 0;
+  v_issued_mask BIGINT := 0;
+  v_pending_mask BIGINT := 0;
+  v_success_count INTEGER := 0;
+  v_should_close BOOLEAN := FALSE;
 
   v_hostname TEXT := p_hostname;
   v_state TEXT := 'closed';
@@ -219,8 +231,8 @@ DECLARE
   v_half_open_since INTEGER := NULL;
   v_half_open_budget INTEGER := 0;
   v_half_open_issued INTEGER := 0;
-  v_half_open_reported_mask BIGINT := 0;
-  v_half_open_success_count INTEGER := 0;
+  v_half_open_resolved_mask BIGINT := 0;
+  v_half_open_success_mask BIGINT := 0;
   v_half_open_deadline INTEGER := NULL;
   v_last_error_code INTEGER := NULL;
   v_open_reason TEXT := NULL;
@@ -235,22 +247,34 @@ BEGIN
     RETURN;
   END IF;
 
-  IF p_half_open_max_probe_count IS NULL
+  IF p_open_cap_seconds IS NULL
+    OR p_close_threshold_percent IS NULL
+    OR p_half_open_success_threshold IS NULL
+    OR p_half_open_close_mode IS NULL
+    OR BTRIM(p_half_open_close_mode) = ''
+    OR p_half_open_max_probe_count IS NULL
     OR p_half_open_max_seconds IS NULL
     OR p_half_open_timeout_mode IS NULL
     OR BTRIM(p_half_open_timeout_mode) = '' THEN
-    RAISE EXCEPTION 'download_authorize_breaker_attempt requires non-null half-open settings';
+    RAISE EXCEPTION 'func_authorize_breaker_attempt requires non-null authorize settings';
   END IF;
 
   IF p_half_open_max_probe_count > v_half_open_ticket_mask_limit THEN
-    RAISE EXCEPTION 'download_authorize_breaker_attempt half-open max probe count exceeds BIGINT mask capacity: %', p_half_open_max_probe_count;
+    RAISE EXCEPTION 'func_authorize_breaker_attempt half-open max probe count exceeds BIGINT mask capacity: %', p_half_open_max_probe_count;
   END IF;
 
+  v_open_cap_seconds := GREATEST(1, p_open_cap_seconds);
+  v_close_threshold := GREATEST(0, p_close_threshold_percent) / 100.0;
+  v_half_open_success_threshold := GREATEST(1, p_half_open_success_threshold);
+  v_half_open_close_mode := LOWER(BTRIM(p_half_open_close_mode));
   v_half_open_max_probe_count := GREATEST(1, p_half_open_max_probe_count);
   v_half_open_max_seconds := GREATEST(1, p_half_open_max_seconds);
   v_half_open_timeout_mode := LOWER(BTRIM(p_half_open_timeout_mode));
+  IF v_half_open_close_mode NOT IN ('and', 'or') THEN
+    RAISE EXCEPTION 'func_authorize_breaker_attempt invalid p_half_open_close_mode: %', p_half_open_close_mode;
+  END IF;
   IF v_half_open_timeout_mode NOT IN ('open', 'close', 'partial-close') THEN
-    RAISE EXCEPTION 'download_authorize_breaker_attempt invalid p_half_open_timeout_mode: %', p_half_open_timeout_mode;
+    RAISE EXCEPTION 'func_authorize_breaker_attempt invalid p_half_open_timeout_mode: %', p_half_open_timeout_mode;
   END IF;
 
   WHILE NOT v_locked LOOP
@@ -266,8 +290,8 @@ BEGIN
       tp."HALF_OPEN_SINCE",
       tp."HALF_OPEN_BUDGET",
       tp."HALF_OPEN_ISSUED",
-      tp."HALF_OPEN_REPORTED_MASK",
-      tp."HALF_OPEN_SUCCESS_COUNT",
+      tp."HALF_OPEN_RESOLVED_MASK",
+      tp."HALF_OPEN_SUCCESS_MASK",
       tp."HALF_OPEN_DEADLINE",
       tp."LAST_ERROR_CODE",
       tp."OPEN_REASON",
@@ -285,8 +309,8 @@ BEGIN
       v_half_open_since,
       v_half_open_budget,
       v_half_open_issued,
-      v_half_open_reported_mask,
-      v_half_open_success_count,
+      v_half_open_resolved_mask,
+      v_half_open_success_mask,
       v_half_open_deadline,
       v_last_error_code,
       v_open_reason,
@@ -315,56 +339,59 @@ BEGIN
   v_success_streak := COALESCE(v_success_streak, 0);
   v_half_open_budget := COALESCE(v_half_open_budget, 0);
   v_half_open_issued := COALESCE(v_half_open_issued, 0);
-  v_half_open_reported_mask := COALESCE(v_half_open_reported_mask, 0);
-  v_half_open_success_count := COALESCE(v_half_open_success_count, 0);
+  v_half_open_resolved_mask := COALESCE(v_half_open_resolved_mask, 0);
+  v_half_open_success_mask := COALESCE(v_half_open_success_mask, 0);
   v_last_open_seconds := COALESCE(v_last_open_seconds, 0);
   v_version := COALESCE(v_version, 0);
   v_initial_state := v_state;
 
   IF v_half_open_budget > v_half_open_ticket_mask_limit
     OR v_half_open_issued > v_half_open_ticket_mask_limit
-    OR v_half_open_reported_mask < 0 THEN
-    RAISE EXCEPTION 'download_authorize_breaker_attempt half-open ticket state exceeds BIGINT mask capacity';
+    OR v_half_open_resolved_mask < 0
+    OR v_half_open_success_mask < 0
+    OR (v_half_open_success_mask & ~v_half_open_resolved_mask) <> 0 THEN
+    RAISE EXCEPTION 'func_authorize_breaker_attempt half-open ticket state exceeds BIGINT mask capacity';
   END IF;
 
   IF v_state = 'open' AND v_open_until IS NULL THEN
-    RAISE EXCEPTION 'download_authorize_breaker_attempt invalid open row without OPEN_UNTIL';
-  ELSIF v_state = 'open' AND v_open_until > v_now THEN
-    NULL;
-  ELSIF v_state = 'open' AND v_open_until <= v_now THEN
+    RAISE EXCEPTION 'func_authorize_breaker_attempt invalid open row without OPEN_UNTIL';
+  END IF;
+
+  IF v_state = 'half_open' AND v_half_open_deadline IS NULL THEN
+    RAISE EXCEPTION 'func_authorize_breaker_attempt invalid half_open row without HALF_OPEN_DEADLINE';
+  END IF;
+
+  IF v_state = 'open' AND v_open_until <= v_now THEN
     v_state := 'half_open';
     v_open_until := NULL;
     v_success_streak := 0;
     v_half_open_since := v_now;
     v_half_open_budget := v_half_open_max_probe_count;
-    v_half_open_issued := 1;
-    v_half_open_reported_mask := 0;
-    v_half_open_success_count := 0;
+    v_half_open_issued := 0;
+    v_half_open_resolved_mask := 0;
+    v_half_open_success_mask := 0;
     v_half_open_deadline := v_now + v_half_open_max_seconds;
-    v_attempt_granted := TRUE;
-    v_attempt_ticket := 1;
-  ELSIF v_state = 'half_open' AND v_half_open_deadline <= v_now THEN
-    v_timeout_open_seconds := CASE
-      WHEN v_last_open_seconds > 0 THEN v_last_open_seconds
-      ELSE 1
+  ELSIF v_state = 'half_open' THEN
+    v_issued_mask := CASE
+      WHEN v_half_open_issued >= v_half_open_ticket_mask_limit THEN 9223372036854775807::BIGINT
+      WHEN v_half_open_issued > 0 THEN (1::BIGINT << v_half_open_issued) - 1
+      ELSE 0
     END;
+    v_pending_mask := v_issued_mask & ~v_half_open_resolved_mask;
+    -- v_success_count := bit_count(v_half_open_success_mask)
+    v_success_count := bit_count(v_half_open_success_mask::bit(63))::INTEGER;
 
-    IF v_half_open_timeout_mode = 'open' THEN
-      v_state := 'open';
-      v_open_until := v_now + v_timeout_open_seconds;
-      v_last_open_seconds := v_timeout_open_seconds;
-    ELSIF v_half_open_timeout_mode = 'close' THEN
-      v_state := 'closed';
-      v_open_until := NULL;
-      v_ewma_score := 0;
-      v_consecutive_error_count := 0;
-      v_success_streak := 0;
-      v_samples_since_reset := 0;
-      v_last_error_code := NULL;
-      v_open_reason := NULL;
-      v_last_open_seconds := 0;
-    ELSE
-      IF v_half_open_success_count > 0 THEN
+    IF v_half_open_deadline <= v_now THEN
+      IF v_half_open_timeout_mode = 'open' THEN
+        v_timeout_open_seconds := CASE
+          WHEN v_last_open_seconds > 0 THEN LEAST(v_open_cap_seconds, v_last_open_seconds * 2)
+          ELSE 1
+        END;
+        v_state := 'open';
+        v_open_until := v_now + v_timeout_open_seconds;
+        v_success_streak := 0;
+        v_last_open_seconds := v_timeout_open_seconds;
+      ELSIF v_half_open_timeout_mode = 'close' THEN
         v_state := 'closed';
         v_open_until := NULL;
         v_ewma_score := 0;
@@ -375,46 +402,106 @@ BEGIN
         v_open_reason := NULL;
         v_last_open_seconds := 0;
       ELSE
+        IF v_half_open_success_mask <> 0 THEN
+          v_state := 'closed';
+          v_open_until := NULL;
+          v_ewma_score := 0;
+          v_consecutive_error_count := 0;
+          v_success_streak := 0;
+          v_samples_since_reset := 0;
+          v_last_error_code := NULL;
+          v_open_reason := NULL;
+          v_last_open_seconds := 0;
+        ELSE
+          v_timeout_open_seconds := CASE
+            WHEN v_last_open_seconds > 0 THEN LEAST(v_open_cap_seconds, v_last_open_seconds * 2)
+            ELSE 1
+          END;
+          v_state := 'open';
+          v_open_until := v_now + v_timeout_open_seconds;
+          v_success_streak := 0;
+          v_last_open_seconds := v_timeout_open_seconds;
+        END IF;
+      END IF;
+
+      v_half_open_since := NULL;
+      v_half_open_budget := 0;
+      v_half_open_issued := 0;
+      v_half_open_resolved_mask := 0;
+      v_half_open_success_mask := 0;
+      v_half_open_deadline := NULL;
+    ELSIF v_half_open_issued = v_half_open_budget
+      AND v_half_open_issued > 0
+      AND v_pending_mask = 0 THEN
+      v_should_close := CASE
+        WHEN v_half_open_close_mode = 'or' THEN
+          v_success_count >= v_half_open_success_threshold
+          OR v_ewma_score <= v_close_threshold
+        ELSE
+          v_success_count >= v_half_open_success_threshold
+          AND v_ewma_score <= v_close_threshold
+      END;
+
+      IF v_should_close THEN
+        v_state := 'closed';
+        v_open_until := NULL;
+        v_ewma_score := 0;
+        v_consecutive_error_count := 0;
+        v_success_streak := 0;
+        v_samples_since_reset := 0;
+        v_last_error_code := NULL;
+        v_open_reason := NULL;
+        v_last_open_seconds := 0;
+      ELSE
+        v_timeout_open_seconds := CASE
+          WHEN v_last_open_seconds > 0 THEN LEAST(v_open_cap_seconds, v_last_open_seconds * 2)
+          ELSE 1
+        END;
         v_state := 'open';
         v_open_until := v_now + v_timeout_open_seconds;
+        v_success_streak := 0;
         v_last_open_seconds := v_timeout_open_seconds;
       END IF;
-    END IF;
 
-    v_half_open_since := NULL;
-    v_half_open_budget := 0;
-    v_half_open_issued := 0;
-    v_half_open_reported_mask := 0;
-    v_half_open_success_count := 0;
-    v_half_open_deadline := NULL;
-  ELSIF v_state = 'half_open'
-    AND v_half_open_deadline > v_now
-    AND v_half_open_issued < v_half_open_budget THEN
-    v_half_open_issued := v_half_open_issued + 1;
-    v_attempt_granted := TRUE;
-    v_attempt_ticket := v_half_open_issued;
+      v_half_open_since := NULL;
+      v_half_open_budget := 0;
+      v_half_open_issued := 0;
+      v_half_open_resolved_mask := 0;
+      v_half_open_success_mask := 0;
+      v_half_open_deadline := NULL;
+    END IF;
   ELSIF v_state = 'closed' THEN
     v_open_until := NULL;
     v_success_streak := 0;
     v_half_open_since := NULL;
     v_half_open_budget := 0;
     v_half_open_issued := 0;
-    v_half_open_reported_mask := 0;
-    v_half_open_success_count := 0;
+    v_half_open_resolved_mask := 0;
+    v_half_open_success_mask := 0;
     v_half_open_deadline := NULL;
+  END IF;
+
+  IF v_initial_state <> 'half_open' AND v_state = 'half_open' THEN
+    v_version := v_version + 1;
+  ELSIF v_initial_state = 'half_open' AND v_state <> 'half_open' THEN
+    v_version := v_version + 1;
+  END IF;
+
+  IF v_state = 'half_open'
+    AND v_half_open_deadline > v_now
+    AND v_half_open_issued < v_half_open_budget THEN
+    v_half_open_issued := v_half_open_issued + 1;
+    v_attempt_granted := TRUE;
+    v_attempt_ticket := v_half_open_issued;
   END IF;
 
   IF v_state = 'open' OR v_state = 'closed' THEN
     v_half_open_since := NULL;
     v_half_open_budget := 0;
     v_half_open_issued := 0;
-    v_half_open_reported_mask := 0;
-    v_half_open_success_count := 0;
+    v_half_open_resolved_mask := 0;
+    v_half_open_success_mask := 0;
     v_half_open_deadline := NULL;
-  END IF;
-
-  IF v_state IS DISTINCT FROM v_initial_state THEN
-    v_version := v_version + 1;
   END IF;
 
   RETURN QUERY
@@ -430,8 +517,8 @@ BEGIN
     "HALF_OPEN_SINCE" = v_half_open_since,
     "HALF_OPEN_BUDGET" = v_half_open_budget,
     "HALF_OPEN_ISSUED" = v_half_open_issued,
-    "HALF_OPEN_REPORTED_MASK" = v_half_open_reported_mask,
-    "HALF_OPEN_SUCCESS_COUNT" = v_half_open_success_count,
+    "HALF_OPEN_RESOLVED_MASK" = v_half_open_resolved_mask,
+    "HALF_OPEN_SUCCESS_MASK" = v_half_open_success_mask,
     "HALF_OPEN_DEADLINE" = v_half_open_deadline,
     "LAST_ERROR_CODE" = v_last_error_code,
     "OPEN_REASON" = v_open_reason,
@@ -449,6 +536,48 @@ BEGIN
     tp."HALF_OPEN_DEADLINE",
     v_attempt_granted,
     v_attempt_ticket;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION download_authorize_breaker_attempt(
+  p_hostname_hash TEXT,
+  p_hostname TEXT,
+  p_now INTEGER,
+  p_open_cap_seconds INTEGER,
+  p_close_threshold_percent INTEGER,
+  p_half_open_success_threshold INTEGER,
+  p_half_open_close_mode TEXT,
+  p_half_open_max_probe_count INTEGER,
+  p_half_open_max_seconds INTEGER,
+  p_half_open_timeout_mode TEXT
+)
+RETURNS TABLE(
+  "HOSTNAME_HASH" TEXT,
+  "HOSTNAME" TEXT,
+  "STATE" TEXT,
+  "OPEN_UNTIL" INTEGER,
+  "OPEN_REASON" TEXT,
+  "LAST_ERROR_CODE" INTEGER,
+  "VERSION" BIGINT,
+  "HALF_OPEN_DEADLINE" INTEGER,
+  "ATTEMPT_GRANTED" BOOLEAN,
+  "ATTEMPT_TICKET" INTEGER
+) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT *
+  FROM func_authorize_breaker_attempt(
+    p_hostname_hash,
+    p_hostname,
+    p_now,
+    p_open_cap_seconds,
+    p_close_threshold_percent,
+    p_half_open_success_threshold,
+    p_half_open_close_mode,
+    p_half_open_max_probe_count,
+    p_half_open_max_seconds,
+    p_half_open_timeout_mode
+  );
 END;
 $$ LANGUAGE plpgsql;
 
@@ -520,8 +649,8 @@ DECLARE
   v_success_streak INTEGER := 0;
   v_half_open_budget INTEGER := 0;
   v_half_open_issued INTEGER := 0;
-  v_half_open_reported_mask BIGINT := 0;
-  v_half_open_success_count INTEGER := 0;
+  v_half_open_resolved_mask BIGINT := 0;
+  v_half_open_success_mask BIGINT := 0;
   v_half_open_deadline INTEGER := NULL;
   v_half_open_since INTEGER := NULL;
   v_last_sample_at INTEGER := NULL;
@@ -535,11 +664,14 @@ DECLARE
   v_locked_row_count INTEGER := 0;
   v_should_open BOOLEAN := FALSE;
   v_should_close BOOLEAN := FALSE;
-  v_half_open_timed_out BOOLEAN := FALSE;
   v_open_seconds INTEGER := 0;
   v_timeout_open_seconds INTEGER := 0;
+  v_has_attempt_version BOOLEAN := p_attempt_version IS NOT NULL;
+  v_has_attempt_ticket BOOLEAN := p_attempt_ticket IS NOT NULL;
   v_ticket_mask BIGINT := 0;
-  v_required_report_mask BIGINT := 0;
+  v_issued_mask BIGINT := 0;
+  v_pending_mask BIGINT := 0;
+  v_success_count INTEGER := 0;
 BEGIN
   IF p_hostname_hash IS NULL OR p_hostname_hash = '' THEN
     RETURN;
@@ -591,8 +723,8 @@ BEGIN
       tp."SUCCESS_STREAK",
       tp."HALF_OPEN_BUDGET",
       tp."HALF_OPEN_ISSUED",
-      tp."HALF_OPEN_REPORTED_MASK",
-      tp."HALF_OPEN_SUCCESS_COUNT",
+      tp."HALF_OPEN_RESOLVED_MASK",
+      tp."HALF_OPEN_SUCCESS_MASK",
       tp."HALF_OPEN_DEADLINE",
       tp."HALF_OPEN_SINCE",
       tp."LAST_SAMPLE_AT",
@@ -611,8 +743,8 @@ BEGIN
       v_success_streak,
       v_half_open_budget,
       v_half_open_issued,
-      v_half_open_reported_mask,
-      v_half_open_success_count,
+      v_half_open_resolved_mask,
+      v_half_open_success_mask,
       v_half_open_deadline,
       v_half_open_since,
       v_last_sample_at,
@@ -628,6 +760,27 @@ BEGIN
     v_locked := v_locked_row_count > 0;
 
     IF NOT v_locked THEN
+      IF v_has_attempt_version OR v_has_attempt_ticket THEN
+        RETURN QUERY
+        SELECT
+          p_hostname_hash,
+          COALESCE(NULLIF(p_hostname, ''), p_hostname_hash),
+          COALESCE(NULLIF(v_state, ''), 'closed'),
+          v_open_until,
+          COALESCE(v_ewma_score, 0),
+          COALESCE(v_total_samples, 0),
+          COALESCE(v_samples_since_reset, 0),
+          COALESCE(v_consecutive_error_count, 0),
+          COALESCE(v_success_streak, 0),
+          v_half_open_deadline,
+          v_last_sample_at,
+          v_last_error_code,
+          v_open_reason,
+          COALESCE(v_last_open_seconds, 0),
+          COALESCE(v_version, 0);
+        RETURN;
+      END IF;
+
       INSERT INTO "THROTTLE_PROTECTION" ("HOSTNAME_HASH", "HOSTNAME", "STATE")
       VALUES (p_hostname_hash, COALESCE(NULLIF(p_hostname, ''), p_hostname_hash), 'closed')
       ON CONFLICT ON CONSTRAINT "THROTTLE_PROTECTION_pkey" DO NOTHING;
@@ -643,27 +796,42 @@ BEGIN
   v_success_streak := COALESCE(v_success_streak, 0);
   v_half_open_budget := COALESCE(v_half_open_budget, 0);
   v_half_open_issued := COALESCE(v_half_open_issued, 0);
-  v_half_open_reported_mask := COALESCE(v_half_open_reported_mask, 0);
-  v_half_open_success_count := COALESCE(v_half_open_success_count, 0);
+  v_half_open_resolved_mask := COALESCE(v_half_open_resolved_mask, 0);
+  v_half_open_success_mask := COALESCE(v_half_open_success_mask, 0);
   v_last_open_seconds := COALESCE(v_last_open_seconds, 0);
   v_version := COALESCE(v_version, 0);
   v_initial_state := v_state;
 
   IF v_half_open_budget > v_half_open_ticket_mask_limit
     OR v_half_open_issued > v_half_open_ticket_mask_limit
-    OR v_half_open_reported_mask < 0 THEN
+    OR v_half_open_resolved_mask < 0
+    OR v_half_open_success_mask < 0
+    OR (v_half_open_success_mask & ~v_half_open_resolved_mask) <> 0 THEN
     RAISE EXCEPTION 'download_report_breaker_sample half-open ticket state exceeds BIGINT mask capacity';
   END IF;
 
-  IF v_half_open_issued > 0 THEN
-    v_required_report_mask := CASE
-      WHEN v_half_open_issued = v_half_open_ticket_mask_limit THEN 9223372036854775807::BIGINT
-      ELSE ((1::BIGINT << (v_half_open_issued - 1)) - 1) | (1::BIGINT << (v_half_open_issued - 1))
-    END;
+  IF v_has_attempt_version <> v_has_attempt_ticket THEN
+    RETURN QUERY SELECT
+      p_hostname_hash,
+      v_hostname,
+      v_state,
+      v_open_until,
+      v_ewma_score,
+      v_total_samples,
+      v_samples_since_reset,
+      v_consecutive_error_count,
+      v_success_streak,
+      v_half_open_deadline,
+      v_last_sample_at,
+      v_last_error_code,
+      v_open_reason,
+      v_last_open_seconds,
+      v_version;
+    RETURN;
   END IF;
 
-  IF p_attempt_version IS NOT NULL THEN
-    IF v_state <> 'half_open' OR p_attempt_version <> v_version THEN
+  IF v_state = 'half_open' THEN
+    IF v_half_open_deadline IS NULL OR v_half_open_deadline <= v_now THEN
       RETURN QUERY SELECT
         p_hostname_hash,
         v_hostname,
@@ -683,7 +851,47 @@ BEGIN
       RETURN;
     END IF;
 
-    IF p_attempt_ticket IS NULL OR p_attempt_ticket < 1 OR p_attempt_ticket > v_half_open_issued OR p_attempt_ticket > v_half_open_ticket_mask_limit THEN
+    IF NOT (v_has_attempt_version AND v_has_attempt_ticket) THEN
+      RETURN QUERY SELECT
+        p_hostname_hash,
+        v_hostname,
+        v_state,
+        v_open_until,
+        v_ewma_score,
+        v_total_samples,
+        v_samples_since_reset,
+        v_consecutive_error_count,
+        v_success_streak,
+        v_half_open_deadline,
+        v_last_sample_at,
+        v_last_error_code,
+        v_open_reason,
+        v_last_open_seconds,
+        v_version;
+      RETURN;
+    END IF;
+
+    IF p_attempt_version <> v_version THEN
+      RETURN QUERY SELECT
+        p_hostname_hash,
+        v_hostname,
+        v_state,
+        v_open_until,
+        v_ewma_score,
+        v_total_samples,
+        v_samples_since_reset,
+        v_consecutive_error_count,
+        v_success_streak,
+        v_half_open_deadline,
+        v_last_sample_at,
+        v_last_error_code,
+        v_open_reason,
+        v_last_open_seconds,
+        v_version;
+      RETURN;
+    END IF;
+
+    IF p_attempt_ticket < 1 OR p_attempt_ticket > v_half_open_issued OR p_attempt_ticket > v_half_open_ticket_mask_limit THEN
       RETURN QUERY SELECT
         p_hostname_hash,
         v_hostname,
@@ -704,7 +912,7 @@ BEGIN
     END IF;
 
     v_ticket_mask := (1::BIGINT << (p_attempt_ticket - 1));
-    IF (v_half_open_reported_mask & v_ticket_mask) <> 0 THEN
+    IF (v_half_open_resolved_mask & v_ticket_mask) <> 0 THEN
       RETURN QUERY SELECT
         p_hostname_hash,
         v_hostname,
@@ -724,8 +932,11 @@ BEGIN
       RETURN;
     END IF;
 
-    v_half_open_reported_mask := v_half_open_reported_mask | v_ticket_mask;
-  ELSIF v_state = 'half_open' THEN
+    v_half_open_resolved_mask := v_half_open_resolved_mask | v_ticket_mask;
+    IF v_sample = 0 THEN
+      v_half_open_success_mask := v_half_open_success_mask | v_ticket_mask;
+    END IF;
+  ELSIF v_has_attempt_version AND v_has_attempt_ticket THEN
     RETURN QUERY SELECT
       p_hostname_hash,
       v_hostname,
@@ -761,39 +972,79 @@ BEGIN
     v_half_open_since := NULL;
     v_half_open_budget := 0;
     v_half_open_issued := 0;
-    v_half_open_reported_mask := 0;
-    v_half_open_success_count := 0;
+    v_half_open_resolved_mask := 0;
+    v_half_open_success_mask := 0;
     v_half_open_deadline := NULL;
   ELSIF v_state = 'open' AND v_open_until IS NOT NULL AND v_open_until <= v_now THEN
     NULL;
   END IF;
 
-  v_half_open_timed_out := v_state = 'half_open'
-    AND v_half_open_deadline IS NOT NULL
-    AND v_half_open_deadline <= v_now;
+  v_ewma_score := (v_alpha * v_sample) + ((1 - v_alpha) * v_ewma_score);
+  v_total_samples := v_total_samples + 1;
+  v_samples_since_reset := v_samples_since_reset + 1;
+  v_last_sample_at := v_now;
 
-  IF v_state = 'half_open' AND v_half_open_timed_out THEN
-    v_timeout_open_seconds := CASE
-      WHEN v_last_open_seconds > 0 THEN v_last_open_seconds
-      ELSE 1
-    END;
+  IF v_sample = 1 THEN
+    v_consecutive_error_count := v_consecutive_error_count + 1;
+    v_success_streak := 0;
+    v_last_error_code := p_status_code;
+    v_should_open := v_state = 'half_open'
+      OR v_state = 'open'
+      OR v_consecutive_error_count >= v_consecutive_threshold
+      OR (
+        v_samples_since_reset >= v_min_samples_before_ewma_open
+        AND v_ewma_score >= v_open_threshold
+      );
 
-    IF v_half_open_timeout_mode = 'open' THEN
+    IF v_should_open THEN
+      IF p_retry_after_seconds IS NOT NULL AND p_retry_after_seconds > 0 THEN
+        v_open_seconds := LEAST(v_open_cap_seconds, GREATEST(1, p_retry_after_seconds));
+      ELSIF v_last_open_seconds > 0 THEN
+        v_open_seconds := LEAST(v_open_cap_seconds, v_last_open_seconds * 2);
+      ELSE
+        v_open_seconds := 1;
+      END IF;
+
       v_state := 'open';
-      v_open_until := v_now + v_timeout_open_seconds;
-      v_last_open_seconds := v_timeout_open_seconds;
-    ELSIF v_half_open_timeout_mode = 'close' THEN
-      v_state := 'closed';
+      v_open_until := v_now + v_open_seconds;
+      v_half_open_since := NULL;
+      v_half_open_budget := 0;
+      v_half_open_issued := 0;
+      v_half_open_resolved_mask := 0;
+      v_half_open_success_mask := 0;
+      v_half_open_deadline := NULL;
+      v_open_reason := CASE
+        WHEN p_status_code IS NOT NULL THEN 'http_' || p_status_code::TEXT
+        ELSE 'error_sample'
+      END;
+      v_last_open_seconds := v_open_seconds;
+    ELSIF v_state = 'closed' THEN
       v_open_until := NULL;
-      v_ewma_score := 0;
-      v_consecutive_error_count := 0;
-      v_success_streak := 0;
-      v_samples_since_reset := 0;
-      v_last_error_code := NULL;
       v_open_reason := NULL;
-      v_last_open_seconds := 0;
-    ELSE
-      IF v_half_open_success_count > 0 THEN
+    END IF;
+  ELSE
+    v_consecutive_error_count := 0;
+
+    IF v_state = 'half_open' THEN
+      v_success_streak := v_success_streak + 1;
+      v_issued_mask := CASE
+        WHEN v_half_open_issued >= v_half_open_ticket_mask_limit THEN 9223372036854775807::BIGINT
+        WHEN v_half_open_issued > 0 THEN (1::BIGINT << v_half_open_issued) - 1
+        ELSE 0
+      END;
+      v_pending_mask := v_issued_mask & ~v_half_open_resolved_mask;
+      -- v_success_count := bit_count(v_half_open_success_mask)
+      v_success_count := bit_count(v_half_open_success_mask::bit(63))::INTEGER;
+      v_should_close := CASE
+        WHEN v_half_open_close_mode = 'or' THEN
+          v_success_count >= v_half_open_success_threshold
+          OR v_ewma_score <= v_close_threshold
+        ELSE
+          v_success_count >= v_half_open_success_threshold
+          AND v_ewma_score <= v_close_threshold
+      END;
+
+      IF v_should_close THEN
         v_state := 'closed';
         v_open_until := NULL;
         v_ewma_score := 0;
@@ -803,114 +1054,38 @@ BEGIN
         v_last_error_code := NULL;
         v_open_reason := NULL;
         v_last_open_seconds := 0;
-      ELSE
-        v_state := 'open';
-        v_open_until := v_now + v_timeout_open_seconds;
-        v_last_open_seconds := v_timeout_open_seconds;
-      END IF;
-    END IF;
-
-    v_half_open_since := NULL;
-    v_half_open_budget := 0;
-    v_half_open_issued := 0;
-    v_half_open_reported_mask := 0;
-    v_half_open_success_count := 0;
-    v_half_open_deadline := NULL;
-  ELSE
-    v_ewma_score := (v_alpha * v_sample) + ((1 - v_alpha) * v_ewma_score);
-    v_total_samples := v_total_samples + 1;
-    v_samples_since_reset := v_samples_since_reset + 1;
-    v_last_sample_at := v_now;
-
-    IF v_sample = 1 THEN
-      v_consecutive_error_count := v_consecutive_error_count + 1;
-      v_success_streak := 0;
-      v_last_error_code := p_status_code;
-      v_should_open := v_state = 'half_open'
-        OR v_state = 'open'
-        OR v_consecutive_error_count >= v_consecutive_threshold
-        OR (
-          v_samples_since_reset >= v_min_samples_before_ewma_open
-          AND v_ewma_score >= v_open_threshold
-        );
-
-      IF v_should_open THEN
-        IF p_retry_after_seconds IS NOT NULL AND p_retry_after_seconds > 0 THEN
-          v_open_seconds := LEAST(v_open_cap_seconds, GREATEST(1, p_retry_after_seconds));
-        ELSIF v_last_open_seconds > 0 THEN
-          v_open_seconds := LEAST(v_open_cap_seconds, v_last_open_seconds * 2);
-        ELSE
-          v_open_seconds := 1;
-        END IF;
-
-        v_state := 'open';
-        v_open_until := v_now + v_open_seconds;
         v_half_open_since := NULL;
         v_half_open_budget := 0;
         v_half_open_issued := 0;
-        v_half_open_reported_mask := 0;
-        v_half_open_success_count := 0;
+        v_half_open_resolved_mask := 0;
+        v_half_open_success_mask := 0;
         v_half_open_deadline := NULL;
-        v_open_reason := CASE
-          WHEN p_status_code IS NOT NULL THEN 'http_' || p_status_code::TEXT
-          ELSE 'error_sample'
+      ELSIF v_half_open_issued = v_half_open_budget
+        AND v_half_open_issued > 0
+        AND v_pending_mask = 0 THEN
+        v_timeout_open_seconds := CASE
+          WHEN v_last_open_seconds > 0 THEN LEAST(v_open_cap_seconds, v_last_open_seconds * 2)
+          ELSE 1
         END;
-        v_last_open_seconds := v_open_seconds;
-      ELSIF v_state = 'closed' THEN
-        v_open_until := NULL;
+        v_state := 'open';
+        v_open_until := v_now + v_timeout_open_seconds;
+        v_success_streak := 0;
+        v_last_open_seconds := v_timeout_open_seconds;
+        v_half_open_since := NULL;
+        v_half_open_budget := 0;
+        v_half_open_issued := 0;
+        v_half_open_resolved_mask := 0;
+        v_half_open_success_mask := 0;
+        v_half_open_deadline := NULL;
+      END IF;
+    ELSIF v_state = 'closed' THEN
+      v_open_until := NULL;
+      v_success_streak := 0;
+      IF v_ewma_score <= v_close_threshold THEN
         v_open_reason := NULL;
       END IF;
-    ELSE
-      v_consecutive_error_count := 0;
-
-      IF v_state = 'half_open' THEN
-        v_success_streak := v_success_streak + 1;
-        v_half_open_success_count := v_half_open_success_count + 1;
-        v_should_close := CASE
-          WHEN v_half_open_close_mode = 'or' THEN
-            v_half_open_success_count >= v_half_open_success_threshold
-            OR v_ewma_score <= v_close_threshold
-          ELSE
-            v_half_open_success_count >= v_half_open_success_threshold
-            AND v_ewma_score <= v_close_threshold
-        END;
-
-        IF v_should_close THEN
-          v_state := 'closed';
-          v_open_until := NULL;
-          v_ewma_score := 0;
-          v_consecutive_error_count := 0;
-          v_success_streak := 0;
-          v_samples_since_reset := 0;
-          v_last_error_code := NULL;
-          v_open_reason := NULL;
-          v_last_open_seconds := 0;
-          v_half_open_since := NULL;
-          v_half_open_budget := 0;
-          v_half_open_issued := 0;
-          v_half_open_reported_mask := 0;
-          v_half_open_success_count := 0;
-          v_half_open_deadline := NULL;
-        ELSIF v_half_open_issued = v_half_open_budget
-          AND v_half_open_issued > 0
-          AND (v_half_open_reported_mask & v_required_report_mask) = v_required_report_mask THEN
-          v_timeout_open_seconds := CASE
-            WHEN v_last_open_seconds > 0 THEN v_last_open_seconds
-            ELSE 1
-          END;
-          v_state := 'open';
-          v_open_until := v_now + v_timeout_open_seconds;
-          v_last_open_seconds := v_timeout_open_seconds;
-        END IF;
-      ELSIF v_state = 'closed' THEN
-        v_open_until := NULL;
-        v_success_streak := 0;
-        IF v_ewma_score <= v_close_threshold THEN
-          v_open_reason := NULL;
-        END IF;
-        IF v_ewma_score = 0 THEN
-          v_last_error_code := NULL;
-        END IF;
+      IF v_ewma_score = 0 THEN
+        v_last_error_code := NULL;
       END IF;
     END IF;
   END IF;
@@ -919,12 +1094,12 @@ BEGIN
     v_half_open_since := NULL;
     v_half_open_budget := 0;
     v_half_open_issued := 0;
-    v_half_open_reported_mask := 0;
-    v_half_open_success_count := 0;
+    v_half_open_resolved_mask := 0;
+    v_half_open_success_mask := 0;
     v_half_open_deadline := NULL;
   END IF;
 
-  IF v_state IS DISTINCT FROM v_initial_state THEN
+  IF v_initial_state = 'half_open' AND v_state <> 'half_open' THEN
     v_version := v_version + 1;
   END IF;
 
@@ -941,8 +1116,8 @@ BEGIN
     "HALF_OPEN_SINCE" = v_half_open_since,
     "HALF_OPEN_BUDGET" = v_half_open_budget,
     "HALF_OPEN_ISSUED" = v_half_open_issued,
-    "HALF_OPEN_REPORTED_MASK" = v_half_open_reported_mask,
-    "HALF_OPEN_SUCCESS_COUNT" = v_half_open_success_count,
+    "HALF_OPEN_RESOLVED_MASK" = v_half_open_resolved_mask,
+    "HALF_OPEN_SUCCESS_MASK" = v_half_open_success_mask,
     "HALF_OPEN_DEADLINE" = v_half_open_deadline,
     "LAST_SAMPLE_AT" = v_last_sample_at,
     "LAST_ERROR_CODE" = v_last_error_code,
@@ -1006,8 +1181,8 @@ DECLARE
   v_success_streak INTEGER := 0;
   v_half_open_budget INTEGER := 0;
   v_half_open_issued INTEGER := 0;
-  v_half_open_reported_mask BIGINT := 0;
-  v_half_open_success_count INTEGER := 0;
+  v_half_open_resolved_mask BIGINT := 0;
+  v_half_open_success_mask BIGINT := 0;
   v_half_open_deadline INTEGER := NULL;
   v_last_sample_at INTEGER := NULL;
   v_last_error_code INTEGER := NULL;
@@ -1015,31 +1190,12 @@ DECLARE
   v_last_open_seconds INTEGER := 0;
   v_version BIGINT := 0;
   v_ticket_mask BIGINT := 0;
+  v_has_attempt_version BOOLEAN := p_attempt_version IS NOT NULL;
+  v_has_attempt_ticket BOOLEAN := p_attempt_ticket IS NOT NULL;
   v_locked BOOLEAN := FALSE;
   v_locked_row_count INTEGER := 0;
 BEGIN
-  IF p_hostname_hash IS NULL OR p_hostname_hash = '' OR p_attempt_version IS NULL THEN
-    RETURN;
-  END IF;
-
-  IF p_attempt_ticket IS NULL OR p_attempt_ticket < 1 OR p_attempt_ticket > v_half_open_ticket_mask_limit THEN
-    RETURN QUERY
-    SELECT
-      p_hostname_hash,
-      COALESCE(NULLIF(p_hostname, ''), p_hostname_hash),
-      'closed'::TEXT,
-      NULL::INTEGER,
-      0::NUMERIC,
-      0::INTEGER,
-      0::INTEGER,
-      0::INTEGER,
-      0::INTEGER,
-      NULL::INTEGER,
-      NULL::INTEGER,
-      NULL::INTEGER,
-      NULL::TEXT,
-      0::INTEGER,
-      0::BIGINT;
+  IF p_hostname_hash IS NULL OR p_hostname_hash = '' THEN
     RETURN;
   END IF;
 
@@ -1055,8 +1211,8 @@ BEGIN
       tp."SUCCESS_STREAK",
       tp."HALF_OPEN_BUDGET",
       tp."HALF_OPEN_ISSUED",
-      tp."HALF_OPEN_REPORTED_MASK",
-      tp."HALF_OPEN_SUCCESS_COUNT",
+      tp."HALF_OPEN_RESOLVED_MASK",
+      tp."HALF_OPEN_SUCCESS_MASK",
       tp."HALF_OPEN_DEADLINE",
       tp."LAST_SAMPLE_AT",
       tp."LAST_ERROR_CODE",
@@ -1074,8 +1230,8 @@ BEGIN
       v_success_streak,
       v_half_open_budget,
       v_half_open_issued,
-      v_half_open_reported_mask,
-      v_half_open_success_count,
+      v_half_open_resolved_mask,
+      v_half_open_success_mask,
       v_half_open_deadline,
       v_last_sample_at,
       v_last_error_code,
@@ -1090,19 +1246,48 @@ BEGIN
     v_locked := v_locked_row_count > 0;
 
     IF NOT v_locked THEN
-      INSERT INTO "THROTTLE_PROTECTION" ("HOSTNAME_HASH", "HOSTNAME", "STATE")
-      VALUES (p_hostname_hash, COALESCE(NULLIF(p_hostname, ''), p_hostname_hash), 'closed')
-      ON CONFLICT ON CONSTRAINT "THROTTLE_PROTECTION_pkey" DO NOTHING;
+      RETURN QUERY
+      SELECT
+        p_hostname_hash,
+        COALESCE(NULLIF(p_hostname, ''), p_hostname_hash),
+        COALESCE(NULLIF(v_state, ''), 'closed'),
+        v_open_until,
+        COALESCE(v_ewma_score, 0),
+        COALESCE(v_total_samples, 0),
+        COALESCE(v_samples_since_reset, 0),
+        COALESCE(v_consecutive_error_count, 0),
+        COALESCE(v_success_streak, 0),
+        v_half_open_deadline,
+        v_last_sample_at,
+        v_last_error_code,
+        v_open_reason,
+        COALESCE(v_last_open_seconds, 0),
+        COALESCE(v_version, 0);
+      RETURN;
     END IF;
   END LOOP;
 
-  IF v_state = 'half_open' AND p_attempt_version = v_version AND p_attempt_ticket <= v_half_open_issued THEN
-    v_ticket_mask := (1::BIGINT << (p_attempt_ticket - 1));
-    v_half_open_reported_mask := COALESCE(v_half_open_reported_mask, 0) | v_ticket_mask;
+  v_hostname := COALESCE(NULLIF(p_hostname, ''), v_hostname, p_hostname_hash);
+  v_half_open_resolved_mask := COALESCE(v_half_open_resolved_mask, 0);
+  v_half_open_success_mask := COALESCE(v_half_open_success_mask, 0);
 
-    UPDATE "THROTTLE_PROTECTION" AS tp SET
-      "HALF_OPEN_REPORTED_MASK" = v_half_open_reported_mask
-    WHERE tp."HOSTNAME_HASH" = p_hostname_hash;
+  IF v_has_attempt_version = v_has_attempt_ticket
+    AND v_has_attempt_version
+    AND v_state = 'half_open'
+    AND v_half_open_deadline IS NOT NULL
+    AND v_half_open_deadline > v_now
+    AND p_attempt_version = v_version
+    AND p_attempt_ticket >= 1
+    AND p_attempt_ticket <= v_half_open_issued
+    AND p_attempt_ticket <= v_half_open_ticket_mask_limit THEN
+    v_ticket_mask := (1::BIGINT << (p_attempt_ticket - 1));
+    IF (v_half_open_resolved_mask & v_ticket_mask) = 0 THEN
+      v_half_open_resolved_mask := COALESCE(v_half_open_resolved_mask, 0) | v_ticket_mask;
+
+      UPDATE "THROTTLE_PROTECTION" AS tp SET
+        "HALF_OPEN_RESOLVED_MASK" = v_half_open_resolved_mask
+      WHERE tp."HOSTNAME_HASH" = p_hostname_hash;
+    END IF;
   END IF;
 
   RETURN QUERY
@@ -3908,6 +4093,10 @@ CREATE OR REPLACE FUNCTION fq_admit_batch(
   p_zombie_timeout INT,
   p_cooldown_seconds INT,
   p_breaker_enabled BOOLEAN,
+  p_open_cap_seconds INT,
+  p_close_threshold_percent INT,
+  p_half_open_success_threshold INT,
+  p_half_open_close_mode TEXT,
   p_half_open_max_probe_count INT,
   p_half_open_max_seconds INT,
   p_half_open_timeout_mode TEXT
@@ -3932,9 +4121,7 @@ DECLARE
   v_breaker_open_until INTEGER := NULL;
   v_breaker_reason TEXT := NULL;
   v_breaker_version BIGINT := NULL;
-  v_throttled BOOLEAN := FALSE;
   v_throttle_code INTEGER := NULL;
-  v_breaker_row_count INTEGER := 0;
   v_authorize_half_open_deadline INTEGER := NULL;
   v_authorize_attempt_granted BOOLEAN := FALSE;
   v_authorize_attempt_ticket INTEGER := NULL;
@@ -3958,12 +4145,6 @@ BEGIN
     INTO v_breaker_state, v_breaker_open_until, v_breaker_reason, v_breaker_version, v_throttle_code
     FROM "THROTTLE_PROTECTION"
     WHERE "HOSTNAME_HASH" = p_hostname_hash;
-
-    GET DIAGNOSTICS v_breaker_row_count = ROW_COUNT;
-    v_throttled := v_breaker_row_count > 0
-      AND v_breaker_state = 'open'
-      AND v_breaker_open_until IS NOT NULL
-      AND v_breaker_open_until > v_now;
   END IF;
 
   IF v_hostname IS NULL THEN
@@ -3982,40 +4163,7 @@ BEGIN
     RETURN;
   END IF;
 
-  IF v_throttled THEN
-    FOR v_idx IN 1..v_site_len LOOP
-      status := 'THROTTLED';
-      slot_token := NULL::TEXT;
-      throttle_code := v_throttle_code;
-      breaker_open_until := v_breaker_open_until;
-      breaker_reason := v_breaker_reason;
-      breaker_version := v_breaker_version;
-      retry_after := NULL::INTEGER;
-      attempt_version := NULL::BIGINT;
-      attempt_ticket := NULL::INTEGER;
-      RETURN NEXT;
-    END LOOP;
-    RETURN;
-  END IF;
-
   FOR v_idx IN 1..v_site_len LOOP
-    IF COALESCE(p_breaker_enabled, FALSE)
-      AND v_breaker_state = 'open'
-      AND v_breaker_open_until IS NOT NULL
-      AND v_breaker_open_until > v_now THEN
-      status := 'THROTTLED';
-      slot_token := NULL::TEXT;
-      throttle_code := v_throttle_code;
-      breaker_open_until := v_breaker_open_until;
-      breaker_reason := v_breaker_reason;
-      breaker_version := v_breaker_version;
-      retry_after := NULL::INTEGER;
-      attempt_version := NULL::BIGINT;
-      attempt_ticket := NULL::INTEGER;
-      RETURN NEXT;
-      CONTINUE;
-    END IF;
-
     v_site_bucket := COALESCE(NULLIF(p_site_buckets[v_idx], ''), 'unknown');
     v_ip_bucket := p_ip_buckets[v_idx];
 
@@ -4152,10 +4300,14 @@ BEGIN
         v_authorize_attempt_granted,
         v_authorize_attempt_ticket,
         v_throttle_code
-      FROM download_authorize_breaker_attempt(
+      FROM func_authorize_breaker_attempt(
         p_hostname_hash,
         p_hostname,
         v_now,
+        p_open_cap_seconds,
+        p_close_threshold_percent,
+        p_half_open_success_threshold,
+        p_half_open_close_mode,
         p_half_open_max_probe_count,
         p_half_open_max_seconds,
         p_half_open_timeout_mode

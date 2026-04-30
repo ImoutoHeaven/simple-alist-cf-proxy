@@ -713,8 +713,22 @@ func expectThrottledResponse(t *testing.T, ch <-chan *AcquireResponse, tok strin
 		if got == nil || got.Result != "throttled" || got.QueryToken != tok || got.ThrottleCode != 429 || got.BreakerOpenUntil <= 0 {
 			t.Fatalf("unexpected throttled resp: %+v", got)
 		}
+		expectNoAttemptMeta(t, got)
 	case <-time.After(250 * time.Millisecond):
 		t.Fatalf("expected throttled response for token %q", tok)
+	}
+}
+
+func expectNoAttemptMeta(t *testing.T, resp *AcquireResponse) {
+	t.Helper()
+	if resp == nil || resp.Meta == nil {
+		return
+	}
+	if _, ok := resp.Meta["attemptVersion"]; ok {
+		t.Fatalf("expected attemptVersion omitted from meta, got %+v", resp.Meta)
+	}
+	if _, ok := resp.Meta["attemptTicket"]; ok {
+		t.Fatalf("expected attemptTicket omitted from meta, got %+v", resp.Meta)
 	}
 }
 
@@ -1040,17 +1054,7 @@ func TestAcquireSideReadyLatchExpiryReturnsPendingAndCompensates(t *testing.T) {
 	}()
 
 	now = now.Add(300 * time.Millisecond)
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatalf("handleAcquireSlot err=%v", err)
 	}
@@ -1127,17 +1131,7 @@ func TestAcquireSideValidReadyLatchStillClaimsGranted(t *testing.T) {
 	commitReadyGrant(t, store, tok, "slot-acquire-valid", 31, 8, 300*time.Millisecond, now)
 
 	now = now.Add(250 * time.Millisecond)
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatalf("handleAcquireSlot err=%v", err)
 	}
@@ -2280,6 +2274,7 @@ func TestProbeOnceHalfOpenFullDeliversTerminalWithoutSlot(t *testing.T) {
 		if got.SlotToken != "" {
 			t.Fatalf("expected HALF_OPEN_FULL to omit slot token, got %+v", got)
 		}
+		expectNoAttemptMeta(t, got)
 		if got.RetryAfter <= 0 {
 			t.Fatalf("expected HALF_OPEN_FULL retryAfter > 0, got %+v", got)
 		}
@@ -2359,6 +2354,7 @@ func TestProbeOnceBreakerEnabledHalfOpenFullSurvivesSameSubBatchLaterThrottled(t
 		if got.SlotToken != "" {
 			t.Fatalf("expected HALF_OPEN_FULL terminal response to omit slot token, got %+v", got)
 		}
+		expectNoAttemptMeta(t, got)
 		if got.RetryAfter != 9 {
 			t.Fatalf("expected HALF_OPEN_FULL retryAfter=9 to survive later THROTTLED, got %+v", got)
 		}
@@ -2789,6 +2785,112 @@ func TestProbeOncePartitionsMixedAtomicSettingsWithinRealSubBatch(t *testing.T) 
 	}
 	if !hasGroupedCall {
 		t.Fatalf("expected real grouped AdmitBatch call, got only singleton batches")
+	}
+}
+
+func canonicalBatchSignatures(t *testing.T, batches [][]AcquireRequest) map[string]int {
+	t.Helper()
+	sigs := make(map[string]int, len(batches))
+	for _, batch := range batches {
+		if len(batch) == 0 {
+			continue
+		}
+		ips := make([]string, 0, len(batch))
+		for _, req := range batch {
+			ips = append(ips, req.IPBucket)
+		}
+		first := batch[0]
+		key := fmt.Sprintf(
+			"be=%t open=%d close=%d succ=%d closemode=%s probe=%d sec=%d mode=%s ips=%s",
+			first.BreakerEnabled,
+			requireAcquireRequestIntField(t, first, "OpenCapSeconds"),
+			requireAcquireRequestIntField(t, first, "CloseThresholdPercent"),
+			requireAcquireRequestIntField(t, first, "HalfOpenSuccessThreshold"),
+			requireAcquireRequestStringField(t, first, "HalfOpenCloseMode"),
+			first.HalfOpenMaxProbeCount,
+			first.HalfOpenMaxSeconds,
+			first.HalfOpenTimeoutMode,
+			strings.Join(ips, ","),
+		)
+		sigs[key]++
+	}
+	return sigs
+}
+
+func TestProbeOncePartitionsCanonicalBreakerTupleWithinRealSubBatch(t *testing.T) {
+	backend := &tupleGroupingBackend{}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		IPCooldownSeconds:  5,
+		PollIntervalMs:     500,
+		MaxBatch:           5,
+		MaxProbeParallel:   5,
+		MaxProbeQpsPerHost: 100,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+
+	now := time.Date(2026, 2, 26, 12, 5, 0, 0, time.UTC)
+	store := s.flowStore
+	createdCalls := 0
+	store.nowFn = func() time.Time {
+		createdCalls++
+		return now.Add(time.Duration(createdCalls) * time.Millisecond)
+	}
+	for i := 0; i < 10; i++ {
+		s.recordUtilizationSample("h1", "s1", 5, 10, 5, 10, now.Add(time.Duration(i)*time.Second))
+	}
+	breakerA := atomicBreakerAcquireRequest("example.com", "h1", "b-breaker-1", "s1")
+	setAcquireRequestCanonicalBreakerTuple(t, &breakerA, 60, 15, 2, "and")
+	breakerB := atomicBreakerAcquireRequest("example.com", "h1", "d-breaker-2", "s1")
+	setAcquireRequestCanonicalBreakerTuple(t, &breakerB, 60, 15, 2, "and")
+	breakerTuned := atomicBreakerAcquireRequest("example.com", "h1", "e-breaker-tuned", "s1")
+	setAcquireRequestCanonicalBreakerTuple(t, &breakerTuned, 75, 19, 3, "or")
+	breakerTuned.HalfOpenMaxProbeCount = 2
+	breakerTuned.HalfOpenMaxSeconds = 9
+	breakerTuned.HalfOpenTimeoutMode = "open"
+	flows := []struct {
+		req    AcquireRequest
+		respCh chan *AcquireResponse
+	}{
+		{req: AcquireRequest{Hostname: "example.com", HostnameHash: "h1", IPBucket: "a-queue-1", SiteBucket: "s1"}, respCh: make(chan *AcquireResponse, 1)},
+		{req: breakerA, respCh: make(chan *AcquireResponse, 1)},
+		{req: AcquireRequest{Hostname: "example.com", HostnameHash: "h1", IPBucket: "c-queue-2", SiteBucket: "s1"}, respCh: make(chan *AcquireResponse, 1)},
+		{req: breakerB, respCh: make(chan *AcquireResponse, 1)},
+		{req: breakerTuned, respCh: make(chan *AcquireResponse, 1)},
+	}
+
+	for _, flow := range flows {
+		tok := store.newFlowFromAcquireRequest(flow.req)
+		if ok, err := store.attachWaiter(tok, &fqWaiter{resCh: flow.respCh}, now); !ok || err != nil {
+			t.Fatalf("attachWaiter ip=%q ok=%t err=%v", flow.req.IPBucket, ok, err)
+		}
+	}
+	listCalls := 0
+	store.listInFlightByHostHook = func(hostKey string) {
+		listCalls++
+		if hostKey == "h1" && listCalls == 2 {
+			cfg.FairQueue.MaxProbeParallel = 1
+		}
+	}
+
+	if ok := s.probeOnce(context.Background(), "h1", now); !ok {
+		t.Fatalf("expected probeOnce to see in-flight waiters")
+	}
+	if listCalls < 2 {
+		t.Fatalf("expected listInFlightByHost hook to collapse selected probe batch into one real sub-batch, got %d calls", listCalls)
+	}
+
+	backend.mu.Lock()
+	batches := append([][]AcquireRequest(nil), backend.batches...)
+	backend.mu.Unlock()
+	sigs := canonicalBatchSignatures(t, batches)
+	expected := map[string]int{
+		"be=false open=0 close=0 succ=0 closemode= probe=0 sec=0 mode= ips=a-queue-1,c-queue-2":                       1,
+		"be=true open=60 close=15 succ=2 closemode=and probe=4 sec=15 mode=partial-close ips=b-breaker-1,d-breaker-2": 1,
+		"be=true open=75 close=19 succ=3 closemode=or probe=2 sec=9 mode=open ips=e-breaker-tuned":                    1,
+	}
+	if !reflect.DeepEqual(sigs, expected) {
+		t.Fatalf("expected AdmitBatch grouping by canonical breaker tuple, got %v", sigs)
 	}
 }
 

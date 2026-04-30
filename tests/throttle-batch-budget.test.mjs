@@ -7,7 +7,7 @@ const createJsonResponse = (payload) => new Response(JSON.stringify(payload), {
   headers: { 'content-type': 'application/json' },
 });
 
-test('authorizeBreakerAttempt sends halfOpenMaxProbeCount to SQL', async () => {
+test('authorizeBreakerAttempt sends the full canonical half-open authorize tuple to SQL without adding ATTEMPT_VERSION', async () => {
   const originalFetch = globalThis.fetch;
   let rpcUrl = null;
   let rpcBody = null;
@@ -33,6 +33,10 @@ test('authorizeBreakerAttempt sends halfOpenMaxProbeCount to SQL', async () => {
       postgrestUrl: 'https://postgrest.example.test',
       verifyHeader: ['X-Verify'],
       verifySecret: ['secret'],
+      openCapSeconds: 75,
+      closeThresholdPercent: 19,
+      halfOpenSuccessThreshold: 3,
+      halfOpenCloseMode: 'or',
       halfOpenMaxProbeCount: 4,
       halfOpenMaxSeconds: 15,
       halfOpenTimeoutMode: 'partial-close',
@@ -42,6 +46,23 @@ test('authorizeBreakerAttempt sends halfOpenMaxProbeCount to SQL', async () => {
     assert.equal(rpcBody.p_half_open_max_probe_count, 4);
     assert.equal(rpcBody.p_half_open_max_seconds, 15);
     assert.equal(rpcBody.p_half_open_timeout_mode, 'partial-close');
+    assert.equal(rpcBody.p_open_cap_seconds, 75);
+    assert.equal(rpcBody.p_close_threshold_percent, 19);
+    assert.equal(rpcBody.p_half_open_success_threshold, 3);
+    assert.equal(rpcBody.p_half_open_close_mode, 'or');
+    assert.ok(!Object.prototype.hasOwnProperty.call(rpcBody, 'p_attempt_version'));
+    assert.deepEqual(Object.keys(rpcBody).sort(), [
+      'p_close_threshold_percent',
+      'p_half_open_close_mode',
+      'p_half_open_max_probe_count',
+      'p_half_open_max_seconds',
+      'p_half_open_success_threshold',
+      'p_half_open_timeout_mode',
+      'p_hostname',
+      'p_hostname_hash',
+      'p_now',
+      'p_open_cap_seconds',
+    ]);
     assert.deepEqual(result, {
       recordExists: true,
       state: 'half_open',
@@ -58,7 +79,7 @@ test('authorizeBreakerAttempt sends halfOpenMaxProbeCount to SQL', async () => {
   }
 });
 
-test('authorizeBreakerAttempt defaults the Task 2 batch budget settings', async () => {
+test('authorizeBreakerAttempt defaults the full canonical half-open authorize tuple', async () => {
   const originalFetch = globalThis.fetch;
   let rpcBody = null;
 
@@ -86,6 +107,11 @@ test('authorizeBreakerAttempt defaults the Task 2 batch budget settings', async 
     assert.equal(rpcBody.p_half_open_max_probe_count, 4);
     assert.equal(rpcBody.p_half_open_max_seconds, 15);
     assert.equal(rpcBody.p_half_open_timeout_mode, 'partial-close');
+    assert.equal(rpcBody.p_open_cap_seconds, 60);
+    assert.equal(rpcBody.p_close_threshold_percent, 15);
+    assert.equal(rpcBody.p_half_open_success_threshold, 2);
+    assert.equal(rpcBody.p_half_open_close_mode, 'and');
+    assert.ok(!Object.prototype.hasOwnProperty.call(rpcBody, 'p_attempt_version'));
   } finally {
     globalThis.fetch = originalFetch;
   }

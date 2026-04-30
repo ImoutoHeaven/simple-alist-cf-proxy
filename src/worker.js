@@ -1198,7 +1198,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
       throttleProfileConfig.openThresholdPercent,
       DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT,
     ),
-    closeThresholdPercent: normalizePositiveSeconds(
+    closeThresholdPercent: normalizeNonNegativeInt(
       throttleProfileConfig.closeThresholdPercent,
       DEFAULT_THROTTLE_CLOSE_THRESHOLD_PERCENT,
     ),
@@ -2715,6 +2715,18 @@ const createSlotHandlerClient = (config) => {
         };
         if (fqContext?.breakerEnabled === true) {
           payload.breakerEnabled = true;
+          if (Number.isFinite(fqContext?.openCapSeconds)) {
+            payload.openCapSeconds = Math.trunc(fqContext.openCapSeconds);
+          }
+          if (Number.isFinite(fqContext?.closeThresholdPercent)) {
+            payload.closeThresholdPercent = Math.trunc(fqContext.closeThresholdPercent);
+          }
+          if (Number.isFinite(fqContext?.halfOpenSuccessThreshold)) {
+            payload.halfOpenSuccessThreshold = Math.trunc(fqContext.halfOpenSuccessThreshold);
+          }
+          if (typeof fqContext?.halfOpenCloseMode === 'string' && fqContext.halfOpenCloseMode) {
+            payload.halfOpenCloseMode = fqContext.halfOpenCloseMode;
+          }
           if (Number.isFinite(fqContext?.halfOpenMaxProbeCount)) {
             payload.halfOpenMaxProbeCount = Math.trunc(fqContext.halfOpenMaxProbeCount);
           }
@@ -4027,6 +4039,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     return {
       breakerEnabled: true,
+      openCapSeconds: config.throttleConfig?.openCapSeconds,
+      closeThresholdPercent: config.throttleConfig?.closeThresholdPercent,
+      halfOpenSuccessThreshold: config.throttleConfig?.halfOpenSuccessThreshold,
+      halfOpenCloseMode: config.throttleConfig?.halfOpenCloseMode,
       halfOpenMaxProbeCount: config.throttleConfig?.halfOpenMaxProbeCount,
       halfOpenMaxSeconds: config.throttleConfig?.halfOpenMaxSeconds,
       halfOpenTimeoutMode: config.throttleConfig?.halfOpenTimeoutMode,

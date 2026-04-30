@@ -108,6 +108,22 @@ func TestAcquireRequestOmitsLegacyThrottleWindowField(t *testing.T) {
 	}
 }
 
+func TestAcquireRequestExposesFullCanonicalBreakerTuple(t *testing.T) {
+	for _, field := range []string{
+		"OpenCapSeconds",
+		"CloseThresholdPercent",
+		"HalfOpenSuccessThreshold",
+		"HalfOpenCloseMode",
+	} {
+		if _, ok := reflect.TypeOf(AcquireRequest{}).FieldByName(field); !ok {
+			t.Fatalf("AcquireRequest must expose %s", field)
+		}
+		if _, ok := reflect.TypeOf(AcquirePayload{}).FieldByName(field); !ok {
+			t.Fatalf("AcquirePayload must expose %s", field)
+		}
+	}
+}
+
 func TestServerGoOmitsLegacyThrottleWindowRequestPlumbing(t *testing.T) {
 	path := filepath.Join(moduleRootDir(t), "internal", "slothandler", "server.go")
 	raw, err := os.ReadFile(path)
@@ -166,10 +182,27 @@ func TestHandleAcquireBreakerEnabledRequiresHalfOpenSettings(t *testing.T) {
 	}
 }
 
+func TestHandleAcquireBreakerEnabledRequiresFullCanonicalBreakerTuple(t *testing.T) {
+	s := newAcquireHandlerTestServer()
+
+	rec := handleAcquireRequest(s, `{"hostnameHash":"h1","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true,"halfOpenMaxProbeCount":4,"halfOpenMaxSeconds":15,"halfOpenTimeoutMode":"open"}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "full breaker settings are required when breakerEnabled is true") {
+		t.Fatalf("expected missing canonical breaker tuple phrase, got %q", rec.Body.String())
+	}
+}
+
 func TestHandleAcquireBreakerEnabledRejectsZeroProbeCount(t *testing.T) {
 	s := newAcquireHandlerTestServer()
 
-	rec := handleAcquireRequest(s, `{"hostnameHash":"h1","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true,"halfOpenMaxProbeCount":0,"halfOpenMaxSeconds":15,"halfOpenTimeoutMode":"open"}`)
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	req.Now = 123
+	req.HalfOpenMaxProbeCount = 0
+	req.HalfOpenTimeoutMode = "open"
+	rec := handleAcquireJSONRequest(t, s, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
@@ -182,7 +215,11 @@ func TestHandleAcquireBreakerEnabledRejectsZeroProbeCount(t *testing.T) {
 func TestHandleAcquireBreakerEnabledRejectsNegativeProbeCount(t *testing.T) {
 	s := newAcquireHandlerTestServer()
 
-	rec := handleAcquireRequest(s, `{"hostnameHash":"h1","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true,"halfOpenMaxProbeCount":-1,"halfOpenMaxSeconds":15,"halfOpenTimeoutMode":"open"}`)
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	req.Now = 123
+	req.HalfOpenMaxProbeCount = -1
+	req.HalfOpenTimeoutMode = "open"
+	rec := handleAcquireJSONRequest(t, s, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
@@ -195,7 +232,11 @@ func TestHandleAcquireBreakerEnabledRejectsNegativeProbeCount(t *testing.T) {
 func TestHandleAcquireBreakerEnabledRejectsProbeCountOver63(t *testing.T) {
 	s := newAcquireHandlerTestServer()
 
-	rec := handleAcquireRequest(s, `{"hostnameHash":"h1","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true,"halfOpenMaxProbeCount":64,"halfOpenMaxSeconds":15,"halfOpenTimeoutMode":"open"}`)
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	req.Now = 123
+	req.HalfOpenMaxProbeCount = 64
+	req.HalfOpenTimeoutMode = "open"
+	rec := handleAcquireJSONRequest(t, s, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
@@ -208,7 +249,11 @@ func TestHandleAcquireBreakerEnabledRejectsProbeCountOver63(t *testing.T) {
 func TestHandleAcquireBreakerEnabledRejectsNonPositiveHalfOpenSeconds(t *testing.T) {
 	s := newAcquireHandlerTestServer()
 
-	rec := handleAcquireRequest(s, `{"hostnameHash":"h1","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true,"halfOpenMaxProbeCount":4,"halfOpenMaxSeconds":0,"halfOpenTimeoutMode":"open"}`)
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	req.Now = 123
+	req.HalfOpenMaxSeconds = 0
+	req.HalfOpenTimeoutMode = "open"
+	rec := handleAcquireJSONRequest(t, s, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
@@ -221,7 +266,10 @@ func TestHandleAcquireBreakerEnabledRejectsNonPositiveHalfOpenSeconds(t *testing
 func TestHandleAcquireBreakerEnabledRejectsInvalidTimeoutMode(t *testing.T) {
 	s := newAcquireHandlerTestServer()
 
-	rec := handleAcquireRequest(s, `{"hostnameHash":"h1","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true,"halfOpenMaxProbeCount":4,"halfOpenMaxSeconds":15,"halfOpenTimeoutMode":"invalid-mode"}`)
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	req.Now = 123
+	req.HalfOpenTimeoutMode = "invalid-mode"
+	rec := handleAcquireJSONRequest(t, s, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
@@ -234,7 +282,23 @@ func TestHandleAcquireBreakerEnabledRejectsInvalidTimeoutMode(t *testing.T) {
 func TestHandleAcquireBreakerEnabledAcceptsWhitespaceWrappedTimeoutMode(t *testing.T) {
 	s := newAcquireHandlerTestServer()
 
-	rec := handleAcquireRequest(s, `{"hostnameHash":"h1","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true,"halfOpenMaxProbeCount":4,"halfOpenMaxSeconds":15,"halfOpenTimeoutMode":" open "}`)
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	req.Now = 123
+	req.HalfOpenTimeoutMode = " open "
+	rec := handleAcquireJSONRequest(t, s, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleAcquireBreakerEnabledAcceptsZeroCloseThresholdPercent(t *testing.T) {
+	s := newAcquireHandlerTestServer()
+
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	req.Now = 123
+	req.CloseThresholdPercent = 0
+	rec := handleAcquireJSONRequest(t, s, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d body=%q", rec.Code, rec.Body.String())
@@ -326,15 +390,19 @@ func TestHandleAcquireResponseContractGranted(t *testing.T) {
 	commitReadyGrant(t, s.flowStore, tok, "slot-granted", 31, 7, 300*time.Millisecond, now)
 
 	body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
+		Hostname:                 req.Hostname,
+		HostnameHash:             req.HostnameHash,
+		IPBucket:                 req.IPBucket,
+		SiteBucket:               req.SiteBucket,
+		BreakerEnabled:           req.BreakerEnabled,
+		OpenCapSeconds:           req.OpenCapSeconds,
+		CloseThresholdPercent:    req.CloseThresholdPercent,
+		HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
+		HalfOpenCloseMode:        req.HalfOpenCloseMode,
+		HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
+		QueryToken:               tok,
 	}), http.StatusOK, "granted", true, true)
 	if body.QueryToken != tok {
 		t.Fatalf("expected granted response to retain token %q, got %+v", tok, body)
@@ -360,16 +428,8 @@ func TestHandleAcquireResponseContractThrottled(t *testing.T) {
 	s.flowStore.nowFn = func() time.Time { return now }
 	defer s.stopAllHostProbeRunners()
 
-	body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-		Hostname:              "example.com",
-		HostnameHash:          "h1",
-		IPBucket:              "ip-throttled",
-		SiteBucket:            "s1",
-		BreakerEnabled:        true,
-		HalfOpenMaxProbeCount: 4,
-		HalfOpenMaxSeconds:    15,
-		HalfOpenTimeoutMode:   "partial-close",
-	}), http.StatusOK, "throttled", true, true)
+	req := atomicBreakerAcquireRequest("example.com", "h1", "ip-throttled", "s1")
+	body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, req), http.StatusOK, "throttled", true, true)
 	if body.QueryToken == "" {
 		t.Fatalf("expected throttled response to include queryToken, got %+v", body)
 	}
@@ -411,15 +471,19 @@ func TestHandleAcquireResponseContractTimeout(t *testing.T) {
 	now = now.Add(cfg.FairQueue.graceDuration())
 
 	requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
+		Hostname:                 req.Hostname,
+		HostnameHash:             req.HostnameHash,
+		IPBucket:                 req.IPBucket,
+		SiteBucket:               req.SiteBucket,
+		BreakerEnabled:           req.BreakerEnabled,
+		OpenCapSeconds:           req.OpenCapSeconds,
+		CloseThresholdPercent:    req.CloseThresholdPercent,
+		HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
+		HalfOpenCloseMode:        req.HalfOpenCloseMode,
+		HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
+		QueryToken:               tok,
 	}), http.StatusOK, "timeout", false, false)
 }
 
@@ -438,15 +502,19 @@ func TestHandleAcquireResponseContractConflict(t *testing.T) {
 	}
 
 	requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
+		Hostname:                 req.Hostname,
+		HostnameHash:             req.HostnameHash,
+		IPBucket:                 req.IPBucket,
+		SiteBucket:               req.SiteBucket,
+		BreakerEnabled:           req.BreakerEnabled,
+		OpenCapSeconds:           req.OpenCapSeconds,
+		CloseThresholdPercent:    req.CloseThresholdPercent,
+		HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
+		HalfOpenCloseMode:        req.HalfOpenCloseMode,
+		HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
+		QueryToken:               tok,
 	}), http.StatusConflict, "conflict", false, false)
 }
 
@@ -489,15 +557,19 @@ func TestHandleAcquirePreAttachPathsNeverReturnThrottled(t *testing.T) {
 		now = now.Add(cfg.FairQueue.graceDuration())
 
 		body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-			Hostname:              req.Hostname,
-			HostnameHash:          req.HostnameHash,
-			IPBucket:              req.IPBucket,
-			SiteBucket:            req.SiteBucket,
-			BreakerEnabled:        req.BreakerEnabled,
-			HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-			HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-			HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-			QueryToken:            tok,
+			Hostname:                 req.Hostname,
+			HostnameHash:             req.HostnameHash,
+			IPBucket:                 req.IPBucket,
+			SiteBucket:               req.SiteBucket,
+			BreakerEnabled:           req.BreakerEnabled,
+			OpenCapSeconds:           req.OpenCapSeconds,
+			CloseThresholdPercent:    req.CloseThresholdPercent,
+			HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
+			HalfOpenCloseMode:        req.HalfOpenCloseMode,
+			HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
+			HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
+			HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
+			QueryToken:               tok,
 		}), http.StatusOK, "timeout", false, false)
 		if body.Result == "throttled" {
 			t.Fatalf("pre-attach timeout path must not return throttled")
@@ -519,15 +591,19 @@ func TestHandleAcquirePreAttachPathsNeverReturnThrottled(t *testing.T) {
 		}
 
 		body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-			Hostname:              req.Hostname,
-			HostnameHash:          req.HostnameHash,
-			IPBucket:              req.IPBucket,
-			SiteBucket:            req.SiteBucket,
-			BreakerEnabled:        req.BreakerEnabled,
-			HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-			HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-			HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-			QueryToken:            tok,
+			Hostname:                 req.Hostname,
+			HostnameHash:             req.HostnameHash,
+			IPBucket:                 req.IPBucket,
+			SiteBucket:               req.SiteBucket,
+			BreakerEnabled:           req.BreakerEnabled,
+			OpenCapSeconds:           req.OpenCapSeconds,
+			CloseThresholdPercent:    req.CloseThresholdPercent,
+			HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
+			HalfOpenCloseMode:        req.HalfOpenCloseMode,
+			HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
+			HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
+			HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
+			QueryToken:               tok,
 		}), http.StatusConflict, "conflict", false, false)
 		if body.Result == "throttled" {
 			t.Fatalf("pre-attach conflict path must not return throttled")

@@ -784,17 +784,7 @@ func TestAbandonDoesNotConsumeClaimedGrant(t *testing.T) {
 	tok := createAcceptedDetachedFlow(t, store, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, store, tok, "slot-abandon-claimed", 11, 4, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	acquireResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	acquireResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatalf("handleAcquireSlot err=%v", err)
 	}
@@ -1283,17 +1273,7 @@ func TestMetricsGrantClaimedOnLatchedAcquirePath(t *testing.T) {
 	tok, oldEpoch := newDetachedAcceptedAbandonFlow(t, s.flowStore, cfg, "h1", "example.com", "ip-latched-claim", "s1", now)
 	commitReadyGrant(t, s.flowStore, tok, "slot-latched-claim", 23, 6, 300*time.Millisecond, now)
 
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1346,17 +1326,7 @@ func TestClaimedGrantDoesNotCompensateOnInvocationLeaseExpiry(t *testing.T) {
 	tok, oldEpoch := newDetachedAcceptedAbandonFlow(t, store, cfg, req.HostnameHash, req.Hostname, req.IPBucket, req.SiteBucket, now)
 	commitReadyGrant(t, store, tok, "slot-claimed-expiry", 29, 7, 300*time.Millisecond, now)
 
-	claimResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	claimResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatalf("handleAcquireSlot err=%v", err)
 	}
@@ -1439,17 +1409,7 @@ func TestAcquireSideReadyLatchExpiryRecordsMetrics(t *testing.T) {
 	commitReadyGrant(t, store, tok, "slot-metric-stale", 37, 9, 300*time.Millisecond, now)
 
 	now = now.Add(300 * time.Millisecond)
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatalf("handleAcquireSlot err=%v", err)
 	}
@@ -1600,17 +1560,7 @@ func TestClaimedGrantTTLExpirySkipsBackendAfterFailedAfterBackendRecord(t *testi
 	tok := createAcceptedDetachedFlow(t, store, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, store, tok, validReleaseSlotToken(), 47, 11, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	claimResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	claimResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatalf("handleAcquireSlot err=%v", err)
 	}
@@ -1695,17 +1645,7 @@ func TestClaimedGrantTTLFailedAfterBackendProofDoesNotRetainRecordForever(t *tes
 	tok := createAcceptedDetachedFlow(t, store, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, store, tok, validReleaseSlotToken(), 48, 12, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	claimResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	claimResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatalf("handleAcquireSlot err=%v", err)
 	}
@@ -1780,17 +1720,7 @@ func TestClaimedGrantTTLExpiryBackendFailureDoesNotRecordCompletion(t *testing.T
 	tok := createAcceptedDetachedFlow(t, store, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, store, tok, validReleaseSlotToken(), 49, 12, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	claimResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	claimResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatalf("handleAcquireSlot err=%v", err)
 	}
@@ -1865,17 +1795,7 @@ func TestClaimedGrantTTLExpiryFailedAfterBackendSkipsInflatedMetrics(t *testing.
 	tok := createAcceptedDetachedFlow(t, store, req, now, now.Add(50*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, store, tok, validReleaseSlotToken(), 51, 13, 300*time.Millisecond, now.Add(60*time.Millisecond))
 
-	claimResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	claimResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatalf("handleAcquireSlot err=%v", err)
 	}

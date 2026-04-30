@@ -57,6 +57,50 @@ func assertFlowAdmissionTuple(t *testing.T, snap fqFlowSnapshot, want AcquireReq
 	}
 }
 
+func assertAcquireResponseOmitsAttemptMeta(t *testing.T, resp *AcquireResponse) {
+	t.Helper()
+	if resp == nil || resp.Meta == nil {
+		return
+	}
+	if _, ok := resp.Meta["attemptVersion"]; ok {
+		t.Fatalf("expected attemptVersion omitted from terminal response meta, got %+v", resp.Meta)
+	}
+	if _, ok := resp.Meta["attemptTicket"]; ok {
+		t.Fatalf("expected attemptTicket omitted from terminal response meta, got %+v", resp.Meta)
+	}
+}
+
+func assertCanonicalBreakerTuple(t *testing.T, snap fqFlowSnapshot, want AcquireRequest) {
+	t.Helper()
+	if snapshotIntField(t, snap, "OpenCapSeconds") != requireAcquireRequestIntField(t, want, "OpenCapSeconds") ||
+		snapshotIntField(t, snap, "CloseThresholdPercent") != requireAcquireRequestIntField(t, want, "CloseThresholdPercent") ||
+		snapshotIntField(t, snap, "HalfOpenSuccessThreshold") != requireAcquireRequestIntField(t, want, "HalfOpenSuccessThreshold") ||
+		snapshotStringField(t, snap, "HalfOpenCloseMode") != strings.TrimSpace(requireAcquireRequestStringField(t, want, "HalfOpenCloseMode")) {
+		t.Fatalf("unexpected canonical breaker tuple: got %+v want openCapSeconds=%d closeThresholdPercent=%d halfOpenSuccessThreshold=%d halfOpenCloseMode=%q",
+			snap,
+			requireAcquireRequestIntField(t, want, "OpenCapSeconds"),
+			requireAcquireRequestIntField(t, want, "CloseThresholdPercent"),
+			requireAcquireRequestIntField(t, want, "HalfOpenSuccessThreshold"),
+			strings.TrimSpace(requireAcquireRequestStringField(t, want, "HalfOpenCloseMode")),
+		)
+	}
+}
+
+func snapshotIntField(t *testing.T, snap fqFlowSnapshot, name string) int {
+	t.Helper()
+	field := reflect.ValueOf(snap).FieldByName(name)
+	if !field.IsValid() {
+		t.Fatalf("expected snapshot field %q", name)
+	}
+	switch field.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return int(field.Int())
+	default:
+		t.Fatalf("expected snapshot field %q to be int-like, got %s", name, field.Kind())
+		return 0
+	}
+}
+
 type flowLeaseRenewer interface {
 	renewAcceptedInvocationLease(token string, until time.Time) bool
 }
@@ -587,17 +631,7 @@ func TestAcquireAttachSuccessReturnsInvocationEpoch(t *testing.T) {
 	}
 
 	now = now.Add(5 * time.Millisecond)
-	secondResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            resp.QueryToken,
-	})
+	secondResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, resp.QueryToken))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,17 +676,7 @@ func TestAcquireSingleWaiterConflictDoesNotRenewAcceptedInvocationLease(t *testi
 		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
 	}
 
-	_, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	_, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if !errors.Is(err, errWaiterAlreadyAttached) {
 		t.Fatalf("expected single-waiter conflict, got %v", err)
 	}
@@ -699,17 +723,7 @@ func TestAcquireSingleWaiterConflictLeavesReconnectTimerUnchangedUntilDetach(t *
 		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
 	}
 
-	_, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	_, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if !errors.Is(err, errWaiterAlreadyAttached) {
 		t.Fatalf("expected single-waiter conflict, got %v", err)
 	}
@@ -774,17 +788,7 @@ func TestAcquireReturnsGrantedForLatchedReady(t *testing.T) {
 		t.Fatalf("expected committedGrantEpoch before reattach")
 	}
 
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -850,17 +854,7 @@ func TestLatchedGrantedResponseRequiresOwnerRoutedRelease(t *testing.T) {
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(5*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, "slot-latched-owner-required", 31, 7, 300*time.Millisecond, now)
 
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -906,16 +900,7 @@ func TestDeliveredGrantedResponseOmitsOwnerRoutedReleaseRequirement(t *testing.T
 		s.flowStore.afterAcceptAcquireInvocationHook = nil
 	}()
 
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -945,17 +930,7 @@ func TestClaimedGrantReacquireReturnsStale(t *testing.T) {
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(200*time.Millisecond), now.Add(2*time.Second))
 	commitReadyGrant(t, s.flowStore, tok, "slot-claimed-stale", 21, 6, 400*time.Millisecond, now)
 
-	claimResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	claimResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -973,17 +948,7 @@ func TestClaimedGrantReacquireReturnsStale(t *testing.T) {
 		t.Fatalf("expected claimed active grant before stale reacquire")
 	}
 
-	staleResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	staleResp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1063,17 +1028,7 @@ func TestReadyLatchExpiryDoesNotReleaseGrantedReattach(t *testing.T) {
 		t.Fatalf("expected captured READY latch expiry callback before granted reattach")
 	}
 
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1219,17 +1174,7 @@ func TestAcquireCommittedReadyReuseIgnoresExpiredAcceptedInvocationLease(t *test
 	commitReadyGrant(t, s.flowStore, tok, "slot-stale", 19, 4, 250*time.Millisecond, now)
 
 	now = now.Add(5 * time.Millisecond)
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1445,6 +1390,44 @@ func TestAcquireQueryTokenMismatchOnBreakerTupleChanges(t *testing.T) {
 	}
 }
 
+func TestAcquireQueryTokenMismatchOnCanonicalBreakerTupleChanges(t *testing.T) {
+	base := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
+	setAcquireRequestCanonicalBreakerTuple(t, &base, 60, 15, 2, "and")
+	cases := []struct {
+		name   string
+		mutate func(req *AcquireRequest)
+	}{
+		{"open cap seconds changed", func(req *AcquireRequest) { setAcquireRequestIntField(t, req, "OpenCapSeconds", 75) }},
+		{"close threshold percent changed", func(req *AcquireRequest) { setAcquireRequestIntField(t, req, "CloseThresholdPercent", 22) }},
+		{"half open success threshold changed", func(req *AcquireRequest) { setAcquireRequestIntField(t, req, "HalfOpenSuccessThreshold", 3) }},
+		{"half open close mode changed", func(req *AcquireRequest) { setAcquireRequestStringField(t, req, "HalfOpenCloseMode", "or") }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer()
+			cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
+			s.updateRuntime(cfg, &stubBackend{}, "test", false)
+			s.flowStore.afterFunc = nil
+
+			tok := s.flowStore.newFlowFromAcquireRequest(base)
+			req := base
+			tc.mutate(&req)
+			req.QueryToken = tok
+
+			resp, err := s.handleAcquireSlot(context.Background(), req)
+			assertQueryTokenMismatch(t, resp, err)
+
+			snap, ok := s.flowStore.getSnapshot(tok)
+			if !ok {
+				t.Fatalf("expected original flow to remain after mismatch")
+			}
+			assertFlowAdmissionTuple(t, snap, base)
+			assertCanonicalBreakerTuple(t, snap, base)
+		})
+	}
+}
+
 func TestAcquireQueryTokenCanonicalSiteBucketAllowsUnknownReuse(t *testing.T) {
 	s := newTestServer()
 	cfg := testConfigForAcquire(2*time.Millisecond, 40*time.Millisecond)
@@ -1551,16 +1534,7 @@ func TestAcquireBackendThrottledResponseDeletesOwnFlow(t *testing.T) {
 	s.flowStore.nowFn = func() time.Time { return now }
 	defer s.stopAllHostProbeRunners()
 
-	throttledResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              "example.com",
-		HostnameHash:          "h1",
-		IPBucket:              "ip1",
-		SiteBucket:            "s1",
-		BreakerEnabled:        true,
-		HalfOpenMaxProbeCount: 4,
-		HalfOpenMaxSeconds:    15,
-		HalfOpenTimeoutMode:   "partial-close",
-	})
+	throttledResp, err := s.handleAcquireSlot(context.Background(), atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1574,6 +1548,7 @@ func TestAcquireBackendThrottledResponseDeletesOwnFlow(t *testing.T) {
 	if throttledResp.ThrottleCode != 429 || throttledResp.BreakerOpenUntil != breakerOpenUntil || throttledResp.BreakerReason != "http_429" || throttledResp.BreakerVersion != 1 {
 		t.Fatalf("expected breaker metadata copied from backend, got %+v", throttledResp)
 	}
+	assertAcquireResponseOmitsAttemptMeta(t, throttledResp)
 	if _, ok := s.flowStore.getSnapshot(throttledResp.QueryToken); ok {
 		t.Fatalf("expected backend throttled flow deleted after terminal delivery")
 	}
@@ -1627,17 +1602,7 @@ func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing
 	respCh := make(chan *AcquireResponse, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-			Hostname:              "example.com",
-			HostnameHash:          "h1",
-			IPBucket:              "ip1",
-			SiteBucket:            "s1",
-			BreakerEnabled:        true,
-			HalfOpenMaxProbeCount: 4,
-			HalfOpenMaxSeconds:    15,
-			HalfOpenTimeoutMode:   "partial-close",
-			QueryToken:            tok,
-		})
+		resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1"), tok))
 		if err != nil {
 			errCh <- err
 			return
@@ -1675,16 +1640,7 @@ func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing
 		}
 	}
 
-	secondResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              "example.com",
-		HostnameHash:          "h1",
-		IPBucket:              "ip-new",
-		SiteBucket:            "s1",
-		BreakerEnabled:        true,
-		HalfOpenMaxProbeCount: 4,
-		HalfOpenMaxSeconds:    15,
-		HalfOpenTimeoutMode:   "partial-close",
-	})
+	secondResp, err := s.handleAcquireSlot(context.Background(), atomicBreakerAcquireRequest("example.com", "h1", "ip-new", "s1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1692,6 +1648,7 @@ func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing
 		t.Fatalf("expected second acquire to converge from backend throttled row, got %+v", secondResp)
 	}
 	requireAcquireResponseInvocationEpoch(t, secondResp, 1)
+	assertAcquireResponseOmitsAttemptMeta(t, secondResp)
 
 	select {
 	case err := <-errCh:
@@ -1704,6 +1661,7 @@ func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing
 			t.Fatalf("expected throttled response to retain token %q, got %+v", tok, resp)
 		}
 		requireAcquireResponseInvocationEpoch(t, resp, 1)
+		assertAcquireResponseOmitsAttemptMeta(t, resp)
 	case <-time.After(200 * time.Millisecond):
 		t.Fatalf("timed out waiting for acquire response")
 	}
@@ -1718,16 +1676,7 @@ func TestAcquirePollWindowConvergesToBackendThrottledInsteadOfPending(t *testing
 		t.Fatalf("expected backend throttled converge path to delete second flow")
 	}
 
-	thirdResp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              "example.com",
-		HostnameHash:          "h1",
-		IPBucket:              "ip-third",
-		SiteBucket:            "s1",
-		BreakerEnabled:        true,
-		HalfOpenMaxProbeCount: 4,
-		HalfOpenMaxSeconds:    15,
-		HalfOpenTimeoutMode:   "partial-close",
-	})
+	thirdResp, err := s.handleAcquireSlot(context.Background(), atomicBreakerAcquireRequest("example.com", "h1", "ip-third", "s1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2000,16 +1949,7 @@ func TestAcquireStoresBreakerInputsForProbeBatch(t *testing.T) {
 	s.flowStore.afterFunc = nil
 	defer s.stopAllHostProbeRunners()
 
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              "example.com",
-		HostnameHash:          "h1",
-		IPBucket:              "ip1",
-		SiteBucket:            "s1",
-		BreakerEnabled:        true,
-		HalfOpenMaxProbeCount: 4,
-		HalfOpenMaxSeconds:    15,
-		HalfOpenTimeoutMode:   "partial-close",
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2196,17 +2136,7 @@ func TestAcquireStaleTokenTimeoutOmitOwnership(t *testing.T) {
 	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now, now.Add(2*time.Second))
 	now = now.Add(cfg.FairQueue.graceDuration())
 
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2240,17 +2170,9 @@ func TestAcquireTupleMismatchTimeoutOmitOwnership(t *testing.T) {
 		t.Fatalf("expected detached flow snapshot before mismatch timeout")
 	}
 
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              "ip-other",
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	mismatchReq := req
+	mismatchReq.IPBucket = "ip-other"
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(mismatchReq, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2316,17 +2238,7 @@ func TestAcquireAcceptPathTimeoutNormalizationOmitsOwnership(t *testing.T) {
 		acceptAcquireInvocationForAcquire = originalAccept
 	})
 
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2375,17 +2287,7 @@ func TestAcquireCancelOnExistingTokenKeepsFlowLive(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := s.handleAcquireSlot(ctx, AcquireRequest{
-			Hostname:              req.Hostname,
-			HostnameHash:          req.HostnameHash,
-			IPBucket:              req.IPBucket,
-			SiteBucket:            req.SiteBucket,
-			BreakerEnabled:        req.BreakerEnabled,
-			HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-			HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-			HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-			QueryToken:            tok,
-		})
+		_, err := s.handleAcquireSlot(ctx, acquireRequestWithQueryToken(req, tok))
 		errCh <- err
 	}()
 
@@ -2437,17 +2339,7 @@ func TestAcquireCancelOnExistingTokenKeepsFlowLive(t *testing.T) {
 		t.Fatalf("expected canceled poll to keep flow live until reconnect window expiry")
 	}
 
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:              req.Hostname,
-		HostnameHash:          req.HostnameHash,
-		IPBucket:              req.IPBucket,
-		SiteBucket:            req.SiteBucket,
-		BreakerEnabled:        req.BreakerEnabled,
-		HalfOpenMaxProbeCount: req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   req.HalfOpenTimeoutMode,
-		QueryToken:            tok,
-	})
+	resp, err := s.handleAcquireSlot(context.Background(), acquireRequestWithQueryToken(req, tok))
 	if err != nil {
 		t.Fatal(err)
 	}

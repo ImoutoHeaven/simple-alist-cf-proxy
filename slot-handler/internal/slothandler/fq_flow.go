@@ -17,6 +17,10 @@ type fqFlow struct {
 	IPBucket              string
 	SiteBucket            string
 	BreakerEnabled        bool
+	OpenCapSeconds        int
+	CloseThresholdPercent int
+	HalfOpenSuccessThreshold int
+	HalfOpenCloseMode     string
 	HalfOpenMaxProbeCount int
 	HalfOpenMaxSeconds    int
 	HalfOpenTimeoutMode   string
@@ -76,6 +80,10 @@ type fqFlowSnapshot struct {
 	IPBucket              string
 	SiteBucket            string
 	BreakerEnabled        bool
+	OpenCapSeconds        int
+	CloseThresholdPercent int
+	HalfOpenSuccessThreshold int
+	HalfOpenCloseMode     string
 	HalfOpenMaxProbeCount int
 	HalfOpenMaxSeconds    int
 	HalfOpenTimeoutMode   string
@@ -114,6 +122,10 @@ func snapshotFromFlow(f *fqFlow) fqFlowSnapshot {
 		IPBucket:              f.IPBucket,
 		SiteBucket:            f.SiteBucket,
 		BreakerEnabled:        f.BreakerEnabled,
+		OpenCapSeconds:        f.OpenCapSeconds,
+		CloseThresholdPercent: f.CloseThresholdPercent,
+		HalfOpenSuccessThreshold: f.HalfOpenSuccessThreshold,
+		HalfOpenCloseMode:     f.HalfOpenCloseMode,
 		HalfOpenMaxProbeCount: f.HalfOpenMaxProbeCount,
 		HalfOpenMaxSeconds:    f.HalfOpenMaxSeconds,
 		HalfOpenTimeoutMode:   f.HalfOpenTimeoutMode,
@@ -835,6 +847,10 @@ func applyAcquireRequestToFlow(f *fqFlow, req AcquireRequest) {
 	f.IPBucket = req.IPBucket
 	f.SiteBucket = canonicalSiteBucket(req.SiteBucket)
 	f.BreakerEnabled = req.BreakerEnabled
+	f.OpenCapSeconds = req.OpenCapSeconds
+	f.CloseThresholdPercent = req.CloseThresholdPercent
+	f.HalfOpenSuccessThreshold = req.HalfOpenSuccessThreshold
+	f.HalfOpenCloseMode = canonicalCloseMode(req.HalfOpenCloseMode)
 	f.HalfOpenMaxProbeCount = req.HalfOpenMaxProbeCount
 	f.HalfOpenMaxSeconds = req.HalfOpenMaxSeconds
 	f.HalfOpenTimeoutMode = canonicalTimeoutMode(req.HalfOpenTimeoutMode)
@@ -1555,12 +1571,20 @@ func canonicalTimeoutMode(raw string) string {
 	return strings.TrimSpace(raw)
 }
 
+func canonicalCloseMode(raw string) string {
+	return strings.TrimSpace(raw)
+}
+
 func matchesAcquireIdentityAndAdmissionTuple(snap fqFlowSnapshot, req AcquireRequest) bool {
 	return snap.Hostname == req.Hostname &&
 		snap.HostnameHash == req.HostnameHash &&
 		snap.IPBucket == req.IPBucket &&
 		snap.SiteBucket == canonicalSiteBucket(req.SiteBucket) &&
 		snap.BreakerEnabled == req.BreakerEnabled &&
+		snap.OpenCapSeconds == req.OpenCapSeconds &&
+		snap.CloseThresholdPercent == req.CloseThresholdPercent &&
+		snap.HalfOpenSuccessThreshold == req.HalfOpenSuccessThreshold &&
+		snap.HalfOpenCloseMode == canonicalCloseMode(req.HalfOpenCloseMode) &&
 		snap.HalfOpenMaxProbeCount == req.HalfOpenMaxProbeCount &&
 		snap.HalfOpenMaxSeconds == req.HalfOpenMaxSeconds &&
 		snap.HalfOpenTimeoutMode == canonicalTimeoutMode(req.HalfOpenTimeoutMode)

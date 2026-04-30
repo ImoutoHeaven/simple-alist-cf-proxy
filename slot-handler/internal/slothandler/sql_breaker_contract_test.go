@@ -17,8 +17,8 @@ func TestInitSQLThrottleProtectionUsesBreakerStateColumns(t *testing.T) {
 		`"half_open_since"\s+integer`,
 		`"half_open_budget"\s+integer`,
 		`"half_open_issued"\s+integer`,
-		`"half_open_reported_mask"\s+bigint`,
-		`"half_open_success_count"\s+integer`,
+		`"half_open_resolved_mask"\s+bigint`,
+		`"half_open_success_mask"\s+bigint`,
 		`"half_open_deadline"\s+integer`,
 		`"version"\s+bigint`,
 	} {
@@ -81,29 +81,29 @@ func TestInitSQLReportBreakerSampleDoesNotPromoteOpenToHalfOpen(t *testing.T) {
 }
 
 func TestInitSQLAuthorizeBreakerAttemptOwnsOpenToHalfOpenTransition(t *testing.T) {
-	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_authorize_breaker_attempt")
-	pattern := `elsif\s+v_state\s*=\s*'open'\s+and\s+v_open_until\s*<=\s*v_now\s+then(?s:.*?)v_state\s*:=\s*'half_open'(?s:.*?)v_half_open_budget\s*:=\s*v_half_open_max_probe_count(?s:.*?)v_half_open_issued\s*:=\s*1(?s:.*?)v_half_open_reported_mask\s*:=\s*0(?s:.*?)v_half_open_success_count\s*:=\s*0(?s:.*?)v_half_open_deadline\s*:=\s*v_now\s*\+\s*v_half_open_max_seconds(?s:.*?)v_attempt_granted\s*:=\s*true(?s:.*?)v_attempt_ticket\s*:=\s*1`
+	body := tableFunctionBody(t, readInitSQLNormalized(t), "func_authorize_breaker_attempt")
+	pattern := `if\s+v_state\s*=\s*'open'\s+and\s+v_open_until\s*<=\s*v_now\s+then(?s:.*?)v_state\s*:=\s*'half_open'(?s:.*?)v_half_open_budget\s*:=\s*v_half_open_max_probe_count(?s:.*?)v_half_open_issued\s*:=\s*0(?s:.*?)v_half_open_resolved_mask\s*:=\s*0(?s:.*?)v_half_open_success_mask\s*:=\s*0(?s:.*?)v_half_open_deadline\s*:=\s*v_now\s*\+\s*v_half_open_max_seconds`
 	if !regexp.MustCompile(pattern).MatchString(body) {
-		t.Fatalf("download_authorize_breaker_attempt must own open->half_open batch-budget authorization")
+		t.Fatalf("func_authorize_breaker_attempt must own open->half_open batch normalization")
 	}
 }
 
 func TestInitSQLReportBreakerSampleTracksAcceptedAttemptTickets(t *testing.T) {
 	body := tableFunctionBody(t, readInitSQLNormalized(t), "download_report_breaker_sample")
-	if !regexp.MustCompile(`if\s+p_attempt_version\s+is\s+not\s+null\s+then(?s:.*?)if\s+v_state\s*<>\s*'half_open'\s+or\s+p_attempt_version\s*<>\s*v_version\s+then(?s:.*?)return\s+query`).MatchString(body) {
+	if !regexp.MustCompile(`if\s+v_state\s*=\s*'half_open'\s+then(?s:.*?)if\s+p_attempt_version\s*<>\s*v_version\s+then(?s:.*?)return\s+query`).MatchString(body) {
 		t.Fatalf("download_report_breaker_sample must no-op stale half_open epoch reports")
 	}
-	if !regexp.MustCompile(`if\s+p_attempt_version\s+is\s+not\s+null\s+then(?s:.*?)if\s+p_attempt_ticket\s+is\s+null\s+or\s+p_attempt_ticket\s*<\s*1\s+or\s+p_attempt_ticket\s*>\s*v_half_open_issued\s+or\s+p_attempt_ticket\s*>\s*v_half_open_ticket_mask_limit\s+then(?s:.*?)return\s+query`).MatchString(body) {
+	if !regexp.MustCompile(`if\s+p_attempt_ticket\s*<\s*1\s+or\s+p_attempt_ticket\s*>\s*v_half_open_issued\s+or\s+p_attempt_ticket\s*>\s*v_half_open_ticket_mask_limit\s+then(?s:.*?)return\s+query`).MatchString(body) {
 		t.Fatalf("download_report_breaker_sample must reject invalid half_open attempt tickets")
 	}
 	if !regexp.MustCompile(`v_ticket_mask\s*:=\s*\(1::bigint\s*<<\s*\(p_attempt_ticket\s*-\s*1\)\)`).MatchString(body) {
 		t.Fatalf("download_report_breaker_sample must derive a per-ticket mask")
 	}
-	if !regexp.MustCompile(`if\s+\(v_half_open_reported_mask\s*&\s*v_ticket_mask\)\s*<>\s*0\s+then(?s:.*?)return\s+query`).MatchString(body) {
+	if !regexp.MustCompile(`if\s+\(v_half_open_resolved_mask\s*&\s*v_ticket_mask\)\s*<>\s*0\s+then(?s:.*?)return\s+query`).MatchString(body) {
 		t.Fatalf("download_report_breaker_sample must ignore duplicate half_open ticket reports")
 	}
-	if !regexp.MustCompile(`v_half_open_reported_mask\s*:=\s*v_half_open_reported_mask\s*\|\s*v_ticket_mask`).MatchString(body) {
-		t.Fatalf("download_report_breaker_sample must record accepted half_open ticket reports in the reported mask")
+	if !regexp.MustCompile(`v_half_open_resolved_mask\s*:=\s*v_half_open_resolved_mask\s*\|\s*v_ticket_mask`).MatchString(body) {
+		t.Fatalf("download_report_breaker_sample must record accepted half_open ticket reports in the resolved mask")
 	}
 	if regexp.MustCompile(`v_probe_version_matches`).MatchString(body) {
 		t.Fatalf("legacy single-probe version matching still present")
@@ -151,19 +151,32 @@ func TestInitSQLReportBreakerSampleParameterizesHalfOpenCloseRule(t *testing.T) 
 	if !regexp.MustCompile(`v_should_close\s*:=\s*case\s+when\s+v_half_open_close_mode\s*=\s*'or'\s+then`).MatchString(body) {
 		t.Fatalf("download_report_breaker_sample must branch close behavior on half_open_close_mode")
 	}
-	if !regexp.MustCompile(`v_half_open_success_count\s*>=\s*v_half_open_success_threshold`).MatchString(body) {
+	if !regexp.MustCompile(`v_success_count\s*>=\s*v_half_open_success_threshold`).MatchString(body) {
 		t.Fatalf("download_report_breaker_sample must use half_open_success_threshold")
 	}
 }
 
 func TestInitSQLDefinesAtomicAdmissionFunctionContract(t *testing.T) {
 	text := readInitSQLNormalized(t)
-	pattern := `create\s+or\s+replace\s+function\s+fq_admit_batch\s*\([^)]*p_breaker_enabled\s+boolean[^)]*p_half_open_max_probe_count\s+int[^)]*p_half_open_max_seconds\s+int[^)]*p_half_open_timeout_mode\s+text[^)]*\)\s*returns\s+table\s*\([^)]*status\s+text[^)]*slot_token\s+text[^)]*throttle_code\s+int[^)]*breaker_open_until\s+int[^)]*breaker_reason\s+text[^)]*breaker_version\s+bigint[^)]*retry_after\s+int[^)]*attempt_version\s+bigint[^)]*attempt_ticket\s+int`
+	pattern := `create\s+or\s+replace\s+function\s+fq_admit_batch\s*\([^)]*p_breaker_enabled\s+boolean[^)]*p_open_cap_seconds\s+int[^)]*p_close_threshold_percent\s+int[^)]*p_half_open_success_threshold\s+int[^)]*p_half_open_close_mode\s+text[^)]*p_half_open_max_probe_count\s+int[^)]*p_half_open_max_seconds\s+int[^)]*p_half_open_timeout_mode\s+text[^)]*\)\s*returns\s+table\s*\([^)]*status\s+text[^)]*slot_token\s+text[^)]*throttle_code\s+int[^)]*breaker_open_until\s+int[^)]*breaker_reason\s+text[^)]*breaker_version\s+bigint[^)]*retry_after\s+int[^)]*attempt_version\s+bigint[^)]*attempt_ticket\s+int`
 	if !regexp.MustCompile(pattern).MatchString(text) {
 		t.Fatalf("fq_admit_batch must expose the atomic admission breaker gate contract")
 	}
 	if regexp.MustCompile(`create\s+or\s+replace\s+function\s+fq_try_acquire_batch`).MatchString(text) {
 		t.Fatalf("legacy fq_try_acquire_batch function still present")
+	}
+}
+
+func TestInitSQLDefinesCanonicalAuthorizeHelperContract(t *testing.T) {
+	text := readInitSQLNormalized(t)
+	if !regexp.MustCompile(`create\s+or\s+replace\s+function\s+func_authorize_breaker_attempt\s*\(`).MatchString(text) {
+		t.Fatalf("init.sql must define one canonical authorize helper")
+	}
+	if !regexp.MustCompile(`create\s+or\s+replace\s+function\s+download_authorize_breaker_attempt(?s:.*?)from\s+func_authorize_breaker_attempt\s*\(`).MatchString(text) {
+		t.Fatalf("download_authorize_breaker_attempt must call the canonical authorize helper")
+	}
+	if !regexp.MustCompile(`create\s+or\s+replace\s+function\s+fq_admit_batch(?s:.*?)from\s+func_authorize_breaker_attempt\s*\(`).MatchString(text) {
+		t.Fatalf("fq_admit_batch must call the canonical authorize helper")
 	}
 }
 
@@ -197,12 +210,12 @@ func TestInitSQLAdmitBatchHalfOpenFullReleasesBothSlotsAndRequiresPositiveRetryA
 func TestInitSQLAdmitBatchGuardsBreakerReadAndAuthorizeWhenDisabled(t *testing.T) {
 	body := batchAcquireFunctionBody(t, readInitSQLNormalized(t))
 	readPattern := `if\s+coalesce\(p_breaker_enabled,\s*false\)\s+and\s+p_hostname_hash\s+is\s+not\s+null\s+and\s+p_hostname_hash\s*<>\s*''\s+then(?s:.*?)from\s+"throttle_protection"`
-	authorizePattern := `if\s+coalesce\(p_breaker_enabled,\s*false\)\s+and\s+p_hostname_hash\s+is\s+not\s+null\s+and\s+p_hostname_hash\s*<>\s*''\s+then(?s:.*?)from\s+download_authorize_breaker_attempt\s*\(`
+	authorizePattern := `if\s+coalesce\(p_breaker_enabled,\s*false\)\s+and\s+p_hostname_hash\s+is\s+not\s+null\s+and\s+p_hostname_hash\s*<>\s*''\s+then(?s:.*?)from\s+func_authorize_breaker_attempt\s*\(`
 	if !regexp.MustCompile(readPattern).MatchString(body) {
 		t.Fatalf("fq_admit_batch must guard the THROTTLE_PROTECTION read with p_breaker_enabled")
 	}
 	if !regexp.MustCompile(authorizePattern).MatchString(body) {
-		t.Fatalf("fq_admit_batch must guard download_authorize_breaker_attempt with p_breaker_enabled")
+		t.Fatalf("fq_admit_batch must guard func_authorize_breaker_attempt with p_breaker_enabled")
 	}
 }
 

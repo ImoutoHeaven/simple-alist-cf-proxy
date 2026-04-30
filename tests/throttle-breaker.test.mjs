@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getBreakerState, reportBreakerSample, settleBreakerAttempt } from '../src/cache/throttle-custom-pg-rest.js';
+import { authorizeBreakerAttempt, getBreakerState, reportBreakerSample, settleBreakerAttempt } from '../src/cache/throttle-custom-pg-rest.js';
 import { scheduleAllCleanups } from '../src/cleanup-scheduler.js';
 import { encryptBindingPayload } from '../src/origin-binding.js';
 import worker from '../src/worker.js';
@@ -584,6 +584,10 @@ test('slot-handler acquire payload carries breaker admission fields for queue_br
     ipBucket: 'ip-bucket',
     siteBucket: 'site-bucket',
     breakerEnabled: true,
+    openCapSeconds: 75,
+    closeThresholdPercent: 19,
+    halfOpenSuccessThreshold: 3,
+    halfOpenCloseMode: 'or',
     halfOpenMaxProbeCount: 4,
     halfOpenMaxSeconds: 15,
     halfOpenTimeoutMode: 'partial-close',
@@ -609,9 +613,70 @@ test('slot-handler acquire payload carries breaker admission fields for queue_br
     const result = await client.waitForSlot({}, fqContext);
     assert.equal(result.kind, 'granted');
     assert.equal(seenPayload.breakerEnabled, true);
+    assert.equal(seenPayload.openCapSeconds, 75);
+    assert.equal(seenPayload.closeThresholdPercent, 19);
+    assert.equal(seenPayload.halfOpenSuccessThreshold, 3);
+    assert.equal(seenPayload.halfOpenCloseMode, 'or');
     assert.equal(seenPayload.halfOpenMaxProbeCount, 4);
     assert.equal(seenPayload.halfOpenMaxSeconds, 15);
     assert.equal(seenPayload.halfOpenTimeoutMode, 'partial-close');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('queue_breaker transport preserves closeThresholdPercent=0 from the resolved throttle config', async () => {
+  const runtimeBootstrap = buildRuntimeBootstrap({
+    hostPatterns: ['*.sharepoint.com'],
+    fairQueueHostPatterns: ['*.sharepoint.com'],
+  });
+  runtimeBootstrap.download.throttleProfiles.default.closeThresholdPercent = 0;
+
+  const { throttleConfig } = resolveConfig({}, runtimeBootstrap, { download: {} });
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.test',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 1,
+    },
+  });
+  const fqContext = {
+    hostname: 'tenant.sharepoint.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    breakerEnabled: true,
+    openCapSeconds: throttleConfig.openCapSeconds,
+    closeThresholdPercent: throttleConfig.closeThresholdPercent,
+    halfOpenSuccessThreshold: throttleConfig.halfOpenSuccessThreshold,
+    halfOpenCloseMode: throttleConfig.halfOpenCloseMode,
+    halfOpenMaxProbeCount: throttleConfig.halfOpenMaxProbeCount,
+    halfOpenMaxSeconds: throttleConfig.halfOpenMaxSeconds,
+    halfOpenTimeoutMode: throttleConfig.halfOpenTimeoutMode,
+  };
+
+  const originalFetch = globalThis.fetch;
+  let seenPayload = null;
+
+  globalThis.fetch = async (_url, init) => {
+    seenPayload = JSON.parse(init.body);
+    return new Response(JSON.stringify({
+      result: 'granted',
+      queryToken: 'query-queue-breaker-grant-zero-threshold',
+      invocationEpoch: 1,
+      slotToken: 'slot-1',
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.equal(result.kind, 'granted');
+    assert.equal(throttleConfig.closeThresholdPercent, 0);
+    assert.equal(seenPayload.closeThresholdPercent, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -662,6 +727,143 @@ test('slot-handler throttled responses preserve raw breaker snapshot metadata', 
       version: 12,
       lastErrorCode: 429,
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('queue_breaker timeout absorption matches breaker_only authoritative post-timeout state', async () => {
+  const hostname = 'tenant.sharepoint.com';
+  const hostnameHash = await decodeHostnameHash(hostname);
+  const runtimeBootstrap = buildRuntimeBootstrap({
+    hostPatterns: ['*.sharepoint.com'],
+    fairQueueHostPatterns: ['*.sharepoint.com'],
+  });
+  Object.assign(runtimeBootstrap.download.throttleProfiles.default, {
+    openCapSeconds: 75,
+    closeThresholdPercent: 19,
+    halfOpenSuccessThreshold: 3,
+    halfOpenCloseMode: 'or',
+    halfOpenMaxProbeCount: 4,
+    halfOpenMaxSeconds: 15,
+    halfOpenTimeoutMode: 'open',
+  });
+
+  const { throttleConfig } = resolveConfig({}, runtimeBootstrap, { download: {} });
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.test',
+      totalMaxWaitMs: 20000,
+      perRequestTimeoutMs: 8000,
+      maxAttemptsCap: 1,
+    },
+  });
+  const fqContext = {
+    hostname,
+    hostnameHash,
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    breakerEnabled: true,
+    openCapSeconds: throttleConfig.openCapSeconds,
+    closeThresholdPercent: throttleConfig.closeThresholdPercent,
+    halfOpenSuccessThreshold: throttleConfig.halfOpenSuccessThreshold,
+    halfOpenCloseMode: throttleConfig.halfOpenCloseMode,
+    halfOpenMaxProbeCount: throttleConfig.halfOpenMaxProbeCount,
+    halfOpenMaxSeconds: throttleConfig.halfOpenMaxSeconds,
+    halfOpenTimeoutMode: throttleConfig.halfOpenTimeoutMode,
+  };
+
+  const authoritativeOpenUntil = Math.floor(Date.now() / 1000) + 22;
+  const authoritativeSnapshot = {
+    state: 'open',
+    openUntil: authoritativeOpenUntil,
+    reason: 'http_429',
+    version: 45,
+    lastErrorCode: 429,
+  };
+  const originalFetch = globalThis.fetch;
+  const acquireBodies = [];
+  const authorizeBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 44,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      acquireBodies.push(JSON.parse(init.body));
+      return createJsonResponse({
+        result: 'throttled',
+        queryToken: 'query-timeout-absorbed',
+        invocationEpoch: 1,
+        throttleCode: authoritativeSnapshot.lastErrorCode,
+        breakerOpenUntil: authoritativeSnapshot.openUntil,
+        breakerReason: authoritativeSnapshot.reason,
+        breakerVersion: authoritativeSnapshot.version,
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: authoritativeSnapshot.state,
+        OPEN_UNTIL: authoritativeSnapshot.openUntil,
+        OPEN_REASON: authoritativeSnapshot.reason,
+        VERSION: authoritativeSnapshot.version,
+        LAST_ERROR_CODE: authoritativeSnapshot.lastErrorCode,
+        HALF_OPEN_DEADLINE: null,
+        ATTEMPT_GRANTED: false,
+        ATTEMPT_TICKET: null,
+      }]);
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const snapshotBeforeAuthorize = await getBreakerState(hostname, throttleConfig);
+    const fqResult = await client.waitForSlot({}, fqContext);
+    const breakerOnlyResult = await authorizeBreakerAttempt(hostname, throttleConfig);
+
+    assert.equal(snapshotBeforeAuthorize.state, 'half_open');
+    assert.equal(fqResult.kind, 'throttled');
+    assert.ok(Number.isFinite(fqResult.retryAfter) && fqResult.retryAfter > 0);
+    assert.deepEqual(fqResult.breakerSnapshot, authoritativeSnapshot);
+    assert.deepEqual(
+      {
+        state: breakerOnlyResult.state,
+        openUntil: breakerOnlyResult.openUntil,
+        reason: breakerOnlyResult.reason,
+        version: breakerOnlyResult.version,
+        lastErrorCode: breakerOnlyResult.lastErrorCode,
+      },
+      authoritativeSnapshot,
+    );
+    assert.equal(breakerOnlyResult.halfOpenDeadline, null);
+    assert.equal(breakerOnlyResult.attemptGranted, false);
+    assert.equal(breakerOnlyResult.attemptTicket, null);
+
+    assert.equal(acquireBodies.length, 1);
+    assert.equal(authorizeBodies.length, 1);
+    assert.equal(acquireBodies[0].hostname, hostname);
+    assert.equal(acquireBodies[0].hostnameHash, hostnameHash);
+    assert.equal(authorizeBodies[0].p_hostname, hostname);
+    assert.equal(authorizeBodies[0].p_hostname_hash, hostnameHash);
+    assert.equal(acquireBodies[0].openCapSeconds, authorizeBodies[0].p_open_cap_seconds);
+    assert.equal(acquireBodies[0].closeThresholdPercent, authorizeBodies[0].p_close_threshold_percent);
+    assert.equal(acquireBodies[0].halfOpenSuccessThreshold, authorizeBodies[0].p_half_open_success_threshold);
+    assert.equal(acquireBodies[0].halfOpenCloseMode, authorizeBodies[0].p_half_open_close_mode);
+    assert.equal(acquireBodies[0].halfOpenMaxProbeCount, authorizeBodies[0].p_half_open_max_probe_count);
+    assert.equal(acquireBodies[0].halfOpenMaxSeconds, authorizeBodies[0].p_half_open_max_seconds);
+    assert.equal(acquireBodies[0].halfOpenTimeoutMode, authorizeBodies[0].p_half_open_timeout_mode);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -3452,6 +3654,14 @@ test('queue_breaker reacquires and reports actual Google-family host attempts ac
     assert.equal(acquireBodies[1].hostname, 'www.googleapis.com');
     assert.equal(acquireBodies[0].breakerEnabled, true);
     assert.equal(acquireBodies[1].breakerEnabled, true);
+    assert.equal(acquireBodies[0].openCapSeconds, 60);
+    assert.equal(acquireBodies[0].closeThresholdPercent, 15);
+    assert.equal(acquireBodies[0].halfOpenSuccessThreshold, 2);
+    assert.equal(acquireBodies[0].halfOpenCloseMode, 'and');
+    assert.equal(acquireBodies[1].openCapSeconds, 60);
+    assert.equal(acquireBodies[1].closeThresholdPercent, 15);
+    assert.equal(acquireBodies[1].halfOpenSuccessThreshold, 2);
+    assert.equal(acquireBodies[1].halfOpenCloseMode, 'and');
     assert.equal(acquireBodies[1].halfOpenMaxProbeCount, 4);
     assert.equal(acquireBodies[1].halfOpenMaxSeconds, 15);
     assert.equal(acquireBodies[1].halfOpenTimeoutMode, 'partial-close');

@@ -26,7 +26,7 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 ## 1. 核心模型（Flow / InvocationEpoch / Waiter / Lease / Grace）
 
 - **Flow（流）**
-  - `queryToken` 是 flow 的唯一标识，并绑定创建时的完整 canonical admission tuple（`hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket` + `breakerEnabled` + breaker half-open 参数）。
+  - `queryToken` 是 flow 的唯一标识，并绑定创建时的完整 canonical admission tuple（`hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket` + `breakerEnabled` + canonical breaker tuple：`openCapSeconds`、`closeThresholdPercent`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`）。
   - `invocationEpoch` 标识当前 accepted invocation；只有 waiter attach 成功才会创建或推进它，客户端可持有的 epoch 永远 `>= 1`。
   - `committedGrantEpoch` 只标识当前已 commit 的 `READY` grant；它只服务 READY cleanup，不赋予 `/abandon` ownership。
   - flow 会跨多次 /acquire 轮询保留公平性状态（例如 LocalVT）；队列可见性绑定在 live flow 上，而不是绑定在某个瞬时 HTTP waiter 上。
@@ -86,12 +86,12 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 ### 2.5 Atomic admission 与 breaker 结果透传（无本地权威）
 
 - 共享 breaker 的运行时真源只有数据库 `THROTTLE_PROTECTION`；slot-handler 不维护 breaker 本地权威、镜像或缓存。
-- `probeOnce` 只调用 backend `AdmitBatch`；`queue_only` 传纯 queue admission，`queue_breaker` 传 `breakerEnabled` 与 half-open 参数，由 backend / `fq_admit_batch` 一次返回 `READY / WAIT / IP_TOO_MANY / THROTTLED / HALF_OPEN_FULL`。
+- `probeOnce` 只调用 backend `AdmitBatch`；`queue_only` 传纯 queue admission，`queue_breaker` 传 `breakerEnabled` 与完整 canonical breaker tuple，由 backend / `fq_admit_batch` 一次返回 `READY / WAIT / IP_TOO_MANY / THROTTLED / HALF_OPEN_FULL`。
 - `IP_TOO_MANY` 是 `fq_admit_batch` 的显式结构性反馈：命中 host/site per-IP 上限或 cooldown 时，scheduler 会执行 `halveWaitCount()` + `setBucketDenyUntil()`；`THROTTLED` latch 只会阻止 breaker-enabled `READY` 的最终提交（并补偿释放已拿到的 `slotToken`），不会吞掉 `IP_TOO_MANY` / `HALF_OPEN_FULL` 的结构性语义；同 tick 的 host sweep 发送 generic `THROTTLED` 时也不会覆盖已按结构性语义处理过的 flow；普通 `WAIT` 仍只表示 contention，不会设置 `DenyUntil`。
-- 若同一个子批次因 breaker admission tuple 不同被拆分为多个分区，前一个分区已拿到 `READY`、后一个分区又报错或结果长度不匹配时，slot-handler 会先同步 best-effort 补偿释放已拿到的 `slotToken`，再把原始失败与 release failure 一并暴露；不会把局部成功留给后续 zombie cleanup。
+- 若同一个子批次因 breaker admission tuple 不同被拆分为多个分区，前一个分区已拿到 `READY`、后一个分区又报错或结果长度不匹配时，slot-handler 会先同步 best-effort 补偿释放已拿到的 `slotToken`，再把原始失败与 release failure 一并暴露；不会把局部成功留给后续 zombie cleanup。这里的 breaker admission tuple 固定包含 `openCapSeconds`、`closeThresholdPercent`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`。
 - 若 backend 返回 `THROTTLED`，slot-handler 只把 `throttleCode`、`breakerOpenUntil`、`breakerReason`、`breakerVersion` 原样投递给 waiter。
 - acquire/release 只处理公平队列上下文，不携带额外 breaker 运行时状态，也不会在本地推进 `open -> half_open`。
-- worker 的四种 admission 路径固定为：`none -> fetch only`、`breaker_only -> authorize -> fetch -> report`、`queue_only -> admit(queue only) -> fetch -> release`、`queue_breaker -> admit(queue + breaker) -> fetch -> report -> release`。
+- worker 的四种 admission 路径固定为：`none -> fetch only`、`breaker_only -> authorize -> fetch -> report|settle`、`queue_only -> admit(queue only) -> fetch -> release`、`queue_breaker -> admit(queue + breaker) -> fetch -> report|settle -> release`。
 
 ---
 
@@ -105,10 +105,10 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 - `now`
 - `queryToken`（首次可不传；轮询时传回上一次返回的 token）
 - `breakerEnabled`（仅 `queue_breaker`）
-- `halfOpenMaxProbeCount` / `halfOpenMaxSeconds` / `halfOpenTimeoutMode`（仅 `queue_breaker`）
+- `openCapSeconds` / `closeThresholdPercent` / `halfOpenSuccessThreshold` / `halfOpenCloseMode` / `halfOpenMaxProbeCount` / `halfOpenMaxSeconds` / `halfOpenTimeoutMode`（仅 `queue_breaker`）
 
 校验（`breakerEnabled=true`）：
-- 必须提供 `hostnameHash` 与 half-open 参数；其中 `halfOpenMaxProbeCount` 为 `1..63`，`halfOpenMaxSeconds > 0`，`halfOpenTimeoutMode` trim 后为 `open|close|partial-close`。
+- 必须提供 `hostnameHash` 与完整 canonical breaker tuple；其中 `openCapSeconds > 0`、`closeThresholdPercent >= 0`、`halfOpenSuccessThreshold > 0`、`halfOpenCloseMode` trim 后为 `and|or`、`halfOpenMaxProbeCount` 为 `1..63`、`halfOpenMaxSeconds > 0`、`halfOpenTimeoutMode` trim 后为 `open|close|partial-close`。
 - 校验失败直接返回 `400`（plain-text；错误短语稳定），且在创建/续接 flow 与启动 probe runner 前失败。
 
 响应字段：
@@ -372,11 +372,11 @@ slot-handler 依赖以下函数（名称可在配置中改）：
 - worker 调用 `acquire`；拿到 `slotToken` 后走 `/release`；未拿到 `slotToken` 且仍持有 `queryToken + invocationEpoch` 的 pre-grant cleanup 才会 best-effort 调 `/abandon`；`acquire` 返回 `pending` 时持续轮询。
 - `queryToken` 标识 live flow，`invocationEpoch` 标识当前 accepted invocation；worker 只消费这组 ownership tuple，不在本地复刻正确性。
 - 若 detached flow 已 short-latch 一个 `READY`，worker 的下一次同 token `acquire` 会直接拿到已有 grant，并切到新的 `invocationEpoch`。
-- worker 与 slot-handler 的边界固定为四种 admission 模式：`none` 不触达 slot-handler，`breaker_only` 由 worker 走 `download_authorize_breaker_attempt`，`queue_only` 只做 queue admission，`queue_breaker` 由 slot-handler 原子完成 queue + breaker admission，再由 worker 在响应后回写 report；slot-handler 不保存任何 breaker 运行时状态。
+- worker 与 slot-handler 的边界固定为四种 admission 模式：`none` 不触达 slot-handler，`breaker_only` 由 worker 走 `download_authorize_breaker_attempt`，`queue_only` 只做 queue admission，`queue_breaker` 由 slot-handler 原子完成 queue + breaker admission，再由 worker 在响应后回写 `report` 或 `settle`；slot-handler 不保存任何 breaker 运行时状态。
 - `overloaded` 表示 in-flight 超限，worker 按 scope 分流处理：
   - `overload_global`：fail-fast 返回 `503`，并携带 `Retry-After`。
   - `overload_host|overload_site|overload_ip`：有界等待后重试（0.5s 递进到 2.0s，单次不超过 2.0s）。
-- sticky miss、token 过期或 token admission tuple（`hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket` + `breakerEnabled` + `queue_breaker` half-open 参数）不匹配仍会退化为 `timeout`；worker 侧表现为 `503`，不保证保留原排队位置。
+- sticky miss、token 过期或 token admission tuple（`hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket` + `breakerEnabled` + canonical breaker tuple）不匹配仍会退化为 `timeout`；worker 侧表现为 `503`，不保证保留原排队位置。
 
 ## 9. 多实例部署注意（sticky 路由）
 

@@ -99,36 +99,44 @@ type SiteCapsConfig struct {
 }
 
 type AcquireRequest struct {
-	Hostname              string `json:"hostname"`
-	HostnameHash          string `json:"hostnameHash"`
-	IPBucket              string `json:"ipBucket"`
-	SiteBucket            string `json:"siteBucket"`
-	Now                   int64  `json:"now"`
-	BreakerEnabled        bool   `json:"breakerEnabled,omitempty"`
-	HalfOpenMaxProbeCount int    `json:"halfOpenMaxProbeCount,omitempty"`
-	HalfOpenMaxSeconds    int    `json:"halfOpenMaxSeconds,omitempty"`
-	HalfOpenTimeoutMode   string `json:"halfOpenTimeoutMode,omitempty"`
-	HostMaxSlotPerHost    int    `json:"hostMaxSlotPerHost,omitempty"`
-	HostMaxSlotPerIP      int    `json:"hostMaxSlotPerIp,omitempty"`
-	SiteMaxSlotPerSite    int    `json:"siteMaxSlotPerSite,omitempty"`
-	SiteMaxSlotPerIP      int    `json:"siteMaxSlotPerIp,omitempty"`
-	ZombieTimeoutSeconds  int    `json:"zombieTimeoutSeconds,omitempty"`
-	CooldownSeconds       int    `json:"cooldownSeconds,omitempty"`
-	PollIntervalMs        int64  `json:"pollIntervalMs,omitempty"`
-	QueryToken            string `json:"queryToken,omitempty"`
+	Hostname                 string `json:"hostname"`
+	HostnameHash             string `json:"hostnameHash"`
+	IPBucket                 string `json:"ipBucket"`
+	SiteBucket               string `json:"siteBucket"`
+	Now                      int64  `json:"now"`
+	BreakerEnabled           bool   `json:"breakerEnabled,omitempty"`
+	OpenCapSeconds           int    `json:"openCapSeconds,omitempty"`
+	CloseThresholdPercent    int    `json:"closeThresholdPercent,omitempty"`
+	HalfOpenSuccessThreshold int    `json:"halfOpenSuccessThreshold,omitempty"`
+	HalfOpenCloseMode        string `json:"halfOpenCloseMode,omitempty"`
+	HalfOpenMaxProbeCount    int    `json:"halfOpenMaxProbeCount,omitempty"`
+	HalfOpenMaxSeconds       int    `json:"halfOpenMaxSeconds,omitempty"`
+	HalfOpenTimeoutMode      string `json:"halfOpenTimeoutMode,omitempty"`
+	HostMaxSlotPerHost       int    `json:"hostMaxSlotPerHost,omitempty"`
+	HostMaxSlotPerIP         int    `json:"hostMaxSlotPerIp,omitempty"`
+	SiteMaxSlotPerSite       int    `json:"siteMaxSlotPerSite,omitempty"`
+	SiteMaxSlotPerIP         int    `json:"siteMaxSlotPerIp,omitempty"`
+	ZombieTimeoutSeconds     int    `json:"zombieTimeoutSeconds,omitempty"`
+	CooldownSeconds          int    `json:"cooldownSeconds,omitempty"`
+	PollIntervalMs           int64  `json:"pollIntervalMs,omitempty"`
+	QueryToken               string `json:"queryToken,omitempty"`
 }
 
 type AcquirePayload struct {
-	Hostname              string `json:"hostname"`
-	HostnameHash          string `json:"hostnameHash"`
-	IPBucket              string `json:"ipBucket"`
-	SiteBucket            string `json:"siteBucket"`
-	Now                   int64  `json:"now"`
-	BreakerEnabled        bool   `json:"breakerEnabled,omitempty"`
-	HalfOpenMaxProbeCount int    `json:"halfOpenMaxProbeCount,omitempty"`
-	HalfOpenMaxSeconds    int    `json:"halfOpenMaxSeconds,omitempty"`
-	HalfOpenTimeoutMode   string `json:"halfOpenTimeoutMode,omitempty"`
-	QueryToken            string `json:"queryToken,omitempty"`
+	Hostname                 string `json:"hostname"`
+	HostnameHash             string `json:"hostnameHash"`
+	IPBucket                 string `json:"ipBucket"`
+	SiteBucket               string `json:"siteBucket"`
+	Now                      int64  `json:"now"`
+	BreakerEnabled           bool   `json:"breakerEnabled,omitempty"`
+	OpenCapSeconds           int    `json:"openCapSeconds,omitempty"`
+	CloseThresholdPercent    int    `json:"closeThresholdPercent,omitempty"`
+	HalfOpenSuccessThreshold int    `json:"halfOpenSuccessThreshold,omitempty"`
+	HalfOpenCloseMode        string `json:"halfOpenCloseMode,omitempty"`
+	HalfOpenMaxProbeCount    int    `json:"halfOpenMaxProbeCount,omitempty"`
+	HalfOpenMaxSeconds       int    `json:"halfOpenMaxSeconds,omitempty"`
+	HalfOpenTimeoutMode      string `json:"halfOpenTimeoutMode,omitempty"`
+	QueryToken               string `json:"queryToken,omitempty"`
 }
 
 type AcquireResponse struct {
@@ -206,7 +214,7 @@ func validateAcquireBatchInputs(reqs []AcquireRequest) error {
 		if req.Hostname != first.Hostname || req.HostnameHash != first.HostnameHash || req.Now != first.Now {
 			return fmt.Errorf("admit batch inputs must match hostname/hash/now (index=%d)", i)
 		}
-		if req.BreakerEnabled != first.BreakerEnabled || req.HalfOpenMaxProbeCount != first.HalfOpenMaxProbeCount || req.HalfOpenMaxSeconds != first.HalfOpenMaxSeconds || req.HalfOpenTimeoutMode != first.HalfOpenTimeoutMode {
+		if req.BreakerEnabled != first.BreakerEnabled || req.OpenCapSeconds != first.OpenCapSeconds || req.CloseThresholdPercent != first.CloseThresholdPercent || req.HalfOpenSuccessThreshold != first.HalfOpenSuccessThreshold || req.HalfOpenCloseMode != first.HalfOpenCloseMode || req.HalfOpenMaxProbeCount != first.HalfOpenMaxProbeCount || req.HalfOpenMaxSeconds != first.HalfOpenMaxSeconds || req.HalfOpenTimeoutMode != first.HalfOpenTimeoutMode {
 			return fmt.Errorf("admit batch inputs must match breaker settings (index=%d)", i)
 		}
 		if req.HostMaxSlotPerHost != first.HostMaxSlotPerHost || req.HostMaxSlotPerIP != first.HostMaxSlotPerIP {
@@ -230,8 +238,17 @@ func validateAcquirePayload(req AcquireRequest) error {
 		return errors.New("hostnameHash is required when breakerEnabled is true")
 	}
 	timeoutMode := strings.TrimSpace(req.HalfOpenTimeoutMode)
-	if req.HalfOpenMaxProbeCount == 0 && req.HalfOpenMaxSeconds == 0 && timeoutMode == "" {
+	closeMode := strings.TrimSpace(req.HalfOpenCloseMode)
+	if req.OpenCapSeconds == 0 && req.CloseThresholdPercent == 0 && req.HalfOpenSuccessThreshold == 0 && closeMode == "" && req.HalfOpenMaxProbeCount == 0 && req.HalfOpenMaxSeconds == 0 && timeoutMode == "" {
 		return errors.New("half-open settings are required when breakerEnabled is true")
+	}
+	if req.OpenCapSeconds <= 0 || req.CloseThresholdPercent < 0 || req.HalfOpenSuccessThreshold <= 0 || closeMode == "" {
+		return errors.New("full breaker settings are required when breakerEnabled is true")
+	}
+	switch closeMode {
+	case "and", "or":
+	default:
+		return errors.New("invalid halfOpenCloseMode")
 	}
 	if req.HalfOpenMaxProbeCount < 1 || req.HalfOpenMaxProbeCount > 63 {
 		return errors.New("halfOpenMaxProbeCount must be between 1 and 63")
@@ -1522,16 +1539,20 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := AcquireRequest{
-		Hostname:              payload.Hostname,
-		HostnameHash:          payload.HostnameHash,
-		IPBucket:              payload.IPBucket,
-		SiteBucket:            payload.SiteBucket,
-		Now:                   payload.Now,
-		BreakerEnabled:        payload.BreakerEnabled,
-		HalfOpenMaxProbeCount: payload.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    payload.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   strings.TrimSpace(payload.HalfOpenTimeoutMode),
-		QueryToken:            payload.QueryToken,
+		Hostname:                 payload.Hostname,
+		HostnameHash:             payload.HostnameHash,
+		IPBucket:                 payload.IPBucket,
+		SiteBucket:               payload.SiteBucket,
+		Now:                      payload.Now,
+		BreakerEnabled:           payload.BreakerEnabled,
+		OpenCapSeconds:           payload.OpenCapSeconds,
+		CloseThresholdPercent:    payload.CloseThresholdPercent,
+		HalfOpenSuccessThreshold: payload.HalfOpenSuccessThreshold,
+		HalfOpenCloseMode:        strings.TrimSpace(payload.HalfOpenCloseMode),
+		HalfOpenMaxProbeCount:    payload.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:       payload.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:      strings.TrimSpace(payload.HalfOpenTimeoutMode),
+		QueryToken:               payload.QueryToken,
 	}
 	if err := validateAcquirePayload(req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1730,21 +1751,25 @@ func (s *server) buildAcquireRequest(cfg *Config, snap fqFlowSnapshot, now time.
 	}
 
 	return AcquireRequest{
-		Hostname:              hostname,
-		HostnameHash:          hostnameHash,
-		IPBucket:              ipBucket,
-		SiteBucket:            siteBucket,
-		Now:                   now.UnixMilli(),
-		BreakerEnabled:        snap.BreakerEnabled,
-		HalfOpenMaxProbeCount: snap.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:    snap.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:   snap.HalfOpenTimeoutMode,
-		HostMaxSlotPerHost:    fq.hostMaxSlotPerHost(),
-		HostMaxSlotPerIP:      fq.hostMaxSlotPerIP(),
-		SiteMaxSlotPerSite:    fq.siteMaxSlotPerSite(),
-		SiteMaxSlotPerIP:      fq.siteMaxSlotPerIP(),
-		ZombieTimeoutSeconds:  fq.zombieTimeoutSeconds(),
-		CooldownSeconds:       fq.cooldownSeconds(),
+		Hostname:                 hostname,
+		HostnameHash:             hostnameHash,
+		IPBucket:                 ipBucket,
+		SiteBucket:               siteBucket,
+		Now:                      now.UnixMilli(),
+		BreakerEnabled:           snap.BreakerEnabled,
+		OpenCapSeconds:           snap.OpenCapSeconds,
+		CloseThresholdPercent:    snap.CloseThresholdPercent,
+		HalfOpenSuccessThreshold: snap.HalfOpenSuccessThreshold,
+		HalfOpenCloseMode:        snap.HalfOpenCloseMode,
+		HalfOpenMaxProbeCount:    snap.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:       snap.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:      snap.HalfOpenTimeoutMode,
+		HostMaxSlotPerHost:       fq.hostMaxSlotPerHost(),
+		HostMaxSlotPerIP:         fq.hostMaxSlotPerIP(),
+		SiteMaxSlotPerSite:       fq.siteMaxSlotPerSite(),
+		SiteMaxSlotPerIP:         fq.siteMaxSlotPerIP(),
+		ZombieTimeoutSeconds:     fq.zombieTimeoutSeconds(),
+		CooldownSeconds:          fq.cooldownSeconds(),
 	}
 }
 
@@ -2401,21 +2426,25 @@ func (b *postgrestBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest
 		ipBuckets[i] = req.IPBucket
 	}
 	body := map[string]interface{}{
-		"p_hostname_hash":             first.HostnameHash,
-		"p_hostname":                  first.Hostname,
-		"p_site_buckets":              siteBuckets,
-		"p_ip_buckets":                ipBuckets,
-		"p_now_ms":                    first.Now,
-		"p_breaker_enabled":           first.BreakerEnabled,
-		"p_half_open_max_probe_count": first.HalfOpenMaxProbeCount,
-		"p_half_open_max_seconds":     first.HalfOpenMaxSeconds,
-		"p_half_open_timeout_mode":    first.HalfOpenTimeoutMode,
-		"p_host_max_slot_per_host":    first.HostMaxSlotPerHost,
-		"p_host_max_slot_per_ip":      first.HostMaxSlotPerIP,
-		"p_site_max_slot_per_site":    first.SiteMaxSlotPerSite,
-		"p_site_max_slot_per_ip":      first.SiteMaxSlotPerIP,
-		"p_zombie_timeout":            first.ZombieTimeoutSeconds,
-		"p_cooldown_seconds":          first.CooldownSeconds,
+		"p_hostname_hash":               first.HostnameHash,
+		"p_hostname":                    first.Hostname,
+		"p_site_buckets":                siteBuckets,
+		"p_ip_buckets":                  ipBuckets,
+		"p_now_ms":                      first.Now,
+		"p_breaker_enabled":             first.BreakerEnabled,
+		"p_open_cap_seconds":            first.OpenCapSeconds,
+		"p_close_threshold_percent":     first.CloseThresholdPercent,
+		"p_half_open_success_threshold": first.HalfOpenSuccessThreshold,
+		"p_half_open_close_mode":        first.HalfOpenCloseMode,
+		"p_half_open_max_probe_count":   first.HalfOpenMaxProbeCount,
+		"p_half_open_max_seconds":       first.HalfOpenMaxSeconds,
+		"p_half_open_timeout_mode":      first.HalfOpenTimeoutMode,
+		"p_host_max_slot_per_host":      first.HostMaxSlotPerHost,
+		"p_host_max_slot_per_ip":        first.HostMaxSlotPerIP,
+		"p_site_max_slot_per_site":      first.SiteMaxSlotPerSite,
+		"p_site_max_slot_per_ip":        first.SiteMaxSlotPerIP,
+		"p_zombie_timeout":              first.ZombieTimeoutSeconds,
+		"p_cooldown_seconds":            first.CooldownSeconds,
 	}
 	var resp []struct {
 		Status           string `json:"status"`
@@ -2539,11 +2568,11 @@ func (p *postgresBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest)
 		siteBuckets[i] = req.SiteBucket
 		ipBuckets[i] = req.IPBucket
 	}
-	rows, err := p.db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)", fn),
+	rows, err := p.db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)", fn),
 		first.HostnameHash, first.Hostname, siteBuckets, ipBuckets, first.Now,
 		first.HostMaxSlotPerHost, first.HostMaxSlotPerIP, first.SiteMaxSlotPerSite, first.SiteMaxSlotPerIP,
 		first.ZombieTimeoutSeconds, first.CooldownSeconds,
-		first.BreakerEnabled, first.HalfOpenMaxProbeCount, first.HalfOpenMaxSeconds, first.HalfOpenTimeoutMode)
+		first.BreakerEnabled, first.OpenCapSeconds, first.CloseThresholdPercent, first.HalfOpenSuccessThreshold, first.HalfOpenCloseMode, first.HalfOpenMaxProbeCount, first.HalfOpenMaxSeconds, first.HalfOpenTimeoutMode)
 	if err != nil {
 		return nil, err
 	}
