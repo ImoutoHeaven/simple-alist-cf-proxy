@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { authorizeBreakerAttempt, getBreakerState, reportBreakerSample, settleBreakerAttempt } from '../src/cache/throttle-custom-pg-rest.js';
 import { scheduleAllCleanups } from '../src/cleanup-scheduler.js';
 import { encryptBindingPayload } from '../src/origin-binding.js';
@@ -52,6 +53,104 @@ const encodeSignatureBase64Url = (input) => Buffer.from(input)
   .toString('base64')
   .replace(/\+/g, '-')
   .replace(/\//g, '_');
+
+const DEFAULT_IDLE_TIMEOUT_SECONDS = 300;
+const TICKET_STATE_READ_URL = 'https://postgrest.example.test/rpc/download_get_ticket_state';
+const TICKET_STATE_MARK_URL = 'https://postgrest.example.test/rpc/download_mark_ticket_used';
+const TICKET_STATE_CLEANUP_URL = 'https://postgrest.example.test/rpc/download_cleanup_expired_tickets';
+
+const decodeSignedRequestPayload = (request) => {
+  const payload = new URL(request.url).searchParams.get('payload');
+  assert.ok(payload, 'signed request is missing payload');
+  return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+};
+
+const assertSignedRequestPayloadContract = (request) => {
+  const payloadJson = decodeSignedRequestPayload(request);
+  assert.equal(typeof payloadJson.ticketNonce, 'string');
+  assert.equal(Number.isInteger(payloadJson.idle_timeout), true);
+  assert.match(payloadJson.ticketNonce, /^[A-Za-z0-9_-]{22,}$/);
+};
+
+const createTicketNonce = () => encodeBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+
+const ticketStateRpcState = {
+  cleanupBodies: [],
+  cleanupHandler: null,
+  markBodies: [],
+  markHandler: null,
+  readBodies: [],
+  readHandler: null,
+};
+
+const resetTicketStateRpcState = () => {
+  ticketStateRpcState.cleanupBodies = [];
+  ticketStateRpcState.cleanupHandler = null;
+  ticketStateRpcState.markBodies = [];
+  ticketStateRpcState.markHandler = null;
+  ticketStateRpcState.readBodies = [];
+  ticketStateRpcState.readHandler = null;
+};
+
+const createDefaultTicketStateRow = (body, overrides = {}) => {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  return {
+    found: true,
+    ticket_hash: body?.p_ticket_hash ?? null,
+    issued_at: nowSeconds,
+    first_used_at: null,
+    hard_expire_at: nowSeconds + 600,
+    ip_hash: null,
+    path_hash: null,
+    ...overrides,
+  };
+};
+
+const handleTicketStateRpc = async (url, init = {}) => {
+  if (url === TICKET_STATE_READ_URL) {
+    const body = JSON.parse(init.body);
+    ticketStateRpcState.readBodies.push(body);
+    if (typeof ticketStateRpcState.readHandler === 'function') {
+      const response = await ticketStateRpcState.readHandler(body, init);
+      if (response instanceof Response) {
+        return response;
+      }
+      return createJsonResponse(Array.isArray(response) ? response : [response]);
+    }
+    return createJsonResponse([createDefaultTicketStateRow(body)]);
+  }
+
+  if (url === TICKET_STATE_MARK_URL) {
+    const body = JSON.parse(init.body);
+    ticketStateRpcState.markBodies.push(body);
+    if (typeof ticketStateRpcState.markHandler === 'function') {
+      const response = await ticketStateRpcState.markHandler(body, init);
+      if (response instanceof Response) {
+        return response;
+      }
+      return createJsonResponse(response);
+    }
+    return createJsonResponse({
+      result: 'transitioned',
+      first_used_at: body?.p_now ?? Math.floor(Date.now() / 1000),
+    });
+  }
+
+  if (url === TICKET_STATE_CLEANUP_URL) {
+    const body = JSON.parse(init.body);
+    ticketStateRpcState.cleanupBodies.push(body);
+    if (typeof ticketStateRpcState.cleanupHandler === 'function') {
+      const response = await ticketStateRpcState.cleanupHandler(body, init);
+      if (response instanceof Response) {
+        return response;
+      }
+      return createJsonResponse(response);
+    }
+    return createJsonResponse({ deleted: 0 });
+  }
+
+  return null;
+};
 
 const signPayload = async (payload, expire, token) => {
   const key = await crypto.subtle.importKey(
@@ -133,7 +232,13 @@ const buildRuntimeBootstrap = (options = {}) => ({
 });
 
 const buildSignedWorkerRequest = async (pathname = '/downloads/test.bin', options = {}) => {
-  const { payloadFileSize = undefined } = options;
+  const {
+    idleTimeoutSeconds = DEFAULT_IDLE_TIMEOUT_SECONDS,
+    omitTicketNonce = false,
+    payloadFileSize = undefined,
+    payloadMutator = null,
+    ticketNonce = createTicketNonce(),
+  } = options;
   const token = 'bootstrap-token';
   const expire = Math.floor(Date.now() / 1000) + 300;
   const encryptedBinding = await encryptBindingPayload({
@@ -141,12 +246,18 @@ const buildSignedWorkerRequest = async (pathname = '/downloads/test.bin', option
     issuer: 'https://landing.example.com',
     workerAddress: 'https://worker.example.com',
   }, token);
-  const payload = encodeBase64Url(JSON.stringify({
+  const payloadObject = {
     v: 1,
     expireTime: expire,
+    idle_timeout: idleTimeoutSeconds,
+    ...(omitTicketNonce ? {} : { ticketNonce }),
     encrypt: encryptedBinding,
     ...(payloadFileSize !== undefined ? { filesize: payloadFileSize } : {}),
-  }));
+  };
+  const finalPayloadObject = typeof payloadMutator === 'function'
+    ? payloadMutator({ ...payloadObject })
+    : payloadObject;
+  const payload = encodeBase64Url(JSON.stringify(finalPayloadObject));
   const payloadSign = await signPayload(payload, expire, token);
   const url = new URL(pathname, 'https://worker.example.com');
   url.searchParams.set('payload', payload);
@@ -228,10 +339,48 @@ const buildBootstrap = () => ({
   },
 });
 
+const wrappedFetch = globalThis.fetch;
+const wrappedFetchBound = typeof wrappedFetch === 'function' ? wrappedFetch.bind(globalThis) : wrappedFetch;
+let delegatedFetch = wrappedFetchBound;
+
+const fetchWithDefaultTicketStateRpc = async (input, init = {}) => {
+  const url = typeof input === 'string' ? input : input.url;
+  const ticketStateResponse = await handleTicketStateRpc(url, init);
+  if (ticketStateResponse) {
+    return ticketStateResponse;
+  }
+  if (typeof delegatedFetch !== 'function') {
+    throw new Error('global fetch handler not configured');
+  }
+  return delegatedFetch(input, init);
+};
+
+Object.defineProperty(globalThis, 'fetch', {
+  configurable: true,
+  enumerable: true,
+  get() {
+    return fetchWithDefaultTicketStateRpc;
+  },
+  set(value) {
+    resetTicketStateRpcState();
+    if (value === fetchWithDefaultTicketStateRpc) {
+      delegatedFetch = wrappedFetchBound;
+      return;
+    }
+    delegatedFetch = value;
+  },
+});
+
+test('signed worker request fixtures include ticketNonce and idle_timeout', async () => {
+  assertSignedRequestPayloadContract(await buildSignedWorkerRequest());
+});
+
 test('resolveConfig returns the canonical breaker runtime config', () => {
   const config = resolveConfig({}, buildBootstrap(), { download: {} });
 
   assert.equal(config.throttleEnabled, true);
+  assert.equal(config.ticketStateTableName, 'DOWNLOAD_TICKET_STATE_TABLE');
+  assert.equal(config.cacheConfig.ticketStateTableName, 'DOWNLOAD_TICKET_STATE_TABLE');
   assert.deepEqual(config.throttleHostnamePatterns, ['*.sharepoint.com']);
   assert.deepEqual(config.throttleConfig, {
     postgrestUrl: 'https://postgrest.example.test',
@@ -7624,26 +7773,88 @@ test('client abort during unmanaged redirect fair-queue bootstrap returns client
   }
 });
 
-test('scheduleAllCleanups leaves breaker state untouched', async () => {
+test('scheduleAllCleanups routes hard-expiry cleanup through download_cleanup_expired_tickets for custom-pg-rest config', async () => {
   const originalFetch = globalThis.fetch;
-  let fetchCalls = 0;
+  let unexpectedFetchCalls = 0;
+  const beforeCleanupNow = Math.floor(Date.now() / 1000);
 
-  globalThis.fetch = async () => {
-    fetchCalls += 1;
-    return createJsonResponse(0);
+  globalThis.fetch = async (input) => {
+    unexpectedFetchCalls += 1;
+    const url = typeof input === 'string' ? input : input.url;
+    throw new Error(`Unexpected non-ticket-state cleanup fetch: ${url}`);
   };
+  ticketStateRpcState.cleanupHandler = async () => ({ deleted: 3 });
 
   try {
     await scheduleAllCleanups({
       dbMode: 'custom-pg-rest',
-      throttleEnabled: true,
-      throttleConfig: {
-        openCapSeconds: 60,
+      cacheConfig: {
+        postgrestUrl: 'https://postgrest.example.test/',
+        verifyHeader: ['X-Verify'],
+        verifySecret: ['secret'],
+        ticketStateTableName: 'DOWNLOAD_TICKET_STATE_TABLE',
+        cleanupProbability: 1,
       },
     }, {}, null);
 
-    assert.equal(fetchCalls, 0);
+    assert.equal(unexpectedFetchCalls, 0);
+    assert.equal(ticketStateRpcState.cleanupBodies.length, 1);
+    assert.deepEqual(Object.keys(ticketStateRpcState.cleanupBodies[0]).sort(), ['p_now', 'p_table_name']);
+    assert.equal(ticketStateRpcState.cleanupBodies[0].p_table_name, 'DOWNLOAD_TICKET_STATE_TABLE');
+    assert.equal(Number.isInteger(ticketStateRpcState.cleanupBodies[0].p_now), true);
+    assert.equal('p_last_active_table_name' in ticketStateRpcState.cleanupBodies[0], false);
+    assert.ok(ticketStateRpcState.cleanupBodies[0].p_now >= beforeCleanupNow);
+    assert.ok(ticketStateRpcState.cleanupBodies[0].p_now <= Math.floor(Date.now() / 1000));
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('scheduleAllCleanups routes hard-expiry cleanup through download_cleanup_expired_tickets when ticket-state config resolves with empty dbMode', async () => {
+  const originalFetch = globalThis.fetch;
+  let unexpectedFetchCalls = 0;
+  const beforeCleanupNow = Math.floor(Date.now() / 1000);
+  const bootstrap = buildBootstrap();
+  bootstrap.download.db = {
+    mode: '',
+    postgrestUrl: 'https://postgrest.example.test',
+    verifyHeader: ['X-Verify'],
+    verifySecret: ['secret'],
+    ticketStateTable: 'DOWNLOAD_TICKET_STATE_TABLE',
+  };
+
+  globalThis.fetch = async (input) => {
+    unexpectedFetchCalls += 1;
+    const url = typeof input === 'string' ? input : input.url;
+    throw new Error(`Unexpected non-ticket-state cleanup fetch: ${url}`);
+  };
+  ticketStateRpcState.cleanupHandler = async () => ({ deleted: 4 });
+
+  try {
+    const config = resolveConfig({}, bootstrap, { download: {} });
+
+    await scheduleAllCleanups({
+      ...config,
+      cleanupPercentage: 100,
+    }, {}, null);
+
+    assert.equal(config.dbMode, '');
+    assert.equal(unexpectedFetchCalls, 0);
+    assert.equal(ticketStateRpcState.cleanupBodies.length, 1);
+    assert.deepEqual(Object.keys(ticketStateRpcState.cleanupBodies[0]).sort(), ['p_now', 'p_table_name']);
+    assert.equal(ticketStateRpcState.cleanupBodies[0].p_table_name, 'DOWNLOAD_TICKET_STATE_TABLE');
+    assert.equal(Number.isInteger(ticketStateRpcState.cleanupBodies[0].p_now), true);
+    assert.equal('p_last_active_table_name' in ticketStateRpcState.cleanupBodies[0], false);
+    assert.ok(ticketStateRpcState.cleanupBodies[0].p_now >= beforeCleanupNow);
+    assert.ok(ticketStateRpcState.cleanupBodies[0].p_now <= Math.floor(Date.now() / 1000));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('download_cleanup_expired_tickets hard-expiry contract deletes by HARD_EXPIRE_AT', async () => {
+  const initSql = await readFile(new URL('../init.sql', import.meta.url), 'utf8');
+
+  assert.match(initSql, /CREATE OR REPLACE FUNCTION download_cleanup_expired_tickets\(/i);
+  assert.match(initSql, /DELETE FROM %1\$I WHERE "HARD_EXPIRE_AT" < \$1/i);
 });

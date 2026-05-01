@@ -1,4 +1,4 @@
-import { applyVerifyHeaders } from './utils.js';
+import { applyVerifyHeaders, hasVerifyCredentials } from './utils.js';
 
 const DEFAULT_CLEANUP_PROBABILITY = 0.01;
 
@@ -32,6 +32,57 @@ const normalizePostgrestUrl = (postgrestUrl) => {
     return '';
   }
   return postgrestUrl.endsWith('/') ? postgrestUrl.slice(0, -1) : postgrestUrl;
+};
+
+const normalizeStringValue = (value, fallback = '') => {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+};
+
+const normalizeHeaderValues = (values) => {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return values.filter((value) => typeof value === 'string' && value.trim() !== '');
+};
+
+const resolveTicketStateCleanupConfig = (config) => {
+  const cacheConfig = config?.cacheConfig && typeof config.cacheConfig === 'object'
+    ? config.cacheConfig
+    : {};
+  const topLevelVerifyHeader = normalizeHeaderValues(config?.verifyHeader);
+  const topLevelVerifySecret = normalizeHeaderValues(config?.verifySecret);
+  const cacheVerifyHeader = normalizeHeaderValues(cacheConfig.verifyHeader);
+  const cacheVerifySecret = normalizeHeaderValues(cacheConfig.verifySecret);
+  const verifyHeader = cacheVerifyHeader.length > 0 ? cacheVerifyHeader : topLevelVerifyHeader;
+  const verifySecret = cacheVerifySecret.length > 0 ? cacheVerifySecret : topLevelVerifySecret;
+  const postgrestUrl = normalizeStringValue(
+    cacheConfig.postgrestUrl,
+    normalizeStringValue(config?.postgrestUrl)
+  );
+  const ticketStateTableName = normalizeStringValue(
+    cacheConfig.ticketStateTableName,
+    normalizeStringValue(config?.ticketStateTableName, 'DOWNLOAD_TICKET_STATE_TABLE')
+  );
+
+  if (
+    !postgrestUrl
+    || !ticketStateTableName
+    || !hasVerifyCredentials(verifyHeader, verifySecret)
+    || verifyHeader.length !== verifySecret.length
+  ) {
+    return null;
+  }
+
+  return {
+    postgrestUrl,
+    verifyHeader,
+    verifySecret,
+    ticketStateTableName,
+  };
 };
 
 const parseContentRange = (contentRange) => {
@@ -149,37 +200,40 @@ const buildCustomPgRestCleanupTasks = (config) => {
   return tasks;
 };
 
-const cleanupLastActiveTable = async (config, env) => {
-  const { dbMode, cacheConfig } = config || {};
-
-  if (
-    dbMode !== 'custom-pg-rest' ||
-    !cacheConfig ||
-    typeof cacheConfig.linkTTL !== 'number' ||
-    cacheConfig.linkTTL <= 0
-  ) {
+const cleanupExpiredTicketState = async (config, env, ticketStateConfig = resolveTicketStateCleanupConfig(config)) => {
+  if (!ticketStateConfig) {
     return { cleaned: 0 };
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const threshold = now - cacheConfig.linkTTL;
-  const tableName = cacheConfig.lastActiveTableName || 'DOWNLOAD_LAST_ACTIVE_TABLE';
+  const tableName = ticketStateConfig.ticketStateTableName || 'DOWNLOAD_TICKET_STATE_TABLE';
 
   try {
-    const { postgrestUrl, verifyHeader, verifySecret } = cacheConfig;
-    const filters = `LAST_ACCESS_TIME=lt.${threshold}`;
-    const cleaned = await executePostgrestDelete(
-      postgrestUrl,
-      verifyHeader,
-      verifySecret,
-      tableName,
-      filters,
-      { Prefer: 'return=representation' }
-    );
-    return { cleaned };
+    const { postgrestUrl, verifyHeader, verifySecret } = ticketStateConfig;
+    const headers = {
+      'Content-Type': 'application/json',
+    };
+    applyVerifyHeaders(headers, verifyHeader, verifySecret);
+
+    const response = await fetch(`${normalizePostgrestUrl(postgrestUrl)}/rpc/download_cleanup_expired_tickets`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        p_now: now,
+        p_table_name: tableName,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`cleanup RPC failed (${response.status}): ${errorText}`);
+    }
+
+    const payload = await response.json();
+    return { cleaned: Number(payload?.deleted) || 0 };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error('[Cleanup] LastActive cleanup failed:', message);
+    console.error('[Cleanup] TicketState cleanup failed:', message);
     return { cleaned: 0, error: message };
   }
 
@@ -187,22 +241,20 @@ const cleanupLastActiveTable = async (config, env) => {
 };
 
 export async function scheduleAllCleanups(config, env, ctx) {
-  if (!config || config.dbMode !== 'custom-pg-rest') {
+  if (!config) {
     return;
   }
 
-  const cleanupTasks = buildCustomPgRestCleanupTasks(config);
+  const cleanupTasks = config.dbMode === 'custom-pg-rest'
+    ? buildCustomPgRestCleanupTasks(config)
+    : [];
+  const ticketStateCleanupConfig = resolveTicketStateCleanupConfig(config);
 
-  if (
-    config.cacheConfig &&
-    typeof config.cacheConfig.linkTTL === 'number' &&
-    config.cacheConfig.linkTTL > 0 &&
-    config.cacheConfig.lastActiveTableName
-  ) {
+  if (ticketStateCleanupConfig) {
     cleanupTasks.push({
-      name: 'LastActive',
+      name: 'TicketState',
       fn: async () => {
-        const result = await cleanupLastActiveTable(config, env);
+        const result = await cleanupExpiredTicketState(config, env, ticketStateCleanupConfig);
         return result.cleaned || 0;
       },
     });
@@ -248,4 +300,4 @@ export async function scheduleAllCleanups(config, env, ctx) {
   }
 }
 
-export { cleanupLastActiveTable };
+export { cleanupExpiredTicketState };

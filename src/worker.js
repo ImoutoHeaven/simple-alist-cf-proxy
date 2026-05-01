@@ -2,7 +2,7 @@
 import { createCacheManager } from './cache/factory.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
-import { unifiedCheck } from './unified-check.js';
+import { unifiedCheck, readTicketState, markTicketUsed } from './unified-check.js';
 import { nextOverloadDelayMs } from './fairqueue-overload.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
 import { parseBoolean, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
@@ -56,11 +56,6 @@ const FQ_GLOBAL_STATE = {
 // Rate Limit in-memory state (per Worker instance, iprange-level)
 const RL_STATE = {
   byIpRange: new Map(),
-};
-
-const IDLE_410_CACHE_CAPACITY = 64;
-const idle410Cache = {
-  entries: new Map(),
 };
 
 const GOOGLE_DRIVE_HEAD_PROBE_RANGE = 'bytes=0-0';
@@ -231,6 +226,179 @@ const normalizeStringValue = (value, fallback = '') => {
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : fallback;
+};
+
+const isValidTicketNonce = (value) => (
+  typeof value === 'string'
+  && /^[A-Za-z0-9_-]{22,}$/.test(value.trim())
+);
+
+const normalizeKnownFileSize = (value) => {
+  const num = Number(value);
+  return Number.isFinite(num) && num > 0 ? Math.trunc(num) : null;
+};
+
+const resolveTicketStateConfig = (config) => {
+  const cacheConfig = config?.cacheConfig && typeof config.cacheConfig === 'object'
+    ? config.cacheConfig
+    : {};
+  const topLevelVerifyHeader = Array.isArray(config?.verifyHeader)
+    ? config.verifyHeader.filter((value) => typeof value === 'string' && value.trim() !== '')
+    : [];
+  const topLevelVerifySecret = Array.isArray(config?.verifySecret)
+    ? config.verifySecret.filter((value) => typeof value === 'string' && value.trim() !== '')
+    : [];
+  const postgrestUrl = normalizeStringValue(
+    cacheConfig.postgrestUrl,
+    normalizeStringValue(config?.postgrestUrl)
+  );
+  const verifyHeader = Array.isArray(cacheConfig.verifyHeader)
+    ? cacheConfig.verifyHeader.filter((value) => typeof value === 'string' && value.trim() !== '')
+    : topLevelVerifyHeader;
+  const verifySecret = Array.isArray(cacheConfig.verifySecret)
+    ? cacheConfig.verifySecret.filter((value) => typeof value === 'string' && value.trim() !== '')
+    : [];
+  const effectiveVerifySecret = verifySecret.length > 0 ? verifySecret : topLevelVerifySecret;
+  const ticketStateTableName = normalizeStringValue(
+    cacheConfig.ticketStateTableName,
+    normalizeStringValue(config?.ticketStateTableName, 'DOWNLOAD_TICKET_STATE_TABLE')
+  );
+
+  if (
+    !postgrestUrl
+    || verifyHeader.length === 0
+    || effectiveVerifySecret.length === 0
+    || verifyHeader.length !== effectiveVerifySecret.length
+    || !ticketStateTableName
+  ) {
+    throw new Error('ticket-state db configuration missing');
+  }
+
+  return {
+    postgrestUrl,
+    verifyHeader,
+    verifySecret: effectiveVerifySecret,
+    ticketStateTableName,
+  };
+};
+
+const buildTicketResponseEvidence = ({
+  response,
+  knownFileSize = null,
+  syntheticContentDisposition = false,
+} = {}) => {
+  const contentDisposition = normalizeStringValue(response?.headers?.get('content-disposition'));
+  const contentRange = normalizeStringValue(response?.headers?.get('content-range'));
+  const acceptRanges = normalizeStringValue(response?.headers?.get('accept-ranges')).toLowerCase();
+  const contentType = normalizeStringValue(response?.headers?.get('content-type')).split(';', 1)[0].toLowerCase();
+  const contentLength = parseContentLengthHeader(response?.headers?.get('content-length'));
+  const expectedFileSize = normalizeKnownFileSize(knownFileSize);
+  const hasResponseBody = Boolean(response) && response.body !== null;
+  const hasPositiveBodyLength = contentLength !== null && contentLength > 0;
+  const hasExactFileSizeMatch = expectedFileSize !== null
+    && hasPositiveBodyLength
+    && contentLength === expectedFileSize;
+  const hasAuthoritativeAttachmentDisposition = Boolean(contentDisposition)
+    && !syntheticContentDisposition
+    && hasResponseBody;
+
+  return {
+    status: response?.status ?? null,
+    contentDisposition,
+    contentRange,
+    acceptRanges,
+    contentType,
+    hasResponseBody,
+    hasPositiveBodyLength,
+    hasExactFileSizeMatch,
+    hasAuthoritativeAttachmentDisposition,
+    hasAuthoritativeFileSignal: (response?.status === 206)
+      || Boolean(contentRange)
+      || hasExactFileSizeMatch
+      || hasAuthoritativeAttachmentDisposition,
+  };
+};
+
+const hasAnyAuthoritativeFileSignal = (...signals) => signals.some(
+  (signal) => Boolean(signal?.hasAuthoritativeFileSignal)
+);
+
+const shouldConsumeTicketResponse = ({
+  requestMethod,
+  response,
+  upstreamResponse = null,
+  knownFileSize = null,
+  syntheticContentDisposition = false,
+} = {}) => {
+  if (requestMethod !== 'GET' || !response) {
+    return false;
+  }
+
+  const responseEvidence = buildTicketResponseEvidence({
+    response,
+    knownFileSize,
+    syntheticContentDisposition,
+  });
+  const upstreamEvidence = upstreamResponse && upstreamResponse !== response
+    ? buildTicketResponseEvidence({
+      response: upstreamResponse,
+      knownFileSize,
+    })
+    : responseEvidence;
+
+  const status = responseEvidence.status;
+  if (status !== 200 && status !== 206) {
+    return false;
+  }
+
+  const {
+    acceptRanges,
+    contentDisposition,
+    contentRange,
+    contentType,
+    hasExactFileSizeMatch,
+    hasPositiveBodyLength,
+    hasResponseBody,
+  } = responseEvidence;
+  const isJsonPayload = contentType === 'application/json';
+  const isPlainTextInterstitialType = contentType === 'text/html' || contentType === 'text/plain';
+  const hasAuthoritativeFileSignal = hasAnyAuthoritativeFileSignal(responseEvidence, upstreamEvidence);
+
+  if (status === 206) {
+    return hasResponseBody;
+  }
+
+  // Encrypted metadata responses can synthesize attachment headers, so JSON only
+  // counts as metadata when the worker synthesized the attachment wrapper itself.
+  if (isJsonPayload) {
+    return hasResponseBody && hasAuthoritativeFileSignal;
+  }
+
+  // Ambiguous inline textual GET 200 responses consume first use whenever the
+  // worker releases them as the user-facing download response, including
+  // crypted wrappers whose attachment header was synthesized by the worker.
+  if (isPlainTextInterstitialType) {
+    return hasResponseBody;
+  }
+
+  if (contentRange) {
+    return true;
+  }
+  if (hasExactFileSizeMatch) {
+    return true;
+  }
+  if (contentDisposition && hasPositiveBodyLength) {
+    return true;
+  }
+  if (acceptRanges === 'bytes' && hasPositiveBodyLength) {
+    return true;
+  }
+
+  if (hasResponseBody) {
+    return true;
+  }
+
+  return hasPositiveBodyLength;
 };
 
 const extractPathname = (urlValue) => {
@@ -597,16 +765,7 @@ const readPayloadExpireTime = (payload) => {
     return null;
   }
   const raw = payload.expireTime;
-  if (typeof raw === 'number' && Number.isFinite(raw)) {
-    return Math.trunc(raw);
-  }
-  if (typeof raw === 'string') {
-    const parsed = Number.parseInt(raw, 10);
-    if (Number.isFinite(parsed)) {
-      return parsed;
-    }
-  }
-  return null;
+  return (typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0) ? raw : null;
 };
 
 const normalizeOrigin = (value) => {
@@ -858,53 +1017,6 @@ async function slowFailDelay() {
   await new Promise((resolve) => setTimeout(resolve, SLOW_FAIL_DELAY_MS));
 }
 
-function touchIdle410Entry(key) {
-  const entries = idle410Cache.entries;
-  const value = entries.get(key);
-  if (value !== undefined) {
-    entries.delete(key);
-    entries.set(key, value);
-  }
-}
-
-function getIdle410Cached(key) {
-  if (!key) {
-    return false;
-  }
-  const entries = idle410Cache.entries;
-  if (!entries.has(key)) {
-    return false;
-  }
-  touchIdle410Entry(key);
-  return true;
-}
-
-function putIdle410Cached(key) {
-  if (!key) {
-    return;
-  }
-  const entries = idle410Cache.entries;
-  if (entries.has(key)) {
-    touchIdle410Entry(key);
-    return;
-  }
-  if (entries.size >= IDLE_410_CACHE_CAPACITY) {
-    const firstKey = entries.keys().next().value;
-    if (firstKey !== undefined) {
-      entries.delete(firstKey);
-    }
-  }
-  entries.set(key, { lastSeen: Date.now() });
-}
-
-async function buildIdleCacheKey(url) {
-  if (!url || typeof url.pathname !== 'string') {
-    return null;
-  }
-  const raw = `${url.pathname}${url.search || ''}`;
-  return sha256Hex(raw);
-}
-
 function markRateLimited(ipSubnet, retryAfterSeconds) {
   const key = typeof ipSubnet === 'string' ? ipSubnet.trim() : '';
   if (!key) {
@@ -1105,13 +1217,8 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     ? linkTTLSecondsRaw
     : DEFAULT_LINK_TTL_SECONDS;
 
-  const idleTimeoutSecondsRaw = Number(dbConfig.idleTimeoutSeconds);
-  const idleTimeoutSeconds = Number.isFinite(idleTimeoutSecondsRaw) && idleTimeoutSecondsRaw >= 0
-    ? idleTimeoutSecondsRaw
-    : 0;
-
   const cacheTableName = normalizeString(dbConfig.cacheTable, 'DOWNLOAD_CACHE_TABLE');
-  const lastActiveTableName = normalizeString(dbConfig.lastActiveTable, 'DOWNLOAD_LAST_ACTIVE_TABLE');
+  const ticketStateTableName = normalizeString(dbConfig.ticketStateTable, 'DOWNLOAD_TICKET_STATE_TABLE');
 
   let cacheEnabled = false;
   let cacheConfig = {};
@@ -1127,8 +1234,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
       verifySecret,
       tableName: cacheTableName,
       linkTTL: linkTTLSeconds,
-      idleTimeout: idleTimeoutSeconds,
-      lastActiveTableName,
+      ticketStateTableName,
       cleanupProbability,
     };
   }
@@ -1345,6 +1451,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     workerAddresses,
     landingWorkerAddresses,
     alistAuthHeaders,
+    postgrestUrl,
     verifyHeader,
     verifySecret,
     ipv4Only,
@@ -1366,8 +1473,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     cfRatelimiterBinding,
     ipv4Suffix: rateLimitConfig.ipv4Suffix,
     ipv6Suffix: rateLimitConfig.ipv6Suffix,
-    idleTimeout: idleTimeoutSeconds,
-    lastActiveTableName,
+    ticketStateTableName,
     fairQueueEnabled: fairQueueContext.fairQueueEnabled,
     fairQueueHostnamePatterns: fairQueueContext.fairQueueHostnamePatterns,
     fairQueueSiteBucket: fairQueueContext.fairQueueSiteBucket,
@@ -1445,13 +1551,6 @@ const ensureEncryptedFileName = (fileName) => {
   const normalized = fileName && fileName.length > 0 ? fileName : 'download.bin';
   return normalized.toLowerCase().endsWith('.enc') ? normalized : `${normalized}.enc`;
 };
-
-async function sha256Hex(text) {
-  const data = new TextEncoder().encode(text);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-}
 
 // Normalize controller decision.pathAction into VALID_ACTIONS; controller is source of truth.
 const normalizeControllerPathActions = (downloadDecision) => {
@@ -3157,8 +3256,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  let dynamicIdleTimeout = null;
-
   const payload = url.searchParams.get("payload") ?? "";
   const payloadSign = url.searchParams.get("payloadSign") ?? "";
   if (!payload) {
@@ -3207,12 +3304,22 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return createUnauthorizedResponse(origin, "link expired");
   }
 
-  if (payloadData && typeof payloadData === "object") {
-    const { idle_timeout: idleTimeoutOverride } = payloadData;
-    if (typeof idleTimeoutOverride === "number" && Number.isFinite(idleTimeoutOverride) && idleTimeoutOverride >= 0) {
-      dynamicIdleTimeout = Math.trunc(idleTimeoutOverride);
-      console.log("[IDLE] Using idle_timeout from payload:", dynamicIdleTimeout);
-    }
+  const ticketNonce = typeof payloadData?.ticketNonce === 'string' ? payloadData.ticketNonce.trim() : '';
+  if (!isValidTicketNonce(ticketNonce)) {
+    return createUnauthorizedResponse(origin, 'payload ticketNonce invalid');
+  }
+
+  const idleTimeoutRaw = payloadData?.idle_timeout;
+  const idleTimeoutSeconds = (typeof idleTimeoutRaw === 'number' && Number.isSafeInteger(idleTimeoutRaw))
+    ? idleTimeoutRaw
+    : null;
+  if (idleTimeoutSeconds === null || idleTimeoutSeconds < 0) {
+    return createUnauthorizedResponse(origin, 'payload idle_timeout invalid');
+  }
+
+  const ticketHash = await sha256Hash(`${payload}:${payloadSign}`);
+  if (!ticketHash) {
+    return createUnauthorizedResponse(origin, 'payload ticket hash invalid');
   }
 
   const encryptedPayload = typeof payloadData.encrypt === "string" ? payloadData.encrypt : "";
@@ -3262,14 +3369,38 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  const effectiveIdleTimeoutForCache =
-    (dynamicIdleTimeout ?? config.cacheConfig?.idleTimeout ?? config.idleTimeout ?? 0);
-  const idleCacheEnabled = Number.isFinite(effectiveIdleTimeoutForCache) && effectiveIdleTimeoutForCache > 0;
-  const idleCacheKey = idleCacheEnabled ? await buildIdleCacheKey(url) : null;
+  let ticketStateConfig;
+  try {
+    ticketStateConfig = resolveTicketStateConfig(config);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('[TicketState] Config invalid:', message);
+    return createErrorResponse(origin, 500, message);
+  }
 
-  if (idleCacheKey && getIdle410Cached(idleCacheKey)) {
-    await slowFailDelay();
-    return createErrorResponse(origin, 410, 'Link expired due to inactivity');
+  let ticketState = null;
+  try {
+    ticketState = await readTicketState(ticketHash, ticketStateConfig);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('[TicketState] Read failed:', message);
+    return createErrorResponse(origin, 500, `Ticket state read failed: ${message}`);
+  }
+
+  if (!ticketState?.found) {
+    return createUnauthorizedResponse(origin, 'ticket state missing');
+  }
+
+  if (!Number.isInteger(ticketState.issuedAt) || ticketState.issuedAt < 0) {
+    return createUnauthorizedResponse(origin, 'ticket state issued_at invalid');
+  }
+
+  if (ticketState.firstUsedAt == null) {
+    const idleAge = Math.floor(Date.now() / 1000) - ticketState.issuedAt;
+    if (idleAge > idleTimeoutSeconds) {
+      await slowFailDelay();
+      return createErrorResponse(origin, 410, 'Link expired due to inactivity');
+    }
   }
 
   // ========================================
@@ -3288,16 +3419,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   const runUnifiedCheck = async (throttleHostnameHash = null) => {
     try {
       const cacheConfig = config.cacheConfig || {};
-      const throttleConfig = config.throttleConfig || {};
-      const effectiveIdleTimeout =
-        dynamicIdleTimeout ?? cacheConfig.idleTimeout ?? config.idleTimeout ?? 0;
 
       const result = await unifiedCheck(path, clientIP, {
         postgrestUrl: rateLimitConfig.postgrestUrl,
         verifyHeader: rateLimitConfig.verifyHeader,
         verifySecret: rateLimitConfig.verifySecret,
         linkTTL: cacheConfig.linkTTL ?? 1800,
-        idleTimeout: effectiveIdleTimeout,
         cacheTableName: cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE',
         windowTimeSeconds: rateLimitConfig.windowTimeSeconds ?? 86400,
         limit: unifiedRateLimit ?? 100,
@@ -3305,7 +3432,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         ipv4Suffix: rateLimitConfig.ipv4Suffix ?? '/32',
         ipv6Suffix: rateLimitConfig.ipv6Suffix ?? '/60',
         rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
-        lastActiveTableName: cacheConfig.lastActiveTableName || config.lastActiveTableName,
         cacheEnabled: config.cacheEnabled,
         throttleHostnameHash,
       });
@@ -3345,7 +3471,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     const unifiedAdmissionMode = resolveAdmissionMode(config, resolvedUnifiedThrottleHostname);
     const unifiedBreakerEligible = unifiedAdmissionMode === 'breaker_only';
 
-    console.log('[Idle Debug] Unified check idle payload:', unifiedResult.idle ?? null);
     if (!unifiedResult.rateLimit.allowed) {
       if (unifiedResult.rateLimit.error) {
         console.error('[Rate Limit] fail-closed error:', unifiedResult.rateLimit.error);
@@ -3379,19 +3504,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         windowLabel,
         retryAfter
       );
-    }
-
-    if (unifiedResult.idle && unifiedResult.idle.expired) {
-      const idleReason = unifiedResult.idle.reason || 'Link expired due to inactivity';
-      const idleDuration = unifiedResult.idle.idleDuration ?? 'unknown';
-      const idleTimeout = unifiedResult.idle.timeout ?? 'unknown';
-      console.warn(
-        `[Idle Timeout] Link expired (idle ${idleDuration}s, timeout ${idleTimeout}s)`
-      );
-      if (idleCacheKey) {
-        putIdle410Cached(idleCacheKey);
-      }
-      return createErrorResponse(origin, 410, idleReason);
     }
 
     if (unifiedResult.cache.hit) {
@@ -5294,6 +5406,45 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     return response;
   };
 
+  const finalizeContentResponse = async (responseToReturn, upstreamResponse = responseToReturn) => {
+    const isContentResponse = shouldConsumeTicketResponse({
+      requestMethod: request.method,
+      response: responseToReturn,
+      upstreamResponse,
+      knownFileSize: readKnownGoogleDriveDownloadSize(),
+      syntheticContentDisposition: payloadData?.isCrypted === true,
+    });
+
+    if (!isContentResponse) {
+      return responseToReturn;
+    }
+
+    try {
+      const markUsedResult = await markTicketUsed(
+        ticketHash,
+        ticketStateConfig,
+        Math.floor(Date.now() / 1000)
+      );
+
+      if (markUsedResult.result === 'transitioned' || markUsedResult.result === 'already_used') {
+        return responseToReturn;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[TicketState] Mark-used failed:', message);
+    }
+
+    if (responseToReturn?.body && typeof responseToReturn.body.cancel === 'function') {
+      try {
+        await responseToReturn.body.cancel();
+      } catch (_error) {
+        // Best effort: fail closed even if cancellation cannot complete cleanly.
+      }
+    }
+
+    return createErrorResponse(origin, 502, 'ticket state update failed');
+  };
+
   let retriedWithFreshLink = false;
 
   // Proceed with fetch
@@ -5466,7 +5617,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     }
 
     if (shouldRewriteGoogleDriveFullDownloadResponse && !needTrueConcurrency) {
-      return buildGoogleDriveFullDownloadResponse(response, request);
+      return await finalizeContentResponse(buildGoogleDriveFullDownloadResponse(response, request), response);
     }
 
     // Ordinary breaker_only terminal exits must retire before any managed stream
@@ -5478,7 +5629,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
 
     const safeResponse = needTrueConcurrency
       ? buildManagedConcurrencyResponse(
-        response,
+          response,
         request,
         shouldRewriteGoogleDriveFullDownloadResponse
           ? buildGoogleDriveFullDownloadResponseInit(response, request)
@@ -5490,44 +5641,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         headers: buildSafeResponseHeaders(response, request),
       });
 
-    const shouldUpdateLastActive =
-      config.cacheConfig &&
-      typeof config.cacheConfig.idleTimeout === 'number' &&
-      config.cacheConfig.idleTimeout > 0 &&
-      config.cacheConfig.lastActiveTableName;
-
-    if (
-      shouldUpdateLastActive &&
-      config.dbMode === 'custom-pg-rest' &&
-      clientIP &&
-      typeof path === 'string'
-    ) {
-      const updatePromise = (async () => {
-        try {
-          const ipSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
-          if (!ipSubnet) {
-            return;
-          }
-
-          const [ipHash, pathHash] = await Promise.all([sha256Hash(ipSubnet), sha256Hash(path)]);
-          if (!ipHash || !pathHash) {
-            return;
-          }
-
-          const { updateLastActive } = await import('./unified-check.js');
-          await updateLastActive(config.cacheConfig, ipHash, pathHash);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          console.error('[LastActive] Update failed:', message);
-        }
-      })();
-
-      if (ctx && ctx.waitUntil) {
-        ctx.waitUntil(updatePromise);
-      }
-    }
-
-    return safeResponse;
+    return await finalizeContentResponse(safeResponse, response);
   } catch (error) {
     const deferredFailureResponse = await flushDeferredQueueBreakerReportOnExit();
     if (deferredFailureResponse) {
@@ -5664,6 +5778,8 @@ export const __fairQueueTestHooks = {
   reconcileFairQueueContextForTarget,
   resolveConfig,
   resolveAdmissionMode,
+  resolveTicketStateConfig,
+  shouldConsumeTicketResponse,
   slowFailDelay,
   markHostOverloaded,
   getHostOverloadedRemainingMs,

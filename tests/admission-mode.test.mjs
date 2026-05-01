@@ -39,6 +39,104 @@ const encodeSignatureBase64Url = (input) => Buffer.from(input)
   .replace(/\+/g, '-')
   .replace(/\//g, '_');
 
+const DEFAULT_IDLE_TIMEOUT_SECONDS = 300;
+const TICKET_STATE_READ_URL = 'https://postgrest.example.test/rpc/download_get_ticket_state';
+const TICKET_STATE_MARK_URL = 'https://postgrest.example.test/rpc/download_mark_ticket_used';
+const TICKET_STATE_CLEANUP_URL = 'https://postgrest.example.test/rpc/download_cleanup_expired_tickets';
+
+const decodeSignedRequestPayload = (request) => {
+  const payload = new URL(request.url).searchParams.get('payload');
+  assert.ok(payload, 'signed request is missing payload');
+  return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+};
+
+const assertSignedRequestPayloadContract = (request) => {
+  const payloadJson = decodeSignedRequestPayload(request);
+  assert.equal(typeof payloadJson.ticketNonce, 'string');
+  assert.equal(Number.isInteger(payloadJson.idle_timeout), true);
+  assert.match(payloadJson.ticketNonce, /^[A-Za-z0-9_-]{22,}$/);
+};
+
+const createTicketNonce = () => encodeBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+
+const ticketStateRpcState = {
+  cleanupBodies: [],
+  cleanupHandler: null,
+  markBodies: [],
+  markHandler: null,
+  readBodies: [],
+  readHandler: null,
+};
+
+const resetTicketStateRpcState = () => {
+  ticketStateRpcState.cleanupBodies = [];
+  ticketStateRpcState.cleanupHandler = null;
+  ticketStateRpcState.markBodies = [];
+  ticketStateRpcState.markHandler = null;
+  ticketStateRpcState.readBodies = [];
+  ticketStateRpcState.readHandler = null;
+};
+
+const createDefaultTicketStateRow = (body, overrides = {}) => {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  return {
+    found: true,
+    ticket_hash: body?.p_ticket_hash ?? null,
+    issued_at: nowSeconds,
+    first_used_at: null,
+    hard_expire_at: nowSeconds + 600,
+    ip_hash: null,
+    path_hash: null,
+    ...overrides,
+  };
+};
+
+const handleTicketStateRpc = async (url, init = {}) => {
+  if (url === TICKET_STATE_READ_URL) {
+    const body = JSON.parse(init.body);
+    ticketStateRpcState.readBodies.push(body);
+    if (typeof ticketStateRpcState.readHandler === 'function') {
+      const response = await ticketStateRpcState.readHandler(body, init);
+      if (response instanceof Response) {
+        return response;
+      }
+      return createJsonResponse(Array.isArray(response) ? response : [response]);
+    }
+    return createJsonResponse([createDefaultTicketStateRow(body)]);
+  }
+
+  if (url === TICKET_STATE_MARK_URL) {
+    const body = JSON.parse(init.body);
+    ticketStateRpcState.markBodies.push(body);
+    if (typeof ticketStateRpcState.markHandler === 'function') {
+      const response = await ticketStateRpcState.markHandler(body, init);
+      if (response instanceof Response) {
+        return response;
+      }
+      return createJsonResponse(response);
+    }
+    return createJsonResponse({
+      result: 'transitioned',
+      first_used_at: body?.p_now ?? Math.floor(Date.now() / 1000),
+    });
+  }
+
+  if (url === TICKET_STATE_CLEANUP_URL) {
+    const body = JSON.parse(init.body);
+    ticketStateRpcState.cleanupBodies.push(body);
+    if (typeof ticketStateRpcState.cleanupHandler === 'function') {
+      const response = await ticketStateRpcState.cleanupHandler(body, init);
+      if (response instanceof Response) {
+        return response;
+      }
+      return createJsonResponse(response);
+    }
+    return createJsonResponse({ deleted: 0 });
+  }
+
+  return null;
+};
+
 const signPayload = async (payload, expire, token) => {
   const key = await crypto.subtle.importKey(
     'raw',
@@ -55,7 +153,13 @@ const signPayload = async (payload, expire, token) => {
   return `${encodeSignatureBase64Url(Buffer.from(signature))}:${expire}`;
 };
 
-const buildSignedWorkerRequest = async (pathname = '/downloads/test.bin') => {
+const buildSignedWorkerRequest = async (pathname = '/downloads/test.bin', options = {}) => {
+  const {
+    idleTimeoutSeconds = DEFAULT_IDLE_TIMEOUT_SECONDS,
+    omitTicketNonce = false,
+    payloadMutator = null,
+    ticketNonce = createTicketNonce(),
+  } = options;
   const token = 'bootstrap-token';
   const expire = Math.floor(Date.now() / 1000) + 300;
   const encryptedBinding = await encryptBindingPayload({
@@ -63,11 +167,17 @@ const buildSignedWorkerRequest = async (pathname = '/downloads/test.bin') => {
     issuer: 'https://landing.example.com',
     workerAddress: 'https://worker.example.com',
   }, token);
-  const payload = encodeBase64Url(JSON.stringify({
+  const payloadObject = {
     v: 1,
     expireTime: expire,
+    idle_timeout: idleTimeoutSeconds,
+    ...(omitTicketNonce ? {} : { ticketNonce }),
     encrypt: encryptedBinding,
-  }));
+  };
+  const finalPayloadObject = typeof payloadMutator === 'function'
+    ? payloadMutator({ ...payloadObject })
+    : payloadObject;
+  const payload = encodeBase64Url(JSON.stringify(finalPayloadObject));
   const payloadSign = await signPayload(payload, expire, token);
   const url = new URL(pathname, 'https://worker.example.com');
   url.searchParams.set('payload', payload);
@@ -156,6 +266,38 @@ const buildEnv = () => ({
   BOOTSTRAP_CACHE_MODE: 'direct',
 });
 
+const wrappedFetch = globalThis.fetch;
+const wrappedFetchBound = typeof wrappedFetch === 'function' ? wrappedFetch.bind(globalThis) : wrappedFetch;
+let delegatedFetch = wrappedFetchBound;
+
+const fetchWithDefaultTicketStateRpc = async (input, init = {}) => {
+  const url = typeof input === 'string' ? input : input.url;
+  const ticketStateResponse = await handleTicketStateRpc(url, init);
+  if (ticketStateResponse) {
+    return ticketStateResponse;
+  }
+  if (typeof delegatedFetch !== 'function') {
+    throw new Error('global fetch handler not configured');
+  }
+  return delegatedFetch(input, init);
+};
+
+Object.defineProperty(globalThis, 'fetch', {
+  configurable: true,
+  enumerable: true,
+  get() {
+    return fetchWithDefaultTicketStateRpc;
+  },
+  set(value) {
+    resetTicketStateRpcState();
+    if (value === fetchWithDefaultTicketStateRpc) {
+      delegatedFetch = wrappedFetchBound;
+      return;
+    }
+    delegatedFetch = value;
+  },
+});
+
 const createModeHarness = ({ fairQueueHostPatterns = [], throttleHostPatterns = [], trueConcurrencyHostPatterns = [] } = {}) => {
   const bootstrap = buildRuntimeBootstrap({ fairQueueHostPatterns, throttleHostPatterns, trueConcurrencyHostPatterns });
   const config = resolveConfig({}, bootstrap, { download: {} });
@@ -164,6 +306,10 @@ const createModeHarness = ({ fairQueueHostPatterns = [], throttleHostPatterns = 
     config,
   };
 };
+
+test('signed worker request fixtures include ticketNonce and idle_timeout', async () => {
+  assertSignedRequestPayloadContract(await buildSignedWorkerRequest());
+});
 
 const runModeScenario = async ({
   fairQueueHostPatterns = [],

@@ -564,3 +564,75 @@ describe('init.sql breaker RPC definitions', () => {
     expect(probeBody).not.toMatch(/pg_advisory_xact_lock\(3, hashtext\(v_request_id\)\)/i);
   });
 });
+
+describe('init.sql ticket-state contract definitions', () => {
+  it('defines the ticket-state table with the ticket hash primary key and hard-expiry index', () => {
+    expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS "DOWNLOAD_TICKET_STATE_TABLE"/i);
+    expect(initSql).toMatch(/"TICKET_HASH"\s+TEXT\s+NOT NULL/i);
+    expect(initSql).toMatch(/"ISSUED_AT"\s+BIGINT\s+NOT NULL/i);
+    expect(initSql).toMatch(/"FIRST_USED_AT"\s+BIGINT\s+NULL/i);
+    expect(initSql).toMatch(/"HARD_EXPIRE_AT"\s+BIGINT\s+NOT NULL/i);
+    expect(initSql).toMatch(/"IP_HASH"\s+TEXT\s+NULL/i);
+    expect(initSql).toMatch(/"PATH_HASH"\s+TEXT\s+NULL/i);
+    expect(initSql).toMatch(/PRIMARY KEY \("TICKET_HASH"\)/i);
+    expect(initSql).toMatch(/CREATE INDEX IF NOT EXISTS idx_download_ticket_state_hard_expire\s+ON "DOWNLOAD_TICKET_STATE_TABLE"\("HARD_EXPIRE_AT"\)/i);
+  });
+
+  it('removes the legacy last-active table and rpc surface', () => {
+    expect(initSql).not.toMatch(/CREATE TABLE IF NOT EXISTS "DOWNLOAD_LAST_ACTIVE_TABLE"/i);
+    expect(initSql).not.toMatch(/CREATE OR REPLACE FUNCTION download_update_last_active\(/i);
+  });
+
+  it('defines an insert-only seed rpc with seeded collision and storage_error outcomes', () => {
+    const functionBody = readFunctionBody('download_seed_ticket');
+
+    expect(functionBody).toMatch(/p_ticket_hash\s+TEXT/i);
+    expect(functionBody).toMatch(/p_issued_at\s+BIGINT/i);
+    expect(functionBody).toMatch(/p_hard_expire_at\s+BIGINT/i);
+    expect(functionBody).toMatch(/p_ip_hash\s+TEXT DEFAULT NULL/i);
+    expect(functionBody).toMatch(/p_path_hash\s+TEXT DEFAULT NULL/i);
+    expect(functionBody).toMatch(/p_table_name\s+TEXT DEFAULT 'DOWNLOAD_TICKET_STATE_TABLE'/i);
+    expect(functionBody).toMatch(/INSERT INTO %1\$I \("TICKET_HASH", "ISSUED_AT", "FIRST_USED_AT", "HARD_EXPIRE_AT", "IP_HASH", "PATH_HASH"\)/i);
+    expect(functionBody).toMatch(/VALUES \(\$1, \$2, NULL, \$3, \$4, \$5\)/i);
+    expect(functionBody).toMatch(/RETURN json_build_object\('result', 'seeded'\)/i);
+    expect(functionBody).toMatch(/WHEN unique_violation THEN\s+RETURN json_build_object\('result', 'collision'\)/i);
+    expect(functionBody).toMatch(/WHEN others THEN\s+RETURN json_build_object\('result', 'storage_error', 'error', SQLERRM\)/i);
+    expect(functionBody).not.toMatch(/ON CONFLICT/i);
+  });
+
+  it('defines a ticket-state read rpc with found and ticket lifecycle fields', () => {
+    const functionBody = readFunctionBody('download_get_ticket_state');
+
+    expect(functionBody).toMatch(/p_ticket_hash\s+TEXT/i);
+    expect(functionBody).toMatch(/p_table_name\s+TEXT DEFAULT 'DOWNLOAD_TICKET_STATE_TABLE'/i);
+    expect(functionBody).toMatch(/RETURNS TABLE\s*\(\s*found BOOLEAN,\s*ticket_hash TEXT,\s*issued_at BIGINT,\s*first_used_at BIGINT,\s*hard_expire_at BIGINT,\s*ip_hash TEXT,\s*path_hash TEXT\s*\)/i);
+  });
+
+  it('defines a mark-used rpc with transitioned already_used and storage_error outcomes', () => {
+    const functionBody = readFunctionBody('download_mark_ticket_used');
+
+    expect(functionBody).toMatch(/p_ticket_hash\s+TEXT/i);
+    expect(functionBody).toMatch(/p_now\s+BIGINT/i);
+    expect(functionBody).toMatch(/p_table_name\s+TEXT DEFAULT 'DOWNLOAD_TICKET_STATE_TABLE'/i);
+    expect(functionBody).toMatch(/FOR UPDATE/i);
+    expect(functionBody).toMatch(/COALESCE\("FIRST_USED_AT", \$2\)/i);
+    expect(functionBody).toMatch(/RETURN json_build_object\('result', 'transitioned', 'first_used_at', v_effective_first_used_at\)/i);
+    expect(functionBody).toMatch(/RETURN json_build_object\('result', 'already_used', 'first_used_at', v_effective_first_used_at\)/i);
+    expect(functionBody).toMatch(/RETURN json_build_object\('result', 'storage_error'\)/i);
+  });
+
+  it('defines ticket cleanup by hard expiry and removes legacy last-active outputs from download_unified_check', () => {
+    const cleanupBody = readFunctionBody('download_cleanup_expired_tickets');
+    const unifiedCheckBody = readFunctionBody('download_unified_check');
+
+    expect(cleanupBody).toMatch(/DELETE FROM %1\$I WHERE "HARD_EXPIRE_AT" < \$1/i);
+    expect(cleanupBody).toMatch(/RETURN json_build_object\('deleted', v_deleted_count\)/i);
+
+    expect(unifiedCheckBody).not.toMatch(/p_idle_timeout\s+INTEGER/i);
+    expect(unifiedCheckBody).not.toMatch(/p_last_active_table_name\s+TEXT/i);
+    expect(unifiedCheckBody).not.toMatch(/active_last_access_time\s+INTEGER/i);
+    expect(unifiedCheckBody).not.toMatch(/active_total_access_count\s+INTEGER/i);
+    expect(unifiedCheckBody).not.toMatch(/LAST_ACCESS_TIME/i);
+    expect(unifiedCheckBody).not.toMatch(/TOTAL_ACCESS_COUNT/i);
+  });
+});

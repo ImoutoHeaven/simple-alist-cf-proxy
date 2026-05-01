@@ -31,50 +31,167 @@ CREATE INDEX IF NOT EXISTS idx_download_cache_hostname
 
 
 -- ========================================
--- Download Last Active Table Schema
+-- Download Ticket State Table Schema
 -- ========================================
--- Purpose: Track last access time and usage count per IP/path pair
+-- Purpose: Track issuance, first use, and hard expiry per signed ticket
 -- Compatible with: PostgreSQL
 
-CREATE TABLE IF NOT EXISTS "DOWNLOAD_LAST_ACTIVE_TABLE" (
-  "IP_HASH" TEXT NOT NULL,
-  "PATH_HASH" TEXT NOT NULL,
-  "LAST_ACCESS_TIME" BIGINT NOT NULL,
-  "TOTAL_ACCESS_COUNT" INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY ("IP_HASH", "PATH_HASH")
+CREATE TABLE IF NOT EXISTS "DOWNLOAD_TICKET_STATE_TABLE" (
+  "TICKET_HASH" TEXT NOT NULL,
+  "ISSUED_AT" BIGINT NOT NULL,
+  "FIRST_USED_AT" BIGINT NULL,
+  "HARD_EXPIRE_AT" BIGINT NOT NULL,
+  "IP_HASH" TEXT NULL,
+  "PATH_HASH" TEXT NULL,
+  PRIMARY KEY ("TICKET_HASH")
 );
 
-CREATE INDEX IF NOT EXISTS idx_download_last_active_time
-  ON "DOWNLOAD_LAST_ACTIVE_TABLE"("LAST_ACCESS_TIME");
+CREATE INDEX IF NOT EXISTS idx_download_ticket_state_hard_expire
+  ON "DOWNLOAD_TICKET_STATE_TABLE"("HARD_EXPIRE_AT");
 
 
 -- ========================================
--- Stored Procedure: Upsert Download Last Active
+-- Stored Procedure: Seed Download Ticket State
 -- ========================================
-CREATE OR REPLACE FUNCTION download_update_last_active(
-  p_ip_hash TEXT,
-  p_path_hash TEXT,
-  p_last_access_time BIGINT,
-  p_table_name TEXT DEFAULT 'DOWNLOAD_LAST_ACTIVE_TABLE'
+CREATE OR REPLACE FUNCTION download_seed_ticket(
+  p_ticket_hash TEXT,
+  p_issued_at BIGINT,
+  p_hard_expire_at BIGINT,
+  p_ip_hash TEXT DEFAULT NULL,
+  p_path_hash TEXT DEFAULT NULL,
+  p_table_name TEXT DEFAULT 'DOWNLOAD_TICKET_STATE_TABLE'
 )
 RETURNS JSON AS $$
 DECLARE
   sql TEXT;
 BEGIN
   sql := format(
-    'INSERT INTO %1$I ("IP_HASH", "PATH_HASH", "LAST_ACCESS_TIME", "TOTAL_ACCESS_COUNT")
-     VALUES ($1, $2, $3, 1)
-     ON CONFLICT ("IP_HASH", "PATH_HASH") DO UPDATE SET
-       "LAST_ACCESS_TIME" = EXCLUDED."LAST_ACCESS_TIME",
-       "TOTAL_ACCESS_COUNT" = %1$I."TOTAL_ACCESS_COUNT" + 1',
+    'INSERT INTO %1$I ("TICKET_HASH", "ISSUED_AT", "FIRST_USED_AT", "HARD_EXPIRE_AT", "IP_HASH", "PATH_HASH")
+     VALUES ($1, $2, NULL, $3, $4, $5)',
     p_table_name
   );
 
-  EXECUTE sql USING p_ip_hash, p_path_hash, p_last_access_time;
-  RETURN json_build_object('success', true);
+  EXECUTE sql USING p_ticket_hash, p_issued_at, p_hard_expire_at, p_ip_hash, p_path_hash;
+  RETURN json_build_object('result', 'seeded');
+EXCEPTION
+  WHEN unique_violation THEN
+    RETURN json_build_object('result', 'collision');
+  WHEN others THEN
+    RETURN json_build_object('result', 'storage_error', 'error', SQLERRM);
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
+-- Stored Procedure: Read Download Ticket State
+-- ========================================
+CREATE OR REPLACE FUNCTION download_get_ticket_state(
+  p_ticket_hash TEXT,
+  p_table_name TEXT DEFAULT 'DOWNLOAD_TICKET_STATE_TABLE'
+)
+RETURNS TABLE(
+  found BOOLEAN,
+  ticket_hash TEXT,
+  issued_at BIGINT,
+  first_used_at BIGINT,
+  hard_expire_at BIGINT,
+  ip_hash TEXT,
+  path_hash TEXT
+) AS $$
+DECLARE
+  sql TEXT;
+  v_row_count INTEGER := 0;
+BEGIN
+  sql := format(
+    'SELECT TRUE::BOOLEAN AS found,
+            "TICKET_HASH",
+            "ISSUED_AT",
+            "FIRST_USED_AT",
+            "HARD_EXPIRE_AT",
+            "IP_HASH",
+            "PATH_HASH"
+       FROM %1$I
+      WHERE "TICKET_HASH" = $1
+      LIMIT 1',
+    p_table_name
+  );
+
+  RETURN QUERY EXECUTE sql USING p_ticket_hash;
+  GET DIAGNOSTICS v_row_count = ROW_COUNT;
+
+  IF v_row_count = 0 THEN
+    RETURN QUERY SELECT FALSE, NULL::TEXT, NULL::BIGINT, NULL::BIGINT, NULL::BIGINT, NULL::TEXT, NULL::TEXT;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
+-- Stored Procedure: Mark Download Ticket Used
+-- ========================================
+CREATE OR REPLACE FUNCTION download_mark_ticket_used(
+  p_ticket_hash TEXT,
+  p_now BIGINT,
+  p_table_name TEXT DEFAULT 'DOWNLOAD_TICKET_STATE_TABLE'
+)
+RETURNS JSON AS $$
+DECLARE
+  v_locked_first_used_at BIGINT;
+  v_effective_first_used_at BIGINT;
+  v_row_count INTEGER := 0;
+  sql_select TEXT;
+  sql_update TEXT;
+BEGIN
+  sql_select := format(
+    'SELECT "FIRST_USED_AT" FROM %1$I WHERE "TICKET_HASH" = $1 FOR UPDATE',
+    p_table_name
+  );
+  EXECUTE sql_select INTO v_locked_first_used_at USING p_ticket_hash;
+  GET DIAGNOSTICS v_row_count = ROW_COUNT;
+
+  IF v_row_count = 0 THEN
+    RETURN json_build_object('result', 'storage_error');
+  END IF;
+
+  sql_update := format(
+    'UPDATE %1$I
+        SET "FIRST_USED_AT" = COALESCE("FIRST_USED_AT", $2)
+      WHERE "TICKET_HASH" = $1
+      RETURNING "FIRST_USED_AT"',
+    p_table_name
+  );
+  EXECUTE sql_update INTO v_effective_first_used_at USING p_ticket_hash, p_now;
+  GET DIAGNOSTICS v_row_count = ROW_COUNT;
+
+  IF v_row_count = 0 OR v_effective_first_used_at IS NULL THEN
+    RETURN json_build_object('result', 'storage_error');
+  ELSIF v_locked_first_used_at IS NULL THEN
+    RETURN json_build_object('result', 'transitioned', 'first_used_at', v_effective_first_used_at);
+  ELSE
+    RETURN json_build_object('result', 'already_used', 'first_used_at', v_effective_first_used_at);
+  END IF;
 EXCEPTION
   WHEN others THEN
-    RETURN json_build_object('success', false, 'error', SQLERRM);
+    RETURN json_build_object('result', 'storage_error');
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
+-- Stored Procedure: Cleanup Expired Tickets
+-- ========================================
+CREATE OR REPLACE FUNCTION download_cleanup_expired_tickets(
+  p_now BIGINT,
+  p_table_name TEXT DEFAULT 'DOWNLOAD_TICKET_STATE_TABLE'
+)
+RETURNS JSON AS $$
+DECLARE
+  v_deleted_count INTEGER;
+BEGIN
+  EXECUTE format('DELETE FROM %1$I WHERE "HARD_EXPIRE_AT" < $1', p_table_name)
+    USING p_now;
+  GET DIAGNOSTICS v_deleted_count = ROW_COUNT;
+  RETURN json_build_object('deleted', v_deleted_count);
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1446,11 +1563,7 @@ CREATE OR REPLACE FUNCTION download_unified_check(
   p_throttle_hostname_hash TEXT,
 
   -- General parameters
-  p_now BIGINT DEFAULT NULL,
-
-  -- Last active parameters
-  p_idle_timeout INTEGER DEFAULT 0,
-  p_last_active_table_name TEXT DEFAULT 'DOWNLOAD_LAST_ACTIVE_TABLE'
+  p_now BIGINT DEFAULT NULL
 )
 RETURNS TABLE(
   -- Cache result
@@ -1469,11 +1582,7 @@ RETURNS TABLE(
   throttle_open_until INTEGER,
   throttle_reason TEXT,
   throttle_version BIGINT,
-  throttle_last_error_code INTEGER,
-
-  -- Last active result
-  active_last_access_time INTEGER,
-  active_total_access_count INTEGER
+  throttle_last_error_code INTEGER
 ) AS $$
 DECLARE
   v_now BIGINT;
@@ -1482,7 +1591,6 @@ DECLARE
   v_throttle_record RECORD;
   v_cache_hostname_hash TEXT;
   v_throttle_hostname_hash TEXT;
-  v_active_record RECORD;
 
   v_cache_link_data TEXT := NULL;
   v_cache_timestamp INTEGER := NULL;
@@ -1498,9 +1606,6 @@ DECLARE
   v_throttle_version BIGINT := NULL;
   v_throttle_last_error_code INTEGER := NULL;
   v_throttle_row_count INTEGER := 0;
-
-  v_active_last_access_time INTEGER := NULL;
-  v_active_total_access_count INTEGER := NULL;
   v_actual_path_hash TEXT := NULL;
 BEGIN
   v_now := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::BIGINT);
@@ -1574,16 +1679,6 @@ BEGIN
     v_throttle_last_error_code := NULL;
   END IF;
 
-  -- Step 4: Last active lookup
-  EXECUTE format('SELECT "LAST_ACCESS_TIME", "TOTAL_ACCESS_COUNT" FROM %1$I WHERE "IP_HASH" = $1 AND "PATH_HASH" = $2 LIMIT 1', p_last_active_table_name)
-    INTO v_active_record
-    USING p_ip_hash, v_actual_path_hash;
-
-  IF v_active_record."LAST_ACCESS_TIME" IS NOT NULL THEN
-    v_active_last_access_time := v_active_record."LAST_ACCESS_TIME";
-    v_active_total_access_count := v_active_record."TOTAL_ACCESS_COUNT";
-  END IF;
-
   RETURN QUERY SELECT
     v_cache_link_data,
     v_cache_timestamp,
@@ -1596,9 +1691,7 @@ BEGIN
     v_throttle_open_until,
     v_throttle_reason,
     v_throttle_version,
-    v_throttle_last_error_code,
-    v_active_last_access_time,
-    v_active_total_access_count;
+    v_throttle_last_error_code;
 END;
 $$ LANGUAGE plpgsql;
 -- ========================================

@@ -6,6 +6,7 @@ import { fetchControllerState } from '../src/controller-adapter.js';
 import { __fairQueueTestHooks } from '../src/worker.js';
 
 const { resolveConfig } = __fairQueueTestHooks;
+const { resolveTicketStateConfig, shouldConsumeTicketResponse } = __fairQueueTestHooks;
 
 const CURRENT_SCHEMA_EPOCH = 4;
 
@@ -189,6 +190,350 @@ test('resolveConfig still requires the canonical default throttleProfile when cu
     () => resolveConfig({}, bootstrap, { download: {} }),
     /Unknown throttleProfile/
   );
+});
+
+test('resolveConfig reads download.db.ticketStateTable and exposes ticketStateTableName', () => {
+  const bootstrap = buildBootstrap();
+  bootstrap.download.db = {
+    mode: 'custom-pg-rest',
+    postgrestUrl: 'https://postgrest.example.test',
+    verifyHeader: ['X-Verify'],
+    verifySecret: ['secret'],
+    cacheEnabled: false,
+    ticketStateTable: 'DOWNLOAD_TICKET_STATE_TABLE',
+  };
+
+  const config = resolveConfig({}, bootstrap, { download: {} });
+
+  assert.equal(config.cacheConfig.ticketStateTableName, 'DOWNLOAD_TICKET_STATE_TABLE');
+  assert.equal(config.ticketStateTableName, 'DOWNLOAD_TICKET_STATE_TABLE');
+  assert.equal(config.lastActiveTableName, undefined);
+  assert.equal(Object.hasOwn(config.cacheConfig, 'lastActiveTableName'), false);
+});
+
+test('ticket-state runtime config remains mandatory even when dbMode is not custom-pg-rest', () => {
+  const ticketStateConfig = {
+    postgrestUrl: 'https://postgrest.example.test',
+    verifyHeader: ['X-Verify'],
+    verifySecret: ['secret'],
+    ticketStateTableName: 'DOWNLOAD_TICKET_STATE_TABLE',
+  };
+
+  assert.deepEqual(
+    resolveTicketStateConfig({
+      dbMode: '',
+      cacheConfig: ticketStateConfig,
+    }),
+    ticketStateConfig,
+  );
+});
+
+test('resolveTicketStateConfig accepts real bootstrap output when db mode is empty', () => {
+  const bootstrap = buildBootstrap();
+  bootstrap.download.db = {
+    mode: '',
+    postgrestUrl: 'https://postgrest.example.test',
+    verifyHeader: ['X-Verify'],
+    verifySecret: ['secret'],
+    ticketStateTable: 'DOWNLOAD_TICKET_STATE_TABLE',
+  };
+
+  const config = resolveConfig({}, bootstrap, { download: {} });
+
+  assert.deepEqual(resolveTicketStateConfig(config), {
+    postgrestUrl: 'https://postgrest.example.test',
+    verifyHeader: ['X-Verify'],
+    verifySecret: ['secret'],
+    ticketStateTableName: 'DOWNLOAD_TICKET_STATE_TABLE',
+  });
+});
+
+test('ticket-state runtime config fails closed when PostgREST wiring is missing', () => {
+  assert.throws(
+    () => resolveTicketStateConfig({
+      dbMode: '',
+      cacheConfig: {
+        ticketStateTableName: 'DOWNLOAD_TICKET_STATE_TABLE',
+      },
+    }),
+    /ticket-state db configuration missing/i,
+  );
+});
+
+test('mark-used predicate ignores metadata-only JSON 200 responses', () => {
+  const response = new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      'content-type': 'application/json;charset=UTF-8',
+      'content-length': '12',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+    knownFileSize: 4096,
+  }), false);
+});
+
+test('mark-used predicate ignores metadata-only JSON 200 responses with synthetic attachment headers', () => {
+  const response = new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      'content-type': 'application/json;charset=UTF-8',
+      'content-length': '12',
+      'content-disposition': 'attachment; filename="metadata.json"',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+    syntheticContentDisposition: true,
+  }), false);
+});
+
+test('mark-used predicate accepts JSON file-content responses with upstream attachment headers without known file size', () => {
+  const response = new Response('{"records":[1,2,3]}', {
+    status: 200,
+    headers: {
+      'content-type': 'application/json;charset=UTF-8',
+      'content-length': '19',
+      'content-disposition': 'attachment; filename="download.json"',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+    syntheticContentDisposition: false,
+  }), true);
+});
+
+test('mark-used predicate consumes ambiguous text/html 200 responses even when they only expose body text', () => {
+  const response = new Response('<html><body>warning</body></html>', {
+    status: 200,
+    headers: {
+      'content-type': 'text/html;charset=UTF-8',
+      'content-length': '33',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+  }), true);
+});
+
+test('mark-used predicate consumes ambiguous text/plain 200 responses even when they only expose body text', () => {
+  const response = new Response('provider warning page', {
+    status: 200,
+    headers: {
+      'content-type': 'text/plain;charset=UTF-8',
+      'content-length': '21',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+  }), true);
+});
+
+test('mark-used predicate consumes synthetic text/plain attachment headers when the worker releases a user-facing textual download response', () => {
+  const response = new Response('provider warning page', {
+    status: 200,
+    headers: {
+      'content-type': 'text/plain;charset=UTF-8',
+      'content-disposition': 'attachment; filename="opaque.bin"',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+    requestPath: '/downloads/opaque',
+    syntheticContentDisposition: true,
+  }), true);
+});
+
+for (const syntheticTextAttachmentCase of [
+  {
+    label: 'text/plain',
+    body: 'provider warning page',
+    contentType: 'text/plain',
+  },
+  {
+    label: 'text/html',
+    body: '<html><body>warning</body></html>',
+    contentType: 'text/html',
+  },
+]) {
+  test(`mark-used predicate consumes synthetic ${syntheticTextAttachmentCase.label} attachment wrappers even with positive content-length`, () => {
+    const response = new Response(syntheticTextAttachmentCase.body, {
+      status: 200,
+      headers: {
+        'content-type': `${syntheticTextAttachmentCase.contentType};charset=UTF-8`,
+        'content-length': String(Buffer.byteLength(syntheticTextAttachmentCase.body)),
+        'content-disposition': 'attachment; filename="opaque.bin"',
+      },
+    });
+
+    assert.equal(shouldConsumeTicketResponse({
+      requestMethod: 'GET',
+      response,
+      requestPath: '/downloads/opaque',
+      syntheticContentDisposition: true,
+    }), true);
+  });
+}
+
+for (const textualPathCase of [
+  {
+    label: 'text/plain warning bodies on .txt request paths',
+    body: 'provider warning page',
+    contentType: 'text/plain',
+    requestPath: '/downloads/readme.txt',
+  },
+  {
+    label: 'text/html warning bodies on .html request paths',
+    body: '<html><body>warning</body></html>',
+    contentType: 'text/html',
+    requestPath: '/downloads/index.html',
+  },
+]) {
+  test(`mark-used predicate consumes ${textualPathCase.label} without upstream file signals`, () => {
+    const response = new Response(textualPathCase.body, {
+      status: 200,
+      headers: {
+        'content-type': `${textualPathCase.contentType};charset=UTF-8`,
+      },
+    });
+
+    assert.equal(shouldConsumeTicketResponse({
+      requestMethod: 'GET',
+      response,
+      requestPath: textualPathCase.requestPath,
+    }), true);
+  });
+}
+
+for (const cryptedTextAttachmentCase of [
+  {
+    label: 'text/plain',
+    body: 'timestamp,value\n2026-05-01,42\n',
+    contentType: 'text/plain',
+  },
+  {
+    label: 'text/html',
+    body: '<html><body>csv export body</body></html>',
+    contentType: 'text/html',
+  },
+]) {
+  test(`mark-used predicate accepts crypted opaque ${cryptedTextAttachmentCase.label} attachments when the upstream response proves file content`, () => {
+    const upstreamResponse = new Response(cryptedTextAttachmentCase.body, {
+      status: 200,
+      headers: {
+        'content-type': `${cryptedTextAttachmentCase.contentType};charset=UTF-8`,
+        'content-disposition': 'attachment; filename="report.csv"',
+      },
+    });
+    const response = new Response(cryptedTextAttachmentCase.body, {
+      status: 200,
+      headers: {
+        'content-type': `${cryptedTextAttachmentCase.contentType};charset=UTF-8`,
+        'content-disposition': 'attachment; filename="report.csv.enc"',
+      },
+    });
+
+    assert.equal(shouldConsumeTicketResponse({
+      requestMethod: 'GET',
+      response,
+      upstreamResponse,
+      requestPath: '/downloads/opaque',
+      syntheticContentDisposition: true,
+    }), true);
+  });
+}
+
+test('mark-used predicate accepts chunked text/plain attachment responses with opaque request paths', () => {
+  const response = new Response('timestamp,value\n2026-05-01,42\n', {
+    status: 200,
+    headers: {
+      'content-type': 'text/plain;charset=UTF-8',
+      'content-disposition': 'attachment; filename="report.csv"',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+    requestPath: '/downloads/opaque',
+    syntheticContentDisposition: false,
+  }), true);
+});
+
+test('mark-used predicate accepts chunked text/html attachment responses with opaque request paths', () => {
+  const response = new Response('<html><body>csv export body</body></html>', {
+    status: 200,
+    headers: {
+      'content-type': 'text/html;charset=UTF-8',
+      'content-disposition': 'attachment; filename="report.csv"',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+    requestPath: '/downloads/opaque',
+    syntheticContentDisposition: false,
+  }), true);
+});
+
+test('mark-used predicate accepts actual file-content responses', () => {
+  const response = new Response('abc', {
+    status: 206,
+    headers: {
+      'content-range': 'bytes 0-2/3',
+      'content-length': '3',
+      'accept-ranges': 'bytes',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+    knownFileSize: 3,
+  }), true);
+});
+
+test('mark-used predicate accepts ordinary binary 200 file responses', () => {
+  const response = new Response('file-bytes', {
+    status: 200,
+    headers: {
+      'content-type': 'application/octet-stream',
+      'content-length': '10',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+  }), true);
+});
+
+test('mark-used predicate accepts streamed binary 200 responses without content-length hints', () => {
+  const response = new Response('stream-body', {
+    status: 200,
+    headers: {
+      'content-type': 'application/octet-stream',
+    },
+  });
+
+  assert.equal(shouldConsumeTicketResponse({
+    requestMethod: 'GET',
+    response,
+  }), true);
 });
 
 test('resolveConfig skips implicit default throttleProfile validation when decision omits the selector', () => {

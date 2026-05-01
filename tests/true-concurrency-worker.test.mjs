@@ -30,6 +30,106 @@ const encodeSignatureBase64Url = (input) => Buffer.from(input)
   .replace(/\+/g, '-')
   .replace(/\//g, '_');
 
+const DEFAULT_IDLE_TIMEOUT_SECONDS = 300;
+const TICKET_STATE_READ_URL = 'https://postgrest.example.test/rpc/download_get_ticket_state';
+const TICKET_STATE_MARK_URL = 'https://postgrest.example.test/rpc/download_mark_ticket_used';
+const TICKET_STATE_CLEANUP_URL = 'https://postgrest.example.test/rpc/download_cleanup_expired_tickets';
+
+const decodeSignedRequestPayload = (request) => {
+  const payload = new URL(request.url).searchParams.get('payload');
+  assert.ok(payload, 'signed request is missing payload');
+  return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+};
+
+const assertSignedRequestPayloadContract = (request) => {
+  const payloadJson = decodeSignedRequestPayload(request);
+  assert.equal(typeof payloadJson.ticketNonce, 'string');
+  assert.equal(Number.isInteger(payloadJson.idle_timeout), true);
+  assert.match(payloadJson.ticketNonce, /^[A-Za-z0-9_-]{22,}$/);
+};
+
+const createTicketNonce = () => encodeBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+
+const ticketStateRpcState = {
+  cleanupBodies: [],
+  cleanupHandler: null,
+  markBodies: [],
+  markHandler: null,
+  readBodies: [],
+  readHandler: null,
+};
+
+const resetTicketStateRpcState = () => {
+  ticketStateRpcState.cleanupBodies = [];
+  ticketStateRpcState.cleanupHandler = null;
+  ticketStateRpcState.markBodies = [];
+  ticketStateRpcState.markHandler = null;
+  ticketStateRpcState.readBodies = [];
+  ticketStateRpcState.readHandler = null;
+};
+
+const createDefaultTicketStateRow = (body, overrides = {}) => {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  return {
+    found: true,
+    ticket_hash: body?.p_ticket_hash ?? null,
+    issued_at: nowSeconds,
+    first_used_at: null,
+    hard_expire_at: nowSeconds + 600,
+    ip_hash: null,
+    path_hash: null,
+    ...overrides,
+  };
+};
+
+const respondWithJson = (payload, init = {}) => createJsonResponse(payload, init);
+
+const handleTicketStateRpc = async (url, init = {}) => {
+  if (url === TICKET_STATE_READ_URL) {
+    const body = JSON.parse(init.body);
+    ticketStateRpcState.readBodies.push(body);
+    if (typeof ticketStateRpcState.readHandler === 'function') {
+      const response = await ticketStateRpcState.readHandler(body, init);
+      if (response instanceof Response) {
+        return response;
+      }
+      return respondWithJson(Array.isArray(response) ? response : [response]);
+    }
+    return respondWithJson([createDefaultTicketStateRow(body)]);
+  }
+
+  if (url === TICKET_STATE_MARK_URL) {
+    const body = JSON.parse(init.body);
+    ticketStateRpcState.markBodies.push(body);
+    if (typeof ticketStateRpcState.markHandler === 'function') {
+      const response = await ticketStateRpcState.markHandler(body, init);
+      if (response instanceof Response) {
+        return response;
+      }
+      return respondWithJson(response);
+    }
+    return respondWithJson({
+      result: 'transitioned',
+      first_used_at: body?.p_now ?? Math.floor(Date.now() / 1000),
+    });
+  }
+
+  if (url === TICKET_STATE_CLEANUP_URL) {
+    const body = JSON.parse(init.body);
+    ticketStateRpcState.cleanupBodies.push(body);
+    if (typeof ticketStateRpcState.cleanupHandler === 'function') {
+      const response = await ticketStateRpcState.cleanupHandler(body, init);
+      if (response instanceof Response) {
+        return response;
+      }
+      return respondWithJson(response);
+    }
+    return respondWithJson({ deleted: 0 });
+  }
+
+  return null;
+};
+
 const signPayload = async (payload, expire, token) => {
   const key = await crypto.subtle.importKey(
     'raw',
@@ -136,10 +236,14 @@ const buildWorkerEnv = () => ({
 const buildSignedWorkerRequest = async ({
   pathname = '/downloads/task-group-4.bin',
   expireOffsetSeconds = 300,
+  idleTimeoutSeconds = DEFAULT_IDLE_TIMEOUT_SECONDS,
+  omitTicketNonce = false,
   payloadExpireTime = null,
   payloadSignExpire = null,
   payloadFileSize = undefined,
+  payloadMutator = null,
   signal = undefined,
+  ticketNonce = createTicketNonce(),
 } = {}) => {
   const token = 'bootstrap-token';
   const expire = payloadSignExpire ?? (Math.floor(Date.now() / 1000) + expireOffsetSeconds);
@@ -148,12 +252,18 @@ const buildSignedWorkerRequest = async ({
     issuer: 'https://landing.example.com',
     workerAddress: 'https://worker.example.com',
   }, token);
-  const payload = encodeBase64Url(JSON.stringify({
+  const payloadObject = {
     v: 1,
     expireTime: payloadExpireTime ?? expire,
+    idle_timeout: idleTimeoutSeconds,
+    ...(omitTicketNonce ? {} : { ticketNonce }),
     encrypt: encryptedBinding,
     ...(payloadFileSize !== undefined ? { filesize: payloadFileSize } : {}),
-  }));
+  };
+  const finalPayloadObject = typeof payloadMutator === 'function'
+    ? payloadMutator(structuredClone(payloadObject))
+    : payloadObject;
+  const payload = encodeBase64Url(JSON.stringify(finalPayloadObject));
   const payloadSign = await signPayload(payload, expire, token);
   const url = new URL(pathname, 'https://worker.example.com');
   url.searchParams.set('payload', payload);
@@ -168,6 +278,10 @@ const buildSignedWorkerRequest = async ({
 };
 
 const readJson = async (response) => JSON.parse(await response.text());
+
+test('signed worker request fixtures include ticketNonce and idle_timeout', async () => {
+  assertSignedRequestPayloadContract(await buildSignedWorkerRequest());
+});
 
 const createClaimGrantResponseFromRequest = (init) => {
   const body = JSON.parse(init.body);
@@ -204,6 +318,10 @@ const setAckHandoffMock = (handler = null) => {
 
 const fetchWithDefaultAckHandoff = async (input, init = {}) => {
   const url = typeof input === 'string' ? input : input.url;
+  const ticketStateResponse = await handleTicketStateRpc(url, init);
+  if (ticketStateResponse) {
+    return ticketStateResponse;
+  }
   if (url === ACK_HANDOFF_URL) {
     if (ackHandoffMock) {
       return ackHandoffMock(input, init);
@@ -234,6 +352,7 @@ Object.defineProperty(globalThis, 'fetch', {
   },
   set(value) {
     ackHandoffMock = null;
+    resetTicketStateRpcState();
     if (value === fetchWithDefaultAckHandoff) {
       delegatedFetch = wrappedFetchBound;
       return;
@@ -3442,6 +3561,899 @@ test('non-positive payloadSign expiry is rejected before admission handlers run'
   }
 });
 
+test('unused ticket is denied when issued_at plus idle_timeout is exceeded', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    calls.push(url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      throw new Error('origin fetch should not run after idle expiry');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+  ticketStateRpcState.readHandler = (body) => createDefaultTicketStateRow(body, {
+    issued_at: Math.floor(Date.now() / 1000) - (DEFAULT_IDLE_TIMEOUT_SECONDS + 1),
+    first_used_at: null,
+  });
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest({ idleTimeoutSeconds: DEFAULT_IDLE_TIMEOUT_SECONDS }),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+    const body = await readJson(response);
+
+    assert.equal(response.status, 410);
+    assert.equal(body.message, 'Link expired due to inactivity');
+    assert.equal(ticketStateRpcState.readBodies.length, 1);
+    assert.equal(ticketStateRpcState.markBodies.length, 0);
+    assert.equal(calls.includes('https://tenant.sharepoint.com/file'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('used ticket skips idle denial and relies on hard expiry only', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+  const firstUsedAt = Math.floor(Date.now() / 1000) - 1800;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      originCalls.push(url);
+      return new Response('used-ticket-ok', {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '14',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+  ticketStateRpcState.readHandler = (body) => createDefaultTicketStateRow(body, {
+    issued_at: Math.floor(Date.now() / 1000) - 3600,
+    first_used_at: firstUsedAt,
+  });
+  ticketStateRpcState.markHandler = () => ({
+    result: 'already_used',
+    first_used_at: firstUsedAt,
+  });
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest({ idleTimeoutSeconds: 0 }),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'used-ticket-ok');
+    assert.deepEqual(originCalls, ['https://tenant.sharepoint.com/file']);
+    assert.equal(ticketStateRpcState.readBodies.length, 1);
+    assert.equal(ticketStateRpcState.markBodies.length, 1);
+    assert.equal(
+      ticketStateRpcState.markBodies[0].p_ticket_hash,
+      ticketStateRpcState.readBodies[0].p_ticket_hash,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('streamed 200 content without content-length still marks the ticket used before returning content', async () => {
+  const originalFetch = globalThis.fetch;
+  const originCalls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      originCalls.push(url);
+      return new Response('streamed-content', {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'streamed-content');
+    assert.deepEqual(originCalls, ['https://tenant.sharepoint.com/file']);
+    assert.equal(ticketStateRpcState.readBodies.length, 1);
+    assert.equal(ticketStateRpcState.markBodies.length, 1);
+    assert.equal(
+      ticketStateRpcState.markBodies[0].p_ticket_hash,
+      ticketStateRpcState.readBodies[0].p_ticket_hash,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+for (const interstitialCase of [
+  {
+    label: 'text/html',
+    body: '<html><body>warning</body></html>',
+    contentType: 'text/html',
+  },
+  {
+    label: 'text/plain',
+    body: 'provider warning page',
+    contentType: 'text/plain',
+  },
+]) {
+  test(`GET 200 ${interstitialCase.label} interstitials still mark the ticket used before returning the response`, async () => {
+    const originalFetch = globalThis.fetch;
+    const originCalls = [];
+
+    globalThis.fetch = async (input, init = {}) => {
+      const url = typeof input === 'string' ? input : input.url;
+
+      if (url === 'https://controller.example.test/api/v0/bootstrap') {
+        return createJsonResponse(buildRuntimeBootstrap());
+      }
+
+      if (url === 'https://alist.example.com/api/fs/link') {
+        return createJsonResponse({
+          code: 200,
+          data: {
+            url: 'https://tenant.sharepoint.com/file',
+            header: {},
+          },
+        });
+      }
+
+      if (url === 'https://tenant.sharepoint.com/file') {
+        originCalls.push(url);
+        return new Response(interstitialCase.body, {
+          status: 200,
+          headers: {
+            'content-type': `${interstitialCase.contentType};charset=UTF-8`,
+            'content-length': String(Buffer.byteLength(interstitialCase.body)),
+          },
+        });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url}`);
+    };
+
+    try {
+      const response = await worker.fetch(
+        await buildSignedWorkerRequest(),
+        buildWorkerEnv(),
+        createTestContext().ctx,
+      );
+
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), interstitialCase.body);
+      assert.deepEqual(originCalls, ['https://tenant.sharepoint.com/file']);
+      assert.equal(ticketStateRpcState.readBodies.length, 1);
+      assert.equal(ticketStateRpcState.markBodies.length, 1);
+      assert.equal(
+        ticketStateRpcState.markBodies[0].p_ticket_hash,
+        ticketStateRpcState.readBodies[0].p_ticket_hash,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete globalThis.bootstrapCache;
+    }
+  });
+}
+
+for (const syntheticTextAttachmentCase of [
+  {
+    label: 'text/html',
+    body: '<html><body>warning</body></html>',
+    contentType: 'text/html',
+  },
+  {
+    label: 'text/plain',
+    body: 'provider warning page',
+    contentType: 'text/plain',
+  },
+]) {
+  test(`crypted GET 200 ${syntheticTextAttachmentCase.label} wrappers with positive content-length still mark the ticket used`, async () => {
+    const originalFetch = globalThis.fetch;
+    const originCalls = [];
+
+    globalThis.fetch = async (input, init = {}) => {
+      const url = typeof input === 'string' ? input : input.url;
+
+      if (url === 'https://controller.example.test/api/v0/bootstrap') {
+        return createJsonResponse(buildRuntimeBootstrap());
+      }
+
+      if (url === 'https://alist.example.com/api/fs/link') {
+        return createJsonResponse({
+          code: 200,
+          data: {
+            url: 'https://tenant.sharepoint.com/file',
+            header: {},
+          },
+        });
+      }
+
+      if (url === 'https://tenant.sharepoint.com/file') {
+        originCalls.push(url);
+        return new Response(syntheticTextAttachmentCase.body, {
+          status: 200,
+          headers: {
+            'content-type': `${syntheticTextAttachmentCase.contentType};charset=UTF-8`,
+            'content-length': String(Buffer.byteLength(syntheticTextAttachmentCase.body)),
+          },
+        });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url}`);
+    };
+
+    try {
+      resetTicketStateRpcState();
+
+      const response = await worker.fetch(
+        await buildSignedWorkerRequest({
+          pathname: '/downloads/opaque',
+          payloadMutator: (payloadObject) => ({
+            ...payloadObject,
+            isCrypted: true,
+          }),
+        }),
+        buildWorkerEnv(),
+        createTestContext().ctx,
+      );
+
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), syntheticTextAttachmentCase.body);
+      assert.deepEqual(originCalls, ['https://tenant.sharepoint.com/file']);
+      assert.match(response.headers.get('content-disposition') || '', /^attachment;/i);
+      assert.equal(response.headers.get('content-length'), String(Buffer.byteLength(syntheticTextAttachmentCase.body)));
+      assert.equal(ticketStateRpcState.readBodies.length, 1);
+      assert.equal(ticketStateRpcState.markBodies.length, 1);
+      assert.equal(
+        ticketStateRpcState.markBodies[0].p_ticket_hash,
+        ticketStateRpcState.readBodies[0].p_ticket_hash,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete globalThis.bootstrapCache;
+    }
+  });
+}
+
+for (const textualPathCase of [
+  {
+    label: 'text/plain warning body on .txt request path',
+    body: 'provider warning page',
+    contentType: 'text/plain',
+    pathname: '/downloads/readme.txt',
+  },
+  {
+    label: 'text/html warning body on .html request path',
+    body: '<html><body>warning</body></html>',
+    contentType: 'text/html',
+    pathname: '/downloads/index.html',
+  },
+]) {
+  test(`GET 200 streamed ${textualPathCase.label} still marks the ticket used`, async () => {
+    const originalFetch = globalThis.fetch;
+    const originCalls = [];
+
+    globalThis.fetch = async (input, init = {}) => {
+      const url = typeof input === 'string' ? input : input.url;
+
+      if (url === 'https://controller.example.test/api/v0/bootstrap') {
+        return createJsonResponse(buildRuntimeBootstrap());
+      }
+
+      if (url === 'https://alist.example.com/api/fs/link') {
+        return createJsonResponse({
+          code: 200,
+          data: {
+            url: 'https://tenant.sharepoint.com/file',
+            header: {},
+          },
+        });
+      }
+
+      if (url === 'https://tenant.sharepoint.com/file') {
+        originCalls.push(url);
+        return new Response(textualPathCase.body, {
+          status: 200,
+          headers: {
+            'content-type': `${textualPathCase.contentType};charset=UTF-8`,
+          },
+        });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url}`);
+    };
+
+    try {
+      resetTicketStateRpcState();
+
+      const response = await worker.fetch(
+        await buildSignedWorkerRequest({ pathname: textualPathCase.pathname }),
+        buildWorkerEnv(),
+        createTestContext().ctx,
+      );
+
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), textualPathCase.body);
+      assert.deepEqual(originCalls, ['https://tenant.sharepoint.com/file']);
+      assert.equal(ticketStateRpcState.readBodies.length, 1);
+      assert.equal(ticketStateRpcState.markBodies.length, 1);
+      assert.equal(
+        ticketStateRpcState.markBodies[0].p_ticket_hash,
+        ticketStateRpcState.readBodies[0].p_ticket_hash,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete globalThis.bootstrapCache;
+    }
+  });
+}
+
+for (const cryptedTextAttachmentCase of [
+  {
+    label: 'text/plain attachment-signaled csv',
+    body: 'timestamp,value\n2026-05-01,42\n',
+    contentType: 'text/plain',
+  },
+  {
+    label: 'text/html attachment-signaled csv',
+    body: '<html><body>csv export body</body></html>',
+    contentType: 'text/html',
+  },
+]) {
+  test(`crypted GET 200 ${cryptedTextAttachmentCase.label} responses mark the ticket used for opaque paths when upstream attachment proves file content`, async () => {
+    const originalFetch = globalThis.fetch;
+    const originCalls = [];
+
+    globalThis.fetch = async (input, init = {}) => {
+      const url = typeof input === 'string' ? input : input.url;
+
+      if (url === 'https://controller.example.test/api/v0/bootstrap') {
+        return createJsonResponse(buildRuntimeBootstrap());
+      }
+
+      if (url === 'https://alist.example.com/api/fs/link') {
+        return createJsonResponse({
+          code: 200,
+          data: {
+            url: 'https://tenant.sharepoint.com/file',
+            header: {},
+          },
+        });
+      }
+
+      if (url === 'https://tenant.sharepoint.com/file') {
+        originCalls.push(url);
+        return new Response(cryptedTextAttachmentCase.body, {
+          status: 200,
+          headers: {
+            'content-type': `${cryptedTextAttachmentCase.contentType};charset=UTF-8`,
+            'content-disposition': 'attachment; filename="report.csv"',
+          },
+        });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url}`);
+    };
+
+    try {
+      resetTicketStateRpcState();
+
+      const response = await worker.fetch(
+        await buildSignedWorkerRequest({
+          pathname: '/downloads/opaque',
+          payloadMutator: (payloadObject) => ({
+            ...payloadObject,
+            isCrypted: true,
+          }),
+        }),
+        buildWorkerEnv(),
+        createTestContext().ctx,
+      );
+
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), cryptedTextAttachmentCase.body);
+      assert.deepEqual(originCalls, ['https://tenant.sharepoint.com/file']);
+      assert.match(response.headers.get('content-disposition') || '', /^attachment;/i);
+      assert.equal(ticketStateRpcState.readBodies.length, 1);
+      assert.equal(ticketStateRpcState.markBodies.length, 1);
+      assert.equal(
+        ticketStateRpcState.markBodies[0].p_ticket_hash,
+        ticketStateRpcState.readBodies[0].p_ticket_hash,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete globalThis.bootstrapCache;
+    }
+  });
+}
+
+for (const attachmentTextCase of [
+  {
+    label: 'text/plain attachment-signaled csv',
+    body: 'timestamp,value\n2026-05-01,42\n',
+    contentType: 'text/plain',
+    contentDisposition: 'attachment; filename="report.csv"',
+  },
+  {
+    label: 'text/html attachment-signaled csv',
+    body: '<html><body>csv export body</body></html>',
+    contentType: 'text/html',
+    contentDisposition: 'attachment; filename="report.csv"',
+  },
+]) {
+  test(`GET 200 chunked ${attachmentTextCase.label} responses mark the ticket used for opaque paths`, async () => {
+    const originalFetch = globalThis.fetch;
+    const originCalls = [];
+
+    globalThis.fetch = async (input, init = {}) => {
+      const url = typeof input === 'string' ? input : input.url;
+
+      if (url === 'https://controller.example.test/api/v0/bootstrap') {
+        return createJsonResponse(buildRuntimeBootstrap());
+      }
+
+      if (url === 'https://alist.example.com/api/fs/link') {
+        return createJsonResponse({
+          code: 200,
+          data: {
+            url: 'https://tenant.sharepoint.com/file',
+            header: {},
+          },
+        });
+      }
+
+      if (url === 'https://tenant.sharepoint.com/file') {
+        originCalls.push(url);
+        return new Response(attachmentTextCase.body, {
+          status: 200,
+          headers: {
+            'content-type': `${attachmentTextCase.contentType};charset=UTF-8`,
+            'content-disposition': attachmentTextCase.contentDisposition,
+          },
+        });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url}`);
+    };
+
+    try {
+      resetTicketStateRpcState();
+
+      const response = await worker.fetch(
+        await buildSignedWorkerRequest({ pathname: '/downloads/opaque' }),
+        buildWorkerEnv(),
+        createTestContext().ctx,
+      );
+
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), attachmentTextCase.body);
+      assert.deepEqual(originCalls, ['https://tenant.sharepoint.com/file']);
+      assert.equal(ticketStateRpcState.readBodies.length, 1);
+      assert.equal(ticketStateRpcState.markBodies.length, 1);
+      assert.equal(
+        ticketStateRpcState.markBodies[0].p_ticket_hash,
+        ticketStateRpcState.readBodies[0].p_ticket_hash,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete globalThis.bootstrapCache;
+    }
+  });
+}
+
+test('numeric-ish signed payload expireTime and idle_timeout fields are rejected before ticket-state read', async () => {
+  const cases = [
+    {
+      label: 'expireTime string',
+      expectedMessage: 'payload expire invalid',
+      buildRequest: () => buildSignedWorkerRequest({
+        payloadMutator: (payloadObject) => ({
+          ...payloadObject,
+          expireTime: String(payloadObject.expireTime),
+        }),
+      }),
+    },
+    {
+      label: 'expireTime fractional number',
+      expectedMessage: 'payload expire invalid',
+      buildRequest: () => buildSignedWorkerRequest({
+        payloadMutator: (payloadObject) => ({
+          ...payloadObject,
+          expireTime: payloadObject.expireTime + 0.5,
+        }),
+      }),
+    },
+    {
+      label: 'idle_timeout string',
+      expectedMessage: 'payload idle_timeout invalid',
+      buildRequest: () => buildSignedWorkerRequest({
+        payloadMutator: (payloadObject) => ({
+          ...payloadObject,
+          idle_timeout: String(payloadObject.idle_timeout),
+        }),
+      }),
+    },
+    {
+      label: 'idle_timeout boolean',
+      expectedMessage: 'payload idle_timeout invalid',
+      buildRequest: () => buildSignedWorkerRequest({
+        payloadMutator: (payloadObject) => ({
+          ...payloadObject,
+          idle_timeout: true,
+        }),
+      }),
+    },
+  ];
+
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    calls.push(url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      throw new Error('origin fetch should not run for malformed signed numeric fields');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    for (const testCase of cases) {
+      resetTicketStateRpcState();
+      calls.length = 0;
+      delete globalThis.bootstrapCache;
+
+      const response = await worker.fetch(
+        await testCase.buildRequest(),
+        buildWorkerEnv(),
+        createTestContext().ctx,
+      );
+      const body = await readJson(response);
+
+      assert.equal(response.status, 401, testCase.label);
+      assert.equal(body.message, testCase.expectedMessage, testCase.label);
+      assert.equal(ticketStateRpcState.readBodies.length, 0, testCase.label);
+      assert.equal(ticketStateRpcState.markBodies.length, 0, testCase.label);
+      assert.equal(calls.includes('https://tenant.sharepoint.com/file'), false, testCase.label);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('missing ticket-state row is rejected as unauthorized protocol mismatch', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    calls.push(url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      throw new Error('origin fetch should not run when ticket state is missing');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+  ticketStateRpcState.readHandler = () => ({
+    found: false,
+    ticket_hash: null,
+    issued_at: null,
+    first_used_at: null,
+    hard_expire_at: null,
+    ip_hash: null,
+    path_hash: null,
+  });
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+    const body = await readJson(response);
+
+    assert.equal(response.status, 401);
+    assert.equal(body.message, 'ticket state missing');
+    assert.equal(ticketStateRpcState.readBodies.length, 1);
+    assert.equal(ticketStateRpcState.markBodies.length, 0);
+    assert.equal(calls.includes('https://tenant.sharepoint.com/file'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('missing or malformed ticketNonce is rejected before ticket-state read', async () => {
+  const cases = [
+    {
+      label: 'missing',
+      buildRequest: () => buildSignedWorkerRequest({ omitTicketNonce: true }),
+    },
+    {
+      label: 'malformed',
+      buildRequest: () => buildSignedWorkerRequest({
+        payloadMutator: (payloadObject) => ({
+          ...payloadObject,
+          ticketNonce: 'not-valid-$$',
+        }),
+      }),
+    },
+  ];
+
+  for (const testCase of cases) {
+    const originalFetch = globalThis.fetch;
+    const calls = [];
+
+    globalThis.fetch = async (input, init = {}) => {
+      const url = typeof input === 'string' ? input : input.url;
+      calls.push(url);
+
+      if (url === 'https://controller.example.test/api/v0/bootstrap') {
+        return createJsonResponse(buildRuntimeBootstrap());
+      }
+
+      if (url === 'https://alist.example.com/api/fs/link') {
+        return createJsonResponse({
+          code: 200,
+          data: {
+            url: 'https://tenant.sharepoint.com/file',
+            header: {},
+          },
+        });
+      }
+
+      if (url === 'https://tenant.sharepoint.com/file') {
+        throw new Error(`origin fetch should not run for ${testCase.label} ticketNonce`);
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url}`);
+    };
+
+    try {
+      const response = await worker.fetch(
+        await testCase.buildRequest(),
+        buildWorkerEnv(),
+        createTestContext().ctx,
+      );
+      const body = await readJson(response);
+
+      assert.equal(response.status, 401);
+      assert.equal(body.message, 'payload ticketNonce invalid');
+      assert.equal(ticketStateRpcState.readBodies.length, 0);
+      assert.equal(ticketStateRpcState.markBodies.length, 0);
+      assert.equal(calls.includes('https://tenant.sharepoint.com/file'), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete globalThis.bootstrapCache;
+    }
+  }
+});
+
+test('concurrent content responses treat already_used as success', async () => {
+  const originalFetch = globalThis.fetch;
+  let markResultCount = 0;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response('concurrent-ok', {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '13',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+  ticketStateRpcState.readHandler = (body) => createDefaultTicketStateRow(body, {
+    issued_at: Math.floor(Date.now() / 1000),
+    first_used_at: null,
+  });
+  ticketStateRpcState.markHandler = () => {
+    markResultCount += 1;
+    return {
+      result: markResultCount === 1 ? 'transitioned' : 'already_used',
+      first_used_at: Math.floor(Date.now() / 1000),
+    };
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest();
+    const { ctx: ctx1 } = createTestContext();
+    const { ctx: ctx2 } = createTestContext();
+    const [responseA, responseB] = await Promise.all([
+      worker.fetch(new Request(baseRequest), buildWorkerEnv(), ctx1),
+      worker.fetch(new Request(baseRequest), buildWorkerEnv(), ctx2),
+    ]);
+
+    assert.equal(responseA.status, 200);
+    assert.equal(responseB.status, 200);
+    assert.equal(await responseA.text(), 'concurrent-ok');
+    assert.equal(await responseB.text(), 'concurrent-ok');
+    assert.equal(ticketStateRpcState.readBodies.length, 2);
+    assert.equal(ticketStateRpcState.markBodies.length, 2);
+    assert.equal(
+      ticketStateRpcState.markBodies[0].p_ticket_hash,
+      ticketStateRpcState.markBodies[1].p_ticket_hash,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('content response fails when mark ticket used returns storage_error', async () => {
+  const originalFetch = globalThis.fetch;
+  const originBody = createTrackedTextBody('should-not-be-released');
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response(originBody.stream, {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '19',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+  ticketStateRpcState.markHandler = () => ({ result: 'storage_error' });
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+    const body = await readJson(response);
+
+    assert.equal(response.status, 502);
+    assert.equal(body.message, 'ticket state update failed');
+    assert.equal(ticketStateRpcState.markBodies.length, 1);
+    assert.equal(originBody.cancelled, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('fairqueue-only same-target redirect retires old state and reacquires a new slot', async () => {
   const originalFetch = globalThis.fetch;
   const fairQueueAcquireBodies = [];
@@ -5423,7 +6435,7 @@ test('queue_only wait hard expiry cancels CQ request after unused fairqueue rele
   }
 });
 
-test('Google Drive HEAD requests use GET range probe and expose resumable headers', async () => {
+test('Google Drive HEAD requests use GET range probe, expose resumable headers, and do not mark the ticket used', async () => {
   const originalFetch = globalThis.fetch;
   const originCalls = [];
   const originUrls = new Set([
@@ -5489,6 +6501,7 @@ test('Google Drive HEAD requests use GET range probe and expose resumable header
       { method: 'GET', range: 'bytes=0-0' },
       { method: 'GET', range: 'bytes=0-0' },
     ]);
+    assert.equal(ticketStateRpcState.markBodies.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -5887,7 +6900,7 @@ test('generic Worker-created responses strip invalid content-length and transfer
   }
 });
 
-test('Google Drive GET downloads prefer payload filesize for full-range translation and expose accept-ranges on rewritten 200 responses', async () => {
+test('Google Drive GET downloads prefer payload filesize for full-range translation, expose accept-ranges, and mark the ticket used before returning content', async () => {
   const originalFetch = globalThis.fetch;
   const originCalls = [];
 
@@ -5939,6 +6952,12 @@ test('Google Drive GET downloads prefer payload filesize for full-range translat
     assert.equal(response.headers.get('content-type'), 'application/octet-stream');
     assert.equal(await response.text(), 'download-body');
     assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
+    assert.equal(ticketStateRpcState.readBodies.length, 1);
+    assert.equal(ticketStateRpcState.markBodies.length, 1);
+    assert.equal(
+      ticketStateRpcState.markBodies[0].p_ticket_hash,
+      ticketStateRpcState.readBodies[0].p_ticket_hash,
+    );
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
