@@ -56,8 +56,9 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 - `download.address`
 - `download.auth.ipv4Only`：IPv4-only 开关
 - `download.overrideCacheControl` / `download.cacheOverrideTime` / `download.cacheOverrideMaxSize`
-- `download.db.mode` 仅支持 `""` 或 `custom-pg-rest`
-- `download.db.*`：PostgREST 地址、校验 header/secret、缓存表/ticket-state 表、TTL/idle 等
+- `download.db.mode` 仅支持 `""` 或 `custom-pg-rest`：`custom-pg-rest` 为 ticket state 全量启用模式，`""` 为完整禁用模式
+- `download.db.*`：PostgREST 地址、校验 header/secret、缓存表/ticket-state 表、TTL 等；仅 `custom-pg-rest` 模式需要完整 ticket-state wiring
+- `download.db.idleTimeoutSeconds` 不是合法的 controller bootstrap 字段；出现即拒绝
 - `download.db.rateLimit.*`：窗口、限额、block 时间、`pgErrorHandle` 等
 - `download.throttleProfiles.<name>`：只定义 breaker profile；controller/bootstrap breaker 字段集合保持不变，固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`closeThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`、`protectHttpCodes`
 - worker 在解析 bootstrap 时会校验 `halfOpenSuccessThreshold <= halfOpenMaxProbeCount`，并拒绝 `halfOpenMaxProbeCount > 63`，因为 SQL 用 signed `BIGINT` mask 记录 half-open 当前批次 ticket 状态；`halfOpenTimeoutMode` 继续决定 half-open timeout 后的终态
@@ -101,7 +102,7 @@ admission 固定为四种显式运行模式：
 
 4. **payload/payloadSign 校验**
     - 校验 `payloadSign`（HMAC + expire）。
-    - 解码 `payload`，要求 `ticketNonce`、`idle_timeout` 与 `expireTime` 都存在且格式合法。
+    - 解码 `payload`，始终要求 `expireTime` 合法；当 `download.db.mode=custom-pg-rest` 时额外要求 `ticketNonce` 与 `idle_timeout` 存在且格式合法，当 `download.db.mode=""` 时允许这两个字段缺失。
     - 取 `payloadSign.expire` 与 `payload.expireTime` 的最短生效期，得到本地 `hardExpireAt`。
     - 计算 `ticketHash = sha256(payload + ":" + payloadSign)` 作为 admission 的 ticket identity。
 
@@ -118,11 +119,12 @@ admission 固定为四种显式运行模式：
      - 同时返回缓存命中、限流状态与 `THROTTLE_PROTECTION` 里的 breaker 原始快照；这一步只读权威状态，不在 worker 侧生成本地 breaker 状态；`pgErrorHandle` 支持 `fail-open`/`fail-closed`。
 
 8. **Ticket State admission**
-    - worker 先按本地 `hardExpireAt` 做前置过期判断；已过期请求不会再读 ticket state。
-    - worker 使用 `TICKET_HASH` 调用 `download_get_ticket_state` 读取 ticket state。
+    - `download.db.mode=custom-pg-rest` 时，worker 先按本地 `hardExpireAt` 做前置过期判断；已过期请求不会再读 ticket state。
+    - `custom-pg-rest` 模式下，worker 使用 `TICKET_HASH` 调用 `download_get_ticket_state` 读取 ticket state。
     - 若 ticket record 缺失，请求按协议不匹配直接拒绝。
     - 只有 `FIRST_USED_AT` 仍为 `null` 时才会执行 idle gate，基线固定为 `ISSUED_AT`，窗口固定为签发时写进 payload 的 `idle_timeout`。
     - 一旦 `FIRST_USED_AT` 非空，worker 永久跳过 idle denial，只保留本地 `hardExpireAt` 作为后续过期门槛。
+    - `download.db.mode=""` 时，这一整段 ticket-state read / idle gate / mark-used 前置流程全部跳过。
 
 9. **缓存与 AList 获取**
     - 优先使用 unified-check 或 cacheManager 的缓存；未命中则请求 AList `/api/fs/link`。
@@ -186,13 +188,15 @@ admission 固定为四种显式运行模式：
      - `payload.isCrypted=true` 时强制设置附件名为 `*.enc`。
      - 按 `download.overrideCacheControl` 与 `payload.filesize` 覆盖 Cache-Control。
      - 统一附加下载 CORS 头。
-     - 对成功的用户可见下载响应，返回前会调用 `download_mark_ticket_used`；`GET 200/206` 都按 first-use 消费处理，歧义性的 inline textual `GET 200` 也不例外；`transitioned` 与 `already_used` 都允许放行，`storage_error` 会中止响应。
+     - `download.db.mode=custom-pg-rest` 时，对成功的用户可见下载响应，返回前会调用 `download_mark_ticket_used`；`GET 200/206` 都按 first-use 消费处理，歧义性的 inline textual `GET 200` 也不例外；`transitioned` 与 `already_used` 都允许放行，`storage_error` 会中止响应。
+     - `download.db.mode=""` 时，请求不会执行 ticket-state mark-used。
      - `HEAD`、probe、metadata-only 与其他非用户可见响应不会消费 first-use 转移。
 
 14. **Ticket State 清理**
-    - 成功的用户可见下载响应只在首次使用时把 `FIRST_USED_AT` 从 `null` 原子切到时间戳，后续请求沿用该 ticket state。
-    - `scheduleAllCleanups` 按概率清理缓存、限流与 ticket state。
-    - ticket state cleanup 调用 `download_cleanup_expired_tickets`，仅按 `HARD_EXPIRE_AT < now` 删除过期 ticket record，不依赖 `ISSUED_AT` 或 `FIRST_USED_AT`。
+    - `download.db.mode=custom-pg-rest` 时，成功的用户可见下载响应只在首次使用时把 `FIRST_USED_AT` 从 `null` 原子切到时间戳，后续请求沿用该 ticket state。
+    - `custom-pg-rest` 模式下，`scheduleAllCleanups` 按概率清理缓存、限流与 ticket state。
+    - `custom-pg-rest` 模式下，ticket state cleanup 调用 `download_cleanup_expired_tickets`，仅按 `HARD_EXPIRE_AT < now` 删除过期 ticket record，不依赖 `ISSUED_AT` 或 `FIRST_USED_AT`。
+    - `download.db.mode=""` 时，不会调度 ticket-state cleanup。
 
 ## 6. 数据库与 RPC（custom-pg-rest）
 

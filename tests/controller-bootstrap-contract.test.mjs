@@ -211,47 +211,41 @@ test('resolveConfig reads download.db.ticketStateTable and exposes ticketStateTa
   assert.equal(Object.hasOwn(config.cacheConfig, 'lastActiveTableName'), false);
 });
 
-test('ticket-state runtime config remains mandatory even when dbMode is not custom-pg-rest', () => {
-  const ticketStateConfig = {
+test('resolveConfig rejects download.db.idleTimeoutSeconds when present', () => {
+  const bootstrap = buildBootstrap();
+  bootstrap.download.db = {
+    mode: 'custom-pg-rest',
     postgrestUrl: 'https://postgrest.example.test',
     verifyHeader: ['X-Verify'],
     verifySecret: ['secret'],
-    ticketStateTableName: 'DOWNLOAD_TICKET_STATE_TABLE',
+    cacheEnabled: false,
+    ticketStateTable: 'DOWNLOAD_TICKET_STATE_TABLE',
+    idleTimeoutSeconds: 60,
   };
 
-  assert.deepEqual(
-    resolveTicketStateConfig({
-      dbMode: '',
-      cacheConfig: ticketStateConfig,
-    }),
-    ticketStateConfig,
+  assert.throws(
+    () => resolveConfig({}, bootstrap, { download: {} }),
+    /download\.db\.idleTimeoutSeconds is not supported/i,
   );
 });
 
-test('resolveTicketStateConfig accepts real bootstrap output when db mode is empty', () => {
+test('resolveConfig accepts dbMode empty without ticket-state runtime wiring', () => {
   const bootstrap = buildBootstrap();
   bootstrap.download.db = {
     mode: '',
-    postgrestUrl: 'https://postgrest.example.test',
-    verifyHeader: ['X-Verify'],
-    verifySecret: ['secret'],
-    ticketStateTable: 'DOWNLOAD_TICKET_STATE_TABLE',
   };
 
   const config = resolveConfig({}, bootstrap, { download: {} });
 
-  assert.deepEqual(resolveTicketStateConfig(config), {
-    postgrestUrl: 'https://postgrest.example.test',
-    verifyHeader: ['X-Verify'],
-    verifySecret: ['secret'],
-    ticketStateTableName: 'DOWNLOAD_TICKET_STATE_TABLE',
-  });
+  assert.equal(config.dbMode, '');
+  assert.equal(config.cacheEnabled, false);
+  assert.equal(config.ticketStateTableName, 'DOWNLOAD_TICKET_STATE_TABLE');
+  assert.deepEqual(config.cacheConfig, {});
 });
 
-test('ticket-state runtime config fails closed when PostgREST wiring is missing', () => {
+test('resolveTicketStateConfig fails closed when PostgREST wiring is missing', () => {
   assert.throws(
     () => resolveTicketStateConfig({
-      dbMode: '',
       cacheConfig: {
         ticketStateTableName: 'DOWNLOAD_TICKET_STATE_TABLE',
       },

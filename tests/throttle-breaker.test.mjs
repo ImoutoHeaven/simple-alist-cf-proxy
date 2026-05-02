@@ -7810,10 +7810,9 @@ test('scheduleAllCleanups routes hard-expiry cleanup through download_cleanup_ex
   }
 });
 
-test('scheduleAllCleanups routes hard-expiry cleanup through download_cleanup_expired_tickets when ticket-state config resolves with empty dbMode', async () => {
+test('scheduleAllCleanups skips ticket-state cleanup when dbMode is empty', async () => {
   const originalFetch = globalThis.fetch;
   let unexpectedFetchCalls = 0;
-  const beforeCleanupNow = Math.floor(Date.now() / 1000);
   const bootstrap = buildBootstrap();
   bootstrap.download.db = {
     mode: '',
@@ -7840,13 +7839,7 @@ test('scheduleAllCleanups routes hard-expiry cleanup through download_cleanup_ex
 
     assert.equal(config.dbMode, '');
     assert.equal(unexpectedFetchCalls, 0);
-    assert.equal(ticketStateRpcState.cleanupBodies.length, 1);
-    assert.deepEqual(Object.keys(ticketStateRpcState.cleanupBodies[0]).sort(), ['p_now', 'p_table_name']);
-    assert.equal(ticketStateRpcState.cleanupBodies[0].p_table_name, 'DOWNLOAD_TICKET_STATE_TABLE');
-    assert.equal(Number.isInteger(ticketStateRpcState.cleanupBodies[0].p_now), true);
-    assert.equal('p_last_active_table_name' in ticketStateRpcState.cleanupBodies[0], false);
-    assert.ok(ticketStateRpcState.cleanupBodies[0].p_now >= beforeCleanupNow);
-    assert.ok(ticketStateRpcState.cleanupBodies[0].p_now <= Math.floor(Date.now() / 1000));
+    assert.equal(ticketStateRpcState.cleanupBodies.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }

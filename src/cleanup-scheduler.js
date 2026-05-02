@@ -245,10 +245,13 @@ export async function scheduleAllCleanups(config, env, ctx) {
     return;
   }
 
-  const cleanupTasks = config.dbMode === 'custom-pg-rest'
+  const ticketStateEnabled = config.dbMode === 'custom-pg-rest';
+  const cleanupTasks = ticketStateEnabled
     ? buildCustomPgRestCleanupTasks(config)
     : [];
-  const ticketStateCleanupConfig = resolveTicketStateCleanupConfig(config);
+  const ticketStateCleanupConfig = ticketStateEnabled
+    ? resolveTicketStateCleanupConfig(config)
+    : null;
 
   if (ticketStateCleanupConfig) {
     cleanupTasks.push({

@@ -1185,6 +1185,9 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   const dbConfig = downloadBootstrap.db && typeof downloadBootstrap.db === 'object'
     ? downloadBootstrap.db
     : {};
+  if (Object.prototype.hasOwnProperty.call(dbConfig, 'idleTimeoutSeconds')) {
+    throw new Error('controller download.db.idleTimeoutSeconds is not supported');
+  }
   const dbModeRaw = normalizeString(dbConfig.mode);
   const dbMode = dbModeRaw ? dbModeRaw.toLowerCase() : '';
   if (dbMode && dbMode !== 'custom-pg-rest') {
@@ -3304,22 +3307,29 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return createUnauthorizedResponse(origin, "link expired");
   }
 
-  const ticketNonce = typeof payloadData?.ticketNonce === 'string' ? payloadData.ticketNonce.trim() : '';
-  if (!isValidTicketNonce(ticketNonce)) {
-    return createUnauthorizedResponse(origin, 'payload ticketNonce invalid');
-  }
-
+  const ticketStateEnabled = config.dbMode === 'custom-pg-rest';
+  const payloadTicketNonce = typeof payloadData?.ticketNonce === 'string' ? payloadData.ticketNonce.trim() : '';
   const idleTimeoutRaw = payloadData?.idle_timeout;
-  const idleTimeoutSeconds = (typeof idleTimeoutRaw === 'number' && Number.isSafeInteger(idleTimeoutRaw))
+  const idleTimeoutSeconds = ticketStateEnabled
+    && typeof idleTimeoutRaw === 'number'
+    && Number.isSafeInteger(idleTimeoutRaw)
     ? idleTimeoutRaw
     : null;
-  if (idleTimeoutSeconds === null || idleTimeoutSeconds < 0) {
-    return createUnauthorizedResponse(origin, 'payload idle_timeout invalid');
-  }
 
-  const ticketHash = await sha256Hash(`${payload}:${payloadSign}`);
-  if (!ticketHash) {
-    return createUnauthorizedResponse(origin, 'payload ticket hash invalid');
+  let ticketHash = null;
+  if (ticketStateEnabled) {
+    if (!isValidTicketNonce(payloadTicketNonce)) {
+      return createUnauthorizedResponse(origin, 'payload ticketNonce invalid');
+    }
+
+    if (idleTimeoutSeconds === null || idleTimeoutSeconds < 0) {
+      return createUnauthorizedResponse(origin, 'payload idle_timeout invalid');
+    }
+
+    ticketHash = await sha256Hash(`${payload}:${payloadSign}`);
+    if (!ticketHash) {
+      return createUnauthorizedResponse(origin, 'payload ticket hash invalid');
+    }
   }
 
   const encryptedPayload = typeof payloadData.encrypt === "string" ? payloadData.encrypt : "";
@@ -3369,37 +3379,39 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   }
 
-  let ticketStateConfig;
-  try {
-    ticketStateConfig = resolveTicketStateConfig(config);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error('[TicketState] Config invalid:', message);
-    return createErrorResponse(origin, 500, message);
-  }
-
+  let ticketStateConfig = null;
   let ticketState = null;
-  try {
-    ticketState = await readTicketState(ticketHash, ticketStateConfig);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error('[TicketState] Read failed:', message);
-    return createErrorResponse(origin, 500, `Ticket state read failed: ${message}`);
-  }
+  if (ticketStateEnabled) {
+    try {
+      ticketStateConfig = resolveTicketStateConfig(config);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[TicketState] Config invalid:', message);
+      return createErrorResponse(origin, 500, message);
+    }
 
-  if (!ticketState?.found) {
-    return createUnauthorizedResponse(origin, 'ticket state missing');
-  }
+    try {
+      ticketState = await readTicketState(ticketHash, ticketStateConfig);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[TicketState] Read failed:', message);
+      return createErrorResponse(origin, 500, `Ticket state read failed: ${message}`);
+    }
 
-  if (!Number.isInteger(ticketState.issuedAt) || ticketState.issuedAt < 0) {
-    return createUnauthorizedResponse(origin, 'ticket state issued_at invalid');
-  }
+    if (!ticketState?.found) {
+      return createUnauthorizedResponse(origin, 'ticket state missing');
+    }
 
-  if (ticketState.firstUsedAt == null) {
-    const idleAge = Math.floor(Date.now() / 1000) - ticketState.issuedAt;
-    if (idleAge > idleTimeoutSeconds) {
-      await slowFailDelay();
-      return createErrorResponse(origin, 410, 'Link expired due to inactivity');
+    if (!Number.isInteger(ticketState.issuedAt) || ticketState.issuedAt < 0) {
+      return createUnauthorizedResponse(origin, 'ticket state issued_at invalid');
+    }
+
+    if (ticketState.firstUsedAt == null) {
+      const idleAge = Math.floor(Date.now() / 1000) - ticketState.issuedAt;
+      if (idleAge > idleTimeoutSeconds) {
+        await slowFailDelay();
+        return createErrorResponse(origin, 410, 'Link expired due to inactivity');
+      }
     }
   }
 
@@ -5416,6 +5428,10 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     });
 
     if (!isContentResponse) {
+      return responseToReturn;
+    }
+
+    if (!ticketStateEnabled) {
       return responseToReturn;
     }
 
