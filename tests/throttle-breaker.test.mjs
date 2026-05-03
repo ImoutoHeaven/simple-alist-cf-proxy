@@ -21,6 +21,84 @@ const createJsonResponse = (payload) => new Response(JSON.stringify(payload), {
 });
 
 const ACK_HANDOFF_URL = 'https://cq.example.test/api/v1/concurrency/ack_handoff';
+const HEARTBEAT_URL = 'https://cq.example.test/api/v1/concurrency/heartbeat';
+const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT = {
+  enabled: true,
+  required: true,
+  path: '/api/v1/concurrency/heartbeat',
+  intervalMs: 5000,
+  timeoutMs: 15000,
+  reconnectGraceMs: 12000,
+  helloTimeoutMs: 2000,
+  startTimeoutMs: 7000,
+  ackTimeoutMs: 2000,
+  initialConnectMaxAttempts: 3,
+  initialConnectMaxElapsedMs: 3000,
+  reconnectMaxAttempts: 3,
+  reconnectMaxElapsedMs: 10000,
+  reconnectBaseDelayMs: 250,
+  reconnectMaxDelayMs: 2000,
+  reconnectSafetyMarginMs: 1000,
+};
+
+const createFakeHeartbeatSocket = ({
+  helloAck = {
+    type: 'hello_ack',
+    generation: 7,
+    deadlineMs: Date.now() + 15_000,
+    ackTimeoutMs: 2000,
+    heartbeatIntervalMs: 5000,
+    heartbeatTimeoutMs: 15000,
+    reconnectGraceMs: 12000,
+    startTimeoutMs: 7000,
+    hardExpireAtMs: Date.now() + 60_000,
+  },
+  heartbeatAck = {
+    type: 'heartbeat_ack',
+    generation: 7,
+    deadlineMs: Date.now() + 15_000,
+    hardExpireAtMs: Date.now() + 60_000,
+  },
+} = {}) => {
+  const listeners = new Map();
+
+  const emit = (type, event = {}) => {
+    const handlers = listeners.get(type);
+    if (!handlers) {
+      return;
+    }
+    for (const handler of [...handlers]) {
+      handler(event);
+    }
+  };
+
+  return {
+    sent: [],
+    addEventListener(type, handler) {
+      const handlers = listeners.get(type) || new Set();
+      handlers.add(handler);
+      listeners.set(type, handlers);
+    },
+    removeEventListener(type, handler) {
+      listeners.get(type)?.delete(handler);
+    },
+    accept() {},
+    send(data) {
+      this.sent.push(data);
+      const payload = JSON.parse(data);
+      if (payload.type === 'hello' && helloAck) {
+        queueMicrotask(() => emit('message', { data: JSON.stringify(helloAck) }));
+        return;
+      }
+      if (payload.type === 'heartbeat' && heartbeatAck) {
+        queueMicrotask(() => emit('message', { data: JSON.stringify(heartbeatAck) }));
+      }
+    },
+    close(code = 1000, reason = '') {
+      queueMicrotask(() => emit('close', { code, reason }));
+    },
+  };
+};
 
 const createClaimGrantResponse = ({
   leaseId,
@@ -228,6 +306,18 @@ const buildRuntimeBootstrap = (options = {}) => ({
         slotHandlerAuthHeader: 'X-FQ-Auth',
       },
     } : {}),
+    ...(options.trueConcurrencyHostPatterns ? {
+      trueConcurrency: {
+        enabled: true,
+        hostPatterns: options.trueConcurrencyHostPatterns,
+        handlerUrl: 'https://cq.example.test',
+        handlerAuthKey: 'cq-secret',
+        heartbeat: {
+          ...DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+          ...(options.trueConcurrencyHeartbeatOverrides || {}),
+        },
+      },
+    } : {}),
   },
 });
 
@@ -348,6 +438,20 @@ const fetchWithDefaultTicketStateRpc = async (input, init = {}) => {
   const ticketStateResponse = await handleTicketStateRpc(url, init);
   if (ticketStateResponse) {
     return ticketStateResponse;
+  }
+  if (url === HEARTBEAT_URL) {
+    try {
+      return await delegatedFetch(input, init);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes(`Unexpected fetch URL in test: ${HEARTBEAT_URL}`)) {
+        throw error;
+      }
+    }
+    return {
+      status: 101,
+      webSocket: createFakeHeartbeatSocket(),
+    };
   }
   if (typeof delegatedFetch !== 'function') {
     throw new Error('global fetch handler not configured');
@@ -2114,6 +2218,7 @@ test('queue_breaker settles old attempt before CQ wait and reauthorizes after CQ
             hostPatterns: ['*.sharepoint.com'],
             handlerUrl: 'https://cq.example.test',
             handlerAuthKey: 'cq-secret',
+            heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
           },
         },
       });
@@ -2174,6 +2279,14 @@ test('queue_breaker settles old attempt before CQ wait and reauthorizes after CQ
     if (url === ACK_HANDOFF_URL) {
       calls.push('concurrency-ack-handoff');
       return createJsonResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      calls.push('heartbeat-upgrade');
+      return {
+        status: 101,
+        webSocket: createFakeHeartbeatSocket(),
+      };
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
@@ -2262,6 +2375,7 @@ test('queue_breaker settles old attempt before CQ wait and reauthorizes after CQ
       'concurrency-claim',
       'concurrency-ack-handoff',
       'breaker-authorize',
+      'heartbeat-upgrade',
       'origin-fetch',
       'breaker-report',
       'concurrency-release',
@@ -2297,6 +2411,7 @@ test('queue_breaker cancels CQ wait when old attempt settlement fails before con
             hostPatterns: ['*.sharepoint.com'],
             handlerUrl: 'https://cq.example.test',
             handlerAuthKey: 'cq-secret',
+            heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
           },
         },
       });
@@ -2418,6 +2533,7 @@ test('queue_breaker releases CQ lease and returns breaker terminal response when
             hostPatterns: ['*.sharepoint.com'],
             handlerUrl: 'https://cq.example.test',
             handlerAuthKey: 'cq-secret',
+            heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
           },
         },
       });
@@ -2994,6 +3110,7 @@ test('worker settles live breaker_only attempt before refresh enters true concur
             hostPatterns: ['*.sharepoint.com'],
             handlerUrl: 'https://cq.example.test',
             handlerAuthKey: 'cq-secret',
+            heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
           },
         },
       });
@@ -4376,6 +4493,7 @@ test('queue_breaker dual mode reports actual Google redirect before fairqueue re
             },
             handlerUrl: 'https://cq.example.test',
             handlerAuthKey: 'cq-secret',
+            heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
           },
         },
       });
@@ -4593,6 +4711,7 @@ test('queue_breaker dual mode reports actual Google redirect when CQ expires bef
             },
             handlerUrl: 'https://cq.example.test',
             handlerAuthKey: 'cq-secret',
+            heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
           },
         },
       });
@@ -4820,6 +4939,7 @@ test('queue_breaker dual mode reports actual Google redirect when CQ wait later 
             },
             handlerUrl: 'https://cq.example.test',
             handlerAuthKey: 'cq-secret',
+            heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
           },
         },
       });

@@ -222,29 +222,29 @@ func TestPostgresBackendAckHandoffAcknowledged(t *testing.T) {
 		if !strings.Contains(query, "FROM cq_ack_handoff(") {
 			t.Fatalf("ack handoff must use fixed rpc, got %s", query)
 		}
-		if len(args) != 3 || args[0] != "request-1" || args[1] != "handoff-1" || args[2] != int64(1000) {
+		if len(args) != 4 || args[0] != "request-1" || args[1] != "handoff-1" || args[2] != int64(1000) || args[3] != int64(7000) {
 			t.Fatalf("unexpected ack handoff args: %v", args)
 		}
-		return &stubRows{rows: [][]any{{"acknowledged", nil}}}, nil
+		return &stubRows{rows: [][]any{{"acknowledged", nil, int64(8000)}}}, nil
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
-	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000})
+	result, err := backend.AckHandoff(context.Background(), AckHandoffBackendRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000, StartTimeoutMs: 7000})
 	if err != nil {
 		t.Fatalf("AckHandoff error: %v", err)
 	}
-	if result.Result != "acknowledged" || result.Reason != "" {
+	if result.Result != "acknowledged" || result.Reason != "" || result.HeartbeatDeadlineMs != 8000 {
 		t.Fatalf("expected acknowledged ack handoff result, got %+v", result)
 	}
 }
 
 func TestPostgresBackendAckHandoffConflictRequiresStableReason(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		return &stubRows{rows: [][]any{{"conflict", "handoff_token_mismatch"}}}, nil
+		return &stubRows{rows: [][]any{{"conflict", "handoff_token_mismatch", nil}}}, nil
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
-	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "wrong-token", NowMs: 1000})
+	result, err := backend.AckHandoff(context.Background(), AckHandoffBackendRequest{RequestID: "request-1", HandoffToken: "wrong-token", NowMs: 1000, StartTimeoutMs: 7000})
 	if err != nil {
 		t.Fatalf("AckHandoff error: %v", err)
 	}
@@ -255,16 +255,131 @@ func TestPostgresBackendAckHandoffConflictRequiresStableReason(t *testing.T) {
 
 func TestPostgresBackendAckHandoffTerminalRequiresReason(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		return &stubRows{rows: [][]any{{"released", "claim_handoff_timeout"}}}, nil
+		return &stubRows{rows: [][]any{{"released", "claim_handoff_timeout", nil}}}, nil
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
-	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000})
+	result, err := backend.AckHandoff(context.Background(), AckHandoffBackendRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000, StartTimeoutMs: 7000})
 	if err != nil {
 		t.Fatalf("AckHandoff error: %v", err)
 	}
 	if result.Result != "released" || result.Reason != "claim_handoff_timeout" {
 		t.Fatalf("expected terminal ack handoff reason, got %+v", result)
+	}
+}
+
+func TestPostgresBackendHeartbeatOpenUsesFixedRPC(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "FROM cq_heartbeat_open(") {
+			t.Fatalf("heartbeat open must use fixed rpc, got %s", query)
+		}
+		if len(args) != 10 || args[0] != "request-1" || args[1] != "lease-1" || args[2] != "token-1" {
+			t.Fatalf("unexpected heartbeat open args: %v", args)
+		}
+		return &stubRows{rows: [][]any{{"accepted", nil, int64(1), int64(2000), int64(2000), int64(5000), int64(15000), int64(12000), int64(7000), int64(50000)}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.HeartbeatOpen(context.Background(), HeartbeatOpenRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", HardExpireAtMs: 50000, NowMs: 1000, HeartbeatTimeoutMs: 15000, AckTimeoutMs: 2000, HeartbeatIntervalMs: 5000, ReconnectGraceMs: 12000, StartTimeoutMs: 7000})
+	if err != nil {
+		t.Fatalf("HeartbeatOpen error: %v", err)
+	}
+	if result.Result != "accepted" || result.Generation != 1 || result.DeadlineMs != 2000 {
+		t.Fatalf("unexpected heartbeat open result: %+v", result)
+	}
+}
+
+func TestPostgresBackendHeartbeatRefreshAllowsAcceptedMinimalTimingShape(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "FROM cq_heartbeat_refresh(") {
+			t.Fatalf("heartbeat refresh must use fixed rpc, got %s", query)
+		}
+		return &stubRows{rows: [][]any{{"accepted", nil, int64(2), int64(21_000), nil, nil, int64(15_000), nil, nil, int64(50_000)}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.HeartbeatRefresh(context.Background(), HeartbeatRefreshRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", Generation: 2, NowMs: 6_000, HeartbeatTimeoutMs: 15_000})
+	if err != nil {
+		t.Fatalf("HeartbeatRefresh error: %v", err)
+	}
+	if result.Result != "accepted" || result.Generation != 2 || result.DeadlineMs != 21_000 || result.HeartbeatTimeoutMs != 15_000 || result.HardExpireAtMs != 50_000 {
+		t.Fatalf("unexpected heartbeat refresh result: %+v", result)
+	}
+}
+
+func TestPostgresBackendHeartbeatDisconnectAllowsAcceptedMinimalTimingShape(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "FROM cq_heartbeat_disconnect(") {
+			t.Fatalf("heartbeat disconnect must use fixed rpc, got %s", query)
+		}
+		return &stubRows{rows: [][]any{{"accepted", nil, int64(2), int64(18_000), nil, nil, nil, int64(12_000), nil, int64(50_000)}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.HeartbeatDisconnect(context.Background(), HeartbeatDisconnectRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", Generation: 2, NowMs: 6_000, ReconnectGraceMs: 12_000})
+	if err != nil {
+		t.Fatalf("HeartbeatDisconnect error: %v", err)
+	}
+	if result.Result != "accepted" || result.Generation != 2 || result.DeadlineMs != 18_000 || result.ReconnectGraceMs != 12_000 || result.HardExpireAtMs != 50_000 {
+		t.Fatalf("unexpected heartbeat disconnect result: %+v", result)
+	}
+}
+
+func TestPostgresBackendLoadActiveHeartbeatDeadlinesQueriesActiveRows(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "heartbeat_deadline_ms IS NOT NULL") || !strings.Contains(query, "ORDER BY heartbeat_deadline_ms, request_id") {
+			t.Fatalf("unexpected heartbeat deadline recovery query: %s", query)
+		}
+		if len(args) != 2 || args[0] != int64(1000) || args[1] != 3 {
+			t.Fatalf("unexpected heartbeat deadline recovery args: %v", args)
+		}
+		return &stubRows{rows: [][]any{{"request-1", int64(2000)}, {"request-2", int64(3000)}}}, nil
+	}}
+
+	cfg := validTestConfig()
+	cfg.Concurrency.Heartbeat.SchedulerBatchSize = 5
+	backend := &postgresBackend{cfg: cfg, db: client}
+	results, err := backend.LoadActiveHeartbeatDeadlines(context.Background(), 1000, 3)
+	if err != nil {
+		t.Fatalf("LoadActiveHeartbeatDeadlines error: %v", err)
+	}
+	if len(results) != 2 || results[0].RequestID != "request-1" || results[0].DeadlineMs != 2000 || results[1].RequestID != "request-2" || results[1].DeadlineMs != 3000 {
+		t.Fatalf("unexpected heartbeat deadline snapshots: %+v", results)
+	}
+}
+
+func TestPostgresBackendLoadActiveHeartbeatDeadlinesHonorsExplicitLimitAboveSchedulerBatchSize(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if len(args) != 2 || args[0] != int64(1000) || args[1] != 7 {
+			t.Fatalf("expected recovery limit 7 to bypass scheduler batch cap, got args %v", args)
+		}
+		return &stubRows{rows: [][]any{{"request-1", int64(2000)}}}, nil
+	}}
+
+	cfg := validTestConfig()
+	cfg.Concurrency.Heartbeat.SchedulerBatchSize = 5
+	backend := &postgresBackend{cfg: cfg, db: client}
+	if _, err := backend.LoadActiveHeartbeatDeadlines(context.Background(), 1000, 7); err != nil {
+		t.Fatalf("LoadActiveHeartbeatDeadlines error: %v", err)
+	}
+}
+
+func TestPostgresBackendLoadActiveHeartbeatDeadlinesWithoutLimitLoadsAllActiveRows(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if strings.Contains(query, "LIMIT") {
+			t.Fatalf("expected all-active recovery query without LIMIT, got %s", query)
+		}
+		if len(args) != 1 || args[0] != int64(1000) {
+			t.Fatalf("expected recovery query args [1000], got %v", args)
+		}
+		return &stubRows{rows: [][]any{{"request-1", int64(2000)}}}, nil
+	}}
+
+	cfg := validTestConfig()
+	cfg.Concurrency.Heartbeat.SchedulerBatchSize = 5
+	backend := &postgresBackend{cfg: cfg, db: client}
+	if _, err := backend.LoadActiveHeartbeatDeadlines(context.Background(), 1000, 0); err != nil {
+		t.Fatalf("LoadActiveHeartbeatDeadlines error: %v", err)
 	}
 }
 

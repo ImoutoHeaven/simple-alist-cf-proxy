@@ -223,21 +223,139 @@ func (b *postgrestBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest
 	return serviceResult, nil
 }
 
-func (b *postgrestBackend) AckHandoff(ctx context.Context, req AckHandoffRequest) (*AckHandoffResult, error) {
+func (b *postgrestBackend) AckHandoff(ctx context.Context, req AckHandoffBackendRequest) (*AckHandoffResult, error) {
 	result := &struct {
-		Result string `json:"result"`
-		Reason string `json:"reason"`
+		Result              string `json:"result"`
+		Reason              string `json:"reason"`
+		HeartbeatDeadlineMs int64  `json:"heartbeat_deadline_ms"`
 	}{}
 	err := b.doRPC(ctx, fixedAckHandoffFunc, map[string]any{
 		"p_request_id":    req.RequestID,
 		"p_handoff_token": req.HandoffToken,
 		"p_now_ms":        req.NowMs,
+		"p_start_timeout_ms": req.StartTimeoutMs,
 	}, result)
 	if err != nil {
 		return nil, err
 	}
-	serviceResult := &AckHandoffResult{Result: result.Result, Reason: result.Reason}
+	serviceResult := &AckHandoffResult{Result: result.Result, Reason: result.Reason, HeartbeatDeadlineMs: result.HeartbeatDeadlineMs}
 	if err := validateAckHandoffResult(serviceResult); err != nil {
+		return nil, err
+	}
+	return serviceResult, nil
+}
+
+func (b *postgrestBackend) HeartbeatOpen(ctx context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+	return b.doHeartbeatRPC(ctx, "cq_heartbeat_open", map[string]any{
+		"p_request_id": req.RequestID,
+		"p_lease_id": req.LeaseID,
+		"p_lease_token": req.LeaseToken,
+		"p_hard_expire_at_ms": req.HardExpireAtMs,
+		"p_now_ms": req.NowMs,
+		"p_heartbeat_timeout_ms": req.HeartbeatTimeoutMs,
+		"p_ack_timeout_ms": req.AckTimeoutMs,
+		"p_heartbeat_interval_ms": req.HeartbeatIntervalMs,
+		"p_reconnect_grace_ms": req.ReconnectGraceMs,
+		"p_start_timeout_ms": req.StartTimeoutMs,
+	})
+}
+
+func (b *postgrestBackend) HeartbeatRefresh(ctx context.Context, req HeartbeatRefreshRequest) (*HeartbeatResult, error) {
+	return b.doHeartbeatRPC(ctx, "cq_heartbeat_refresh", map[string]any{
+		"p_request_id": req.RequestID,
+		"p_lease_id": req.LeaseID,
+		"p_lease_token": req.LeaseToken,
+		"p_generation": req.Generation,
+		"p_now_ms": req.NowMs,
+		"p_heartbeat_timeout_ms": req.HeartbeatTimeoutMs,
+	})
+}
+
+func (b *postgrestBackend) HeartbeatDisconnect(ctx context.Context, req HeartbeatDisconnectRequest) (*HeartbeatResult, error) {
+	return b.doHeartbeatRPC(ctx, "cq_heartbeat_disconnect", map[string]any{
+		"p_request_id": req.RequestID,
+		"p_lease_id": req.LeaseID,
+		"p_lease_token": req.LeaseToken,
+		"p_generation": req.Generation,
+		"p_now_ms": req.NowMs,
+		"p_reconnect_grace_ms": req.ReconnectGraceMs,
+	})
+}
+
+func (b *postgrestBackend) ExpireHeartbeatIfDue(ctx context.Context, req ExpireHeartbeatRequest) (*HeartbeatResult, error) {
+	return b.doHeartbeatRPC(ctx, "cq_expire_heartbeat_if_due", map[string]any{
+		"p_request_id": req.RequestID,
+		"p_now_ms": req.NowMs,
+	})
+}
+
+func (b *postgrestBackend) LoadActiveHeartbeatDeadlines(ctx context.Context, nowMs int64, limit int) ([]HeartbeatDeadlineSnapshot, error) {
+	params := url.Values{}
+	params.Set("select", "request_id,heartbeat_deadline_ms")
+	params.Set("state", "eq.active")
+	params.Set("heartbeat_deadline_ms", "not.is.null")
+	params.Set("hard_expire_at_ms", "gt."+strconv.FormatInt(nowMs, 10))
+	params.Set("order", "heartbeat_deadline_ms.asc,request_id.asc")
+	if limit > 0 {
+		params.Set("limit", strconv.Itoa(limit))
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, b.baseURL+"/concurrency_requests?"+params.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header = b.buildHeaders()
+	response, err := b.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+		return nil, fmt.Errorf("postgrest heartbeat recovery query failed: status=%d body=%s", response.StatusCode, string(data))
+	}
+	var rows []struct {
+		RequestID string `json:"request_id"`
+		DeadlineMs int64 `json:"heartbeat_deadline_ms"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&rows); err != nil {
+		return nil, err
+	}
+	snapshots := make([]HeartbeatDeadlineSnapshot, 0, len(rows))
+	for _, row := range rows {
+		snapshots = append(snapshots, HeartbeatDeadlineSnapshot{RequestID: row.RequestID, DeadlineMs: row.DeadlineMs})
+	}
+	return snapshots, nil
+}
+
+func (b *postgrestBackend) doHeartbeatRPC(ctx context.Context, funcName string, payload any) (*HeartbeatResult, error) {
+	result := &struct {
+		Result              string `json:"result"`
+		Reason              string `json:"reason"`
+		Generation          int64  `json:"generation"`
+		DeadlineMs          int64  `json:"deadline_ms"`
+		AckTimeoutMs        int64  `json:"ack_timeout_ms"`
+		HeartbeatIntervalMs int64  `json:"heartbeat_interval_ms"`
+		HeartbeatTimeoutMs  int64  `json:"heartbeat_timeout_ms"`
+		ReconnectGraceMs    int64  `json:"reconnect_grace_ms"`
+		StartTimeoutMs      int64  `json:"start_timeout_ms"`
+		HardExpireAtMs      int64  `json:"hard_expire_at_ms"`
+	}{}
+	if err := b.doRPC(ctx, funcName, payload, result); err != nil {
+		return nil, err
+	}
+	serviceResult := &HeartbeatResult{
+		Result: result.Result,
+		Reason: result.Reason,
+		Generation: result.Generation,
+		DeadlineMs: result.DeadlineMs,
+		AckTimeoutMs: result.AckTimeoutMs,
+		HeartbeatIntervalMs: result.HeartbeatIntervalMs,
+		HeartbeatTimeoutMs: result.HeartbeatTimeoutMs,
+		ReconnectGraceMs: result.ReconnectGraceMs,
+		StartTimeoutMs: result.StartTimeoutMs,
+		HardExpireAtMs: result.HardExpireAtMs,
+	}
+	if err := validateHeartbeatResult(serviceResult); err != nil {
 		return nil, err
 	}
 	return serviceResult, nil

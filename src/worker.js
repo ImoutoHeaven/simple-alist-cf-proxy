@@ -25,6 +25,24 @@ const DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER = 'X-CQ-Auth';
 // Must exceed the default CQ wait poll window with explicit slack, or held acquires can time out client-side first.
 const DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS = 11500;
 const DEFAULT_TRUE_CONCURRENCY_RELEASE_TIMEOUT_MS = 1500;
+const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG = Object.freeze({
+  enabled: true,
+  required: true,
+  path: '/api/v1/concurrency/heartbeat',
+  intervalMs: 5000,
+  timeoutMs: 15000,
+  reconnectGraceMs: 12000,
+  helloTimeoutMs: 2000,
+  startTimeoutMs: 7000,
+  ackTimeoutMs: 2000,
+  initialConnectMaxAttempts: 3,
+  initialConnectMaxElapsedMs: 3000,
+  reconnectMaxAttempts: 3,
+  reconnectMaxElapsedMs: 10000,
+  reconnectBaseDelayMs: 250,
+  reconnectMaxDelayMs: 2000,
+  reconnectSafetyMarginMs: 1000,
+});
 const TRUE_CONCURRENCY_RELEASE_RETRY_DELAYS_MS = [0, 2000, 4000, 8000];
 const FINAL_CLEANUP_RELEASE_CONCURRENCY = 2;
 const DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS = 35;
@@ -669,6 +687,98 @@ const normalizePositiveMs = (value, fallback) => {
     return Math.max(1, Math.trunc(fb));
   }
   return 0;
+};
+
+const normalizeTrueConcurrencyHeartbeatConfig = (heartbeatConfig, options = {}) => {
+  const fieldName = options.fieldName || 'controller trueConcurrency.heartbeat';
+  const required = options.required === true;
+
+  if (!heartbeatConfig || typeof heartbeatConfig !== 'object' || Array.isArray(heartbeatConfig)) {
+    if (required) {
+      throw new Error(`${fieldName} is required when trueConcurrency.enabled is true`);
+    }
+    return { ...DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG };
+  }
+
+  const readBoolean = (property, fallback) => {
+    if (!Object.prototype.hasOwnProperty.call(heartbeatConfig, property)) {
+      return fallback;
+    }
+    if (typeof heartbeatConfig[property] !== 'boolean') {
+      throw new Error(`Invalid ${fieldName}.${property}: expected boolean`);
+    }
+    return heartbeatConfig[property];
+  };
+
+  const readPositiveInt = (property, fallback) => {
+    if (!Object.prototype.hasOwnProperty.call(heartbeatConfig, property)) {
+      return fallback;
+    }
+    const value = Number(heartbeatConfig[property]);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error(`Invalid ${fieldName}.${property}: must be > 0`);
+    }
+    return Math.max(1, Math.trunc(value));
+  };
+
+  const enabled = readBoolean('enabled', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.enabled);
+  const requiredEnabled = readBoolean('required', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.required);
+  const rawPath = Object.prototype.hasOwnProperty.call(heartbeatConfig, 'path')
+    ? normalizeStringValue(heartbeatConfig.path)
+    : '';
+  const normalizedPath = rawPath
+    ? normalizePath(rawPath)
+    : DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.path;
+
+  if (!normalizedPath) {
+    throw new Error(`Invalid ${fieldName}.path`);
+  }
+
+  const normalized = {
+    enabled,
+    required: requiredEnabled,
+    path: normalizedPath,
+    intervalMs: readPositiveInt('intervalMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.intervalMs),
+    timeoutMs: readPositiveInt('timeoutMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.timeoutMs),
+    reconnectGraceMs: readPositiveInt('reconnectGraceMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.reconnectGraceMs),
+    helloTimeoutMs: readPositiveInt('helloTimeoutMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.helloTimeoutMs),
+    startTimeoutMs: readPositiveInt('startTimeoutMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.startTimeoutMs),
+    ackTimeoutMs: readPositiveInt('ackTimeoutMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.ackTimeoutMs),
+    initialConnectMaxAttempts: readPositiveInt('initialConnectMaxAttempts', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.initialConnectMaxAttempts),
+    initialConnectMaxElapsedMs: readPositiveInt('initialConnectMaxElapsedMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.initialConnectMaxElapsedMs),
+    reconnectMaxAttempts: readPositiveInt('reconnectMaxAttempts', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.reconnectMaxAttempts),
+    reconnectMaxElapsedMs: readPositiveInt('reconnectMaxElapsedMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.reconnectMaxElapsedMs),
+    reconnectBaseDelayMs: readPositiveInt('reconnectBaseDelayMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.reconnectBaseDelayMs),
+    reconnectMaxDelayMs: readPositiveInt('reconnectMaxDelayMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.reconnectMaxDelayMs),
+    reconnectSafetyMarginMs: readPositiveInt('reconnectSafetyMarginMs', DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.reconnectSafetyMarginMs),
+  };
+
+  if (required && !normalized.enabled) {
+    throw new Error(`Invalid ${fieldName}.enabled: must be true`);
+  }
+  if (required && !normalized.required) {
+    throw new Error(`Invalid ${fieldName}.required: must be true`);
+  }
+  if (normalized.required && !normalized.enabled) {
+    throw new Error(`Invalid ${fieldName}.required: required=true requires enabled=true`);
+  }
+  if (normalized.timeoutMs <= normalized.intervalMs) {
+    throw new Error(`Invalid ${fieldName}.timeoutMs: must be greater than intervalMs`);
+  }
+  if (normalized.reconnectGraceMs > normalized.timeoutMs) {
+    throw new Error(`Invalid ${fieldName}.reconnectGraceMs: must be <= timeoutMs`);
+  }
+  if (normalized.reconnectSafetyMarginMs >= normalized.reconnectGraceMs) {
+    throw new Error(`Invalid ${fieldName}.reconnectSafetyMarginMs: must be < reconnectGraceMs`);
+  }
+  if (normalized.reconnectMaxElapsedMs > (normalized.reconnectGraceMs - normalized.reconnectSafetyMarginMs)) {
+    throw new Error(`Invalid ${fieldName}.reconnect: reconnectMaxElapsedMs exceeds reconnect grace budget`);
+  }
+  if ((normalized.initialConnectMaxElapsedMs + normalized.helloTimeoutMs) > (normalized.startTimeoutMs - normalized.reconnectSafetyMarginMs)) {
+    throw new Error(`Invalid ${fieldName}.startTimeoutMs: initial connect budget exceeds start timeout budget`);
+  }
+
+  return normalized;
 };
 
 const CACHE_OVERRIDE_UNIT_SECONDS = {
@@ -1415,6 +1525,13 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     trueConcurrencyConfigRaw.siteBucket,
     'controller trueConcurrency.siteBucket',
   );
+  const heartbeatConfig = normalizeTrueConcurrencyHeartbeatConfig(
+    trueConcurrencyConfigRaw.heartbeat,
+    {
+      fieldName: 'controller trueConcurrency.heartbeat',
+      required: trueConcurrencyEnabled,
+    },
+  );
   const concurrencyHandlerConfig = {
     url: concurrencyHandlerUrl,
     authKey: concurrencyHandlerAuthKey,
@@ -1427,6 +1544,7 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
       trueConcurrencyConfigRaw.releaseTimeoutMs,
       DEFAULT_TRUE_CONCURRENCY_RELEASE_TIMEOUT_MS,
     ),
+    heartbeat: heartbeatConfig,
   };
 
   const enableCfRatelimiter = normalizeString(env.ENABLE_CF_RATELIMITER, 'false').toLowerCase() === 'true';
@@ -1859,6 +1977,49 @@ const TRUE_CONCURRENCY_RELEASE_NOOP_REASONS = new Set([
   'token_mismatch',
 ]);
 const TRUE_CONCURRENCY_CANCEL_NOOP_REASONS = new Set(['already_terminal']);
+const TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_REASONS = new Set([
+  'heartbeat_timeout',
+  'heartbeat_start_timeout',
+  'hard_expired',
+  'already_released',
+  'request_cancelled',
+  'protocol_error',
+  'token_mismatch',
+]);
+const TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_NO_RELEASE_REASONS = new Set([
+  'heartbeat_timeout',
+  'heartbeat_start_timeout',
+  'hard_expired',
+  'already_released',
+  'request_cancelled',
+]);
+const TRUE_CONCURRENCY_CANONICAL_RELEASE_REASONS = new Set([
+  'stream_complete',
+  'client_disconnect',
+  'hard_expiry',
+  'upstream_failure',
+  'origin_fetch_failure',
+  'heartbeat_connect_failed',
+  'heartbeat_lost',
+  'final_cleanup',
+]);
+const TRUE_CONCURRENCY_RELEASE_REASON_ALIASES = new Map([
+  ['target_change', 'final_cleanup'],
+  ['grant_delivery_failed', 'final_cleanup'],
+  ['acquire_delivery_failed', 'final_cleanup'],
+  ['head_probe_complete', 'stream_complete'],
+  ['head_probe_invalid', 'origin_fetch_failure'],
+  ['prestream_terminal', 'origin_fetch_failure'],
+  ['google_drive_range_mismatch', 'origin_fetch_failure'],
+]);
+
+const normalizeTrueConcurrencyReleaseReason = (reason) => {
+  const normalizedReason = normalizeStringValue(reason);
+  if (TRUE_CONCURRENCY_CANONICAL_RELEASE_REASONS.has(normalizedReason)) {
+    return normalizedReason;
+  }
+  return TRUE_CONCURRENCY_RELEASE_REASON_ALIASES.get(normalizedReason) || 'final_cleanup';
+};
 
 const isTrueConcurrencyLeaseIdentity = (lease) => (
   typeof lease?.leaseId === 'string'
@@ -1887,7 +2048,7 @@ const buildTrueConcurrencyReleasePayload = (lease, reason) => {
     return {
       leaseId: lease.leaseId,
       leaseToken: lease.leaseToken,
-      reason,
+      reason: normalizeTrueConcurrencyReleaseReason(reason),
       nowMs: Date.now(),
     };
   }
@@ -2145,6 +2306,193 @@ const normalizeTrueConcurrencyCancelResult = (data) => {
   };
 };
 
+const parseTrueConcurrencyHeartbeatJson = (rawData, messageType) => {
+  const decode = () => {
+    if (typeof rawData === 'string') {
+      return rawData;
+    }
+    if (rawData instanceof ArrayBuffer) {
+      return new TextDecoder().decode(new Uint8Array(rawData));
+    }
+    if (ArrayBuffer.isView(rawData)) {
+      return new TextDecoder().decode(rawData);
+    }
+    throw new Error(`[CQ] ${messageType} message must be text`);
+  };
+
+  try {
+    const parsed = JSON.parse(decode());
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('payload must be an object');
+    }
+    return parsed;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`[CQ] ${messageType} parse failed: ${message}`);
+  }
+};
+
+const readTrueConcurrencyHeartbeatRequiredString = (payload, fieldName, messageType) => {
+  if (typeof payload?.[fieldName] !== 'string' || !payload[fieldName]) {
+    throw new Error(`[CQ] ${messageType} missing ${fieldName}`);
+  }
+  return payload[fieldName];
+};
+
+const readTrueConcurrencyHeartbeatRequiredPositiveInt = (payload, fieldName, messageType) => {
+  const value = Number(payload?.[fieldName]);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`[CQ] ${messageType} missing ${fieldName}`);
+  }
+  return Math.max(1, Math.trunc(value));
+};
+
+const normalizeTrueConcurrencyHelloAck = (payload) => {
+  if (payload?.type !== 'hello_ack') {
+    throw new Error('[CQ] hello_ack response has unsupported type');
+  }
+  const helloAck = {
+    type: 'hello_ack',
+    generation: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'generation', 'hello_ack'),
+    deadlineMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'deadlineMs', 'hello_ack'),
+    ackTimeoutMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'ackTimeoutMs', 'hello_ack'),
+    heartbeatIntervalMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'heartbeatIntervalMs', 'hello_ack'),
+    heartbeatTimeoutMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'heartbeatTimeoutMs', 'hello_ack'),
+    reconnectGraceMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'reconnectGraceMs', 'hello_ack'),
+    startTimeoutMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'startTimeoutMs', 'hello_ack'),
+    hardExpireAtMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'hardExpireAtMs', 'hello_ack'),
+  };
+  if (helloAck.deadlineMs > helloAck.hardExpireAtMs) {
+    throw new Error('[CQ] hello_ack deadlineMs exceeds hardExpireAtMs');
+  }
+  return helloAck;
+};
+
+const normalizeTrueConcurrencyHeartbeatAck = (payload, generation) => {
+  if (payload?.type !== 'heartbeat_ack') {
+    throw new Error('[CQ] heartbeat_ack response has unsupported type');
+  }
+  const ack = {
+    type: 'heartbeat_ack',
+    generation: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'generation', 'heartbeat_ack'),
+    deadlineMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'deadlineMs', 'heartbeat_ack'),
+    hardExpireAtMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(payload, 'hardExpireAtMs', 'heartbeat_ack'),
+  };
+  if (ack.generation !== generation) {
+    throw new Error('[CQ] heartbeat_ack generation mismatch');
+  }
+  if (ack.deadlineMs > ack.hardExpireAtMs) {
+    throw new Error('[CQ] heartbeat_ack deadlineMs exceeds hardExpireAtMs');
+  }
+  return ack;
+};
+
+const normalizeTrueConcurrencyHeartbeatTerminal = (payload) => {
+  if (payload?.type !== 'terminal') {
+    throw new Error('[CQ] terminal heartbeat response has unsupported type');
+  }
+  const result = typeof payload?.result === 'string' ? payload.result : '';
+  if (!result) {
+    throw new Error('[CQ] terminal heartbeat response missing result');
+  }
+  const reason = typeof payload?.reason === 'string' ? payload.reason : '';
+  if (!TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_REASONS.has(reason)) {
+    throw new Error('[CQ] terminal heartbeat response has unsupported reason');
+  }
+  return {
+    type: 'terminal',
+    result,
+    reason,
+  };
+};
+
+const createTrueConcurrencyHeartbeatTerminalError = (terminal) => {
+  const reason = terminal?.reason || 'unknown';
+  const error = new Error(`[CQ] heartbeat terminal ${reason}`);
+  error.name = 'TrueConcurrencyHeartbeatTerminalError';
+  error.terminal = terminal;
+  return error;
+};
+
+const isTrueConcurrencyHeartbeatTerminalError = (error) => (
+  error instanceof Error
+  && error.name === 'TrueConcurrencyHeartbeatTerminalError'
+  && Boolean(error.terminal)
+);
+
+const waitForTrueConcurrencyHeartbeatMessage = (ws, signal, timeoutMs, messageType) => new Promise((resolve, reject) => {
+  let settled = false;
+  let timer = null;
+
+  const cleanup = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    ws.removeEventListener?.('message', onMessage);
+    ws.removeEventListener?.('close', onClose);
+    ws.removeEventListener?.('error', onError);
+    signal?.removeEventListener?.('abort', onAbort);
+  };
+
+  const settle = (callback) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    cleanup();
+    callback();
+  };
+
+  const onMessage = (event) => {
+    settle(() => {
+      try {
+        resolve(parseTrueConcurrencyHeartbeatJson(event?.data, messageType));
+      } catch (error) {
+        reject(error);
+      }
+    });
+  };
+
+  const onClose = (event) => {
+    const code = Number.isFinite(Number(event?.code)) ? Number(event.code) : 1000;
+    const reason = typeof event?.reason === 'string' && event.reason ? `: ${event.reason}` : '';
+    settle(() => reject(new Error(`[CQ] ${messageType} websocket closed before response (${code}${reason})`)));
+  };
+
+  const onError = () => {
+    settle(() => reject(new Error(`[CQ] ${messageType} websocket error`)));
+  };
+
+  const onAbort = () => {
+    settle(() => reject(new Error(`[CQ] ${messageType} aborted`)));
+  };
+
+  ws.addEventListener?.('message', onMessage);
+  ws.addEventListener?.('close', onClose);
+  ws.addEventListener?.('error', onError);
+  if (signal?.aborted) {
+    onAbort();
+    return;
+  }
+  signal?.addEventListener?.('abort', onAbort, { once: true });
+
+  timer = setTimeout(() => {
+    settle(() => reject(new Error(`[CQ] ${messageType} timed out`)));
+  }, timeoutMs);
+});
+
+const closeTrueConcurrencyHeartbeatSocket = (ws, reason = '') => {
+  if (!ws || typeof ws.close !== 'function') {
+    return;
+  }
+  try {
+    ws.close(1000, typeof reason === 'string' ? reason : String(reason ?? ''));
+  } catch (_error) {
+    // Best-effort close only.
+  }
+};
+
 const createConcurrencyHandlerClient = (config) => {
   const handlerCfg = config.concurrencyHandlerConfig || {};
   const baseUrl = normalizePostgrestBaseUrl(handlerCfg.url);
@@ -2159,6 +2507,9 @@ const createConcurrencyHandlerClient = (config) => {
   const ackHandoffUrl = `${baseUrl}/api/v1/concurrency/ack_handoff`;
   const releaseUrl = `${baseUrl}/api/v1/concurrency/release`;
   const cancelUrl = `${baseUrl}/api/v1/concurrency/cancel`;
+  const heartbeatPath = normalizePath(normalizeStringValue(handlerCfg.heartbeat?.path))
+    || DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.path;
+  const heartbeatUrl = `${baseUrl}${heartbeatPath}`;
   const acquireTimeoutMs = normalizePositiveMs(
     handlerCfg.acquireTimeoutMs,
     DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS,
@@ -2292,6 +2643,102 @@ const createConcurrencyHandlerClient = (config) => {
       return normalizeTrueConcurrencyAckHandoffResult(data);
     },
 
+    async connectHeartbeat(_ctx, identity, signal = new AbortController().signal) {
+      const heartbeatConfig = normalizeTrueConcurrencyHeartbeatConfig(handlerCfg.heartbeat, {
+        fieldName: 'concurrencyHandlerConfig.heartbeat',
+        required: true,
+      });
+      const helloPayload = {
+        type: 'hello',
+        requestId: readTrueConcurrencyHeartbeatRequiredString(identity, 'requestId', 'heartbeat hello'),
+        leaseId: readTrueConcurrencyHeartbeatRequiredString(identity, 'leaseId', 'heartbeat hello'),
+        leaseToken: readTrueConcurrencyHeartbeatRequiredString(identity, 'leaseToken', 'heartbeat hello'),
+        hardExpireAtMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(identity, 'hardExpireAtMs', 'heartbeat hello'),
+        clientInstanceId: readTrueConcurrencyHeartbeatRequiredString(identity, 'clientInstanceId', 'heartbeat hello'),
+        attempt: readTrueConcurrencyHeartbeatRequiredPositiveInt(identity, 'attempt', 'heartbeat hello'),
+        nowMs: Date.now(),
+      };
+
+      const response = await fetch(heartbeatUrl, {
+        headers: {
+          Upgrade: 'websocket',
+          ...(authKey ? { [authHeader]: authKey } : {}),
+        },
+        signal,
+      });
+      if (response?.status !== 101 || !response?.webSocket) {
+        throw new Error(`[CQ] heartbeat upgrade failed with status ${response?.status ?? 'unknown'}`);
+      }
+
+      const ws = response.webSocket;
+      if (typeof ws.accept === 'function') {
+        ws.accept();
+      }
+
+      try {
+        const helloAckPromise = waitForTrueConcurrencyHeartbeatMessage(
+          ws,
+          signal,
+          heartbeatConfig.helloTimeoutMs,
+          'hello_ack',
+        );
+        ws.send(JSON.stringify(helloPayload));
+        const helloMessage = await helloAckPromise;
+        if (helloMessage?.type === 'terminal') {
+          throw createTrueConcurrencyHeartbeatTerminalError(
+            normalizeTrueConcurrencyHeartbeatTerminal(helloMessage),
+          );
+        }
+        const helloAck = normalizeTrueConcurrencyHelloAck(helloMessage);
+
+        const session = {
+          ws,
+          generation: helloAck.generation,
+          deadlineMs: helloAck.deadlineMs,
+          ackTimeoutMs: helloAck.ackTimeoutMs,
+          heartbeatIntervalMs: helloAck.heartbeatIntervalMs,
+          heartbeatTimeoutMs: helloAck.heartbeatTimeoutMs,
+          reconnectGraceMs: helloAck.reconnectGraceMs,
+          startTimeoutMs: helloAck.startTimeoutMs,
+          hardExpireAtMs: helloAck.hardExpireAtMs,
+          close(reason = '') {
+            closeTrueConcurrencyHeartbeatSocket(ws, reason);
+          },
+          async sendHeartbeat() {
+            const heartbeatPromise = waitForTrueConcurrencyHeartbeatMessage(
+              ws,
+              signal,
+              session.ackTimeoutMs,
+              'heartbeat_ack',
+            );
+            ws.send(JSON.stringify({
+              type: 'heartbeat',
+              requestId: helloPayload.requestId,
+              leaseId: helloPayload.leaseId,
+              leaseToken: helloPayload.leaseToken,
+              generation: session.generation,
+              nowMs: Date.now(),
+            }));
+            const heartbeatMessage = await heartbeatPromise;
+            if (heartbeatMessage?.type === 'terminal') {
+              throw createTrueConcurrencyHeartbeatTerminalError(
+                normalizeTrueConcurrencyHeartbeatTerminal(heartbeatMessage),
+              );
+            }
+            const ack = normalizeTrueConcurrencyHeartbeatAck(heartbeatMessage, session.generation);
+            session.deadlineMs = ack.deadlineMs;
+            session.hardExpireAtMs = ack.hardExpireAtMs;
+            return ack;
+          },
+        };
+
+        return session;
+      } catch (error) {
+        closeTrueConcurrencyHeartbeatSocket(ws, 'heartbeat_connect_failed');
+        throw error;
+      }
+    },
+
     async cancel(_ctx, requestIdentity, reason, signal) {
       const { data } = await postJson(
         cancelUrl,
@@ -2404,6 +2851,458 @@ const createConcurrencyReleaseController = ({ client, ctx, lease, label }) => {
       }
       return fullReleasePromise;
     },
+  };
+};
+
+const createTrueConcurrencyHeartbeatManager = ({
+  client,
+  ctx,
+  plan,
+  lease,
+  heartbeatConfig,
+  clientSignal,
+  abortStream,
+}) => {
+  const cfg = normalizeTrueConcurrencyHeartbeatConfig(heartbeatConfig, {
+    fieldName: 'concurrencyHandlerConfig.heartbeat',
+    required: true,
+  });
+  const managerController = new AbortController();
+  const managerSignal = managerController.signal;
+  const clientInstanceId = normalizeStringValue(plan?.clientInstanceId) || 'download-worker';
+  let stopped = false;
+  let currentSession = null;
+  let currentSessionListeners = null;
+  let heartbeatTimer = null;
+  let heartbeatInFlight = null;
+  let reconnectTask = null;
+  let reconnectFirstDisconnectAtMs = 0;
+  let reconnectAttempts = 0;
+  let connectAttempts = 0;
+  let reconnectGraceMs = cfg.reconnectGraceMs;
+  let hardExpireAtMs = Number(plan?.hardExpireAtMs) || 0;
+  let boundStreamAbortController = null;
+  let pendingAbortReason = '';
+
+  const clearHeartbeatTimer = () => {
+    if (heartbeatTimer) {
+      clearTimeout(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  };
+
+  const waitForDelay = (delayMs) => new Promise((resolve) => {
+    if (!Number.isFinite(delayMs) || delayMs <= 0 || managerSignal.aborted) {
+      resolve();
+      return;
+    }
+    let timer = null;
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      managerSignal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      resolve();
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, delayMs);
+    if (typeof timer?.unref === 'function') {
+      timer.unref();
+    }
+    managerSignal.addEventListener('abort', onAbort, { once: true });
+  });
+
+  const connectHeartbeatWithBudget = (identity, budgetMs, timeoutCloseReason) => new Promise((resolve, reject) => {
+    const remainingMs = Math.floor(Number(budgetMs));
+    const budgetLabel = timeoutCloseReason === 'heartbeat_connect_failed' ? 'initial connect' : 'reconnect';
+    const createBudgetError = () => {
+      const error = new Error(`[CQ] heartbeat ${budgetLabel} exhausted elapsed budget`);
+      error.heartbeatBudgetExhausted = true;
+      return error;
+    };
+    if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+      reject(createBudgetError());
+      return;
+    }
+
+    const attemptController = new AbortController();
+    let settled = false;
+    let timer = null;
+    let lateCloseReason = '';
+
+    const abortAttempt = () => {
+      if (!attemptController.signal.aborted) {
+        attemptController.abort();
+      }
+    };
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      managerSignal.removeEventListener('abort', onManagerAbort);
+    };
+    const settle = (callback) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const onManagerAbort = () => {
+      lateCloseReason = 'heartbeat_stopped';
+      abortAttempt();
+      settle(() => reject(new Error('[CQ] heartbeat connect aborted')));
+    };
+
+    if (managerSignal.aborted) {
+      onManagerAbort();
+      return;
+    }
+    managerSignal.addEventListener('abort', onManagerAbort, { once: true });
+
+    let connectPromise;
+    try {
+      connectPromise = Promise.resolve(client.connectHeartbeat(ctx, identity, attemptController.signal));
+    } catch (error) {
+      settle(() => reject(error));
+      return;
+    }
+
+    connectPromise.then(
+      (session) => {
+        if (lateCloseReason) {
+          session?.close?.(lateCloseReason);
+          return;
+        }
+        settle(() => resolve(session));
+      },
+      (error) => settle(() => reject(error)),
+    );
+
+    queueMicrotask(() => {
+      if (settled) {
+        return;
+      }
+      timer = setTimeout(() => {
+        lateCloseReason = timeoutCloseReason;
+        abortAttempt();
+        settle(() => reject(createBudgetError()));
+      }, remainingMs);
+      if (typeof timer?.unref === 'function') {
+        timer.unref();
+      }
+    });
+  });
+
+  const buildIdentity = (attempt) => ({
+    requestId: plan.requestId,
+    leaseId: lease.leaseId,
+    leaseToken: lease.leaseToken,
+    hardExpireAtMs: plan.hardExpireAtMs,
+    clientInstanceId,
+    attempt,
+  });
+
+  const disconnectSessionListeners = () => {
+    if (!currentSession || !currentSessionListeners) {
+      return;
+    }
+    currentSession.ws?.removeEventListener?.('close', currentSessionListeners.onClose);
+    currentSession.ws?.removeEventListener?.('error', currentSessionListeners.onError);
+    currentSessionListeners = null;
+  };
+
+  const closeSession = (reason = '') => {
+    disconnectSessionListeners();
+    if (currentSession) {
+      currentSession.close?.(reason);
+      currentSession = null;
+    }
+  };
+
+  const abortManagedStream = (reason) => {
+    if (!pendingAbortReason && typeof reason === 'string' && reason) {
+      pendingAbortReason = reason;
+    }
+    if (boundStreamAbortController && !boundStreamAbortController.signal.aborted) {
+      boundStreamAbortController.abort();
+    }
+    abortStream(reason);
+  };
+
+  const computeReconnectDeadlineMs = () => {
+    const reconnectGraceDeadlineMs = reconnectFirstDisconnectAtMs
+      + Math.max(0, reconnectGraceMs - cfg.reconnectSafetyMarginMs);
+    return Math.min(
+      reconnectFirstDisconnectAtMs + cfg.reconnectMaxElapsedMs,
+      reconnectGraceDeadlineMs,
+      hardExpireAtMs,
+    );
+  };
+
+  const computeRemainingReconnectBudgetMs = (nowMs = Date.now()) => Math.max(
+    0,
+    computeReconnectDeadlineMs() - nowMs,
+  );
+
+  const computeJitteredReconnectDelayMs = (rawDelayMs) => {
+    if (!Number.isFinite(rawDelayMs) || rawDelayMs <= 0) {
+      return 0;
+    }
+    const cappedDelayMs = Math.min(cfg.reconnectMaxDelayMs, rawDelayMs);
+    const jitterMs = Math.floor(Math.random() * cappedDelayMs);
+    return Math.min(cfg.reconnectMaxDelayMs, cappedDelayMs + jitterMs);
+  };
+
+  const attachSession = (session) => {
+    currentSession = session;
+    reconnectGraceMs = Number(session?.reconnectGraceMs) || reconnectGraceMs;
+    hardExpireAtMs = Number(session?.hardExpireAtMs) || hardExpireAtMs;
+    reconnectFirstDisconnectAtMs = 0;
+    reconnectAttempts = 0;
+
+    const onClose = () => {
+      if (stopped || !currentSession || currentSession !== session) {
+        return;
+      }
+      void startReconnect('socket_closed');
+    };
+    const onError = () => {
+      if (stopped || !currentSession || currentSession !== session) {
+        return;
+      }
+      void startReconnect('socket_error');
+    };
+
+    currentSessionListeners = { onClose, onError };
+    session.ws?.addEventListener?.('close', onClose);
+    session.ws?.addEventListener?.('error', onError);
+  };
+
+  const handleTerminal = (terminal) => {
+    if (stopped) {
+      return;
+    }
+    clearHeartbeatTimer();
+    stop(terminal?.reason || 'heartbeat_terminal');
+    if (TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_NO_RELEASE_REASONS.has(terminal?.reason)) {
+      abortManagedStream(terminal.reason);
+      return;
+    }
+    abortManagedStream('heartbeat_lost');
+  };
+
+  const scheduleNextHeartbeat = () => {
+    clearHeartbeatTimer();
+    if (stopped || !currentSession) {
+      return;
+    }
+    heartbeatTimer = setTimeout(() => {
+      heartbeatTimer = null;
+      const session = currentSession;
+      if (!session || stopped) {
+        return;
+      }
+      heartbeatInFlight = (async () => {
+        try {
+          await session.sendHeartbeat();
+          if (stopped || currentSession !== session) {
+            return;
+          }
+          scheduleNextHeartbeat();
+        } catch (error) {
+          if (stopped) {
+            return;
+          }
+          if (isTrueConcurrencyHeartbeatTerminalError(error)) {
+            handleTerminal(error.terminal);
+            return;
+          }
+          if (!currentSession || currentSession !== session) {
+            return;
+          }
+          await startReconnect('heartbeat_ack_failed');
+        } finally {
+          heartbeatInFlight = null;
+        }
+      })();
+    }, currentSession.heartbeatIntervalMs);
+    if (typeof heartbeatTimer?.unref === 'function') {
+      heartbeatTimer.unref();
+    }
+  };
+
+  async function startReconnect(_trigger) {
+    if (stopped) {
+      return;
+    }
+    if (reconnectTask) {
+      return reconnectTask;
+    }
+
+    clearHeartbeatTimer();
+    closeSession('heartbeat_reconnect');
+    reconnectFirstDisconnectAtMs = reconnectFirstDisconnectAtMs || Date.now();
+
+    reconnectTask = (async () => {
+      let nextDelayMs = cfg.reconnectBaseDelayMs;
+      while (!stopped && !managerSignal.aborted) {
+        if (reconnectAttempts >= cfg.reconnectMaxAttempts) {
+          break;
+        }
+        if (Date.now() >= computeReconnectDeadlineMs()) {
+          break;
+        }
+
+        reconnectAttempts += 1;
+        try {
+          const session = await connectHeartbeatWithBudget(
+            buildIdentity(++connectAttempts),
+            computeRemainingReconnectBudgetMs(),
+            'heartbeat_lost',
+          );
+          if (stopped) {
+            session.close?.('heartbeat_stopped');
+            return;
+          }
+          if (Date.now() >= computeReconnectDeadlineMs()) {
+            session.close?.('heartbeat_lost');
+            break;
+          }
+          attachSession(session);
+          scheduleNextHeartbeat();
+          return;
+        } catch (error) {
+          if (stopped || managerSignal.aborted) {
+            return;
+          }
+          if (isTrueConcurrencyHeartbeatTerminalError(error)) {
+            handleTerminal(error.terminal);
+            return;
+          }
+          if (error?.heartbeatBudgetExhausted) {
+            break;
+          }
+          if (reconnectAttempts >= cfg.reconnectMaxAttempts || Date.now() >= computeReconnectDeadlineMs()) {
+            break;
+          }
+        }
+
+        const remainingBudgetMs = computeRemainingReconnectBudgetMs();
+        if (remainingBudgetMs <= 0) {
+          break;
+        }
+        await waitForDelay(Math.min(computeJitteredReconnectDelayMs(nextDelayMs), remainingBudgetMs));
+        nextDelayMs = Math.min(cfg.reconnectMaxDelayMs, nextDelayMs * 2);
+      }
+
+      if (!stopped) {
+        stop('heartbeat_lost');
+        abortManagedStream('heartbeat_lost');
+      }
+    })().finally(() => {
+      reconnectTask = null;
+    });
+
+    return reconnectTask;
+  }
+
+  const stop = (reason = '') => {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    clearHeartbeatTimer();
+    closeSession(reason);
+    managerController.abort();
+    clientSignal?.removeEventListener?.('abort', onClientAbort);
+  };
+
+  const onClientAbort = () => {
+    abortManagedStream('client_disconnect');
+    void ensureCleanup('client_disconnect');
+  };
+  clientSignal?.addEventListener?.('abort', onClientAbort, { once: true });
+
+  const ensureCleanup = (reason = '') => {
+    stop(reason);
+    const cleanupPromise = Promise.allSettled([
+      heartbeatInFlight,
+      reconnectTask,
+    ].filter(Boolean));
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(cleanupPromise);
+    }
+    return cleanupPromise;
+  };
+
+  return {
+    async startBeforeOriginFetch() {
+      const startedAtMs = Date.now();
+      const initialConnectDeadlineMs = startedAtMs + cfg.initialConnectMaxElapsedMs;
+      let lastError = null;
+
+      while (!stopped && !managerSignal.aborted) {
+        if (connectAttempts >= cfg.initialConnectMaxAttempts) {
+          break;
+        }
+        if (Date.now() >= initialConnectDeadlineMs) {
+          break;
+        }
+
+        connectAttempts += 1;
+        try {
+          const session = await connectHeartbeatWithBudget(
+            buildIdentity(connectAttempts),
+            initialConnectDeadlineMs - Date.now(),
+            'heartbeat_connect_failed',
+          );
+          if (stopped) {
+            session.close?.('heartbeat_stopped');
+            break;
+          }
+          if (Date.now() > initialConnectDeadlineMs) {
+            session.close?.('heartbeat_connect_failed');
+            lastError = new Error('[CQ] heartbeat initial connect exceeded elapsed budget');
+            break;
+          }
+          attachSession(session);
+          scheduleNextHeartbeat();
+          return;
+        } catch (error) {
+          lastError = error;
+          if (isTrueConcurrencyHeartbeatTerminalError(error)) {
+            throw error;
+          }
+          if (error?.heartbeatBudgetExhausted) {
+            break;
+          }
+          if (Date.now() >= initialConnectDeadlineMs) {
+            break;
+          }
+        }
+      }
+
+      throw lastError || new Error('[CQ] heartbeat initial connect failed');
+    },
+
+    bindStreamAbortController(abortController) {
+      boundStreamAbortController = abortController;
+      if (pendingAbortReason && abortController && !abortController.signal.aborted) {
+        abortController.abort();
+      }
+    },
+
+    stop,
+    ensureCleanup,
   };
 };
 
@@ -4198,7 +5097,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let cqTargetUrl = '';
   let cqLease = null;
   let cqReleaseController = null;
+  let cqHeartbeatManager = null;
   let cqCleanupBoundToStream = false;
+  let cqStreamAbortController = null;
+  let cqStreamAbortReason = '';
   let cqAcquireDispatched = false;
 
   const clearPendingBreakerOnlyAttempt = () => {
@@ -4373,6 +5275,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       hostnameHash: await sha256Hash(hostname),
       siteBucket: await deriveSiteBucket(hostname, targetUrl, config.trueConcurrencySiteBucket),
       ipBucket: clientIpSubnetHash,
+      clientInstanceId: normalizeStringValue(env?.INSTANCE_ID) || 'download-worker',
       requestId,
       hardExpireAtMs,
       nowMs: Date.now(),
@@ -4387,13 +5290,25 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return createTrueConcurrencyUnavailableResponse(origin, `True concurrency ${result}${suffix}`);
   };
 
+  const abortCurrentTrueConcurrencyStream = (reason = '') => {
+    if (!cqStreamAbortReason && typeof reason === 'string' && reason) {
+      cqStreamAbortReason = reason;
+    }
+    if (cqStreamAbortController && !cqStreamAbortController.signal.aborted) {
+      cqStreamAbortController.abort();
+    }
+  };
+
   const clearCurrentTrueConcurrencyState = () => {
     cqPlan = null;
     cqPlanKey = '';
     cqTargetUrl = '';
     cqLease = null;
     cqReleaseController = null;
+    cqHeartbeatManager = null;
     cqCleanupBoundToStream = false;
+    cqStreamAbortController = null;
+    cqStreamAbortReason = '';
     cqAcquireDispatched = false;
   };
 
@@ -4403,6 +5318,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     const releaseController = cqReleaseController;
+    const heartbeatManager = cqHeartbeatManager;
+    await heartbeatManager?.ensureCleanup?.(reason);
     clearCurrentTrueConcurrencyState();
     if (immediate) {
       const released = await releaseController.releaseImmediately(reason);
@@ -4980,6 +5897,47 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           fqContext.attemptTicket = breakerAttempt?.attemptTicket ?? null;
         }
 
+        cqHeartbeatManager = createTrueConcurrencyHeartbeatManager({
+          client: concurrencyClient,
+          ctx,
+          plan: cqPlan,
+          lease: cqLease,
+          heartbeatConfig: config.concurrencyHandlerConfig?.heartbeat,
+          clientSignal,
+          abortStream: abortCurrentTrueConcurrencyStream,
+        });
+        try {
+          await cqHeartbeatManager.startBeforeOriginFetch();
+        } catch (error) {
+          const claimHostname = cqPlan?.hostname;
+          if (isTrueConcurrencyHeartbeatTerminalError(error)) {
+            const terminalReason = error.terminal?.reason || '';
+            if (terminalReason === 'token_mismatch' || terminalReason === 'protocol_error') {
+              await ensureCurrentTrueConcurrencyReleased('heartbeat_lost', true);
+            } else if (TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_NO_RELEASE_REASONS.has(terminalReason)) {
+              await cqHeartbeatManager?.ensureCleanup?.(terminalReason);
+              clearCurrentTrueConcurrencyState();
+            } else {
+              await ensureCurrentTrueConcurrencyReleased('heartbeat_connect_failed', true);
+            }
+          } else {
+            await ensureCurrentTrueConcurrencyReleased('heartbeat_connect_failed', true);
+          }
+          const settleResponse = await settleBreakerAttemptIfNeeded(claimHostname);
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(`[CQ] heartbeat start failed during ${phase}:`, message);
+          if (settleResponse instanceof Response) {
+            if (needFairQueue) {
+              await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq heartbeat settle failure`);
+            }
+            return settleResponse;
+          }
+          if (needFairQueue) {
+            await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq heartbeat failure`);
+          }
+          return createTrueConcurrencyUnavailableResponse(origin);
+        }
+
         cqAcquireDispatched = false;
         delete cqPlan.waitToken;
       } catch (error) {
@@ -5277,8 +6235,9 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       : buildSafeResponseHeaders(upstreamResponse, requestToWrap);
 
     if (!upstreamResponse.body) {
+      cqHeartbeatManager?.ensureCleanup?.('stream_complete');
       if (cqReleaseController) {
-        cqReleaseController.ensureReleased('no_body_response');
+        cqReleaseController.ensureReleased('stream_complete');
       }
       return new Response(null, {
         status: upstreamResponse.status,
@@ -5302,17 +6261,26 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           controller.enqueue(chunk);
         },
       }));
-	const abortController = new AbortController();
-	const msUntilExpire = Math.max(0, hardExpireAtMs - Date.now());
-	let hardExpiryAbort = false;
-	const expireTimer = setTimeout(() => {
-	  hardExpiryAbort = true;
-	  abortController.abort();
-	}, msUntilExpire);
+    const abortController = new AbortController();
+    cqStreamAbortController = abortController;
+    cqHeartbeatManager?.bindStreamAbortController?.(abortController);
+    if (cqStreamAbortReason && !abortController.signal.aborted) {
+      abortController.abort();
+    }
+    const managedHardExpireAtMs = Number(cqLease?.hardExpireAtMs) || hardExpireAtMs;
+    const msUntilExpire = Math.max(0, managedHardExpireAtMs - Date.now());
+    let hardExpiryAbort = false;
+    const expireTimer = setTimeout(() => {
+      hardExpiryAbort = true;
+      abortCurrentTrueConcurrencyStream('hard_expiry');
+    }, msUntilExpire);
     if (typeof expireTimer?.unref === 'function') {
       expireTimer.unref();
     }
-    const onClientAbort = () => abortController.abort();
+    const onClientAbort = () => {
+      clientAborted = true;
+      abortCurrentTrueConcurrencyStream('client_disconnect');
+    };
     if (clientSignal && typeof clientSignal.addEventListener === 'function') {
       clientSignal.addEventListener('abort', onClientAbort, { once: true });
     }
@@ -5321,24 +6289,47 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       onClientAbort();
     }
 
+    const readManagedStreamTerminationReason = (error) => {
+      if (cqStreamAbortReason) {
+        return cqStreamAbortReason;
+      }
+      if (didClientAbort()) {
+        return 'client_disconnect';
+      }
+      if (hardExpiryAbort || Date.now() >= managedHardExpireAtMs) {
+        return 'hard_expiry';
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (typeof error === 'string' || message === 'client closed download') {
+        return 'client_disconnect';
+      }
+      if (isAbortError(error)) {
+        return 'client_disconnect';
+      }
+      return 'upstream_failure';
+    };
+
     const pipePromise = upstreamResponse.body.pipeTo(streamPair.writable, {
       signal: abortController.signal,
       preventAbort: false,
       preventCancel: false,
       preventClose: false,
     }).then(async () => {
+      await cqHeartbeatManager?.ensureCleanup?.('stream_complete');
       await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
     }).catch(async (error) => {
-		const reason = didClientAbort()
-		  ? 'client_disconnect'
-		  : (hardExpiryAbort || Date.now() >= hardExpireAtMs ? 'hard_expiry' : 'upstream_failure');
-      await ensureCurrentTrueConcurrencyReleased(reason, true);
-      if (!isAbortError(error)) {
+      const reason = readManagedStreamTerminationReason(error);
+      await cqHeartbeatManager?.ensureCleanup?.(reason);
+      if (!TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_NO_RELEASE_REASONS.has(reason)) {
+        await ensureCurrentTrueConcurrencyReleased(reason, true);
+      }
+      if (!isAbortError(error) && reason === 'upstream_failure') {
         const message = error instanceof Error ? error.message : String(error);
         console.warn('[CQ] managed stream terminated with error:', message);
       }
     }).finally(() => {
       clearTimeout(expireTimer);
+      cqStreamAbortController = null;
       if (clientSignal && typeof clientSignal.removeEventListener === 'function') {
         clientSignal.removeEventListener('abort', onClientAbort);
       }
@@ -5673,6 +6664,9 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     }
     throw error;
   } finally {
+    if (cqHeartbeatManager && !cqCleanupBoundToStream) {
+      cqHeartbeatManager.ensureCleanup('final_cleanup');
+    }
     if (cqReleaseController && !cqCleanupBoundToStream) {
       cqReleaseController.ensureReleased('final_cleanup');
     }
@@ -5786,8 +6780,10 @@ export const __fairQueueTestHooks = {
   }),
   buildFinalCleanupGroups,
   createConcurrencyHandlerClient,
+  createTrueConcurrencyHeartbeatManager,
   createConcurrencyReleaseController,
   createSlotHandlerClient,
+  normalizeTrueConcurrencyReleaseReason,
   deriveOpenSeconds,
   finalizeFairQueueContext,
   readOpenBreakerSnapshot,

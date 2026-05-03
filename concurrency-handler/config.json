@@ -44,6 +44,17 @@
       "intervalSeconds": 300,
       "batchSize": 500
     },
+    "heartbeat": {
+      "enabled": true,
+      "required": true,
+      "intervalMs": 5000,
+      "timeoutMs": 15000,
+      "reconnectGraceMs": 12000,
+      "helloTimeoutMs": 2000,
+      "startTimeoutMs": 7000,
+      "ackTimeoutMs": 2000,
+      "schedulerBatchSize": 500
+    },
     "rpc": {
       "acquireFunc": "cq_acquire",
       "releaseFunc": "cq_release",

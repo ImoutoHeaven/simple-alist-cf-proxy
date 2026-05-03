@@ -42,6 +42,17 @@ func validTestConfig() Config {
 				IntervalSeconds: 300,
 				BatchSize:       500,
 			},
+			Heartbeat: ConcurrencyHeartbeatConfig{
+				Enabled:           true,
+				Required:          true,
+				IntervalMs:        5000,
+				TimeoutMs:         15000,
+				ReconnectGraceMs:  12000,
+				HelloTimeoutMs:    2000,
+				StartTimeoutMs:    7000,
+				AckTimeoutMs:      2000,
+				SchedulerBatchSize: 500,
+			},
 			RPC: ConcurrencyRPCConfig{
 				AcquireFunc: "cq_acquire",
 				ReleaseFunc: "cq_release",
@@ -180,6 +191,77 @@ func TestParseConfigBytesAppliesDefaults(t *testing.T) {
 	}
 	if cfg.LogLevel != "info" {
 		t.Fatalf("expected default log level info, got %q", cfg.LogLevel)
+	}
+	if !cfg.Concurrency.Heartbeat.Enabled || !cfg.Concurrency.Heartbeat.Required {
+		t.Fatalf("expected heartbeat defaults enabled and required, got %+v", cfg.Concurrency.Heartbeat)
+	}
+	if cfg.Concurrency.Heartbeat.IntervalMs != 5000 || cfg.Concurrency.Heartbeat.TimeoutMs != 15000 || cfg.Concurrency.Heartbeat.ReconnectGraceMs != 12000 {
+		t.Fatalf("unexpected heartbeat timing defaults: %+v", cfg.Concurrency.Heartbeat)
+	}
+	if cfg.Concurrency.Heartbeat.HelloTimeoutMs != 2000 || cfg.Concurrency.Heartbeat.StartTimeoutMs != 7000 || cfg.Concurrency.Heartbeat.AckTimeoutMs != 2000 {
+		t.Fatalf("unexpected heartbeat handshake defaults: %+v", cfg.Concurrency.Heartbeat)
+	}
+	if cfg.Concurrency.Heartbeat.SchedulerBatchSize != 500 {
+		t.Fatalf("expected heartbeat schedulerBatchSize default 500, got %+v", cfg.Concurrency.Heartbeat)
+	}
+}
+
+func TestConfigValidateRejectsHeartbeatContractViolations(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name: "disabled heartbeat",
+			mutate: func(cfg *Config) {
+				cfg.Concurrency.Heartbeat.Enabled = false
+			},
+			want: "concurrency.heartbeat.enabled",
+		},
+		{
+			name: "heartbeat required false",
+			mutate: func(cfg *Config) {
+				cfg.Concurrency.Heartbeat.Required = false
+			},
+			want: "concurrency.heartbeat.required",
+		},
+		{
+			name: "timeout must exceed interval",
+			mutate: func(cfg *Config) {
+				cfg.Concurrency.Heartbeat.TimeoutMs = cfg.Concurrency.Heartbeat.IntervalMs
+			},
+			want: "timeoutMs",
+		},
+		{
+			name: "reconnect grace capped by timeout",
+			mutate: func(cfg *Config) {
+				cfg.Concurrency.Heartbeat.ReconnectGraceMs = cfg.Concurrency.Heartbeat.TimeoutMs + 1
+			},
+			want: "reconnectGraceMs",
+		},
+		{
+			name: "scheduler batch size positive",
+			mutate: func(cfg *Config) {
+				cfg.Concurrency.Heartbeat.SchedulerBatchSize = 0
+			},
+			want: "schedulerBatchSize",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validTestConfig()
+			tc.mutate(&cfg)
+
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("expected heartbeat validation error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q error, got %v", tc.want, err)
+			}
+		})
 	}
 }
 

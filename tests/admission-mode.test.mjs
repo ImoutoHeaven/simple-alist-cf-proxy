@@ -12,6 +12,84 @@ const createJsonResponse = (payload) => new Response(JSON.stringify(payload), {
 });
 
 const ACK_HANDOFF_URL = 'https://cq.example.test/api/v1/concurrency/ack_handoff';
+const HEARTBEAT_URL = 'https://cq.example.test/api/v1/concurrency/heartbeat';
+const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT = {
+  enabled: true,
+  required: true,
+  path: '/api/v1/concurrency/heartbeat',
+  intervalMs: 5000,
+  timeoutMs: 15000,
+  reconnectGraceMs: 12000,
+  helloTimeoutMs: 2000,
+  startTimeoutMs: 7000,
+  ackTimeoutMs: 2000,
+  initialConnectMaxAttempts: 3,
+  initialConnectMaxElapsedMs: 3000,
+  reconnectMaxAttempts: 3,
+  reconnectMaxElapsedMs: 10000,
+  reconnectBaseDelayMs: 250,
+  reconnectMaxDelayMs: 2000,
+  reconnectSafetyMarginMs: 1000,
+};
+
+const createFakeHeartbeatSocket = ({
+  helloAck = {
+    type: 'hello_ack',
+    generation: 7,
+    deadlineMs: Date.now() + 15_000,
+    ackTimeoutMs: 2000,
+    heartbeatIntervalMs: 5000,
+    heartbeatTimeoutMs: 15000,
+    reconnectGraceMs: 12000,
+    startTimeoutMs: 7000,
+    hardExpireAtMs: Date.now() + 60_000,
+  },
+  heartbeatAck = {
+    type: 'heartbeat_ack',
+    generation: 7,
+    deadlineMs: Date.now() + 15_000,
+    hardExpireAtMs: Date.now() + 60_000,
+  },
+} = {}) => {
+  const listeners = new Map();
+
+  const emit = (type, event = {}) => {
+    const handlers = listeners.get(type);
+    if (!handlers) {
+      return;
+    }
+    for (const handler of [...handlers]) {
+      handler(event);
+    }
+  };
+
+  return {
+    sent: [],
+    addEventListener(type, handler) {
+      const handlers = listeners.get(type) || new Set();
+      handlers.add(handler);
+      listeners.set(type, handlers);
+    },
+    removeEventListener(type, handler) {
+      listeners.get(type)?.delete(handler);
+    },
+    accept() {},
+    send(data) {
+      this.sent.push(data);
+      const payload = JSON.parse(data);
+      if (payload.type === 'hello' && helloAck) {
+        queueMicrotask(() => emit('message', { data: JSON.stringify(helloAck) }));
+        return;
+      }
+      if (payload.type === 'heartbeat' && heartbeatAck) {
+        queueMicrotask(() => emit('message', { data: JSON.stringify(heartbeatAck) }));
+      }
+    },
+    close(code = 1000, reason = '') {
+      queueMicrotask(() => emit('close', { code, reason }));
+    },
+  };
+};
 
 const createClaimGrantResponse = ({
   leaseId,
@@ -252,6 +330,7 @@ const buildRuntimeBootstrap = ({ fairQueueHostPatterns = [], throttleHostPattern
         hostPatterns: trueConcurrencyHostPatterns,
         handlerUrl: 'https://cq.example.test',
         handlerAuthKey: 'cq-secret',
+        heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
       },
     } : {}),
   },
@@ -275,6 +354,20 @@ const fetchWithDefaultTicketStateRpc = async (input, init = {}) => {
   const ticketStateResponse = await handleTicketStateRpc(url, init);
   if (ticketStateResponse) {
     return ticketStateResponse;
+  }
+  if (url === HEARTBEAT_URL) {
+    try {
+      return await delegatedFetch(input, init);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes(`Unexpected fetch URL in test: ${HEARTBEAT_URL}`)) {
+        throw error;
+      }
+    }
+    return {
+      status: 101,
+      webSocket: createFakeHeartbeatSocket(),
+    };
   }
   if (typeof delegatedFetch !== 'function') {
     throw new Error('global fetch handler not configured');
@@ -829,6 +922,14 @@ test('queue_only with true concurrency wait path never calls breaker RPCs', asyn
       return createJsonResponse({ result: 'acknowledged' });
     }
 
+    if (url === HEARTBEAT_URL) {
+      calls.push('heartbeat-upgrade');
+      return {
+        status: 101,
+        webSocket: createFakeHeartbeatSocket(),
+      };
+    }
+
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
       return createJsonResponse({ result: 'released' });
@@ -865,6 +966,7 @@ test('queue_only with true concurrency wait path never calls breaker RPCs', asyn
       'concurrency-acquire-2',
       'concurrency-claim',
       'concurrency-ack-handoff',
+      'heartbeat-upgrade',
       'origin-fetch',
       'concurrency-release',
     ]);

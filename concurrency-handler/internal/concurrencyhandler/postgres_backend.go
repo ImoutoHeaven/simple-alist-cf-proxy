@@ -224,12 +224,12 @@ func (p *postgresBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest)
 	return result, rows.Err()
 }
 
-func (p *postgresBackend) AckHandoff(ctx context.Context, req AckHandoffRequest) (*AckHandoffResult, error) {
-	query, err := rpcSelectAll(fixedAckHandoffFunc, 3)
+func (p *postgresBackend) AckHandoff(ctx context.Context, req AckHandoffBackendRequest) (*AckHandoffResult, error) {
+	query, err := rpcSelectAll(fixedAckHandoffFunc, 4)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := p.db.Query(ctx, query, req.RequestID, req.HandoffToken, req.NowMs)
+	rows, err := p.db.Query(ctx, query, req.RequestID, req.HandoffToken, req.NowMs, req.StartTimeoutMs)
 	if err != nil {
 		return nil, err
 	}
@@ -239,11 +239,124 @@ func (p *postgresBackend) AckHandoff(ctx context.Context, req AckHandoffRequest)
 	}
 	result := &AckHandoffResult{}
 	var reason sql.NullString
-	if err := rows.Scan(&result.Result, &reason); err != nil {
+	var heartbeatDeadlineMs sql.NullInt64
+	if err := rows.Scan(&result.Result, &reason, &heartbeatDeadlineMs); err != nil {
 		return nil, err
 	}
 	result.Reason = reason.String
+	result.HeartbeatDeadlineMs = heartbeatDeadlineMs.Int64
 	if err := validateAckHandoffResult(result); err != nil {
+		return nil, err
+	}
+	return result, rows.Err()
+}
+
+func (p *postgresBackend) HeartbeatOpen(ctx context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+	query, err := rpcSelectAll("cq_heartbeat_open", 10)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := p.db.Query(ctx, query, req.RequestID, req.LeaseID, req.LeaseToken, req.HardExpireAtMs, req.NowMs, req.HeartbeatTimeoutMs, req.AckTimeoutMs, req.HeartbeatIntervalMs, req.ReconnectGraceMs, req.StartTimeoutMs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanHeartbeatResult(rows, "empty heartbeat open result")
+}
+
+func (p *postgresBackend) HeartbeatRefresh(ctx context.Context, req HeartbeatRefreshRequest) (*HeartbeatResult, error) {
+	query, err := rpcSelectAll("cq_heartbeat_refresh", 6)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := p.db.Query(ctx, query, req.RequestID, req.LeaseID, req.LeaseToken, req.Generation, req.NowMs, req.HeartbeatTimeoutMs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanHeartbeatResult(rows, "empty heartbeat refresh result")
+}
+
+func (p *postgresBackend) HeartbeatDisconnect(ctx context.Context, req HeartbeatDisconnectRequest) (*HeartbeatResult, error) {
+	query, err := rpcSelectAll("cq_heartbeat_disconnect", 6)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := p.db.Query(ctx, query, req.RequestID, req.LeaseID, req.LeaseToken, req.Generation, req.NowMs, req.ReconnectGraceMs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanHeartbeatResult(rows, "empty heartbeat disconnect result")
+}
+
+func (p *postgresBackend) ExpireHeartbeatIfDue(ctx context.Context, req ExpireHeartbeatRequest) (*HeartbeatResult, error) {
+	query, err := rpcSelectAll("cq_expire_heartbeat_if_due", 2)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := p.db.Query(ctx, query, req.RequestID, req.NowMs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanHeartbeatResult(rows, "empty expire heartbeat result")
+}
+
+func (p *postgresBackend) LoadActiveHeartbeatDeadlines(ctx context.Context, nowMs int64, limit int) ([]HeartbeatDeadlineSnapshot, error) {
+	query := `
+		SELECT request_id, heartbeat_deadline_ms
+		FROM concurrency_requests
+		WHERE state = 'active'
+		  AND heartbeat_deadline_ms IS NOT NULL
+		  AND hard_expire_at_ms > $1
+		ORDER BY heartbeat_deadline_ms, request_id`
+	args := []any{nowMs}
+	if limit > 0 {
+		query += `
+		LIMIT $2`
+		args = append(args, limit)
+	}
+	rows, err := p.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var snapshots []HeartbeatDeadlineSnapshot
+	for rows.Next() {
+		var snapshot HeartbeatDeadlineSnapshot
+		if err := rows.Scan(&snapshot.RequestID, &snapshot.DeadlineMs); err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return snapshots, nil
+}
+
+func scanHeartbeatResult(rows pgRows, emptyMessage string) (*HeartbeatResult, error) {
+	if !rows.Next() {
+		return nil, errors.New(emptyMessage)
+	}
+	result := &HeartbeatResult{}
+	var reason sql.NullString
+	var generation, deadlineMs, ackTimeoutMs, heartbeatIntervalMs, heartbeatTimeoutMs, reconnectGraceMs, startTimeoutMs, hardExpireAtMs sql.NullInt64
+	if err := rows.Scan(&result.Result, &reason, &generation, &deadlineMs, &ackTimeoutMs, &heartbeatIntervalMs, &heartbeatTimeoutMs, &reconnectGraceMs, &startTimeoutMs, &hardExpireAtMs); err != nil {
+		return nil, err
+	}
+	result.Reason = reason.String
+	result.Generation = generation.Int64
+	result.DeadlineMs = deadlineMs.Int64
+	result.AckTimeoutMs = ackTimeoutMs.Int64
+	result.HeartbeatIntervalMs = heartbeatIntervalMs.Int64
+	result.HeartbeatTimeoutMs = heartbeatTimeoutMs.Int64
+	result.ReconnectGraceMs = reconnectGraceMs.Int64
+	result.StartTimeoutMs = startTimeoutMs.Int64
+	result.HardExpireAtMs = hardExpireAtMs.Int64
+	if err := validateHeartbeatResult(result); err != nil {
 		return nil, err
 	}
 	return result, rows.Err()

@@ -4,6 +4,118 @@ import { __fairQueueTestHooks } from '../src/worker.js';
 
 const { resolveConfig, createConcurrencyHandlerClient } = __fairQueueTestHooks;
 
+const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT = {
+  enabled: true,
+  required: true,
+  path: '/api/v1/concurrency/heartbeat',
+  intervalMs: 5000,
+  timeoutMs: 15000,
+  reconnectGraceMs: 12000,
+  helloTimeoutMs: 2000,
+  startTimeoutMs: 7000,
+  ackTimeoutMs: 2000,
+  initialConnectMaxAttempts: 3,
+  initialConnectMaxElapsedMs: 3000,
+  reconnectMaxAttempts: 3,
+  reconnectMaxElapsedMs: 10000,
+  reconnectBaseDelayMs: 250,
+  reconnectMaxDelayMs: 2000,
+  reconnectSafetyMarginMs: 1000,
+};
+
+const buildTrueConcurrency = (overrides = {}) => {
+  const config = {
+    enabled: true,
+    hostPatterns: ['*.sharepoint.com'],
+    handlerUrl: 'https://cq.example.test/',
+    handlerAuthKey: 'cq-secret',
+    heartbeat: {
+      enabled: true,
+      required: true,
+    },
+    ...overrides,
+  };
+
+  if (overrides.heartbeat && typeof overrides.heartbeat === 'object') {
+    config.heartbeat = {
+      enabled: true,
+      required: true,
+      ...overrides.heartbeat,
+    };
+  }
+
+  return config;
+};
+
+const createFakeHeartbeatSocket = ({
+  helloAck = {
+    type: 'hello_ack',
+    generation: 7,
+    deadlineMs: 12000,
+    ackTimeoutMs: 2300,
+    heartbeatIntervalMs: 5100,
+    heartbeatTimeoutMs: 15100,
+    reconnectGraceMs: 11900,
+    startTimeoutMs: 6900,
+    hardExpireAtMs: 20000,
+  },
+  heartbeatAck = {
+    type: 'heartbeat_ack',
+    generation: 7,
+    deadlineMs: 15000,
+    hardExpireAtMs: 20000,
+  },
+} = {}) => {
+  const listeners = new Map();
+  let closeArgs = null;
+
+  const emit = (type, event = {}) => {
+    const handlers = listeners.get(type);
+    if (!handlers) {
+      return;
+    }
+    for (const handler of [...handlers]) {
+      handler(event);
+    }
+  };
+
+  return {
+    accepted: false,
+    sent: [],
+    addEventListener(type, handler) {
+      const handlers = listeners.get(type) || new Set();
+      handlers.add(handler);
+      listeners.set(type, handlers);
+    },
+    removeEventListener(type, handler) {
+      listeners.get(type)?.delete(handler);
+    },
+    accept() {
+      this.accepted = true;
+    },
+    send(data) {
+      this.sent.push(data);
+      const payload = JSON.parse(data);
+      if (payload.type === 'hello') {
+        queueMicrotask(() => emit('message', { data: JSON.stringify(helloAck) }));
+        return;
+      }
+      if (payload.type === 'heartbeat') {
+        queueMicrotask(() => emit('message', { data: JSON.stringify(heartbeatAck) }));
+        return;
+      }
+      throw new Error(`unexpected socket payload type: ${payload.type}`);
+    },
+    close(code = 1000, reason = '') {
+      closeArgs = { code, reason };
+      queueMicrotask(() => emit('close', { code, reason }));
+    },
+    getCloseArgs() {
+      return closeArgs;
+    },
+  };
+};
+
 const buildBootstrap = (trueConcurrency = undefined) => ({
   common: {
     tokenHmacKey: 'bootstrap-token',
@@ -35,12 +147,7 @@ const buildBootstrap = (trueConcurrency = undefined) => ({
 });
 
 test('resolveConfig exposes true concurrency config with deterministic defaults', () => {
-  const config = resolveConfig({}, buildBootstrap({
-    enabled: true,
-    hostPatterns: ['*.sharepoint.com'],
-    handlerUrl: 'https://cq.example.test/',
-    handlerAuthKey: 'cq-secret',
-  }), { download: {} });
+  const config = resolveConfig({}, buildBootstrap(buildTrueConcurrency()), { download: {} });
 
   assert.equal(config.trueConcurrencyEnabled, true);
   assert.deepEqual(config.trueConcurrencyHostnamePatterns, ['*.sharepoint.com']);
@@ -54,16 +161,12 @@ test('resolveConfig exposes true concurrency config with deterministic defaults'
     authHeader: 'X-CQ-Auth',
     acquireTimeoutMs: 11500,
     releaseTimeoutMs: 1500,
+    heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
   });
 });
 
 test('resolveConfig default acquire timeout keeps explicit slack above the default CQ wait poll window', () => {
-  const config = resolveConfig({}, buildBootstrap({
-    enabled: true,
-    hostPatterns: ['*.sharepoint.com'],
-    handlerUrl: 'https://cq.example.test/',
-    handlerAuthKey: 'cq-secret',
-  }), { download: {} });
+  const config = resolveConfig({}, buildBootstrap(buildTrueConcurrency()), { download: {} });
 
   assert.equal(config.concurrencyHandlerConfig.acquireTimeoutMs, 11500);
   assert.ok(config.concurrencyHandlerConfig.acquireTimeoutMs > 10000);
@@ -71,41 +174,120 @@ test('resolveConfig default acquire timeout keeps explicit slack above the defau
 
 test('resolveConfig requires true concurrency hostPatterns handlerUrl and handlerAuthKey when enabled', () => {
   assert.throws(
-    () => resolveConfig({}, buildBootstrap({
-      enabled: true,
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
       handlerUrl: 'https://cq.example.test',
       handlerAuthKey: 'cq-secret',
-    }), { download: {} }),
+      hostPatterns: undefined,
+    })), { download: {} }),
     /hostPatterns/
   );
 
   assert.throws(
-    () => resolveConfig({}, buildBootstrap({
-      enabled: true,
-      hostPatterns: ['*.sharepoint.com'],
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
       handlerAuthKey: 'cq-secret',
-    }), { download: {} }),
+      handlerUrl: undefined,
+    })), { download: {} }),
     /handlerUrl/
   );
 
+  assert.throws(
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
+      handlerUrl: 'https://cq.example.test',
+      handlerAuthKey: undefined,
+    })), { download: {} }),
+    /handlerAuthKey/
+  );
+});
+
+test('resolveConfig requires heartbeat config and validates heartbeat timing when true concurrency is enabled', () => {
   assert.throws(
     () => resolveConfig({}, buildBootstrap({
       enabled: true,
       hostPatterns: ['*.sharepoint.com'],
       handlerUrl: 'https://cq.example.test',
+      handlerAuthKey: 'cq-secret',
     }), { download: {} }),
-    /handlerAuthKey/
+    /heartbeat/
+  );
+
+  assert.throws(
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
+      heartbeat: { enabled: false },
+    })), { download: {} }),
+    /heartbeat\.enabled/
+  );
+
+  assert.throws(
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
+      heartbeat: { required: false },
+    })), { download: {} }),
+    /heartbeat\.required/
+  );
+
+  assert.throws(
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
+      heartbeat: { intervalMs: 5000, timeoutMs: 5000 },
+    })), { download: {} }),
+    /timeoutMs/
+  );
+
+  assert.throws(
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
+      heartbeat: { timeoutMs: 15000, reconnectGraceMs: 15001 },
+    })), { download: {} }),
+    /reconnectGraceMs/
+  );
+
+  assert.throws(
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
+      heartbeat: { reconnectGraceMs: 12000, reconnectSafetyMarginMs: 12000 },
+    })), { download: {} }),
+    /reconnectSafetyMarginMs/
+  );
+
+  assert.throws(
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
+      heartbeat: { reconnectGraceMs: 12000, reconnectSafetyMarginMs: 1000, reconnectMaxElapsedMs: 11001 },
+    })), { download: {} }),
+    /reconnect/
+  );
+
+  assert.throws(
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
+      heartbeat: {
+        helloTimeoutMs: 2000,
+        startTimeoutMs: 7000,
+        reconnectSafetyMarginMs: 1000,
+        initialConnectMaxElapsedMs: 4001,
+      },
+    })), { download: {} }),
+    /startTimeoutMs/
   );
 });
 
+test('resolveConfig accepts explicit disabled heartbeat config when true concurrency is disabled', () => {
+  const config = resolveConfig({}, buildBootstrap(buildTrueConcurrency({
+    enabled: false,
+    heartbeat: {
+      enabled: false,
+      required: false,
+    },
+  })), { download: {} });
+
+  assert.equal(config.trueConcurrencyEnabled, false);
+  assert.deepEqual(config.concurrencyHandlerConfig.heartbeat, {
+    ...DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+    enabled: false,
+    required: false,
+  });
+});
+
 test('resolveConfig accepts host site bucket mode', () => {
-  const config = resolveConfig({}, buildBootstrap({
-    enabled: true,
+  const config = resolveConfig({}, buildBootstrap(buildTrueConcurrency({
     hostPatterns: ['*.example.com'],
     handlerUrl: 'https://cq.example.test',
-    handlerAuthKey: 'cq-secret',
     siteBucket: { mode: 'host' },
-  }), { download: {} });
+  })), { download: {} });
 
   assert.deepEqual(config.trueConcurrencySiteBucket, {
     mode: 'host',
@@ -114,39 +296,33 @@ test('resolveConfig accepts host site bucket mode', () => {
 });
 
 test('resolveConfig normalizes true concurrency site bucket modes with precedence and fallback', () => {
-  const modesWin = resolveConfig({}, buildBootstrap({
-    enabled: true,
+  const modesWin = resolveConfig({}, buildBootstrap(buildTrueConcurrency({
     hostPatterns: ['*.example.com'],
     handlerUrl: 'https://cq.example.test',
-    handlerAuthKey: 'cq-secret',
     siteBucket: { mode: 'googledrive', modes: ['', 'host', 'host', 'sharepoint'] },
-  }), { download: {} });
+  })), { download: {} });
 
   assert.deepEqual(modesWin.trueConcurrencySiteBucket, {
     mode: 'host',
     modes: ['host', 'sharepoint'],
   });
 
-  const emptyModesFallback = resolveConfig({}, buildBootstrap({
-    enabled: true,
+  const emptyModesFallback = resolveConfig({}, buildBootstrap(buildTrueConcurrency({
     hostPatterns: ['*.example.com'],
     handlerUrl: 'https://cq.example.test',
-    handlerAuthKey: 'cq-secret',
     siteBucket: { mode: 'googledrive', modes: ['', '   '] },
-  }), { download: {} });
+  })), { download: {} });
 
   assert.deepEqual(emptyModesFallback.trueConcurrencySiteBucket, {
     mode: 'googledrive',
     modes: ['googledrive'],
   });
 
-  const defaultModes = resolveConfig({}, buildBootstrap({
-    enabled: true,
+  const defaultModes = resolveConfig({}, buildBootstrap(buildTrueConcurrency({
     hostPatterns: ['*.example.com'],
     handlerUrl: 'https://cq.example.test',
-    handlerAuthKey: 'cq-secret',
     siteBucket: {},
-  }), { download: {} });
+  })), { download: {} });
 
   assert.deepEqual(defaultModes.trueConcurrencySiteBucket, {
     mode: 'sharepoint',
@@ -156,13 +332,9 @@ test('resolveConfig normalizes true concurrency site bucket modes with precedenc
 
 test('resolveConfig rejects unsupported true concurrency site bucket modes', () => {
   assert.throws(
-    () => resolveConfig({}, buildBootstrap({
-      enabled: true,
-      hostPatterns: ['*.sharepoint.com'],
-      handlerUrl: 'https://cq.example.test',
-      handlerAuthKey: 'cq-secret',
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({
       siteBucket: { modes: ['sharepoint', 'other'] },
-    }), { download: {} }),
+    })), { download: {} }),
     /unsupported siteBucket mode other/
   );
 });
@@ -280,6 +452,103 @@ test('concurrency client normalizes granted acquire responses', async () => {
     });
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('concurrency client exposes connectHeartbeat and enforces heartbeat wire contract', async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  const ws = createFakeHeartbeatSocket();
+
+  Date.now = () => 123456;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url,
+      method: init.method,
+      headers: init.headers,
+      hasSignal: init.signal instanceof AbortSignal,
+    });
+    return {
+      status: 101,
+      webSocket: ws,
+    };
+  };
+
+  try {
+    const client = createConcurrencyHandlerClient({
+      concurrencyHandlerConfig: {
+        url: 'https://cq.example.test/',
+        authKey: 'cq-secret',
+        authHeader: 'X-CQ-Auth',
+        heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+      },
+    });
+
+    assert.equal(typeof client.connectHeartbeat, 'function');
+
+    const heartbeat = await client.connectHeartbeat(null, {
+      requestId: 'req-1',
+      leaseId: 'lease-1',
+      leaseToken: 'token-1',
+      hardExpireAtMs: 20000,
+      clientInstanceId: 'client-1',
+      attempt: 2,
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://cq.example.test/api/v1/concurrency/heartbeat');
+    assert.equal(calls[0].method, undefined);
+    assert.equal(calls[0].headers.Upgrade, 'websocket');
+    assert.equal(calls[0].headers['X-CQ-Auth'], 'cq-secret');
+    assert.equal(calls[0].hasSignal, true);
+    assert.equal(ws.accepted, true);
+
+    const hello = JSON.parse(ws.sent[0]);
+    assert.equal(hello.type, 'hello');
+    assert.equal(hello.requestId, 'req-1');
+    assert.equal(hello.leaseId, 'lease-1');
+    assert.equal(hello.leaseToken, 'token-1');
+    assert.equal(hello.hardExpireAtMs, 20000);
+    assert.equal(hello.clientInstanceId, 'client-1');
+    assert.equal(hello.attempt, 2);
+    assert.equal(typeof hello.nowMs, 'number');
+    assert.equal(Object.hasOwn(hello, 'downloadedBytes'), false);
+
+    assert.equal(heartbeat.ws, ws);
+    assert.equal(heartbeat.generation, 7);
+    assert.equal(heartbeat.deadlineMs, 12000);
+    assert.equal(heartbeat.ackTimeoutMs, 2300);
+    assert.equal(heartbeat.heartbeatIntervalMs, 5100);
+    assert.equal(heartbeat.heartbeatTimeoutMs, 15100);
+    assert.equal(heartbeat.reconnectGraceMs, 11900);
+    assert.equal(heartbeat.startTimeoutMs, 6900);
+    assert.equal(heartbeat.hardExpireAtMs, 20000);
+    assert.equal(typeof heartbeat.close, 'function');
+    assert.equal(typeof heartbeat.sendHeartbeat, 'function');
+
+    const ack = await heartbeat.sendHeartbeat();
+    const heartbeatMessage = JSON.parse(ws.sent[1]);
+    assert.equal(heartbeatMessage.type, 'heartbeat');
+    assert.equal(heartbeatMessage.requestId, 'req-1');
+    assert.equal(heartbeatMessage.leaseId, 'lease-1');
+    assert.equal(heartbeatMessage.leaseToken, 'token-1');
+    assert.equal(heartbeatMessage.generation, 7);
+    assert.equal(typeof heartbeatMessage.nowMs, 'number');
+    assert.equal(Object.hasOwn(heartbeatMessage, 'downloadedBytes'), false);
+
+    assert.deepEqual(ack, {
+      type: 'heartbeat_ack',
+      generation: 7,
+      deadlineMs: 15000,
+      hardExpireAtMs: 20000,
+    });
+
+    heartbeat.close('done');
+    assert.deepEqual(ws.getCloseArgs(), { code: 1000, reason: 'done' });
+  } finally {
+    globalThis.fetch = originalFetch;
+    Date.now = originalNow;
   }
 });
 
@@ -626,13 +895,9 @@ test('concurrency client rejects conflict payloads with unsupported reason', asy
 });
 
 test('resolveConfig omits legacy precheck timeout from true concurrency config', () => {
-  const config = resolveConfig({}, buildBootstrap({
-    enabled: true,
-    hostPatterns: ['*.sharepoint.com'],
-    handlerUrl: 'https://cq.example.test/',
-    handlerAuthKey: 'cq-secret',
+  const config = resolveConfig({}, buildBootstrap(buildTrueConcurrency({
     precheckTimeoutMs: 9999,
-  }), { download: {} });
+  })), { download: {} });
 
   assert.equal(Object.hasOwn(config.concurrencyHandlerConfig, 'precheckTimeoutMs'), false);
   assert.deepEqual(config.concurrencyHandlerConfig, {
@@ -641,6 +906,7 @@ test('resolveConfig omits legacy precheck timeout from true concurrency config',
     authHeader: 'X-CQ-Auth',
     acquireTimeoutMs: 11500,
     releaseTimeoutMs: 1500,
+    heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
   });
 });
 

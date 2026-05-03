@@ -417,19 +417,41 @@ type runtimeClaimGrantResult struct {
 }
 
 type runtimeAckHandoffResult struct {
-	Result string
-	Reason sql.NullString
+	Result              string
+	Reason              sql.NullString
+	HeartbeatDeadlineMs sql.NullInt64
+}
+
+type runtimeHeartbeatResult struct {
+	Result              string
+	Reason              sql.NullString
+	Generation          sql.NullInt64
+	DeadlineMs          sql.NullInt64
+	AckTimeoutMs        sql.NullInt64
+	HeartbeatIntervalMs sql.NullInt64
+	HeartbeatTimeoutMs  sql.NullInt64
+	ReconnectGraceMs    sql.NullInt64
+	StartTimeoutMs      sql.NullInt64
+	HardExpireAtMs      sql.NullInt64
 }
 
 type runtimeRequestState struct {
-	State             string
-	TerminalReason    sql.NullString
-	ClaimState        sql.NullString
-	ClaimClaimedAtMs  sql.NullInt64
-	HandoffState      sql.NullString
-	HandoffToken      sql.NullString
-	HandoffDeadlineMs sql.NullInt64
-	HandoffAckedAtMs  sql.NullInt64
+	State                     string
+	TerminalReason            sql.NullString
+	ClaimState                sql.NullString
+	ClaimClaimedAtMs          sql.NullInt64
+	HandoffState              sql.NullString
+	HandoffToken              sql.NullString
+	HandoffDeadlineMs         sql.NullInt64
+	HandoffAckedAtMs          sql.NullInt64
+	HeartbeatState            sql.NullString
+	HeartbeatGeneration       sql.NullInt64
+	HeartbeatLastAtMs         sql.NullInt64
+	HeartbeatDeadlineMs       sql.NullInt64
+	HeartbeatGraceUntilMs     sql.NullInt64
+	HeartbeatConnectedAtMs    sql.NullInt64
+	HeartbeatDisconnectedAtMs sql.NullInt64
+	HeartbeatTerminalReason   sql.NullString
 }
 
 func seedRuntimeActiveLeases(t *testing.T, db *sql.DB, base runtimeAcquireCall, count int) {
@@ -572,16 +594,215 @@ func execRuntimeClaimGrant(ctx context.Context, db *sql.DB, requestID, claimToke
 	return result, nil
 }
 
-func execRuntimeAckHandoff(ctx context.Context, db *sql.DB, requestID, handoffToken string, nowMs int64) (*runtimeAckHandoffResult, error) {
+func execRuntimeAckHandoff(ctx context.Context, db *sql.DB, requestID, handoffToken string, nowMs, startTimeoutMs int64) (*runtimeAckHandoffResult, error) {
 	result := &runtimeAckHandoffResult{}
 	err := db.QueryRowContext(ctx, `
-		SELECT result, reason
-		FROM cq_ack_handoff($1, $2, $3)
-	`, requestID, handoffToken, nowMs).Scan(&result.Result, &result.Reason)
+		SELECT result, reason, heartbeat_deadline_ms
+		FROM cq_ack_handoff($1, $2, $3, $4)
+	`, requestID, handoffToken, nowMs, startTimeoutMs).Scan(&result.Result, &result.Reason, &result.HeartbeatDeadlineMs)
 	if err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+func execRuntimeHeartbeatOpen(ctx context.Context, db *sql.DB, req HeartbeatOpenRequest) (*runtimeHeartbeatResult, error) {
+	result := &runtimeHeartbeatResult{}
+	err := db.QueryRowContext(ctx, `
+		SELECT result, reason, generation, deadline_ms, ack_timeout_ms, heartbeat_interval_ms, heartbeat_timeout_ms, reconnect_grace_ms, start_timeout_ms, hard_expire_at_ms
+		FROM cq_heartbeat_open($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, req.RequestID, req.LeaseID, req.LeaseToken, req.HardExpireAtMs, req.NowMs, req.HeartbeatTimeoutMs, req.AckTimeoutMs, req.HeartbeatIntervalMs, req.ReconnectGraceMs, req.StartTimeoutMs).Scan(
+		&result.Result,
+		&result.Reason,
+		&result.Generation,
+		&result.DeadlineMs,
+		&result.AckTimeoutMs,
+		&result.HeartbeatIntervalMs,
+		&result.HeartbeatTimeoutMs,
+		&result.ReconnectGraceMs,
+		&result.StartTimeoutMs,
+		&result.HardExpireAtMs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func execRuntimeHeartbeatRefresh(ctx context.Context, db *sql.DB, req HeartbeatRefreshRequest) (*runtimeHeartbeatResult, error) {
+	result := &runtimeHeartbeatResult{}
+	err := db.QueryRowContext(ctx, `
+		SELECT result, reason, generation, deadline_ms, ack_timeout_ms, heartbeat_interval_ms, heartbeat_timeout_ms, reconnect_grace_ms, start_timeout_ms, hard_expire_at_ms
+		FROM cq_heartbeat_refresh($1, $2::uuid, $3, $4, $5, $6)
+	`, req.RequestID, req.LeaseID, req.LeaseToken, req.Generation, req.NowMs, req.HeartbeatTimeoutMs).Scan(
+		&result.Result,
+		&result.Reason,
+		&result.Generation,
+		&result.DeadlineMs,
+		&result.AckTimeoutMs,
+		&result.HeartbeatIntervalMs,
+		&result.HeartbeatTimeoutMs,
+		&result.ReconnectGraceMs,
+		&result.StartTimeoutMs,
+		&result.HardExpireAtMs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func execRuntimeHeartbeatDisconnect(ctx context.Context, db *sql.DB, req HeartbeatDisconnectRequest) (*runtimeHeartbeatResult, error) {
+	result := &runtimeHeartbeatResult{}
+	err := db.QueryRowContext(ctx, `
+		SELECT result, reason, generation, deadline_ms, ack_timeout_ms, heartbeat_interval_ms, heartbeat_timeout_ms, reconnect_grace_ms, start_timeout_ms, hard_expire_at_ms
+		FROM cq_heartbeat_disconnect($1, $2::uuid, $3, $4, $5, $6)
+	`, req.RequestID, req.LeaseID, req.LeaseToken, req.Generation, req.NowMs, req.ReconnectGraceMs).Scan(
+		&result.Result,
+		&result.Reason,
+		&result.Generation,
+		&result.DeadlineMs,
+		&result.AckTimeoutMs,
+		&result.HeartbeatIntervalMs,
+		&result.HeartbeatTimeoutMs,
+		&result.ReconnectGraceMs,
+		&result.StartTimeoutMs,
+		&result.HardExpireAtMs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func execRuntimeExpireHeartbeatIfDue(ctx context.Context, db *sql.DB, requestID string, nowMs int64) (*runtimeHeartbeatResult, error) {
+	result := &runtimeHeartbeatResult{}
+	err := db.QueryRowContext(ctx, `
+		SELECT result, reason, generation, deadline_ms, ack_timeout_ms, heartbeat_interval_ms, heartbeat_timeout_ms, reconnect_grace_ms, start_timeout_ms, hard_expire_at_ms
+		FROM cq_expire_heartbeat_if_due($1, $2)
+	`, requestID, nowMs).Scan(
+		&result.Result,
+		&result.Reason,
+		&result.Generation,
+		&result.DeadlineMs,
+		&result.AckTimeoutMs,
+		&result.HeartbeatIntervalMs,
+		&result.HeartbeatTimeoutMs,
+		&result.ReconnectGraceMs,
+		&result.StartTimeoutMs,
+		&result.HardExpireAtMs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func seedRuntimeConnectedHeartbeat(t *testing.T, db *sql.DB, requestID, hostnameHash string, nowMs, heartbeatTimeoutMs int64) (*runtimeAcquireResult, *runtimeHeartbeatResult) {
+	t.Helper()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      hostnameHash,
+		Hostname:          hostnameHash + ".example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         requestID,
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, requestID, grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, requestID, claim.HandoffToken.String, nowMs+2, 7_000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           requestID,
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  heartbeatTimeoutMs,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat open: %v", err)
+	}
+	if open.Result != "accepted" || !open.Generation.Valid {
+		t.Fatalf("expected accepted heartbeat open, got %+v", open)
+	}
+	return grant, open
+}
+
+func assertRuntimeHeartbeatReleasedReplayReason(t *testing.T, db *sql.DB, requestID string, grant *runtimeAcquireResult, generation, nowMs int64, expectedReason string) {
+	t.Helper()
+
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           requestID,
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat open replay: %v", err)
+	}
+	if open.Result != "terminal" || open.Reason.String != expectedReason {
+		t.Fatalf("expected heartbeat open replay terminal %q, got %+v", expectedReason, open)
+	}
+
+	refresh, err := execRuntimeHeartbeatRefresh(context.Background(), db, HeartbeatRefreshRequest{
+		RequestID:          requestID,
+		LeaseID:            grant.LeaseID,
+		LeaseToken:         grant.LeaseToken,
+		Generation:         generation,
+		NowMs:              nowMs + 1,
+		HeartbeatTimeoutMs: 15_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat refresh replay: %v", err)
+	}
+	if refresh.Result != "terminal" || refresh.Reason.String != expectedReason {
+		t.Fatalf("expected heartbeat refresh replay terminal %q, got %+v", expectedReason, refresh)
+	}
+
+	disconnect, err := execRuntimeHeartbeatDisconnect(context.Background(), db, HeartbeatDisconnectRequest{
+		RequestID:        requestID,
+		LeaseID:          grant.LeaseID,
+		LeaseToken:       grant.LeaseToken,
+		Generation:       generation,
+		NowMs:            nowMs + 2,
+		ReconnectGraceMs: 12_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat disconnect replay: %v", err)
+	}
+	if disconnect.Result != "terminal" || disconnect.Reason.String != expectedReason {
+		t.Fatalf("expected heartbeat disconnect replay terminal %q, got %+v", expectedReason, disconnect)
+	}
+
+	expire, err := execRuntimeExpireHeartbeatIfDue(context.Background(), db, requestID, nowMs+3)
+	if err != nil {
+		t.Fatalf("heartbeat expiry replay: %v", err)
+	}
+	if expire.Result != "terminal" || expire.Reason.String != expectedReason {
+		t.Fatalf("expected heartbeat expiry replay terminal %q, got %+v", expectedReason, expire)
+	}
 }
 
 func readRuntimeRequestState(t *testing.T, db *sql.DB, requestID string) runtimeRequestState {
@@ -596,7 +817,15 @@ func readRuntimeRequestState(t *testing.T, db *sql.DB, requestID string) runtime
 		       handoff_state,
 		       handoff_token,
 		       handoff_deadline_ms,
-		       handoff_acked_at_ms
+		       handoff_acked_at_ms,
+		       heartbeat_state,
+		       heartbeat_generation,
+		       heartbeat_last_at_ms,
+		       heartbeat_deadline_ms,
+		       heartbeat_grace_until_ms,
+		       heartbeat_connected_at_ms,
+		       heartbeat_disconnected_at_ms,
+		       heartbeat_terminal_reason
 		FROM concurrency_requests
 		WHERE request_id = $1
 	`, requestID).Scan(
@@ -608,6 +837,14 @@ func readRuntimeRequestState(t *testing.T, db *sql.DB, requestID string) runtime
 		&state.HandoffToken,
 		&state.HandoffDeadlineMs,
 		&state.HandoffAckedAtMs,
+		&state.HeartbeatState,
+		&state.HeartbeatGeneration,
+		&state.HeartbeatLastAtMs,
+		&state.HeartbeatDeadlineMs,
+		&state.HeartbeatGraceUntilMs,
+		&state.HeartbeatConnectedAtMs,
+		&state.HeartbeatDisconnectedAtMs,
+		&state.HeartbeatTerminalReason,
 	); err != nil {
 		t.Fatalf("read request state for %q: %v", requestID, err)
 	}
@@ -990,7 +1227,10 @@ func TestRuntimeAckHandoffAcknowledgesPendingRequest(t *testing.T) {
 		t.Fatalf("claim grant: %v", err)
 	}
 
-	ack, err := execRuntimeAckHandoff(context.Background(), db, "handoff-ack-request", claim.HandoffToken.String, nowMs+2)
+	workerNowMs := nowMs - 30_000
+	beforeAck := time.Now().UnixMilli()
+	ack, err := execRuntimeAckHandoff(context.Background(), db, "handoff-ack-request", claim.HandoffToken.String, workerNowMs, 7000)
+	afterAck := time.Now().UnixMilli()
 	if err != nil {
 		t.Fatalf("ack handoff: %v", err)
 	}
@@ -999,8 +1239,11 @@ func TestRuntimeAckHandoffAcknowledgesPendingRequest(t *testing.T) {
 	}
 
 	request := readRuntimeRequestState(t, db, "handoff-ack-request")
-	if request.HandoffState.String != "acknowledged" || !request.HandoffAckedAtMs.Valid || request.HandoffAckedAtMs.Int64 != nowMs+2 {
+	if request.HandoffState.String != "acknowledged" || !request.HandoffAckedAtMs.Valid {
 		t.Fatalf("expected ack_handoff to persist acknowledged handoff state, got %+v", request)
+	}
+	if request.HandoffAckedAtMs.Int64 < beforeAck || request.HandoffAckedAtMs.Int64 > afterAck || request.HandoffAckedAtMs.Int64 == workerNowMs {
+		t.Fatalf("expected handoff ack timestamp from handler-side commit time in [%d,%d] instead of worker time %d, got %+v", beforeAck, afterAck, workerNowMs, request)
 	}
 }
 
@@ -1027,7 +1270,7 @@ func TestRuntimeDuplicateAckHandoffPreservesOriginalAckTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim grant: %v", err)
 	}
-	if _, err := execRuntimeAckHandoff(context.Background(), db, "handoff-duplicate-ack-request", claim.HandoffToken.String, nowMs+2); err != nil {
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "handoff-duplicate-ack-request", claim.HandoffToken.String, nowMs+2, 7000); err != nil {
 		t.Fatalf("first ack handoff: %v", err)
 	}
 
@@ -1036,7 +1279,7 @@ func TestRuntimeDuplicateAckHandoffPreservesOriginalAckTimestamp(t *testing.T) {
 		t.Fatalf("expected first ack to persist timestamp, got %+v", firstAck)
 	}
 
-	duplicateAck, err := execRuntimeAckHandoff(context.Background(), db, "handoff-duplicate-ack-request", claim.HandoffToken.String, nowMs+3)
+	duplicateAck, err := execRuntimeAckHandoff(context.Background(), db, "handoff-duplicate-ack-request", claim.HandoffToken.String, nowMs+3, 7000)
 	if err != nil {
 		t.Fatalf("duplicate ack handoff: %v", err)
 	}
@@ -1132,7 +1375,7 @@ func TestRuntimeLateAckAfterHandoffTimeoutReturnsTerminalWithoutResurrection(t *
 		t.Fatalf("compensating duplicate claim: %v", err)
 	}
 
-	ack, err := execRuntimeAckHandoff(context.Background(), db, "handoff-late-ack-request", claim.HandoffToken.String, overdueNow+1)
+	ack, err := execRuntimeAckHandoff(context.Background(), db, "handoff-late-ack-request", claim.HandoffToken.String, overdueNow+1, 7000)
 	if err != nil {
 		t.Fatalf("late ack after timeout compensation: %v", err)
 	}
@@ -1146,6 +1389,875 @@ func TestRuntimeLateAckAfterHandoffTimeoutReturnsTerminalWithoutResurrection(t *
 	}
 	if request.HandoffState.String == "acknowledged" || request.HandoffAckedAtMs.Valid {
 		t.Fatalf("expected late ack not to resurrect acknowledged handoff state, got %+v", request)
+	}
+}
+
+func TestRuntimeAckHandoffSeedsHeartbeatStartDeadline(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	startTimeoutMs := int64(7000)
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-start-host",
+		Hostname:          "heartbeat-start.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-start-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-start-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+
+	workerNowMs := nowMs - 45_000
+	beforeAck := time.Now().UnixMilli()
+	ack, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-start-request", claim.HandoffToken.String, workerNowMs, startTimeoutMs)
+	afterAck := time.Now().UnixMilli()
+	if err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	minDeadline := beforeAck + startTimeoutMs
+	maxDeadline := afterAck + startTimeoutMs
+	if !ack.HeartbeatDeadlineMs.Valid || ack.HeartbeatDeadlineMs.Int64 < minDeadline || ack.HeartbeatDeadlineMs.Int64 > maxDeadline || ack.HeartbeatDeadlineMs.Int64 == workerNowMs+startTimeoutMs {
+		t.Fatalf("expected heartbeat start deadline from handler-side commit time in [%d,%d] instead of worker-derived %d, got %+v", minDeadline, maxDeadline, workerNowMs+startTimeoutMs, ack)
+	}
+
+	request := readRuntimeRequestState(t, db, "heartbeat-start-request")
+	if request.HandoffState.String != "acknowledged" {
+		t.Fatalf("expected acknowledged handoff state, got %+v", request)
+	}
+	if request.HeartbeatState.String != "none" || !request.HeartbeatDeadlineMs.Valid || request.HeartbeatDeadlineMs.Int64 < minDeadline || request.HeartbeatDeadlineMs.Int64 > maxDeadline {
+		t.Fatalf("expected heartbeat start state none with deadline in [%d,%d], got %+v", minDeadline, maxDeadline, request)
+	}
+	if request.HeartbeatGraceUntilMs.Valid || request.HeartbeatTerminalReason.Valid {
+		t.Fatalf("expected fresh heartbeat start state without grace or terminal reason, got %+v", request)
+	}
+}
+
+func TestRuntimeExpireActiveRequestIfDueReleasesHeartbeatStartTimeout(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-timeout-host",
+		Hostname:          "heartbeat-timeout.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-timeout-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-timeout-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	ack, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-timeout-request", claim.HandoffToken.String, nowMs+2, 25)
+	if err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+
+	var expired bool
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT cq_expire_active_request_if_due($1, $2)
+	`, "heartbeat-timeout-request", ack.HeartbeatDeadlineMs.Int64).Scan(&expired); err != nil {
+		t.Fatalf("expire active request if due: %v", err)
+	}
+	if !expired {
+		t.Fatal("expected heartbeat start timeout expiry to transition the request")
+	}
+
+	request := readRuntimeRequestState(t, db, "heartbeat-timeout-request")
+	if request.State != "released" || request.TerminalReason.String != "heartbeat_start_timeout" {
+		t.Fatalf("expected heartbeat start timeout terminal release, got %+v", request)
+	}
+
+	hostCount, siteCount, siteIPCount := readRuntimeActiveCounters(t, db, "heartbeat-timeout-host", "site-a", "ip-a")
+	if hostCount != 0 || siteCount != 0 || siteIPCount != 0 {
+		t.Fatalf("expected heartbeat start timeout to decrement counters, got host=%d site=%d site_ip=%d", hostCount, siteCount, siteIPCount)
+	}
+}
+
+func TestRuntimeHeartbeatStartDeadlinePreservesHardExpiryPrecedence(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	hardExpireAtMs := nowMs + 40
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-hard-expiry-host",
+		Hostname:          "heartbeat-hard-expiry.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-hard-expiry-request",
+		HardExpireMs:      hardExpireAtMs,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-hard-expiry-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	ack, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-hard-expiry-request", claim.HandoffToken.String, nowMs+2, 7_000)
+	if err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	if !ack.HeartbeatDeadlineMs.Valid || ack.HeartbeatDeadlineMs.Int64 != hardExpireAtMs {
+		t.Fatalf("expected heartbeat deadline capped by hard expiry %d, got %+v", hardExpireAtMs, ack)
+	}
+
+	var expired bool
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT cq_expire_active_request_if_due($1, $2)
+	`, "heartbeat-hard-expiry-request", ack.HeartbeatDeadlineMs.Int64).Scan(&expired); err != nil {
+		t.Fatalf("expire active request if due: %v", err)
+	}
+	if !expired {
+		t.Fatal("expected hard expiry to terminalize the request")
+	}
+
+	request := readRuntimeRequestState(t, db, "heartbeat-hard-expiry-request")
+	if request.State != "expired" || request.TerminalReason.String != "hard_expired" {
+		t.Fatalf("expected hard_expired precedence over heartbeat start timeout, got %+v", request)
+	}
+}
+
+func TestRuntimeHeartbeatOpenAcceptsAcknowledgedLease(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-open-host",
+		Hostname:          "heartbeat-open.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-open-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-open-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-open-request", claim.HandoffToken.String, nowMs+2, 7000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-open-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat open: %v", err)
+	}
+	if open.Result != "accepted" || !open.Generation.Valid || open.Generation.Int64 != 1 {
+		t.Fatalf("expected accepted heartbeat open result, got %+v", open)
+	}
+	if !open.DeadlineMs.Valid || open.DeadlineMs.Int64 != nowMs+3+15_000 {
+		t.Fatalf("expected heartbeat deadline %d, got %+v", nowMs+3+15_000, open)
+	}
+
+	request := readRuntimeRequestState(t, db, "heartbeat-open-request")
+	if request.HeartbeatState.String != "connected" || request.HeartbeatGeneration.Int64 != 1 {
+		t.Fatalf("expected connected heartbeat state, got %+v", request)
+	}
+	if request.HeartbeatConnectedAtMs.Int64 != nowMs+3 || request.HeartbeatLastAtMs.Int64 != nowMs+3 {
+		t.Fatalf("expected connected and last heartbeat timestamps at %d, got %+v", nowMs+3, request)
+	}
+}
+
+func TestRuntimeHeartbeatReleasedReplayUsesAlreadyReleasedForWorkerReleaseReasons(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	workerReleaseReasons := []string{"stream_complete", "client_disconnect", "heartbeat_connect_failed", "heartbeat_lost"}
+	for index, releaseReason := range workerReleaseReasons {
+		t.Run(releaseReason, func(t *testing.T) {
+			caseNowMs := nowMs + int64(index*1_000)
+			requestID := "heartbeat-replay-" + strings.ReplaceAll(releaseReason, "_", "-")
+			grant, open := seedRuntimeConnectedHeartbeat(t, db, requestID, "heartbeat-replay-"+strings.ReplaceAll(releaseReason, "_", "-"), caseNowMs, 15_000)
+
+			var releaseResult string
+			var releaseReplayReason, releaseRequestID sql.NullString
+			if err := db.QueryRowContext(context.Background(), `
+				SELECT result, reason, request_id
+				FROM cq_release($1::uuid, $2, $3, $4)
+			`, grant.LeaseID, grant.LeaseToken, releaseReason, caseNowMs+4).Scan(&releaseResult, &releaseReplayReason, &releaseRequestID); err != nil {
+				t.Fatalf("release active heartbeat lease: %v", err)
+			}
+			if releaseResult != "released" || releaseRequestID.String != requestID {
+				t.Fatalf("expected release to persist %q for %q, got result=%q reason=%q request=%q", releaseReason, requestID, releaseResult, releaseReplayReason.String, releaseRequestID.String)
+			}
+
+			request := readRuntimeRequestState(t, db, requestID)
+			if request.State != "released" || request.TerminalReason.String != releaseReason || request.HeartbeatTerminalReason.String != releaseReason {
+				t.Fatalf("expected HTTP release to keep persisted worker reason %q, got %+v", releaseReason, request)
+			}
+
+			assertRuntimeHeartbeatReleasedReplayReason(t, db, requestID, grant, open.Generation.Int64, caseNowMs+5, "already_released")
+		})
+	}
+}
+
+func TestRuntimeHeartbeatReleasedReplayPreservesHeartbeatNativeReasons(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	startGrant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-replay-preserve-start-host",
+		Hostname:          "heartbeat-replay-preserve-start.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-replay-preserve-start",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire for start timeout replay: %v", err)
+	}
+	startClaim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-replay-preserve-start", startGrant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant for start timeout replay: %v", err)
+	}
+	startAck, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-replay-preserve-start", startClaim.HandoffToken.String, nowMs+2, 25)
+	if err != nil {
+		t.Fatalf("ack handoff for start timeout replay: %v", err)
+	}
+	var startExpired bool
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT cq_expire_active_request_if_due($1, $2)
+	`, "heartbeat-replay-preserve-start", startAck.HeartbeatDeadlineMs.Int64).Scan(&startExpired); err != nil {
+		t.Fatalf("expire heartbeat start timeout: %v", err)
+	}
+	if !startExpired {
+		t.Fatal("expected heartbeat start timeout to transition request")
+	}
+	assertRuntimeHeartbeatReleasedReplayReason(t, db, "heartbeat-replay-preserve-start", startGrant, 1, nowMs+5, "heartbeat_start_timeout")
+
+	timeoutGrant, timeoutOpen := seedRuntimeConnectedHeartbeat(t, db, "heartbeat-replay-preserve-timeout", "heartbeat-replay-preserve-timeout-host", nowMs+1_000, 25)
+	expired, err := execRuntimeExpireHeartbeatIfDue(context.Background(), db, "heartbeat-replay-preserve-timeout", timeoutOpen.DeadlineMs.Int64)
+	if err != nil {
+		t.Fatalf("expire heartbeat timeout: %v", err)
+	}
+	if expired.Result != "released" || expired.Reason.String != "heartbeat_timeout" {
+		t.Fatalf("expected heartbeat_timeout release, got %+v", expired)
+	}
+	assertRuntimeHeartbeatReleasedReplayReason(t, db, "heartbeat-replay-preserve-timeout", timeoutGrant, timeoutOpen.Generation.Int64, timeoutOpen.DeadlineMs.Int64+1, "heartbeat_timeout")
+}
+
+func TestRuntimeHeartbeatRefreshUpdatesCurrentGenerationDeadline(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-refresh-host",
+		Hostname:          "heartbeat-refresh.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-refresh-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-refresh-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-refresh-request", claim.HandoffToken.String, nowMs+2, 7000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-refresh-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat open: %v", err)
+	}
+
+	refresh, err := execRuntimeHeartbeatRefresh(context.Background(), db, HeartbeatRefreshRequest{
+		RequestID:          "heartbeat-refresh-request",
+		LeaseID:            grant.LeaseID,
+		LeaseToken:         grant.LeaseToken,
+		Generation:         open.Generation.Int64,
+		NowMs:              nowMs + 20,
+		HeartbeatTimeoutMs: 15_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat refresh: %v", err)
+	}
+	if refresh.Result != "accepted" || refresh.Generation.Int64 != open.Generation.Int64 {
+		t.Fatalf("expected accepted heartbeat refresh result, got %+v", refresh)
+	}
+	if refresh.DeadlineMs.Int64 != nowMs+20+15_000 {
+		t.Fatalf("expected refreshed heartbeat deadline %d, got %+v", nowMs+20+15_000, refresh)
+	}
+
+	request := readRuntimeRequestState(t, db, "heartbeat-refresh-request")
+	if request.HeartbeatState.String != "connected" || request.HeartbeatLastAtMs.Int64 != nowMs+20 || request.HeartbeatDeadlineMs.Int64 != nowMs+20+15_000 {
+		t.Fatalf("expected refreshed connected heartbeat state, got %+v", request)
+	}
+}
+
+func TestRuntimeHeartbeatDisconnectMovesCurrentGenerationToGrace(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-disconnect-host",
+		Hostname:          "heartbeat-disconnect.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-disconnect-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-disconnect-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-disconnect-request", claim.HandoffToken.String, nowMs+2, 7000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-disconnect-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat open: %v", err)
+	}
+
+	disconnectNow := nowMs + 50
+	disconnect, err := execRuntimeHeartbeatDisconnect(context.Background(), db, HeartbeatDisconnectRequest{
+		RequestID:        "heartbeat-disconnect-request",
+		LeaseID:          grant.LeaseID,
+		LeaseToken:       grant.LeaseToken,
+		Generation:       open.Generation.Int64,
+		NowMs:            disconnectNow,
+		ReconnectGraceMs: 12_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat disconnect: %v", err)
+	}
+	if disconnect.Result != "accepted" || disconnect.Generation.Int64 != open.Generation.Int64 {
+		t.Fatalf("expected accepted heartbeat disconnect result, got %+v", disconnect)
+	}
+
+	request := readRuntimeRequestState(t, db, "heartbeat-disconnect-request")
+	expectedGraceUntil := disconnectNow + 12_000
+	if request.HeartbeatState.String != "grace" || request.HeartbeatDisconnectedAtMs.Int64 != disconnectNow || request.HeartbeatGraceUntilMs.Int64 != expectedGraceUntil {
+		t.Fatalf("expected grace heartbeat state after disconnect, got %+v", request)
+	}
+	if request.HeartbeatDeadlineMs.Int64 != expectedGraceUntil {
+		t.Fatalf("expected grace heartbeat deadline %d, got %+v", expectedGraceUntil, request)
+	}
+}
+
+func TestRuntimeExpireHeartbeatIfDueReleasesConnectedHeartbeatTimeout(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-expire-host",
+		Hostname:          "heartbeat-expire.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-expire-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-expire-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-expire-request", claim.HandoffToken.String, nowMs+2, 7000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-expire-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  25,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat open: %v", err)
+	}
+
+	expired, err := execRuntimeExpireHeartbeatIfDue(context.Background(), db, "heartbeat-expire-request", open.DeadlineMs.Int64)
+	if err != nil {
+		t.Fatalf("expire heartbeat if due: %v", err)
+	}
+	if expired.Result != "released" || expired.Reason.String != "heartbeat_timeout" {
+		t.Fatalf("expected heartbeat timeout terminal release, got %+v", expired)
+	}
+
+	request := readRuntimeRequestState(t, db, "heartbeat-expire-request")
+	if request.State != "released" || request.TerminalReason.String != "heartbeat_timeout" {
+		t.Fatalf("expected heartbeat timeout persisted terminal state, got %+v", request)
+	}
+}
+
+func TestRuntimeHeartbeatReplacementMakesPreviousGenerationStale(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-replacement-host",
+		Hostname:          "heartbeat-replacement.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-replacement-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-replacement-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-replacement-request", claim.HandoffToken.String, nowMs+2, 7000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	firstOpen, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-replacement-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("first heartbeat open: %v", err)
+	}
+	secondOpen, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-replacement-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 4,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("second heartbeat open: %v", err)
+	}
+	if firstOpen.Generation.Int64 != 1 || secondOpen.Generation.Int64 != 2 {
+		t.Fatalf("expected replacement generations 1 then 2, got first=%+v second=%+v", firstOpen, secondOpen)
+	}
+
+	refresh, err := execRuntimeHeartbeatRefresh(context.Background(), db, HeartbeatRefreshRequest{
+		RequestID:          "heartbeat-replacement-request",
+		LeaseID:            grant.LeaseID,
+		LeaseToken:         grant.LeaseToken,
+		Generation:         firstOpen.Generation.Int64,
+		NowMs:              nowMs + 5,
+		HeartbeatTimeoutMs: 15_000,
+	})
+	if err != nil {
+		t.Fatalf("stale heartbeat refresh: %v", err)
+	}
+	if refresh.Result != "noop" || refresh.Reason.String != "stale_generation" {
+		t.Fatalf("expected stale heartbeat refresh noop, got %+v", refresh)
+	}
+
+	disconnect, err := execRuntimeHeartbeatDisconnect(context.Background(), db, HeartbeatDisconnectRequest{
+		RequestID:        "heartbeat-replacement-request",
+		LeaseID:          grant.LeaseID,
+		LeaseToken:       grant.LeaseToken,
+		Generation:       firstOpen.Generation.Int64,
+		NowMs:            nowMs + 6,
+		ReconnectGraceMs: 12_000,
+	})
+	if err != nil {
+		t.Fatalf("stale heartbeat disconnect: %v", err)
+	}
+	if disconnect.Result != "noop" || disconnect.Reason.String != "stale_generation" {
+		t.Fatalf("expected stale heartbeat disconnect noop, got %+v", disconnect)
+	}
+
+	request := readRuntimeRequestState(t, db, "heartbeat-replacement-request")
+	if request.HeartbeatState.String != "connected" || request.HeartbeatGeneration.Int64 != secondOpen.Generation.Int64 || request.HeartbeatDeadlineMs.Int64 != secondOpen.DeadlineMs.Int64 {
+		t.Fatalf("expected replacement to keep current generation connected state, got %+v", request)
+	}
+	if request.HeartbeatDisconnectedAtMs.Valid {
+		t.Fatalf("expected stale generation close not to persist disconnect timestamp, got %+v", request)
+	}
+}
+
+func TestRuntimeHeartbeatReconnectDuringGraceIncrementsGeneration(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-grace-reconnect-host",
+		Hostname:          "heartbeat-grace-reconnect.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-grace-reconnect-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-grace-reconnect-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-grace-reconnect-request", claim.HandoffToken.String, nowMs+2, 7000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-grace-reconnect-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat open: %v", err)
+	}
+	disconnect, err := execRuntimeHeartbeatDisconnect(context.Background(), db, HeartbeatDisconnectRequest{
+		RequestID:        "heartbeat-grace-reconnect-request",
+		LeaseID:          grant.LeaseID,
+		LeaseToken:       grant.LeaseToken,
+		Generation:       open.Generation.Int64,
+		NowMs:            nowMs + 25,
+		ReconnectGraceMs: 12_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat disconnect: %v", err)
+	}
+	reconnect, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-grace-reconnect-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               disconnect.DeadlineMs.Int64 - 1,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("grace reconnect heartbeat open: %v", err)
+	}
+	if reconnect.Result != "accepted" || reconnect.Generation.Int64 != 2 {
+		t.Fatalf("expected grace reconnect generation 2, got %+v", reconnect)
+	}
+	request := readRuntimeRequestState(t, db, "heartbeat-grace-reconnect-request")
+	if request.HeartbeatState.String != "connected" || request.HeartbeatGeneration.Int64 != 2 {
+		t.Fatalf("expected grace reconnect to restore connected generation 2, got %+v", request)
+	}
+}
+
+func TestRuntimeHeartbeatReconnectAfterGraceDeadlineIsRefused(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-late-reconnect-host",
+		Hostname:          "heartbeat-late-reconnect.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-late-reconnect-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-late-reconnect-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-late-reconnect-request", claim.HandoffToken.String, nowMs+2, 7000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-late-reconnect-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    25,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat open: %v", err)
+	}
+	disconnect, err := execRuntimeHeartbeatDisconnect(context.Background(), db, HeartbeatDisconnectRequest{
+		RequestID:        "heartbeat-late-reconnect-request",
+		LeaseID:          grant.LeaseID,
+		LeaseToken:       grant.LeaseToken,
+		Generation:       open.Generation.Int64,
+		NowMs:            nowMs + 10,
+		ReconnectGraceMs: 25,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat disconnect: %v", err)
+	}
+	reconnect, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-late-reconnect-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               disconnect.DeadlineMs.Int64 + 1,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    25,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("late reconnect heartbeat open: %v", err)
+	}
+	if reconnect.Result != "released" || reconnect.Reason.String != "heartbeat_timeout" {
+		t.Fatalf("expected late reconnect refusal heartbeat_timeout, got %+v", reconnect)
+	}
+	request := readRuntimeRequestState(t, db, "heartbeat-late-reconnect-request")
+	if request.State != "released" || request.TerminalReason.String != "heartbeat_timeout" {
+		t.Fatalf("expected late reconnect not to revive released request, got %+v", request)
+	}
+}
+
+func TestRuntimeReleaseDuringConnectedHeartbeatClearsHeartbeatState(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-release-connected-host",
+		Hostname:          "heartbeat-release-connected.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-release-connected-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-release-connected-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-release-connected-request", claim.HandoffToken.String, nowMs+2, 7000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-release-connected-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat open: %v", err)
+	}
+	var releaseResult string
+	var releaseReason, releaseRequestID sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason, request_id
+		FROM cq_release($1::uuid, $2, $3, $4)
+	`, grant.LeaseID, grant.LeaseToken, "stream_complete", nowMs+4).Scan(&releaseResult, &releaseReason, &releaseRequestID); err != nil {
+		t.Fatalf("release connected heartbeat lease: %v", err)
+	}
+	if releaseResult != "released" || releaseRequestID.String != "heartbeat-release-connected-request" {
+		t.Fatalf("expected connected heartbeat release, got result=%q reason=%q request=%q", releaseResult, releaseReason.String, releaseRequestID.String)
+	}
+	request := readRuntimeRequestState(t, db, "heartbeat-release-connected-request")
+	if request.State != "released" || request.HeartbeatState.String != "none" {
+		t.Fatalf("expected connected heartbeat release cleanup, got %+v", request)
+	}
+	if request.HeartbeatDeadlineMs.Valid || request.HeartbeatGraceUntilMs.Valid {
+		t.Fatalf("expected connected heartbeat release to clear deadline and grace, got %+v", request)
+	}
+	if !request.HeartbeatTerminalReason.Valid || request.HeartbeatTerminalReason.String != request.TerminalReason.String {
+		t.Fatalf("expected connected heartbeat release to mirror terminal reason into heartbeat cleanup, got %+v", request)
+	}
+	if request.HeartbeatGeneration.Int64 != open.Generation.Int64 || request.HeartbeatConnectedAtMs.Int64 != nowMs+3 || request.HeartbeatLastAtMs.Int64 != nowMs+3 {
+		t.Fatalf("expected connected heartbeat release to preserve generation and audit timestamps, got %+v", request)
+	}
+}
+
+func TestRuntimeReleaseDuringGraceHeartbeatClearsHeartbeatState(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-release-grace-host",
+		Hostname:          "heartbeat-release-grace.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-release-grace-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-release-grace-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-release-grace-request", claim.HandoffToken.String, nowMs+2, 7000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, HeartbeatOpenRequest{
+		RequestID:           "heartbeat-release-grace-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat open: %v", err)
+	}
+	if _, err := execRuntimeHeartbeatDisconnect(context.Background(), db, HeartbeatDisconnectRequest{
+		RequestID:        "heartbeat-release-grace-request",
+		LeaseID:          grant.LeaseID,
+		LeaseToken:       grant.LeaseToken,
+		Generation:       open.Generation.Int64,
+		NowMs:            nowMs + 20,
+		ReconnectGraceMs: 12_000,
+	}); err != nil {
+		t.Fatalf("heartbeat disconnect: %v", err)
+	}
+	var releaseResult string
+	var releaseReason, releaseRequestID sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason, request_id
+		FROM cq_release($1::uuid, $2, $3, $4)
+	`, grant.LeaseID, grant.LeaseToken, "stream_complete", nowMs+21).Scan(&releaseResult, &releaseReason, &releaseRequestID); err != nil {
+		t.Fatalf("release grace heartbeat lease: %v", err)
+	}
+	if releaseResult != "released" || releaseRequestID.String != "heartbeat-release-grace-request" {
+		t.Fatalf("expected grace heartbeat release, got result=%q reason=%q request=%q", releaseResult, releaseReason.String, releaseRequestID.String)
+	}
+	request := readRuntimeRequestState(t, db, "heartbeat-release-grace-request")
+	if request.State != "released" || request.HeartbeatState.String != "none" || request.HeartbeatDeadlineMs.Valid || request.HeartbeatGraceUntilMs.Valid {
+		t.Fatalf("expected grace heartbeat release cleanup, got %+v", request)
+	}
+	if !request.HeartbeatTerminalReason.Valid || request.HeartbeatTerminalReason.String != request.TerminalReason.String {
+		t.Fatalf("expected grace heartbeat release to mirror terminal reason into heartbeat cleanup, got %+v", request)
+	}
+	if request.HeartbeatGeneration.Int64 != open.Generation.Int64 {
+		t.Fatalf("expected grace heartbeat release to preserve generation, got %+v", request)
 	}
 }
 
@@ -2403,16 +3515,77 @@ func TestRuntimeReleaseMarksRequestReleasedWithoutCreatingNewLease(t *testing.T)
 		t.Fatalf("expected released lease state, got %q", leaseState)
 	}
 
-	var requestState, terminalReason string
+	var requestState, terminalReason, heartbeatTerminalReason string
 	if err := db.QueryRowContext(context.Background(), `
-		SELECT state, terminal_reason
+		SELECT state, terminal_reason, heartbeat_terminal_reason
 		FROM concurrency_requests
 		WHERE request_id = $1
-	`, "release-request").Scan(&requestState, &terminalReason); err != nil {
+	`, "release-request").Scan(&requestState, &terminalReason, &heartbeatTerminalReason); err != nil {
 		t.Fatalf("read released request state: %v", err)
 	}
-	if requestState != "released" || terminalReason != "already_released" {
-		t.Fatalf("expected released request tombstone, got state=%q terminal_reason=%q", requestState, terminalReason)
+	if requestState != "released" || terminalReason != "stream_complete" || heartbeatTerminalReason != "stream_complete" {
+		t.Fatalf("expected canonical release persistence, got state=%q terminal_reason=%q heartbeat_terminal_reason=%q", requestState, terminalReason, heartbeatTerminalReason)
+	}
+}
+
+func TestRuntimeReleasePersistsCanonicalWorkerReasons(t *testing.T) {
+	canonicalReasons := []string{
+		"stream_complete",
+		"client_disconnect",
+		"hard_expiry",
+		"upstream_failure",
+		"origin_fetch_failure",
+		"heartbeat_connect_failed",
+		"heartbeat_lost",
+		"final_cleanup",
+	}
+
+	for _, reason := range canonicalReasons {
+		t.Run(reason, func(t *testing.T) {
+			db := requireRuntimeConcurrencyDB(t)
+			nowMs := time.Now().UnixMilli()
+			requestID := "canonical-release-" + strings.ReplaceAll(reason, "_", "-")
+			lease, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+				HostnameHash: "canonical-release-host-" + reason,
+				Hostname:     "canonical-release.example.com",
+				SiteBucket:   "site-a",
+				IPBucket:     "ip-a",
+				RequestID:    requestID,
+				HardExpireMs: nowMs + 60_000,
+				NowMs:        nowMs,
+			})
+			if err != nil {
+				t.Fatalf("seed acquire: %v", err)
+			}
+			if lease.Result != "granted" {
+				t.Fatalf("expected granted seed lease, got %+v", lease)
+			}
+
+			var releaseResult string
+			var releaseReason sql.NullString
+			var releaseRequestID sql.NullString
+			if err := db.QueryRowContext(context.Background(), `
+				SELECT result, reason, request_id
+				FROM cq_release($1::uuid, $2, $3, $4)
+			`, lease.LeaseID, lease.LeaseToken, reason, nowMs+1).Scan(&releaseResult, &releaseReason, &releaseRequestID); err != nil {
+				t.Fatalf("release active lease: %v", err)
+			}
+			if releaseResult != "released" {
+				t.Fatalf("expected released result, got result=%q reason=%q", releaseResult, releaseReason.String)
+			}
+
+			var requestState, terminalReason, heartbeatTerminalReason string
+			if err := db.QueryRowContext(context.Background(), `
+				SELECT state, terminal_reason, heartbeat_terminal_reason
+				FROM concurrency_requests
+				WHERE request_id = $1
+			`, requestID).Scan(&requestState, &terminalReason, &heartbeatTerminalReason); err != nil {
+				t.Fatalf("read released request state: %v", err)
+			}
+			if requestState != "released" || terminalReason != reason || heartbeatTerminalReason != reason {
+				t.Fatalf("expected canonical reason %q persisted, got state=%q terminal_reason=%q heartbeat_terminal_reason=%q", reason, requestState, terminalReason, heartbeatTerminalReason)
+			}
+		})
 	}
 }
 
@@ -2527,7 +3700,7 @@ func TestRuntimeReleaseReturnsExpiredBeforeWrongTokenConflictForExpiredActiveLea
 	}
 }
 
-func TestRuntimeCompensationReleaseReasonsPersist(t *testing.T) {
+func TestRuntimeCompensationReleaseReasonsCanonicalizeToFinalCleanup(t *testing.T) {
 	for _, reason := range []string{releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed} {
 		t.Run(reason, func(t *testing.T) {
 			db := requireRuntimeConcurrencyDB(t)
@@ -2569,11 +3742,11 @@ func TestRuntimeCompensationReleaseReasonsPersist(t *testing.T) {
 			`, "compensate-request-"+reason).Scan(&requestState, &terminalReason); err != nil {
 				t.Fatalf("read compensated request: %v", err)
 			}
-			if requestState != "released" || terminalReason != reason {
-				t.Fatalf("expected compensation reason persisted, got state=%q reason=%q", requestState, terminalReason)
+			if requestState != "released" || terminalReason != "final_cleanup" {
+				t.Fatalf("expected compensation release to canonicalize to final_cleanup, got state=%q reason=%q", requestState, terminalReason)
 			}
-			if terminalReason == "stream_complete" || terminalReason == "already_released" {
-				t.Fatalf("compensation reason collapsed to %q", terminalReason)
+			if terminalReason == reason {
+				t.Fatalf("expected compensation reason %q not to leak into terminal state", terminalReason)
 			}
 		})
 	}

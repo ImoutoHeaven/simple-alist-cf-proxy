@@ -368,6 +368,27 @@ func TestRunSweepPassCompensatesOverdueHandoffPendingRequests(t *testing.T) {
 	}
 }
 
+func TestRunSweepPassCompensatesOverdueHeartbeatDeadlineRequests(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli() - 1_000
+	_, open := seedRuntimeConnectedHeartbeat(t, db, "sweep-heartbeat-request", "sweep-heartbeat-host", nowMs, 25)
+	if open.DeadlineMs.Int64 > time.Now().UnixMilli() {
+		t.Fatalf("expected seeded heartbeat deadline to already be overdue, got %+v", open)
+	}
+
+	cfg := validTestConfig()
+	server := newTestServerInstanceWithConfig(t, cfg, &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}})
+
+	if err := server.runSweepPass(context.Background()); err != nil {
+		t.Fatalf("runSweepPass error: %v", err)
+	}
+
+	request := readRuntimeRequestState(t, db, "sweep-heartbeat-request")
+	if request.State != "released" || request.TerminalReason.String != "heartbeat_timeout" {
+		t.Fatalf("expected sweep to compensate overdue heartbeat deadline, got %+v", request)
+	}
+}
+
 func TestStartupRecoveryCompensatesOverdueHandoffPendingBeforeServing(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	seedOverdueHandoffPendingRequest(t, db, "startup-handoff-host", "startup-handoff.example.com", "startup-handoff-request")

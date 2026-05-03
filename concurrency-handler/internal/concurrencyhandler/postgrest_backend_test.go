@@ -227,7 +227,7 @@ func TestPostgrestBackendAckHandoffAcknowledged(t *testing.T) {
 			t.Fatalf("decode body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"result":"acknowledged"}]`))
+		_, _ = w.Write([]byte(`[{"result":"acknowledged","heartbeat_deadline_ms":8000}]`))
 	}))
 	defer srv.Close()
 
@@ -237,17 +237,17 @@ func TestPostgrestBackendAckHandoffAcknowledged(t *testing.T) {
 	cfg.Backend.Postgrest.BaseURL = srv.URL
 	backend := newPostgrestBackend(cfg, srv.Client())
 
-	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000})
+	result, err := backend.AckHandoff(context.Background(), AckHandoffBackendRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000, StartTimeoutMs: 7000})
 	if err != nil {
 		t.Fatalf("AckHandoff error: %v", err)
 	}
 	if gotPath != "/rpc/cq_ack_handoff" {
 		t.Fatalf("expected fixed ack handoff rpc path, got %s", gotPath)
 	}
-	if gotBody["p_request_id"] != "request-1" || gotBody["p_handoff_token"] != "handoff-1" || gotBody["p_now_ms"] != float64(1000) {
+	if gotBody["p_request_id"] != "request-1" || gotBody["p_handoff_token"] != "handoff-1" || gotBody["p_now_ms"] != float64(1000) || gotBody["p_start_timeout_ms"] != float64(7000) {
 		t.Fatalf("expected ack handoff payload, got %v", gotBody)
 	}
-	if result.Result != "acknowledged" || result.Reason != "" {
+	if result.Result != "acknowledged" || result.Reason != "" || result.HeartbeatDeadlineMs != 8000 {
 		t.Fatalf("expected acknowledged ack handoff result, got %+v", result)
 	}
 }
@@ -265,7 +265,7 @@ func TestPostgrestBackendAckHandoffConflictRequiresStableReason(t *testing.T) {
 	cfg.Backend.Postgrest.BaseURL = srv.URL
 	backend := newPostgrestBackend(cfg, srv.Client())
 
-	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "wrong-token", NowMs: 1000})
+	result, err := backend.AckHandoff(context.Background(), AckHandoffBackendRequest{RequestID: "request-1", HandoffToken: "wrong-token", NowMs: 1000, StartTimeoutMs: 7000})
 	if err != nil {
 		t.Fatalf("AckHandoff error: %v", err)
 	}
@@ -287,12 +287,180 @@ func TestPostgrestBackendAckHandoffTerminalRequiresReason(t *testing.T) {
 	cfg.Backend.Postgrest.BaseURL = srv.URL
 	backend := newPostgrestBackend(cfg, srv.Client())
 
-	result, err := backend.AckHandoff(context.Background(), AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000})
+	result, err := backend.AckHandoff(context.Background(), AckHandoffBackendRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: 1000, StartTimeoutMs: 7000})
 	if err != nil {
 		t.Fatalf("AckHandoff error: %v", err)
 	}
 	if result.Result != "released" || result.Reason != "claim_handoff_timeout" {
 		t.Fatalf("expected terminal ack handoff reason, got %+v", result)
+	}
+}
+
+func TestPostgrestBackendHeartbeatOpenUsesFixedRPC(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"accepted","generation":1,"deadline_ms":2000,"ack_timeout_ms":2000,"heartbeat_interval_ms":5000,"heartbeat_timeout_ms":15000,"reconnect_grace_ms":12000,"start_timeout_ms":7000,"hard_expire_at_ms":50000}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.HeartbeatOpen(context.Background(), HeartbeatOpenRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", HardExpireAtMs: 50000, NowMs: 1000, HeartbeatTimeoutMs: 15000, AckTimeoutMs: 2000, HeartbeatIntervalMs: 5000, ReconnectGraceMs: 12000, StartTimeoutMs: 7000})
+	if err != nil {
+		t.Fatalf("HeartbeatOpen error: %v", err)
+	}
+	if gotPath != "/rpc/cq_heartbeat_open" {
+		t.Fatalf("expected heartbeat open rpc path, got %s", gotPath)
+	}
+	if gotBody["p_request_id"] != "request-1" || gotBody["p_lease_id"] != "lease-1" || gotBody["p_start_timeout_ms"] != float64(7000) {
+		t.Fatalf("unexpected heartbeat open payload: %v", gotBody)
+	}
+	if result.Result != "accepted" || result.Generation != 1 || result.DeadlineMs != 2000 {
+		t.Fatalf("unexpected heartbeat open result: %+v", result)
+	}
+}
+
+func TestPostgrestBackendHeartbeatRefreshAllowsAcceptedMinimalTimingShape(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"accepted","generation":2,"deadline_ms":21000,"heartbeat_timeout_ms":15000,"hard_expire_at_ms":50000}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.HeartbeatRefresh(context.Background(), HeartbeatRefreshRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", Generation: 2, NowMs: 6000, HeartbeatTimeoutMs: 15000})
+	if err != nil {
+		t.Fatalf("HeartbeatRefresh error: %v", err)
+	}
+	if gotPath != "/rpc/cq_heartbeat_refresh" {
+		t.Fatalf("expected heartbeat refresh rpc path, got %s", gotPath)
+	}
+	if result.Result != "accepted" || result.Generation != 2 || result.DeadlineMs != 21000 || result.HeartbeatTimeoutMs != 15000 || result.HardExpireAtMs != 50000 {
+		t.Fatalf("unexpected heartbeat refresh result: %+v", result)
+	}
+}
+
+func TestPostgrestBackendHeartbeatDisconnectAllowsAcceptedMinimalTimingShape(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"accepted","generation":2,"deadline_ms":18000,"reconnect_grace_ms":12000,"hard_expire_at_ms":50000}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.HeartbeatDisconnect(context.Background(), HeartbeatDisconnectRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", Generation: 2, NowMs: 6000, ReconnectGraceMs: 12000})
+	if err != nil {
+		t.Fatalf("HeartbeatDisconnect error: %v", err)
+	}
+	if gotPath != "/rpc/cq_heartbeat_disconnect" {
+		t.Fatalf("expected heartbeat disconnect rpc path, got %s", gotPath)
+	}
+	if result.Result != "accepted" || result.Generation != 2 || result.DeadlineMs != 18000 || result.ReconnectGraceMs != 12000 || result.HardExpireAtMs != 50000 {
+		t.Fatalf("unexpected heartbeat disconnect result: %+v", result)
+	}
+}
+
+func TestPostgrestBackendLoadActiveHeartbeatDeadlinesQueriesActiveRows(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.String()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"request_id":"request-1","heartbeat_deadline_ms":2000},{"request_id":"request-2","heartbeat_deadline_ms":3000}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	cfg.Concurrency.Heartbeat.SchedulerBatchSize = 5
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	results, err := backend.LoadActiveHeartbeatDeadlines(context.Background(), 1000, 3)
+	if err != nil {
+		t.Fatalf("LoadActiveHeartbeatDeadlines error: %v", err)
+	}
+	if !strings.Contains(gotPath, "heartbeat_deadline_ms=not.is.null") || !strings.Contains(gotPath, "hard_expire_at_ms=gt.1000") || !strings.Contains(gotPath, "order=heartbeat_deadline_ms.asc%2Crequest_id.asc") || !strings.Contains(gotPath, "limit=3") {
+		t.Fatalf("unexpected heartbeat deadline recovery query: %s", gotPath)
+	}
+	if len(results) != 2 || results[0].RequestID != "request-1" || results[0].DeadlineMs != 2000 || results[1].RequestID != "request-2" || results[1].DeadlineMs != 3000 {
+		t.Fatalf("unexpected heartbeat deadline snapshots: %+v", results)
+	}
+}
+
+func TestPostgrestBackendLoadActiveHeartbeatDeadlinesHonorsExplicitLimitAboveSchedulerBatchSize(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.String()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"request_id":"request-1","heartbeat_deadline_ms":2000}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	cfg.Concurrency.Heartbeat.SchedulerBatchSize = 5
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	if _, err := backend.LoadActiveHeartbeatDeadlines(context.Background(), 1000, 7); err != nil {
+		t.Fatalf("LoadActiveHeartbeatDeadlines error: %v", err)
+	}
+	if !strings.Contains(gotPath, "limit=7") {
+		t.Fatalf("expected recovery query to keep explicit limit 7, got %s", gotPath)
+	}
+}
+
+func TestPostgrestBackendLoadActiveHeartbeatDeadlinesWithoutLimitOmitsLimitParam(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.String()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"request_id":"request-1","heartbeat_deadline_ms":2000}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	cfg.Concurrency.Heartbeat.SchedulerBatchSize = 5
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	if _, err := backend.LoadActiveHeartbeatDeadlines(context.Background(), 1000, 0); err != nil {
+		t.Fatalf("LoadActiveHeartbeatDeadlines error: %v", err)
+	}
+	if strings.Contains(gotPath, "limit=") {
+		t.Fatalf("expected all-active recovery query without limit param, got %s", gotPath)
 	}
 }
 

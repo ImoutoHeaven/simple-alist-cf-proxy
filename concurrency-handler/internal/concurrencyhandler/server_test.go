@@ -6,35 +6,127 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"nhooyr.io/websocket"
+	"nhooyr.io/websocket/wsjson"
 )
 
+type heartbeatHelloFrame struct {
+	Type             string `json:"type"`
+	RequestID        string `json:"requestId"`
+	LeaseID          string `json:"leaseId"`
+	LeaseToken       string `json:"leaseToken"`
+	HardExpireAtMs   int64  `json:"hardExpireAtMs"`
+	ClientInstanceID string `json:"clientInstanceId"`
+	Attempt          int64  `json:"attempt"`
+	NowMs            int64  `json:"nowMs"`
+}
+
+type heartbeatHelloAckFrame struct {
+	Type                string `json:"type"`
+	Generation          int64  `json:"generation"`
+	DeadlineMs          int64  `json:"deadlineMs"`
+	AckTimeoutMs        int64  `json:"ackTimeoutMs"`
+	HeartbeatIntervalMs int64  `json:"heartbeatIntervalMs"`
+	HeartbeatTimeoutMs  int64  `json:"heartbeatTimeoutMs"`
+	ReconnectGraceMs    int64  `json:"reconnectGraceMs"`
+	StartTimeoutMs      int64  `json:"startTimeoutMs"`
+	HardExpireAtMs      int64  `json:"hardExpireAtMs"`
+}
+
+type heartbeatFrame struct {
+	Type       string `json:"type"`
+	RequestID  string `json:"requestId"`
+	LeaseID    string `json:"leaseId"`
+	LeaseToken string `json:"leaseToken"`
+	Generation int64  `json:"generation"`
+	NowMs      int64  `json:"nowMs"`
+}
+
+type heartbeatAckFrame struct {
+	Type           string `json:"type"`
+	Generation     int64  `json:"generation"`
+	DeadlineMs     int64  `json:"deadlineMs"`
+	HardExpireAtMs int64  `json:"hardExpireAtMs"`
+}
+
+type heartbeatTerminalFrame struct {
+	Type   string `json:"type"`
+	Result string `json:"result"`
+	Reason string `json:"reason"`
+}
+
+type heartbeatDisconnectRecorder struct {
+	mu    sync.Mutex
+	calls []HeartbeatDisconnectRequest
+}
+
+func (r *heartbeatDisconnectRecorder) record(req HeartbeatDisconnectRequest) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, req)
+	return len(r.calls)
+}
+
+func (r *heartbeatDisconnectRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+func (r *heartbeatDisconnectRecorder) call(i int) HeartbeatDisconnectRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if i < 0 || i >= len(r.calls) {
+		return HeartbeatDisconnectRequest{}
+	}
+	return r.calls[i]
+}
+
 type stubBackend struct {
-	acquireResult *AcquireResult
-	acquireErr    error
-	acquireFn     func(context.Context, AcquireRequest) (*AcquireResult, error)
-	claimResult   *ClaimGrantResult
-	claimErr      error
-	claimFn       func(context.Context, ClaimGrantRequest) (*ClaimGrantResult, error)
-	ackResult     *AckHandoffResult
-	ackErr        error
-	ackFn         func(context.Context, AckHandoffRequest) (*AckHandoffResult, error)
-	releaseResult *ReleaseResult
-	releaseErr    error
-	releaseFn     func(context.Context, ReleaseRequest) (*ReleaseResult, error)
-	promoteResult *AcquireResult
-	promoteErr    error
-	promoteFn     func(context.Context, PromoteWaitingRequest) (*AcquireResult, error)
-	cancelResult  *CancelResult
-	cancelErr     error
-	cancelFn      func(context.Context, CancelRequest) (*CancelResult, error)
-	expireResult  *ExpireScopeResult
-	expireErr     error
+	acquireResult             *AcquireResult
+	acquireErr                error
+	acquireFn                 func(context.Context, AcquireRequest) (*AcquireResult, error)
+	claimResult               *ClaimGrantResult
+	claimErr                  error
+	claimFn                   func(context.Context, ClaimGrantRequest) (*ClaimGrantResult, error)
+	ackResult                 *AckHandoffResult
+	ackErr                    error
+	ackFn                     func(context.Context, AckHandoffBackendRequest) (*AckHandoffResult, error)
+	releaseResult             *ReleaseResult
+	releaseErr                error
+	releaseFn                 func(context.Context, ReleaseRequest) (*ReleaseResult, error)
+	promoteResult             *AcquireResult
+	promoteErr                error
+	promoteFn                 func(context.Context, PromoteWaitingRequest) (*AcquireResult, error)
+	cancelResult              *CancelResult
+	cancelErr                 error
+	cancelFn                  func(context.Context, CancelRequest) (*CancelResult, error)
+	expireResult              *ExpireScopeResult
+	expireErr                 error
+	heartbeatOpenResult       *HeartbeatResult
+	heartbeatOpenErr          error
+	heartbeatOpenFn           func(context.Context, HeartbeatOpenRequest) (*HeartbeatResult, error)
+	heartbeatRefreshResult    *HeartbeatResult
+	heartbeatRefreshErr       error
+	heartbeatRefreshFn        func(context.Context, HeartbeatRefreshRequest) (*HeartbeatResult, error)
+	heartbeatDisconnectResult *HeartbeatResult
+	heartbeatDisconnectErr    error
+	heartbeatDisconnectFn     func(context.Context, HeartbeatDisconnectRequest) (*HeartbeatResult, error)
+	expireHeartbeatResult     *HeartbeatResult
+	expireHeartbeatErr        error
+	expireHeartbeatFn         func(context.Context, ExpireHeartbeatRequest) (*HeartbeatResult, error)
+	loadHeartbeatDeadlines    []HeartbeatDeadlineSnapshot
+	loadHeartbeatDeadlinesErr error
+	loadHeartbeatDeadlinesFn  func(context.Context, int64, int) ([]HeartbeatDeadlineSnapshot, error)
 }
 
 type firstContinueWaitBlocksBackend struct {
@@ -318,11 +410,46 @@ func (s *stubBackend) ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*C
 	return s.claimResult, s.claimErr
 }
 
-func (s *stubBackend) AckHandoff(ctx context.Context, req AckHandoffRequest) (*AckHandoffResult, error) {
+func (s *stubBackend) AckHandoff(ctx context.Context, req AckHandoffBackendRequest) (*AckHandoffResult, error) {
 	if s.ackFn != nil {
 		return s.ackFn(ctx, req)
 	}
 	return s.ackResult, s.ackErr
+}
+
+func (s *stubBackend) HeartbeatOpen(ctx context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+	if s.heartbeatOpenFn != nil {
+		return s.heartbeatOpenFn(ctx, req)
+	}
+	return s.heartbeatOpenResult, s.heartbeatOpenErr
+}
+
+func (s *stubBackend) HeartbeatRefresh(ctx context.Context, req HeartbeatRefreshRequest) (*HeartbeatResult, error) {
+	if s.heartbeatRefreshFn != nil {
+		return s.heartbeatRefreshFn(ctx, req)
+	}
+	return s.heartbeatRefreshResult, s.heartbeatRefreshErr
+}
+
+func (s *stubBackend) HeartbeatDisconnect(ctx context.Context, req HeartbeatDisconnectRequest) (*HeartbeatResult, error) {
+	if s.heartbeatDisconnectFn != nil {
+		return s.heartbeatDisconnectFn(ctx, req)
+	}
+	return s.heartbeatDisconnectResult, s.heartbeatDisconnectErr
+}
+
+func (s *stubBackend) ExpireHeartbeatIfDue(ctx context.Context, req ExpireHeartbeatRequest) (*HeartbeatResult, error) {
+	if s.expireHeartbeatFn != nil {
+		return s.expireHeartbeatFn(ctx, req)
+	}
+	return s.expireHeartbeatResult, s.expireHeartbeatErr
+}
+
+func (s *stubBackend) LoadActiveHeartbeatDeadlines(ctx context.Context, nowMs int64, limit int) ([]HeartbeatDeadlineSnapshot, error) {
+	if s.loadHeartbeatDeadlinesFn != nil {
+		return s.loadHeartbeatDeadlinesFn(ctx, nowMs, limit)
+	}
+	return append([]HeartbeatDeadlineSnapshot(nil), s.loadHeartbeatDeadlines...), s.loadHeartbeatDeadlinesErr
 }
 
 func (s *stubBackend) Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
@@ -368,6 +495,107 @@ func newTestServerInstanceWithConfig(t *testing.T, cfg Config, backend Backend) 
 		t.Fatalf("NewServer error: %v", err)
 	}
 	return srv
+}
+
+func newHeartbeatWebSocketTestServer(t *testing.T, cfg Config, backend Backend) (*Server, *httptest.Server) {
+	t.Helper()
+	server := newTestServerInstanceWithConfig(t, cfg, backend)
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(httpServer.Close)
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+	return server, httpServer
+}
+
+func dialHeartbeatSocket(t *testing.T, baseURL, authHeader string) *websocket.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	url := strings.Replace(baseURL, "http", "ws", 1) + heartbeatPath
+	conn, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: http.Header{"X-CQ-Auth": []string{authHeader}}})
+	if err != nil {
+		status := 0
+		body := ""
+		if resp != nil {
+			status = resp.StatusCode
+			payload := make([]byte, 1024)
+			n, _ := resp.Body.Read(payload)
+			body = string(payload[:n])
+		}
+		t.Fatalf("websocket dial %s failed: %v status=%d body=%q", url, err, status, body)
+	}
+	return conn
+}
+
+func writeWebSocketJSON(t *testing.T, conn *websocket.Conn, payload any) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := wsjson.Write(ctx, conn, payload); err != nil {
+		t.Fatalf("websocket write json: %v", err)
+	}
+}
+
+func writeWebSocketText(t *testing.T, conn *websocket.Conn, payload string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.Write(ctx, websocket.MessageText, []byte(payload)); err != nil {
+		t.Fatalf("websocket write text: %v", err)
+	}
+}
+
+func readWebSocketJSON(t *testing.T, conn *websocket.Conn, payload any) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := wsjson.Read(ctx, conn, payload); err != nil {
+		t.Fatalf("websocket read json: %v", err)
+	}
+}
+
+func expectWebSocketClosedWithoutPayload(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, payload, err := conn.Read(ctx)
+	if err == nil {
+		t.Fatalf("expected websocket close without payload, got %q", string(payload))
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected websocket close without payload, got timeout")
+	}
+}
+
+func expectNoWebSocketMessage(t *testing.T, conn *websocket.Conn, timeout time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, payload, err := conn.Read(ctx)
+	if err == nil {
+		t.Fatalf("expected no websocket message, got %q", string(payload))
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected no websocket message before timeout, got %v", err)
+	}
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	waitForConditionWithMessage(t, timeout, cond, "condition not satisfied before timeout")
+}
+
+func waitForConditionWithMessage(t *testing.T, timeout time.Duration, cond func() bool, message string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal(message)
 }
 
 func encodeJSONBody(t *testing.T, body any) []byte {
@@ -588,12 +816,12 @@ func TestClaimGrantEndpointTerminalResponseAllowsClaimHandoffTimeoutReason(t *te
 }
 
 func TestAckHandoffEndpointUsesAuthAndNormalizesResults(t *testing.T) {
-	var ackCalls []AckHandoffRequest
-	handler := newTestServer(t, &stubBackend{ackFn: func(_ context.Context, req AckHandoffRequest) (*AckHandoffResult, error) {
+	var ackCalls []AckHandoffBackendRequest
+	handler := newTestServer(t, &stubBackend{ackFn: func(_ context.Context, req AckHandoffBackendRequest) (*AckHandoffResult, error) {
 		ackCalls = append(ackCalls, req)
 		switch len(ackCalls) {
 		case 1:
-			return &AckHandoffResult{Result: "acknowledged"}, nil
+			return &AckHandoffResult{Result: "acknowledged", HeartbeatDeadlineMs: 17_000}, nil
 		case 2:
 			return &AckHandoffResult{Result: "conflict", Reason: "handoff_token_mismatch"}, nil
 		case 3:
@@ -614,8 +842,8 @@ func TestAckHandoffEndpointUsesAuthAndNormalizesResults(t *testing.T) {
 		t.Fatalf("expected acknowledged 200, got %d body=%s", acknowledged.Code, acknowledged.Body.String())
 	}
 	acknowledgedBody := decodeBody(t, acknowledged)
-	if len(acknowledgedBody) != 1 || acknowledgedBody["result"] != "acknowledged" {
-		t.Fatalf("expected acknowledged body without reason, got %v", acknowledgedBody)
+	if acknowledgedBody["result"] != "acknowledged" || acknowledgedBody["heartbeatDeadlineMs"] != float64(17_000) {
+		t.Fatalf("expected acknowledged body with heartbeat deadline, got %v", acknowledgedBody)
 	}
 
 	conflict := postJSON(t, handler, "/api/v1/concurrency/ack_handoff", AckHandoffRequest{RequestID: "request-1", HandoffToken: "wrong-token", NowMs: 1001}, "secret")
@@ -639,16 +867,16 @@ func TestAckHandoffEndpointUsesAuthAndNormalizesResults(t *testing.T) {
 	if len(ackCalls) != 3 {
 		t.Fatalf("expected 3 authorized ack handoff calls, got %+v", ackCalls)
 	}
-	if ackCalls[0].RequestID != "request-1" || ackCalls[0].HandoffToken != "handoff-1" || ackCalls[0].NowMs != 1000 {
+	if ackCalls[0].RequestID != "request-1" || ackCalls[0].HandoffToken != "handoff-1" || ackCalls[0].NowMs <= 0 || ackCalls[0].StartTimeoutMs != int64(validTestConfig().Concurrency.Heartbeat.StartTimeoutMs) {
 		t.Fatalf("expected first ack handoff request forwarded to backend, got %+v", ackCalls[0])
 	}
 }
 
 func TestAckHandoffEndpointRejectsInvalidRequestContract(t *testing.T) {
 	var called bool
-	handler := newTestServer(t, &stubBackend{ackFn: func(_ context.Context, req AckHandoffRequest) (*AckHandoffResult, error) {
+	handler := newTestServer(t, &stubBackend{ackFn: func(_ context.Context, req AckHandoffBackendRequest) (*AckHandoffResult, error) {
 		called = true
-		return &AckHandoffResult{Result: "acknowledged"}, nil
+		return &AckHandoffResult{Result: "acknowledged", HeartbeatDeadlineMs: req.NowMs + req.StartTimeoutMs}, nil
 	}})
 
 	for _, tc := range []struct {
@@ -672,6 +900,710 @@ func TestAckHandoffEndpointRejectsInvalidRequestContract(t *testing.T) {
 	}
 	if called {
 		t.Fatal("expected invalid ack handoff request to be rejected before backend call")
+	}
+}
+
+func TestHeartbeatRouteRejectsUnauthorizedBeforeUpgrade(t *testing.T) {
+	server := newTestServerInstance(t, &stubBackend{})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/concurrency/heartbeat", nil)
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected heartbeat route auth rejection before upgrade, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAckHandoffEndpointPassesStartTimeoutAndSchedulesHeartbeatDeadline(t *testing.T) {
+	cfg := validTestConfig()
+	var ackCalls []AckHandoffBackendRequest
+	server := newTestServerInstanceWithConfig(t, cfg, &stubBackend{ackFn: func(_ context.Context, req AckHandoffBackendRequest) (*AckHandoffResult, error) {
+		ackCalls = append(ackCalls, req)
+		return &AckHandoffResult{Result: "acknowledged", HeartbeatDeadlineMs: req.NowMs + req.StartTimeoutMs}, nil
+	}})
+	handler := server.Handler()
+
+	workerNowMs := int64(1)
+	beforeCall := time.Now().UnixMilli()
+	rec := postJSON(t, handler, ackPath, AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-1", NowMs: workerNowMs}, "secret")
+	afterCall := time.Now().UnixMilli()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected acknowledged 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(ackCalls) != 1 {
+		t.Fatalf("expected one backend ack call, got %+v", ackCalls)
+	}
+	if ackCalls[0].StartTimeoutMs != int64(cfg.Concurrency.Heartbeat.StartTimeoutMs) {
+		t.Fatalf("expected backend start timeout %d, got %+v", cfg.Concurrency.Heartbeat.StartTimeoutMs, ackCalls[0])
+	}
+	if ackCalls[0].NowMs < beforeCall || ackCalls[0].NowMs > afterCall || ackCalls[0].NowMs == workerNowMs {
+		t.Fatalf("expected backend nowMs from handler-side time in [%d,%d] instead of worker time %d, got %+v", beforeCall, afterCall, workerNowMs, ackCalls[0])
+	}
+	if server.heartbeatRuntime == nil {
+		t.Fatal("expected heartbeat runtime to be constructed")
+	}
+	minDeadline := beforeCall + int64(cfg.Concurrency.Heartbeat.StartTimeoutMs)
+	maxDeadline := afterCall + int64(cfg.Concurrency.Heartbeat.StartTimeoutMs)
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got < minDeadline || got > maxDeadline {
+		t.Fatalf("expected scheduled heartbeat deadline in [%d,%d], got %d", minDeadline, maxDeadline, got)
+	}
+	body := decodeBody(t, rec)
+	deadline, ok := body["heartbeatDeadlineMs"].(float64)
+	if !ok || int64(deadline) < minDeadline || int64(deadline) > maxDeadline {
+		t.Fatalf("expected heartbeatDeadlineMs in ack response, got %v", body)
+	}
+}
+
+func TestNewServerRecoversActiveHeartbeatDeadlines(t *testing.T) {
+	server := newTestServerInstance(t, &stubBackend{loadHeartbeatDeadlinesFn: func(_ context.Context, nowMs int64, limit int) ([]HeartbeatDeadlineSnapshot, error) {
+		if nowMs <= 0 {
+			t.Fatalf("expected positive recovery nowMs, got %d", nowMs)
+		}
+		if limit != 0 {
+			t.Fatalf("expected heartbeat recovery to request all active deadlines, got limit %d", limit)
+		}
+		return []HeartbeatDeadlineSnapshot{{RequestID: "request-1", DeadlineMs: nowMs + 1000}, {RequestID: "request-2", DeadlineMs: nowMs + 2000}}, nil
+	}})
+
+	if server.heartbeatRuntime == nil {
+		t.Fatal("expected heartbeat runtime on new server")
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got == 0 {
+		t.Fatal("expected request-1 heartbeat deadline recovered on startup")
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("request-2"); got == 0 {
+		t.Fatal("expected request-2 heartbeat deadline recovered on startup")
+	}
+}
+
+func TestNewServerRecoversAllActiveHeartbeatDeadlinesOnStartup(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Concurrency.Heartbeat.SchedulerBatchSize = 2
+	rows := []HeartbeatDeadlineSnapshot{
+		{RequestID: "request-1", DeadlineMs: time.Now().Add(time.Minute).UnixMilli()},
+		{RequestID: "request-2", DeadlineMs: time.Now().Add(2 * time.Minute).UnixMilli()},
+		{RequestID: "request-3", DeadlineMs: time.Now().Add(3 * time.Minute).UnixMilli()},
+	}
+	server := newTestServerInstanceWithConfig(t, cfg, &stubBackend{loadHeartbeatDeadlinesFn: func(_ context.Context, nowMs int64, limit int) ([]HeartbeatDeadlineSnapshot, error) {
+		if nowMs <= 0 {
+			t.Fatalf("expected positive recovery nowMs, got %d", nowMs)
+		}
+		if limit > 0 && limit < len(rows) {
+			return append([]HeartbeatDeadlineSnapshot(nil), rows[:limit]...), nil
+		}
+		return append([]HeartbeatDeadlineSnapshot(nil), rows...), nil
+	}})
+
+	for _, row := range rows {
+		if got := server.heartbeatRuntime.scheduledDeadline(row.RequestID); got != row.DeadlineMs {
+			t.Fatalf("expected recovered heartbeat deadline %d for %s, got %d", row.DeadlineMs, row.RequestID, got)
+		}
+	}
+}
+
+func TestServerCloseStopsHeartbeatTimers(t *testing.T) {
+	server := newTestServerInstance(t, &stubBackend{})
+	server.heartbeatRuntime.schedule("request-1", time.Now().Add(time.Minute).UnixMilli())
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got == 0 {
+		t.Fatal("expected scheduled heartbeat deadline before Close")
+	}
+	if err := server.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got != 0 {
+		t.Fatalf("expected Close to stop heartbeat timers, got deadline %d", got)
+	}
+}
+
+func TestHeartbeatRouteRegisteredWhenEnabled(t *testing.T) {
+	server := newTestServerInstance(t, &stubBackend{})
+	req := httptest.NewRequest(http.MethodGet, heartbeatPath, nil)
+	req.Header.Set("X-CQ-Auth", "secret")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUpgradeRequired {
+		t.Fatalf("expected registered heartbeat route to reject non-upgrade GET with 426, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHeartbeatWebSocketRejectsMalformedFirstMessageWithoutHeartbeatOpen(t *testing.T) {
+	var openCalls int
+	server, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{heartbeatOpenFn: func(_ context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+		openCalls++
+		return nil, errors.New("unexpected open")
+	}})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketText(t, conn, "{")
+	expectWebSocketClosedWithoutPayload(t, conn)
+	if openCalls != 0 {
+		t.Fatalf("expected malformed first message to skip HeartbeatOpen, got %d calls", openCalls)
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got != 0 {
+		t.Fatalf("expected no heartbeat schedule after malformed first message, got %d", got)
+	}
+}
+
+func TestHeartbeatWebSocketRejectsNonHelloFirstMessageWithoutHeartbeatOpen(t *testing.T) {
+	var openCalls int
+	_, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{heartbeatOpenFn: func(_ context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+		openCalls++
+		return nil, errors.New("unexpected open")
+	}})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, map[string]any{"type": "heartbeat", "requestId": "request-1"})
+	expectWebSocketClosedWithoutPayload(t, conn)
+	if openCalls != 0 {
+		t.Fatalf("expected non-hello first message to skip HeartbeatOpen, got %d calls", openCalls)
+	}
+}
+
+func TestHeartbeatWebSocketAcceptedHelloReturnsAckAndUsesHandlerTime(t *testing.T) {
+	deadlineMs := time.Now().Add(time.Minute).UnixMilli()
+	var openCalls []HeartbeatOpenRequest
+	server, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{heartbeatOpenFn: func(_ context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+		openCalls = append(openCalls, req)
+		return &HeartbeatResult{
+			Result:              "accepted",
+			Generation:          3,
+			DeadlineMs:          deadlineMs,
+			AckTimeoutMs:        2_100,
+			HeartbeatIntervalMs: 5_100,
+			HeartbeatTimeoutMs:  15_100,
+			ReconnectGraceMs:    12_100,
+			StartTimeoutMs:      7_100,
+			HardExpireAtMs:      50_000,
+		}, nil
+	}})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	beforeSend := time.Now().UnixMilli()
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{
+		Type:             "hello",
+		RequestID:        "request-1",
+		LeaseID:          "11111111-1111-1111-1111-111111111111",
+		LeaseToken:       "lease-token-1",
+		HardExpireAtMs:   50_000,
+		ClientInstanceID: "client-a",
+		Attempt:          1,
+		NowMs:            1,
+	})
+	var ack heartbeatHelloAckFrame
+	readWebSocketJSON(t, conn, &ack)
+	afterSend := time.Now().UnixMilli()
+
+	if len(openCalls) != 1 {
+		t.Fatalf("expected one HeartbeatOpen call, got %+v", openCalls)
+	}
+	if openCalls[0].NowMs < beforeSend || openCalls[0].NowMs > afterSend || openCalls[0].NowMs == 1 {
+		t.Fatalf("expected HeartbeatOpen to use handler-side time in [%d,%d] instead of client nowMs, got %+v", beforeSend, afterSend, openCalls[0])
+	}
+	if openCalls[0].RequestID != "request-1" || openCalls[0].LeaseToken != "lease-token-1" || openCalls[0].StartTimeoutMs != int64(validTestConfig().Concurrency.Heartbeat.StartTimeoutMs) {
+		t.Fatalf("expected HeartbeatOpen request contract forwarded, got %+v", openCalls[0])
+	}
+	if ack != (heartbeatHelloAckFrame{Type: "hello_ack", Generation: 3, DeadlineMs: deadlineMs, AckTimeoutMs: 2_100, HeartbeatIntervalMs: 5_100, HeartbeatTimeoutMs: 15_100, ReconnectGraceMs: 12_100, StartTimeoutMs: 7_100, HardExpireAtMs: 50_000}) {
+		t.Fatalf("unexpected hello_ack payload: %+v", ack)
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got != deadlineMs {
+		t.Fatalf("expected accepted hello to schedule deadline %d, got %d", deadlineMs, got)
+	}
+	if got := server.heartbeatRuntime.currentGeneration("request-1"); got != 3 {
+		t.Fatalf("expected accepted hello to track generation 3, got %d", got)
+	}
+}
+
+func TestHeartbeatWebSocketRefreshUsesHandlerTimeAndReschedules(t *testing.T) {
+	initialDeadlineMs := time.Now().Add(time.Minute).UnixMilli()
+	refreshDeadlineMs := time.Now().Add(2 * time.Minute).UnixMilli()
+	var refreshCalls []HeartbeatRefreshRequest
+	server, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{
+		heartbeatOpenResult: &HeartbeatResult{
+			Result:              "accepted",
+			Generation:          7,
+			DeadlineMs:          initialDeadlineMs,
+			AckTimeoutMs:        2_000,
+			HeartbeatIntervalMs: 5_000,
+			HeartbeatTimeoutMs:  15_000,
+			ReconnectGraceMs:    12_000,
+			StartTimeoutMs:      7_000,
+			HardExpireAtMs:      80_000,
+		},
+		heartbeatRefreshFn: func(_ context.Context, req HeartbeatRefreshRequest) (*HeartbeatResult, error) {
+			refreshCalls = append(refreshCalls, req)
+			return &HeartbeatResult{Result: "accepted", Generation: req.Generation, DeadlineMs: refreshDeadlineMs, HeartbeatTimeoutMs: 15_000, HardExpireAtMs: 80_000}, nil
+		},
+	})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{
+		Type:             "hello",
+		RequestID:        "request-1",
+		LeaseID:          "11111111-1111-1111-1111-111111111111",
+		LeaseToken:       "lease-token-1",
+		HardExpireAtMs:   80_000,
+		ClientInstanceID: "client-a",
+		Attempt:          1,
+		NowMs:            1,
+	})
+	var helloAck heartbeatHelloAckFrame
+	readWebSocketJSON(t, conn, &helloAck)
+
+	beforeRefresh := time.Now().UnixMilli()
+	writeWebSocketJSON(t, conn, heartbeatFrame{
+		Type:       "heartbeat",
+		RequestID:  "request-1",
+		LeaseID:    "11111111-1111-1111-1111-111111111111",
+		LeaseToken: "lease-token-1",
+		Generation: helloAck.Generation,
+		NowMs:      2,
+	})
+	var ack heartbeatAckFrame
+	readWebSocketJSON(t, conn, &ack)
+	afterRefresh := time.Now().UnixMilli()
+
+	if len(refreshCalls) != 1 {
+		t.Fatalf("expected one HeartbeatRefresh call, got %+v", refreshCalls)
+	}
+	if refreshCalls[0].Generation != helloAck.Generation {
+		t.Fatalf("expected refresh generation %d, got %+v", helloAck.Generation, refreshCalls[0])
+	}
+	if refreshCalls[0].NowMs < beforeRefresh || refreshCalls[0].NowMs > afterRefresh || refreshCalls[0].NowMs == 2 {
+		t.Fatalf("expected HeartbeatRefresh to use handler-side time in [%d,%d] instead of client nowMs, got %+v", beforeRefresh, afterRefresh, refreshCalls[0])
+	}
+	if ack != (heartbeatAckFrame{Type: "heartbeat_ack", Generation: helloAck.Generation, DeadlineMs: refreshDeadlineMs, HardExpireAtMs: 80_000}) {
+		t.Fatalf("unexpected heartbeat_ack payload: %+v", ack)
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got != refreshDeadlineMs {
+		t.Fatalf("expected heartbeat refresh to reschedule deadline %d, got %d", refreshDeadlineMs, got)
+	}
+}
+
+func TestHeartbeatWebSocketMissingHelloTimeoutClosesWithoutHeartbeatOpen(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Concurrency.Heartbeat.HelloTimeoutMs = 20
+	var openCalls int
+	_, httpServer := newHeartbeatWebSocketTestServer(t, cfg, &stubBackend{heartbeatOpenFn: func(_ context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+		openCalls++
+		return nil, errors.New("unexpected open")
+	}})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	expectWebSocketClosedWithoutPayload(t, conn)
+	if openCalls != 0 {
+		t.Fatalf("expected hello timeout to close before HeartbeatOpen, got %d calls", openCalls)
+	}
+}
+
+func TestHeartbeatWebSocketPreHandoffHelloClosesWithoutTerminalFrame(t *testing.T) {
+	var openCalls int
+	_, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{heartbeatOpenFn: func(_ context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+		openCalls++
+		return &HeartbeatResult{Result: "conflict", Reason: "handoff_not_acknowledged", HardExpireAtMs: req.HardExpireAtMs}, nil
+	}})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	expectWebSocketClosedWithoutPayload(t, conn)
+	if openCalls != 1 {
+		t.Fatalf("expected pre-handoff hello to reach backend once, got %d calls", openCalls)
+	}
+}
+
+func TestHeartbeatWebSocketHardExpiryMismatchClosesWithoutTerminalFrame(t *testing.T) {
+	_, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{heartbeatOpenResult: &HeartbeatResult{Result: "conflict", Reason: "hard_expire_at_mismatch", HardExpireAtMs: 90_000}})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	expectWebSocketClosedWithoutPayload(t, conn)
+}
+
+func TestHeartbeatWebSocketCredentialMismatchMapsToTerminalTokenMismatch(t *testing.T) {
+	_, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{heartbeatOpenResult: &HeartbeatResult{Result: "conflict", Reason: "lease_token_mismatch", HardExpireAtMs: 80_000}})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	var terminal heartbeatTerminalFrame
+	readWebSocketJSON(t, conn, &terminal)
+	if terminal.Type != "terminal" || terminal.Result != "terminal" || terminal.Reason != "token_mismatch" {
+		t.Fatalf("expected credential mismatch terminal token_mismatch, got %+v", terminal)
+	}
+	expectWebSocketClosedWithoutPayload(t, conn)
+}
+
+func TestHeartbeatWebSocketLateHelloReturnsHeartbeatStartTimeoutTerminal(t *testing.T) {
+	server, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{heartbeatOpenResult: &HeartbeatResult{Result: "released", Reason: "heartbeat_start_timeout", HardExpireAtMs: 80_000}})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	var terminal heartbeatTerminalFrame
+	readWebSocketJSON(t, conn, &terminal)
+	if terminal.Type != "terminal" || terminal.Result != "released" || terminal.Reason != "heartbeat_start_timeout" {
+		t.Fatalf("expected heartbeat_start_timeout terminal, got %+v", terminal)
+	}
+	expectWebSocketClosedWithoutPayload(t, conn)
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got != 0 {
+		t.Fatalf("expected terminal late hello to clear heartbeat schedule, got %d", got)
+	}
+}
+
+func TestHeartbeatWebSocketTerminalOpenRefusalMapsReason(t *testing.T) {
+	server, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{heartbeatOpenResult: &HeartbeatResult{Result: "terminal", Reason: "already_released", HardExpireAtMs: 80_000}})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	var terminal heartbeatTerminalFrame
+	readWebSocketJSON(t, conn, &terminal)
+	if terminal.Type != "terminal" || terminal.Result != "terminal" || terminal.Reason != "already_released" {
+		t.Fatalf("expected terminal refusal to preserve backend reason, got %+v", terminal)
+	}
+	expectWebSocketClosedWithoutPayload(t, conn)
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got != 0 {
+		t.Fatalf("expected terminal refusal to clear heartbeat schedule, got %d", got)
+	}
+}
+
+func TestHeartbeatWebSocketUnknownPostHelloMessageSendsProtocolErrorWithoutRefresh(t *testing.T) {
+	initialDeadlineMs := time.Now().Add(time.Minute).UnixMilli()
+	graceDeadlineMs := time.Now().Add(30 * time.Second).UnixMilli()
+	var refreshCalls atomic.Int32
+	disconnectCalls := &heartbeatDisconnectRecorder{}
+	server, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{
+		heartbeatOpenResult: &HeartbeatResult{Result: "accepted", Generation: 1, DeadlineMs: initialDeadlineMs, AckTimeoutMs: 2_000, HeartbeatIntervalMs: 5_000, HeartbeatTimeoutMs: 15_000, ReconnectGraceMs: 12_000, StartTimeoutMs: 7_000, HardExpireAtMs: 80_000},
+		heartbeatRefreshFn: func(_ context.Context, req HeartbeatRefreshRequest) (*HeartbeatResult, error) {
+			refreshCalls.Add(1)
+			return nil, errors.New("unexpected refresh")
+		},
+		heartbeatDisconnectFn: func(_ context.Context, req HeartbeatDisconnectRequest) (*HeartbeatResult, error) {
+			disconnectCalls.record(req)
+			return &HeartbeatResult{Result: "accepted", Generation: req.Generation, DeadlineMs: graceDeadlineMs, ReconnectGraceMs: req.ReconnectGraceMs, HardExpireAtMs: 80_000}, nil
+		},
+	})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	var ack heartbeatHelloAckFrame
+	readWebSocketJSON(t, conn, &ack)
+	writeWebSocketJSON(t, conn, map[string]any{"type": "unknown", "requestId": "request-1"})
+	var terminal heartbeatTerminalFrame
+	readWebSocketJSON(t, conn, &terminal)
+	if terminal.Type != "terminal" || terminal.Reason != "protocol_error" {
+		t.Fatalf("expected protocol_error terminal, got %+v", terminal)
+	}
+	expectWebSocketClosedWithoutPayload(t, conn)
+	waitForConditionWithMessage(t, 500*time.Millisecond, func() bool {
+		return disconnectCalls.count() == 1 && server.heartbeatRuntime.scheduledDeadline("request-1") == graceDeadlineMs
+	}, fmt.Sprintf("protocol-error close did not schedule grace deadline %d before timeout", graceDeadlineMs))
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("expected protocol error to skip HeartbeatRefresh, got %d calls", refreshCalls.Load())
+	}
+	if disconnectCall := disconnectCalls.call(0); disconnectCall.Generation != 1 {
+		t.Fatalf("expected current-generation close after protocol error, got %+v", disconnectCall)
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got != graceDeadlineMs {
+		t.Fatalf("expected protocol-error close path to schedule grace deadline %d, got %d", graceDeadlineMs, got)
+	}
+}
+
+func TestHeartbeatWebSocketMalformedPostHelloMessageSendsProtocolErrorWithoutRefresh(t *testing.T) {
+	initialDeadlineMs := time.Now().Add(time.Minute).UnixMilli()
+	graceDeadlineMs := time.Now().Add(30 * time.Second).UnixMilli()
+	var refreshCalls atomic.Int32
+	var disconnectCalls atomic.Int32
+	_, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{
+		heartbeatOpenResult: &HeartbeatResult{Result: "accepted", Generation: 1, DeadlineMs: initialDeadlineMs, AckTimeoutMs: 2_000, HeartbeatIntervalMs: 5_000, HeartbeatTimeoutMs: 15_000, ReconnectGraceMs: 12_000, StartTimeoutMs: 7_000, HardExpireAtMs: 80_000},
+		heartbeatRefreshFn: func(_ context.Context, req HeartbeatRefreshRequest) (*HeartbeatResult, error) {
+			refreshCalls.Add(1)
+			return nil, errors.New("unexpected refresh")
+		},
+		heartbeatDisconnectFn: func(_ context.Context, req HeartbeatDisconnectRequest) (*HeartbeatResult, error) {
+			disconnectCalls.Add(1)
+			return &HeartbeatResult{Result: "accepted", Generation: req.Generation, DeadlineMs: graceDeadlineMs, ReconnectGraceMs: req.ReconnectGraceMs, HardExpireAtMs: 80_000}, nil
+		},
+	})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	var ack heartbeatHelloAckFrame
+	readWebSocketJSON(t, conn, &ack)
+	writeWebSocketJSON(t, conn, map[string]any{"type": "heartbeat", "requestId": "request-1"})
+	var terminal heartbeatTerminalFrame
+	readWebSocketJSON(t, conn, &terminal)
+	if terminal.Type != "terminal" || terminal.Reason != "protocol_error" {
+		t.Fatalf("expected malformed heartbeat to return protocol_error terminal, got %+v", terminal)
+	}
+	expectWebSocketClosedWithoutPayload(t, conn)
+	waitForCondition(t, 500*time.Millisecond, func() bool { return disconnectCalls.Load() == 1 })
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("expected malformed heartbeat to skip HeartbeatRefresh, got %d calls", refreshCalls.Load())
+	}
+}
+
+func TestHeartbeatWebSocketCurrentGenerationCloseCallsDisconnectAndSchedulesGrace(t *testing.T) {
+	initialDeadlineMs := time.Now().Add(time.Minute).UnixMilli()
+	graceDeadlineMs := time.Now().Add(30 * time.Second).UnixMilli()
+	disconnectCalls := &heartbeatDisconnectRecorder{}
+	server, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{
+		heartbeatOpenResult: &HeartbeatResult{Result: "accepted", Generation: 1, DeadlineMs: initialDeadlineMs, AckTimeoutMs: 2_000, HeartbeatIntervalMs: 5_000, HeartbeatTimeoutMs: 15_000, ReconnectGraceMs: 12_000, StartTimeoutMs: 7_000, HardExpireAtMs: 80_000},
+		heartbeatDisconnectFn: func(_ context.Context, req HeartbeatDisconnectRequest) (*HeartbeatResult, error) {
+			disconnectCalls.record(req)
+			return &HeartbeatResult{Result: "accepted", Generation: req.Generation, DeadlineMs: graceDeadlineMs, ReconnectGraceMs: req.ReconnectGraceMs, HardExpireAtMs: 80_000}, nil
+		},
+	})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	var ack heartbeatHelloAckFrame
+	readWebSocketJSON(t, conn, &ack)
+	beforeClose := time.Now().UnixMilli()
+	if err := conn.Close(websocket.StatusNormalClosure, "client closed"); err != nil {
+		t.Fatalf("client close error: %v", err)
+	}
+	afterClose := time.Now().UnixMilli()
+	waitForConditionWithMessage(t, 500*time.Millisecond, func() bool {
+		return disconnectCalls.count() == 1 && server.heartbeatRuntime.scheduledDeadline("request-1") == graceDeadlineMs
+	}, fmt.Sprintf("disconnect did not schedule grace deadline %d before timeout", graceDeadlineMs))
+	disconnectCall := disconnectCalls.call(0)
+	if disconnectCall.Generation != ack.Generation || disconnectCall.ReconnectGraceMs != int64(validTestConfig().Concurrency.Heartbeat.ReconnectGraceMs) {
+		t.Fatalf("unexpected HeartbeatDisconnect request: %+v", disconnectCall)
+	}
+	if disconnectCall.NowMs < beforeClose || disconnectCall.NowMs > afterClose {
+		t.Fatalf("expected HeartbeatDisconnect handler-side close time in [%d,%d], got %+v", beforeClose, afterClose, disconnectCall)
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got != graceDeadlineMs {
+		t.Fatalf("expected disconnect to schedule grace deadline %d, got %d", graceDeadlineMs, got)
+	}
+}
+
+func TestHeartbeatWebSocketReplacementMakesOldGenerationStale(t *testing.T) {
+	baseDeadlineMs := time.Now().Add(time.Minute).UnixMilli()
+	nextDeadlineMs := time.Now().Add(90 * time.Second).UnixMilli()
+	graceDeadlineMs := time.Now().Add(30 * time.Second).UnixMilli()
+	var refreshCalls atomic.Int32
+	disconnectCalls := &heartbeatDisconnectRecorder{}
+	var openCalls atomic.Int64
+	server, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{
+		heartbeatOpenFn: func(_ context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+			generation := openCalls.Add(1)
+			deadlineMs := baseDeadlineMs
+			if generation == 2 {
+				deadlineMs = nextDeadlineMs
+			}
+			return &HeartbeatResult{Result: "accepted", Generation: generation, DeadlineMs: deadlineMs, AckTimeoutMs: 2_000, HeartbeatIntervalMs: 5_000, HeartbeatTimeoutMs: 15_000, ReconnectGraceMs: 12_000, StartTimeoutMs: 7_000, HardExpireAtMs: 80_000}, nil
+		},
+		heartbeatRefreshFn: func(_ context.Context, req HeartbeatRefreshRequest) (*HeartbeatResult, error) {
+			refreshCalls.Add(1)
+			return &HeartbeatResult{Result: "accepted", Generation: req.Generation, DeadlineMs: nextDeadlineMs, HeartbeatTimeoutMs: 15_000, HardExpireAtMs: 80_000}, nil
+		},
+		heartbeatDisconnectFn: func(_ context.Context, req HeartbeatDisconnectRequest) (*HeartbeatResult, error) {
+			disconnectCalls.record(req)
+			return &HeartbeatResult{Result: "accepted", Generation: req.Generation, DeadlineMs: graceDeadlineMs, ReconnectGraceMs: req.ReconnectGraceMs, HardExpireAtMs: 80_000}, nil
+		},
+	})
+
+	conn1 := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn1.Close(websocket.StatusNormalClosure, "") })
+	writeWebSocketJSON(t, conn1, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	var ack1 heartbeatHelloAckFrame
+	readWebSocketJSON(t, conn1, &ack1)
+
+	conn2 := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn2.Close(websocket.StatusNormalClosure, "") })
+	writeWebSocketJSON(t, conn2, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 2, NowMs: 2})
+	var ack2 heartbeatHelloAckFrame
+	readWebSocketJSON(t, conn2, &ack2)
+
+	if ack1.Generation != 1 || ack2.Generation != 2 {
+		t.Fatalf("expected replacement generations 1 then 2, got ack1=%+v ack2=%+v", ack1, ack2)
+	}
+	if got := server.heartbeatRuntime.currentGeneration("request-1"); got != 2 {
+		t.Fatalf("expected replacement hello to advance tracked generation to 2, got %d", got)
+	}
+
+	writeWebSocketJSON(t, conn1, heartbeatFrame{Type: "heartbeat", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", Generation: ack1.Generation, NowMs: 3})
+	time.Sleep(100 * time.Millisecond)
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("expected stale generation refresh to skip backend refresh, got %d calls", refreshCalls.Load())
+	}
+	if err := conn1.Close(websocket.StatusNormalClosure, "stale close"); err != nil {
+		t.Fatalf("stale client close error: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if disconnectCalls.count() != 0 {
+		t.Fatalf("expected stale generation close to skip HeartbeatDisconnect, got %+v", disconnectCalls.call(0))
+	}
+	if err := conn2.Close(websocket.StatusNormalClosure, "current close"); err != nil {
+		t.Fatalf("current client close error: %v", err)
+	}
+	waitForCondition(t, 500*time.Millisecond, func() bool { return disconnectCalls.count() == 1 })
+	if disconnectCall := disconnectCalls.call(0); disconnectCall.Generation != ack2.Generation {
+		t.Fatalf("expected current generation close to disconnect generation %d, got %+v", ack2.Generation, disconnectCall)
+	}
+}
+
+func TestHeartbeatWebSocketGraceReconnectAndLateReconnectRefusal(t *testing.T) {
+	firstDeadlineMs := time.Now().Add(time.Minute).UnixMilli()
+	secondDeadlineMs := time.Now().Add(90 * time.Second).UnixMilli()
+	graceDeadlineMs := time.Now().Add(30 * time.Second).UnixMilli()
+	openCalls := 0
+	_, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{
+		heartbeatOpenFn: func(_ context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+			openCalls++
+			switch openCalls {
+			case 1:
+				return &HeartbeatResult{Result: "accepted", Generation: 1, DeadlineMs: firstDeadlineMs, AckTimeoutMs: 2_000, HeartbeatIntervalMs: 5_000, HeartbeatTimeoutMs: 15_000, ReconnectGraceMs: 12_000, StartTimeoutMs: 7_000, HardExpireAtMs: 80_000}, nil
+			case 2:
+				return &HeartbeatResult{Result: "accepted", Generation: 2, DeadlineMs: secondDeadlineMs, AckTimeoutMs: 2_000, HeartbeatIntervalMs: 5_000, HeartbeatTimeoutMs: 15_000, ReconnectGraceMs: 12_000, StartTimeoutMs: 7_000, HardExpireAtMs: 80_000}, nil
+			default:
+				return &HeartbeatResult{Result: "released", Reason: "heartbeat_timeout", HardExpireAtMs: 80_000}, nil
+			}
+		},
+		heartbeatDisconnectResult: &HeartbeatResult{Result: "accepted", Generation: 1, DeadlineMs: graceDeadlineMs, ReconnectGraceMs: 12_000, HardExpireAtMs: 80_000},
+	})
+
+	conn1 := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn1.Close(websocket.StatusNormalClosure, "") })
+	writeWebSocketJSON(t, conn1, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	var ack1 heartbeatHelloAckFrame
+	readWebSocketJSON(t, conn1, &ack1)
+	if err := conn1.Close(websocket.StatusNormalClosure, "disconnect to grace"); err != nil {
+		t.Fatalf("grace close error: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	conn2 := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn2.Close(websocket.StatusNormalClosure, "") })
+	writeWebSocketJSON(t, conn2, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 2, NowMs: 2})
+	var ack2 heartbeatHelloAckFrame
+	readWebSocketJSON(t, conn2, &ack2)
+	if ack2.Generation != 2 {
+		t.Fatalf("expected grace reconnect generation 2, got %+v", ack2)
+	}
+
+	conn3 := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn3.Close(websocket.StatusNormalClosure, "") })
+	writeWebSocketJSON(t, conn3, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 3, NowMs: 3})
+	var terminal heartbeatTerminalFrame
+	readWebSocketJSON(t, conn3, &terminal)
+	if terminal.Type != "terminal" || terminal.Result != "released" || terminal.Reason != "heartbeat_timeout" {
+		t.Fatalf("expected late reconnect refusal terminal heartbeat_timeout, got %+v", terminal)
+	}
+}
+
+func TestHandleReleaseCancelsHeartbeatScheduleAndWakesWaiters(t *testing.T) {
+	backend := &stubBackend{releaseResult: &ReleaseResult{Result: "released", RequestID: "released-active-request"}, promoteFn: func(_ context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+		if req.RequestID != "waiting-request" {
+			t.Fatalf("unexpected promote request after release wake: %+v", req)
+		}
+		return &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: time.Now().Add(time.Minute).UnixMilli()}, nil
+	}}
+	server := newTestServerInstance(t, backend)
+	server.heartbeatRuntime.schedule("released-active-request", time.Now().Add(time.Minute).UnixMilli())
+	waiter, ok := server.waitingRuntime.tryAttach("wait-release")
+	if !ok || waiter == nil {
+		t.Fatal("expected attached waiter for release wake test")
+	}
+	nowMs := time.Now().UnixMilli()
+	server.waitingRuntime.setRequest(waiter, AcquireRequest{Hostname: "release.example.com", HostnameHash: "release-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "waiting-request", HardExpireAtMs: nowMs + 60_000, NowMs: nowMs, WaitToken: "wait-release"})
+	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "release.example.com", HostnameHash: "release-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "waiting-request", HardExpireAtMs: nowMs + 60_000, NowMs: nowMs, WaitToken: "wait-release"}, "wait-release", waiter, server.cfg)
+
+	rec := postJSON(t, server.Handler(), releasePath, ReleaseRequest{LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token", Reason: "stream_complete", NowMs: nowMs + 1}, "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected release 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("released-active-request"); got != 0 {
+		t.Fatalf("expected release to cancel heartbeat schedule, got %d", got)
+	}
+	select {
+	case delivered := <-waiter.resultCh:
+		if delivered == nil || delivered.Result != "granted" {
+			t.Fatalf("expected waiter grant after release wake, got %+v", delivered)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for release wake delivery")
+	}
+}
+
+func TestHandleCancelCancelsHeartbeatSchedule(t *testing.T) {
+	server := newTestServerInstance(t, &stubBackend{cancelResult: &CancelResult{Result: "cancelled"}})
+	server.heartbeatRuntime.schedule("cancelled-active-request", time.Now().Add(time.Minute).UnixMilli())
+
+	rec := postJSON(t, server.Handler(), cancelPath, CancelRequest{RequestID: "cancelled-active-request", Hostname: "cancel.example.com", HostnameHash: "cancel-host", SiteBucket: "site-a", IPBucket: "ip-a", HardExpireAtMs: time.Now().Add(time.Minute).UnixMilli(), Reason: "worker_aborted", NowMs: time.Now().UnixMilli()}, "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected cancel 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("cancelled-active-request"); got != 0 {
+		t.Fatalf("expected cancel to clear heartbeat schedule, got %d", got)
+	}
+}
+
+func TestHeartbeatRuntimeExpiryCancelsScheduleAndWakesWaiters(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result *HeartbeatResult
+	}{
+		{name: "released heartbeat timeout", result: &HeartbeatResult{Result: "released", Reason: "heartbeat_timeout", Generation: 1, HardExpireAtMs: 80_000}},
+		{name: "expired hard expiry", result: &HeartbeatResult{Result: "expired", Reason: "hard_expired", Generation: 1, HardExpireAtMs: 80_000}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &stubBackend{
+				expireHeartbeatResult: tc.result,
+				promoteFn: func(_ context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+					if req.RequestID != "waiting-request" {
+						t.Fatalf("unexpected promote request after heartbeat expiry: %+v", req)
+					}
+					return &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: time.Now().Add(time.Minute).UnixMilli()}, nil
+				},
+			}
+			server := newTestServerInstance(t, backend)
+			waiter, ok := server.waitingRuntime.tryAttach("wait-heartbeat-expiry")
+			if !ok || waiter == nil {
+				t.Fatal("expected waiter attach")
+			}
+			nowMs := time.Now().UnixMilli()
+			server.waitingRuntime.setRequest(waiter, AcquireRequest{Hostname: "heartbeat-expiry.example.com", HostnameHash: "heartbeat-expiry-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "waiting-request", HardExpireAtMs: nowMs + 60_000, NowMs: nowMs, WaitToken: "wait-heartbeat-expiry"})
+			server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "heartbeat-expiry.example.com", HostnameHash: "heartbeat-expiry-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "waiting-request", HardExpireAtMs: nowMs + 60_000, NowMs: nowMs, WaitToken: "wait-heartbeat-expiry"}, "wait-heartbeat-expiry", waiter, server.cfg)
+			server.heartbeatRuntime.schedule("active-request", time.Now().Add(25*time.Millisecond).UnixMilli())
+
+			select {
+			case delivered := <-waiter.resultCh:
+				if delivered == nil || delivered.Result != "granted" {
+					t.Fatalf("expected waiter grant after heartbeat terminal expiry, got %+v", delivered)
+				}
+			case <-time.After(750 * time.Millisecond):
+				t.Fatal("timed out waiting for heartbeat expiry wake delivery")
+			}
+			if got := server.heartbeatRuntime.scheduledDeadline("active-request"); got != 0 {
+				t.Fatalf("expected heartbeat terminal expiry to cancel schedule, got %d", got)
+			}
+		})
 	}
 }
 
@@ -2081,6 +3013,119 @@ func TestRunExpiryPassCountsExpiredHardAndClearsActiveReplayStateWithPostgrestAu
 	}
 }
 
+func TestDefaultSweepTargetSourcePostgrestIncludesOverdueHeartbeatDeadlineScopes(t *testing.T) {
+	var leaseQueryCount int
+	var heartbeatQueryCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/concurrency_leases"):
+			leaseQueryCount++
+			query := r.URL.Query()
+			if query.Get("select") != "hostname_hash,site_bucket,ip_bucket,expires_at_ms" || query.Get("state") != "eq.active" || query.Get("expires_at_ms") != "lte.1000" || query.Get("order") != "expires_at_ms.asc,hostname_hash.asc,site_bucket.asc,ip_bucket.asc,lease_id.asc" || query.Get("limit") != "3" {
+				t.Fatalf("expected hard-expiry sweep target query, got %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`[{"hostname_hash":"hard-host","site_bucket":"site-a","ip_bucket":"ip-a","expires_at_ms":900}]`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/concurrency_requests"):
+			heartbeatQueryCount++
+			query := r.URL.Query()
+			if query.Get("select") != "hostname_hash,site_bucket,ip_bucket,heartbeat_deadline_ms" || query.Get("state") != "eq.active" || query.Get("heartbeat_deadline_ms") != "lte.1000" || query.Get("order") != "heartbeat_deadline_ms.asc,hostname_hash.asc,site_bucket.asc,ip_bucket.asc,request_id.asc" || query.Get("limit") != "3" {
+				t.Fatalf("expected heartbeat fallback sweep target query, got %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`[
+				{"hostname_hash":"heartbeat-host","site_bucket":"site-b","ip_bucket":"ip-b","heartbeat_deadline_ms":800},
+				{"hostname_hash":"hard-host","site_bucket":"site-a","ip_bucket":"ip-a","heartbeat_deadline_ms":850}
+			]`))
+		default:
+			t.Fatalf("unexpected postgrest request: method=%s path=%s query=%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	server := &Server{cfg: cfg, backend: newPostgrestBackend(cfg, srv.Client())}
+
+	targets, err := server.defaultSweepTargetSource(context.Background(), 1000, 3)
+	if err != nil {
+		t.Fatalf("defaultSweepTargetSource error: %v", err)
+	}
+	if leaseQueryCount != 1 || heartbeatQueryCount != 1 {
+		t.Fatalf("expected one hard-expiry query and one heartbeat query, got lease=%d heartbeat=%d", leaseQueryCount, heartbeatQueryCount)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("expected merged unique sweep targets, got %+v", targets)
+	}
+	if targets[0].HostnameHash != "heartbeat-host" || targets[0].SiteBucket != "site-b" || targets[0].IPBucket != "ip-b" {
+		t.Fatalf("expected earliest heartbeat-only overdue scope first, got %+v", targets)
+	}
+	if targets[1].HostnameHash != "hard-host" || targets[1].SiteBucket != "site-a" || targets[1].IPBucket != "ip-a" {
+		t.Fatalf("expected deduped hard-expiry scope second, got %+v", targets)
+	}
+}
+
+func TestDefaultSweepTargetSourcePostgrestExtendsHeartbeatQueryPastDuplicateScopeWindow(t *testing.T) {
+	var heartbeatQueryOffsets []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/concurrency_leases"):
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/concurrency_requests"):
+			query := r.URL.Query()
+			if query.Get("select") != "hostname_hash,site_bucket,ip_bucket,heartbeat_deadline_ms" || query.Get("state") != "eq.active" || query.Get("heartbeat_deadline_ms") != "lte.1000" || query.Get("limit") != "2" {
+				t.Fatalf("expected heartbeat fallback sweep target query, got %s", r.URL.RawQuery)
+			}
+			offset := query.Get("offset")
+			if offset == "" {
+				offset = "0"
+			}
+			heartbeatQueryOffsets = append(heartbeatQueryOffsets, offset)
+			switch offset {
+			case "0":
+				_, _ = w.Write([]byte(`[
+					{"hostname_hash":"dup-host","site_bucket":"site-a","ip_bucket":"ip-a","heartbeat_deadline_ms":800},
+					{"hostname_hash":"dup-host","site_bucket":"site-a","ip_bucket":"ip-a","heartbeat_deadline_ms":810}
+				]`))
+			case "2":
+				_, _ = w.Write([]byte(`[
+					{"hostname_hash":"later-host","site_bucket":"site-b","ip_bucket":"ip-b","heartbeat_deadline_ms":820}
+				]`))
+			default:
+				t.Fatalf("unexpected heartbeat query offset %q", offset)
+			}
+		default:
+			t.Fatalf("unexpected postgrest request: method=%s path=%s query=%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	server := &Server{cfg: cfg, backend: newPostgrestBackend(cfg, srv.Client())}
+
+	targets, err := server.defaultSweepTargetSource(context.Background(), 1000, 2)
+	if err != nil {
+		t.Fatalf("defaultSweepTargetSource error: %v", err)
+	}
+	if len(heartbeatQueryOffsets) != 2 || heartbeatQueryOffsets[0] != "0" || heartbeatQueryOffsets[1] != "2" {
+		t.Fatalf("expected heartbeat query to continue past duplicate raw-row window, got offsets=%v", heartbeatQueryOffsets)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("expected duplicate-window fallback to return two unique sweep targets, got %+v", targets)
+	}
+	if targets[0].HostnameHash != "dup-host" || targets[0].SiteBucket != "site-a" || targets[0].IPBucket != "ip-a" {
+		t.Fatalf("expected earliest duplicate scope first, got %+v", targets)
+	}
+	if targets[1].HostnameHash != "later-host" || targets[1].SiteBucket != "site-b" || targets[1].IPBucket != "ip-b" {
+		t.Fatalf("expected later unique scope second, got %+v", targets)
+	}
+}
+
 func TestAcquireReturnsTerminal410ForCancelledReplay(t *testing.T) {
 	handler := newTestServer(t, &stubBackend{acquireResult: &AcquireResult{Result: "cancelled", Reason: "request_cancelled"}})
 	rec := postJSON(t, handler, "/api/v1/concurrency/acquire", validAcquireRequest(), "secret")
@@ -2795,7 +3840,7 @@ func TestContinueWaitRealPathCompensatesDeliveredGrantOnDisconnect(t *testing.T)
 	if err != nil {
 		t.Fatalf("replay acquire after delivery failure: %v", err)
 	}
-	if replay.Result != "released" || replay.Reason.String != releaseReasonGrantDeliveryFailed || strings.TrimSpace(replay.LeaseToken) != "" {
+	if replay.Result != "released" || replay.Reason.String != "final_cleanup" || strings.TrimSpace(replay.LeaseToken) != "" {
 		t.Fatalf("expected compensated released replay without lease after delivery failure, got %+v", replay)
 	}
 
@@ -2807,7 +3852,7 @@ func TestContinueWaitRealPathCompensatesDeliveredGrantOnDisconnect(t *testing.T)
 	`, "waiting-request").Scan(&requestState, &terminalReason); err != nil {
 		t.Fatalf("read request state after delivery failure: %v", err)
 	}
-	if requestState != "released" || terminalReason != releaseReasonGrantDeliveryFailed {
+	if requestState != "released" || terminalReason != "final_cleanup" {
 		t.Fatalf("expected request compensated released after delivery failure, got state=%q reason=%q", requestState, terminalReason)
 	}
 }
@@ -3724,6 +4769,19 @@ func TestReleaseReturnsNoopBody(t *testing.T) {
 	body := decodeBody(t, rec)
 	if body["result"] != "noop" || body["reason"] != "expired" {
 		t.Fatalf("expected noop body, got %v", body)
+	}
+}
+
+func TestReleaseRejectsUnsupportedReason(t *testing.T) {
+	handler := newTestServer(t, &stubBackend{})
+	req := validReleaseRequest()
+	req.Reason = "target_change"
+	rec := postJSON(t, handler, "/api/v1/concurrency/release", req, "secret")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unsupported release reason") {
+		t.Fatalf("expected unsupported release reason error, got %q", rec.Body.String())
 	}
 }
 

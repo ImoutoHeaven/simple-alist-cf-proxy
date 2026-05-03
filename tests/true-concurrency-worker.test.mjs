@@ -9,6 +9,8 @@ const {
   clearOverloadedByHost,
   createConcurrencyReleaseController,
   createSlotHandlerClient,
+  createTrueConcurrencyHeartbeatManager,
+  normalizeTrueConcurrencyReleaseReason,
 } = __fairQueueTestHooks;
 
 const createJsonResponse = (payload, init = {}) => new Response(JSON.stringify(payload), {
@@ -34,6 +36,156 @@ const DEFAULT_IDLE_TIMEOUT_SECONDS = 300;
 const TICKET_STATE_READ_URL = 'https://postgrest.example.test/rpc/download_get_ticket_state';
 const TICKET_STATE_MARK_URL = 'https://postgrest.example.test/rpc/download_mark_ticket_used';
 const TICKET_STATE_CLEANUP_URL = 'https://postgrest.example.test/rpc/download_cleanup_expired_tickets';
+const HEARTBEAT_URL = 'https://cq.example.test/api/v1/concurrency/heartbeat';
+const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT = {
+  enabled: true,
+  required: true,
+  path: '/api/v1/concurrency/heartbeat',
+  intervalMs: 5000,
+  timeoutMs: 15000,
+  reconnectGraceMs: 12000,
+  helloTimeoutMs: 2000,
+  startTimeoutMs: 7000,
+  ackTimeoutMs: 2000,
+  initialConnectMaxAttempts: 3,
+  initialConnectMaxElapsedMs: 3000,
+  reconnectMaxAttempts: 3,
+  reconnectMaxElapsedMs: 10000,
+  reconnectBaseDelayMs: 250,
+  reconnectMaxDelayMs: 2000,
+  reconnectSafetyMarginMs: 1000,
+};
+
+const buildHeartbeatHelloAck = (overrides = {}) => ({
+  type: 'hello_ack',
+  generation: 7,
+  deadlineMs: Date.now() + 15_000,
+  ackTimeoutMs: 2000,
+  heartbeatIntervalMs: 5000,
+  heartbeatTimeoutMs: 15000,
+  reconnectGraceMs: 12000,
+  startTimeoutMs: 7000,
+  hardExpireAtMs: Date.now() + 60_000,
+  ...overrides,
+});
+
+const buildHeartbeatAck = (generation = 7, overrides = {}) => ({
+  type: 'heartbeat_ack',
+  generation,
+  deadlineMs: Date.now() + 15_000,
+  hardExpireAtMs: Date.now() + 60_000,
+  ...overrides,
+});
+
+const createFakeHeartbeatSocket = ({
+  helloAck = buildHeartbeatHelloAck(),
+  heartbeatAck = buildHeartbeatAck(),
+  onSend = null,
+} = {}) => {
+  const listeners = new Map();
+  let closeArgs = null;
+
+  const emit = (type, event = {}) => {
+    const handlers = listeners.get(type);
+    if (!handlers) {
+      return;
+    }
+    for (const handler of [...handlers]) {
+      handler(event);
+    }
+  };
+
+  const emitJsonMessage = (payload) => {
+    queueMicrotask(() => emit('message', { data: JSON.stringify(payload) }));
+  };
+
+  const socket = {
+    accepted: false,
+    sent: [],
+    addEventListener(type, handler) {
+      const handlers = listeners.get(type) || new Set();
+      handlers.add(handler);
+      listeners.set(type, handlers);
+    },
+    removeEventListener(type, handler) {
+      listeners.get(type)?.delete(handler);
+    },
+    accept() {
+      this.accepted = true;
+    },
+    send(data) {
+      this.sent.push(data);
+      const payload = JSON.parse(data);
+      onSend?.(payload, { emit, emitJsonMessage, socket: this });
+      if (payload.type === 'hello') {
+        if (helloAck) {
+          emitJsonMessage(typeof helloAck === 'function' ? helloAck(payload) : helloAck);
+        }
+        return;
+      }
+      if (payload.type === 'heartbeat') {
+        if (heartbeatAck) {
+          emitJsonMessage(typeof heartbeatAck === 'function' ? heartbeatAck(payload) : heartbeatAck);
+        }
+        return;
+      }
+      throw new Error(`unexpected socket payload type: ${payload.type}`);
+    },
+    close(code = 1000, reason = '') {
+      closeArgs = { code, reason };
+      queueMicrotask(() => emit('close', { code, reason }));
+    },
+    emitClose(code = 1000, reason = '') {
+      closeArgs = { code, reason };
+      queueMicrotask(() => emit('close', { code, reason }));
+    },
+    emitError(error = new Error('heartbeat socket error')) {
+      queueMicrotask(() => emit('error', { error }));
+    },
+    emitJsonMessage,
+    getCloseArgs() {
+      return closeArgs;
+    },
+  };
+
+  return socket;
+};
+
+const createHeartbeatManagerSession = ({
+  socket = createFakeHeartbeatSocket(),
+  generation = 1,
+  heartbeatIntervalMs = 1000,
+  reconnectGraceMs = 12000,
+  hardExpireAtMs = Date.now() + 60_000,
+} = {}) => {
+  let closeReason = null;
+  return {
+    socket,
+    session: {
+      ws: socket,
+      generation,
+      deadlineMs: Date.now() + 15_000,
+      ackTimeoutMs: 2000,
+      heartbeatIntervalMs,
+      heartbeatTimeoutMs: 15_000,
+      reconnectGraceMs,
+      startTimeoutMs: 7000,
+      hardExpireAtMs,
+      close(reason = '') {
+        closeReason = reason;
+      },
+      async sendHeartbeat() {
+        return buildHeartbeatAck(generation, {
+          deadlineMs: Date.now() + 15_000,
+          hardExpireAtMs,
+        });
+      },
+    },
+    getCloseReason() {
+      return closeReason;
+    },
+  };
+};
 
 const decodeSignedRequestPayload = (request) => {
   const payload = new URL(request.url).searchParams.get('payload');
@@ -152,6 +304,7 @@ const buildRuntimeBootstrap = ({
   fairQueueHostPatterns = [],
   fairQueueSiteBucket = undefined,
   trueConcurrencyHostPatterns = [],
+  trueConcurrencyHeartbeatOverrides = null,
   trueConcurrencySiteBucket = undefined,
   throttleHostPatterns = [],
 } = {}) => ({
@@ -222,6 +375,10 @@ const buildRuntimeBootstrap = ({
         hostPatterns: trueConcurrencyHostPatterns,
         handlerUrl: 'https://cq.example.test',
         handlerAuthKey: 'cq-secret',
+        heartbeat: {
+          ...DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+          ...(trueConcurrencyHeartbeatOverrides || {}),
+        },
         ...(trueConcurrencySiteBucket !== undefined ? { siteBucket: trueConcurrencySiteBucket } : {}),
       },
     } : {}),
@@ -284,6 +441,30 @@ const buildSignedWorkerRequest = async ({
 
 const readJson = async (response) => JSON.parse(await response.text());
 
+test('worker normalizes CQ release reasons to the canonical contract', () => {
+  const scenarios = new Map([
+    ['stream_complete', 'stream_complete'],
+    ['client_disconnect', 'client_disconnect'],
+    ['hard_expiry', 'hard_expiry'],
+    ['upstream_failure', 'upstream_failure'],
+    ['origin_fetch_failure', 'origin_fetch_failure'],
+    ['heartbeat_connect_failed', 'heartbeat_connect_failed'],
+    ['heartbeat_lost', 'heartbeat_lost'],
+    ['final_cleanup', 'final_cleanup'],
+    ['target_change', 'final_cleanup'],
+    ['grant_delivery_failed', 'final_cleanup'],
+    ['acquire_delivery_failed', 'final_cleanup'],
+    ['head_probe_complete', 'stream_complete'],
+    ['head_probe_invalid', 'origin_fetch_failure'],
+    ['prestream_terminal', 'origin_fetch_failure'],
+    ['google_drive_range_mismatch', 'origin_fetch_failure'],
+  ]);
+
+  for (const [input, expected] of scenarios) {
+    assert.equal(normalizeTrueConcurrencyReleaseReason(input), expected, input);
+  }
+});
+
 test('signed worker request fixtures include ticketNonce and idle_timeout', async () => {
   assertSignedRequestPayloadContract(await buildSignedWorkerRequest());
 });
@@ -316,9 +497,14 @@ const wrappedFetch = globalThis.fetch;
 const wrappedFetchBound = typeof wrappedFetch === 'function' ? wrappedFetch.bind(globalThis) : wrappedFetch;
 let delegatedFetch = wrappedFetchBound;
 let ackHandoffMock = null;
+let heartbeatMock = null;
 
 const setAckHandoffMock = (handler = null) => {
   ackHandoffMock = typeof handler === 'function' ? handler : null;
+};
+
+const setHeartbeatMock = (handler = null) => {
+  heartbeatMock = typeof handler === 'function' ? handler : null;
 };
 
 const fetchWithDefaultAckHandoff = async (input, init = {}) => {
@@ -343,6 +529,25 @@ const fetchWithDefaultAckHandoff = async (input, init = {}) => {
     }
     return createAckHandoffResponse({ result: 'acknowledged' });
   }
+  if (url === HEARTBEAT_URL) {
+    if (heartbeatMock) {
+      return heartbeatMock(input, init);
+    }
+    if (typeof delegatedFetch === 'function') {
+      try {
+        return await delegatedFetch(input, init);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes(`Unexpected fetch URL in test: ${HEARTBEAT_URL}`)) {
+          throw error;
+        }
+      }
+    }
+    return {
+      status: 101,
+      webSocket: createFakeHeartbeatSocket(),
+    };
+  }
   if (typeof delegatedFetch !== 'function') {
     throw new Error('global fetch handler not configured');
   }
@@ -357,6 +562,7 @@ Object.defineProperty(globalThis, 'fetch', {
   },
   set(value) {
     ackHandoffMock = null;
+    heartbeatMock = null;
     resetTicketStateRpcState();
     if (value === fetchWithDefaultAckHandoff) {
       delegatedFetch = wrappedFetchBound;
@@ -376,6 +582,27 @@ const createTestContext = () => {
     },
     waitUntilPromises,
   };
+};
+
+const waitForCondition = async (
+  predicate,
+  {
+    timeoutMs = 250,
+    intervalMs = 5,
+    message = 'timed out waiting for condition',
+  } = {},
+) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  if (predicate()) {
+    return;
+  }
+  throw new Error(message);
 };
 
 const createTrackedTextBody = (text) => {
@@ -2064,7 +2291,7 @@ test('breaker_only with true concurrency does not authorize or settle after clai
       'concurrency-release',
     ]);
     assert.equal(releaseBody.leaseToken, 'token-breaker-only-claim-fail');
-    assert.equal(releaseBody.reason, 'acquire_delivery_failed');
+    assert.equal(releaseBody.reason, 'final_cleanup');
     assert.equal(settleBodies.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -2461,6 +2688,8 @@ test('true concurrency only skips precheck and fairqueue and acks handoff before
   const originalFetch = globalThis.fetch;
   const calls = [];
   let ackBody = null;
+  let heartbeatHeaders = null;
+  const heartbeatSocket = createFakeHeartbeatSocket();
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -2521,6 +2750,15 @@ test('true concurrency only skips precheck and fairqueue and acks handoff before
       return createAckHandoffResponse({ result: 'acknowledged' });
     }
 
+    if (url === HEARTBEAT_URL) {
+      calls.push('heartbeat-upgrade');
+      heartbeatHeaders = init.headers;
+      return {
+        status: 101,
+        webSocket: heartbeatSocket,
+      };
+    }
+
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
       return createJsonResponse({ result: 'released' });
@@ -2535,11 +2773,332 @@ test('true concurrency only skips precheck and fairqueue and acks handoff before
     assert.equal(response.status, 200);
     assert.equal(await response.text(), 'ok');
     await Promise.allSettled(waitUntilPromises);
-    assert.deepEqual(calls.slice(0, 4), ['concurrency-acquire', 'concurrency-claim', 'concurrency-ack-handoff', 'origin-fetch']);
+    assert.deepEqual(calls.slice(0, 5), ['concurrency-acquire', 'concurrency-claim', 'concurrency-ack-handoff', 'heartbeat-upgrade', 'origin-fetch']);
     assert.equal(typeof ackBody?.requestId, 'string');
     assert.equal(ackBody?.handoffToken, 'handoff-1');
+    assert.equal(heartbeatHeaders?.Upgrade, 'websocket');
+    assert.equal(heartbeatHeaders?.['X-CQ-Auth'], 'cq-secret');
+    const helloPayload = JSON.parse(heartbeatSocket.sent[0]);
+    assert.equal(helloPayload.type, 'hello');
+    assert.equal(helloPayload.requestId, ackBody.requestId);
+    assert.equal(helloPayload.leaseId, 'lease-1');
+    assert.equal(helloPayload.leaseToken, 'token-1');
+    assert.equal(Object.hasOwn(helloPayload, 'downloadedBytes'), false);
     assert.equal(calls.includes('precheck'), false);
     assert.equal(calls.includes('fairqueue-acquire'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency heartbeat hello timeout retries initial connect before origin fetch and releases heartbeat_connect_failed', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const heartbeatSockets = [];
+  let releaseBody = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHeartbeatOverrides: {
+          helloTimeoutMs: 5,
+          startTimeoutMs: 50,
+          initialConnectMaxAttempts: 3,
+          initialConnectMaxElapsedMs: 20,
+          reconnectSafetyMarginMs: 1,
+        },
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-heartbeat-timeout',
+        leaseToken: 'token-heartbeat-timeout',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-heartbeat-timeout',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      calls.push('heartbeat-upgrade');
+      const socket = createFakeHeartbeatSocket({ helloAck: null, heartbeatAck: null });
+      heartbeatSockets.push(socket);
+      return {
+        status: 101,
+        webSocket: socket,
+      };
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      throw new Error('origin fetch should not run after heartbeat hello timeout');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 503);
+    assert.match(body.message, /true concurrency unavailable/i);
+    assert.equal(calls.includes('origin-fetch'), false);
+    assert.equal(calls.filter((call) => call === 'heartbeat-upgrade').length, 3);
+    assert.equal(releaseBody?.reason, 'heartbeat_connect_failed');
+    assert.deepEqual(
+      heartbeatSockets.map((socket) => JSON.parse(socket.sent[0]).attempt),
+      [1, 2, 3],
+    );
+    for (const socket of heartbeatSockets) {
+      const helloPayload = JSON.parse(socket.sent[0]);
+      assert.equal(helloPayload.type, 'hello');
+      assert.equal(Object.hasOwn(helloPayload, 'downloadedBytes'), false);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency heartbeat_connect_failed schedules release retry cleanup through waitUntil when immediate release fails', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const releaseBodies = [];
+  const retryDelays = [];
+  let releaseAttempts = 0;
+
+  globalThis.setTimeout = (callback, delay = 0, ...args) => {
+    retryDelays.push(delay);
+    Promise.resolve().then(() => callback(...args));
+    return { cleared: false };
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (handle && typeof handle === 'object') {
+      handle.cleared = true;
+    }
+  };
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHeartbeatOverrides: {
+          initialConnectMaxAttempts: 1,
+          initialConnectMaxElapsedMs: 5,
+          helloTimeoutMs: 5,
+          startTimeoutMs: 40,
+          reconnectSafetyMarginMs: 1,
+        },
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-heartbeat-release-retry',
+        leaseToken: 'token-heartbeat-release-retry',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-heartbeat-release-retry',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      return { status: 503 };
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      releaseAttempts += 1;
+      releaseBodies.push(JSON.parse(init.body));
+      if (releaseAttempts === 1) {
+        throw new Error('release transport failed');
+      }
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      throw new Error('origin fetch should not run after immediate heartbeat upgrade failure');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 503);
+    assert.match(body.message, /true concurrency unavailable/i);
+    assert.equal(waitUntilPromises.length > 0, true);
+    assert.equal(releaseBodies.length >= 2, true);
+    assert.deepEqual(releaseBodies.map((entry) => entry.reason), ['heartbeat_connect_failed', 'heartbeat_connect_failed']);
+    assert.equal(retryDelays.includes(2000), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency initial heartbeat terminal mapping suppresses duplicate release or falls back to heartbeat_lost before origin fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  const scenarios = [
+    { reason: 'heartbeat_start_timeout', terminalResult: 'released', expectedReleaseReason: null },
+    { reason: 'hard_expired', terminalResult: 'expired', expectedReleaseReason: null },
+    { reason: 'already_released', terminalResult: 'terminal', expectedReleaseReason: null },
+    { reason: 'request_cancelled', terminalResult: 'terminal', expectedReleaseReason: null },
+    { reason: 'token_mismatch', terminalResult: 'terminal', expectedReleaseReason: 'heartbeat_lost' },
+    { reason: 'protocol_error', terminalResult: 'terminal', expectedReleaseReason: 'heartbeat_lost' },
+  ];
+
+  try {
+    for (const scenario of scenarios) {
+      let originFetchCalled = false;
+      let releaseBody = null;
+
+      globalThis.fetch = async (input, init = {}) => {
+        const url = typeof input === 'string' ? input : input.url;
+
+        if (url === 'https://controller.example.test/api/v0/bootstrap') {
+          return createJsonResponse(buildRuntimeBootstrap({
+            trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+            trueConcurrencyHeartbeatOverrides: {
+              helloTimeoutMs: 5,
+              startTimeoutMs: 50,
+              initialConnectMaxAttempts: 1,
+              initialConnectMaxElapsedMs: 20,
+              reconnectSafetyMarginMs: 1,
+            },
+          }));
+        }
+
+        if (url === 'https://alist.example.com/api/fs/link') {
+          return createJsonResponse({
+            code: 200,
+            data: {
+              url: 'https://tenant.sharepoint.com/file',
+              header: {},
+            },
+          });
+        }
+
+        if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+          const body = JSON.parse(init.body);
+          return createJsonResponse({
+            result: 'granted',
+            leaseId: `lease-initial-terminal-${scenario.reason}`,
+            leaseToken: `token-initial-terminal-${scenario.reason}`,
+            expiresAtMs: body.hardExpireAtMs,
+            claimToken: `claim-token-initial-terminal-${scenario.reason}`,
+          });
+        }
+
+        if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+          return createClaimGrantResponseFromRequest(init);
+        }
+
+        if (url === ACK_HANDOFF_URL) {
+          return createAckHandoffResponse({ result: 'acknowledged' });
+        }
+
+        if (url === HEARTBEAT_URL) {
+          return {
+            status: 101,
+            webSocket: createFakeHeartbeatSocket({
+              helloAck: {
+                type: 'terminal',
+                result: scenario.terminalResult,
+                reason: scenario.reason,
+              },
+              heartbeatAck: null,
+            }),
+          };
+        }
+
+        if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+          releaseBody = JSON.parse(init.body);
+          return createJsonResponse({ result: 'released' });
+        }
+
+        if (url === 'https://tenant.sharepoint.com/file') {
+          originFetchCalled = true;
+          return new Response('should-not-fetch', { status: 200 });
+        }
+
+        throw new Error(`Unexpected fetch URL in test: ${url}`);
+      };
+
+      delete globalThis.bootstrapCache;
+      const { ctx, waitUntilPromises } = createTestContext();
+      const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+      const body = await readJson(response);
+      await Promise.allSettled(waitUntilPromises);
+
+      assert.equal(response.status, 503, scenario.reason);
+      assert.match(body.message, /true concurrency unavailable/i, scenario.reason);
+      assert.equal(originFetchCalled, false, scenario.reason);
+      assert.equal(releaseBody?.reason ?? null, scenario.expectedReleaseReason, scenario.reason);
+    }
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -2790,7 +3349,7 @@ test('true concurrency ack_handoff transport or availability or malformed-succes
         assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-ack-handoff', 'concurrency-release'], scenario.name);
         assert.equal(releaseBody.leaseId, 'lease-ack-fail', scenario.name);
         assert.equal(releaseBody.leaseToken, 'token-ack-fail', scenario.name);
-        assert.equal(releaseBody.reason, 'grant_delivery_failed', scenario.name);
+        assert.equal(releaseBody.reason, 'final_cleanup', scenario.name);
       } finally {
         delete globalThis.bootstrapCache;
       }
@@ -3122,7 +3681,7 @@ test('true concurrency claim failure releases acquired lease before origin fetch
         assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-release'], scenario.name);
         assert.equal(releaseBody.leaseId, 'lease-claim-fail', scenario.name);
         assert.equal(releaseBody.leaseToken, 'token-claim-fail', scenario.name);
-        assert.equal(releaseBody.reason, 'acquire_delivery_failed', scenario.name);
+        assert.equal(releaseBody.reason, 'final_cleanup', scenario.name);
       } finally {
         delete globalThis.bootstrapCache;
       }
@@ -3223,7 +3782,7 @@ test('true concurrency claim conflict grant_unclaimed releases acquired lease be
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-release']);
     assert.equal(releaseBody.leaseId, 'lease-claim-conflict');
     assert.equal(releaseBody.leaseToken, 'token-claim-conflict');
-    assert.equal(releaseBody.reason, 'acquire_delivery_failed');
+    assert.equal(releaseBody.reason, 'final_cleanup');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -5075,6 +5634,473 @@ test('true concurrency managed streaming releases after body completion and does
   }
 });
 
+test('true concurrency managed streaming reconnects after heartbeat_ack timeout using hello_ack timing and keeps the stream active', async () => {
+  const originalFetch = globalThis.fetch;
+  const heartbeatSockets = [];
+  let heartbeatUpgradeCount = 0;
+  let releaseBody = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHeartbeatOverrides: {
+          intervalMs: 1000,
+          ackTimeoutMs: 1000,
+          helloTimeoutMs: 5,
+          startTimeoutMs: 50,
+          initialConnectMaxElapsedMs: 5,
+          reconnectSafetyMarginMs: 1,
+          reconnectMaxAttempts: 2,
+          reconnectMaxElapsedMs: 50,
+          reconnectBaseDelayMs: 1,
+          reconnectMaxDelayMs: 1,
+        },
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-heartbeat-reconnect',
+        leaseToken: 'token-heartbeat-reconnect',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-heartbeat-reconnect',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      heartbeatUpgradeCount += 1;
+      const generation = heartbeatUpgradeCount;
+      const socket = createFakeHeartbeatSocket({
+        helloAck: buildHeartbeatHelloAck({
+          generation,
+          heartbeatIntervalMs: 1,
+          ackTimeoutMs: 5,
+          reconnectGraceMs: 40,
+          deadlineMs: Date.now() + 1000,
+          hardExpireAtMs: Date.now() + 1000,
+        }),
+        heartbeatAck: generation === 1 ? null : buildHeartbeatAck(generation, {
+          deadlineMs: Date.now() + 1000,
+          hardExpireAtMs: Date.now() + 1000,
+        }),
+      });
+      heartbeatSockets.push(socket);
+      return {
+        status: 101,
+        webSocket: socket,
+      };
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('reconnect-ok'));
+          setTimeout(() => controller.close(), 25);
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    await waitForCondition(() => heartbeatUpgradeCount === 2, {
+      message: 'expected reconnect after missing heartbeat_ack',
+    });
+    assert.equal(await response.text(), 'reconnect-ok');
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(releaseBody?.reason, 'stream_complete');
+    assert.equal(heartbeatUpgradeCount, 2);
+    const firstHeartbeat = JSON.parse(heartbeatSockets[0].sent[1]);
+    const secondHeartbeat = JSON.parse(heartbeatSockets[1].sent[1]);
+    assert.equal(firstHeartbeat.type, 'heartbeat');
+    assert.equal(secondHeartbeat.type, 'heartbeat');
+    assert.equal(Object.hasOwn(firstHeartbeat, 'downloadedBytes'), false);
+    assert.equal(Object.hasOwn(secondHeartbeat, 'downloadedBytes'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency managed streaming aborts after websocket close exhausts reconnect budget and releases heartbeat_lost', async () => {
+  const originalFetch = globalThis.fetch;
+  const heartbeatSockets = [];
+  let heartbeatUpgradeCount = 0;
+  let releaseBody = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHeartbeatOverrides: {
+          helloTimeoutMs: 5,
+          startTimeoutMs: 50,
+          initialConnectMaxElapsedMs: 5,
+          reconnectSafetyMarginMs: 1,
+          reconnectMaxAttempts: 2,
+          reconnectMaxElapsedMs: 20,
+          reconnectBaseDelayMs: 1,
+          reconnectMaxDelayMs: 1,
+        },
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-heartbeat-close',
+        leaseToken: 'token-heartbeat-close',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-heartbeat-close',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      heartbeatUpgradeCount += 1;
+      if (heartbeatUpgradeCount === 1) {
+        const socket = createFakeHeartbeatSocket({
+          helloAck: buildHeartbeatHelloAck({
+            heartbeatIntervalMs: 10,
+            ackTimeoutMs: 10,
+            reconnectGraceMs: 30,
+            deadlineMs: Date.now() + 1000,
+            hardExpireAtMs: Date.now() + 1000,
+          }),
+        });
+        heartbeatSockets.push(socket);
+        return {
+          status: 101,
+          webSocket: socket,
+        };
+      }
+      return { status: 503 };
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('close-budget'));
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const reader = response.body.getReader();
+    const firstChunk = await reader.read();
+    assert.equal(new TextDecoder().decode(firstChunk.value), 'close-budget');
+    heartbeatSockets[0].emitClose(1006, 'network_lost');
+    await waitForCondition(() => releaseBody !== null, {
+      timeoutMs: 150,
+      message: 'expected heartbeat_lost release after reconnect exhaustion',
+    });
+    await assert.rejects(() => reader.read(), /abort/i);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(releaseBody?.reason, 'heartbeat_lost');
+    assert.equal(heartbeatUpgradeCount, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency heartbeat terminal reasons map duplicate-release suppression and heartbeat_lost fallback', async () => {
+  const originalFetch = globalThis.fetch;
+  const scenarios = [
+    { reason: 'heartbeat_timeout', expectRelease: false },
+    { reason: 'heartbeat_start_timeout', expectRelease: false },
+    { reason: 'hard_expired', expectRelease: false },
+    { reason: 'already_released', expectRelease: false },
+    { reason: 'request_cancelled', expectRelease: false },
+    { reason: 'token_mismatch', expectRelease: true },
+    { reason: 'protocol_error', expectRelease: true },
+  ];
+
+  try {
+    for (const scenario of scenarios) {
+      let releaseBody = null;
+      const heartbeatSocket = createFakeHeartbeatSocket({
+        helloAck: buildHeartbeatHelloAck({
+          heartbeatIntervalMs: 1,
+          ackTimeoutMs: 5,
+          reconnectGraceMs: 40,
+          deadlineMs: Date.now() + 1000,
+          hardExpireAtMs: Date.now() + 1000,
+        }),
+        heartbeatAck: null,
+        onSend(payload, { emitJsonMessage }) {
+          if (payload.type === 'heartbeat') {
+            emitJsonMessage({
+              type: 'terminal',
+              result: scenario.expectRelease ? 'conflict' : 'released',
+              reason: scenario.reason,
+            });
+          }
+        },
+      });
+
+      globalThis.fetch = async (input, init = {}) => {
+        const url = typeof input === 'string' ? input : input.url;
+
+        if (url === 'https://controller.example.test/api/v0/bootstrap') {
+          return createJsonResponse(buildRuntimeBootstrap({
+            trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+            trueConcurrencyHeartbeatOverrides: {
+              intervalMs: 1000,
+              ackTimeoutMs: 1000,
+              helloTimeoutMs: 5,
+              startTimeoutMs: 50,
+              initialConnectMaxElapsedMs: 5,
+              reconnectSafetyMarginMs: 1,
+            },
+          }));
+        }
+
+        if (url === 'https://alist.example.com/api/fs/link') {
+          return createJsonResponse({
+            code: 200,
+            data: {
+              url: 'https://tenant.sharepoint.com/file',
+              header: {},
+            },
+          });
+        }
+
+        if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+          const body = JSON.parse(init.body);
+          return createJsonResponse({
+            result: 'granted',
+            leaseId: `lease-terminal-${scenario.reason}`,
+            leaseToken: `token-terminal-${scenario.reason}`,
+            expiresAtMs: body.hardExpireAtMs,
+            claimToken: `claim-token-terminal-${scenario.reason}`,
+          });
+        }
+
+        if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+          return createClaimGrantResponseFromRequest(init);
+        }
+
+        if (url === ACK_HANDOFF_URL) {
+          return createAckHandoffResponse({ result: 'acknowledged' });
+        }
+
+        if (url === HEARTBEAT_URL) {
+          return {
+            status: 101,
+            webSocket: heartbeatSocket,
+          };
+        }
+
+        if (url === 'https://tenant.sharepoint.com/file') {
+          return new Response(new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(`terminal-${scenario.reason}`));
+            },
+          }), {
+            status: 200,
+            headers: { 'content-type': 'application/octet-stream' },
+          });
+        }
+
+        if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+          releaseBody = JSON.parse(init.body);
+          return createJsonResponse({ result: 'released' });
+        }
+
+        throw new Error(`Unexpected fetch URL in test: ${url}`);
+      };
+
+      delete globalThis.bootstrapCache;
+      const { ctx, waitUntilPromises } = createTestContext();
+      const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+      const reader = response.body.getReader();
+      const firstChunk = await reader.read();
+      assert.equal(new TextDecoder().decode(firstChunk.value), `terminal-${scenario.reason}`);
+      const terminalResult = await Promise.race([
+        reader.read().then(
+          () => 'resolved',
+          (error) => error,
+        ),
+        new Promise((resolve) => setTimeout(() => resolve('timeout'), 150)),
+      ]);
+      await Promise.allSettled(waitUntilPromises);
+
+      assert.notEqual(terminalResult, 'timeout', scenario.reason);
+      assert.match(String(terminalResult?.message ?? terminalResult), /abort/i, scenario.reason);
+      if (scenario.expectRelease) {
+        assert.equal(releaseBody?.reason, 'heartbeat_lost', scenario.reason);
+      } else {
+        assert.equal(releaseBody, null, scenario.reason);
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency managed streaming releases upstream_failure after a mid-stream body error and closes heartbeat cleanup', async () => {
+  const originalFetch = globalThis.fetch;
+  let releaseBody = null;
+  const heartbeatSocket = createFakeHeartbeatSocket();
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-upstream-failure',
+        leaseToken: 'token-upstream-failure',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-upstream-failure',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      return {
+        status: 101,
+        webSocket: heartbeatSocket,
+      };
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      let sentChunk = false;
+      return new Response(new ReadableStream({
+        pull(controller) {
+          if (!sentChunk) {
+            sentChunk = true;
+            controller.enqueue(new TextEncoder().encode('upstream-first-chunk'));
+            return;
+          }
+          controller.error(new Error('origin stream exploded'));
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const reader = response.body.getReader();
+    const firstChunk = await reader.read();
+    assert.equal(new TextDecoder().decode(firstChunk.value), 'upstream-first-chunk');
+    await assert.rejects(() => reader.read(), /origin stream exploded/);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(releaseBody?.reason, 'upstream_failure');
+    assert.equal(heartbeatSocket.getCloseArgs()?.reason, 'upstream_failure');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('true concurrency managed streaming prefers IdentityTransformStream fallback and releases on completion', async () => {
   const originalFetch = globalThis.fetch;
   const originalIdentityTransformStream = globalThis.IdentityTransformStream;
@@ -5163,6 +6189,7 @@ test('true concurrency managed streaming prefers IdentityTransformStream fallbac
 test('true concurrency managed streaming binds CQ cleanup to waitUntil for post-return client cancellation', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
+  const heartbeatSocket = createFakeHeartbeatSocket();
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -5209,6 +6236,13 @@ test('true concurrency managed streaming binds CQ cleanup to waitUntil for post-
       return createClaimGrantResponseFromRequest(init);
     }
 
+    if (url === HEARTBEAT_URL) {
+      return {
+        status: 101,
+        webSocket: heartbeatSocket,
+      };
+    }
+
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
       return createJsonResponse({ result: 'released' });
@@ -5229,6 +6263,7 @@ test('true concurrency managed streaming binds CQ cleanup to waitUntil for post-
 
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-release']);
+    assert.equal(heartbeatSocket.getCloseArgs()?.reason, 'client_disconnect');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -5392,10 +6427,435 @@ test('concurrency release controller treats direct expired release as settled', 
   assert.deepEqual(reasons, ['stream_complete']);
 });
 
+test('heartbeat manager fails closed when initial connect returns after the elapsed budget is already exhausted', async () => {
+  const originalDateNow = Date.now;
+  let nowMs = 10_000;
+  const hardExpireAtMs = nowMs + 60_000;
+  const { session, getCloseReason } = createHeartbeatManagerSession({ hardExpireAtMs });
+  let manager = null;
+
+  Date.now = () => nowMs;
+
+  try {
+    manager = createTrueConcurrencyHeartbeatManager({
+      client: {
+        async connectHeartbeat() {
+          nowMs += 25;
+          return session;
+        },
+      },
+      ctx: createTestContext().ctx,
+      plan: {
+        requestId: 'request-late-heartbeat',
+        hardExpireAtMs,
+        clientInstanceId: 'worker-test',
+      },
+      lease: {
+        leaseId: 'lease-late-heartbeat',
+        leaseToken: 'token-late-heartbeat',
+      },
+      heartbeatConfig: {
+        ...DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+        initialConnectMaxAttempts: 1,
+        initialConnectMaxElapsedMs: 20,
+        reconnectSafetyMarginMs: 1,
+      },
+      clientSignal: new AbortController().signal,
+      abortStream() {},
+    });
+
+    await assert.rejects(() => manager.startBeforeOriginFetch());
+    assert.equal(getCloseReason(), 'heartbeat_connect_failed');
+  } finally {
+    Date.now = originalDateNow;
+    await manager?.ensureCleanup('test_cleanup');
+  }
+});
+
+test('heartbeat manager fails closed when pending initial connect exhausts the elapsed budget', async () => {
+  const originalDateNow = Date.now;
+  let nowMs = 11_000;
+  const hardExpireAtMs = nowMs + 60_000;
+  let manager = null;
+  let startPromise = null;
+  let connectSignals = [];
+
+  Date.now = () => nowMs;
+
+  try {
+    manager = createTrueConcurrencyHeartbeatManager({
+      client: {
+        connectHeartbeat(_ctx, _identity, signal) {
+          connectSignals.push(signal);
+          return new Promise((resolve, reject) => {
+            signal?.addEventListener?.('abort', () => reject(new Error('connect aborted')), { once: true });
+          });
+        },
+      },
+      ctx: createTestContext().ctx,
+      plan: {
+        requestId: 'request-pending-initial-heartbeat',
+        hardExpireAtMs,
+        clientInstanceId: 'worker-test',
+      },
+      lease: {
+        leaseId: 'lease-pending-initial-heartbeat',
+        leaseToken: 'token-pending-initial-heartbeat',
+      },
+      heartbeatConfig: {
+        ...DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+        initialConnectMaxAttempts: 1,
+        initialConnectMaxElapsedMs: 5,
+        reconnectSafetyMarginMs: 1,
+      },
+      clientSignal: new AbortController().signal,
+      abortStream() {},
+    });
+
+    startPromise = manager.startBeforeOriginFetch();
+    startPromise.catch(() => {});
+    const outcome = await Promise.race([
+      startPromise.then(
+        () => ({ status: 'resolved' }),
+        (error) => ({ status: 'rejected', error }),
+      ),
+      new Promise((resolve) => setTimeout(() => resolve({ status: 'pending' }), 30)),
+    ]);
+
+    assert.equal(outcome.status, 'rejected');
+    assert.match(outcome.error?.message || '', /heartbeat initial connect/i);
+    assert.equal(connectSignals.length, 1);
+    assert.equal(connectSignals[0]?.aborted, true);
+  } finally {
+    Date.now = originalDateNow;
+    await manager?.ensureCleanup('test_cleanup');
+    await startPromise?.catch(() => {});
+  }
+});
+
+test('heartbeat manager clamps reconnect waits to the remaining reconnect budget before sleeping', async () => {
+  const originalDateNow = Date.now;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  let nowMs = 20_000;
+  const hardExpireAtMs = nowMs + 60_000;
+  const reconnectDelays = [];
+  const abortReasons = [];
+  let connectCalls = 0;
+  let manager = null;
+  const { session, socket } = createHeartbeatManagerSession({
+    heartbeatIntervalMs: 1000,
+    reconnectGraceMs: 2000,
+    hardExpireAtMs,
+  });
+
+  Date.now = () => nowMs;
+  globalThis.setTimeout = (callback, delay = 0, ...args) => {
+    const handle = { cleared: false };
+    if (delay < 1000) {
+      reconnectDelays.push(delay);
+      Promise.resolve().then(() => {
+        if (handle.cleared) {
+          return;
+        }
+        nowMs += delay;
+        callback(...args);
+      });
+    }
+    return handle;
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (handle && typeof handle === 'object') {
+      handle.cleared = true;
+    }
+  };
+
+  try {
+    manager = createTrueConcurrencyHeartbeatManager({
+      client: {
+        async connectHeartbeat() {
+          connectCalls += 1;
+          if (connectCalls === 1) {
+            return session;
+          }
+          throw new Error('reconnect failed');
+        },
+      },
+      ctx: createTestContext().ctx,
+      plan: {
+        requestId: 'request-reconnect-clamp',
+        hardExpireAtMs,
+        clientInstanceId: 'worker-test',
+      },
+      lease: {
+        leaseId: 'lease-reconnect-clamp',
+        leaseToken: 'token-reconnect-clamp',
+      },
+      heartbeatConfig: {
+        ...DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+        reconnectGraceMs: 1000,
+        reconnectMaxAttempts: 2,
+        reconnectMaxElapsedMs: 10,
+        reconnectBaseDelayMs: 50,
+        reconnectMaxDelayMs: 50,
+        reconnectSafetyMarginMs: 1,
+      },
+      clientSignal: new AbortController().signal,
+      abortStream(reason) {
+        abortReasons.push(reason);
+      },
+    });
+
+    await manager.startBeforeOriginFetch();
+    socket.emitClose(1000, 'simulated_disconnect');
+    await Promise.resolve();
+    await new Promise((resolve) => originalSetTimeout(resolve, 0));
+
+    assert.deepEqual(reconnectDelays, [10]);
+    assert.deepEqual(abortReasons, ['heartbeat_lost']);
+  } finally {
+    Date.now = originalDateNow;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    await manager?.ensureCleanup('test_cleanup');
+  }
+});
+
+test('heartbeat manager applies jittered exponential backoff between reconnect attempts', async () => {
+  const originalDateNow = Date.now;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const originalMathRandom = Math.random;
+  let nowMs = 30_000;
+  const hardExpireAtMs = nowMs + 60_000;
+  const reconnectDelays = [];
+  const abortReasons = [];
+  let connectCalls = 0;
+  let manager = null;
+  const { session, socket } = createHeartbeatManagerSession({
+    heartbeatIntervalMs: 1000,
+    reconnectGraceMs: 1000,
+    hardExpireAtMs,
+  });
+
+  Date.now = () => nowMs;
+  Math.random = () => 0.5;
+  globalThis.setTimeout = (callback, delay = 0, ...args) => {
+    const handle = { cleared: false };
+    if (delay < 1000) {
+      reconnectDelays.push(delay);
+      Promise.resolve().then(() => {
+        if (handle.cleared) {
+          return;
+        }
+        nowMs += delay;
+        callback(...args);
+      });
+    }
+    return handle;
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (handle && typeof handle === 'object') {
+      handle.cleared = true;
+    }
+  };
+
+  try {
+    manager = createTrueConcurrencyHeartbeatManager({
+      client: {
+        async connectHeartbeat() {
+          connectCalls += 1;
+          if (connectCalls === 1) {
+            return session;
+          }
+          throw new Error('reconnect failed');
+        },
+      },
+      ctx: createTestContext().ctx,
+      plan: {
+        requestId: 'request-reconnect-jitter',
+        hardExpireAtMs,
+        clientInstanceId: 'worker-test',
+      },
+      lease: {
+        leaseId: 'lease-reconnect-jitter',
+        leaseToken: 'token-reconnect-jitter',
+      },
+      heartbeatConfig: {
+        ...DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+        reconnectGraceMs: 2000,
+        reconnectMaxAttempts: 3,
+        reconnectMaxElapsedMs: 900,
+        reconnectBaseDelayMs: 10,
+        reconnectMaxDelayMs: 100,
+        reconnectSafetyMarginMs: 1,
+      },
+      clientSignal: new AbortController().signal,
+      abortStream(reason) {
+        abortReasons.push(reason);
+      },
+    });
+
+    await manager.startBeforeOriginFetch();
+    socket.emitClose(1000, 'simulated_disconnect');
+    await Promise.resolve();
+    await new Promise((resolve) => originalSetTimeout(resolve, 0));
+
+    assert.deepEqual(reconnectDelays, [15, 30]);
+    assert.deepEqual(abortReasons, ['heartbeat_lost']);
+  } finally {
+    Date.now = originalDateNow;
+    Math.random = originalMathRandom;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    await manager?.ensureCleanup('test_cleanup');
+  }
+});
+
+test('heartbeat manager fails closed when reconnect returns after the reconnect budget is already exhausted', async () => {
+  const originalDateNow = Date.now;
+  let nowMs = 40_000;
+  const hardExpireAtMs = nowMs + 60_000;
+  const abortReasons = [];
+  let connectCalls = 0;
+  let manager = null;
+  const initial = createHeartbeatManagerSession({
+    heartbeatIntervalMs: 1000,
+    reconnectGraceMs: 1000,
+    hardExpireAtMs,
+  });
+  const lateReconnect = createHeartbeatManagerSession({
+    generation: 2,
+    heartbeatIntervalMs: 1000,
+    reconnectGraceMs: 1000,
+    hardExpireAtMs,
+  });
+
+  Date.now = () => nowMs;
+
+  try {
+    manager = createTrueConcurrencyHeartbeatManager({
+      client: {
+        async connectHeartbeat() {
+          connectCalls += 1;
+          if (connectCalls === 1) {
+            return initial.session;
+          }
+          nowMs += 25;
+          return lateReconnect.session;
+        },
+      },
+      ctx: createTestContext().ctx,
+      plan: {
+        requestId: 'request-reconnect-late-success',
+        hardExpireAtMs,
+        clientInstanceId: 'worker-test',
+      },
+      lease: {
+        leaseId: 'lease-reconnect-late-success',
+        leaseToken: 'token-reconnect-late-success',
+      },
+      heartbeatConfig: {
+        ...DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+        reconnectGraceMs: 1000,
+        reconnectMaxAttempts: 2,
+        reconnectMaxElapsedMs: 20,
+        reconnectBaseDelayMs: 1,
+        reconnectMaxDelayMs: 1,
+        reconnectSafetyMarginMs: 1,
+      },
+      clientSignal: new AbortController().signal,
+      abortStream(reason) {
+        abortReasons.push(reason);
+      },
+    });
+
+    await manager.startBeforeOriginFetch();
+    initial.socket.emitClose(1000, 'simulated_disconnect');
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(lateReconnect.getCloseReason(), 'heartbeat_lost');
+    assert.deepEqual(abortReasons, ['heartbeat_lost']);
+  } finally {
+    Date.now = originalDateNow;
+    await manager?.ensureCleanup('test_cleanup');
+  }
+});
+
+test('heartbeat manager aborts when pending reconnect exhausts the reconnect budget', async () => {
+  const originalDateNow = Date.now;
+  let nowMs = 45_000;
+  const hardExpireAtMs = nowMs + 60_000;
+  const abortReasons = [];
+  let connectCalls = 0;
+  let reconnectSignal = null;
+  let manager = null;
+  const initial = createHeartbeatManagerSession({
+    heartbeatIntervalMs: 1000,
+    reconnectGraceMs: 1000,
+    hardExpireAtMs,
+  });
+
+  Date.now = () => nowMs;
+
+  try {
+    manager = createTrueConcurrencyHeartbeatManager({
+      client: {
+        connectHeartbeat(_ctx, _identity, signal) {
+          connectCalls += 1;
+          if (connectCalls === 1) {
+            return initial.session;
+          }
+          reconnectSignal = signal;
+          return new Promise((resolve, reject) => {
+            signal?.addEventListener?.('abort', () => reject(new Error('reconnect aborted')), { once: true });
+          });
+        },
+      },
+      ctx: createTestContext().ctx,
+      plan: {
+        requestId: 'request-pending-reconnect-heartbeat',
+        hardExpireAtMs,
+        clientInstanceId: 'worker-test',
+      },
+      lease: {
+        leaseId: 'lease-pending-reconnect-heartbeat',
+        leaseToken: 'token-pending-reconnect-heartbeat',
+      },
+      heartbeatConfig: {
+        ...DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+        reconnectGraceMs: 1000,
+        reconnectMaxAttempts: 2,
+        reconnectMaxElapsedMs: 5,
+        reconnectBaseDelayMs: 1,
+        reconnectMaxDelayMs: 1,
+        reconnectSafetyMarginMs: 1,
+      },
+      clientSignal: new AbortController().signal,
+      abortStream(reason) {
+        abortReasons.push(reason);
+      },
+    });
+
+    await manager.startBeforeOriginFetch();
+    initial.socket.emitClose(1000, 'simulated_disconnect');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.equal(connectCalls, 2);
+    assert.equal(reconnectSignal?.aborted, true);
+    assert.deepEqual(abortReasons, ['heartbeat_lost']);
+  } finally {
+    Date.now = originalDateNow;
+    await manager?.ensureCleanup('test_cleanup');
+  }
+});
+
 test('true concurrency managed streaming releases on client abort', async () => {
   const originalFetch = globalThis.fetch;
   const abortController = new AbortController();
   const calls = [];
+  const heartbeatSocket = createFakeHeartbeatSocket();
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -5440,6 +6900,13 @@ test('true concurrency managed streaming releases on client abort', async () => 
       return createClaimGrantResponseFromRequest(init);
     }
 
+    if (url === HEARTBEAT_URL) {
+      return {
+        status: 101,
+        webSocket: heartbeatSocket,
+      };
+    }
+
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
       return createJsonResponse({ result: 'released' });
@@ -5456,6 +6923,7 @@ test('true concurrency managed streaming releases on client abort', async () => 
     await assert.rejects(() => reader.read(), /aborted/i);
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-release']);
+    assert.equal(heartbeatSocket.getCloseArgs()?.reason, 'client_disconnect');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -5625,6 +7093,7 @@ test('true concurrency managed streaming releases on hard-expiry cutoff', async 
   const originalFetch = globalThis.fetch;
   const originalSetTimeout = globalThis.setTimeout;
   const originalClearTimeout = globalThis.clearTimeout;
+  const heartbeatSocket = createFakeHeartbeatSocket();
   let acquireCalled = false;
   let releaseCalled = false;
   let releaseBody = null;
@@ -5712,6 +7181,13 @@ test('true concurrency managed streaming releases on hard-expiry cutoff', async 
       });
     }
 
+    if (url === HEARTBEAT_URL) {
+      return {
+        status: 101,
+        webSocket: heartbeatSocket,
+      };
+    }
+
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       releaseCalled = true;
       releaseBody = JSON.parse(init.body);
@@ -5737,6 +7213,7 @@ test('true concurrency managed streaming releases on hard-expiry cutoff', async 
     assert.equal(releaseBody.reason, 'hard_expiry');
     assert.equal(acquireCalled, true);
     assert.equal(releaseCalled, true);
+    assert.equal(heartbeatSocket.getCloseArgs()?.reason, 'hard_expiry');
   } finally {
     globalThis.setTimeout = originalSetTimeout;
     globalThis.clearTimeout = originalClearTimeout;
@@ -5750,6 +7227,7 @@ test('redirect to new target releases old lease and reruns target admission with
   const originalRandomUUID = crypto.randomUUID;
   const requestIds = [];
   const calls = [];
+  const concurrencyReleaseBodies = [];
 
   crypto.randomUUID = () => `req-${requestIds.length + 1}`;
   globalThis.fetch = async (input, init = {}) => {
@@ -5821,6 +7299,7 @@ test('redirect to new target releases old lease and reruns target admission with
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
+      concurrencyReleaseBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'released' });
     }
 
@@ -5840,6 +7319,7 @@ test('redirect to new target releases old lease and reruns target admission with
     assert.equal(requestIds.length, 2);
     assert.notEqual(requestIds[0], requestIds[1]);
     assert.equal(calls.includes('concurrency-release'), true);
+    assert.equal(concurrencyReleaseBodies[0]?.reason, 'final_cleanup');
     assert.equal(calls.includes('origin-fetch:b'), true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -5954,6 +7434,7 @@ test('same-host redirect still rotates admission state and reacquires with a new
     assert.equal(fairQueueAcquireBodies.length, 2);
     assert.equal(fairQueueReleaseBodies.length >= 2, true);
     assert.equal(concurrencyReleaseBodies.length >= 1, true);
+    assert.equal(concurrencyReleaseBodies[0]?.reason, 'final_cleanup');
     assert.deepEqual(originFetches, [
       'https://tenant.sharepoint.com/sites/demo/start.bin',
       'https://tenant.sharepoint.com/sites/demo/final.bin?rotated=1',
@@ -6693,6 +8174,88 @@ test('Google Drive HEAD requests use GET range probe, expose resumable headers, 
   }
 });
 
+test('true concurrency Google Drive HEAD probe releases stream_complete after a successful probe response', async () => {
+  const originalFetch = globalThis.fetch;
+  let releaseBody = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const { url, method, headers } = request;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: GOOGLE_DRIVE_HOST_PATTERNS,
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-head-success',
+        leaseToken: 'token-head-success',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-head-success',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      releaseBody = JSON.parse(init.body);
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
+      assert.equal(method, 'GET');
+      assert.equal(headers.get('range'), 'bytes=0-0');
+      return new Response('x', {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="probe.bin"',
+          'content-range': 'bytes 0-0/100',
+          'content-length': '1',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest();
+    const request = new Request(baseRequest.url, {
+      method: 'HEAD',
+      headers: baseRequest.headers,
+    });
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(request, buildWorkerEnv(), ctx);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.equal(response.headers.get('content-length'), '100');
+    assert.equal(response.headers.get('content-range'), null);
+    assert.equal(releaseBody?.reason, 'stream_complete');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('Google Drive HEAD range probes fail safely and cancel body when upstream returns 200', async () => {
   const originalFetch = globalThis.fetch;
   const originBody = createTrackedTextBody('unsafe-head-body');
@@ -6865,6 +8428,7 @@ test('Google Drive HEAD probe failure waits for in-flight fairqueue header relea
   const originalFetch = globalThis.fetch;
   const calls = [];
   const releaseBodies = [];
+  let concurrencyReleaseBody = null;
   let releaseStarted = null;
   let finishHeaderRelease = null;
 
@@ -6939,6 +8503,7 @@ test('Google Drive HEAD probe failure waits for in-flight fairqueue header relea
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
+      concurrencyReleaseBody = JSON.parse(init.body);
       return createJsonResponse({ result: 'released' });
     }
 
@@ -6968,6 +8533,7 @@ test('Google Drive HEAD probe failure waits for in-flight fairqueue header relea
     assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.equal(releaseBodies[0].slotToken, 'slot-invalid-head');
+    assert.equal(concurrencyReleaseBody?.reason, 'origin_fetch_failure');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -7530,6 +9096,7 @@ test('Google Drive full-range mismatch waits for in-flight fairqueue header rele
   const originalFetch = globalThis.fetch;
   const calls = [];
   const releaseBodies = [];
+  let concurrencyReleaseBody = null;
   let releaseStarted = null;
   let finishHeaderRelease = null;
 
@@ -7606,6 +9173,7 @@ test('Google Drive full-range mismatch waits for in-flight fairqueue header rele
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
       calls.push('concurrency-release');
+      concurrencyReleaseBody = JSON.parse(init.body);
       return createJsonResponse({ result: 'released' });
     }
 
@@ -7634,6 +9202,7 @@ test('Google Drive full-range mismatch waits for in-flight fairqueue header rele
     assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.equal(releaseBodies[0].slotToken, 'slot-range-mismatch');
+    assert.equal(concurrencyReleaseBody?.reason, 'origin_fetch_failure');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;

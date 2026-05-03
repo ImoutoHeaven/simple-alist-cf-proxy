@@ -1969,6 +1969,14 @@ CREATE TABLE IF NOT EXISTS concurrency_requests (
   handoff_token text,
   handoff_deadline_ms bigint,
   handoff_acked_at_ms bigint,
+  heartbeat_state text NOT NULL DEFAULT 'none' CHECK (heartbeat_state IN ('none', 'connected', 'grace')),
+  heartbeat_generation bigint NOT NULL DEFAULT 0,
+  heartbeat_last_at_ms bigint,
+  heartbeat_deadline_ms bigint,
+  heartbeat_grace_until_ms bigint,
+  heartbeat_connected_at_ms bigint,
+  heartbeat_disconnected_at_ms bigint,
+  heartbeat_terminal_reason text,
   terminal_reason text,
   created_at_ms bigint NOT NULL,
   updated_at_ms bigint NOT NULL
@@ -1981,6 +1989,46 @@ CREATE UNIQUE INDEX IF NOT EXISTS concurrency_requests_claim_token_idx
 CREATE INDEX IF NOT EXISTS concurrency_requests_waiting_host_idx
   ON concurrency_requests (hostname_hash, site_bucket, ip_bucket, first_wait_at_ms, request_id)
   WHERE state = 'waiting';
+
+CREATE INDEX IF NOT EXISTS concurrency_requests_heartbeat_deadline_idx
+  ON concurrency_requests (heartbeat_deadline_ms, request_id)
+  WHERE state = 'active' AND heartbeat_deadline_ms IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION cq_apply_heartbeat_terminal_cleanup_trigger()
+RETURNS trigger AS $$
+BEGIN
+  IF NEW.state IN ('released', 'expired', 'cancelled') THEN
+    NEW.heartbeat_state := 'none';
+    NEW.heartbeat_deadline_ms := NULL;
+    NEW.heartbeat_grace_until_ms := NULL;
+    NEW.heartbeat_terminal_reason := NEW.terminal_reason;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS cq_concurrency_requests_heartbeat_cleanup ON concurrency_requests;
+
+CREATE TRIGGER cq_concurrency_requests_heartbeat_cleanup
+BEFORE INSERT OR UPDATE ON concurrency_requests
+FOR EACH ROW
+EXECUTE FUNCTION cq_apply_heartbeat_terminal_cleanup_trigger();
+
+CREATE OR REPLACE FUNCTION cq_heartbeat_released_replay_reason(
+  p_terminal_reason text,
+  p_fallback_reason text DEFAULT 'already_released'
+)
+RETURNS text AS $$
+DECLARE
+  v_reason text := COALESCE(NULLIF(BTRIM(COALESCE(p_terminal_reason, '')), ''), NULLIF(BTRIM(COALESCE(p_fallback_reason, '')), ''), 'already_released');
+BEGIN
+  IF v_reason IN ('heartbeat_start_timeout', 'heartbeat_timeout') THEN
+    RETURN v_reason;
+  END IF;
+
+  RETURN 'already_released';
+END;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION cq_apply_request_terminal_transition(
   p_request_id text,
@@ -2032,6 +2080,10 @@ BEGIN
       terminal_reason = p_terminal_reason,
       claim_state = CASE WHEN p_claim_state IS NOT NULL THEN p_claim_state ELSE claim_state END,
       handoff_state = CASE WHEN p_handoff_state IS NOT NULL THEN p_handoff_state ELSE handoff_state END,
+      heartbeat_state = 'none',
+      heartbeat_deadline_ms = NULL,
+      heartbeat_grace_until_ms = NULL,
+      heartbeat_terminal_reason = p_terminal_reason,
       updated_at_ms = p_now_ms
   WHERE request_id = p_request_id
     AND state = 'active';
@@ -2114,6 +2166,19 @@ BEGIN
     RETURN cq_apply_request_terminal_transition(p_request_id, 'expired', 'hard_expired', p_now_ms);
   END IF;
 
+  IF v_request.handoff_state = 'acknowledged'
+    AND COALESCE(v_request.heartbeat_state, 'none') = 'none'
+    AND v_request.heartbeat_deadline_ms IS NOT NULL
+    AND v_request.heartbeat_deadline_ms <= p_now_ms THEN
+    RETURN cq_apply_request_terminal_transition(p_request_id, 'released', 'heartbeat_start_timeout', p_now_ms);
+  END IF;
+
+  IF COALESCE(v_request.heartbeat_state, 'none') IN ('connected', 'grace')
+    AND v_request.heartbeat_deadline_ms IS NOT NULL
+    AND v_request.heartbeat_deadline_ms <= p_now_ms THEN
+    RETURN cq_apply_request_terminal_transition(p_request_id, 'released', 'heartbeat_timeout', p_now_ms);
+  END IF;
+
   IF v_request.handoff_state = 'pending'
     AND v_request.handoff_deadline_ms IS NOT NULL
     AND v_request.handoff_deadline_ms <= p_now_ms THEN
@@ -2160,9 +2225,10 @@ BEGIN
     WITH expired_rows AS (
       SELECT r.request_id,
              CASE
-               WHEN r.handoff_state = 'pending' AND r.handoff_deadline_ms IS NOT NULL AND r.handoff_deadline_ms <= v_now_ms THEN r.handoff_deadline_ms
-               ELSE l.expires_at_ms
-             END AS due_at_ms
+                WHEN r.handoff_state = 'pending' AND r.handoff_deadline_ms IS NOT NULL AND r.handoff_deadline_ms <= v_now_ms THEN r.handoff_deadline_ms
+                WHEN r.heartbeat_deadline_ms IS NOT NULL AND r.heartbeat_deadline_ms <= v_now_ms THEN r.heartbeat_deadline_ms
+                ELSE l.expires_at_ms
+              END AS due_at_ms
       FROM concurrency_requests AS r
       LEFT JOIN concurrency_leases AS l
         ON l.request_id = r.request_id
@@ -2176,6 +2242,7 @@ BEGIN
         )
         AND (
           (l.request_id IS NOT NULL AND l.expires_at_ms <= v_now_ms)
+          OR (r.heartbeat_deadline_ms IS NOT NULL AND r.heartbeat_deadline_ms <= v_now_ms)
           OR (r.handoff_state = 'pending' AND r.handoff_deadline_ms IS NOT NULL AND r.handoff_deadline_ms <= v_now_ms)
         )
       ORDER BY due_at_ms, r.request_id
@@ -2211,6 +2278,7 @@ DECLARE
   v_request concurrency_requests%ROWTYPE;
   v_locked_lease record;
   v_request_id text;
+  v_input_terminal_reason text;
   v_terminal_reason text;
   v_locked_lease_row_count bigint := 0;
   v_transitioned boolean := FALSE;
@@ -2314,9 +2382,10 @@ BEGIN
     RETURN;
   END IF;
 
+  v_input_terminal_reason := COALESCE(NULLIF(BTRIM(COALESCE(p_reason, '')), ''), 'already_released');
   v_terminal_reason := CASE
-    WHEN p_reason IN ('grant_delivery_failed', 'acquire_delivery_failed') THEN p_reason
-    ELSE 'already_released'
+    WHEN v_input_terminal_reason IN ('grant_delivery_failed', 'acquire_delivery_failed') THEN 'final_cleanup'
+    ELSE v_input_terminal_reason
   END;
 
   v_transitioned := cq_apply_request_terminal_transition(
@@ -2324,7 +2393,7 @@ BEGIN
     'released',
     v_terminal_reason,
     v_now_ms,
-    CASE WHEN p_reason IN ('grant_delivery_failed', 'acquire_delivery_failed') THEN 'compensated' ELSE NULL END
+    CASE WHEN v_input_terminal_reason IN ('grant_delivery_failed', 'acquire_delivery_failed') THEN 'compensated' ELSE NULL END
   );
 
   IF NOT v_transitioned THEN
@@ -3523,11 +3592,13 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION cq_ack_handoff(
   p_request_id text,
   p_handoff_token text,
-  p_now_ms bigint DEFAULT NULL
+  p_now_ms bigint DEFAULT NULL,
+  p_start_timeout_ms bigint DEFAULT NULL
 )
-RETURNS TABLE(result text, reason text) AS $$
+RETURNS TABLE(result text, reason text, heartbeat_deadline_ms bigint) AS $$
 DECLARE
   v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
+  v_commit_now_ms bigint := (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint;
   v_request_id text := BTRIM(COALESCE(p_request_id, ''));
   v_handoff_token text := BTRIM(COALESCE(p_handoff_token, ''));
   v_request record;
@@ -3535,10 +3606,12 @@ DECLARE
   v_request_row_count bigint := 0;
   v_active_lease_row_count bigint := 0;
   v_transitioned boolean := FALSE;
+  v_heartbeat_deadline_ms bigint := NULL;
 BEGIN
-  IF v_request_id = '' OR v_handoff_token = '' THEN
+  IF v_request_id = '' OR v_handoff_token = '' OR COALESCE(p_start_timeout_ms, 0) <= 0 THEN
     result := 'conflict';
     reason := 'handoff_token_mismatch';
+    heartbeat_deadline_ms := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -3556,6 +3629,7 @@ BEGIN
   IF v_request_row_count = 0 THEN
     result := 'conflict';
     reason := 'handoff_token_mismatch';
+    heartbeat_deadline_ms := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -3564,16 +3638,19 @@ BEGIN
     WHEN 'released' THEN
       result := 'released';
       reason := COALESCE(v_request.terminal_reason, 'already_released');
+      heartbeat_deadline_ms := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'cancelled' THEN
       result := 'cancelled';
       reason := 'request_cancelled';
+      heartbeat_deadline_ms := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'expired' THEN
       result := 'expired';
       reason := COALESCE(v_request.terminal_reason, 'hard_expired');
+      heartbeat_deadline_ms := NULL;
       RETURN NEXT;
       RETURN;
     WHEN 'active' THEN
@@ -3581,6 +3658,7 @@ BEGIN
     ELSE
       result := 'conflict';
       reason := 'handoff_token_mismatch';
+      heartbeat_deadline_ms := NULL;
       RETURN NEXT;
       RETURN;
   END CASE;
@@ -3604,6 +3682,7 @@ BEGIN
       WHEN v_transitioned THEN 'hard_expired'
       ELSE COALESCE(v_request.terminal_reason, 'hard_expired')
     END;
+    heartbeat_deadline_ms := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -3625,20 +3704,43 @@ BEGIN
       WHEN v_transitioned THEN 'claim_handoff_timeout'
       ELSE COALESCE(v_request.terminal_reason, 'claim_handoff_timeout')
     END;
+    heartbeat_deadline_ms := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
 
   IF v_request.handoff_token IS NOT DISTINCT FROM v_handoff_token
     AND v_request.handoff_state = 'pending' THEN
+    IF v_request.hard_expire_at_ms <= v_commit_now_ms
+      OR COALESCE(v_request.lease_expires_at_ms, 0) <= v_commit_now_ms
+      OR (v_active_lease_row_count > 0 AND (v_active_lease.hard_expire_at_ms <= v_commit_now_ms OR v_active_lease.expires_at_ms <= v_commit_now_ms)) THEN
+      v_transitioned := cq_apply_request_terminal_transition(v_request_id, 'expired', 'hard_expired', v_commit_now_ms);
+
+      result := 'expired';
+      reason := CASE
+        WHEN v_transitioned THEN 'hard_expired'
+        ELSE COALESCE(v_request.terminal_reason, 'hard_expired')
+      END;
+      heartbeat_deadline_ms := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    v_heartbeat_deadline_ms := LEAST(v_commit_now_ms + p_start_timeout_ms, v_request.hard_expire_at_ms);
+
     UPDATE concurrency_requests
     SET handoff_state = 'acknowledged',
-        handoff_acked_at_ms = v_now_ms,
-        updated_at_ms = v_now_ms
+        handoff_acked_at_ms = v_commit_now_ms,
+        heartbeat_state = 'none',
+        heartbeat_deadline_ms = LEAST(v_commit_now_ms + p_start_timeout_ms, v_request.hard_expire_at_ms),
+        heartbeat_grace_until_ms = NULL,
+        heartbeat_terminal_reason = NULL,
+        updated_at_ms = v_commit_now_ms
     WHERE request_id = v_request_id;
 
     result := 'acknowledged';
     reason := NULL;
+    heartbeat_deadline_ms := v_heartbeat_deadline_ms;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -3647,12 +3749,709 @@ BEGIN
     AND v_request.handoff_state = 'acknowledged' THEN
     result := 'acknowledged';
     reason := NULL;
+    heartbeat_deadline_ms := COALESCE(v_request.heartbeat_deadline_ms, LEAST(v_commit_now_ms + p_start_timeout_ms, v_request.hard_expire_at_ms));
     RETURN NEXT;
     RETURN;
   END IF;
 
   result := 'conflict';
   reason := 'handoff_token_mismatch';
+  heartbeat_deadline_ms := NULL;
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_heartbeat_open(
+  p_request_id text,
+  p_lease_id uuid,
+  p_lease_token text,
+  p_hard_expire_at_ms bigint,
+  p_now_ms bigint,
+  p_heartbeat_timeout_ms bigint,
+  p_ack_timeout_ms bigint,
+  p_heartbeat_interval_ms bigint,
+  p_reconnect_grace_ms bigint,
+  p_start_timeout_ms bigint
+)
+RETURNS TABLE(result text, reason text, generation bigint, deadline_ms bigint, ack_timeout_ms bigint, heartbeat_interval_ms bigint, heartbeat_timeout_ms bigint, reconnect_grace_ms bigint, start_timeout_ms bigint, hard_expire_at_ms bigint) AS $$
+DECLARE
+  v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
+  v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_lease_token text := BTRIM(COALESCE(p_lease_token, ''));
+  v_request concurrency_requests%ROWTYPE;
+  v_active_lease concurrency_leases%ROWTYPE;
+  v_request_row_count bigint := 0;
+  v_active_lease_row_count bigint := 0;
+  v_transitioned boolean := FALSE;
+  v_generation bigint := 0;
+  v_deadline_ms bigint := NULL;
+BEGIN
+  IF v_request_id = ''
+    OR p_lease_id IS NULL
+    OR v_lease_token = ''
+    OR COALESCE(p_hard_expire_at_ms, 0) <= 0
+    OR COALESCE(p_heartbeat_timeout_ms, 0) <= 0
+    OR COALESCE(p_ack_timeout_ms, 0) <= 0
+    OR COALESCE(p_heartbeat_interval_ms, 0) <= 0
+    OR COALESCE(p_reconnect_grace_ms, 0) <= 0
+    OR COALESCE(p_start_timeout_ms, 0) <= 0 THEN
+    result := 'conflict';
+    reason := 'invalid_request';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+
+  SELECT *
+    INTO v_request
+  FROM concurrency_requests
+  WHERE request_id = v_request_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
+
+  IF v_request_row_count = 0 THEN
+    result := 'conflict';
+    reason := 'request_not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  CASE v_request.state
+    WHEN 'released' THEN
+      result := 'terminal';
+      reason := cq_heartbeat_released_replay_reason(v_request.terminal_reason);
+      RETURN NEXT;
+      RETURN;
+    WHEN 'cancelled' THEN
+      result := 'terminal';
+      reason := 'request_cancelled';
+      RETURN NEXT;
+      RETURN;
+    WHEN 'expired' THEN
+      result := 'terminal';
+      reason := COALESCE(v_request.terminal_reason, 'hard_expired');
+      RETURN NEXT;
+      RETURN;
+    WHEN 'active' THEN
+      NULL;
+    ELSE
+      result := 'conflict';
+      reason := 'invalid_request_state';
+      RETURN NEXT;
+      RETURN;
+  END CASE;
+
+  SELECT *
+    INTO v_active_lease
+  FROM concurrency_leases
+  WHERE request_id = v_request_id
+    AND state = 'active'
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_active_lease_row_count = ROW_COUNT;
+
+  IF v_active_lease_row_count = 0
+    OR v_request.lease_id IS DISTINCT FROM p_lease_id
+    OR v_active_lease.lease_id IS DISTINCT FROM p_lease_id THEN
+    result := 'conflict';
+    reason := 'lease_mismatch';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.lease_token IS DISTINCT FROM v_lease_token
+    OR v_active_lease.lease_token IS DISTINCT FROM v_lease_token THEN
+    result := 'conflict';
+    reason := 'lease_token_mismatch';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms
+    OR v_active_lease.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms THEN
+    result := 'conflict';
+    reason := 'hard_expire_at_mismatch';
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.hard_expire_at_ms <= v_now_ms
+    OR COALESCE(v_request.lease_expires_at_ms, 0) <= v_now_ms
+    OR v_active_lease.hard_expire_at_ms <= v_now_ms
+    OR v_active_lease.expires_at_ms <= v_now_ms THEN
+    v_transitioned := cq_apply_request_terminal_transition(v_request_id, 'expired', 'hard_expired', v_now_ms);
+    result := CASE WHEN v_transitioned THEN 'expired' ELSE 'terminal' END;
+    reason := CASE
+      WHEN v_transitioned THEN 'hard_expired'
+      ELSE COALESCE(v_request.terminal_reason, 'hard_expired')
+    END;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.handoff_state IS DISTINCT FROM 'acknowledged' THEN
+    result := 'conflict';
+    reason := 'handoff_not_acknowledged';
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF COALESCE(v_request.heartbeat_state, 'none') = 'none'
+    AND v_request.heartbeat_deadline_ms IS NOT NULL
+    AND v_request.heartbeat_deadline_ms <= v_now_ms THEN
+    v_transitioned := cq_apply_request_terminal_transition(v_request_id, 'released', 'heartbeat_start_timeout', v_now_ms);
+    result := CASE WHEN v_transitioned THEN 'released' ELSE 'terminal' END;
+    reason := CASE
+      WHEN v_transitioned THEN 'heartbeat_start_timeout'
+      ELSE cq_heartbeat_released_replay_reason(v_request.terminal_reason, 'heartbeat_start_timeout')
+    END;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF COALESCE(v_request.heartbeat_state, 'none') IN ('connected', 'grace')
+    AND v_request.heartbeat_deadline_ms IS NOT NULL
+    AND v_request.heartbeat_deadline_ms <= v_now_ms THEN
+    v_transitioned := cq_apply_request_terminal_transition(v_request_id, 'released', 'heartbeat_timeout', v_now_ms);
+    result := CASE WHEN v_transitioned THEN 'released' ELSE 'terminal' END;
+    reason := CASE
+      WHEN v_transitioned THEN 'heartbeat_timeout'
+      ELSE cq_heartbeat_released_replay_reason(v_request.terminal_reason, 'heartbeat_timeout')
+    END;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  CASE COALESCE(v_request.heartbeat_state, 'none')
+    WHEN 'none' THEN
+      NULL;
+    WHEN 'connected' THEN
+      NULL;
+    WHEN 'grace' THEN
+      IF v_request.heartbeat_grace_until_ms IS NULL OR v_request.heartbeat_grace_until_ms < v_now_ms THEN
+        result := 'conflict';
+        reason := 'grace_expired';
+        hard_expire_at_ms := v_request.hard_expire_at_ms;
+        RETURN NEXT;
+        RETURN;
+      END IF;
+    ELSE
+      result := 'conflict';
+      reason := 'invalid_heartbeat_state';
+      hard_expire_at_ms := v_request.hard_expire_at_ms;
+      RETURN NEXT;
+      RETURN;
+  END CASE;
+
+  v_generation := COALESCE(v_request.heartbeat_generation, 0) + 1;
+  v_deadline_ms := LEAST(v_now_ms + p_heartbeat_timeout_ms, v_request.hard_expire_at_ms);
+
+  UPDATE concurrency_requests
+  SET heartbeat_state = 'connected',
+      heartbeat_generation = v_generation,
+      heartbeat_connected_at_ms = v_now_ms,
+      heartbeat_last_at_ms = v_now_ms,
+      heartbeat_deadline_ms = v_deadline_ms,
+      heartbeat_grace_until_ms = NULL,
+      heartbeat_disconnected_at_ms = NULL,
+      heartbeat_terminal_reason = NULL,
+      updated_at_ms = v_now_ms
+  WHERE request_id = v_request_id;
+
+  result := 'accepted';
+  reason := NULL;
+  generation := v_generation;
+  deadline_ms := v_deadline_ms;
+  ack_timeout_ms := p_ack_timeout_ms;
+  heartbeat_interval_ms := p_heartbeat_interval_ms;
+  heartbeat_timeout_ms := p_heartbeat_timeout_ms;
+  reconnect_grace_ms := p_reconnect_grace_ms;
+  start_timeout_ms := p_start_timeout_ms;
+  hard_expire_at_ms := v_request.hard_expire_at_ms;
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_heartbeat_refresh(
+  p_request_id text,
+  p_lease_id uuid,
+  p_lease_token text,
+  p_generation bigint,
+  p_now_ms bigint,
+  p_heartbeat_timeout_ms bigint
+)
+RETURNS TABLE(result text, reason text, generation bigint, deadline_ms bigint, ack_timeout_ms bigint, heartbeat_interval_ms bigint, heartbeat_timeout_ms bigint, reconnect_grace_ms bigint, start_timeout_ms bigint, hard_expire_at_ms bigint) AS $$
+DECLARE
+  v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
+  v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_lease_token text := BTRIM(COALESCE(p_lease_token, ''));
+  v_request concurrency_requests%ROWTYPE;
+  v_active_lease concurrency_leases%ROWTYPE;
+  v_request_row_count bigint := 0;
+  v_active_lease_row_count bigint := 0;
+  v_transitioned boolean := FALSE;
+  v_deadline_ms bigint := NULL;
+BEGIN
+  IF v_request_id = ''
+    OR p_lease_id IS NULL
+    OR v_lease_token = ''
+    OR COALESCE(p_generation, 0) <= 0
+    OR COALESCE(p_heartbeat_timeout_ms, 0) <= 0 THEN
+    result := 'conflict';
+    reason := 'invalid_request';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+
+  SELECT *
+    INTO v_request
+  FROM concurrency_requests
+  WHERE request_id = v_request_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
+
+  IF v_request_row_count = 0 THEN
+    result := 'conflict';
+    reason := 'request_not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  CASE v_request.state
+    WHEN 'released' THEN
+      result := 'terminal';
+      reason := cq_heartbeat_released_replay_reason(v_request.terminal_reason);
+      RETURN NEXT;
+      RETURN;
+    WHEN 'cancelled' THEN
+      result := 'terminal';
+      reason := 'request_cancelled';
+      RETURN NEXT;
+      RETURN;
+    WHEN 'expired' THEN
+      result := 'terminal';
+      reason := COALESCE(v_request.terminal_reason, 'hard_expired');
+      RETURN NEXT;
+      RETURN;
+    WHEN 'active' THEN
+      NULL;
+    ELSE
+      result := 'conflict';
+      reason := 'invalid_request_state';
+      RETURN NEXT;
+      RETURN;
+  END CASE;
+
+  SELECT *
+    INTO v_active_lease
+  FROM concurrency_leases
+  WHERE request_id = v_request_id
+    AND state = 'active'
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_active_lease_row_count = ROW_COUNT;
+
+  IF v_active_lease_row_count = 0
+    OR v_request.lease_id IS DISTINCT FROM p_lease_id
+    OR v_active_lease.lease_id IS DISTINCT FROM p_lease_id THEN
+    result := 'conflict';
+    reason := 'lease_mismatch';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.lease_token IS DISTINCT FROM v_lease_token
+    OR v_active_lease.lease_token IS DISTINCT FROM v_lease_token THEN
+    result := 'conflict';
+    reason := 'lease_token_mismatch';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.hard_expire_at_ms <= v_now_ms
+    OR COALESCE(v_request.lease_expires_at_ms, 0) <= v_now_ms
+    OR v_active_lease.hard_expire_at_ms <= v_now_ms
+    OR v_active_lease.expires_at_ms <= v_now_ms THEN
+    v_transitioned := cq_apply_request_terminal_transition(v_request_id, 'expired', 'hard_expired', v_now_ms);
+    result := CASE WHEN v_transitioned THEN 'expired' ELSE 'terminal' END;
+    reason := CASE
+      WHEN v_transitioned THEN 'hard_expired'
+      ELSE COALESCE(v_request.terminal_reason, 'hard_expired')
+    END;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.handoff_state IS DISTINCT FROM 'acknowledged' THEN
+    result := 'conflict';
+    reason := 'handoff_not_acknowledged';
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF COALESCE(v_request.heartbeat_state, 'none') IN ('connected', 'grace')
+    AND v_request.heartbeat_deadline_ms IS NOT NULL
+    AND v_request.heartbeat_deadline_ms <= v_now_ms THEN
+    v_transitioned := cq_apply_request_terminal_transition(v_request_id, 'released', 'heartbeat_timeout', v_now_ms);
+    result := CASE WHEN v_transitioned THEN 'released' ELSE 'terminal' END;
+    reason := CASE
+      WHEN v_transitioned THEN 'heartbeat_timeout'
+      ELSE cq_heartbeat_released_replay_reason(v_request.terminal_reason, 'heartbeat_timeout')
+    END;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF COALESCE(v_request.heartbeat_state, 'none') IS DISTINCT FROM 'connected' THEN
+    result := 'conflict';
+    reason := 'invalid_heartbeat_state';
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.heartbeat_generation IS DISTINCT FROM p_generation THEN
+    result := 'noop';
+    reason := 'stale_generation';
+    generation := v_request.heartbeat_generation;
+    deadline_ms := v_request.heartbeat_deadline_ms;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  v_deadline_ms := LEAST(v_now_ms + p_heartbeat_timeout_ms, v_request.hard_expire_at_ms);
+
+  UPDATE concurrency_requests
+  SET heartbeat_state = 'connected',
+      heartbeat_last_at_ms = v_now_ms,
+      heartbeat_deadline_ms = v_deadline_ms,
+      heartbeat_grace_until_ms = NULL,
+      heartbeat_disconnected_at_ms = NULL,
+      heartbeat_terminal_reason = NULL,
+      updated_at_ms = v_now_ms
+  WHERE request_id = v_request_id;
+
+  result := 'accepted';
+  reason := NULL;
+  generation := v_request.heartbeat_generation;
+  deadline_ms := v_deadline_ms;
+  heartbeat_timeout_ms := p_heartbeat_timeout_ms;
+  hard_expire_at_ms := v_request.hard_expire_at_ms;
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_heartbeat_disconnect(
+  p_request_id text,
+  p_lease_id uuid,
+  p_lease_token text,
+  p_generation bigint,
+  p_now_ms bigint,
+  p_reconnect_grace_ms bigint
+)
+RETURNS TABLE(result text, reason text, generation bigint, deadline_ms bigint, ack_timeout_ms bigint, heartbeat_interval_ms bigint, heartbeat_timeout_ms bigint, reconnect_grace_ms bigint, start_timeout_ms bigint, hard_expire_at_ms bigint) AS $$
+DECLARE
+  v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
+  v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_lease_token text := BTRIM(COALESCE(p_lease_token, ''));
+  v_request concurrency_requests%ROWTYPE;
+  v_active_lease concurrency_leases%ROWTYPE;
+  v_request_row_count bigint := 0;
+  v_active_lease_row_count bigint := 0;
+  v_transitioned boolean := FALSE;
+  v_grace_until_ms bigint := NULL;
+  v_deadline_ms bigint := NULL;
+BEGIN
+  IF v_request_id = ''
+    OR p_lease_id IS NULL
+    OR v_lease_token = ''
+    OR COALESCE(p_generation, 0) <= 0
+    OR COALESCE(p_reconnect_grace_ms, 0) <= 0 THEN
+    result := 'conflict';
+    reason := 'invalid_request';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+
+  SELECT *
+    INTO v_request
+  FROM concurrency_requests
+  WHERE request_id = v_request_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
+
+  IF v_request_row_count = 0 THEN
+    result := 'conflict';
+    reason := 'request_not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  CASE v_request.state
+    WHEN 'released' THEN
+      result := 'terminal';
+      reason := cq_heartbeat_released_replay_reason(v_request.terminal_reason);
+      RETURN NEXT;
+      RETURN;
+    WHEN 'cancelled' THEN
+      result := 'terminal';
+      reason := 'request_cancelled';
+      RETURN NEXT;
+      RETURN;
+    WHEN 'expired' THEN
+      result := 'terminal';
+      reason := COALESCE(v_request.terminal_reason, 'hard_expired');
+      RETURN NEXT;
+      RETURN;
+    WHEN 'active' THEN
+      NULL;
+    ELSE
+      result := 'conflict';
+      reason := 'invalid_request_state';
+      RETURN NEXT;
+      RETURN;
+  END CASE;
+
+  SELECT *
+    INTO v_active_lease
+  FROM concurrency_leases
+  WHERE request_id = v_request_id
+    AND state = 'active'
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_active_lease_row_count = ROW_COUNT;
+
+  IF v_active_lease_row_count = 0
+    OR v_request.lease_id IS DISTINCT FROM p_lease_id
+    OR v_active_lease.lease_id IS DISTINCT FROM p_lease_id THEN
+    result := 'conflict';
+    reason := 'lease_mismatch';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.lease_token IS DISTINCT FROM v_lease_token
+    OR v_active_lease.lease_token IS DISTINCT FROM v_lease_token THEN
+    result := 'conflict';
+    reason := 'lease_token_mismatch';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.hard_expire_at_ms <= v_now_ms
+    OR COALESCE(v_request.lease_expires_at_ms, 0) <= v_now_ms
+    OR v_active_lease.hard_expire_at_ms <= v_now_ms
+    OR v_active_lease.expires_at_ms <= v_now_ms THEN
+    v_transitioned := cq_apply_request_terminal_transition(v_request_id, 'expired', 'hard_expired', v_now_ms);
+    result := CASE WHEN v_transitioned THEN 'expired' ELSE 'terminal' END;
+    reason := CASE
+      WHEN v_transitioned THEN 'hard_expired'
+      ELSE COALESCE(v_request.terminal_reason, 'hard_expired')
+    END;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.handoff_state IS DISTINCT FROM 'acknowledged' THEN
+    result := 'conflict';
+    reason := 'handoff_not_acknowledged';
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF COALESCE(v_request.heartbeat_state, 'none') IN ('connected', 'grace')
+    AND v_request.heartbeat_deadline_ms IS NOT NULL
+    AND v_request.heartbeat_deadline_ms <= v_now_ms THEN
+    v_transitioned := cq_apply_request_terminal_transition(v_request_id, 'released', 'heartbeat_timeout', v_now_ms);
+    result := CASE WHEN v_transitioned THEN 'released' ELSE 'terminal' END;
+    reason := CASE
+      WHEN v_transitioned THEN 'heartbeat_timeout'
+      ELSE cq_heartbeat_released_replay_reason(v_request.terminal_reason, 'heartbeat_timeout')
+    END;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF COALESCE(v_request.heartbeat_state, 'none') IS DISTINCT FROM 'connected' THEN
+    result := 'conflict';
+    reason := 'invalid_heartbeat_state';
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.heartbeat_generation IS DISTINCT FROM p_generation THEN
+    result := 'noop';
+    reason := 'stale_generation';
+    generation := v_request.heartbeat_generation;
+    deadline_ms := v_request.heartbeat_deadline_ms;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  v_grace_until_ms := LEAST(v_now_ms + p_reconnect_grace_ms, v_request.hard_expire_at_ms);
+  v_deadline_ms := LEAST(COALESCE(v_request.heartbeat_deadline_ms, v_grace_until_ms), v_grace_until_ms, v_request.hard_expire_at_ms);
+
+  UPDATE concurrency_requests
+  SET heartbeat_state = 'grace',
+      heartbeat_deadline_ms = v_deadline_ms,
+      heartbeat_grace_until_ms = v_grace_until_ms,
+      heartbeat_disconnected_at_ms = v_now_ms,
+      heartbeat_terminal_reason = NULL,
+      updated_at_ms = v_now_ms
+  WHERE request_id = v_request_id;
+
+  result := 'accepted';
+  reason := NULL;
+  generation := v_request.heartbeat_generation;
+  deadline_ms := v_deadline_ms;
+  reconnect_grace_ms := p_reconnect_grace_ms;
+  hard_expire_at_ms := v_request.hard_expire_at_ms;
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_expire_heartbeat_if_due(
+  p_request_id text,
+  p_now_ms bigint
+)
+RETURNS TABLE(result text, reason text, generation bigint, deadline_ms bigint, ack_timeout_ms bigint, heartbeat_interval_ms bigint, heartbeat_timeout_ms bigint, reconnect_grace_ms bigint, start_timeout_ms bigint, hard_expire_at_ms bigint) AS $$
+DECLARE
+  v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
+  v_request concurrency_requests%ROWTYPE;
+  v_active_lease concurrency_leases%ROWTYPE;
+  v_request_row_count bigint := 0;
+  v_active_lease_row_count bigint := 0;
+  v_transitioned boolean := FALSE;
+BEGIN
+  PERFORM pg_advisory_xact_lock(3, hashtext(BTRIM(COALESCE(p_request_id, ''))));
+
+  SELECT *
+    INTO v_request
+  FROM concurrency_requests
+  WHERE request_id = p_request_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
+
+  IF v_request_row_count = 0 THEN
+    result := 'conflict';
+    reason := 'request_not_found';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  CASE v_request.state
+    WHEN 'released' THEN
+      result := 'terminal';
+      reason := cq_heartbeat_released_replay_reason(v_request.terminal_reason);
+      RETURN NEXT;
+      RETURN;
+    WHEN 'cancelled' THEN
+      result := 'terminal';
+      reason := 'request_cancelled';
+      RETURN NEXT;
+      RETURN;
+    WHEN 'expired' THEN
+      result := 'terminal';
+      reason := COALESCE(v_request.terminal_reason, 'hard_expired');
+      RETURN NEXT;
+      RETURN;
+    WHEN 'active' THEN
+      NULL;
+    ELSE
+      result := 'conflict';
+      reason := 'invalid_request_state';
+      RETURN NEXT;
+      RETURN;
+  END CASE;
+
+  SELECT *
+    INTO v_active_lease
+  FROM concurrency_leases
+  WHERE request_id = p_request_id
+    AND state = 'active'
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_active_lease_row_count = ROW_COUNT;
+
+  IF v_request.hard_expire_at_ms <= v_now_ms
+    OR COALESCE(v_request.lease_expires_at_ms, 0) <= v_now_ms
+    OR (v_active_lease_row_count > 0 AND (v_active_lease.hard_expire_at_ms <= v_now_ms OR v_active_lease.expires_at_ms <= v_now_ms)) THEN
+    v_transitioned := cq_apply_request_terminal_transition(p_request_id, 'expired', 'hard_expired', v_now_ms);
+    result := CASE WHEN v_transitioned THEN 'expired' ELSE 'terminal' END;
+    reason := CASE
+      WHEN v_transitioned THEN 'hard_expired'
+      ELSE COALESCE(v_request.terminal_reason, 'hard_expired')
+    END;
+    generation := v_request.heartbeat_generation;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.heartbeat_deadline_ms IS NULL OR v_request.heartbeat_deadline_ms > v_now_ms THEN
+    result := 'noop';
+    reason := 'not_due';
+    generation := v_request.heartbeat_generation;
+    deadline_ms := v_request.heartbeat_deadline_ms;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_request.handoff_state = 'acknowledged' AND COALESCE(v_request.heartbeat_state, 'none') = 'none' THEN
+    v_transitioned := cq_apply_request_terminal_transition(p_request_id, 'released', 'heartbeat_start_timeout', v_now_ms);
+    result := CASE WHEN v_transitioned THEN 'released' ELSE 'terminal' END;
+    reason := CASE
+      WHEN v_transitioned THEN 'heartbeat_start_timeout'
+      ELSE cq_heartbeat_released_replay_reason(v_request.terminal_reason, 'heartbeat_start_timeout')
+    END;
+    generation := v_request.heartbeat_generation;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF COALESCE(v_request.heartbeat_state, 'none') IN ('connected', 'grace') THEN
+    v_transitioned := cq_apply_request_terminal_transition(p_request_id, 'released', 'heartbeat_timeout', v_now_ms);
+    result := CASE WHEN v_transitioned THEN 'released' ELSE 'terminal' END;
+    reason := CASE
+      WHEN v_transitioned THEN 'heartbeat_timeout'
+      ELSE cq_heartbeat_released_replay_reason(v_request.terminal_reason, 'heartbeat_timeout')
+    END;
+    generation := v_request.heartbeat_generation;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  result := 'conflict';
+  reason := 'invalid_heartbeat_state';
+  generation := v_request.heartbeat_generation;
+  deadline_ms := v_request.heartbeat_deadline_ms;
+  hard_expire_at_ms := v_request.hard_expire_at_ms;
   RETURN NEXT;
 END;
 $$ LANGUAGE plpgsql;

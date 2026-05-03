@@ -54,6 +54,7 @@ type ConcurrencyConfig struct {
 	Lease ConcurrencyLeaseConfig `json:"lease"`
 	Wait  ConcurrencyWaitConfig  `json:"wait"`
 	Sweep ConcurrencySweepConfig `json:"sweep"`
+	Heartbeat ConcurrencyHeartbeatConfig `json:"heartbeat"`
 	RPC   ConcurrencyRPCConfig   `json:"rpc"`
 }
 
@@ -82,6 +83,18 @@ type ConcurrencySweepConfig struct {
 	Enabled         bool `json:"enabled"`
 	IntervalSeconds int  `json:"intervalSeconds"`
 	BatchSize       int  `json:"batchSize"`
+}
+
+type ConcurrencyHeartbeatConfig struct {
+	Enabled           bool `json:"enabled"`
+	Required          bool `json:"required"`
+	IntervalMs        int  `json:"intervalMs"`
+	TimeoutMs         int  `json:"timeoutMs"`
+	ReconnectGraceMs  int  `json:"reconnectGraceMs"`
+	HelloTimeoutMs    int  `json:"helloTimeoutMs"`
+	StartTimeoutMs    int  `json:"startTimeoutMs"`
+	AckTimeoutMs      int  `json:"ackTimeoutMs"`
+	SchedulerBatchSize int `json:"schedulerBatchSize"`
 }
 
 type ConcurrencyRPCConfig struct {
@@ -118,10 +131,27 @@ func ParseConfigBytes(data []byte) (Config, error) {
 	if cfg.Controller.APIPrefix == "" {
 		cfg.Controller.APIPrefix = "/api/v0"
 	}
+	if !cfg.Concurrency.Heartbeat.Enabled && !cfg.Concurrency.Heartbeat.Required && cfg.Concurrency.Heartbeat.IntervalMs == 0 && cfg.Concurrency.Heartbeat.TimeoutMs == 0 && cfg.Concurrency.Heartbeat.ReconnectGraceMs == 0 && cfg.Concurrency.Heartbeat.HelloTimeoutMs == 0 && cfg.Concurrency.Heartbeat.StartTimeoutMs == 0 && cfg.Concurrency.Heartbeat.AckTimeoutMs == 0 && cfg.Concurrency.Heartbeat.SchedulerBatchSize == 0 {
+		cfg.Concurrency.Heartbeat = defaultHeartbeatConfig()
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func defaultHeartbeatConfig() ConcurrencyHeartbeatConfig {
+	return ConcurrencyHeartbeatConfig{
+		Enabled:           true,
+		Required:          true,
+		IntervalMs:        5000,
+		TimeoutMs:         15000,
+		ReconnectGraceMs:  12000,
+		HelloTimeoutMs:    2000,
+		StartTimeoutMs:    7000,
+		AckTimeoutMs:      2000,
+		SchedulerBatchSize: 500,
+	}
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -203,6 +233,39 @@ func (c *Config) Validate() error {
 	}
 	if c.Concurrency.Sweep.BatchSize <= 0 {
 		return errors.New("concurrency.sweep.batchSize is required")
+	}
+	if !c.Concurrency.Heartbeat.Enabled {
+		return errors.New("concurrency.heartbeat.enabled must be true")
+	}
+	if !c.Concurrency.Heartbeat.Required {
+		return errors.New("concurrency.heartbeat.required must be true")
+	}
+	if c.Concurrency.Heartbeat.IntervalMs <= 0 {
+		return errors.New("concurrency.heartbeat.intervalMs must be > 0")
+	}
+	if c.Concurrency.Heartbeat.TimeoutMs <= 0 {
+		return errors.New("concurrency.heartbeat.timeoutMs must be > 0")
+	}
+	if c.Concurrency.Heartbeat.ReconnectGraceMs <= 0 {
+		return errors.New("concurrency.heartbeat.reconnectGraceMs must be > 0")
+	}
+	if c.Concurrency.Heartbeat.HelloTimeoutMs <= 0 {
+		return errors.New("concurrency.heartbeat.helloTimeoutMs must be > 0")
+	}
+	if c.Concurrency.Heartbeat.StartTimeoutMs <= 0 {
+		return errors.New("concurrency.heartbeat.startTimeoutMs must be > 0")
+	}
+	if c.Concurrency.Heartbeat.AckTimeoutMs <= 0 {
+		return errors.New("concurrency.heartbeat.ackTimeoutMs must be > 0")
+	}
+	if c.Concurrency.Heartbeat.SchedulerBatchSize <= 0 {
+		return errors.New("concurrency.heartbeat.schedulerBatchSize must be > 0")
+	}
+	if c.Concurrency.Heartbeat.TimeoutMs <= c.Concurrency.Heartbeat.IntervalMs {
+		return errors.New("concurrency.heartbeat.timeoutMs must be greater than intervalMs")
+	}
+	if c.Concurrency.Heartbeat.ReconnectGraceMs > c.Concurrency.Heartbeat.TimeoutMs {
+		return errors.New("concurrency.heartbeat.reconnectGraceMs must be less than or equal to timeoutMs")
 	}
 	if strings.TrimSpace(c.Concurrency.RPC.AcquireFunc) == "" {
 		return errors.New("concurrency.rpc.acquireFunc is required")

@@ -395,7 +395,8 @@ describe('init.sql breaker RPC definitions', () => {
 
     expect(ackBody).toMatch(/handoff_token_mismatch/i);
     expect(ackBody).toMatch(/handoff_state\s*=\s*'acknowledged'/i);
-    expect(ackBody).toMatch(/handoff_acked_at_ms\s*=\s*v_now_ms/i);
+    expect(ackBody).toMatch(/v_commit_now_ms\s+bigint\s*:=\s*\(EXTRACT\(EPOCH FROM clock_timestamp\(\)\) \* 1000\)::bigint/i);
+    expect(ackBody).toMatch(/handoff_acked_at_ms\s*=\s*v_commit_now_ms/i);
   });
 
   it('represents handoff-timeout compensation in claim replay, ack_handoff, and recovery SQL paths', () => {
@@ -634,5 +635,66 @@ describe('init.sql ticket-state contract definitions', () => {
     expect(unifiedCheckBody).not.toMatch(/active_total_access_count\s+INTEGER/i);
     expect(unifiedCheckBody).not.toMatch(/LAST_ACCESS_TIME/i);
     expect(unifiedCheckBody).not.toMatch(/TOTAL_ACCESS_COUNT/i);
+  });
+});
+
+describe('init.sql heartbeat contract definitions', () => {
+  it('defines request heartbeat columns, state default, and deadline index', () => {
+    expect(initSql).toMatch(/heartbeat_state\s+text\s+NOT NULL\s+DEFAULT 'none'/i);
+    expect(initSql).toMatch(/heartbeat_generation\s+bigint\s+NOT NULL\s+DEFAULT 0/i);
+    expect(initSql).toMatch(/heartbeat_last_at_ms\s+bigint/i);
+    expect(initSql).toMatch(/heartbeat_deadline_ms\s+bigint/i);
+    expect(initSql).toMatch(/heartbeat_grace_until_ms\s+bigint/i);
+    expect(initSql).toMatch(/heartbeat_connected_at_ms\s+bigint/i);
+    expect(initSql).toMatch(/heartbeat_disconnected_at_ms\s+bigint/i);
+    expect(initSql).toMatch(/heartbeat_terminal_reason\s+text/i);
+    expect(initSql).toMatch(/CREATE INDEX IF NOT EXISTS\s+concurrency_requests_heartbeat_deadline_idx/i);
+  });
+
+  it('defines heartbeat rpc entrypoints and ack_handoff start timeout contract', () => {
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_heartbeat_open\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_heartbeat_refresh\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_heartbeat_disconnect\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_expire_heartbeat_if_due\(/i);
+
+    const ackBody = readFunctionBody('cq_ack_handoff');
+    expect(ackBody).toMatch(/p_start_timeout_ms\s+bigint/i);
+    expect(ackBody).toMatch(/RETURNS TABLE\s*\(\s*result\s+text,\s*reason\s+text,\s*heartbeat_deadline_ms\s+bigint\s*\)/i);
+    expect(ackBody).toMatch(/heartbeat_state\s*=\s*'none'/i);
+    expect(ackBody).toMatch(/heartbeat_deadline_ms\s*=\s*LEAST\(v_commit_now_ms \+ p_start_timeout_ms, v_request\.hard_expire_at_ms\)/i);
+  });
+
+  it('applies deterministic heartbeat cleanup on terminal request transitions', () => {
+    const helperBody = readFunctionBody('cq_apply_request_terminal_transition');
+
+    expect(helperBody).toMatch(/heartbeat_state\s*=\s*'none'/i);
+    expect(helperBody).toMatch(/heartbeat_deadline_ms\s*=\s*NULL/i);
+    expect(helperBody).toMatch(/heartbeat_grace_until_ms\s*=\s*NULL/i);
+    expect(helperBody).toMatch(/heartbeat_terminal_reason\s*=\s*p_terminal_reason/i);
+    expect(helperBody).not.toMatch(/heartbeat_generation\s*=\s*0/i);
+    expect(helperBody).not.toMatch(/heartbeat_last_at_ms\s*=\s*NULL/i);
+  });
+
+  it('gives hard expiry precedence before heartbeat start timeout and heartbeat timeout', () => {
+    const expireActiveBody = readFunctionBody('cq_expire_active_request_if_due');
+
+    const hardExpiredIndex = expectPatternIndex(
+      expireActiveBody,
+      /hard_expired/i,
+      'expected hard expiry terminal branch in cq_expire_active_request_if_due',
+    );
+    const heartbeatStartTimeoutIndex = expectPatternIndex(
+      expireActiveBody,
+      /heartbeat_start_timeout/i,
+      'expected heartbeat_start_timeout branch in cq_expire_active_request_if_due',
+    );
+    const heartbeatTimeoutIndex = expectPatternIndex(
+      expireActiveBody,
+      /heartbeat_timeout/i,
+      'expected heartbeat_timeout branch in cq_expire_active_request_if_due',
+    );
+
+    expect(heartbeatStartTimeoutIndex).toBeGreaterThan(hardExpiredIndex);
+    expect(heartbeatTimeoutIndex).toBeGreaterThan(hardExpiredIndex);
   });
 });

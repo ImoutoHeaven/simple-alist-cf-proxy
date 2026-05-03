@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,17 +23,19 @@ import (
 )
 
 const (
-	acquirePath = "/api/v1/concurrency/acquire"
-	claimPath   = "/api/v1/concurrency/claim"
-	ackPath     = "/api/v1/concurrency/ack_handoff"
-	releasePath = "/api/v1/concurrency/release"
-	cancelPath  = "/api/v1/concurrency/cancel"
+	acquirePath   = "/api/v1/concurrency/acquire"
+	claimPath     = "/api/v1/concurrency/claim"
+	ackPath       = "/api/v1/concurrency/ack_handoff"
+	releasePath   = "/api/v1/concurrency/release"
+	cancelPath    = "/api/v1/concurrency/cancel"
+	heartbeatPath = "/api/v1/concurrency/heartbeat"
 )
 
 type Server struct {
 	cfg               Config
 	backend           Backend
 	waitingRuntime    *waitingRuntime
+	heartbeatRuntime  *heartbeatRuntime
 	observability     *cqObservability
 	mux               *http.ServeMux
 	newSweepTicker    func(time.Duration) sweepTicker
@@ -170,6 +173,14 @@ func NewServer(cfg Config, backend Backend) (*Server, error) {
 		}
 	}
 	s := &Server{cfg: cfg, backend: backend, waitingRuntime: newWaitingRuntime(), observability: newCQObservability(), mux: http.NewServeMux(), reactorStopCh: make(chan struct{})}
+	if hbBackend, ok := backend.(heartbeatBackend); ok && cfg.Concurrency.Heartbeat.Enabled {
+		s.heartbeatRuntime = newHeartbeatRuntime(cfg.Concurrency.Heartbeat, hbBackend)
+		s.heartbeatRuntime.setTerminalHook(func(requestID string, nowMs int64) {
+			s.clearActiveReplayState(requestID)
+			s.wakeAttachedWaiters(context.Background())
+			s.deliverTerminalToAttachedWaiters(context.Background(), nowMs)
+		})
+	}
 	s.newSweepTicker = func(interval time.Duration) sweepTicker {
 		return &realSweepTicker{ticker: time.NewTicker(interval)}
 	}
@@ -191,6 +202,9 @@ func (s *Server) Close() error {
 		s.reactorStopOnce.Do(func() {
 			close(s.reactorStopCh)
 		})
+		if s.heartbeatRuntime != nil {
+			s.heartbeatRuntime.close()
+		}
 	}
 	if closer, ok := s.backend.(io.Closer); ok {
 		return closer.Close()
@@ -204,6 +218,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc(ackPath, s.handleAckHandoff)
 	s.mux.HandleFunc(releasePath, s.handleRelease)
 	s.mux.HandleFunc(cancelPath, s.handleCancel)
+	if s.heartbeatRuntime != nil {
+		s.mux.HandleFunc(heartbeatPath, s.handleHeartbeat)
+	}
 }
 
 func (s *Server) startSweepLoop(ctx context.Context) func() {
@@ -300,6 +317,11 @@ func (s *Server) recoverStartupState(ctx context.Context) error {
 	}
 	if err := s.recoverActiveReplayState(ctx); err != nil {
 		return err
+	}
+	if s.heartbeatRuntime != nil {
+		if err := s.heartbeatRuntime.recoverActiveDeadlines(ctx, nowMs); err != nil {
+			return err
+		}
 	}
 	for hostnameHash := range survivingHosts {
 		s.ensureHostReactor(hostnameHash)
@@ -412,77 +434,63 @@ func (s *Server) defaultSweepTargetSource(ctx context.Context, nowMs int64, batc
 		return nil, nil
 	}
 
-	switch backend := s.backend.(type) {
-	case *postgresBackend:
-		query := `
-			SELECT hostname_hash, site_bucket, ip_bucket
-			FROM concurrency_leases
-			WHERE state = 'active' AND expires_at_ms <= $1
-			GROUP BY hostname_hash, site_bucket, ip_bucket
-			ORDER BY MIN(expires_at_ms), hostname_hash, site_bucket, ip_bucket
-			LIMIT $2`
-		rows, err := backend.db.Query(ctx, query, nowMs, limit)
-		if err != nil {
-			return nil, err
+	type sweepTargetRow struct {
+		HostnameHash string
+		SiteBucket   string
+		IPBucket     string
+		DueAtMs      int64
+	}
+
+	appendUniqueTarget := func(targets []sweepTargetRow, seen map[string]struct{}, row sweepTargetRow) []sweepTargetRow {
+		row.HostnameHash = strings.TrimSpace(row.HostnameHash)
+		if row.HostnameHash == "" {
+			return targets
 		}
-		defer rows.Close()
-		var requests []ExpireScopeRequest
-		for rows.Next() {
-			var hostnameHash string
-			var siteBucket sql.NullString
-			var ipBucket sql.NullString
-			if err := rows.Scan(&hostnameHash, &siteBucket, &ipBucket); err != nil {
-				return nil, err
+		key := makeTupleKey(row.HostnameHash, row.SiteBucket, row.IPBucket)
+		if _, ok := seen[key]; ok {
+			return targets
+		}
+		seen[key] = struct{}{}
+		return append(targets, row)
+	}
+
+	buildRequests := func(rows ...[]sweepTargetRow) []ExpireScopeRequest {
+		merged := make(map[string]sweepTargetRow)
+		for _, group := range rows {
+			for _, row := range group {
+				row.HostnameHash = strings.TrimSpace(row.HostnameHash)
+				if row.HostnameHash == "" {
+					continue
+				}
+				key := makeTupleKey(row.HostnameHash, row.SiteBucket, row.IPBucket)
+				if existing, ok := merged[key]; !ok || row.DueAtMs < existing.DueAtMs {
+					merged[key] = row
+				}
 			}
-			requests = append(requests, ExpireScopeRequest{
-				Scope:        "site_ip",
-				HostnameHash: hostnameHash,
-				SiteBucket:   siteBucket.String,
-				IPBucket:     ipBucket.String,
-				Limit:        limit,
-			})
 		}
-		if err := rows.Err(); err != nil {
-			return nil, err
+
+		targets := make([]sweepTargetRow, 0, len(merged))
+		for _, row := range merged {
+			targets = append(targets, row)
 		}
-		return requests, nil
-	case *postgrestBackend:
-		params := url.Values{}
-		params.Set("select", "hostname_hash,site_bucket,ip_bucket,expires_at_ms")
-		params.Set("state", "eq.active")
-		params.Set("expires_at_ms", "lte."+strconv.FormatInt(nowMs, 10))
-		params.Set("order", "expires_at_ms.asc")
-		params.Set("limit", strconv.Itoa(limit))
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, backend.baseURL+"/concurrency_leases?"+params.Encode(), nil)
-		if err != nil {
-			return nil, err
-		}
-		request.Header = backend.buildHeaders()
-		response, err := backend.client.Do(request)
-		if err != nil {
-			return nil, err
-		}
-		defer response.Body.Close()
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			data, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
-			return nil, fmt.Errorf("postgrest sweep query failed: status=%d body=%s", response.StatusCode, string(data))
-		}
-		var rows []struct {
-			HostnameHash string `json:"hostname_hash"`
-			SiteBucket   string `json:"site_bucket"`
-			IPBucket     string `json:"ip_bucket"`
-		}
-		if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&rows); err != nil {
-			return nil, err
-		}
-		requests := make([]ExpireScopeRequest, 0, len(rows))
-		seen := make(map[string]struct{}, len(rows))
-		for _, row := range rows {
-			key := row.HostnameHash + "|" + row.SiteBucket + "|" + row.IPBucket
-			if _, ok := seen[key]; ok {
-				continue
+		sort.Slice(targets, func(i, j int) bool {
+			if targets[i].DueAtMs != targets[j].DueAtMs {
+				return targets[i].DueAtMs < targets[j].DueAtMs
 			}
-			seen[key] = struct{}{}
+			if targets[i].HostnameHash != targets[j].HostnameHash {
+				return targets[i].HostnameHash < targets[j].HostnameHash
+			}
+			if targets[i].SiteBucket != targets[j].SiteBucket {
+				return targets[i].SiteBucket < targets[j].SiteBucket
+			}
+			return targets[i].IPBucket < targets[j].IPBucket
+		})
+		if len(targets) > limit {
+			targets = targets[:limit]
+		}
+
+		requests := make([]ExpireScopeRequest, 0, len(targets))
+		for _, row := range targets {
 			requests = append(requests, ExpireScopeRequest{
 				Scope:        "site_ip",
 				HostnameHash: row.HostnameHash,
@@ -491,7 +499,171 @@ func (s *Server) defaultSweepTargetSource(ctx context.Context, nowMs int64, batc
 				Limit:        limit,
 			})
 		}
-		return requests, nil
+		return requests
+	}
+
+	switch backend := s.backend.(type) {
+	case *postgresBackend:
+		leaseQuery := `
+			SELECT hostname_hash, site_bucket, ip_bucket, MIN(expires_at_ms) AS due_at_ms
+			FROM concurrency_leases
+			WHERE state = 'active' AND expires_at_ms <= $1
+			GROUP BY hostname_hash, site_bucket, ip_bucket
+			ORDER BY MIN(expires_at_ms), hostname_hash, site_bucket, ip_bucket
+			LIMIT $2`
+		leaseRows, err := backend.db.Query(ctx, leaseQuery, nowMs, limit)
+		if err != nil {
+			return nil, err
+		}
+		defer leaseRows.Close()
+
+		leaseTargets := make([]sweepTargetRow, 0, limit)
+		for leaseRows.Next() {
+			var hostnameHash string
+			var siteBucket sql.NullString
+			var ipBucket sql.NullString
+			var dueAtMs int64
+			if err := leaseRows.Scan(&hostnameHash, &siteBucket, &ipBucket, &dueAtMs); err != nil {
+				return nil, err
+			}
+			leaseTargets = append(leaseTargets, sweepTargetRow{
+				HostnameHash: hostnameHash,
+				SiteBucket:   siteBucket.String,
+				IPBucket:     ipBucket.String,
+				DueAtMs:      dueAtMs,
+			})
+		}
+		if err := leaseRows.Err(); err != nil {
+			return nil, err
+		}
+
+		heartbeatQuery := `
+			SELECT hostname_hash, site_bucket, ip_bucket, MIN(heartbeat_deadline_ms) AS due_at_ms
+			FROM concurrency_requests
+			WHERE state = 'active'
+			  AND heartbeat_deadline_ms IS NOT NULL
+			  AND heartbeat_deadline_ms <= $1
+			GROUP BY hostname_hash, site_bucket, ip_bucket
+			ORDER BY MIN(heartbeat_deadline_ms), hostname_hash, site_bucket, ip_bucket
+			LIMIT $2`
+		heartbeatRows, err := backend.db.Query(ctx, heartbeatQuery, nowMs, limit)
+		if err != nil {
+			return nil, err
+		}
+		defer heartbeatRows.Close()
+
+		heartbeatTargets := make([]sweepTargetRow, 0, limit)
+		for heartbeatRows.Next() {
+			var hostnameHash string
+			var siteBucket sql.NullString
+			var ipBucket sql.NullString
+			var dueAtMs int64
+			if err := heartbeatRows.Scan(&hostnameHash, &siteBucket, &ipBucket, &dueAtMs); err != nil {
+				return nil, err
+			}
+			heartbeatTargets = append(heartbeatTargets, sweepTargetRow{
+				HostnameHash: hostnameHash,
+				SiteBucket:   siteBucket.String,
+				IPBucket:     ipBucket.String,
+				DueAtMs:      dueAtMs,
+			})
+		}
+		if err := heartbeatRows.Err(); err != nil {
+			return nil, err
+		}
+
+		return buildRequests(leaseTargets, heartbeatTargets), nil
+	case *postgrestBackend:
+		fetchRows := func(path string, params url.Values, dst any) error {
+			request, err := http.NewRequestWithContext(ctx, http.MethodGet, backend.baseURL+path+"?"+params.Encode(), nil)
+			if err != nil {
+				return err
+			}
+			request.Header = backend.buildHeaders()
+			response, err := backend.client.Do(request)
+			if err != nil {
+				return err
+			}
+			defer response.Body.Close()
+			if response.StatusCode < 200 || response.StatusCode >= 300 {
+				data, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+				return fmt.Errorf("postgrest sweep query failed: status=%d body=%s", response.StatusCode, string(data))
+			}
+			return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(dst)
+		}
+
+		pageSize := limit
+		leaseTargets := make([]sweepTargetRow, 0, limit)
+		leaseSeen := make(map[string]struct{}, limit)
+		for offset := 0; len(leaseTargets) < limit; {
+			leaseParams := url.Values{}
+			leaseParams.Set("select", "hostname_hash,site_bucket,ip_bucket,expires_at_ms")
+			leaseParams.Set("state", "eq.active")
+			leaseParams.Set("expires_at_ms", "lte."+strconv.FormatInt(nowMs, 10))
+			leaseParams.Set("order", "expires_at_ms.asc,hostname_hash.asc,site_bucket.asc,ip_bucket.asc,lease_id.asc")
+			leaseParams.Set("limit", strconv.Itoa(pageSize))
+			if offset > 0 {
+				leaseParams.Set("offset", strconv.Itoa(offset))
+			}
+			var leaseRows []struct {
+				HostnameHash string `json:"hostname_hash"`
+				SiteBucket   string `json:"site_bucket"`
+				IPBucket     string `json:"ip_bucket"`
+				ExpiresAtMs  int64  `json:"expires_at_ms"`
+			}
+			if err := fetchRows("/concurrency_leases", leaseParams, &leaseRows); err != nil {
+				return nil, err
+			}
+			for _, row := range leaseRows {
+				leaseTargets = appendUniqueTarget(leaseTargets, leaseSeen, sweepTargetRow{
+					HostnameHash: row.HostnameHash,
+					SiteBucket:   row.SiteBucket,
+					IPBucket:     row.IPBucket,
+					DueAtMs:      row.ExpiresAtMs,
+				})
+			}
+			if len(leaseRows) < pageSize {
+				break
+			}
+			offset += len(leaseRows)
+		}
+
+		heartbeatTargets := make([]sweepTargetRow, 0, limit)
+		heartbeatSeen := make(map[string]struct{}, limit)
+		for offset := 0; len(heartbeatTargets) < limit; {
+			heartbeatParams := url.Values{}
+			heartbeatParams.Set("select", "hostname_hash,site_bucket,ip_bucket,heartbeat_deadline_ms")
+			heartbeatParams.Set("state", "eq.active")
+			heartbeatParams.Set("heartbeat_deadline_ms", "lte."+strconv.FormatInt(nowMs, 10))
+			heartbeatParams.Set("order", "heartbeat_deadline_ms.asc,hostname_hash.asc,site_bucket.asc,ip_bucket.asc,request_id.asc")
+			heartbeatParams.Set("limit", strconv.Itoa(pageSize))
+			if offset > 0 {
+				heartbeatParams.Set("offset", strconv.Itoa(offset))
+			}
+			var heartbeatRows []struct {
+				HostnameHash        string `json:"hostname_hash"`
+				SiteBucket          string `json:"site_bucket"`
+				IPBucket            string `json:"ip_bucket"`
+				HeartbeatDeadlineMs int64  `json:"heartbeat_deadline_ms"`
+			}
+			if err := fetchRows("/concurrency_requests", heartbeatParams, &heartbeatRows); err != nil {
+				return nil, err
+			}
+			for _, row := range heartbeatRows {
+				heartbeatTargets = appendUniqueTarget(heartbeatTargets, heartbeatSeen, sweepTargetRow{
+					HostnameHash: row.HostnameHash,
+					SiteBucket:   row.SiteBucket,
+					IPBucket:     row.IPBucket,
+					DueAtMs:      row.HeartbeatDeadlineMs,
+				})
+			}
+			if len(heartbeatRows) < pageSize {
+				break
+			}
+			offset += len(heartbeatRows)
+		}
+
+		return buildRequests(leaseTargets, heartbeatTargets), nil
 	default:
 		return nil, nil
 	}
@@ -741,8 +913,14 @@ func validateReleaseRequest(req ReleaseRequest) error {
 	if strings.TrimSpace(req.LeaseToken) == "" {
 		return errors.New("leaseToken is required")
 	}
-	if strings.TrimSpace(req.Reason) == "" {
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
 		return errors.New("reason is required")
+	}
+	switch reason {
+	case "stream_complete", "client_disconnect", "hard_expiry", "upstream_failure", "origin_fetch_failure", "heartbeat_connect_failed", "heartbeat_lost", "final_cleanup":
+	default:
+		return errors.New("unsupported release reason")
 	}
 	if req.NowMs <= 0 {
 		return errors.New("nowMs is required")
@@ -801,7 +979,13 @@ func (s *Server) handleAckHandoff(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	result, err := backend.AckHandoff(r.Context(), req)
+	handlerNowMs := time.Now().UnixMilli()
+	result, err := backend.AckHandoff(r.Context(), AckHandoffBackendRequest{
+		RequestID:      req.RequestID,
+		HandoffToken:   req.HandoffToken,
+		NowMs:          handlerNowMs,
+		StartTimeoutMs: int64(s.cfg.Concurrency.Heartbeat.StartTimeoutMs),
+	})
 	if err != nil || result == nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
@@ -812,8 +996,13 @@ func (s *Server) handleAckHandoff(w http.ResponseWriter, r *http.Request) {
 	}
 	if result.Result == "released" || result.Result == "cancelled" || result.Result == "expired" {
 		s.clearActiveReplayState(req.RequestID)
+		if s.heartbeatRuntime != nil {
+			s.heartbeatRuntime.cancel(req.RequestID)
+		}
 		s.wakeAttachedWaiters(context.Background())
 		s.deliverTerminalToAttachedWaiters(context.Background(), time.Now().UnixMilli())
+	} else if result.Result == "acknowledged" && s.heartbeatRuntime != nil {
+		s.heartbeatRuntime.schedule(req.RequestID, result.HeartbeatDeadlineMs)
 	}
 	status, ok := ackHandoffResultStatus(result.Result)
 	if !ok {
@@ -821,6 +1010,18 @@ func (s *Server) handleAckHandoff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, status, result)
+}
+
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if ok, code := s.checkAuth(r); !ok {
+		http.Error(w, http.StatusText(code), code)
+		return
+	}
+	if s.heartbeatRuntime == nil {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	s.heartbeatRuntime.handleWebSocket(w, r)
 }
 
 func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
@@ -1071,6 +1272,16 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 			s.clearActiveReplayState(result.RequestID)
 		}
 	}
+	if s.heartbeatRuntime != nil {
+		switch result.Result {
+		case "released", "expired":
+			s.heartbeatRuntime.cancel(result.RequestID)
+		case "noop":
+			if result.Reason == "expired" || result.Reason == "already_released" {
+				s.heartbeatRuntime.cancel(result.RequestID)
+			}
+		}
+	}
 	s.wakeAttachedWaiters(context.Background())
 	publicResult := &ReleaseResult{Result: result.Result, Reason: result.Reason}
 	writeJSON(w, http.StatusOK, publicResult)
@@ -1111,6 +1322,9 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	if result.Result == "cancelled" {
 		s.recordObservability(observabilityCancelled, "request_id="+strings.TrimSpace(req.RequestID))
 		s.clearActiveReplayState(req.RequestID)
+		if s.heartbeatRuntime != nil {
+			s.heartbeatRuntime.cancel(req.RequestID)
+		}
 		if snap := s.waitingRuntime.finishRequest(req.RequestID, nil); snap != nil && snap.WaitToken != "" {
 			s.waitingRuntime.deliver(snap.WaitToken, &AcquireResult{Result: "cancelled", Reason: "request_cancelled"})
 		}

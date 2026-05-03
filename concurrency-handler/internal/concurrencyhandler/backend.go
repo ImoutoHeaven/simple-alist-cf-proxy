@@ -53,9 +53,71 @@ type AckHandoffRequest struct {
 	NowMs        int64  `json:"nowMs"`
 }
 
+type AckHandoffBackendRequest struct {
+	RequestID      string
+	HandoffToken   string
+	NowMs          int64
+	StartTimeoutMs int64
+}
+
 type AckHandoffResult struct {
-	Result string `json:"result"`
-	Reason string `json:"reason,omitempty"`
+	Result              string `json:"result"`
+	Reason              string `json:"reason,omitempty"`
+	HeartbeatDeadlineMs int64  `json:"heartbeatDeadlineMs,omitempty"`
+}
+
+type HeartbeatOpenRequest struct {
+	RequestID           string
+	LeaseID             string
+	LeaseToken          string
+	HardExpireAtMs      int64
+	NowMs               int64
+	HeartbeatTimeoutMs  int64
+	AckTimeoutMs        int64
+	HeartbeatIntervalMs int64
+	ReconnectGraceMs    int64
+	StartTimeoutMs      int64
+}
+
+type HeartbeatRefreshRequest struct {
+	RequestID          string
+	LeaseID            string
+	LeaseToken         string
+	Generation         int64
+	NowMs              int64
+	HeartbeatTimeoutMs int64
+}
+
+type HeartbeatDisconnectRequest struct {
+	RequestID        string
+	LeaseID          string
+	LeaseToken       string
+	Generation       int64
+	NowMs            int64
+	ReconnectGraceMs int64
+}
+
+type ExpireHeartbeatRequest struct {
+	RequestID string
+	NowMs     int64
+}
+
+type HeartbeatDeadlineSnapshot struct {
+	RequestID  string
+	DeadlineMs int64
+}
+
+type HeartbeatResult struct {
+	Result              string
+	Reason              string
+	Generation          int64
+	DeadlineMs          int64
+	AckTimeoutMs        int64
+	HeartbeatIntervalMs int64
+	HeartbeatTimeoutMs  int64
+	ReconnectGraceMs    int64
+	StartTimeoutMs      int64
+	HardExpireAtMs      int64
 }
 
 type ReleaseRequest struct {
@@ -207,7 +269,15 @@ type continueWaitProber interface {
 }
 
 type ackHandoffer interface {
-	AckHandoff(ctx context.Context, req AckHandoffRequest) (*AckHandoffResult, error)
+	AckHandoff(ctx context.Context, req AckHandoffBackendRequest) (*AckHandoffResult, error)
+}
+
+type heartbeatBackend interface {
+	HeartbeatOpen(ctx context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error)
+	HeartbeatRefresh(ctx context.Context, req HeartbeatRefreshRequest) (*HeartbeatResult, error)
+	HeartbeatDisconnect(ctx context.Context, req HeartbeatDisconnectRequest) (*HeartbeatResult, error)
+	ExpireHeartbeatIfDue(ctx context.Context, req ExpireHeartbeatRequest) (*HeartbeatResult, error)
+	LoadActiveHeartbeatDeadlines(ctx context.Context, nowMs int64, limit int) ([]HeartbeatDeadlineSnapshot, error)
 }
 
 type acquireWireResult struct {
@@ -276,6 +346,15 @@ func boundedExpireLimit(limit int, fallback int) int {
 	return limit
 }
 
+func isValidReleasedTerminalReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "already_released", "stream_complete", "client_disconnect", "hard_expiry", "upstream_failure", "origin_fetch_failure", "heartbeat_connect_failed", "heartbeat_lost", "heartbeat_start_timeout", "heartbeat_timeout", "claim_handoff_timeout", "final_cleanup":
+		return true
+	default:
+		return false
+	}
+}
+
 func validateAcquireResult(req AcquireRequest, result *AcquireResult) error {
 	if result == nil {
 		return errors.New("missing acquire result")
@@ -310,9 +389,7 @@ func validateAcquireResult(req AcquireRequest, result *AcquireResult) error {
 			return fmt.Errorf("invalid acquire conflict reason %q", result.Reason)
 		}
 	case "released":
-		switch result.Reason {
-		case "already_released", releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed, "claim_handoff_timeout":
-		default:
+		if !isValidReleasedTerminalReason(result.Reason) {
 			return fmt.Errorf("invalid acquire released reason %q", result.Reason)
 		}
 	case "cancelled":
@@ -371,9 +448,7 @@ func validateClaimGrantResult(result *ClaimGrantResult) error {
 			return fmt.Errorf("invalid claim conflict reason %q", result.Reason)
 		}
 	case "released":
-		switch result.Reason {
-		case "already_released", releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed, "claim_handoff_timeout":
-		default:
+		if !isValidReleasedTerminalReason(result.Reason) {
 			return fmt.Errorf("invalid claim released reason %q", result.Reason)
 		}
 		return nil
@@ -416,6 +491,9 @@ func validateAckHandoffResult(result *AckHandoffResult) error {
 		if strings.TrimSpace(result.Reason) != "" {
 			return errors.New("acknowledged ack handoff result must not include reason")
 		}
+		if result.HeartbeatDeadlineMs <= 0 {
+			return errors.New("acknowledged ack handoff result must include positive heartbeatDeadlineMs")
+		}
 		return nil
 	case "conflict":
 		if result.Reason != ackHandoffConflictReasonTokenMismatch {
@@ -423,12 +501,10 @@ func validateAckHandoffResult(result *AckHandoffResult) error {
 		}
 		return nil
 	case "released":
-		switch result.Reason {
-		case "already_released", releaseReasonGrantDeliveryFailed, releaseReasonAcquireDeliveryFailed, "claim_handoff_timeout":
+		if isValidReleasedTerminalReason(result.Reason) {
 			return nil
-		default:
-			return fmt.Errorf("invalid ack handoff released reason %q", result.Reason)
 		}
+		return fmt.Errorf("invalid ack handoff released reason %q", result.Reason)
 	case "cancelled":
 		if result.Reason != "request_cancelled" {
 			return fmt.Errorf("invalid ack handoff cancelled reason %q", result.Reason)
@@ -443,6 +519,43 @@ func validateAckHandoffResult(result *AckHandoffResult) error {
 		}
 	default:
 		return fmt.Errorf("invalid ack handoff result %q", result.Result)
+	}
+}
+
+func validateHeartbeatResult(result *HeartbeatResult) error {
+	if result == nil {
+		return errors.New("missing heartbeat result")
+	}
+	switch result.Result {
+	case "accepted":
+		if result.Generation <= 0 {
+			return errors.New("accepted heartbeat result must include positive generation")
+		}
+		if result.DeadlineMs <= 0 || result.HardExpireAtMs <= 0 || result.DeadlineMs > result.HardExpireAtMs {
+			return errors.New("accepted heartbeat result must include deadlineMs capped by hardExpireAtMs")
+		}
+		if strings.TrimSpace(result.Reason) != "" {
+			return errors.New("accepted heartbeat result must not include reason")
+		}
+		requiresOpenTiming := result.AckTimeoutMs > 0 || result.HeartbeatIntervalMs > 0 || result.StartTimeoutMs > 0 || (result.HeartbeatTimeoutMs > 0 && result.ReconnectGraceMs > 0)
+		if requiresOpenTiming {
+			if result.AckTimeoutMs <= 0 || result.HeartbeatIntervalMs <= 0 || result.HeartbeatTimeoutMs <= 0 || result.ReconnectGraceMs <= 0 || result.StartTimeoutMs <= 0 {
+				return errors.New("accepted heartbeat open result must include positive timing fields")
+			}
+			return nil
+		}
+		if result.HeartbeatTimeoutMs > 0 || result.ReconnectGraceMs > 0 {
+			return nil
+		}
+		return errors.New("accepted heartbeat result must include open timing fields or the authoritative refresh/disconnect timing field")
+		return nil
+	case "released", "expired", "terminal", "conflict", "noop":
+		if strings.TrimSpace(result.Reason) == "" {
+			return fmt.Errorf("%s heartbeat result must include reason", result.Result)
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid heartbeat result %q", result.Result)
 	}
 }
 
