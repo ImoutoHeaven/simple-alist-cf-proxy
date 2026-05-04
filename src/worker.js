@@ -1958,17 +1958,24 @@ const TRUE_CONCURRENCY_CANCEL_CONFLICT_REASONS = new Set([
   'must_release_active_lease',
 ]);
 const TRUE_CONCURRENCY_ACK_HANDOFF_CONFLICT_REASONS = new Set(['handoff_token_mismatch']);
-const TRUE_CONCURRENCY_TERMINAL_REASONS = new Set([
+const TRUE_CONCURRENCY_RELEASED_TERMINAL_REASONS = new Set([
   'already_released',
-  'request_cancelled',
-  'hard_expired',
-  'waiter_detached_timeout',
-  'grant_delivery_failed',
-  'acquire_delivery_failed',
+  'stream_complete',
+  'client_disconnect',
+  'hard_expiry',
+  'upstream_failure',
+  'origin_fetch_failure',
+  'heartbeat_connect_failed',
+  'heartbeat_lost',
+  'final_cleanup',
+  'heartbeat_start_timeout',
+  'heartbeat_timeout',
   'claim_handoff_timeout',
 ]);
-const TRUE_CONCURRENCY_CLAIM_TERMINAL_REASONS = new Set([
-  ...TRUE_CONCURRENCY_TERMINAL_REASONS,
+const TRUE_CONCURRENCY_CANCELLED_TERMINAL_REASONS = new Set(['request_cancelled']);
+const TRUE_CONCURRENCY_EXPIRED_TERMINAL_REASONS = new Set([
+  'hard_expired',
+  'waiter_detached_timeout',
 ]);
 const TRUE_CONCURRENCY_RELEASE_NOOP_REASONS = new Set([
   'already_released',
@@ -2081,6 +2088,16 @@ const readTrueConcurrencyResult = (operation, data, allowedResults) => {
   return result;
 };
 
+const readTrueConcurrencyTerminalReason = (operation, result, data, allowedReasons) => {
+  if (typeof data?.reason !== 'string' || !data.reason) {
+    throw new Error(`[CQ] ${operation} ${result} response missing reason`);
+  }
+  if (!(allowedReasons instanceof Set) || !allowedReasons.has(data.reason)) {
+    throw new Error(`[CQ] ${operation} ${result} response has unsupported reason`);
+  }
+  return data.reason;
+};
+
 const normalizeTrueConcurrencyAcquireResult = (data, options = {}) => {
   const result = readTrueConcurrencyResult('acquire', data, TRUE_CONCURRENCY_ACQUIRE_RESULTS);
 
@@ -2145,15 +2162,15 @@ const normalizeTrueConcurrencyAcquireResult = (data, options = {}) => {
     };
   }
 
-  if (typeof data?.reason !== 'string' || !data.reason) {
-    throw new Error(`[CQ] acquire ${result} response missing reason`);
-  }
-  if (!TRUE_CONCURRENCY_TERMINAL_REASONS.has(data.reason)) {
-    throw new Error(`[CQ] acquire ${result} response has unsupported reason`);
-  }
+  const allowedTerminalReasons = result === 'released'
+    ? TRUE_CONCURRENCY_RELEASED_TERMINAL_REASONS
+    : result === 'cancelled'
+      ? TRUE_CONCURRENCY_CANCELLED_TERMINAL_REASONS
+      : TRUE_CONCURRENCY_EXPIRED_TERMINAL_REASONS;
+  const reason = readTrueConcurrencyTerminalReason('acquire', result, data, allowedTerminalReasons);
   return {
     result,
-    reason: data.reason,
+    reason,
   };
 };
 
@@ -2204,13 +2221,15 @@ const normalizeTrueConcurrencyClaimResult = (data, options = {}) => {
     return { result: 'conflict', reason: data.reason };
   }
 
-  if (typeof data?.reason !== 'string' || !data.reason) {
-    throw new Error(`[CQ] claim ${result} response missing reason`);
-  }
-  if (!TRUE_CONCURRENCY_CLAIM_TERMINAL_REASONS.has(data.reason)) {
-    throw new Error(`[CQ] claim ${result} response has unsupported reason`);
-  }
-  return { result, reason: data.reason };
+  const allowedTerminalReasons = result === 'released'
+    ? TRUE_CONCURRENCY_RELEASED_TERMINAL_REASONS
+    : result === 'cancelled'
+      ? TRUE_CONCURRENCY_CANCELLED_TERMINAL_REASONS
+      : TRUE_CONCURRENCY_EXPIRED_TERMINAL_REASONS;
+  return {
+    result,
+    reason: readTrueConcurrencyTerminalReason('claim', result, data, allowedTerminalReasons),
+  };
 };
 
 const normalizeTrueConcurrencyAckHandoffResult = (data) => {
@@ -2236,15 +2255,14 @@ const normalizeTrueConcurrencyAckHandoffResult = (data) => {
     };
   }
 
-  if (typeof data?.reason !== 'string' || !data.reason) {
-    throw new Error(`[CQ] ack_handoff ${result} response missing reason`);
-  }
-  if (!TRUE_CONCURRENCY_CLAIM_TERMINAL_REASONS.has(data.reason)) {
-    throw new Error(`[CQ] ack_handoff ${result} response has unsupported reason`);
-  }
+  const allowedTerminalReasons = result === 'released'
+    ? TRUE_CONCURRENCY_RELEASED_TERMINAL_REASONS
+    : result === 'cancelled'
+      ? TRUE_CONCURRENCY_CANCELLED_TERMINAL_REASONS
+      : TRUE_CONCURRENCY_EXPIRED_TERMINAL_REASONS;
   return {
     result,
-    reason: data.reason,
+    reason: readTrueConcurrencyTerminalReason('ack_handoff', result, data, allowedTerminalReasons),
   };
 };
 

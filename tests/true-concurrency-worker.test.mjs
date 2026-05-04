@@ -4181,6 +4181,101 @@ test('true concurrency acquire terminal replay with claim_handoff_timeout fails 
   }
 });
 
+test('true concurrency acquire terminal replay with heartbeat_timeout fails closed and does not fetch origin', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+    }
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      return createJsonResponse({ result: 'released', reason: 'heartbeat_timeout' }, { status: 410 });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      throw new Error('claim should not run for heartbeat_timeout acquire replay');
+    }
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('should-not-fetch', { status: 200 });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.equal(body.message, 'True concurrency released (heartbeat_timeout)');
+    assert.deepEqual(calls, ['concurrency-acquire-fast']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency claim terminal replay with heartbeat_timeout fails closed and does not fetch origin', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+    }
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-claim-heartbeat-timeout',
+        leaseToken: 'token-claim-heartbeat-timeout',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-claim-heartbeat-timeout',
+      });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createJsonResponse({ result: 'released', reason: 'heartbeat_timeout' }, { status: 410 });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      throw new Error('release should not run for heartbeat_timeout terminal replay');
+    }
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch');
+      return new Response('should-not-fetch', { status: 200 });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(response.status, 503);
+    assert.equal(body.message, 'True concurrency released (heartbeat_timeout)');
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('true concurrency claim failure releases acquired lease before origin fetch', async () => {
   const originalFetch = globalThis.fetch;
   const scenarios = [
