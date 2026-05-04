@@ -2007,8 +2007,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS cq_concurrency_requests_heartbeat_cleanup ON concurrency_requests;
-
 CREATE TRIGGER cq_concurrency_requests_heartbeat_cleanup
 BEFORE INSERT OR UPDATE ON concurrency_requests
 FOR EACH ROW

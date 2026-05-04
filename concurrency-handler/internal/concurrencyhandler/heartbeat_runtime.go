@@ -418,10 +418,7 @@ func (h *heartbeatRuntime) cancel(requestID string) {
 }
 
 func (h *heartbeatRuntime) recoverActiveDeadlines(ctx context.Context, nowMs int64) error {
-	if h == nil || h.backend == nil {
-		return nil
-	}
-	rows, err := h.backend.LoadActiveHeartbeatDeadlines(ctx, nowMs, 0)
+	rows, err := h.loadActiveDeadlines(ctx, nowMs)
 	if err != nil {
 		return err
 	}
@@ -429,6 +426,13 @@ func (h *heartbeatRuntime) recoverActiveDeadlines(ctx context.Context, nowMs int
 		h.schedule(row.RequestID, row.DeadlineMs)
 	}
 	return nil
+}
+
+func (h *heartbeatRuntime) loadActiveDeadlines(ctx context.Context, nowMs int64) ([]HeartbeatDeadlineSnapshot, error) {
+	if h == nil || h.backend == nil {
+		return nil, nil
+	}
+	return h.backend.LoadActiveHeartbeatDeadlines(ctx, nowMs, 0)
 }
 
 func (h *heartbeatRuntime) close() {

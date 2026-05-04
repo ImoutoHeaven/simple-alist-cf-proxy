@@ -651,6 +651,12 @@ describe('init.sql heartbeat contract definitions', () => {
     expect(initSql).toMatch(/CREATE INDEX IF NOT EXISTS\s+concurrency_requests_heartbeat_deadline_idx/i);
   });
 
+  it('keeps the heartbeat cleanup trigger as a current-state declaration without migrate-only replacement DDL', () => {
+    expect(initSql).toMatch(/CREATE TRIGGER\s+cq_concurrency_requests_heartbeat_cleanup/i);
+    expect(initSql).toMatch(/EXECUTE FUNCTION\s+cq_apply_heartbeat_terminal_cleanup_trigger\(\)/i);
+    expect(initSql).not.toMatch(/DROP\s+TRIGGER\s+IF\s+EXISTS\s+cq_concurrency_requests_heartbeat_cleanup\s+ON\s+concurrency_requests/i);
+  });
+
   it('defines heartbeat rpc entrypoints and ack_handoff start timeout contract', () => {
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_heartbeat_open\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_heartbeat_refresh\(/i);

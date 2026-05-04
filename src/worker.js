@@ -4674,6 +4674,20 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const throttleCheckEnabled = config.throttleEnabled && throttleManager;
   const isThrottleManagedHostname = (hostname) => isManagedThrottleHost(hostname, config.throttleHostnamePatterns);
+  const isProtectedThrottleStatusCode = (statusCode) => {
+    if (!Number.isInteger(statusCode)) {
+      return false;
+    }
+    const protectedHttpCodes = Array.isArray(config.throttleConfig?.protectHttpCodes)
+      ? config.throttleConfig.protectHttpCodes
+      : [];
+    return protectedHttpCodes.includes(statusCode);
+  };
+  const isGeneratedTerminalUpstreamStatus = (statusCode) => (
+    Number.isInteger(statusCode)
+    && statusCode >= 400
+    && statusCode < 600
+  );
   const getThrottleAuthorityHostname = (hostname) => {
     if (!isThrottleManagedHostname(hostname)) {
       return null;
@@ -4907,11 +4921,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     if (response) {
-      const protectedHttpCodes = Array.isArray(config.throttleConfig?.protectHttpCodes)
-        ? config.throttleConfig.protectHttpCodes
-        : [];
       const statusCode = response.status;
-      const isProtectedError = protectedHttpCodes.includes(statusCode);
+      const isProtectedError = isProtectedThrottleStatusCode(statusCode);
       const isSuccessStatus = statusCode >= 200 && statusCode < 400;
       if (isProtectedError || isSuccessStatus) {
         return null;
@@ -4978,11 +4989,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     try {
       const statusCode = response.status;
-      const protectedHttpCodes = Array.isArray(config.throttleConfig?.protectHttpCodes)
-        ? config.throttleConfig.protectHttpCodes
-        : [];
-
-      const isProtectedError = protectedHttpCodes.includes(statusCode);
+      const isProtectedError = isProtectedThrottleStatusCode(statusCode);
       const isSuccessStatus = statusCode >= 200 && statusCode < 400;
       if (!isProtectedError && !isSuccessStatus) {
         return;
@@ -5036,12 +5043,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
       if (!snapshot) {
         console.error('[Throttle] Sample report returned no authority state');
+        await cancelResponseBody(response);
         return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
       }
 
       attempt?.consumeAfterReport?.();
     } catch (error) {
       console.error('[Throttle] Sample report failed:', error instanceof Error ? error.message : String(error));
+      await cancelResponseBody(response);
       return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
     }
 
@@ -6136,29 +6145,29 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         try {
           upstreamResponse = await fetch(requestToFetch);
         } catch (error) {
-          const breakerOnlyRetirementResponse = await retirePendingBreakerOnlyAttemptIfNeeded();
+          // Preserve deferred same-site redirect reporting; direct fetch throws with live
+          // breaker debt still need the existing no-sample settlement path.
+          const keepDeferredQueueBreakerReport = requestAdmissionMode === 'queue_breaker'
+            && fqContext?.hostname === requestHostname
+            && fqContext.deferredReportArmed === true
+            && Number.isFinite(fqContext.deferredReportStatusCode);
+          const breakerSettlementResponse = keepDeferredQueueBreakerReport
+            ? null
+            : await settleBreakerAttemptIfNeeded(requestHostname);
           if (cqReleaseController) {
             await ensureCurrentTrueConcurrencyReleased('origin_fetch_failure', true);
           }
           if (needFairQueue) {
             await finalizeFairQueueOnFailure('origin fetch failure');
           }
-          if (breakerOnlyRetirementResponse) {
-            throw breakerOnlyRetirementResponse;
+          if (breakerSettlementResponse instanceof Response) {
+            throw breakerSettlementResponse;
           }
           throw error;
         }
-        const reportFailureResponse = await reportBreakerResponseIfNeeded(
-          requestHostname,
-          upstreamResponse,
-          requestToFetch?.url || '',
-          attempt,
-        );
-        if (reportFailureResponse) {
-          throw reportFailureResponse;
-        }
         return upstreamResponse;
       })(),
+      attempt,
     };
   };
   const shouldRetryAuthError = (status) => status === 401 || status === 410;
@@ -6396,6 +6405,19 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     return new Response(upstreamResponse.body, responseInit);
   };
 
+  const buildGeneratedUpstreamTerminalResponse = (upstreamResponse) => {
+    const status = upstreamResponse?.status;
+    const message = status >= 500
+      ? 'upstream download failed'
+      : 'upstream download rejected';
+    return createErrorResponse(origin, status, message);
+  };
+
+  const cancelResponseBodyAndReturn = async (responseToCancel, responseToReturn, reason) => {
+    await cancelResponseBody(responseToCancel);
+    return await releaseAdmissionBeforeTerminalResponse(responseToReturn, reason);
+  };
+
   const releaseAdmissionBeforeTerminalResponse = async (response, reason) => {
     if (cqReleaseController && !cqCleanupBoundToStream) {
       await ensureCurrentTrueConcurrencyReleased(reason, true);
@@ -6407,6 +6429,54 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       }
     }
     return response;
+  };
+
+  const reportFetchedUpstreamResponseIfNeeded = async (response, requestHostname, requestUrl, attempt, options = {}) => {
+    if (!response) {
+      return null;
+    }
+
+    if (response.status >= 400) {
+      return null;
+    }
+
+    if (options.skipProtectedError === true && isProtectedThrottleStatusCode(response.status)) {
+      return null;
+    }
+
+    return await reportBreakerResponseIfNeeded(requestHostname, response, requestUrl, attempt);
+  };
+
+  const finalizeUpstreamTerminalResponseIfNeeded = async (upstreamResponse, requestHostname, attempt = null) => {
+    const status = upstreamResponse?.status;
+    if (!isGeneratedTerminalUpstreamStatus(status)) {
+      return null;
+    }
+
+    if (isProtectedThrottleStatusCode(status)) {
+      const reportResponse = await reportBreakerResponseIfNeeded(
+        requestHostname,
+        upstreamResponse,
+        '',
+        attempt,
+      );
+      if (reportResponse) {
+        return await cancelResponseBodyAndReturn(upstreamResponse, reportResponse, 'upstream_terminal');
+      }
+    }
+
+    if (!isProtectedThrottleStatusCode(status)) {
+      const settleResponse = await settleBreakerAttemptIfNeeded(requestHostname);
+      if (settleResponse instanceof Response) {
+        return await cancelResponseBodyAndReturn(upstreamResponse, settleResponse, 'upstream_terminal');
+      }
+    }
+
+    await cancelResponseBody(upstreamResponse);
+    return await releaseAdmissionBeforeTerminalResponse(
+      buildGeneratedUpstreamTerminalResponse(upstreamResponse),
+      'upstream_terminal',
+    );
   };
 
   const finalizeContentResponse = async (responseToReturn, upstreamResponse = responseToReturn) => {
@@ -6462,11 +6532,22 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     }
 
     request = await maybeApplyGoogleDriveFullDownloadTranslation(buildUpstreamRequest(downloadUrl, res.data.header));
-    let { blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request);
+    let { blockedResponse, response, attempt } = await fetchUpstreamWithBreakerAttempt(request);
     if (blockedResponse) {
       return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
     }
     const currentOrigin = new URL(originalRequest.url).origin;
+    let requestHostname = extractHostname(request?.url || '')?.toLowerCase() || null;
+    const initialReportResponse = await reportFetchedUpstreamResponseIfNeeded(
+      response,
+      requestHostname,
+      request.url,
+      attempt,
+      { skipProtectedError: !retriedWithFreshLink && shouldRetryAuthError(response.status) },
+    );
+    if (initialReportResponse) {
+      return await cancelResponseBodyAndReturn(response, initialReportResponse, 'prestream_terminal');
+    }
     while (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("Location");
       if (location) {
@@ -6484,9 +6565,20 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
             return targetPrepareResponse;
           }
           request = await maybeApplyGoogleDriveFullDownloadTranslation(new Request(resolvedLocation, request));
-          ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
+          ({ blockedResponse, response, attempt } = await fetchUpstreamWithBreakerAttempt(request));
           if (blockedResponse) {
             return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
+          }
+          requestHostname = extractHostname(request?.url || '')?.toLowerCase() || null;
+          const redirectedReportResponse = await reportFetchedUpstreamResponseIfNeeded(
+            response,
+            requestHostname,
+            request.url,
+            attempt,
+            { skipProtectedError: !retriedWithFreshLink && shouldRetryAuthError(response.status) },
+          );
+          if (redirectedReportResponse) {
+            return await cancelResponseBodyAndReturn(response, redirectedReportResponse, 'prestream_terminal');
           }
         }
       } else {
@@ -6498,7 +6590,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       if (needTrueConcurrency && !needFairQueue) {
         const settleResponse = await settleBreakerOnlyAttemptIfNeeded(extractHostname(request?.url || '')?.toLowerCase() || null);
         if (settleResponse instanceof Response) {
-          return await releaseAdmissionBeforeTerminalResponse(settleResponse, 'prestream_terminal');
+          return await cancelResponseBodyAndReturn(response, settleResponse, 'prestream_terminal');
         }
       }
       retriedWithFreshLink = true;
@@ -6521,9 +6613,19 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           return targetPrepareResponse;
         }
         request = await maybeApplyGoogleDriveFullDownloadTranslation(buildUpstreamRequest(downloadUrl, res.data.header));
-        ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
+        ({ blockedResponse, response, attempt } = await fetchUpstreamWithBreakerAttempt(request));
         if (blockedResponse) {
           return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
+        }
+        requestHostname = extractHostname(request?.url || '')?.toLowerCase() || null;
+        const refreshedReportResponse = await reportFetchedUpstreamResponseIfNeeded(
+          response,
+          requestHostname,
+          request.url,
+          attempt,
+        );
+        if (refreshedReportResponse) {
+          return await cancelResponseBodyAndReturn(response, refreshedReportResponse, 'prestream_terminal');
         }
         while (response.status >= 300 && response.status < 400) {
           const location = response.headers.get("Location");
@@ -6542,9 +6644,19 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
                 return redirectPrepareResponse;
               }
               request = await maybeApplyGoogleDriveFullDownloadTranslation(new Request(resolvedLocation, request));
-              ({ blockedResponse, response } = await fetchUpstreamWithBreakerAttempt(request));
+              ({ blockedResponse, response, attempt } = await fetchUpstreamWithBreakerAttempt(request));
               if (blockedResponse) {
                 return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
+              }
+              requestHostname = extractHostname(request?.url || '')?.toLowerCase() || null;
+              const nestedRedirectReportResponse = await reportFetchedUpstreamResponseIfNeeded(
+                response,
+                requestHostname,
+                request.url,
+                attempt,
+              );
+              if (nestedRedirectReportResponse) {
+                return await cancelResponseBodyAndReturn(response, nestedRedirectReportResponse, 'prestream_terminal');
               }
             }
           } else {
@@ -6555,21 +6667,26 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     }
 
     if (retriedWithFreshLink && shouldRetryAuthError(response.status)) {
-      if (needTrueConcurrency && !needFairQueue) {
+      if (needTrueConcurrency && !needFairQueue && !isProtectedThrottleStatusCode(response.status)) {
         const settleResponse = await settleBreakerOnlyAttemptIfNeeded(extractHostname(request?.url || '')?.toLowerCase() || null);
         if (settleResponse instanceof Response) {
-          return await releaseAdmissionBeforeTerminalResponse(settleResponse, 'prestream_terminal');
+          return await cancelResponseBodyAndReturn(response, settleResponse, 'prestream_terminal');
         }
       }
       const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
       if (deferredReportResponse) {
-        return deferredReportResponse;
+        return await cancelResponseBodyAndReturn(response, deferredReportResponse, 'prestream_terminal');
       }
     }
 
     const deferredTerminalReportResponse = await flushDeferredQueueBreakerReportOnExit(response);
     if (deferredTerminalReportResponse) {
-      return deferredTerminalReportResponse;
+      return await cancelResponseBodyAndReturn(response, deferredTerminalReportResponse, 'prestream_terminal');
+    }
+
+    const terminalUpstreamResponse = await finalizeUpstreamTerminalResponseIfNeeded(response, requestHostname, attempt);
+    if (terminalUpstreamResponse) {
+      return terminalUpstreamResponse;
     }
 
     if (response.status !== 200 && response.status !== 206) {
@@ -6631,7 +6748,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     // binds concurrency cleanup to the response body.
     const terminalBreakerOnlyRetirementResponse = await retirePendingBreakerOnlyAttemptIfNeeded();
     if (terminalBreakerOnlyRetirementResponse) {
-      return await releaseAdmissionBeforeTerminalResponse(terminalBreakerOnlyRetirementResponse, 'prestream_terminal');
+      return await cancelResponseBodyAndReturn(response, terminalBreakerOnlyRetirementResponse, 'prestream_terminal');
     }
 
     const safeResponse = needTrueConcurrency

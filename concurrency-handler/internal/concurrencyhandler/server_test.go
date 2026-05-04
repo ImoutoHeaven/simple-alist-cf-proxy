@@ -160,6 +160,18 @@ type probingBackend struct {
 	probeFn func(context.Context, AcquireRequest) (*AcquireResult, error)
 }
 
+type startupRecoveryFailBackend struct {
+	*stubBackend
+	startupProbeErr error
+	loadWaitingErr  error
+}
+
+type startupProbeCloseBackend struct {
+	*stubBackend
+	closeServer func() error
+	probeCalls  atomic.Int32
+}
+
 type activeReplayCleanupBackend struct {
 	*stubBackend
 }
@@ -302,6 +314,29 @@ func (b *probingBackend) ProbeContinueWait(ctx context.Context, req AcquireReque
 		return b.probeFn(ctx, req)
 	}
 	return &AcquireResult{Result: "wait", WaitToken: req.WaitToken, Scope: "host", RetryAfter: 1}, nil
+}
+
+func (b *startupRecoveryFailBackend) StartupProbe(context.Context) error {
+	return b.startupProbeErr
+}
+
+func (b *startupRecoveryFailBackend) LoadWaitingRequests(context.Context) ([]requestSnapshot, error) {
+	return nil, b.loadWaitingErr
+}
+
+func (s *stubBackend) StartupProbe(context.Context) error {
+	return nil
+}
+
+func (b *startupProbeCloseBackend) StartupProbe(context.Context) error {
+	if b.probeCalls.Add(1) == 1 && b.closeServer != nil {
+		return b.closeServer()
+	}
+	return nil
+}
+
+func (b *startupProbeCloseBackend) LoadWaitingRequests(context.Context) ([]requestSnapshot, error) {
+	return nil, nil
 }
 
 func (w *failingResponseWriter) Header() http.Header {
@@ -494,7 +529,15 @@ func newTestServerInstanceWithConfig(t *testing.T, cfg Config, backend Backend) 
 	if err != nil {
 		t.Fatalf("NewServer error: %v", err)
 	}
+	waitForServerReady(t, srv)
 	return srv
+}
+
+func waitForServerReady(t *testing.T, server *Server) {
+	t.Helper()
+	waitForConditionWithMessage(t, 2*time.Second, func() bool {
+		return server != nil && server.isReady()
+	}, "server did not reach ready state before timeout")
 }
 
 func newHeartbeatWebSocketTestServer(t *testing.T, cfg Config, backend Backend) (*Server, *httptest.Server) {
@@ -1013,6 +1056,203 @@ func TestServerCloseStopsHeartbeatTimers(t *testing.T) {
 	}
 	if got := server.heartbeatRuntime.scheduledDeadline("request-1"); got != 0 {
 		t.Fatalf("expected Close to stop heartbeat timers, got deadline %d", got)
+	}
+}
+
+func TestCloseMakesStartupLifecycleClosedTerminal(t *testing.T) {
+	server := &Server{reactorStopCh: make(chan struct{})}
+	server.setStartupState(startupStateProbing)
+	if err := server.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+	server.setStartupState(startupStateReady)
+	if got := server.startupStateValue(); got != startupStateClosed {
+		t.Fatalf("expected closed lifecycle state to stay terminal, got %v", got)
+	}
+}
+
+func TestStartupLoopDoesNotOverwriteClosedStateAfterCloseDuringProbe(t *testing.T) {
+	backend := &startupProbeCloseBackend{stubBackend: &stubBackend{loadHeartbeatDeadlinesFn: func(_ context.Context, nowMs int64, limit int) ([]HeartbeatDeadlineSnapshot, error) {
+		return []HeartbeatDeadlineSnapshot{{RequestID: "closed-race-request", DeadlineMs: nowMs + 60_000}}, nil
+	}}}
+	startupCtx, startupCancel := context.WithCancel(context.Background())
+	server := &Server{
+		cfg:            validTestConfig(),
+		backend:        backend,
+		waitingRuntime: newWaitingRuntime(),
+		observability:  newCQObservability(),
+		mux:            http.NewServeMux(),
+		reactorStopCh:  make(chan struct{}),
+		startupCtx:     startupCtx,
+		startupCancel:  startupCancel,
+	}
+	server.heartbeatRuntime = newHeartbeatRuntime(server.cfg.Concurrency.Heartbeat, backend)
+	backend.closeServer = server.Close
+
+	server.startStartupLifecycle()
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		return backend.probeCalls.Load() > 0
+	}, "expected startup probe to run")
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		return server.startupStateValue() == startupStateClosed
+	}, "expected close during probe to leave closed lifecycle state")
+	if got := server.startupStateValue(); got != startupStateClosed {
+		t.Fatalf("expected startup loop not to overwrite closed state, got %v", got)
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("closed-race-request"); got != 0 {
+		t.Fatalf("expected close during probe to prevent staged heartbeat swap, got deadline %d", got)
+	}
+}
+
+func TestNewServerStartsBeforeRecoveryBackendIsReady(t *testing.T) {
+	server, err := NewServer(validTestConfig(), &startupRecoveryFailBackend{
+		stubBackend:    &stubBackend{},
+		loadWaitingErr: errors.New("db down"),
+	})
+	if err != nil {
+		t.Fatalf("expected non-fatal startup before backend readiness, got %v", err)
+	}
+	if server == nil {
+		t.Fatal("expected server construction to return a server")
+	}
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+}
+
+func TestBusinessEndpointsReturn503BeforeStartupRecoveryReady(t *testing.T) {
+	server, err := NewServer(validTestConfig(), &startupRecoveryFailBackend{
+		stubBackend: &stubBackend{
+			acquireResult: &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: 5000, ClaimToken: "claim-token"},
+			claimResult:   &ClaimGrantResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: 5000, HandoffToken: "handoff-token", HandoffDeadlineMs: 4000},
+			ackResult:     &AckHandoffResult{Result: "acknowledged", HeartbeatDeadlineMs: 4000},
+			releaseResult: &ReleaseResult{Result: "released", RequestID: "request-1"},
+			cancelResult:  &CancelResult{Result: "cancelled"},
+			heartbeatOpenResult: &HeartbeatResult{
+				Result:              "accepted",
+				Generation:          1,
+				DeadlineMs:          4000,
+				AckTimeoutMs:        2000,
+				HeartbeatIntervalMs: 5000,
+				HeartbeatTimeoutMs:  15000,
+				ReconnectGraceMs:    12000,
+				StartTimeoutMs:      7000,
+				HardExpireAtMs:      5000,
+			},
+		},
+		loadWaitingErr: errors.New("db down"),
+	})
+	if err != nil {
+		t.Fatalf("expected server construction to succeed before ready, got %v", err)
+	}
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	acquireReq := validAcquireRequest()
+	claimReq := ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-token", NowMs: 1000}
+	ackReq := AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-token", NowMs: 1000}
+	releaseReq := validReleaseRequest()
+	cancelReq := CancelRequest{
+		RequestID:      "request-1",
+		Hostname:       "example.com",
+		HostnameHash:   "host-hash",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		HardExpireAtMs: 5000,
+		Reason:         "worker_aborted",
+		NowMs:          1000,
+	}
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{method: http.MethodPost, path: acquirePath, body: acquireReq},
+		{method: http.MethodPost, path: claimPath, body: claimReq},
+		{method: http.MethodPost, path: ackPath, body: ackReq},
+		{method: http.MethodGet, path: heartbeatPath},
+		{method: http.MethodPost, path: releasePath, body: releaseReq},
+		{method: http.MethodPost, path: cancelPath, body: cancelReq},
+	} {
+		var rec *httptest.ResponseRecorder
+		if tc.method == http.MethodGet {
+			rec = serveJSONRequest(server.Handler(), tc.method, tc.path, nil, "secret")
+		} else {
+			rec = postJSON(t, server.Handler(), tc.path, tc.body, "secret")
+		}
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 for %s %s before ready, got %d body=%s", tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestStartupRecoveryDoesNotScheduleHeartbeatDeadlinesBeforeReady(t *testing.T) {
+	deadlineMs := time.Now().Add(30 * time.Second).UnixMilli()
+	server, err := NewServer(validTestConfig(), &startupRecoveryFailBackend{
+		stubBackend: &stubBackend{loadHeartbeatDeadlinesFn: func(_ context.Context, nowMs int64, limit int) ([]HeartbeatDeadlineSnapshot, error) {
+			return []HeartbeatDeadlineSnapshot{{RequestID: "not-ready-heartbeat", DeadlineMs: deadlineMs}}, nil
+		}},
+		loadWaitingErr: errors.New("db down"),
+	})
+	if err != nil {
+		t.Fatalf("expected server construction to succeed before ready, got %v", err)
+	}
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	if server.heartbeatRuntime == nil {
+		t.Fatal("expected heartbeat runtime to be constructed")
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("not-ready-heartbeat"); got != 0 {
+		t.Fatalf("expected heartbeat recovery to stay inactive before ready, got deadline %d", got)
+	}
+}
+
+func TestStartupRecoveryDoesNotStartHostReactorsBeforeReady(t *testing.T) {
+	backend := &startupRecoveryFailBackend{stubBackend: &stubBackend{promoteFn: func(context.Context, PromoteWaitingRequest) (*AcquireResult, error) {
+		return &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: time.Now().Add(time.Minute).UnixMilli()}, nil
+	}}}
+	server, err := NewServer(validTestConfig(), backend)
+	if err != nil {
+		t.Fatalf("expected server construction to succeed before ready, got %v", err)
+	}
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	waiter, ok := server.waitingRuntime.tryAttach("wait-pre-ready")
+	if !ok || waiter == nil {
+		t.Fatal("expected attached waiter for pre-ready reactor test")
+	}
+	nowMs := time.Now().UnixMilli()
+	server.waitingRuntime.setRequest(waiter, AcquireRequest{
+		Hostname:       "pre-ready.example.com",
+		HostnameHash:   "pre-ready-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "waiting-request",
+		HardExpireAtMs: nowMs + 60_000,
+		NowMs:          nowMs,
+		WaitToken:      "wait-pre-ready",
+	})
+	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{
+		Hostname:       "pre-ready.example.com",
+		HostnameHash:   "pre-ready-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "waiting-request",
+		HardExpireAtMs: nowMs + 60_000,
+		NowMs:          nowMs,
+		WaitToken:      "wait-pre-ready",
+	}, "wait-pre-ready", waiter, server.cfg)
+
+	select {
+	case delivered := <-waiter.resultCh:
+		t.Fatalf("expected pre-ready reactor to stay inactive, got %+v", delivered)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -2310,6 +2550,10 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 			switch {
 			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/concurrency_requests"):
 				query := r.URL.Query()
+				if query.Get("select") == "request_id" && query.Get("limit") == "1" && query.Get("state") == "" {
+					_, _ = w.Write([]byte(`[]`))
+					return
+				}
 				if query.Get("state") == "eq.waiting" {
 					_, _ = w.Write([]byte(`[]`))
 					return
@@ -2728,9 +2972,9 @@ func TestObservabilityCountsConflictAndDenyReasons(t *testing.T) {
 			},
 			releaseFn: func(_ context.Context, req ReleaseRequest) (*ReleaseResult, error) {
 				if req.LeaseToken == "release-token" {
-					return &ReleaseResult{Result: "released"}, nil
+					return &ReleaseResult{Result: "released", RequestID: "released-request"}, nil
 				}
-				return &ReleaseResult{Result: "noop", Reason: "expired"}, nil
+				return &ReleaseResult{Result: "noop", Reason: "expired", RequestID: "expired-request"}, nil
 			},
 			cancelFn: func(_ context.Context, req CancelRequest) (*CancelResult, error) {
 				return &CancelResult{Result: "cancelled"}, nil
@@ -2852,6 +3096,93 @@ func TestReleaseClearsActiveReplayStateForDirectExpiredResult(t *testing.T) {
 	}
 	if server.waitingRuntime.isReplayActiveRequest("expired-active-request") {
 		t.Fatal("expected direct expired release to clear runtime active replay state")
+	}
+}
+
+func TestReleaseUsesServerOwnedContextAfterClientCancel(t *testing.T) {
+	releaseEntered := make(chan struct{})
+	allowRelease := make(chan struct{})
+	backend := &stubBackend{releaseFn: func(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
+		if req.LeaseID != "11111111-1111-1111-1111-111111111111" {
+			t.Fatalf("unexpected release request: %+v", req)
+		}
+		close(releaseEntered)
+		<-allowRelease
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return &ReleaseResult{Result: "released", RequestID: "request-1"}, nil
+	}}
+	server := newTestServerInstance(t, backend)
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, releasePath, bytes.NewReader(encodeJSONBody(t, validReleaseRequest()))).WithContext(reqCtx)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CQ-Auth", "secret")
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	<-releaseEntered
+	cancel()
+	close(allowRelease)
+	<-done
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected release 200 after client cancel, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleReleaseRespondsBeforeAsyncWaiterWakeCompletes(t *testing.T) {
+	wakeStarted := make(chan struct{})
+	allowWake := make(chan struct{})
+	backend := &stubBackend{releaseResult: &ReleaseResult{Result: "released", RequestID: "released-active-request"}, promoteFn: func(_ context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+		if req.RequestID != "waiting-request" {
+			t.Fatalf("unexpected promote request after release wake: %+v", req)
+		}
+		close(wakeStarted)
+		<-allowWake
+		return &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: time.Now().Add(time.Minute).UnixMilli()}, nil
+	}}
+	server := newTestServerInstance(t, backend)
+	waiter, ok := server.waitingRuntime.tryAttach("wait-release")
+	if !ok || waiter == nil {
+		t.Fatal("expected attached waiter for release wake test")
+	}
+	nowMs := time.Now().UnixMilli()
+	server.waitingRuntime.setRequest(waiter, AcquireRequest{Hostname: "release.example.com", HostnameHash: "release-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "waiting-request", HardExpireAtMs: nowMs + 60_000, NowMs: nowMs, WaitToken: "wait-release"})
+	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "release.example.com", HostnameHash: "release-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "waiting-request", HardExpireAtMs: nowMs + 60_000, NowMs: nowMs, WaitToken: "wait-release"}, "wait-release", waiter, server.cfg)
+
+	recCh := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recCh <- postJSON(t, server.Handler(), releasePath, validReleaseRequest(), "secret")
+	}()
+
+	select {
+	case rec := <-recCh:
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected release 200, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("release response blocked on waiter wake")
+	}
+
+	<-wakeStarted
+	select {
+	case delivered := <-waiter.resultCh:
+		t.Fatalf("unexpected waiter delivery before wake unblock: %+v", delivered)
+	default:
+	}
+
+	close(allowWake)
+	delivered := <-waiter.resultCh
+	if delivered == nil || delivered.Result != "granted" {
+		t.Fatalf("expected granted delivery after wake unblock, got %+v", delivered)
 	}
 }
 
@@ -3825,6 +4156,18 @@ func TestContinueWaitRealPathCompensatesDeliveredGrantOnDisconnect(t *testing.T)
 		t.Fatalf("expected release 200, got %d body=%s", releaseRec.Code, releaseRec.Body.String())
 	}
 
+	var requestState, terminalReason string
+	waitForConditionWithMessage(t, 2*time.Second, func() bool {
+		if err := db.QueryRowContext(context.Background(), `
+			SELECT state, COALESCE(terminal_reason, '')
+			FROM concurrency_requests
+			WHERE request_id = $1
+		`, "waiting-request").Scan(&requestState, &terminalReason); err != nil {
+			return false
+		}
+		return requestState == "released" && terminalReason == "final_cleanup"
+	}, "expected request compensated released after delivery failure")
+
 	replay, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
 		HostnameHash:      "delivery-fail-host",
 		Hostname:          "delivery-fail.example.com",
@@ -3842,15 +4185,6 @@ func TestContinueWaitRealPathCompensatesDeliveredGrantOnDisconnect(t *testing.T)
 	}
 	if replay.Result != "released" || replay.Reason.String != "final_cleanup" || strings.TrimSpace(replay.LeaseToken) != "" {
 		t.Fatalf("expected compensated released replay without lease after delivery failure, got %+v", replay)
-	}
-
-	var requestState, terminalReason string
-	if err := db.QueryRowContext(context.Background(), `
-		SELECT state, COALESCE(terminal_reason, '')
-		FROM concurrency_requests
-		WHERE request_id = $1
-	`, "waiting-request").Scan(&requestState, &terminalReason); err != nil {
-		t.Fatalf("read request state after delivery failure: %v", err)
 	}
 	if requestState != "released" || terminalReason != "final_cleanup" {
 		t.Fatalf("expected request compensated released after delivery failure, got state=%q reason=%q", requestState, terminalReason)
@@ -4634,6 +4968,7 @@ func TestStartupRecoveryDropsDetachedWaitingRowsAndRebuildsLiveHeads(t *testing.
 	if err != nil {
 		t.Fatalf("NewServer startup recovery error: %v", err)
 	}
+	waitForServerReady(t, server)
 	defer func() { _ = server.Close() }()
 
 	var detachedState, detachedReason string
@@ -4679,6 +5014,7 @@ func TestStartupRecoveryStartsHostReactorDeadlineLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer startup reactor recovery error: %v", err)
 	}
+	waitForServerReady(t, server)
 	defer func() { _ = server.Close() }()
 
 	if _, ok := server.waitingRuntime.snapshotForWaitToken("wait-startup-reactor"); !ok {
@@ -4761,7 +5097,7 @@ func TestAcquireConflictErrorReturnsDeterministicConflict(t *testing.T) {
 }
 
 func TestReleaseReturnsNoopBody(t *testing.T) {
-	handler := newTestServer(t, &stubBackend{releaseResult: &ReleaseResult{Result: "noop", Reason: "expired"}})
+	handler := newTestServer(t, &stubBackend{releaseResult: &ReleaseResult{Result: "noop", Reason: "expired", RequestID: "expired-request"}})
 	rec := postJSON(t, handler, "/api/v1/concurrency/release", validReleaseRequest(), "secret")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)

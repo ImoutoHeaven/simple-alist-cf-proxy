@@ -11,6 +11,30 @@ const createJsonResponse = (payload) => new Response(JSON.stringify(payload), {
   headers: { 'content-type': 'application/json' },
 });
 
+const createTrackedTextBody = (text) => {
+  const encoded = new TextEncoder().encode(text);
+  let pulled = false;
+  let cancelled = false;
+
+  return {
+    stream: new ReadableStream({
+      pull(controller) {
+        if (!pulled) {
+          controller.enqueue(encoded);
+          pulled = true;
+        }
+        controller.close();
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }),
+    get cancelled() {
+      return cancelled;
+    },
+  };
+};
+
 const ACK_HANDOFF_URL = 'https://cq.example.test/api/v1/concurrency/ack_handoff';
 const HEARTBEAT_URL = 'https://cq.example.test/api/v1/concurrency/heartbeat';
 const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT = {
@@ -649,7 +673,7 @@ test('breaker_only calls authorize/report but never slot-handler', async () => {
 });
 
 test('breaker_only explicitly settles authorized no-sample terminal responses before returning upstream status', async () => {
-  const { response, calls, reportBodies, settleBodies } = await runModeScenario({
+  const { response, responseBodyText, calls, reportBodies, settleBodies } = await runModeScenario({
     throttleHostPatterns: ['*.sharepoint.com'],
     authorizeAttemptSnapshot: {
       STATE: 'half_open',
@@ -668,6 +692,10 @@ test('breaker_only explicitly settles authorized no-sample terminal responses be
   });
 
   assert.equal(response.status, 404);
+  const body = JSON.parse(responseBodyText);
+  assert.equal(body.code, 404);
+  assert.equal(typeof body.message, 'string');
+  assert.notEqual(body.message, 'missing');
   assert.equal(calls.acquire, 0);
   assert.equal(calls.authorize, 1);
   assert.deepEqual(reportBodies, []);
@@ -677,6 +705,7 @@ test('breaker_only explicitly settles authorized no-sample terminal responses be
 });
 
 test('breaker_only fails closed when settlement fails on authorized no-sample terminal response', async () => {
+  const originBody = createTrackedTextBody('missing');
   const { response, responseBodyText, calls, reportBodies, settleBodies } = await runModeScenario({
     throttleHostPatterns: ['*.sharepoint.com'],
     authorizeAttemptSnapshot: {
@@ -690,7 +719,7 @@ test('breaker_only fails closed when settlement fails on authorized no-sample te
       ATTEMPT_TICKET: 4,
     },
     settleError: new Error('settle unavailable'),
-    upstreamResponse: new Response('missing', {
+    upstreamResponse: new Response(originBody.stream, {
       status: 404,
       headers: { 'content-type': 'text/plain' },
     }),
@@ -704,6 +733,7 @@ test('breaker_only fails closed when settlement fails on authorized no-sample te
   assert.equal(calls.settle, 1);
   assert.equal(settleBodies[0].p_attempt_version, 9);
   assert.equal(settleBodies[0].p_attempt_ticket, 4);
+  assert.equal(originBody.cancelled, true);
 });
 
 test('breaker_only settles authorized origin fetch throws before returning the worker error contract', async () => {
@@ -761,6 +791,36 @@ test('breaker_only fails closed when settlement fails after origin fetch throws 
   assert.equal(calls.settle, 1);
   assert.equal(settleBodies[0].p_attempt_version, 13);
   assert.equal(settleBodies[0].p_attempt_ticket, 8);
+});
+
+test('queue_breaker settles slot-carried breaker attempt when direct origin fetch throws before any upstream response', async () => {
+  const { response, responseBodyText, calls, reportBodies, settleBodies } = await runModeScenario({
+    fairQueueHostPatterns: ['*.sharepoint.com'],
+    throttleHostPatterns: ['*.sharepoint.com'],
+    slotHandlerResponse: {
+      result: 'granted',
+      queryToken: 'query-mode-queue-breaker-throw',
+      invocationEpoch: 1,
+      slotToken: 'slot-queue-breaker-throw',
+      meta: {
+        attemptVersion: 17,
+        attemptTicket: 12,
+      },
+    },
+    upstreamResponse: () => {
+      throw new Error('origin exploded');
+    },
+  });
+
+  assert.equal(response.status, 500);
+  assert.equal(JSON.parse(responseBodyText).message, 'origin exploded');
+  assert.equal(calls.acquire, 1);
+  assert.equal(calls.release, 1);
+  assert.equal(calls.authorize, 0);
+  assert.deepEqual(reportBodies, []);
+  assert.equal(calls.settle, 1);
+  assert.equal(settleBodies[0].p_attempt_version, 17);
+  assert.equal(settleBodies[0].p_attempt_ticket, 12);
 });
 
 test('queue_only calls slot-handler but never breaker RPCs', async () => {

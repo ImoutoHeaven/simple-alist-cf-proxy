@@ -7,7 +7,7 @@ simple-alist-cf-proxy 是 AList 下载体系里的 Cloudflare Worker 下载代�
 - `payload` / `payloadSign` 校验（HMAC + expire）
 - Origin 绑定：解密 `payload.encrypt` 并重算 `bindingStr`（ip/iprange/Geo/ASN/TLS/path）
 - PostgREST 模式缓存、限流与 Breaker 权威快照：`download_unified_check` 一次 RTT 统一检查
-- SharePoint admission 四种运行模式：`none` / `breaker_only` / `queue_only` / `queue_breaker`；其中 `queue_breaker` 由 slot-handler 原子完成 queue + breaker admission，worker 只在 `breaker_only` 调用 authorize RPC，并在 `breaker_only` / `queue_breaker` fetch 后按当前 ticket 是否产出 sample 回写 `report` 或 `settle` RPC
+- SharePoint admission 四种运行模式：`none` / `breaker_only` / `queue_only` / `queue_breaker`；其中 `queue_breaker` 由 slot-handler 原子完成 queue + breaker admission，worker 只在 `breaker_only` 调用 authorize RPC，并在 `breaker_only` / `queue_breaker` fetch 后按上游终态执行 `report` 或 `settle` RPC：仅 `2xx` 代理上游 body，保留现有 `3xx` redirect/deferred 行为，`4xx`/`5xx` 改为返回 Worker 生成的 JSON error envelope
 - 可选的 split admission：`slot-handler` 继续负责 fairqueue，`concurrency-handler` 负责 true in-flight concurrency；两者可独立启用，也可按固定顺序组合启用
 - 可选 Cloudflare 原生 Rate Limiter
 - 安全响应封装：精简 headers + 统一 CORS + 小文件 Cache-Control 覆盖
@@ -122,6 +122,7 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - 访问 AList `/api/fs/link` 获取真实下载链接（带鉴权 header）
 - admission 固定为四种显式路径：`none -> fetch only`、`breaker_only -> authorize -> fetch -> report|settle`、`queue_only -> admit(queue only) -> fetch -> release`、`queue_breaker -> admit(queue + breaker) -> fetch -> report|settle -> release`
 - 命中托管 breaker hostname 时，`breaker_only` 先按权威快照对 `open` 立即 fail-fast，并在实际 fetch 前调用 `download_authorize_breaker_attempt`；`queue_breaker` 直接消费 slot-handler / `fq_admit_batch` 返回的 `attemptVersion` / `attemptTicket`，不会在拿到 slot 后再走第二套 authorize 逻辑。`download_authorize_breaker_attempt` 与 `fq_admit_batch` 共享同一套 authorize helper，而 authorize 也是唯一的 lazy-cleanup / normalization 入口。half-open bookkeeping 固定使用 `HALF_OPEN_RESOLVED_MASK` 与 `HALF_OPEN_SUCCESS_MASK`；`report` 只接受当前 live batch 的有效 ticket 作为 evidence-bearing mutation，`settle` 只负责当前 live batch 的无 sample ticket debt，stale / identity-free / duplicate / expired-batch 调用都会返回 no-mutation snapshot。live `half_open` 批次若 budget 已满但仍有 pending debt，`breaker_only` 不再发 ticket，`queue_breaker` 明确返回 `HALF_OPEN_FULL`；`halfOpenMaxProbeCount` 的有效范围固定为 `1..63`。
+- 上游响应矩阵固定为：`2xx` 继续走现有 body proxy / CQ managed streaming；`3xx` 保持当前 redirect 与 queue-breaker deferred report 行为；`4xx`/`5xx` 会在 deferred flush 之后、body proxy 之前统一进入 terminal classifier，先完成 breaker `report(sample=1)` 或 `settle(no-sample debt)`、CQ release 与 fairqueue cleanup，再返回保留原 upstream status 的 Worker-generated JSON `{ code, message }`，不会再透传 upstream body。
 - 可选 Fair Queue（slot-handler）获取 slot；slot-handler 只透传 backend `THROTTLED` / `HALF_OPEN_FULL` 和 `READY` 对应的 attempt ownership 元数据，不在本地维护 breaker 运行时状态
 - 可选 True Concurrency（`concurrency-handler`）负责真实 in-flight 并发；它与 fairqueue 拆分部署，依赖 `hardExpireAtMs`、hot-path expiry cleanup 与 sweep 回收 lease
 - 当 fairqueue 与 true concurrency 同时启用时，worker 固定按 `fairqueue acquire -> true-concurrency acquire -> /api/v1/concurrency/claim -> /api/v1/concurrency/ack_handoff -> heartbeat websocket upgrade + hello_ack -> origin fetch -> fairqueue release after headers -> true-concurrency release on stream lifecycle` 的主顺序执行；若 `acquire` 先返回 `wait`，则继续用稳定 `waitToken` 续连，直到拿到 `granted` 后再调用 `/claim`

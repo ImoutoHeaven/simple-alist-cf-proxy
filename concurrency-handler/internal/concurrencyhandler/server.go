@@ -31,6 +31,23 @@ const (
 	heartbeatPath = "/api/v1/concurrency/heartbeat"
 )
 
+const (
+	startupProbeInterval  = 100 * time.Millisecond
+	startupProbeTimeout   = 2 * time.Second
+	startupRecoverTimeout = 5 * time.Second
+	releaseTimeout        = 5 * time.Second
+	releaseWakeTimeout    = 5 * time.Second
+)
+
+type startupLifecycleState int
+
+const (
+	startupStateProbing startupLifecycleState = iota + 1
+	startupStateRecovering
+	startupStateReady
+	startupStateClosed
+)
+
 type Server struct {
 	cfg               Config
 	backend           Backend
@@ -42,6 +59,15 @@ type Server struct {
 	sweepTargetSource func(context.Context, int64, int) ([]ExpireScopeRequest, error)
 	reactorStopCh     chan struct{}
 	reactorStopOnce   sync.Once
+	startupStateMu    sync.RWMutex
+	startupState      startupLifecycleState
+	startupCtx        context.Context
+	startupCancel     context.CancelFunc
+}
+
+type startupRecoveryActivation struct {
+	survivingHosts      map[string]struct{}
+	heartbeatDeadlines []HeartbeatDeadlineSnapshot
 }
 
 type cqObservability struct {
@@ -172,7 +198,8 @@ func NewServer(cfg Config, backend Backend) (*Server, error) {
 			return nil, err
 		}
 	}
-	s := &Server{cfg: cfg, backend: backend, waitingRuntime: newWaitingRuntime(), observability: newCQObservability(), mux: http.NewServeMux(), reactorStopCh: make(chan struct{})}
+	startupCtx, startupCancel := context.WithCancel(context.Background())
+	s := &Server{cfg: cfg, backend: backend, waitingRuntime: newWaitingRuntime(), observability: newCQObservability(), mux: http.NewServeMux(), reactorStopCh: make(chan struct{}), startupCtx: startupCtx, startupCancel: startupCancel}
 	if hbBackend, ok := backend.(heartbeatBackend); ok && cfg.Concurrency.Heartbeat.Enabled {
 		s.heartbeatRuntime = newHeartbeatRuntime(cfg.Concurrency.Heartbeat, hbBackend)
 		s.heartbeatRuntime.setTerminalHook(func(requestID string, nowMs int64) {
@@ -186,10 +213,8 @@ func NewServer(cfg Config, backend Backend) (*Server, error) {
 	}
 	s.sweepTargetSource = s.defaultSweepTargetSource
 	s.routes()
-	if err := s.recoverStartupState(context.Background()); err != nil {
-		_ = s.Close()
-		return nil, err
-	}
+	s.setStartupState(startupStateProbing)
+	s.startStartupLifecycle()
 	return s, nil
 }
 
@@ -199,8 +224,14 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) Close() error {
 	if s != nil {
+		s.setStartupState(startupStateClosed)
+		if s.startupCancel != nil {
+			s.startupCancel()
+		}
 		s.reactorStopOnce.Do(func() {
-			close(s.reactorStopCh)
+			if s.reactorStopCh != nil {
+				close(s.reactorStopCh)
+			}
 		})
 		if s.heartbeatRuntime != nil {
 			s.heartbeatRuntime.close()
@@ -221,6 +252,174 @@ func (s *Server) routes() {
 	if s.heartbeatRuntime != nil {
 		s.mux.HandleFunc(heartbeatPath, s.handleHeartbeat)
 	}
+}
+
+func (s *Server) setStartupState(state startupLifecycleState) {
+	if s == nil {
+		return
+	}
+	s.startupStateMu.Lock()
+	if s.startupState == startupStateClosed {
+		s.startupStateMu.Unlock()
+		return
+	}
+	s.startupState = state
+	s.startupStateMu.Unlock()
+}
+
+func (s *Server) startupStateValue() startupLifecycleState {
+	if s == nil {
+		return startupStateClosed
+	}
+	s.startupStateMu.RLock()
+	defer s.startupStateMu.RUnlock()
+	return s.startupState
+}
+
+func (s *Server) isReady() bool {
+	return s.startupStateValue() == startupStateReady
+}
+
+func (s *Server) startStartupLifecycle() {
+	if s == nil {
+		return
+	}
+	go func() {
+		for {
+			if s.startupCtx == nil || s.startupCtx.Err() != nil || s.startupStateValue() == startupStateClosed {
+				return
+			}
+			s.setStartupState(startupStateProbing)
+			if err := s.runStartupProbe(); err != nil {
+				if !sleepWithContext(s.startupCtx, startupProbeInterval) {
+					return
+				}
+				continue
+			}
+			if s.startupStateValue() == startupStateClosed {
+				return
+			}
+			s.setStartupState(startupStateRecovering)
+			activation, err := s.runStartupRecovery()
+			if err != nil {
+				if !sleepWithContext(s.startupCtx, startupProbeInterval) {
+					return
+				}
+				continue
+			}
+			if s.startupStateValue() == startupStateClosed {
+				return
+			}
+			s.setStartupState(startupStateReady)
+			s.activateRecoveredBusinessState(activation)
+			return
+		}
+	}()
+}
+
+func (s *Server) serverOwnedContext() context.Context {
+	if s != nil && s.startupCtx != nil {
+		return s.startupCtx
+	}
+	return context.Background()
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) bool {
+	if ctx == nil {
+		time.Sleep(delay)
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (s *Server) runStartupProbe() error {
+	prober, ok := s.backend.(startupProber)
+	if !ok {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(s.startupCtx, startupProbeTimeout)
+	defer cancel()
+	return prober.StartupProbe(ctx)
+}
+
+func (s *Server) runStartupRecovery() (*startupRecoveryActivation, error) {
+	ctx, cancel := context.WithTimeout(s.startupCtx, startupRecoverTimeout)
+	defer cancel()
+
+	staged := s.newStartupRecoveryServer()
+	activation, err := staged.recoverStartupState(ctx)
+	if err != nil {
+		if staged.heartbeatRuntime != nil {
+			staged.heartbeatRuntime.close()
+		}
+		return nil, err
+	}
+	if s.startupStateValue() == startupStateClosed {
+		if staged.heartbeatRuntime != nil {
+			staged.heartbeatRuntime.close()
+		}
+		return nil, context.Canceled
+	}
+	s.startupStateMu.Lock()
+	if s.startupState == startupStateClosed {
+		s.startupStateMu.Unlock()
+		if staged.heartbeatRuntime != nil {
+			staged.heartbeatRuntime.close()
+		}
+		return nil, context.Canceled
+	}
+	oldHeartbeat := s.heartbeatRuntime
+	s.waitingRuntime = staged.waitingRuntime
+	s.observability = staged.observability
+	s.heartbeatRuntime = staged.heartbeatRuntime
+	s.startupStateMu.Unlock()
+	if oldHeartbeat != nil && oldHeartbeat != staged.heartbeatRuntime {
+		oldHeartbeat.close()
+	}
+	return activation, nil
+}
+
+func (s *Server) activateRecoveredBusinessState(activation *startupRecoveryActivation) {
+	if s == nil || activation == nil {
+		return
+	}
+	if s.startupStateValue() != startupStateReady {
+		return
+	}
+	if s.heartbeatRuntime != nil {
+		for _, row := range activation.heartbeatDeadlines {
+			s.heartbeatRuntime.schedule(row.RequestID, row.DeadlineMs)
+		}
+	}
+	for hostnameHash := range activation.survivingHosts {
+		s.ensureHostReactor(hostnameHash)
+	}
+}
+
+func (s *Server) newStartupRecoveryServer() *Server {
+	staged := &Server{
+		cfg:            s.cfg,
+		backend:        s.backend,
+		waitingRuntime: newWaitingRuntime(),
+		observability:  newCQObservability(),
+		reactorStopCh:  s.reactorStopCh,
+	}
+	if hbBackend, ok := s.backend.(heartbeatBackend); ok && s.cfg.Concurrency.Heartbeat.Enabled {
+		staged.heartbeatRuntime = newHeartbeatRuntime(s.cfg.Concurrency.Heartbeat, hbBackend)
+		staged.heartbeatRuntime.setTerminalHook(func(requestID string, nowMs int64) {
+			staged.clearActiveReplayState(requestID)
+			staged.wakeAttachedWaiters(context.Background())
+			staged.deliverTerminalToAttachedWaiters(context.Background(), nowMs)
+		})
+	}
+	return staged
 }
 
 func (s *Server) startSweepLoop(ctx context.Context) func() {
@@ -256,6 +455,9 @@ func (s *Server) startSweepLoop(ctx context.Context) func() {
 }
 
 func (s *Server) runSweepPass(ctx context.Context) error {
+	if !s.isReady() {
+		return nil
+	}
 	nowMs := time.Now().UnixMilli()
 	overdueAny, err := s.recoverOverdueHandoffPendingAt(ctx, nowMs)
 	if err != nil {
@@ -303,30 +505,30 @@ func (s *Server) runExpiryPassAt(ctx context.Context, nowMs int64) (bool, error)
 	return expiredAny, nil
 }
 
-func (s *Server) recoverStartupState(ctx context.Context) error {
+func (s *Server) recoverStartupState(ctx context.Context) (*startupRecoveryActivation, error) {
 	nowMs := time.Now().UnixMilli()
 	survivingHosts, err := s.recoverWaitingRequestsAt(ctx, nowMs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := s.recoverOverdueHandoffPendingAt(ctx, nowMs); err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.recoverExpiredActiveLeasesAt(ctx, nowMs); err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.recoverActiveReplayState(ctx); err != nil {
-		return err
+		return nil, err
 	}
+	activation := &startupRecoveryActivation{survivingHosts: survivingHosts}
 	if s.heartbeatRuntime != nil {
-		if err := s.heartbeatRuntime.recoverActiveDeadlines(ctx, nowMs); err != nil {
-			return err
+		deadlines, err := s.heartbeatRuntime.loadActiveDeadlines(ctx, nowMs)
+		if err != nil {
+			return nil, err
 		}
+		activation.heartbeatDeadlines = deadlines
 	}
-	for hostnameHash := range survivingHosts {
-		s.ensureHostReactor(hostnameHash)
-	}
-	return nil
+	return activation, nil
 }
 
 func (s *Server) recoverWaitingRequestsAt(ctx context.Context, nowMs int64) (map[string]struct{}, error) {
@@ -965,6 +1167,10 @@ func (s *Server) handleAckHandoff(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(code), code)
 		return
 	}
+	if !s.isReady() {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	var req AckHandoffRequest
 	if err := decodeJSON(r, &req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -1017,6 +1223,10 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(code), code)
 		return
 	}
+	if !s.isReady() {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if s.heartbeatRuntime == nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
@@ -1031,6 +1241,10 @@ func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	}
 	if ok, code := s.checkAuth(r); !ok {
 		http.Error(w, http.StatusText(code), code)
+		return
+	}
+	if !s.isReady() {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	var req AcquireRequest
@@ -1202,6 +1416,10 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(code), code)
 		return
 	}
+	if !s.isReady() {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	var req ClaimGrantRequest
 	if err := decodeJSON(r, &req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -1246,6 +1464,10 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(code), code)
 		return
 	}
+	if !s.isReady() {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	var req ReleaseRequest
 	if err := decodeJSON(r, &req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -1255,8 +1477,14 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	result, err := s.backend.Release(r.Context(), req)
+	releaseCtx, cancel := context.WithTimeout(s.serverOwnedContext(), releaseTimeout)
+	defer cancel()
+	result, err := s.backend.Release(releaseCtx, req)
 	if err != nil || result == nil {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err := validateReleaseResult(result); err != nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -1282,9 +1510,20 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.wakeAttachedWaiters(context.Background())
 	publicResult := &ReleaseResult{Result: result.Result, Reason: result.Reason}
 	writeJSON(w, http.StatusOK, publicResult)
+	s.wakeAttachedWaitersAsync()
+}
+
+func (s *Server) wakeAttachedWaitersAsync() {
+	if s == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(s.serverOwnedContext(), releaseWakeTimeout)
+		defer cancel()
+		s.wakeAttachedWaiters(ctx)
+	}()
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
@@ -1294,6 +1533,10 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	}
 	if ok, code := s.checkAuth(r); !ok {
 		http.Error(w, http.StatusText(code), code)
+		return
+	}
+	if !s.isReady() {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	var req CancelRequest

@@ -3,6 +3,7 @@ package concurrencyhandler
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -123,6 +124,7 @@ func TestSweepDisabledDoesNotStartLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer error: %v", err)
 	}
+	waitForServerReady(t, server)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -148,6 +150,7 @@ func TestSweepRunnerUsesConfiguredIntervalAndBoundedBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer error: %v", err)
 	}
+	waitForServerReady(t, server)
 	ticker := &fakeSweepTicker{ch: make(chan time.Time, 1)}
 	server.newSweepTicker = func(time.Duration) sweepTicker {
 		return ticker
@@ -249,6 +252,31 @@ func TestRunSweepPassWakesAttachedWaitersAfterExpiry(t *testing.T) {
 	}
 }
 
+func TestSweepDoesNotProcessBackendStateBeforeStartupReady(t *testing.T) {
+	server, err := NewServer(validTestConfig(), &startupRecoveryFailBackend{
+		stubBackend:    &stubBackend{expireResult: &ExpireScopeResult{ExpiredCount: 0}},
+		loadWaitingErr: errors.New("db down"),
+	})
+	if err != nil {
+		t.Fatalf("expected server construction to succeed before ready, got %v", err)
+	}
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	ran := false
+	server.sweepTargetSource = func(context.Context, int64, int) ([]ExpireScopeRequest, error) {
+		ran = true
+		return nil, nil
+	}
+	if err := server.runSweepPass(context.Background()); err != nil {
+		t.Fatalf("runSweepPass: %v", err)
+	}
+	if ran {
+		t.Fatal("expected sweep to remain inactive before ready")
+	}
+}
+
 func TestStartupRecoveryExpiresActiveLeasesBeforeServing(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
@@ -297,6 +325,7 @@ func TestStartupRecoveryExpiresActiveLeasesBeforeServing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer startup recovery error: %v", err)
 	}
+	waitForServerReady(t, server)
 	defer func() { _ = server.Close() }()
 
 	var leaseState string
@@ -398,6 +427,7 @@ func TestStartupRecoveryCompensatesOverdueHandoffPendingBeforeServing(t *testing
 	if err != nil {
 		t.Fatalf("NewServer startup recovery error: %v", err)
 	}
+	waitForServerReady(t, server)
 	defer func() { _ = server.Close() }()
 
 	request := readRuntimeRequestState(t, db, "startup-handoff-request")

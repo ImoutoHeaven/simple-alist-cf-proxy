@@ -136,7 +136,8 @@ admission 固定为四种显式运行模式：
      - `download_report_breaker_sample` 是 evidence-bearing mutation path，`download_settle_breaker_attempt` 是 no-sample debt-resolution path；二者都只接受当前 live `half_open` batch 的有效 ticket。partial identity、identity-free `half_open` 调用、stale version、duplicate ticket、expired batch，或不再处于 `half_open` 的 attempt-tagged 调用，都会返回 no-mutation snapshot。`queue_breaker` 的 same-host same-site deferred 3xx report 会先被 defer（armed）；仅当 deferred 仍 armed 且未被终态 sample 取代时，才会在当前 attempt 的终止出口（包括 fetch 抛异常或 abort）flush；终态 sample 一旦进入 report 路径，旧 deferred redirect 会被 disarm 并退出 attempt 竞争；若 report/flush 或 settle 失败，worker 返回 breaker authority unavailable，同时 finally 仍执行 slot release。
      - `half_open` 当前批次固定使用 `HALF_OPEN_RESOLVED_MASK` 与 `HALF_OPEN_SUCCESS_MASK` 记账，且 success mask 始终是 resolved mask 的子集。首个受保护错误 report 会立即重新 `open`；成功 report 在 close rule 满足时可立即 `close`；`settle` 只结清 ticket debt，不会直接裁决 breaker 终态。若 live batch 的 budget 已满但仍有 pending debt，`breaker_only` 不再发 ticket，`queue_breaker` 明确返回 `HALF_OPEN_FULL`；批次超时或 exhausted-and-fully-resolved 后的最终裁决都在下一次 authorize 完成。由于状态存进 signed `BIGINT` mask，`halfOpenMaxProbeCount` 的有效范围固定为 `1..63`。
      - SQL 里 `TOTAL_SAMPLES` 只保留 lifetime observability；EWMA warm-up 只看 `SAMPLES_SINCE_RESET`，并用 `LAST_SAMPLE_AT` + `idleResetSeconds` 在 `closed` 态空闲过久后先软重置 breaker 记忆再评估新样本。
-     - 下载后仅按 `protectHttpCodes` 上报二值 `sample=1`，`2xx/3xx` 上报 `sample=0`；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退；受保护的 `half_open` attempt 仍会立即重新 `open`。
+     - 下载后的响应矩阵固定为：`2xx` 才会继续代理 upstream body；`3xx` 保持当前 redirect / deferred-report 路径；`4xx`/`5xx` 在 redirect 与 deferred flush 完成后、任何 CQ managed stream 或普通 `new Response(response.body, ...)` 之前统一进入 terminal classifier，先做 breaker bookkeeping、CQ release 与 fairqueue cleanup，再返回保留原 upstream status 的 Worker-generated JSON error envelope，不再透传 upstream body。
+     - `protectHttpCodes` 命中的 terminal `4xx`/`5xx` 继续走 `download_report_breaker_sample(sample=1)`；非 protected terminal `4xx`/`5xx` 不允许写 `sample=0`，只在 live attempt 存在时走 `download_settle_breaker_attempt` 结清 no-sample debt。`2xx/3xx` 仍是 `sample=0` 的唯一路径；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退；受保护的 `half_open` attempt 仍会立即重新 `open`。
 
 11. **Fair Queue（slot-handler）**
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
@@ -184,6 +185,7 @@ admission 固定为四种显式运行模式：
 
 13. **上游请求与响应封装**
      - 支持 3xx 重定向与 401/410 触发的 refresh（`refresh=true`）重试一次。
+     - upstream `4xx`/`5xx` terminal response 会先取消 upstream body，再返回 Worker-generated JSON `{ code, message }`；CQ managed 与非 CQ 路径都共享这一 terminal matrix。
      - 只保留安全的响应头（Content-Type/Disposition/Length/Range 等）。
      - `payload.isCrypted=true` 时强制设置附件名为 `*.enc`。
      - 按 `download.overrideCacheControl` 与 `payload.filesize` 覆盖 Cache-Control。

@@ -280,6 +280,10 @@ type heartbeatBackend interface {
 	LoadActiveHeartbeatDeadlines(ctx context.Context, nowMs int64, limit int) ([]HeartbeatDeadlineSnapshot, error)
 }
 
+type startupProber interface {
+	StartupProbe(ctx context.Context) error
+}
+
 type acquireWireResult struct {
 	Result      string  `json:"result"`
 	LeaseID     *string `json:"lease_id"`

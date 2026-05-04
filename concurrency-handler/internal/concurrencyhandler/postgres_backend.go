@@ -61,6 +61,21 @@ func (p *postgresBackend) Close() error {
 	return p.db.Close()
 }
 
+func (p *postgresBackend) StartupProbe(ctx context.Context) error {
+	if p == nil || p.db == nil {
+		return errors.New("postgres backend is not initialized")
+	}
+	rows, err := p.db.Query(ctx, `SELECT 1 FROM concurrency_requests LIMIT 1`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		break
+	}
+	return rows.Err()
+}
+
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func validatedIdentifier(name string) (string, error) {

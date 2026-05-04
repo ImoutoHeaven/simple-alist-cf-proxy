@@ -18,6 +18,8 @@ It does not do fairqueue scheduling, but it does own server-side waiting semanti
 
 Production deployments require sticky routing for `waitToken` continuation. All HTTP endpoints require auth; `auth.enabled` must be `true` and `auth.token` must be set.
 
+Process startup and concurrency business readiness are separate. The process may start while Postgres or PostgREST is still unreachable. Until startup probe and recovery complete, `acquire`, `claim`, `ack_handoff`, `heartbeat`, `release`, and `cancel` return `503 Service Unavailable`.
+
 ## Worker Coordination
 
 When a target enables true concurrency only, Worker runs:
@@ -96,6 +98,8 @@ Granted `acquire` results include a `claimToken`. Worker must call `claim` befor
 - `410 expired`
 
 `release` is only for active leases. It returns `200 released` or `200 noop`.
+
+`release` remains backend-authoritative and idempotent. After a valid release request is accepted, the handler runs authoritative release under a bounded server-owned context, completes immediate local cleanup, writes the HTTP response, and then wakes attached waiters asynchronously. Client disconnect after request acceptance does not cancel the in-flight authoritative release.
 
 `cancel` is request-level tombstone cleanup for waiting requests and ambiguous pre-active cleanup. It returns `200 cancelled`, `200 noop`, or `409 conflict` for active-lease mismatch cases such as `must_release_active_lease`.
 

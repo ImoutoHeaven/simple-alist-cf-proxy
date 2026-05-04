@@ -1548,8 +1548,11 @@ test('breaker_only with true concurrency authorizes after ack_handoff and settle
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
     assert.equal(response.status, 401);
-    assert.equal(await response.text(), 'expired');
+    assert.equal(body.code, 401);
+    assert.equal(typeof body.message, 'string');
+    assert.notEqual(body.message, 'expired');
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls, [
       'link-api',
@@ -1577,9 +1580,167 @@ test('breaker_only with true concurrency authorizes after ack_handoff and settle
   }
 });
 
+test('breaker_only with true concurrency reports protected auth refresh failures once without settling the refreshed attempt', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const settleBodies = [];
+  const reportBodies = [];
+  let linkFetchCount = 0;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      const bootstrap = buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      });
+      bootstrap.download.throttleProfiles.default.protectHttpCodes = [401, 410, 429, 499, 500, 502, 503, 504];
+      return createJsonResponse(bootstrap);
+    }
+
+    if (url.startsWith('https://alist.example.com/api/fs/link')) {
+      linkFetchCount += 1;
+      calls.push('link-api');
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: linkFetchCount === 1
+            ? 'https://tenant.sharepoint.com/protected-refresh-start'
+            : 'https://tenant.sharepoint.com/protected-refresh-final',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 51,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 52,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 8,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-breaker-protected-refresh',
+        leaseToken: 'token-breaker-protected-refresh',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-breaker-protected-refresh',
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/protected-refresh-start') {
+      calls.push('origin-fetch-401-start');
+      return new Response('expired', {
+        status: 401,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/protected-refresh-final') {
+      calls.push('origin-fetch-401-final');
+      return new Response('expired-final', {
+        status: 401,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 52,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      calls.push('breaker-report');
+      reportBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: reportBodies.length,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 401);
+    assert.equal(body.code, 401);
+    assert.equal(typeof body.message, 'string');
+    assert.notEqual(body.message, 'expired-final');
+    assert.equal(linkFetchCount, 2);
+    assert.ok(calls.indexOf('origin-fetch-401-start') >= 0);
+    assert.ok(calls.indexOf('origin-fetch-401-final') > calls.indexOf('origin-fetch-401-start'));
+    assert.ok(calls.indexOf('breaker-report') > calls.indexOf('origin-fetch-401-final'));
+    assert.ok(calls.includes('concurrency-release'));
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 52);
+    assert.equal(settleBodies[0].p_attempt_ticket, 8);
+    assert.equal(reportBodies.length, 1);
+    assert.equal(reportBodies[0].p_sample, 1);
+    assert.equal(reportBodies[0].p_status_code, 401);
+    assert.equal(reportBodies[0].p_attempt_version, 52);
+    assert.equal(reportBodies[0].p_attempt_ticket, 8);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('breaker_only with true concurrency returns authority unavailable when no-sample settle fails during refresh retirement', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
+  const originBody = createTrackedTextBody('expired');
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -1651,7 +1812,7 @@ test('breaker_only with true concurrency returns authority unavailable when no-s
 
     if (url === 'https://tenant.sharepoint.com/file') {
       calls.push('origin-fetch-401');
-      return new Response('expired', {
+      return new Response(originBody.stream, {
         status: 401,
         headers: { 'content-type': 'text/plain' },
       });
@@ -1688,6 +1849,283 @@ test('breaker_only with true concurrency returns authority unavailable when no-s
       'breaker-settle',
       'concurrency-release',
     ]);
+    assert.equal(originBody.cancelled, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency returns generated JSON for protected terminal upstream responses after sample reporting', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const reportBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      calls.push('link-api');
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 111,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 112,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 15,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-protected-terminal',
+        leaseToken: 'token-protected-terminal',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-protected-terminal',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch-500');
+      return new Response('boom', {
+        status: 500,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      calls.push('breaker-report');
+      reportBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'open',
+        OPEN_UNTIL: Math.floor(Date.now() / 1000) + 30,
+        OPEN_REASON: 'http_500',
+        VERSION: 113,
+        LAST_ERROR_CODE: 500,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      throw new Error('protected terminal CQ path should not settle breaker attempt debt');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 500);
+    assert.equal(body.code, 500);
+    assert.equal(typeof body.message, 'string');
+    assert.notEqual(body.message, 'boom');
+    assert.deepEqual(calls, [
+      'link-api',
+      'breaker-snapshot',
+      'concurrency-acquire',
+      'concurrency-claim',
+      'concurrency-ack-handoff',
+      'breaker-authorize',
+      'origin-fetch-500',
+      'breaker-report',
+      'concurrency-release',
+    ]);
+    assert.deepEqual(
+      reportBodies.map((reportBody) => ({
+        sample: reportBody.p_sample,
+        statusCode: reportBody.p_status_code,
+        attemptVersion: reportBody.p_attempt_version,
+        attemptTicket: reportBody.p_attempt_ticket,
+      })),
+      [{ sample: 1, statusCode: 500, attemptVersion: 112, attemptTicket: 15 }],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker_only with true concurrency fails closed and cancels the upstream body when protected sample reporting fails', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const reportBodies = [];
+  const originBody = createTrackedTextBody('boom');
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      calls.push('link-api');
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 121,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      calls.push('breaker-authorize');
+      return createJsonResponse([{
+        STATE: 'half_open',
+        OPEN_UNTIL: null,
+        OPEN_REASON: 'http_429',
+        VERSION: 122,
+        LAST_ERROR_CODE: 429,
+        HALF_OPEN_DEADLINE: Math.floor(Date.now() / 1000) + 15,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 16,
+      }]);
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-protected-terminal-report-fail',
+        leaseToken: 'token-protected-terminal-report-fail',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-protected-terminal-report-fail',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch-500');
+      return new Response(originBody.stream, {
+        status: 500,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      calls.push('breaker-report');
+      reportBodies.push(JSON.parse(init.body));
+      throw new Error('report unavailable');
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      throw new Error('protected terminal CQ report failure path should not settle breaker attempt debt');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 503);
+    assert.match(body.message, /sample report/i);
+    assert.deepEqual(calls, [
+      'link-api',
+      'breaker-snapshot',
+      'concurrency-acquire',
+      'concurrency-claim',
+      'concurrency-ack-handoff',
+      'breaker-authorize',
+      'origin-fetch-500',
+      'breaker-report',
+      'concurrency-release',
+    ]);
+    assert.deepEqual(
+      reportBodies.map((reportBody) => ({
+        sample: reportBody.p_sample,
+        statusCode: reportBody.p_status_code,
+        attemptVersion: reportBody.p_attempt_version,
+        attemptTicket: reportBody.p_attempt_ticket,
+      })),
+      [{ sample: 1, statusCode: 500, attemptVersion: 122, attemptTicket: 16 }],
+    );
+    assert.equal(originBody.cancelled, true);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
