@@ -6725,6 +6725,152 @@ test('queue_breaker flushes a deferred same-site redirect as 302 after refresh w
   }
 });
 
+test('queue_breaker reports the final protected auth-refresh status instead of flushing a deferred same-site redirect success sample', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const authorizeBodies = [];
+  const reportBodies = [];
+  const acquireBodies = [];
+  const releaseBodies = [];
+  let linkFetchCount = 0;
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: ['*.sharepoint.com'],
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+        protectHttpCodes: [401, 410, 429, 499, 500, 502, 503, 504],
+      }));
+    }
+
+    if (url.startsWith('https://alist.example.com/api/fs/link')) {
+      linkFetchCount += 1;
+      if (linkFetchCount === 2) {
+        assert.equal(reportBodies.length, 0);
+      }
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: linkFetchCount === 1
+            ? 'https://tenant.sharepoint.com/sites/alpha/start'
+            : 'https://tenant.sharepoint.com/sites/alpha/protected-final',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+      acquireBodies.push(JSON.parse(init.body));
+      return createJsonResponse({
+        result: 'granted',
+        queryToken: 'query-granted',
+        invocationEpoch: 1,
+        slotToken: 'slot-1',
+        meta: {
+          attemptVersion: 903,
+          attemptTicket: 6,
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      authorizeBodies.push(JSON.parse(init.body));
+      return createJsonResponse([]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      reportBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'open',
+        OPEN_UNTIL: Math.floor(Date.now() / 1000) + 60,
+        OPEN_REASON: 'http_410',
+        VERSION: reportBodies.length,
+        LAST_ERROR_CODE: 410,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      throw new Error('protected refresh terminal path should not settle breaker attempt debt');
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/alpha/start') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://tenant.sharepoint.com/sites/alpha/stale' },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/alpha/stale') {
+      return new Response('expired', {
+        status: 401,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/alpha/protected-final') {
+      assert.equal(reportBodies.length, 0);
+      return new Response('expired-final', {
+        status: 410,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/queue-breaker-refresh-same-site-410.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    const body = JSON.parse(await response.text());
+    await Promise.all(waitUntilPromises);
+
+    assert.equal(response.status, 410);
+    assert.equal(body.code, 410);
+    assert.equal(typeof body.message, 'string');
+    assert.notEqual(body.message, 'expired-final');
+    assert.equal(linkFetchCount, 2);
+    assert.equal(acquireBodies.length, 1);
+    assert.equal(releaseBodies.length, 1);
+    assert.deepEqual(authorizeBodies, []);
+    assert.deepEqual(
+      reportBodies.map((body) => ({
+        sample: body.p_sample,
+        statusCode: body.p_status_code,
+        attemptVersion: body.p_attempt_version,
+        attemptTicket: body.p_attempt_ticket,
+      })),
+      [{
+        sample: 1,
+        statusCode: 410,
+        attemptVersion: 903,
+        attemptTicket: 6,
+      }],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('queue_breaker flushes a deferred same-site attempt only when refresh failure leaves the original auth error', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];

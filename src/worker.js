@@ -6673,9 +6673,11 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           return await cancelResponseBodyAndReturn(response, settleResponse, 'prestream_terminal');
         }
       }
-      const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
-      if (deferredReportResponse) {
-        return await cancelResponseBodyAndReturn(response, deferredReportResponse, 'prestream_terminal');
+      if (!isProtectedThrottleStatusCode(response.status)) {
+        const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+        if (deferredReportResponse) {
+          return await cancelResponseBodyAndReturn(response, deferredReportResponse, 'prestream_terminal');
+        }
       }
     }
 

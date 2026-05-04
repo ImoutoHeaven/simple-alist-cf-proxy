@@ -166,6 +166,11 @@ type startupRecoveryFailBackend struct {
 	loadWaitingErr  error
 }
 
+type slowStartupRecoveryBackend struct {
+	*stubBackend
+	loadWaitingDelay time.Duration
+}
+
 type startupProbeCloseBackend struct {
 	*stubBackend
 	closeServer func() error
@@ -322,6 +327,24 @@ func (b *startupRecoveryFailBackend) StartupProbe(context.Context) error {
 
 func (b *startupRecoveryFailBackend) LoadWaitingRequests(context.Context) ([]requestSnapshot, error) {
 	return nil, b.loadWaitingErr
+}
+
+func (b *slowStartupRecoveryBackend) StartupProbe(context.Context) error {
+	return nil
+}
+
+func (b *slowStartupRecoveryBackend) LoadWaitingRequests(ctx context.Context) ([]requestSnapshot, error) {
+	if b.loadWaitingDelay <= 0 {
+		return nil, nil
+	}
+	timer := time.NewTimer(b.loadWaitingDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, nil
+	}
 }
 
 func (s *stubBackend) StartupProbe(context.Context) error {
@@ -1208,6 +1231,37 @@ func TestStartupRecoveryDoesNotScheduleHeartbeatDeadlinesBeforeReady(t *testing.
 	}
 	if got := server.heartbeatRuntime.scheduledDeadline("not-ready-heartbeat"); got != 0 {
 		t.Fatalf("expected heartbeat recovery to stay inactive before ready, got deadline %d", got)
+	}
+}
+
+func TestStartupRecoveryAllowsSlowButSuccessfulBackendRebuild(t *testing.T) {
+	backend := &slowStartupRecoveryBackend{
+		stubBackend: &stubBackend{acquireResult: &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: 4000, ClaimToken: "claim-token"}},
+		loadWaitingDelay: 5500 * time.Millisecond,
+	}
+	server, err := NewServer(validTestConfig(), backend)
+	if err != nil {
+		t.Fatalf("expected server construction to succeed before slow recovery completes, got %v", err)
+	}
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	if server.isReady() {
+		t.Fatal("expected startup to remain not-ready while slow recovery is still running")
+	}
+	preReady := postJSON(t, server.Handler(), acquirePath, validAcquireRequest(), "secret")
+	if preReady.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected pre-ready acquire to fail closed with 503, got %d body=%s", preReady.Code, preReady.Body.String())
+	}
+
+	waitForConditionWithMessage(t, 8*time.Second, func() bool {
+		return server.isReady()
+	}, "expected server to become ready after a slow but successful startup recovery")
+
+	readyRec := postJSON(t, server.Handler(), acquirePath, validAcquireRequest(), "secret")
+	if readyRec.Code != http.StatusOK {
+		t.Fatalf("expected acquire 200 after slow recovery completed, got %d body=%s", readyRec.Code, readyRec.Body.String())
 	}
 }
 

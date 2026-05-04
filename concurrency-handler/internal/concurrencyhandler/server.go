@@ -34,7 +34,9 @@ const (
 const (
 	startupProbeInterval  = 100 * time.Millisecond
 	startupProbeTimeout   = 2 * time.Second
-	startupRecoverTimeout = 5 * time.Second
+	// Startup recovery may need to rebuild waiting state, replay state, heartbeat
+	// deadlines, and stale-row cleanup before the server can safely serve traffic.
+	startupRecoverTimeout = 30 * time.Second
 	releaseTimeout        = 5 * time.Second
 	releaseWakeTimeout    = 5 * time.Second
 )
