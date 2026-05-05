@@ -1550,7 +1550,9 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	result, err := s.backend.Cancel(r.Context(), req)
+	cancelCtx, cancel := context.WithTimeout(s.serverOwnedContext(), releaseTimeout)
+	defer cancel()
+	result, err := s.backend.Cancel(cancelCtx, req)
 	if err != nil {
 		var conflictErr *cancelConflictError
 		if errors.As(err, &conflictErr) {

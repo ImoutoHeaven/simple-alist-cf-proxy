@@ -3192,6 +3192,58 @@ func TestReleaseUsesServerOwnedContextAfterClientCancel(t *testing.T) {
 	}
 }
 
+func TestCancelUsesServerOwnedContextAfterClientCancel(t *testing.T) {
+	cancelEntered := make(chan struct{})
+	allowCancel := make(chan struct{})
+	backend := &stubBackend{cancelFn: func(ctx context.Context, req CancelRequest) (*CancelResult, error) {
+		if req.RequestID != "cancelled-active-request" {
+			t.Fatalf("unexpected cancel request: %+v", req)
+		}
+		close(cancelEntered)
+		<-allowCancel
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return &CancelResult{Result: "cancelled"}, nil
+	}}
+	server := newTestServerInstance(t, backend)
+	server.heartbeatRuntime.schedule("cancelled-active-request", time.Now().Add(time.Minute).UnixMilli())
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, cancelPath, bytes.NewReader(encodeJSONBody(t, CancelRequest{
+		RequestID:      "cancelled-active-request",
+		Hostname:       "cancel.example.com",
+		HostnameHash:   "cancel-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		HardExpireAtMs: time.Now().Add(time.Minute).UnixMilli(),
+		Reason:         "worker_aborted",
+		NowMs:          time.Now().UnixMilli(),
+	}))).WithContext(reqCtx)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CQ-Auth", "secret")
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	<-cancelEntered
+	cancel()
+	close(allowCancel)
+	<-done
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected cancel 200 after client cancel, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := server.heartbeatRuntime.scheduledDeadline("cancelled-active-request"); got != 0 {
+		t.Fatalf("expected cancel to clear heartbeat schedule, got %d", got)
+	}
+}
+
 func TestHandleReleaseRespondsBeforeAsyncWaiterWakeCompletes(t *testing.T) {
 	wakeStarted := make(chan struct{})
 	allowWake := make(chan struct{})
