@@ -161,8 +161,22 @@ test('resolveConfig exposes true concurrency config with deterministic defaults'
     authHeader: 'X-CQ-Auth',
     acquireTimeoutMs: 11500,
     releaseTimeoutMs: 1500,
+    waitTotalMaxMs: 20000,
+    waitMaxAttemptsCap: 35,
     heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
   });
+});
+
+test('resolveConfig rejects malformed CQ wait budget bootstrap values', () => {
+  assert.throws(
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({ waitTotalMaxMs: 12.5 })), { download: {} }),
+    /waitTotalMaxMs/
+  );
+
+  assert.throws(
+    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({ waitMaxAttemptsCap: 0 })), { download: {} }),
+    /waitMaxAttemptsCap/
+  );
 });
 
 test('resolveConfig default acquire timeout keeps explicit slack above the default CQ wait poll window', () => {
@@ -393,6 +407,54 @@ test('concurrency client sends wait acquire to the normalized endpoint with auth
       nowMs: 101,
       waitToken: 'wait-1',
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('concurrency client honors per-call acquire timeout override', async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (_url, init = {}) => new Promise((_resolve, reject) => {
+    const abortError = new Error('The operation was aborted.');
+    abortError.name = 'AbortError';
+
+    if (init.signal?.aborted) {
+      reject(abortError);
+      return;
+    }
+
+    init.signal?.addEventListener('abort', () => reject(abortError), { once: true });
+  });
+
+  try {
+    const client = createConcurrencyHandlerClient({
+      concurrencyHandlerConfig: {
+        url: 'https://cq.example.test/',
+        authKey: 'cq-secret',
+        acquireTimeoutMs: 2000,
+      },
+    });
+
+    const startedAt = Date.now();
+    await assert.rejects(
+      () => client.acquire(null, {
+        hostname: 'tenant.sharepoint.com',
+        hostnameHash: 'host-hash',
+        siteBucket: 'site-hash',
+        ipBucket: 'ip-hash',
+        requestId: 'req-1',
+        hardExpireAtMs: 5000,
+        nowMs: 101,
+        waitToken: 'wait-1',
+      }, undefined, 25),
+      (error) => {
+        assert.equal(error?.name, 'AbortError');
+        return true;
+      }
+    );
+    const elapsedMs = Date.now() - startedAt;
+    assert.ok(elapsedMs < 250, `expected shorter acquire timeout override, saw ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -906,6 +968,8 @@ test('resolveConfig omits legacy precheck timeout from true concurrency config',
     authHeader: 'X-CQ-Auth',
     acquireTimeoutMs: 11500,
     releaseTimeoutMs: 1500,
+    waitTotalMaxMs: 20000,
+    waitMaxAttemptsCap: 35,
     heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
   });
 });

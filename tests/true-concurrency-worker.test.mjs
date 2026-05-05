@@ -8576,6 +8576,251 @@ test('queue_only replays acquire after continue-wait timeout abort and recovers 
   }
 });
 
+test('CQ wait attempt budget counts timeout-replayed continue-wait acquires against the cap', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const cancelBodies = [];
+  const continueBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      const bootstrap = buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      });
+      bootstrap.download.trueConcurrency.waitTotalMaxMs = 20000;
+      bootstrap.download.trueConcurrency.waitMaxAttemptsCap = 3;
+      return createJsonResponse(bootstrap);
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
+      if (!body.waitToken) {
+        return createJsonResponse({
+          result: 'wait',
+          waitToken: 'wait-replay-budget-1',
+          scope: 'host',
+          retryAfter: 1,
+        });
+      }
+
+      continueBodies.push(body);
+      if (continueBodies.length === 1) {
+        const abortError = new Error('The operation was aborted.');
+        abortError.name = 'AbortError';
+        throw abortError;
+      }
+
+      if (continueBodies.length === 2) {
+        return createJsonResponse({
+          result: 'wait',
+          waitToken: 'wait-replay-budget-1',
+          scope: 'host',
+          retryAfter: 1,
+        });
+      }
+
+      throw new Error('worker must not issue a fourth CQ acquire attempt after timeout replay reaches the cap');
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
+      calls.push('concurrency-cancel');
+      cancelBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'cancelled' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
+      throw new Error('origin fetch should not run after replayed wait attempt cap exhaustion');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 503);
+    assert.match(body.message, /wait budget exhausted/i);
+    assert.deepEqual(calls, [
+      'concurrency-acquire-fast',
+      'concurrency-acquire-continue',
+      'concurrency-acquire-continue',
+      'concurrency-cancel',
+    ]);
+    assert.equal(continueBodies.length, 2);
+    assert.equal(cancelBodies.length, 1);
+    assert.equal(cancelBodies[0].reason, 'worker_aborted');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('CQ wait elapsed budget exhaustion cancels CQ request and returns the existing unavailable surface', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const cancelBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      const bootstrap = buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      });
+      bootstrap.download.trueConcurrency.waitTotalMaxMs = 25;
+      bootstrap.download.trueConcurrency.waitMaxAttemptsCap = 35;
+      return createJsonResponse(bootstrap);
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
+      if (!body.waitToken) {
+        return createJsonResponse({
+          result: 'wait',
+          waitToken: 'wait-budget-elapsed-1',
+          scope: 'host',
+          retryAfter: 1,
+        });
+      }
+      await new Promise((resolve, reject) => {
+        const abortError = new Error('The operation was aborted.');
+        abortError.name = 'AbortError';
+        init.signal?.addEventListener('abort', () => reject(abortError), { once: true });
+        setTimeout(() => resolve(), 1000);
+      });
+      throw new Error('continue-wait acquire should abort before resolving');
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
+      calls.push('concurrency-cancel');
+      cancelBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'cancelled' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
+      throw new Error('origin fetch should not run after wait budget exhaustion');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 503);
+    assert.match(body.message, /wait budget exhausted/i);
+    assert.deepEqual(calls, [
+      'concurrency-acquire-fast',
+      'concurrency-acquire-continue',
+      'concurrency-cancel',
+    ]);
+    assert.equal(cancelBodies.length, 1);
+    assert.equal(cancelBodies[0].reason, 'worker_aborted');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('CQ wait attempt budget exhaustion hard-fails before a third acquire call', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const cancelBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      const bootstrap = buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      });
+      bootstrap.download.trueConcurrency.waitTotalMaxMs = 20000;
+      bootstrap.download.trueConcurrency.waitMaxAttemptsCap = 2;
+      return createJsonResponse(bootstrap);
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
+      return createJsonResponse({
+        result: 'wait',
+        waitToken: 'wait-budget-attempt-1',
+        scope: 'host',
+        retryAfter: 1,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
+      calls.push('concurrency-cancel');
+      cancelBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'cancelled' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
+      throw new Error('origin fetch should not run after wait attempt budget exhaustion');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 503);
+    assert.equal(calls.filter((call) => call === 'concurrency-acquire-continue').length, 1);
+    assert.equal(calls.includes('concurrency-cancel'), true);
+    assert.match(body.message, /wait budget exhausted/i);
+    assert.equal(cancelBodies.length, 1);
+    assert.equal(cancelBodies[0].reason, 'worker_aborted');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
 test('queue_only aborts CQ wait and cancels request when unused fairqueue release cannot be confirmed', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];

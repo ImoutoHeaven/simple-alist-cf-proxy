@@ -25,6 +25,8 @@ const DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER = 'X-CQ-Auth';
 // Must exceed the default CQ wait poll window with explicit slack, or held acquires can time out client-side first.
 const DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS = 11500;
 const DEFAULT_TRUE_CONCURRENCY_RELEASE_TIMEOUT_MS = 1500;
+const DEFAULT_TRUE_CONCURRENCY_WAIT_TOTAL_MAX_MS = 20000;
+const DEFAULT_TRUE_CONCURRENCY_WAIT_MAX_ATTEMPTS_CAP = 35;
 const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG = Object.freeze({
   enabled: true,
   required: true,
@@ -687,6 +689,19 @@ const normalizePositiveMs = (value, fallback) => {
     return Math.max(1, Math.trunc(fb));
   }
   return 0;
+};
+
+const readOptionalPositiveIntegerFromBootstrap = (config, property, fallback, fieldName) => {
+  if (!Object.prototype.hasOwnProperty.call(config, property)) {
+    return fallback;
+  }
+
+  const value = config[property];
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid ${fieldName}: must be a positive integer`);
+  }
+
+  return value;
 };
 
 const normalizeTrueConcurrencyHeartbeatConfig = (heartbeatConfig, options = {}) => {
@@ -1543,6 +1558,18 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
     releaseTimeoutMs: normalizePositiveMs(
       trueConcurrencyConfigRaw.releaseTimeoutMs,
       DEFAULT_TRUE_CONCURRENCY_RELEASE_TIMEOUT_MS,
+    ),
+    waitTotalMaxMs: readOptionalPositiveIntegerFromBootstrap(
+      trueConcurrencyConfigRaw,
+      'waitTotalMaxMs',
+      DEFAULT_TRUE_CONCURRENCY_WAIT_TOTAL_MAX_MS,
+      'controller trueConcurrency.waitTotalMaxMs',
+    ),
+    waitMaxAttemptsCap: readOptionalPositiveIntegerFromBootstrap(
+      trueConcurrencyConfigRaw,
+      'waitMaxAttemptsCap',
+      DEFAULT_TRUE_CONCURRENCY_WAIT_MAX_ATTEMPTS_CAP,
+      'controller trueConcurrency.waitMaxAttemptsCap',
     ),
     heartbeat: heartbeatConfig,
   };
@@ -2590,7 +2617,7 @@ const createConcurrencyHandlerClient = (config) => {
   };
 
   return {
-    async acquire(_ctx, plan, signal) {
+    async acquire(_ctx, plan, signal, timeoutMs = acquireTimeoutMs) {
       const payload = {
         hostname: plan.hostname,
         hostnameHash: plan.hostnameHash,
@@ -2604,7 +2631,7 @@ const createConcurrencyHandlerClient = (config) => {
         payload.waitToken = plan.waitToken;
       }
       const { data } = await postJson(acquireUrl, payload, {
-        timeoutMs: acquireTimeoutMs,
+        timeoutMs,
         signal,
         allowedStatuses: [200, 409, 410],
       });
@@ -5129,6 +5156,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let cqStreamAbortController = null;
   let cqStreamAbortReason = '';
   let cqAcquireDispatched = false;
+  let cqWaitBudget = null;
 
   const clearPendingBreakerOnlyAttempt = () => {
     pendingBreakerOnlyAttempt = null;
@@ -5337,6 +5365,29 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     cqStreamAbortController = null;
     cqStreamAbortReason = '';
     cqAcquireDispatched = false;
+    cqWaitBudget = null;
+  };
+
+  const readCurrentTrueConcurrencyWaitBudgetWindow = () => {
+    if (!cqWaitBudget) {
+      return null;
+    }
+
+    const nowMs = Date.now();
+    const elapsedMs = nowMs - cqWaitBudget.startedAtMs;
+    const remainingMs = cqWaitBudget.totalMaxMs - elapsedMs;
+
+    return {
+      nowMs,
+      remainingMs,
+      exhausted: remainingMs <= 0 || cqWaitBudget.attempts >= cqWaitBudget.maxAttemptsCap,
+      timeoutMs: Math.min(config.concurrencyHandlerConfig.acquireTimeoutMs, remainingMs),
+    };
+  };
+
+  const createTrueConcurrencyWaitBudgetExhaustedResponse = async () => {
+    await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
+    return createTrueConcurrencyUnavailableResponse(origin, 'True concurrency wait budget exhausted');
   };
 
   const ensureCurrentTrueConcurrencyReleased = async (reason, immediate = false) => {
@@ -5407,10 +5458,17 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       throw error;
     }
 
+    const waitBudgetWindow = readCurrentTrueConcurrencyWaitBudgetWindow();
+    if (waitBudgetWindow?.exhausted) {
+      return null;
+    }
+
+    cqWaitBudget.attempts += 1;
+
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[CQ] continue-wait acquire failed during ${phase}, replaying immutable tuple:`, message);
-    cqPlan.nowMs = Date.now();
-    return concurrencyClient.acquire(ctx, cqPlan, clientSignal);
+    cqPlan.nowMs = waitBudgetWindow.nowMs;
+    return concurrencyClient.acquire(ctx, cqPlan, clientSignal, waitBudgetWindow.timeoutMs);
   };
 
   const releaseUnusedFairQueueGrantIfNeeded = async (phase) => {
@@ -5742,6 +5800,12 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
 
         if (acquireResult.result === 'wait') {
           cqPlan.waitToken = acquireResult.waitToken;
+          cqWaitBudget = {
+            startedAtMs: Date.now(),
+            attempts: 1,
+            totalMaxMs: config.concurrencyHandlerConfig.waitTotalMaxMs,
+            maxAttemptsCap: config.concurrencyHandlerConfig.waitMaxAttemptsCap,
+          };
           if (resolveAdmissionMode(config, cqPlan.hostname) === 'queue_breaker' || !needFairQueue) {
             const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
             if (settleResponse instanceof Response) {
@@ -5760,11 +5824,29 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           }
 
           while (acquireResult.result === 'wait') {
-            cqPlan.nowMs = Date.now();
+            const waitBudgetWindow = readCurrentTrueConcurrencyWaitBudgetWindow();
+            if (!waitBudgetWindow || waitBudgetWindow.exhausted) {
+              return createTrueConcurrencyWaitBudgetExhaustedResponse();
+            }
+
+            cqWaitBudget.attempts += 1;
+            cqPlan.nowMs = waitBudgetWindow.nowMs;
             try {
-              acquireResult = await concurrencyClient.acquire(ctx, cqPlan, clientSignal);
+              acquireResult = await concurrencyClient.acquire(
+                ctx,
+                cqPlan,
+                clientSignal,
+                waitBudgetWindow.timeoutMs,
+              );
             } catch (error) {
-              acquireResult = await replayCurrentTrueConcurrencyAcquireAfterWaitError(phase, error);
+              const replayedAcquireResult = await replayCurrentTrueConcurrencyAcquireAfterWaitError(
+                phase,
+                error,
+              );
+              if (!replayedAcquireResult) {
+                return createTrueConcurrencyWaitBudgetExhaustedResponse();
+              }
+              acquireResult = replayedAcquireResult;
             }
           }
         }
@@ -5966,6 +6048,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         }
 
         cqAcquireDispatched = false;
+        cqWaitBudget = null;
         delete cqPlan.waitToken;
       } catch (error) {
         if (didClientAbort() && isAbortError(error)) {
