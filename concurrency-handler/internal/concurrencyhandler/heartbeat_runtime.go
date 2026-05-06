@@ -21,6 +21,7 @@ type heartbeatSession struct {
 	requestID  string
 	leaseID    string
 	leaseToken string
+	ticketHash string
 	generation int64
 	accepted   bool
 	skipClose  bool
@@ -35,6 +36,7 @@ type heartbeatHelloMessage struct {
 	RequestID        string `json:"requestId"`
 	LeaseID          string `json:"leaseId"`
 	LeaseToken       string `json:"leaseToken"`
+	TicketHash       string `json:"ticketHash"`
 	HardExpireAtMs   int64  `json:"hardExpireAtMs"`
 	ClientInstanceID string `json:"clientInstanceId"`
 	Attempt          int64  `json:"attempt"`
@@ -58,6 +60,7 @@ type heartbeatRefreshMessage struct {
 	RequestID  string `json:"requestId"`
 	LeaseID    string `json:"leaseId"`
 	LeaseToken string `json:"leaseToken"`
+	TicketHash string `json:"ticketHash"`
 	Generation int64  `json:"generation"`
 	NowMs      int64  `json:"nowMs"`
 }
@@ -149,6 +152,7 @@ func (h *heartbeatRuntime) handleWebSocket(w http.ResponseWriter, r *http.Reques
 		RequestID:           hello.RequestID,
 		LeaseID:             hello.LeaseID,
 		LeaseToken:          hello.LeaseToken,
+		TicketHash:          hello.TicketHash,
 		HardExpireAtMs:      hello.HardExpireAtMs,
 		NowMs:               handlerNowMs,
 		HeartbeatTimeoutMs:  int64(h.cfg.TimeoutMs),
@@ -163,14 +167,15 @@ func (h *heartbeatRuntime) handleWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 
 	switch result.Result {
-	case "accepted":
-		session = heartbeatSession{
-			requestID:  hello.RequestID,
-			leaseID:    hello.LeaseID,
-			leaseToken: hello.LeaseToken,
-			generation: result.Generation,
-			accepted:   true,
-		}
+		case "accepted":
+			session = heartbeatSession{
+				requestID:  hello.RequestID,
+				leaseID:    hello.LeaseID,
+				leaseToken: hello.LeaseToken,
+				ticketHash: hello.TicketHash,
+				generation: result.Generation,
+				accepted:   true,
+			}
 		h.setCurrentGeneration(session.requestID, session.generation)
 		h.schedule(session.requestID, result.DeadlineMs)
 		if !h.writeJSON(conn, heartbeatHelloAckMessage{
@@ -246,6 +251,10 @@ func (h *heartbeatRuntime) handleHeartbeatMessage(conn *websocket.Conn, ctx cont
 		h.writeTerminal(conn, "terminal", "token_mismatch")
 		return false
 	}
+	if message.TicketHash != session.ticketHash {
+		h.writeTerminal(conn, "terminal", "protocol_error")
+		return false
+	}
 	if message.Generation != session.generation || !h.isCurrentGeneration(session.requestID, session.generation) {
 		return true
 	}
@@ -254,6 +263,7 @@ func (h *heartbeatRuntime) handleHeartbeatMessage(conn *websocket.Conn, ctx cont
 		RequestID:          session.requestID,
 		LeaseID:            session.leaseID,
 		LeaseToken:         session.leaseToken,
+		TicketHash:         message.TicketHash,
 		Generation:         message.Generation,
 		NowMs:              time.Now().UnixMilli(),
 		HeartbeatTimeoutMs: int64(h.cfg.TimeoutMs),
@@ -540,9 +550,9 @@ func mapConflictReasonToTerminal(reason string) (string, bool) {
 }
 
 func validHeartbeatHelloMessage(message heartbeatHelloMessage) bool {
-	return message.Type == "hello" && strings.TrimSpace(message.RequestID) != "" && strings.TrimSpace(message.LeaseID) != "" && strings.TrimSpace(message.LeaseToken) != "" && message.HardExpireAtMs > 0 && strings.TrimSpace(message.ClientInstanceID) != "" && message.Attempt > 0 && message.NowMs > 0
+	return message.Type == "hello" && strings.TrimSpace(message.RequestID) != "" && strings.TrimSpace(message.LeaseID) != "" && strings.TrimSpace(message.LeaseToken) != "" && strings.TrimSpace(message.TicketHash) != "" && message.HardExpireAtMs > 0 && strings.TrimSpace(message.ClientInstanceID) != "" && message.Attempt > 0 && message.NowMs > 0
 }
 
 func validHeartbeatRefreshMessage(message heartbeatRefreshMessage) bool {
-	return message.Type == "heartbeat" && strings.TrimSpace(message.RequestID) != "" && strings.TrimSpace(message.LeaseID) != "" && strings.TrimSpace(message.LeaseToken) != "" && message.Generation > 0 && message.NowMs > 0
+	return message.Type == "heartbeat" && strings.TrimSpace(message.RequestID) != "" && strings.TrimSpace(message.LeaseID) != "" && strings.TrimSpace(message.LeaseToken) != "" && strings.TrimSpace(message.TicketHash) != "" && message.Generation > 0 && message.NowMs > 0
 }

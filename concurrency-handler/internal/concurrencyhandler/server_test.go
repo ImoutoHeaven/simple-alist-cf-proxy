@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,7 @@ type heartbeatHelloFrame struct {
 	RequestID        string `json:"requestId"`
 	LeaseID          string `json:"leaseId"`
 	LeaseToken       string `json:"leaseToken"`
+	TicketHash       string `json:"ticketHash"`
 	HardExpireAtMs   int64  `json:"hardExpireAtMs"`
 	ClientInstanceID string `json:"clientInstanceId"`
 	Attempt          int64  `json:"attempt"`
@@ -47,6 +49,7 @@ type heartbeatFrame struct {
 	RequestID  string `json:"requestId"`
 	LeaseID    string `json:"leaseId"`
 	LeaseToken string `json:"leaseToken"`
+	TicketHash string `json:"ticketHash"`
 	Generation int64  `json:"generation"`
 	NowMs      int64  `json:"nowMs"`
 }
@@ -89,6 +92,52 @@ func (r *heartbeatDisconnectRecorder) call(i int) HeartbeatDisconnectRequest {
 		return HeartbeatDisconnectRequest{}
 	}
 	return r.calls[i]
+}
+
+func setTestStructStringField(target any, fieldName, value string) {
+	if target == nil {
+		return
+	}
+	ref := reflect.ValueOf(target)
+	if ref.Kind() != reflect.Pointer || ref.IsNil() {
+		return
+	}
+	field := ref.Elem().FieldByName(fieldName)
+	if !field.IsValid() || !field.CanSet() || field.Kind() != reflect.String {
+		return
+	}
+	field.SetString(value)
+}
+
+func requireTestStructStringField(t *testing.T, target any, fieldName string) string {
+	t.Helper()
+	ref := reflect.ValueOf(target)
+	if ref.Kind() == reflect.Pointer {
+		if ref.IsNil() {
+			t.Fatalf("expected %T to expose %s, got nil pointer", target, fieldName)
+		}
+		ref = ref.Elem()
+	}
+	field := ref.FieldByName(fieldName)
+	if !field.IsValid() || field.Kind() != reflect.String {
+		t.Fatalf("expected %T to expose string field %s", target, fieldName)
+	}
+	return field.String()
+}
+
+func lookupTestStructStringField(target any, fieldName string) string {
+	ref := reflect.ValueOf(target)
+	if ref.Kind() == reflect.Pointer {
+		if ref.IsNil() {
+			return ""
+		}
+		ref = ref.Elem()
+	}
+	field := ref.FieldByName(fieldName)
+	if !field.IsValid() || field.Kind() != reflect.String {
+		return ""
+	}
+	return field.String()
 }
 
 type stubBackend struct {
@@ -1387,6 +1436,7 @@ func TestHeartbeatWebSocketAcceptedHelloReturnsAckAndUsesHandlerTime(t *testing.
 		RequestID:        "request-1",
 		LeaseID:          "11111111-1111-1111-1111-111111111111",
 		LeaseToken:       "lease-token-1",
+		TicketHash:       "ticket-hash-1",
 		HardExpireAtMs:   50_000,
 		ClientInstanceID: "client-a",
 		Attempt:          1,
@@ -1401,6 +1451,9 @@ func TestHeartbeatWebSocketAcceptedHelloReturnsAckAndUsesHandlerTime(t *testing.
 	}
 	if openCalls[0].NowMs < beforeSend || openCalls[0].NowMs > afterSend || openCalls[0].NowMs == 1 {
 		t.Fatalf("expected HeartbeatOpen to use handler-side time in [%d,%d] instead of client nowMs, got %+v", beforeSend, afterSend, openCalls[0])
+	}
+	if got := requireTestStructStringField(t, openCalls[0], "TicketHash"); got != "ticket-hash-1" {
+		t.Fatalf("expected HeartbeatOpen to forward ticket hash, got %+v", openCalls[0])
 	}
 	if openCalls[0].RequestID != "request-1" || openCalls[0].LeaseToken != "lease-token-1" || openCalls[0].StartTimeoutMs != int64(validTestConfig().Concurrency.Heartbeat.StartTimeoutMs) {
 		t.Fatalf("expected HeartbeatOpen request contract forwarded, got %+v", openCalls[0])
@@ -1446,6 +1499,7 @@ func TestHeartbeatWebSocketRefreshUsesHandlerTimeAndReschedules(t *testing.T) {
 		RequestID:        "request-1",
 		LeaseID:          "11111111-1111-1111-1111-111111111111",
 		LeaseToken:       "lease-token-1",
+		TicketHash:       "ticket-hash-1",
 		HardExpireAtMs:   80_000,
 		ClientInstanceID: "client-a",
 		Attempt:          1,
@@ -1460,6 +1514,7 @@ func TestHeartbeatWebSocketRefreshUsesHandlerTimeAndReschedules(t *testing.T) {
 		RequestID:  "request-1",
 		LeaseID:    "11111111-1111-1111-1111-111111111111",
 		LeaseToken: "lease-token-1",
+		TicketHash: "ticket-hash-1",
 		Generation: helloAck.Generation,
 		NowMs:      2,
 	})
@@ -1475,6 +1530,9 @@ func TestHeartbeatWebSocketRefreshUsesHandlerTimeAndReschedules(t *testing.T) {
 	}
 	if refreshCalls[0].NowMs < beforeRefresh || refreshCalls[0].NowMs > afterRefresh || refreshCalls[0].NowMs == 2 {
 		t.Fatalf("expected HeartbeatRefresh to use handler-side time in [%d,%d] instead of client nowMs, got %+v", beforeRefresh, afterRefresh, refreshCalls[0])
+	}
+	if got := requireTestStructStringField(t, refreshCalls[0], "TicketHash"); got != "ticket-hash-1" {
+		t.Fatalf("expected HeartbeatRefresh to forward ticket hash, got %+v", refreshCalls[0])
 	}
 	if ack != (heartbeatAckFrame{Type: "heartbeat_ack", Generation: helloAck.Generation, DeadlineMs: refreshDeadlineMs, HardExpireAtMs: 80_000}) {
 		t.Fatalf("unexpected heartbeat_ack payload: %+v", ack)
@@ -1502,6 +1560,23 @@ func TestHeartbeatWebSocketMissingHelloTimeoutClosesWithoutHeartbeatOpen(t *test
 	}
 }
 
+func TestHeartbeatWebSocketHelloMissingTicketHashFailsClosedForRenewablePath(t *testing.T) {
+	var openCalls int
+	_, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{heartbeatOpenFn: func(_ context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
+		openCalls++
+		return nil, errors.New("unexpected open")
+	}})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	expectWebSocketClosedWithoutPayload(t, conn)
+	if openCalls != 0 {
+		t.Fatalf("expected missing ticketHash hello to fail closed before HeartbeatOpen, got %d calls", openCalls)
+	}
+}
+
 func TestHeartbeatWebSocketPreHandoffHelloClosesWithoutTerminalFrame(t *testing.T) {
 	var openCalls int
 	_, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{heartbeatOpenFn: func(_ context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
@@ -1512,7 +1587,7 @@ func TestHeartbeatWebSocketPreHandoffHelloClosesWithoutTerminalFrame(t *testing.
 	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
 
-	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
 	expectWebSocketClosedWithoutPayload(t, conn)
 	if openCalls != 1 {
 		t.Fatalf("expected pre-handoff hello to reach backend once, got %d calls", openCalls)
@@ -1525,7 +1600,7 @@ func TestHeartbeatWebSocketHardExpiryMismatchClosesWithoutTerminalFrame(t *testi
 	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
 
-	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
 	expectWebSocketClosedWithoutPayload(t, conn)
 }
 
@@ -1535,7 +1610,7 @@ func TestHeartbeatWebSocketCredentialMismatchMapsToTerminalTokenMismatch(t *test
 	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
 
-	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
 	var terminal heartbeatTerminalFrame
 	readWebSocketJSON(t, conn, &terminal)
 	if terminal.Type != "terminal" || terminal.Result != "terminal" || terminal.Reason != "token_mismatch" {
@@ -1550,7 +1625,7 @@ func TestHeartbeatWebSocketLateHelloReturnsHeartbeatStartTimeoutTerminal(t *test
 	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
 
-	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
 	var terminal heartbeatTerminalFrame
 	readWebSocketJSON(t, conn, &terminal)
 	if terminal.Type != "terminal" || terminal.Result != "released" || terminal.Reason != "heartbeat_start_timeout" {
@@ -1568,7 +1643,7 @@ func TestHeartbeatWebSocketTerminalOpenRefusalMapsReason(t *testing.T) {
 	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
 
-	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
 	var terminal heartbeatTerminalFrame
 	readWebSocketJSON(t, conn, &terminal)
 	if terminal.Type != "terminal" || terminal.Result != "terminal" || terminal.Reason != "already_released" {
@@ -1600,7 +1675,7 @@ func TestHeartbeatWebSocketUnknownPostHelloMessageSendsProtocolErrorWithoutRefre
 	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
 
-	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
 	var ack heartbeatHelloAckFrame
 	readWebSocketJSON(t, conn, &ack)
 	writeWebSocketJSON(t, conn, map[string]any{"type": "unknown", "requestId": "request-1"})
@@ -1644,7 +1719,7 @@ func TestHeartbeatWebSocketMalformedPostHelloMessageSendsProtocolErrorWithoutRef
 	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
 
-	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
 	var ack heartbeatHelloAckFrame
 	readWebSocketJSON(t, conn, &ack)
 	writeWebSocketJSON(t, conn, map[string]any{"type": "heartbeat", "requestId": "request-1"})
@@ -1657,6 +1732,42 @@ func TestHeartbeatWebSocketMalformedPostHelloMessageSendsProtocolErrorWithoutRef
 	waitForCondition(t, 500*time.Millisecond, func() bool { return disconnectCalls.Load() == 1 })
 	if refreshCalls.Load() != 0 {
 		t.Fatalf("expected malformed heartbeat to skip HeartbeatRefresh, got %d calls", refreshCalls.Load())
+	}
+}
+
+func TestHeartbeatWebSocketRefreshMissingTicketHashFailsClosedForRenewablePath(t *testing.T) {
+	initialDeadlineMs := time.Now().Add(time.Minute).UnixMilli()
+	var refreshCalls atomic.Int32
+	_, httpServer := newHeartbeatWebSocketTestServer(t, validTestConfig(), &stubBackend{
+		heartbeatOpenResult: &HeartbeatResult{Result: "accepted", Generation: 1, DeadlineMs: initialDeadlineMs, AckTimeoutMs: 2_000, HeartbeatIntervalMs: 5_000, HeartbeatTimeoutMs: 15_000, ReconnectGraceMs: 12_000, StartTimeoutMs: 7_000, HardExpireAtMs: 80_000},
+		heartbeatRefreshFn: func(_ context.Context, req HeartbeatRefreshRequest) (*HeartbeatResult, error) {
+			refreshCalls.Add(1)
+			return nil, errors.New("unexpected refresh")
+		},
+	})
+
+	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
+	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	var ack heartbeatHelloAckFrame
+	readWebSocketJSON(t, conn, &ack)
+	writeWebSocketJSON(t, conn, map[string]any{
+		"type":       "heartbeat",
+		"requestId":  "request-1",
+		"leaseId":    "11111111-1111-1111-1111-111111111111",
+		"leaseToken": "lease-token-1",
+		"generation": ack.Generation,
+		"nowMs":      2,
+	})
+	var terminal heartbeatTerminalFrame
+	readWebSocketJSON(t, conn, &terminal)
+	if terminal.Type != "terminal" || terminal.Reason != "protocol_error" {
+		t.Fatalf("expected missing ticketHash heartbeat to return protocol_error terminal, got %+v", terminal)
+	}
+	expectWebSocketClosedWithoutPayload(t, conn)
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("expected missing ticketHash heartbeat to skip HeartbeatRefresh, got %d calls", refreshCalls.Load())
 	}
 }
 
@@ -1673,7 +1784,7 @@ func TestHeartbeatWebSocketCurrentGenerationCloseCallsDisconnectAndSchedulesGrac
 	})
 
 	conn := dialHeartbeatSocket(t, httpServer.URL, "secret")
-	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	writeWebSocketJSON(t, conn, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
 	var ack heartbeatHelloAckFrame
 	readWebSocketJSON(t, conn, &ack)
 	beforeClose := time.Now().UnixMilli()
@@ -1724,13 +1835,13 @@ func TestHeartbeatWebSocketReplacementMakesOldGenerationStale(t *testing.T) {
 
 	conn1 := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn1.Close(websocket.StatusNormalClosure, "") })
-	writeWebSocketJSON(t, conn1, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	writeWebSocketJSON(t, conn1, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
 	var ack1 heartbeatHelloAckFrame
 	readWebSocketJSON(t, conn1, &ack1)
 
 	conn2 := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn2.Close(websocket.StatusNormalClosure, "") })
-	writeWebSocketJSON(t, conn2, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 2, NowMs: 2})
+	writeWebSocketJSON(t, conn2, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 2, NowMs: 2})
 	var ack2 heartbeatHelloAckFrame
 	readWebSocketJSON(t, conn2, &ack2)
 
@@ -1741,7 +1852,7 @@ func TestHeartbeatWebSocketReplacementMakesOldGenerationStale(t *testing.T) {
 		t.Fatalf("expected replacement hello to advance tracked generation to 2, got %d", got)
 	}
 
-	writeWebSocketJSON(t, conn1, heartbeatFrame{Type: "heartbeat", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", Generation: ack1.Generation, NowMs: 3})
+	writeWebSocketJSON(t, conn1, heartbeatFrame{Type: "heartbeat", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", Generation: ack1.Generation, NowMs: 3})
 	time.Sleep(100 * time.Millisecond)
 	if refreshCalls.Load() != 0 {
 		t.Fatalf("expected stale generation refresh to skip backend refresh, got %d calls", refreshCalls.Load())
@@ -1784,7 +1895,7 @@ func TestHeartbeatWebSocketGraceReconnectAndLateReconnectRefusal(t *testing.T) {
 
 	conn1 := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn1.Close(websocket.StatusNormalClosure, "") })
-	writeWebSocketJSON(t, conn1, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
+	writeWebSocketJSON(t, conn1, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 1, NowMs: 1})
 	var ack1 heartbeatHelloAckFrame
 	readWebSocketJSON(t, conn1, &ack1)
 	if err := conn1.Close(websocket.StatusNormalClosure, "disconnect to grace"); err != nil {
@@ -1794,7 +1905,7 @@ func TestHeartbeatWebSocketGraceReconnectAndLateReconnectRefusal(t *testing.T) {
 
 	conn2 := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn2.Close(websocket.StatusNormalClosure, "") })
-	writeWebSocketJSON(t, conn2, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 2, NowMs: 2})
+	writeWebSocketJSON(t, conn2, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 2, NowMs: 2})
 	var ack2 heartbeatHelloAckFrame
 	readWebSocketJSON(t, conn2, &ack2)
 	if ack2.Generation != 2 {
@@ -1803,7 +1914,7 @@ func TestHeartbeatWebSocketGraceReconnectAndLateReconnectRefusal(t *testing.T) {
 
 	conn3 := dialHeartbeatSocket(t, httpServer.URL, "secret")
 	t.Cleanup(func() { _ = conn3.Close(websocket.StatusNormalClosure, "") })
-	writeWebSocketJSON(t, conn3, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 3, NowMs: 3})
+	writeWebSocketJSON(t, conn3, heartbeatHelloFrame{Type: "hello", RequestID: "request-1", LeaseID: "11111111-1111-1111-1111-111111111111", LeaseToken: "lease-token-1", TicketHash: "ticket-hash-1", HardExpireAtMs: 80_000, ClientInstanceID: "client-a", Attempt: 3, NowMs: 3})
 	var terminal heartbeatTerminalFrame
 	readWebSocketJSON(t, conn3, &terminal)
 	if terminal.Type != "terminal" || terminal.Result != "released" || terminal.Reason != "heartbeat_timeout" {

@@ -228,6 +228,11 @@ const createDefaultTicketStateRow = (body, overrides = {}) => {
     issued_at: nowSeconds,
     first_used_at: null,
     hard_expire_at: nowSeconds + 600,
+    idle_timeout_seconds: 300,
+    idle_policy: 'first_use',
+    idle_lease_expires_at: nowSeconds + 300,
+    idle_renew_owner_lease_id: null,
+    idle_renew_owner_last_heartbeat_at: null,
     ip_hash: null,
     path_hash: null,
     ...overrides,
@@ -4795,7 +4800,63 @@ test('non-positive payloadSign expiry is rejected before admission handlers run'
   }
 });
 
-test('unused ticket is denied when issued_at plus idle_timeout is exceeded', async () => {
+for (const idlePolicy of ['first_use', 'renewable']) {
+  test(`unused ${idlePolicy} ticket is denied exactly at issued_at plus idle_timeout`, async () => {
+    const originalFetch = globalThis.fetch;
+    const calls = [];
+
+    globalThis.fetch = async (input, init = {}) => {
+      const url = typeof input === 'string' ? input : input.url;
+      calls.push(url);
+
+      if (url === 'https://controller.example.test/api/v0/bootstrap') {
+        return createJsonResponse(buildRuntimeBootstrap());
+      }
+
+      if (url === 'https://alist.example.com/api/fs/link') {
+        return createJsonResponse({
+          code: 200,
+          data: {
+            url: 'https://tenant.sharepoint.com/file',
+            header: {},
+          },
+        });
+      }
+
+      if (url === 'https://tenant.sharepoint.com/file') {
+        throw new Error('origin fetch should not run at the idle cutoff boundary');
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url}`);
+    };
+    ticketStateRpcState.readHandler = (body) => createDefaultTicketStateRow(body, {
+      issued_at: Math.floor(Date.now() / 1000) - DEFAULT_IDLE_TIMEOUT_SECONDS,
+      first_used_at: null,
+      idle_timeout_seconds: DEFAULT_IDLE_TIMEOUT_SECONDS,
+      idle_policy: idlePolicy,
+    });
+
+    try {
+      const response = await worker.fetch(
+        await buildSignedWorkerRequest({ idleTimeoutSeconds: DEFAULT_IDLE_TIMEOUT_SECONDS }),
+        buildWorkerEnv(),
+        createTestContext().ctx,
+      );
+      const body = await readJson(response);
+
+      assert.equal(response.status, 410);
+      assert.equal(body.message, 'Link expired due to inactivity');
+      assert.equal(ticketStateRpcState.readBodies.length, 1);
+      assert.equal(ticketStateRpcState.markBodies.length, 0);
+      assert.equal(calls.includes('https://tenant.sharepoint.com/file'), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete globalThis.bootstrapCache;
+    }
+  });
+}
+
+test('unused first_use ticket with row idle_timeout_seconds 0 is denied immediately', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
 
@@ -4818,19 +4879,22 @@ test('unused ticket is denied when issued_at plus idle_timeout is exceeded', asy
     }
 
     if (url === 'https://tenant.sharepoint.com/file') {
-      throw new Error('origin fetch should not run after idle expiry');
+      throw new Error('origin fetch should not run for zero-timeout first-use ticket');
     }
 
     throw new Error(`Unexpected fetch URL in test: ${url}`);
   };
   ticketStateRpcState.readHandler = (body) => createDefaultTicketStateRow(body, {
-    issued_at: Math.floor(Date.now() / 1000) - (DEFAULT_IDLE_TIMEOUT_SECONDS + 1),
+    issued_at: Math.floor(Date.now() / 1000),
     first_used_at: null,
+    idle_timeout_seconds: 0,
+    idle_policy: 'first_use',
+    idle_lease_expires_at: Math.floor(Date.now() / 1000),
   });
 
   try {
     const response = await worker.fetch(
-      await buildSignedWorkerRequest({ idleTimeoutSeconds: DEFAULT_IDLE_TIMEOUT_SECONDS }),
+      await buildSignedWorkerRequest({ idleTimeoutSeconds: 0 }),
       buildWorkerEnv(),
       createTestContext().ctx,
     );
@@ -4841,6 +4905,328 @@ test('unused ticket is denied when issued_at plus idle_timeout is exceeded', asy
     assert.equal(ticketStateRpcState.readBodies.length, 1);
     assert.equal(ticketStateRpcState.markBodies.length, 0);
     assert.equal(calls.includes('https://tenant.sharepoint.com/file'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('renewable ticket rejects after first use when idle_lease_expires_at is in the past', async () => {
+  const originalFetch = globalThis.fetch;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://origin.example.test/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://origin.example.test/file') {
+      throw new Error('origin fetch should not run after renewable lease expiry');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+  ticketStateRpcState.readHandler = (body) => createDefaultTicketStateRow(body, {
+    issued_at: nowSeconds - 20,
+    first_used_at: nowSeconds - 10,
+    hard_expire_at: nowSeconds + 300,
+    idle_timeout_seconds: 60,
+    idle_policy: 'renewable',
+    idle_lease_expires_at: nowSeconds - 1,
+    idle_renew_owner_lease_id: '11111111-1111-1111-1111-111111111111',
+    idle_renew_owner_last_heartbeat_at: nowSeconds - 2,
+  });
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+    const body = await readJson(response);
+
+    assert.equal(response.status, 401);
+    assert.equal(body.message, 'link expired');
+    assert.equal(ticketStateRpcState.markBodies.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('renewable ticket rejects after first use when idle_lease_expires_at is absent', async () => {
+  const originalFetch = globalThis.fetch;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://origin.example.test/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://origin.example.test/file') {
+      throw new Error('origin fetch should not run when renewable lease is absent');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+  ticketStateRpcState.readHandler = (body) => createDefaultTicketStateRow(body, {
+    issued_at: nowSeconds - 20,
+    first_used_at: nowSeconds - 10,
+    hard_expire_at: nowSeconds + 300,
+    idle_timeout_seconds: 60,
+    idle_policy: 'renewable',
+    idle_lease_expires_at: null,
+    idle_renew_owner_lease_id: '11111111-1111-1111-1111-111111111111',
+    idle_renew_owner_last_heartbeat_at: nowSeconds - 2,
+  });
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+    const body = await readJson(response);
+
+    assert.equal(response.status, 401);
+    assert.equal(body.message, 'link expired');
+    assert.equal(ticketStateRpcState.markBodies.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('first_use ticket ignores idle_lease_expires_at after first use and still runs until hard_expire_at', async () => {
+  const originalFetch = globalThis.fetch;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://origin.example.test/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://origin.example.test/file') {
+      return new Response('ok', { status: 200 });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+  ticketStateRpcState.readHandler = (body) => createDefaultTicketStateRow(body, {
+    issued_at: nowSeconds - 20,
+    first_used_at: nowSeconds - 10,
+    hard_expire_at: nowSeconds + 300,
+    idle_timeout_seconds: 60,
+    idle_policy: 'first_use',
+    idle_lease_expires_at: nowSeconds - 1,
+  });
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest(),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'ok');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('heartbeat hello forwards ticketHash alongside request and lease identity', async () => {
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  const signedRequest = await buildSignedWorkerRequest();
+  const signedUrl = new URL(signedRequest.url);
+  const expectedTicketHash = await sha256Hash(
+    `${signedUrl.searchParams.get('payload')}:${signedUrl.searchParams.get('payloadSign')}`,
+  );
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-1',
+        leaseToken: 'token-1',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response('hello-ok', { status: 200 });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+  setHeartbeatMock(() => ({
+    status: 101,
+    webSocket: createFakeHeartbeatSocket({
+      onSend: (payload) => sent.push(payload),
+    }),
+  }));
+
+  try {
+    const response = await worker.fetch(new Request(signedRequest), buildWorkerEnv(), createTestContext().ctx);
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'hello-ok');
+    assert.equal(sent[0]?.type, 'hello');
+    assert.equal(sent[0]?.ticketHash, expectedTicketHash);
+    assert.equal(typeof sent[0]?.requestId, 'string');
+    assert.equal(typeof sent[0]?.leaseId, 'string');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('heartbeat refresh forwards ticketHash alongside generation and lease identity', async () => {
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  const { ctx, waitUntilPromises } = createTestContext();
+  const signedRequest = await buildSignedWorkerRequest();
+  const signedUrl = new URL(signedRequest.url);
+  const expectedTicketHash = await sha256Hash(
+    `${signedUrl.searchParams.get('payload')}:${signedUrl.searchParams.get('payloadSign')}`,
+  );
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHeartbeatOverrides: { intervalMs: 1, ackTimeoutMs: 1000 },
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-1',
+        leaseToken: 'token-1',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-1',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response('refresh-ok', { status: 200 });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+  setHeartbeatMock(() => ({
+    status: 101,
+    webSocket: createFakeHeartbeatSocket({
+      helloAck: buildHeartbeatHelloAck({ heartbeatIntervalMs: 1 }),
+      onSend: (payload) => sent.push(payload),
+    }),
+  }));
+
+  try {
+    const response = await worker.fetch(new Request(signedRequest), buildWorkerEnv(), ctx);
+    await waitForCondition(() => sent.some((payload) => payload.type === 'heartbeat'));
+    assert.equal(await response.text(), 'refresh-ok');
+    await Promise.allSettled(waitUntilPromises);
+
+    const refreshPayload = sent.find((payload) => payload.type === 'heartbeat');
+    assert.equal(response.status, 200);
+    assert.equal(refreshPayload?.ticketHash, expectedTicketHash);
+    assert.equal(typeof refreshPayload?.generation, 'number');
+    assert.equal(typeof refreshPayload?.leaseId, 'string');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -5007,6 +5393,7 @@ test('used ticket skips idle denial and relies on hard expiry only', async () =>
   ticketStateRpcState.readHandler = (body) => createDefaultTicketStateRow(body, {
     issued_at: Math.floor(Date.now() / 1000) - 3600,
     first_used_at: firstUsedAt,
+    idle_timeout_seconds: 0,
   });
   ticketStateRpcState.markHandler = () => ({
     result: 'already_used',

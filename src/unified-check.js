@@ -81,6 +81,11 @@ const parseTicketStateRow = (row) => {
       issuedAt: null,
       firstUsedAt: null,
       hardExpireAt: null,
+      idleTimeoutSeconds: null,
+      idlePolicy: null,
+      idleLeaseExpiresAt: null,
+      idleRenewOwnerLeaseId: null,
+      idleRenewOwnerLastHeartbeatAt: null,
       ipHash: null,
       pathHash: null,
     };
@@ -92,6 +97,11 @@ const parseTicketStateRow = (row) => {
     issuedAt: parseNullableInt(row?.issued_at),
     firstUsedAt: parseNullableInt(row?.first_used_at),
     hardExpireAt: parseNullableInt(row?.hard_expire_at),
+    idleTimeoutSeconds: parseNullableInt(row?.idle_timeout_seconds),
+    idlePolicy: typeof row?.idle_policy === 'string' ? row.idle_policy : null,
+    idleLeaseExpiresAt: parseNullableInt(row?.idle_lease_expires_at),
+    idleRenewOwnerLeaseId: typeof row?.idle_renew_owner_lease_id === 'string' ? row.idle_renew_owner_lease_id : null,
+    idleRenewOwnerLastHeartbeatAt: parseNullableInt(row?.idle_renew_owner_last_heartbeat_at),
     ipHash: typeof row?.ip_hash === 'string' ? row.ip_hash : null,
     pathHash: typeof row?.path_hash === 'string' ? row.path_hash : null,
   };

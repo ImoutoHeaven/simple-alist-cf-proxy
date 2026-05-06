@@ -2698,6 +2698,7 @@ const createConcurrencyHandlerClient = (config) => {
         requestId: readTrueConcurrencyHeartbeatRequiredString(identity, 'requestId', 'heartbeat hello'),
         leaseId: readTrueConcurrencyHeartbeatRequiredString(identity, 'leaseId', 'heartbeat hello'),
         leaseToken: readTrueConcurrencyHeartbeatRequiredString(identity, 'leaseToken', 'heartbeat hello'),
+        ticketHash: readTrueConcurrencyHeartbeatRequiredString(identity, 'ticketHash', 'heartbeat hello'),
         hardExpireAtMs: readTrueConcurrencyHeartbeatRequiredPositiveInt(identity, 'hardExpireAtMs', 'heartbeat hello'),
         clientInstanceId: readTrueConcurrencyHeartbeatRequiredString(identity, 'clientInstanceId', 'heartbeat hello'),
         attempt: readTrueConcurrencyHeartbeatRequiredPositiveInt(identity, 'attempt', 'heartbeat hello'),
@@ -2761,6 +2762,7 @@ const createConcurrencyHandlerClient = (config) => {
               requestId: helloPayload.requestId,
               leaseId: helloPayload.leaseId,
               leaseToken: helloPayload.leaseToken,
+              ticketHash: helloPayload.ticketHash,
               generation: session.generation,
               nowMs: Date.now(),
             }));
@@ -3054,6 +3056,7 @@ const createTrueConcurrencyHeartbeatManager = ({
     hardExpireAtMs: plan.hardExpireAtMs,
     clientInstanceId,
     attempt,
+    ticketHash: plan.ticketHash,
   });
 
   const disconnectSessionListeners = () => {
@@ -4251,6 +4254,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     return createUnauthorizedResponse(origin, "link expired");
   }
 
+  const ticketHash = await sha256Hash(`${payload}:${payloadSign}`);
+  if (!ticketHash) {
+    return createUnauthorizedResponse(origin, 'payload ticket hash invalid');
+  }
+
   const ticketStateEnabled = config.dbMode === 'custom-pg-rest';
   const payloadTicketNonce = typeof payloadData?.ticketNonce === 'string' ? payloadData.ticketNonce.trim() : '';
   const idleTimeoutRaw = payloadData?.idle_timeout;
@@ -4259,8 +4267,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     && Number.isSafeInteger(idleTimeoutRaw)
     ? idleTimeoutRaw
     : null;
-
-  let ticketHash = null;
   if (ticketStateEnabled) {
     if (!isValidTicketNonce(payloadTicketNonce)) {
       return createUnauthorizedResponse(origin, 'payload ticketNonce invalid');
@@ -4268,11 +4274,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     if (idleTimeoutSeconds === null || idleTimeoutSeconds < 0) {
       return createUnauthorizedResponse(origin, 'payload idle_timeout invalid');
-    }
-
-    ticketHash = await sha256Hash(`${payload}:${payloadSign}`);
-    if (!ticketHash) {
-      return createUnauthorizedResponse(origin, 'payload ticket hash invalid');
     }
   }
 
@@ -4350,12 +4351,40 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return createUnauthorizedResponse(origin, 'ticket state issued_at invalid');
     }
 
+    if (!Number.isInteger(ticketState.hardExpireAt) || ticketState.hardExpireAt <= 0) {
+      return createUnauthorizedResponse(origin, 'ticket state hard_expire_at invalid');
+    }
+
+    if (!Number.isInteger(ticketState.idleTimeoutSeconds) || ticketState.idleTimeoutSeconds < 0) {
+      return createUnauthorizedResponse(origin, 'ticket state idle_timeout_seconds invalid');
+    }
+
+    if (ticketState.firstUsedAt != null && (!Number.isInteger(ticketState.firstUsedAt) || ticketState.firstUsedAt < 0)) {
+      return createUnauthorizedResponse(origin, 'ticket state first_used_at invalid');
+    }
+
+    if (ticketState.idlePolicy !== 'first_use' && ticketState.idlePolicy !== 'renewable') {
+      return createUnauthorizedResponse(origin, 'ticket state idle_policy invalid');
+    }
+
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
     if (ticketState.firstUsedAt == null) {
-      const idleAge = Math.floor(Date.now() / 1000) - ticketState.issuedAt;
-      if (idleAge > idleTimeoutSeconds) {
+      const idleAge = nowSeconds - ticketState.issuedAt;
+      if (idleAge >= ticketState.idleTimeoutSeconds) {
         await slowFailDelay();
         return createErrorResponse(origin, 410, 'Link expired due to inactivity');
       }
+    } else if (ticketState.idlePolicy === 'renewable') {
+      if (!Number.isInteger(ticketState.idleLeaseExpiresAt) || ticketState.idleLeaseExpiresAt <= 0) {
+        return createUnauthorizedResponse(origin, 'link expired');
+      }
+
+      if (nowSeconds >= Math.min(ticketState.hardExpireAt, ticketState.idleLeaseExpiresAt)) {
+        return createUnauthorizedResponse(origin, 'link expired');
+      }
+    } else if (nowSeconds >= ticketState.hardExpireAt) {
+      return createUnauthorizedResponse(origin, 'link expired');
     }
   }
 
@@ -5334,6 +5363,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       requestId,
       hardExpireAtMs,
       nowMs: Date.now(),
+      ticketHash,
     };
   };
 

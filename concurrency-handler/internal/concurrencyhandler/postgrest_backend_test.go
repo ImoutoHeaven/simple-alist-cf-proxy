@@ -296,7 +296,7 @@ func TestPostgrestBackendAckHandoffTerminalRequiresReason(t *testing.T) {
 	}
 }
 
-func TestPostgrestBackendHeartbeatOpenUsesFixedRPC(t *testing.T) {
+func TestPostgrestBackendHeartbeatOpenUsesFixedRPCAndIncludesTicketHash(t *testing.T) {
 	var gotPath string
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -319,14 +319,16 @@ func TestPostgrestBackendHeartbeatOpenUsesFixedRPC(t *testing.T) {
 	cfg.Backend.Postgrest.BaseURL = srv.URL
 	backend := newPostgrestBackend(cfg, srv.Client())
 
-	result, err := backend.HeartbeatOpen(context.Background(), HeartbeatOpenRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", HardExpireAtMs: 50000, NowMs: 1000, HeartbeatTimeoutMs: 15000, AckTimeoutMs: 2000, HeartbeatIntervalMs: 5000, ReconnectGraceMs: 12000, StartTimeoutMs: 7000})
+	req := HeartbeatOpenRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", HardExpireAtMs: 50000, NowMs: 1000, HeartbeatTimeoutMs: 15000, AckTimeoutMs: 2000, HeartbeatIntervalMs: 5000, ReconnectGraceMs: 12000, StartTimeoutMs: 7000}
+	setTestStructStringField(&req, "TicketHash", "ticket-hash-1")
+	result, err := backend.HeartbeatOpen(context.Background(), req)
 	if err != nil {
 		t.Fatalf("HeartbeatOpen error: %v", err)
 	}
 	if gotPath != "/rpc/cq_heartbeat_open" {
 		t.Fatalf("expected heartbeat open rpc path, got %s", gotPath)
 	}
-	if gotBody["p_request_id"] != "request-1" || gotBody["p_lease_id"] != "lease-1" || gotBody["p_start_timeout_ms"] != float64(7000) {
+	if gotBody["p_request_id"] != "request-1" || gotBody["p_lease_id"] != "lease-1" || gotBody["p_ticket_hash"] != "ticket-hash-1" || gotBody["p_start_timeout_ms"] != float64(7000) {
 		t.Fatalf("unexpected heartbeat open payload: %v", gotBody)
 	}
 	if result.Result != "accepted" || result.Generation != 1 || result.DeadlineMs != 2000 {
@@ -334,10 +336,19 @@ func TestPostgrestBackendHeartbeatOpenUsesFixedRPC(t *testing.T) {
 	}
 }
 
-func TestPostgrestBackendHeartbeatRefreshAllowsAcceptedMinimalTimingShape(t *testing.T) {
+
+func TestPostgrestBackendHeartbeatRefreshAllowsAcceptedMinimalTimingShapeAndIncludesTicketHash(t *testing.T) {
 	var gotPath string
+	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[{"result":"accepted","generation":2,"deadline_ms":21000,"heartbeat_timeout_ms":15000,"hard_expire_at_ms":50000}]`))
 	}))
@@ -349,12 +360,17 @@ func TestPostgrestBackendHeartbeatRefreshAllowsAcceptedMinimalTimingShape(t *tes
 	cfg.Backend.Postgrest.BaseURL = srv.URL
 	backend := newPostgrestBackend(cfg, srv.Client())
 
-	result, err := backend.HeartbeatRefresh(context.Background(), HeartbeatRefreshRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", Generation: 2, NowMs: 6000, HeartbeatTimeoutMs: 15000})
+	req := HeartbeatRefreshRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", Generation: 2, NowMs: 6000, HeartbeatTimeoutMs: 15000}
+	setTestStructStringField(&req, "TicketHash", "ticket-hash-1")
+	result, err := backend.HeartbeatRefresh(context.Background(), req)
 	if err != nil {
 		t.Fatalf("HeartbeatRefresh error: %v", err)
 	}
 	if gotPath != "/rpc/cq_heartbeat_refresh" {
 		t.Fatalf("expected heartbeat refresh rpc path, got %s", gotPath)
+	}
+	if gotBody["p_ticket_hash"] != "ticket-hash-1" {
+		t.Fatalf("expected heartbeat refresh payload to include p_ticket_hash, got %v", gotBody)
 	}
 	if result.Result != "accepted" || result.Generation != 2 || result.DeadlineMs != 21000 || result.HeartbeatTimeoutMs != 15000 || result.HardExpireAtMs != 50000 {
 		t.Fatalf("unexpected heartbeat refresh result: %+v", result)

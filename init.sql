@@ -39,8 +39,13 @@ CREATE INDEX IF NOT EXISTS idx_download_cache_hostname
 CREATE TABLE IF NOT EXISTS "DOWNLOAD_TICKET_STATE_TABLE" (
   "TICKET_HASH" TEXT NOT NULL,
   "ISSUED_AT" BIGINT NOT NULL,
-  "FIRST_USED_AT" BIGINT NULL,
   "HARD_EXPIRE_AT" BIGINT NOT NULL,
+  "IDLE_TIMEOUT_SECONDS" INTEGER NOT NULL,
+  "FIRST_USED_AT" BIGINT NULL,
+  "IDLE_POLICY" TEXT NOT NULL CHECK ("IDLE_POLICY" IN ('first_use', 'renewable')),
+  "IDLE_LEASE_EXPIRES_AT" BIGINT NOT NULL,
+  "IDLE_RENEW_OWNER_LEASE_ID" UUID NULL,
+  "IDLE_RENEW_OWNER_LAST_HEARTBEAT_AT" BIGINT NULL,
   "IP_HASH" TEXT NULL,
   "PATH_HASH" TEXT NULL,
   PRIMARY KEY ("TICKET_HASH")
@@ -57,6 +62,7 @@ CREATE OR REPLACE FUNCTION download_seed_ticket(
   p_ticket_hash TEXT,
   p_issued_at BIGINT,
   p_hard_expire_at BIGINT,
+  p_idle_timeout_seconds INTEGER,
   p_ip_hash TEXT DEFAULT NULL,
   p_path_hash TEXT DEFAULT NULL,
   p_table_name TEXT DEFAULT 'DOWNLOAD_TICKET_STATE_TABLE'
@@ -66,12 +72,12 @@ DECLARE
   sql TEXT;
 BEGIN
   sql := format(
-    'INSERT INTO %1$I ("TICKET_HASH", "ISSUED_AT", "FIRST_USED_AT", "HARD_EXPIRE_AT", "IP_HASH", "PATH_HASH")
-     VALUES ($1, $2, NULL, $3, $4, $5)',
+    'INSERT INTO %1$I ("TICKET_HASH", "ISSUED_AT", "FIRST_USED_AT", "HARD_EXPIRE_AT", "IDLE_TIMEOUT_SECONDS", "IDLE_POLICY", "IDLE_LEASE_EXPIRES_AT", "IDLE_RENEW_OWNER_LEASE_ID", "IDLE_RENEW_OWNER_LAST_HEARTBEAT_AT", "IP_HASH", "PATH_HASH")
+     VALUES ($1, $2, NULL, $3, $4, ''first_use'', $2 + $4, NULL, NULL, $5, $6)',
     p_table_name
   );
 
-  EXECUTE sql USING p_ticket_hash, p_issued_at, p_hard_expire_at, p_ip_hash, p_path_hash;
+  EXECUTE sql USING p_ticket_hash, p_issued_at, p_hard_expire_at, p_idle_timeout_seconds, p_ip_hash, p_path_hash;
   RETURN json_build_object('result', 'seeded');
 EXCEPTION
   WHEN unique_violation THEN
@@ -95,6 +101,11 @@ RETURNS TABLE(
   issued_at BIGINT,
   first_used_at BIGINT,
   hard_expire_at BIGINT,
+  idle_timeout_seconds INTEGER,
+  idle_policy TEXT,
+  idle_lease_expires_at BIGINT,
+  idle_renew_owner_lease_id UUID,
+  idle_renew_owner_last_heartbeat_at BIGINT,
   ip_hash TEXT,
   path_hash TEXT
 ) AS $$
@@ -108,6 +119,11 @@ BEGIN
             "ISSUED_AT",
             "FIRST_USED_AT",
             "HARD_EXPIRE_AT",
+            "IDLE_TIMEOUT_SECONDS",
+            "IDLE_POLICY",
+            "IDLE_LEASE_EXPIRES_AT",
+            "IDLE_RENEW_OWNER_LEASE_ID",
+            "IDLE_RENEW_OWNER_LAST_HEARTBEAT_AT",
             "IP_HASH",
             "PATH_HASH"
        FROM %1$I
@@ -120,7 +136,7 @@ BEGIN
   GET DIAGNOSTICS v_row_count = ROW_COUNT;
 
   IF v_row_count = 0 THEN
-    RETURN QUERY SELECT FALSE, NULL::TEXT, NULL::BIGINT, NULL::BIGINT, NULL::BIGINT, NULL::TEXT, NULL::TEXT;
+    RETURN QUERY SELECT FALSE, NULL::TEXT, NULL::BIGINT, NULL::BIGINT, NULL::BIGINT, NULL::INTEGER, NULL::TEXT, NULL::BIGINT, NULL::UUID, NULL::BIGINT, NULL::TEXT, NULL::TEXT;
   END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -1999,8 +2015,6 @@ RETURNS trigger AS $$
 BEGIN
   IF NEW.state IN ('released', 'expired', 'cancelled') THEN
     NEW.heartbeat_state := 'none';
-    NEW.heartbeat_deadline_ms := NULL;
-    NEW.heartbeat_grace_until_ms := NULL;
     NEW.heartbeat_terminal_reason := NEW.terminal_reason;
   END IF;
   RETURN NEW;
@@ -2079,8 +2093,6 @@ BEGIN
       claim_state = CASE WHEN p_claim_state IS NOT NULL THEN p_claim_state ELSE claim_state END,
       handoff_state = CASE WHEN p_handoff_state IS NOT NULL THEN p_handoff_state ELSE handoff_state END,
       heartbeat_state = 'none',
-      heartbeat_deadline_ms = NULL,
-      heartbeat_grace_until_ms = NULL,
       heartbeat_terminal_reason = p_terminal_reason,
       updated_at_ms = p_now_ms
   WHERE request_id = p_request_id
@@ -2119,6 +2131,75 @@ BEGIN
     AND ip_bucket = v_request.ip_bucket;
 
   RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_heartbeat_touch_ticket_renewal(
+  p_ticket_hash text,
+  p_lease_id uuid,
+  p_now_ms bigint
+)
+RETURNS text AS $$
+DECLARE
+  v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
+  v_now_seconds bigint := v_now_ms / 1000;
+  v_ticket "DOWNLOAD_TICKET_STATE_TABLE"%ROWTYPE;
+  v_owner_request concurrency_requests%ROWTYPE;
+  v_ticket_row_count bigint := 0;
+  v_owner_row_count bigint := 0;
+  v_owner_is_stale boolean := TRUE;
+  v_idle_lease_expires_at bigint;
+BEGIN
+  IF BTRIM(COALESCE(p_ticket_hash, '')) = '' OR p_lease_id IS NULL THEN
+    RETURN 'invalid_request';
+  END IF;
+
+  SELECT *
+    INTO v_ticket
+  FROM "DOWNLOAD_TICKET_STATE_TABLE"
+  WHERE "TICKET_HASH" = p_ticket_hash
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_ticket_row_count = ROW_COUNT;
+
+  IF v_ticket_row_count = 0 THEN
+    -- Disabled ticket-state mode still threads ticketHash through CQ,
+    -- but it never seeds a renewal row for handler-side writes.
+    RETURN 'noop';
+  END IF;
+
+  IF COALESCE(v_ticket."IDLE_TIMEOUT_SECONDS", 0) <= 0 THEN
+    RETURN 'noop';
+  END IF;
+
+  IF v_ticket."IDLE_RENEW_OWNER_LEASE_ID" IS NOT NULL THEN
+    SELECT *
+      INTO v_owner_request
+    FROM concurrency_requests
+    WHERE lease_id = v_ticket."IDLE_RENEW_OWNER_LEASE_ID"
+    FOR UPDATE;
+
+    GET DIAGNOSTICS v_owner_row_count = ROW_COUNT;
+
+    IF v_owner_row_count > 0 AND COALESCE(v_owner_request.heartbeat_deadline_ms, 0) > v_now_ms THEN
+      v_owner_is_stale := FALSE;
+    END IF;
+  END IF;
+
+  IF v_ticket."IDLE_RENEW_OWNER_LEASE_ID" IS DISTINCT FROM p_lease_id AND NOT v_owner_is_stale THEN
+    RETURN 'noop';
+  END IF;
+
+  v_idle_lease_expires_at := LEAST(v_ticket."HARD_EXPIRE_AT", v_now_seconds + v_ticket."IDLE_TIMEOUT_SECONDS");
+
+  UPDATE "DOWNLOAD_TICKET_STATE_TABLE"
+  SET "IDLE_POLICY" = 'renewable',
+      "IDLE_LEASE_EXPIRES_AT" = v_idle_lease_expires_at,
+      "IDLE_RENEW_OWNER_LEASE_ID" = p_lease_id,
+      "IDLE_RENEW_OWNER_LAST_HEARTBEAT_AT" = v_now_seconds
+  WHERE "TICKET_HASH" = p_ticket_hash;
+
+  RETURN 'updated';
 END;
 $$ LANGUAGE plpgsql;
 
@@ -3763,6 +3844,7 @@ CREATE OR REPLACE FUNCTION cq_heartbeat_open(
   p_request_id text,
   p_lease_id uuid,
   p_lease_token text,
+  p_ticket_hash text,
   p_hard_expire_at_ms bigint,
   p_now_ms bigint,
   p_heartbeat_timeout_ms bigint,
@@ -3776,17 +3858,20 @@ DECLARE
   v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
   v_request_id text := BTRIM(COALESCE(p_request_id, ''));
   v_lease_token text := BTRIM(COALESCE(p_lease_token, ''));
+  v_ticket_hash text := BTRIM(COALESCE(p_ticket_hash, ''));
   v_request concurrency_requests%ROWTYPE;
   v_active_lease concurrency_leases%ROWTYPE;
   v_request_row_count bigint := 0;
   v_active_lease_row_count bigint := 0;
   v_transitioned boolean := FALSE;
+  v_ticket_renewal_result text := NULL;
   v_generation bigint := 0;
   v_deadline_ms bigint := NULL;
 BEGIN
   IF v_request_id = ''
     OR p_lease_id IS NULL
     OR v_lease_token = ''
+    OR v_ticket_hash = ''
     OR COALESCE(p_hard_expire_at_ms, 0) <= 0
     OR COALESCE(p_heartbeat_timeout_ms, 0) <= 0
     OR COALESCE(p_ack_timeout_ms, 0) <= 0
@@ -3800,6 +3885,7 @@ BEGIN
   END IF;
 
   PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+  PERFORM pg_advisory_xact_lock(4, hashtext(v_ticket_hash));
 
   SELECT *
     INTO v_request
@@ -3948,6 +4034,21 @@ BEGIN
       RETURN;
   END CASE;
 
+  v_ticket_renewal_result := cq_heartbeat_touch_ticket_renewal(v_ticket_hash, p_lease_id, v_now_ms);
+  IF v_ticket_renewal_result = 'invalid_request' THEN
+    result := 'conflict';
+    reason := 'invalid_request';
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  ELSIF v_ticket_renewal_result = 'ticket_not_found' THEN
+    result := 'conflict';
+    reason := 'ticket_not_found';
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
   v_generation := COALESCE(v_request.heartbeat_generation, 0) + 1;
   v_deadline_ms := LEAST(v_now_ms + p_heartbeat_timeout_ms, v_request.hard_expire_at_ms);
 
@@ -3981,6 +4082,7 @@ CREATE OR REPLACE FUNCTION cq_heartbeat_refresh(
   p_request_id text,
   p_lease_id uuid,
   p_lease_token text,
+  p_ticket_hash text,
   p_generation bigint,
   p_now_ms bigint,
   p_heartbeat_timeout_ms bigint
@@ -3990,16 +4092,19 @@ DECLARE
   v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
   v_request_id text := BTRIM(COALESCE(p_request_id, ''));
   v_lease_token text := BTRIM(COALESCE(p_lease_token, ''));
+  v_ticket_hash text := BTRIM(COALESCE(p_ticket_hash, ''));
   v_request concurrency_requests%ROWTYPE;
   v_active_lease concurrency_leases%ROWTYPE;
   v_request_row_count bigint := 0;
   v_active_lease_row_count bigint := 0;
   v_transitioned boolean := FALSE;
+  v_ticket_renewal_result text := NULL;
   v_deadline_ms bigint := NULL;
 BEGIN
   IF v_request_id = ''
     OR p_lease_id IS NULL
     OR v_lease_token = ''
+    OR v_ticket_hash = ''
     OR COALESCE(p_generation, 0) <= 0
     OR COALESCE(p_heartbeat_timeout_ms, 0) <= 0 THEN
     result := 'conflict';
@@ -4009,6 +4114,7 @@ BEGIN
   END IF;
 
   PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+  PERFORM pg_advisory_xact_lock(4, hashtext(v_ticket_hash));
 
   SELECT *
     INTO v_request
@@ -4126,6 +4232,21 @@ BEGIN
     reason := 'stale_generation';
     generation := v_request.heartbeat_generation;
     deadline_ms := v_request.heartbeat_deadline_ms;
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  v_ticket_renewal_result := cq_heartbeat_touch_ticket_renewal(v_ticket_hash, p_lease_id, v_now_ms);
+  IF v_ticket_renewal_result = 'invalid_request' THEN
+    result := 'conflict';
+    reason := 'invalid_request';
+    hard_expire_at_ms := v_request.hard_expire_at_ms;
+    RETURN NEXT;
+    RETURN;
+  ELSIF v_ticket_renewal_result = 'ticket_not_found' THEN
+    result := 'conflict';
+    reason := 'ticket_not_found';
     hard_expire_at_ms := v_request.hard_expire_at_ms;
     RETURN NEXT;
     RETURN;

@@ -567,12 +567,17 @@ describe('init.sql breaker RPC definitions', () => {
 });
 
 describe('init.sql ticket-state contract definitions', () => {
-  it('defines the ticket-state table with the ticket hash primary key and hard-expiry index', () => {
+  it('defines the dual-policy ticket-state table with renewal ownership fields and hard-expiry index', () => {
     expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS "DOWNLOAD_TICKET_STATE_TABLE"/i);
     expect(initSql).toMatch(/"TICKET_HASH"\s+TEXT\s+NOT NULL/i);
     expect(initSql).toMatch(/"ISSUED_AT"\s+BIGINT\s+NOT NULL/i);
-    expect(initSql).toMatch(/"FIRST_USED_AT"\s+BIGINT\s+NULL/i);
     expect(initSql).toMatch(/"HARD_EXPIRE_AT"\s+BIGINT\s+NOT NULL/i);
+    expect(initSql).toMatch(/"IDLE_TIMEOUT_SECONDS"\s+INTEGER\s+NOT NULL/i);
+    expect(initSql).toMatch(/"FIRST_USED_AT"\s+BIGINT\s+NULL/i);
+    expect(initSql).toMatch(/"IDLE_POLICY"\s+TEXT\s+NOT NULL\s+CHECK\s*\("IDLE_POLICY"\s+IN\s*\('first_use',\s*'renewable'\)\)/i);
+    expect(initSql).toMatch(/"IDLE_LEASE_EXPIRES_AT"\s+BIGINT\s+NOT NULL/i);
+    expect(initSql).toMatch(/"IDLE_RENEW_OWNER_LEASE_ID"\s+UUID\s+NULL/i);
+    expect(initSql).toMatch(/"IDLE_RENEW_OWNER_LAST_HEARTBEAT_AT"\s+BIGINT\s+NULL/i);
     expect(initSql).toMatch(/"IP_HASH"\s+TEXT\s+NULL/i);
     expect(initSql).toMatch(/"PATH_HASH"\s+TEXT\s+NULL/i);
     expect(initSql).toMatch(/PRIMARY KEY \("TICKET_HASH"\)/i);
@@ -584,32 +589,33 @@ describe('init.sql ticket-state contract definitions', () => {
     expect(initSql).not.toMatch(/CREATE OR REPLACE FUNCTION download_update_last_active\(/i);
   });
 
-  it('defines an insert-only seed rpc with seeded collision and storage_error outcomes', () => {
+  it('defines an insert-only seed rpc that seeds first_use policy and renewal defaults', () => {
     const functionBody = readFunctionBody('download_seed_ticket');
 
     expect(functionBody).toMatch(/p_ticket_hash\s+TEXT/i);
     expect(functionBody).toMatch(/p_issued_at\s+BIGINT/i);
     expect(functionBody).toMatch(/p_hard_expire_at\s+BIGINT/i);
+    expect(functionBody).toMatch(/p_idle_timeout_seconds\s+INTEGER/i);
     expect(functionBody).toMatch(/p_ip_hash\s+TEXT DEFAULT NULL/i);
     expect(functionBody).toMatch(/p_path_hash\s+TEXT DEFAULT NULL/i);
     expect(functionBody).toMatch(/p_table_name\s+TEXT DEFAULT 'DOWNLOAD_TICKET_STATE_TABLE'/i);
-    expect(functionBody).toMatch(/INSERT INTO %1\$I \("TICKET_HASH", "ISSUED_AT", "FIRST_USED_AT", "HARD_EXPIRE_AT", "IP_HASH", "PATH_HASH"\)/i);
-    expect(functionBody).toMatch(/VALUES \(\$1, \$2, NULL, \$3, \$4, \$5\)/i);
+    expect(functionBody).toMatch(/INSERT INTO %1\$I \("TICKET_HASH", "ISSUED_AT", "FIRST_USED_AT", "HARD_EXPIRE_AT", "IDLE_TIMEOUT_SECONDS", "IDLE_POLICY", "IDLE_LEASE_EXPIRES_AT", "IDLE_RENEW_OWNER_LEASE_ID", "IDLE_RENEW_OWNER_LAST_HEARTBEAT_AT", "IP_HASH", "PATH_HASH"\)/i);
+    expect(functionBody).toMatch(/VALUES \(\$1, \$2, NULL, \$3, \$4, ''first_use'', \$2 \+ \$4, NULL, NULL, \$5, \$6\)/i);
     expect(functionBody).toMatch(/RETURN json_build_object\('result', 'seeded'\)/i);
     expect(functionBody).toMatch(/WHEN unique_violation THEN\s+RETURN json_build_object\('result', 'collision'\)/i);
     expect(functionBody).toMatch(/WHEN others THEN\s+RETURN json_build_object\('result', 'storage_error', 'error', SQLERRM\)/i);
     expect(functionBody).not.toMatch(/ON CONFLICT/i);
   });
 
-  it('defines a ticket-state read rpc with found and ticket lifecycle fields', () => {
+  it('defines a ticket-state read rpc with dual-policy lifecycle and renewal ownership fields', () => {
     const functionBody = readFunctionBody('download_get_ticket_state');
 
     expect(functionBody).toMatch(/p_ticket_hash\s+TEXT/i);
     expect(functionBody).toMatch(/p_table_name\s+TEXT DEFAULT 'DOWNLOAD_TICKET_STATE_TABLE'/i);
-    expect(functionBody).toMatch(/RETURNS TABLE\s*\(\s*found BOOLEAN,\s*ticket_hash TEXT,\s*issued_at BIGINT,\s*first_used_at BIGINT,\s*hard_expire_at BIGINT,\s*ip_hash TEXT,\s*path_hash TEXT\s*\)/i);
+    expect(functionBody).toMatch(/RETURNS TABLE\s*\(\s*found BOOLEAN,\s*ticket_hash TEXT,\s*issued_at BIGINT,\s*first_used_at BIGINT,\s*hard_expire_at BIGINT,\s*idle_timeout_seconds INTEGER,\s*idle_policy TEXT,\s*idle_lease_expires_at BIGINT,\s*idle_renew_owner_lease_id UUID,\s*idle_renew_owner_last_heartbeat_at BIGINT,\s*ip_hash TEXT,\s*path_hash TEXT\s*\)/i);
   });
 
-  it('defines a mark-used rpc with transitioned already_used and storage_error outcomes', () => {
+  it('defines a mark-used rpc that only updates first-use state', () => {
     const functionBody = readFunctionBody('download_mark_ticket_used');
 
     expect(functionBody).toMatch(/p_ticket_hash\s+TEXT/i);
@@ -620,6 +626,10 @@ describe('init.sql ticket-state contract definitions', () => {
     expect(functionBody).toMatch(/RETURN json_build_object\('result', 'transitioned', 'first_used_at', v_effective_first_used_at\)/i);
     expect(functionBody).toMatch(/RETURN json_build_object\('result', 'already_used', 'first_used_at', v_effective_first_used_at\)/i);
     expect(functionBody).toMatch(/RETURN json_build_object\('result', 'storage_error'\)/i);
+    expect(functionBody).not.toMatch(/SET[\s\S]*?"IDLE_POLICY"/i);
+    expect(functionBody).not.toMatch(/SET[\s\S]*?"IDLE_LEASE_EXPIRES_AT"/i);
+    expect(functionBody).not.toMatch(/SET[\s\S]*?"IDLE_RENEW_OWNER_LEASE_ID"/i);
+    expect(functionBody).not.toMatch(/SET[\s\S]*?"IDLE_RENEW_OWNER_LAST_HEARTBEAT_AT"/i);
   });
 
   it('defines ticket cleanup by hard expiry and removes legacy last-active outputs from download_unified_check', () => {
@@ -663,6 +673,12 @@ describe('init.sql heartbeat contract definitions', () => {
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_heartbeat_disconnect\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_expire_heartbeat_if_due\(/i);
 
+    const openBody = readFunctionBody('cq_heartbeat_open');
+    const refreshBody = readFunctionBody('cq_heartbeat_refresh');
+
+    expect(openBody).toMatch(/p_ticket_hash\s+text/i);
+    expect(refreshBody).toMatch(/p_ticket_hash\s+text/i);
+
     const ackBody = readFunctionBody('cq_ack_handoff');
     expect(ackBody).toMatch(/p_start_timeout_ms\s+bigint/i);
     expect(ackBody).toMatch(/RETURNS TABLE\s*\(\s*result\s+text,\s*reason\s+text,\s*heartbeat_deadline_ms\s+bigint\s*\)/i);
@@ -670,12 +686,41 @@ describe('init.sql heartbeat contract definitions', () => {
     expect(ackBody).toMatch(/heartbeat_deadline_ms\s*=\s*LEAST\(v_commit_now_ms \+ p_start_timeout_ms, v_request\.hard_expire_at_ms\)/i);
   });
 
+  it('locks ticket renewal ownership before authoritative request rows to avoid fan-out deadlocks', () => {
+    const openBody = readFunctionBody('cq_heartbeat_open');
+    const refreshBody = readFunctionBody('cq_heartbeat_refresh');
+
+    const openTicketLockIndex = expectPatternIndex(
+      openBody,
+      /pg_advisory_xact_lock\(4,\s*hashtext\(v_ticket_hash\)\)/i,
+      'expected cq_heartbeat_open to take a ticketHash advisory lock before request-row locking',
+    );
+    const openRequestRowLockIndex = expectPatternIndex(
+      openBody,
+      /FROM concurrency_requests\s+WHERE request_id = v_request_id\s+FOR UPDATE/i,
+      'expected cq_heartbeat_open to lock the authoritative request row',
+    );
+    expect(openTicketLockIndex).toBeLessThan(openRequestRowLockIndex);
+
+    const refreshTicketLockIndex = expectPatternIndex(
+      refreshBody,
+      /pg_advisory_xact_lock\(4,\s*hashtext\(v_ticket_hash\)\)/i,
+      'expected cq_heartbeat_refresh to take a ticketHash advisory lock before request-row locking',
+    );
+    const refreshRequestRowLockIndex = expectPatternIndex(
+      refreshBody,
+      /FROM concurrency_requests\s+WHERE request_id = v_request_id\s+FOR UPDATE/i,
+      'expected cq_heartbeat_refresh to lock the authoritative request row',
+    );
+    expect(refreshTicketLockIndex).toBeLessThan(refreshRequestRowLockIndex);
+  });
+
   it('applies deterministic heartbeat cleanup on terminal request transitions', () => {
     const helperBody = readFunctionBody('cq_apply_request_terminal_transition');
 
     expect(helperBody).toMatch(/heartbeat_state\s*=\s*'none'/i);
-    expect(helperBody).toMatch(/heartbeat_deadline_ms\s*=\s*NULL/i);
-    expect(helperBody).toMatch(/heartbeat_grace_until_ms\s*=\s*NULL/i);
+    expect(helperBody).not.toMatch(/heartbeat_deadline_ms\s*=\s*NULL/i);
+    expect(helperBody).not.toMatch(/heartbeat_grace_until_ms\s*=\s*NULL/i);
     expect(helperBody).toMatch(/heartbeat_terminal_reason\s*=\s*p_terminal_reason/i);
     expect(helperBody).not.toMatch(/heartbeat_generation\s*=\s*0/i);
     expect(helperBody).not.toMatch(/heartbeat_last_at_ms\s*=\s*NULL/i);

@@ -70,6 +70,7 @@ type HeartbeatOpenRequest struct {
 	RequestID           string
 	LeaseID             string
 	LeaseToken          string
+	TicketHash          string
 	HardExpireAtMs      int64
 	NowMs               int64
 	HeartbeatTimeoutMs  int64
@@ -83,6 +84,7 @@ type HeartbeatRefreshRequest struct {
 	RequestID          string
 	LeaseID            string
 	LeaseToken         string
+	TicketHash         string
 	Generation         int64
 	NowMs              int64
 	HeartbeatTimeoutMs int64
