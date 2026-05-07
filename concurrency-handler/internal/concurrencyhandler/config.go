@@ -35,9 +35,10 @@ type AuthConfig struct {
 }
 
 type BackendConfig struct {
-	Mode      string          `json:"mode"`
-	Postgrest PostgrestConfig `json:"postgrest"`
-	Postgres  PostgresConfig  `json:"postgres"`
+	Mode             string          `json:"mode"`
+	TicketStateTable string          `json:"ticketStateTable"`
+	Postgrest        PostgrestConfig `json:"postgrest"`
+	Postgres         PostgresConfig  `json:"postgres"`
 }
 
 type PostgrestConfig struct {
@@ -50,12 +51,12 @@ type PostgresConfig struct {
 }
 
 type ConcurrencyConfig struct {
-	Caps  ConcurrencyCapsConfig  `json:"caps"`
-	Lease ConcurrencyLeaseConfig `json:"lease"`
-	Wait  ConcurrencyWaitConfig  `json:"wait"`
-	Sweep ConcurrencySweepConfig `json:"sweep"`
+	Caps      ConcurrencyCapsConfig      `json:"caps"`
+	Lease     ConcurrencyLeaseConfig     `json:"lease"`
+	Wait      ConcurrencyWaitConfig      `json:"wait"`
+	Sweep     ConcurrencySweepConfig     `json:"sweep"`
 	Heartbeat ConcurrencyHeartbeatConfig `json:"heartbeat"`
-	RPC   ConcurrencyRPCConfig   `json:"rpc"`
+	RPC       ConcurrencyRPCConfig       `json:"rpc"`
 }
 
 type ConcurrencyCapsConfig struct {
@@ -86,15 +87,15 @@ type ConcurrencySweepConfig struct {
 }
 
 type ConcurrencyHeartbeatConfig struct {
-	Enabled           bool `json:"enabled"`
-	Required          bool `json:"required"`
-	IntervalMs        int  `json:"intervalMs"`
-	TimeoutMs         int  `json:"timeoutMs"`
-	ReconnectGraceMs  int  `json:"reconnectGraceMs"`
-	HelloTimeoutMs    int  `json:"helloTimeoutMs"`
-	StartTimeoutMs    int  `json:"startTimeoutMs"`
-	AckTimeoutMs      int  `json:"ackTimeoutMs"`
-	SchedulerBatchSize int `json:"schedulerBatchSize"`
+	Enabled            bool `json:"enabled"`
+	Required           bool `json:"required"`
+	IntervalMs         int  `json:"intervalMs"`
+	TimeoutMs          int  `json:"timeoutMs"`
+	ReconnectGraceMs   int  `json:"reconnectGraceMs"`
+	HelloTimeoutMs     int  `json:"helloTimeoutMs"`
+	StartTimeoutMs     int  `json:"startTimeoutMs"`
+	AckTimeoutMs       int  `json:"ackTimeoutMs"`
+	SchedulerBatchSize int  `json:"schedulerBatchSize"`
 }
 
 type ConcurrencyRPCConfig struct {
@@ -142,16 +143,24 @@ func ParseConfigBytes(data []byte) (Config, error) {
 
 func defaultHeartbeatConfig() ConcurrencyHeartbeatConfig {
 	return ConcurrencyHeartbeatConfig{
-		Enabled:           true,
-		Required:          true,
-		IntervalMs:        5000,
-		TimeoutMs:         15000,
-		ReconnectGraceMs:  12000,
-		HelloTimeoutMs:    2000,
-		StartTimeoutMs:    7000,
-		AckTimeoutMs:      2000,
+		Enabled:            true,
+		Required:           true,
+		IntervalMs:         5000,
+		TimeoutMs:          15000,
+		ReconnectGraceMs:   12000,
+		HelloTimeoutMs:     2000,
+		StartTimeoutMs:     7000,
+		AckTimeoutMs:       2000,
 		SchedulerBatchSize: 500,
 	}
+}
+
+func normalizeTicketStateTableName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "DOWNLOAD_TICKET_STATE_TABLE"
+	}
+	return trimmed
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -185,6 +194,7 @@ func (c *Config) Validate() error {
 	if c.Auth.Header == "" {
 		c.Auth.Header = "X-CQ-Auth"
 	}
+	c.Backend.TicketStateTable = normalizeTicketStateTableName(c.Backend.TicketStateTable)
 
 	mode := strings.ToLower(strings.TrimSpace(c.Backend.Mode))
 	if mode != "postgres" && mode != "postgrest" {

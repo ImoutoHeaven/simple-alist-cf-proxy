@@ -267,11 +267,11 @@ func (p *postgresBackend) AckHandoff(ctx context.Context, req AckHandoffBackendR
 }
 
 func (p *postgresBackend) HeartbeatOpen(ctx context.Context, req HeartbeatOpenRequest) (*HeartbeatResult, error) {
-	query, err := rpcSelectAll("cq_heartbeat_open", 11)
+	query, err := rpcSelectAll("cq_heartbeat_open", 12)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := p.db.Query(ctx, query, req.RequestID, req.LeaseID, req.LeaseToken, req.TicketHash, req.HardExpireAtMs, req.NowMs, req.HeartbeatTimeoutMs, req.AckTimeoutMs, req.HeartbeatIntervalMs, req.ReconnectGraceMs, req.StartTimeoutMs)
+	rows, err := p.db.Query(ctx, query, req.RequestID, req.LeaseID, req.LeaseToken, req.TicketHash, req.HardExpireAtMs, req.NowMs, req.HeartbeatTimeoutMs, req.AckTimeoutMs, req.HeartbeatIntervalMs, req.ReconnectGraceMs, req.StartTimeoutMs, normalizeTicketStateTableName(p.cfg.Backend.TicketStateTable))
 	if err != nil {
 		return nil, err
 	}
@@ -280,11 +280,11 @@ func (p *postgresBackend) HeartbeatOpen(ctx context.Context, req HeartbeatOpenRe
 }
 
 func (p *postgresBackend) HeartbeatRefresh(ctx context.Context, req HeartbeatRefreshRequest) (*HeartbeatResult, error) {
-	query, err := rpcSelectAll("cq_heartbeat_refresh", 7)
+	query, err := rpcSelectAll("cq_heartbeat_refresh", 8)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := p.db.Query(ctx, query, req.RequestID, req.LeaseID, req.LeaseToken, req.TicketHash, req.Generation, req.NowMs, req.HeartbeatTimeoutMs)
+	rows, err := p.db.Query(ctx, query, req.RequestID, req.LeaseID, req.LeaseToken, req.TicketHash, req.Generation, req.NowMs, req.HeartbeatTimeoutMs, normalizeTicketStateTableName(p.cfg.Backend.TicketStateTable))
 	if err != nil {
 		return nil, err
 	}

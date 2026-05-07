@@ -678,6 +678,10 @@ describe('init.sql heartbeat contract definitions', () => {
 
     expect(openBody).toMatch(/p_ticket_hash\s+text/i);
     expect(refreshBody).toMatch(/p_ticket_hash\s+text/i);
+    expect(openBody).toMatch(/p_ticket_table_name\s+text\s+DEFAULT\s+'DOWNLOAD_TICKET_STATE_TABLE'/i);
+    expect(refreshBody).toMatch(/p_ticket_table_name\s+text\s+DEFAULT\s+'DOWNLOAD_TICKET_STATE_TABLE'/i);
+    expect(openBody).toMatch(/cq_heartbeat_touch_ticket_renewal\(v_ticket_hash,\s*p_lease_id,\s*v_now_ms,\s*v_ticket_table_name\)/i);
+    expect(refreshBody).toMatch(/cq_heartbeat_touch_ticket_renewal\(v_ticket_hash,\s*p_lease_id,\s*v_now_ms,\s*v_ticket_table_name\)/i);
 
     const ackBody = readFunctionBody('cq_ack_handoff');
     expect(ackBody).toMatch(/p_start_timeout_ms\s+bigint/i);
@@ -724,6 +728,24 @@ describe('init.sql heartbeat contract definitions', () => {
     expect(helperBody).toMatch(/heartbeat_terminal_reason\s*=\s*p_terminal_reason/i);
     expect(helperBody).not.toMatch(/heartbeat_generation\s*=\s*0/i);
     expect(helperBody).not.toMatch(/heartbeat_last_at_ms\s*=\s*NULL/i);
+  });
+
+  it('keeps terminal renewal owners non-stale until the preserved heartbeat contract expires while allowing custom ticket tables', () => {
+    const helperBody = readFunctionBody('cq_heartbeat_touch_ticket_renewal');
+
+    expect(helperBody).toMatch(/p_ticket_table_name\s+text\s+DEFAULT\s+'DOWNLOAD_TICKET_STATE_TABLE'/i);
+    expect(helperBody).toMatch(/v_ticket_table_name\s+text\s*:=\s*COALESCE\(NULLIF\(BTRIM\(COALESCE\(p_ticket_table_name,\s*''\)\),\s*''\),\s*'DOWNLOAD_TICKET_STATE_TABLE'\)/i);
+    expect(helperBody).toMatch(/SELECT \* FROM %1\$I WHERE "TICKET_HASH" = \$1 FOR UPDATE/i);
+    expect(helperBody).toMatch(/WHERE lease_id = v_ticket\."IDLE_RENEW_OWNER_LEASE_ID"/i);
+    expect(helperBody).not.toMatch(/AND state = 'active'/i);
+    expect(helperBody).toMatch(/UPDATE %1\$I/i);
+  });
+
+  it('fails closed when the seeded renewal row is missing instead of accepting a compatibility noop path', () => {
+    const helperBody = readFunctionBody('cq_heartbeat_touch_ticket_renewal');
+
+    expect(helperBody).toMatch(/IF v_ticket_row_count = 0 THEN\s+RETURN 'ticket_not_found';\s+END IF;/i);
+    expect(helperBody).not.toMatch(/IF v_ticket_row_count = 0 THEN\s+RETURN 'noop';\s+END IF;/i);
   });
 
   it('gives hard expiry precedence before heartbeat start timeout and heartbeat timeout', () => {

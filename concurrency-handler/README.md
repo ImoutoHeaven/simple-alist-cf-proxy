@@ -113,6 +113,7 @@ The first client frame is `hello` and must include:
 - `requestId`
 - `leaseId`
 - `leaseToken`
+- `ticketHash`
 - `hardExpireAtMs`
 - `clientInstanceId`
 - `attempt`
@@ -136,6 +137,7 @@ Subsequent client refresh frames are `heartbeat` and must include:
 - `requestId`
 - `leaseId`
 - `leaseToken`
+- `ticketHash`
 - `generation`
 - `nowMs`
 
@@ -197,6 +199,8 @@ HTTP release is terminal and idempotent. Terminal release, terminal cancel, and 
 
 - `postgres`
 - `postgrest`
+
+`backend.ticketStateTable` defaults to `DOWNLOAD_TICKET_STATE_TABLE`. Set it to the same table name used by the worker-side `download.db.ticketStateTable` when you are deploying CQ against a non-default ticket-state table.
 
 Both modes normalize to the same service-level waiting contract: `granted|wait|conflict|released|cancelled|expired` for `acquire`, `released|noop` for `release`, and `cancelled|noop|conflict` for `cancel`. The transport changes, not the contract.
 

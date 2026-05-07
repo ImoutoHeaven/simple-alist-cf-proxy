@@ -43,14 +43,14 @@ func validTestConfig() Config {
 				BatchSize:       500,
 			},
 			Heartbeat: ConcurrencyHeartbeatConfig{
-				Enabled:           true,
-				Required:          true,
-				IntervalMs:        5000,
-				TimeoutMs:         15000,
-				ReconnectGraceMs:  12000,
-				HelloTimeoutMs:    2000,
-				StartTimeoutMs:    7000,
-				AckTimeoutMs:      2000,
+				Enabled:            true,
+				Required:           true,
+				IntervalMs:         5000,
+				TimeoutMs:          15000,
+				ReconnectGraceMs:   12000,
+				HelloTimeoutMs:     2000,
+				StartTimeoutMs:     7000,
+				AckTimeoutMs:       2000,
 				SchedulerBatchSize: 500,
 			},
 			RPC: ConcurrencyRPCConfig{
@@ -203,6 +203,33 @@ func TestParseConfigBytesAppliesDefaults(t *testing.T) {
 	}
 	if cfg.Concurrency.Heartbeat.SchedulerBatchSize != 500 {
 		t.Fatalf("expected heartbeat schedulerBatchSize default 500, got %+v", cfg.Concurrency.Heartbeat)
+	}
+}
+
+func TestParseConfigBytesPreservesCustomTicketStateTable(t *testing.T) {
+	data := []byte(`{
+		"controller": {},
+		"auth": {"enabled": true, "token": "secret"},
+		"backend": {
+			"mode": "postgrest",
+			"ticketStateTable": "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE",
+			"postgrest": {"baseUrl": "https://postgrest.example.test"}
+		},
+		"concurrency": {
+			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
+			"lease": {"requireHardExpiry": true},
+			"wait": {"waitPollWindowMs": 10000, "waitReconnectGraceMs": 1500},
+			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
+			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
+		}
+	}`)
+
+	cfg, err := ParseConfigBytes(data)
+	if err != nil {
+		t.Fatalf("ParseConfigBytes error: %v", err)
+	}
+	if got := requireTestStructStringField(t, cfg.Backend, "TicketStateTable"); got != "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE" {
+		t.Fatalf("expected custom backend ticketStateTable preserved, got %q", got)
 	}
 }
 

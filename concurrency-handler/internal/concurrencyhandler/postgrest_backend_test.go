@@ -112,6 +112,7 @@ func TestPostgrestClaimGrantUsesFixedRPCAndNormalizesResult(t *testing.T) {
 	cfg.Backend.Mode = "postgrest"
 	cfg.Backend.Postgres.DSN = ""
 	cfg.Backend.Postgrest.BaseURL = srv.URL
+	setTestStructStringField(&cfg.Backend, "TicketStateTable", "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE")
 	backend := newPostgrestBackend(cfg, srv.Client())
 
 	result, err := backend.ClaimGrant(context.Background(), ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-1", NowMs: 1000})
@@ -317,6 +318,7 @@ func TestPostgrestBackendHeartbeatOpenUsesFixedRPCAndIncludesTicketHash(t *testi
 	cfg.Backend.Mode = "postgrest"
 	cfg.Backend.Postgres.DSN = ""
 	cfg.Backend.Postgrest.BaseURL = srv.URL
+	setTestStructStringField(&cfg.Backend, "TicketStateTable", "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE")
 	backend := newPostgrestBackend(cfg, srv.Client())
 
 	req := HeartbeatOpenRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", HardExpireAtMs: 50000, NowMs: 1000, HeartbeatTimeoutMs: 15000, AckTimeoutMs: 2000, HeartbeatIntervalMs: 5000, ReconnectGraceMs: 12000, StartTimeoutMs: 7000}
@@ -328,14 +330,13 @@ func TestPostgrestBackendHeartbeatOpenUsesFixedRPCAndIncludesTicketHash(t *testi
 	if gotPath != "/rpc/cq_heartbeat_open" {
 		t.Fatalf("expected heartbeat open rpc path, got %s", gotPath)
 	}
-	if gotBody["p_request_id"] != "request-1" || gotBody["p_lease_id"] != "lease-1" || gotBody["p_ticket_hash"] != "ticket-hash-1" || gotBody["p_start_timeout_ms"] != float64(7000) {
+	if gotBody["p_request_id"] != "request-1" || gotBody["p_lease_id"] != "lease-1" || gotBody["p_ticket_hash"] != "ticket-hash-1" || gotBody["p_ticket_table_name"] != "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE" || gotBody["p_start_timeout_ms"] != float64(7000) {
 		t.Fatalf("unexpected heartbeat open payload: %v", gotBody)
 	}
 	if result.Result != "accepted" || result.Generation != 1 || result.DeadlineMs != 2000 {
 		t.Fatalf("unexpected heartbeat open result: %+v", result)
 	}
 }
-
 
 func TestPostgrestBackendHeartbeatRefreshAllowsAcceptedMinimalTimingShapeAndIncludesTicketHash(t *testing.T) {
 	var gotPath string
@@ -358,6 +359,7 @@ func TestPostgrestBackendHeartbeatRefreshAllowsAcceptedMinimalTimingShapeAndIncl
 	cfg.Backend.Mode = "postgrest"
 	cfg.Backend.Postgres.DSN = ""
 	cfg.Backend.Postgrest.BaseURL = srv.URL
+	setTestStructStringField(&cfg.Backend, "TicketStateTable", "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE")
 	backend := newPostgrestBackend(cfg, srv.Client())
 
 	req := HeartbeatRefreshRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", Generation: 2, NowMs: 6000, HeartbeatTimeoutMs: 15000}
@@ -369,7 +371,7 @@ func TestPostgrestBackendHeartbeatRefreshAllowsAcceptedMinimalTimingShapeAndIncl
 	if gotPath != "/rpc/cq_heartbeat_refresh" {
 		t.Fatalf("expected heartbeat refresh rpc path, got %s", gotPath)
 	}
-	if gotBody["p_ticket_hash"] != "ticket-hash-1" {
+	if gotBody["p_ticket_hash"] != "ticket-hash-1" || gotBody["p_ticket_table_name"] != "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE" {
 		t.Fatalf("expected heartbeat refresh payload to include p_ticket_hash, got %v", gotBody)
 	}
 	if result.Result != "accepted" || result.Generation != 2 || result.DeadlineMs != 21000 || result.HeartbeatTimeoutMs != 15000 || result.HardExpireAtMs != 50000 {

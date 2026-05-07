@@ -664,6 +664,33 @@ func execRuntimeHeartbeatRefresh(ctx context.Context, db *sql.DB, req HeartbeatR
 	return result, nil
 }
 
+func execRuntimeHeartbeatOpenForTicketTable(ctx context.Context, db *sql.DB, req HeartbeatOpenRequest, ticketTableName string) (*runtimeHeartbeatResult, error) {
+	result := &runtimeHeartbeatResult{}
+	ticketHash := lookupTestStructStringField(req, "TicketHash")
+	if ticketHash == "" {
+		ticketHash = runtimeTicketHashForRequest(req.RequestID)
+	}
+	err := db.QueryRowContext(ctx, `
+		SELECT result, reason, generation, deadline_ms, ack_timeout_ms, heartbeat_interval_ms, heartbeat_timeout_ms, reconnect_grace_ms, start_timeout_ms, hard_expire_at_ms
+		FROM cq_heartbeat_open($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	`, req.RequestID, req.LeaseID, req.LeaseToken, ticketHash, req.HardExpireAtMs, req.NowMs, req.HeartbeatTimeoutMs, req.AckTimeoutMs, req.HeartbeatIntervalMs, req.ReconnectGraceMs, req.StartTimeoutMs, ticketTableName).Scan(
+		&result.Result,
+		&result.Reason,
+		&result.Generation,
+		&result.DeadlineMs,
+		&result.AckTimeoutMs,
+		&result.HeartbeatIntervalMs,
+		&result.HeartbeatTimeoutMs,
+		&result.ReconnectGraceMs,
+		&result.StartTimeoutMs,
+		&result.HardExpireAtMs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func execRuntimeHeartbeatDisconnect(ctx context.Context, db *sql.DB, req HeartbeatDisconnectRequest) (*runtimeHeartbeatResult, error) {
 	result := &runtimeHeartbeatResult{}
 	err := db.QueryRowContext(ctx, `
@@ -747,15 +774,15 @@ func seedRuntimeDefaultHeartbeatTicketForRequest(t *testing.T, db *sql.DB, reque
 }
 
 type runtimeTicketState struct {
-	TicketHash                     string
-	IssuedAt                       int64
-	HardExpireAt                   int64
-	IdleTimeoutSeconds             int64
-	FirstUsedAt                    sql.NullInt64
-	IdlePolicy                     string
-	IdleLeaseExpiresAt             int64
-	IdleRenewOwnerLeaseID          sql.NullString
-	IdleRenewOwnerLastHeartbeatAt  sql.NullInt64
+	TicketHash                    string
+	IssuedAt                      int64
+	HardExpireAt                  int64
+	IdleTimeoutSeconds            int64
+	FirstUsedAt                   sql.NullInt64
+	IdlePolicy                    string
+	IdleLeaseExpiresAt            int64
+	IdleRenewOwnerLeaseID         sql.NullString
+	IdleRenewOwnerLastHeartbeatAt sql.NullInt64
 }
 
 func readRuntimeTicketState(t *testing.T, db *sql.DB, ticketHash string) runtimeTicketState {
@@ -787,6 +814,60 @@ func readRuntimeTicketState(t *testing.T, db *sql.DB, ticketHash string) runtime
 		t.Fatalf("read ticket row for %q: %v", ticketHash, err)
 	}
 	return state
+}
+
+func readRuntimeTicketStateFromTable(t *testing.T, db *sql.DB, ticketHash, tableName string) runtimeTicketState {
+	t.Helper()
+	query := fmt.Sprintf(`
+		SELECT "TICKET_HASH",
+		       "ISSUED_AT",
+		       "HARD_EXPIRE_AT",
+		       "IDLE_TIMEOUT_SECONDS",
+		       "FIRST_USED_AT",
+		       "IDLE_POLICY",
+		       "IDLE_LEASE_EXPIRES_AT",
+		       "IDLE_RENEW_OWNER_LEASE_ID"::text,
+		       "IDLE_RENEW_OWNER_LAST_HEARTBEAT_AT"
+		FROM %q
+		WHERE "TICKET_HASH" = $1
+	`, tableName)
+	var state runtimeTicketState
+	if err := db.QueryRowContext(context.Background(), query, ticketHash).Scan(
+		&state.TicketHash,
+		&state.IssuedAt,
+		&state.HardExpireAt,
+		&state.IdleTimeoutSeconds,
+		&state.FirstUsedAt,
+		&state.IdlePolicy,
+		&state.IdleLeaseExpiresAt,
+		&state.IdleRenewOwnerLeaseID,
+		&state.IdleRenewOwnerLastHeartbeatAt,
+	); err != nil {
+		t.Fatalf("read ticket row for %q from %s: %v", ticketHash, tableName, err)
+	}
+	return state
+}
+
+func createRuntimeTicketStateTableClone(t *testing.T, db *sql.DB, tableName string) {
+	t.Helper()
+	query := fmt.Sprintf(`CREATE TABLE %q AS SELECT * FROM "DOWNLOAD_TICKET_STATE_TABLE" WITH NO DATA`, tableName)
+	if _, err := db.ExecContext(context.Background(), query); err != nil {
+		t.Fatalf("create runtime ticket table clone %s: %v", tableName, err)
+	}
+}
+
+func seedRuntimeFirstUseTicketRowInTable(t *testing.T, db *sql.DB, tableName, ticketHash string, issuedAtSeconds, hardExpireAtSeconds int64, idleTimeoutSeconds int) {
+	t.Helper()
+	query := fmt.Sprintf(`
+		INSERT INTO %q (
+			"TICKET_HASH", "ISSUED_AT", "HARD_EXPIRE_AT", "IDLE_TIMEOUT_SECONDS", "FIRST_USED_AT",
+			"IDLE_POLICY", "IDLE_LEASE_EXPIRES_AT", "IDLE_RENEW_OWNER_LEASE_ID", "IDLE_RENEW_OWNER_LAST_HEARTBEAT_AT",
+			"IP_HASH", "PATH_HASH"
+		) VALUES ($1, $2::bigint, $3::bigint, $4::integer, NULL, 'first_use', $2::bigint + $4::bigint, NULL, NULL, NULL, NULL)
+	`, tableName)
+	if _, err := db.ExecContext(context.Background(), query, ticketHash, issuedAtSeconds, hardExpireAtSeconds, idleTimeoutSeconds); err != nil {
+		t.Fatalf("seed first_use ticket row for %q in %s: %v", ticketHash, tableName, err)
+	}
 }
 
 func seedRuntimeConnectedHeartbeat(t *testing.T, db *sql.DB, requestID, hostnameHash string, nowMs, heartbeatTimeoutMs int64) (*runtimeAcquireResult, *runtimeHeartbeatResult) {
@@ -1829,7 +1910,7 @@ func TestRuntimeHeartbeatOpenPromotesFirstUseTicketToRenewableOwner(t *testing.T
 	}
 }
 
-func TestRuntimeHeartbeatWithoutTicketRowAcceptsDisabledTicketStatePath(t *testing.T) {
+func TestRuntimeHeartbeatOpenWithoutTicketRowFailsClosed(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 	ticketHash := "heartbeat-disabled-ticket-state-ticket"
@@ -1888,44 +1969,22 @@ func TestRuntimeHeartbeatWithoutTicketRowAcceptsDisabledTicketStatePath(t *testi
 	if err != nil {
 		t.Fatalf("heartbeat open without seeded ticket row: %v", err)
 	}
-	if open.Result != "accepted" || !open.Generation.Valid || open.Generation.Int64 != 1 {
-		t.Fatalf("expected disabled ticket-state heartbeat open to stay accepted, got %+v", open)
+	if open.Result != "conflict" || open.Reason.String != "ticket_not_found" {
+		t.Fatalf("expected missing-row heartbeat open to fail closed with ticket_not_found, got %+v", open)
 	}
-
-	refreshReq := HeartbeatRefreshRequest{
-		RequestID:          "heartbeat-disabled-ticket-state-request",
-		LeaseID:            grant.LeaseID,
-		LeaseToken:         grant.LeaseToken,
-		Generation:         open.Generation.Int64,
-		NowMs:              nowMs + 4,
-		HeartbeatTimeoutMs: 15_000,
-	}
-	refresh := &runtimeHeartbeatResult{}
-	err = db.QueryRowContext(context.Background(), `
-		SELECT result, reason, generation, deadline_ms, ack_timeout_ms, heartbeat_interval_ms, heartbeat_timeout_ms, reconnect_grace_ms, start_timeout_ms, hard_expire_at_ms
-		FROM cq_heartbeat_refresh($1, $2::uuid, $3, $4, $5, $6, $7)
-	`, refreshReq.RequestID, refreshReq.LeaseID, refreshReq.LeaseToken, ticketHash, refreshReq.Generation, refreshReq.NowMs, refreshReq.HeartbeatTimeoutMs).Scan(
-		&refresh.Result,
-		&refresh.Reason,
-		&refresh.Generation,
-		&refresh.DeadlineMs,
-		&refresh.AckTimeoutMs,
-		&refresh.HeartbeatIntervalMs,
-		&refresh.HeartbeatTimeoutMs,
-		&refresh.ReconnectGraceMs,
-		&refresh.StartTimeoutMs,
-		&refresh.HardExpireAtMs,
-	)
-	if err != nil {
-		t.Fatalf("heartbeat refresh without seeded ticket row: %v", err)
-	}
-	if refresh.Result != "accepted" || refresh.Generation.Int64 != open.Generation.Int64 {
-		t.Fatalf("expected disabled ticket-state heartbeat refresh to stay accepted, got %+v", refresh)
+	if open.Generation.Valid || open.DeadlineMs.Valid {
+		t.Fatalf("expected missing-row heartbeat open to avoid connected heartbeat outputs, got %+v", open)
 	}
 
 	request := readRuntimeRequestState(t, db, "heartbeat-disabled-ticket-state-request")
-	if request.HeartbeatState.String != "connected" || request.HeartbeatGeneration.Int64 != 1 {
-		t.Fatalf("expected connected heartbeat state without seeded ticket row, got %+v", request)
+	if !request.HeartbeatState.Valid || request.HeartbeatState.String != "none" {
+		t.Fatalf("expected missing-row heartbeat open to leave request in non-connected heartbeat state, got %+v", request)
+	}
+	if !request.HeartbeatGeneration.Valid || request.HeartbeatGeneration.Int64 != 0 {
+		t.Fatalf("expected missing-row heartbeat open to preserve pre-connect generation 0, got %+v", request)
+	}
+	if request.HeartbeatConnectedAtMs.Valid || request.HeartbeatLastAtMs.Valid {
+		t.Fatalf("expected missing-row heartbeat open to avoid connected heartbeat timestamps, got %+v", request)
 	}
 
 	var ticketRowCount int
@@ -1934,10 +1993,100 @@ func TestRuntimeHeartbeatWithoutTicketRowAcceptsDisabledTicketStatePath(t *testi
 		  FROM "DOWNLOAD_TICKET_STATE_TABLE"
 		 WHERE "TICKET_HASH" = $1
 	`, ticketHash).Scan(&ticketRowCount); err != nil {
-		t.Fatalf("count ticket rows for disabled ticket-state path: %v", err)
+		t.Fatalf("count ticket rows for missing-row heartbeat path: %v", err)
 	}
 	if ticketRowCount != 0 {
-		t.Fatalf("expected disabled ticket-state heartbeat path to skip renewal row writes, found %d rows", ticketRowCount)
+		t.Fatalf("expected missing-row heartbeat path to avoid renewal row writes, found %d rows", ticketRowCount)
+	}
+}
+
+func TestRuntimeHeartbeatRefreshWithoutTicketRowFailsClosed(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	ticketHash := "heartbeat-refresh-missing-ticket-row"
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-refresh-missing-ticket-row-host",
+		Hostname:          "heartbeat-refresh-missing-ticket-row.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-refresh-missing-ticket-row-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-refresh-missing-ticket-row-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-refresh-missing-ticket-row-request", claim.HandoffToken.String, nowMs+2, 7_000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	seedRuntimeFirstUseTicketRow(t, db, ticketHash, nowMs/1000, grant.ExpiresAtMs/1000, 60)
+
+	openReq := HeartbeatOpenRequest{
+		RequestID:           "heartbeat-refresh-missing-ticket-row-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	}
+	setTestStructStringField(&openReq, "TicketHash", ticketHash)
+	open, err := execRuntimeHeartbeatOpen(context.Background(), db, openReq)
+	if err != nil {
+		t.Fatalf("heartbeat open with seeded ticket row: %v", err)
+	}
+	if open.Result != "accepted" || !open.Generation.Valid {
+		t.Fatalf("expected accepted heartbeat open before deleting ticket row, got %+v", open)
+	}
+
+	if _, err := db.ExecContext(context.Background(), `
+		DELETE FROM "DOWNLOAD_TICKET_STATE_TABLE"
+		 WHERE "TICKET_HASH" = $1
+	`, ticketHash); err != nil {
+		t.Fatalf("delete seeded ticket row before refresh: %v", err)
+	}
+
+	refreshReq := HeartbeatRefreshRequest{
+		RequestID:          "heartbeat-refresh-missing-ticket-row-request",
+		LeaseID:            grant.LeaseID,
+		LeaseToken:         grant.LeaseToken,
+		Generation:         open.Generation.Int64,
+		NowMs:              nowMs + 4,
+		HeartbeatTimeoutMs: 15_000,
+	}
+	setTestStructStringField(&refreshReq, "TicketHash", ticketHash)
+	refresh, err := execRuntimeHeartbeatRefresh(context.Background(), db, refreshReq)
+	if err != nil {
+		t.Fatalf("heartbeat refresh after deleting ticket row: %v", err)
+	}
+	if refresh.Result != "conflict" || refresh.Reason.String != "ticket_not_found" {
+		t.Fatalf("expected missing-row heartbeat refresh to fail closed with ticket_not_found, got %+v", refresh)
+	}
+	if refresh.Generation.Valid || refresh.DeadlineMs.Valid {
+		t.Fatalf("expected missing-row heartbeat refresh to avoid success payload fields, got %+v", refresh)
+	}
+
+	var ticketRowCount int
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		  FROM "DOWNLOAD_TICKET_STATE_TABLE"
+		 WHERE "TICKET_HASH" = $1
+	`, ticketHash).Scan(&ticketRowCount); err != nil {
+		t.Fatalf("count ticket rows after missing-row refresh path: %v", err)
+	}
+	if ticketRowCount != 0 {
+		t.Fatalf("expected missing-row heartbeat refresh path to avoid renewal row writes, found %d rows", ticketRowCount)
 	}
 }
 
@@ -2186,6 +2335,223 @@ func TestRuntimeHeartbeatOpenTransfersRenewalOwnershipOnlyAfterPreviousOwnerTurn
 	}
 	if updated.IdleLeaseExpiresAt < beforeStale.IdleLeaseExpiresAt {
 		t.Fatalf("expected stale takeover to not shorten idle lease expiry, before=%+v after=%+v", beforeStale, updated)
+	}
+}
+
+func TestRuntimeHeartbeatOpenBlocksTerminalOwnerTakeoverUntilPreservedHeartbeatDeadlineExpires(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	ticketHash := "heartbeat-renewable-terminal-owner-ticket"
+
+	grantA, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-renewable-terminal-owner-a",
+		Hostname:          "heartbeat-renewable-terminal-owner-a.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-renewable-terminal-owner-request-a",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire a: %v", err)
+	}
+	claimA, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-renewable-terminal-owner-request-a", grantA.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant a: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-renewable-terminal-owner-request-a", claimA.HandoffToken.String, nowMs+2, 7_000); err != nil {
+		t.Fatalf("ack handoff a: %v", err)
+	}
+	seedRuntimeFirstUseTicketRow(t, db, ticketHash, nowMs/1000, grantA.ExpiresAtMs/1000, 60)
+
+	openReqA := HeartbeatOpenRequest{
+		RequestID:           "heartbeat-renewable-terminal-owner-request-a",
+		LeaseID:             grantA.LeaseID,
+		LeaseToken:          grantA.LeaseToken,
+		HardExpireAtMs:      grantA.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	}
+	setTestStructStringField(&openReqA, "TicketHash", ticketHash)
+	openA, err := execRuntimeHeartbeatOpen(context.Background(), db, openReqA)
+	if err != nil {
+		t.Fatalf("heartbeat open a: %v", err)
+	}
+	var releaseResult string
+	var releaseReason, releaseRequestID sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason, request_id
+		FROM cq_release($1::uuid, $2, $3, $4)
+	`, grantA.LeaseID, grantA.LeaseToken, "stream_complete", nowMs+10).Scan(&releaseResult, &releaseReason, &releaseRequestID); err != nil {
+		t.Fatalf("release terminal renewal owner: %v", err)
+	}
+	if releaseResult != "released" || releaseRequestID.String != "heartbeat-renewable-terminal-owner-request-a" {
+		t.Fatalf("expected release of owner request A, got result=%q reason=%q request=%q", releaseResult, releaseReason.String, releaseRequestID.String)
+	}
+	ownerAfterRelease := readRuntimeRequestState(t, db, "heartbeat-renewable-terminal-owner-request-a")
+	if ownerAfterRelease.State != "released" {
+		t.Fatalf("expected request A to be terminal before takeover, got %+v", ownerAfterRelease)
+	}
+	if !ownerAfterRelease.HeartbeatDeadlineMs.Valid || ownerAfterRelease.HeartbeatDeadlineMs.Int64 != openA.DeadlineMs.Int64 {
+		t.Fatalf("expected terminal owner to preserve heartbeat deadline %d, got %+v", openA.DeadlineMs.Int64, ownerAfterRelease)
+	}
+
+	grantB, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-renewable-terminal-owner-b",
+		Hostname:          "heartbeat-renewable-terminal-owner-b.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-renewable-terminal-owner-request-b",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs + 20,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire b: %v", err)
+	}
+	claimB, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-renewable-terminal-owner-request-b", grantB.ClaimToken.String, nowMs+21)
+	if err != nil {
+		t.Fatalf("claim grant b: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-renewable-terminal-owner-request-b", claimB.HandoffToken.String, nowMs+22, 7_000); err != nil {
+		t.Fatalf("ack handoff b: %v", err)
+	}
+
+	openReqB := HeartbeatOpenRequest{
+		RequestID:           "heartbeat-renewable-terminal-owner-request-b",
+		LeaseID:             grantB.LeaseID,
+		LeaseToken:          grantB.LeaseToken,
+		HardExpireAtMs:      grantB.ExpiresAtMs,
+		NowMs:               nowMs + 23,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	}
+	setTestStructStringField(&openReqB, "TicketHash", ticketHash)
+	openB, err := execRuntimeHeartbeatOpen(context.Background(), db, openReqB)
+	if err != nil {
+		t.Fatalf("heartbeat open b after terminal owner release: %v", err)
+	}
+	if openB.Result != "accepted" {
+		t.Fatalf("expected accepted heartbeat open after terminal owner release, got %+v", openB)
+	}
+
+	beforeStale := readRuntimeTicketState(t, db, ticketHash)
+	if !beforeStale.IdleRenewOwnerLeaseID.Valid || beforeStale.IdleRenewOwnerLeaseID.String != grantA.LeaseID {
+		t.Fatalf("expected released owner lease A to keep renewal ownership until stale cutoff, got %+v", beforeStale)
+	}
+
+	refreshReqB := HeartbeatRefreshRequest{
+		RequestID:          "heartbeat-renewable-terminal-owner-request-b",
+		LeaseID:            grantB.LeaseID,
+		LeaseToken:         grantB.LeaseToken,
+		Generation:         openB.Generation.Int64,
+		NowMs:              openA.DeadlineMs.Int64 + 1,
+		HeartbeatTimeoutMs: 15_000,
+	}
+	setTestStructStringField(&refreshReqB, "TicketHash", ticketHash)
+	refreshB, err := execRuntimeHeartbeatRefresh(context.Background(), db, refreshReqB)
+	if err != nil {
+		t.Fatalf("heartbeat refresh b after terminal owner stale cutoff: %v", err)
+	}
+	if refreshB.Result != "accepted" {
+		t.Fatalf("expected accepted heartbeat refresh after terminal owner stale cutoff, got %+v", refreshB)
+	}
+
+	afterStale := readRuntimeTicketState(t, db, ticketHash)
+	if !afterStale.IdleRenewOwnerLeaseID.Valid || afterStale.IdleRenewOwnerLeaseID.String != grantB.LeaseID {
+		t.Fatalf("expected takeover after preserved heartbeat deadline expiry to move renewal owner to lease B, got %+v", afterStale)
+	}
+	if !afterStale.IdleRenewOwnerLastHeartbeatAt.Valid || afterStale.IdleRenewOwnerLastHeartbeatAt.Int64 < refreshReqB.NowMs/1000 {
+		t.Fatalf("expected takeover after preserved heartbeat deadline expiry to refresh last heartbeat timestamp, got %+v", afterStale)
+	}
+	if afterStale.IdleLeaseExpiresAt < beforeStale.IdleLeaseExpiresAt {
+		t.Fatalf("expected takeover after preserved heartbeat deadline expiry to avoid shortening lease expiry, before=%+v after=%+v", beforeStale, afterStale)
+	}
+}
+
+func TestRuntimeHeartbeatOpenUsesCustomTicketStateTableForRenewal(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	ticketTableName := "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE"
+	ticketHash := "heartbeat-custom-ticket-table-ticket"
+
+	createRuntimeTicketStateTableClone(t, db, ticketTableName)
+
+	grant, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "heartbeat-custom-ticket-table-host",
+		Hostname:          "heartbeat-custom-ticket-table.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "heartbeat-custom-ticket-table-request",
+		HardExpireMs:      nowMs + 60_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "heartbeat-custom-ticket-table-request", grant.ClaimToken.String, nowMs+1)
+	if err != nil {
+		t.Fatalf("claim grant: %v", err)
+	}
+	if _, err := execRuntimeAckHandoff(context.Background(), db, "heartbeat-custom-ticket-table-request", claim.HandoffToken.String, nowMs+2, 7_000); err != nil {
+		t.Fatalf("ack handoff: %v", err)
+	}
+	seedRuntimeFirstUseTicketRowInTable(t, db, ticketTableName, ticketHash, nowMs/1000, grant.ExpiresAtMs/1000, 60)
+
+	openReq := HeartbeatOpenRequest{
+		RequestID:           "heartbeat-custom-ticket-table-request",
+		LeaseID:             grant.LeaseID,
+		LeaseToken:          grant.LeaseToken,
+		HardExpireAtMs:      grant.ExpiresAtMs,
+		NowMs:               nowMs + 3,
+		HeartbeatTimeoutMs:  15_000,
+		AckTimeoutMs:        2_000,
+		HeartbeatIntervalMs: 5_000,
+		ReconnectGraceMs:    12_000,
+		StartTimeoutMs:      7_000,
+	}
+	setTestStructStringField(&openReq, "TicketHash", ticketHash)
+	open, err := execRuntimeHeartbeatOpenForTicketTable(context.Background(), db, openReq, ticketTableName)
+	if err != nil {
+		t.Fatalf("heartbeat open against custom ticket table: %v", err)
+	}
+	if open.Result != "accepted" {
+		t.Fatalf("expected accepted heartbeat open against custom ticket table, got %+v", open)
+	}
+
+	ticket := readRuntimeTicketStateFromTable(t, db, ticketHash, ticketTableName)
+	if ticket.IdlePolicy != "renewable" {
+		t.Fatalf("expected custom ticket table row promoted to renewable, got %+v", ticket)
+	}
+	if !ticket.IdleRenewOwnerLeaseID.Valid || ticket.IdleRenewOwnerLeaseID.String != grant.LeaseID {
+		t.Fatalf("expected custom ticket table row to record renewal owner lease id %q, got %+v", grant.LeaseID, ticket)
+	}
+
+	var defaultTableCount int
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		  FROM "DOWNLOAD_TICKET_STATE_TABLE"
+		 WHERE "TICKET_HASH" = $1
+	`, ticketHash).Scan(&defaultTableCount); err != nil {
+		t.Fatalf("count default ticket rows: %v", err)
+	}
+	if defaultTableCount != 0 {
+		t.Fatalf("expected renewal to avoid default ticket table writes for custom table flow, found %d rows", defaultTableCount)
 	}
 }
 

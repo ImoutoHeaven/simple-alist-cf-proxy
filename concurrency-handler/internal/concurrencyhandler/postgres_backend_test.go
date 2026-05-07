@@ -273,13 +273,15 @@ func TestPostgresBackendHeartbeatOpenUsesFixedRPCAndIncludesTicketHash(t *testin
 		if !strings.Contains(query, "FROM cq_heartbeat_open(") {
 			t.Fatalf("heartbeat open must use fixed rpc, got %s", query)
 		}
-		if len(args) != 11 || args[0] != "request-1" || args[1] != "lease-1" || args[2] != "token-1" || args[3] != "ticket-hash-1" {
+		if len(args) != 12 || args[0] != "request-1" || args[1] != "lease-1" || args[2] != "token-1" || args[3] != "ticket-hash-1" || args[11] != "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE" {
 			t.Fatalf("unexpected heartbeat open args: %v", args)
 		}
 		return &stubRows{rows: [][]any{{"accepted", nil, int64(1), int64(2000), int64(2000), int64(5000), int64(15000), int64(12000), int64(7000), int64(50000)}}}, nil
 	}}
 
-	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	cfg := validTestConfig()
+	setTestStructStringField(&cfg.Backend, "TicketStateTable", "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE")
+	backend := &postgresBackend{cfg: cfg, db: client}
 	req := HeartbeatOpenRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", HardExpireAtMs: 50000, NowMs: 1000, HeartbeatTimeoutMs: 15000, AckTimeoutMs: 2000, HeartbeatIntervalMs: 5000, ReconnectGraceMs: 12000, StartTimeoutMs: 7000}
 	setTestStructStringField(&req, "TicketHash", "ticket-hash-1")
 	result, err := backend.HeartbeatOpen(context.Background(), req)
@@ -296,13 +298,15 @@ func TestPostgresBackendHeartbeatRefreshAllowsAcceptedMinimalTimingShapeAndInclu
 		if !strings.Contains(query, "FROM cq_heartbeat_refresh(") {
 			t.Fatalf("heartbeat refresh must use fixed rpc, got %s", query)
 		}
-		if len(args) != 7 || args[3] != "ticket-hash-1" {
+		if len(args) != 8 || args[3] != "ticket-hash-1" || args[7] != "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE" {
 			t.Fatalf("unexpected heartbeat refresh args: %v", args)
 		}
 		return &stubRows{rows: [][]any{{"accepted", nil, int64(2), int64(21_000), nil, nil, int64(15_000), nil, nil, int64(50_000)}}}, nil
 	}}
 
-	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	cfg := validTestConfig()
+	setTestStructStringField(&cfg.Backend, "TicketStateTable", "CUSTOM_DOWNLOAD_TICKET_STATE_TABLE")
+	backend := &postgresBackend{cfg: cfg, db: client}
 	req := HeartbeatRefreshRequest{RequestID: "request-1", LeaseID: "lease-1", LeaseToken: "token-1", Generation: 2, NowMs: 6_000, HeartbeatTimeoutMs: 15_000}
 	setTestStructStringField(&req, "TicketHash", "ticket-hash-1")
 	result, err := backend.HeartbeatRefresh(context.Background(), req)

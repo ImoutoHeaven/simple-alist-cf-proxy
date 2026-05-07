@@ -18,6 +18,7 @@
   },
   "backend": {
     "mode": "postgres",
+    "ticketStateTable": "DOWNLOAD_TICKET_STATE_TABLE",
     "postgrest": {
       "baseUrl": "https://your-postgrest-endpoint.example.com",
       "authHeader": "Bearer your-postgrest-token"
