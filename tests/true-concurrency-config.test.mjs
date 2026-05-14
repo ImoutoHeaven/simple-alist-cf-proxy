@@ -553,6 +553,7 @@ test('concurrency client exposes connectHeartbeat and enforces heartbeat wire co
       requestId: 'req-1',
       leaseId: 'lease-1',
       leaseToken: 'token-1',
+      ticketHash: 'ticket-hash-1',
       hardExpireAtMs: 20000,
       clientInstanceId: 'client-1',
       attempt: 2,
@@ -571,6 +572,7 @@ test('concurrency client exposes connectHeartbeat and enforces heartbeat wire co
     assert.equal(hello.requestId, 'req-1');
     assert.equal(hello.leaseId, 'lease-1');
     assert.equal(hello.leaseToken, 'token-1');
+    assert.equal(hello.ticketHash, 'ticket-hash-1');
     assert.equal(hello.hardExpireAtMs, 20000);
     assert.equal(hello.clientInstanceId, 'client-1');
     assert.equal(hello.attempt, 2);
@@ -595,6 +597,7 @@ test('concurrency client exposes connectHeartbeat and enforces heartbeat wire co
     assert.equal(heartbeatMessage.requestId, 'req-1');
     assert.equal(heartbeatMessage.leaseId, 'lease-1');
     assert.equal(heartbeatMessage.leaseToken, 'token-1');
+    assert.equal(heartbeatMessage.ticketHash, 'ticket-hash-1');
     assert.equal(heartbeatMessage.generation, 7);
     assert.equal(typeof heartbeatMessage.nowMs, 'number');
     assert.equal(Object.hasOwn(heartbeatMessage, 'downloadedBytes'), false);
