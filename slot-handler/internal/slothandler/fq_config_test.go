@@ -1,6 +1,12 @@
 package slothandler
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func intPtr(value int) *int {
 	return &value
@@ -126,5 +132,43 @@ func TestFairQueueInFlightZeroDisables(t *testing.T) {
 	}
 	if limits.ip != 0 {
 		t.Fatalf("expected ip limit 0, got %d", limits.ip)
+	}
+}
+
+func TestFairQueueConfigJSONUsesSSEWaitNames(t *testing.T) {
+	path := filepath.Join(moduleRootDir(t), "config.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config.json: %v", err)
+	}
+	text := string(raw)
+	for _, want := range []string{"\"maxStreamMs\"", "\"keepaliveMs\"", "\"acceptedLeaseMs\"", "\"detachGraceMs\""} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected config.json to contain %s", want)
+		}
+	}
+	legacyPollWindowKey := "\"poll" + "WindowMs\""
+	legacyGraceKey := "\"grace" + "Ms\""
+	for _, banned := range []string{legacyPollWindowKey, legacyGraceKey} {
+		if strings.Contains(text, banned) {
+			t.Fatalf("expected config.json to omit legacy key %s", banned)
+		}
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("decode config.json: %v", err)
+	}
+	if cfg.FairQueue.Wait.MaxStreamMs != 10000 {
+		t.Fatalf("expected wait.maxStreamMs to load as 10000, got %d", cfg.FairQueue.Wait.MaxStreamMs)
+	}
+	if cfg.FairQueue.Wait.KeepaliveMs != 1500 {
+		t.Fatalf("expected wait.keepaliveMs to load as 1500, got %d", cfg.FairQueue.Wait.KeepaliveMs)
+	}
+	if cfg.FairQueue.AcceptedLeaseMs != 6000 {
+		t.Fatalf("expected acceptedLeaseMs to load as 6000, got %d", cfg.FairQueue.AcceptedLeaseMs)
+	}
+	if cfg.FairQueue.DetachedGraceMs != 4000 {
+		t.Fatalf("expected detachGraceMs to load as 4000, got %d", cfg.FairQueue.DetachedGraceMs)
 	}
 }

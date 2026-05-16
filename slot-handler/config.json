@@ -29,8 +29,12 @@
   },
   "fairQueue": {
     "pollIntervalMs": 500,
-    "pollWindowMs": 6000,
-    "graceMs": 4000,
+    "acceptedLeaseMs": 6000,
+    "detachGraceMs": 4000,
+    "wait": {
+      "maxStreamMs": 10000,
+      "keepaliveMs": 1500
+    },
     "utilWindowSec": 10,
     "maxBatch": 8,
     "maxProbeParallel": 4,

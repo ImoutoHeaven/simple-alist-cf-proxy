@@ -35,6 +35,66 @@ const createTrackedTextBody = (text) => {
   };
 };
 
+const createStreamingSseResponse = (frames, init = {}) => {
+  const encoder = new TextEncoder();
+  let index = 0;
+
+  return new Response(new ReadableStream({
+    pull(controller) {
+      if (index >= frames.length) {
+        controller.close();
+        return;
+      }
+
+      controller.enqueue(encoder.encode(frames[index]));
+      index += 1;
+      if (index >= frames.length) {
+        controller.close();
+      }
+    },
+  }), {
+    status: init.status ?? 200,
+    headers: {
+      'content-type': 'text/event-stream',
+      ...(init.headers || {}),
+    },
+  });
+};
+
+const createFairQueueWaitSseResponse = (finalPayload, options = {}) => {
+  const acceptedPayload = {
+    queryToken: options.queryToken ?? finalPayload.queryToken ?? 'fq-q-default',
+    invocationEpoch: options.invocationEpoch ?? finalPayload.invocationEpoch ?? 1,
+    deadlineMs: options.acceptedDeadlineMs ?? finalPayload.deadlineMs ?? (Date.now() + 1_000),
+  };
+
+  return createStreamingSseResponse([
+    'event: accepted\n',
+    `data: ${JSON.stringify(acceptedPayload)}\n\n`,
+    ': keepalive 1710000000001\n\n',
+    'event: result\n',
+    `data: ${JSON.stringify({
+      ...finalPayload,
+      queryToken: finalPayload.queryToken ?? acceptedPayload.queryToken,
+      invocationEpoch: finalPayload.invocationEpoch ?? acceptedPayload.invocationEpoch,
+    })}\n\n`,
+  ], options);
+};
+
+const createTrueConcurrencyWaitSseResponse = (finalPayload, options = {}) => {
+  const acceptedDeadlineMs = Number.isFinite(options.acceptedDeadlineMs)
+    ? options.acceptedDeadlineMs
+    : Date.now() + 1_000;
+
+  return createStreamingSseResponse([
+    'event: accepted\n',
+    `data: ${JSON.stringify({ deadlineMs: acceptedDeadlineMs })}\n\n`,
+    ': keepalive 1710000000001\n\n',
+    'event: result\n',
+    `data: ${JSON.stringify(finalPayload)}\n\n`,
+  ], options);
+};
+
 const ACK_HANDOFF_URL = 'https://cq.example.test/api/v1/concurrency/ack_handoff';
 const HEARTBEAT_URL = 'https://cq.example.test/api/v1/concurrency/heartbeat';
 const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT = {
@@ -464,7 +524,7 @@ const runModeScenario = async ({
 } = {}) => {
   const { bootstrap } = createModeHarness({ fairQueueHostPatterns, throttleHostPatterns, trueConcurrencyHostPatterns });
   const calls = {
-    acquire: 0,
+    wait: 0,
     release: 0,
     snapshot: 0,
     authorize: 0,
@@ -475,7 +535,8 @@ const runModeScenario = async ({
     concurrencyRelease: 0,
     concurrencyCancel: 0,
   };
-  const acquireBodies = [];
+  const waitBodies = [];
+  const waitResults = [];
   const authorizeBodies = [];
   const reportBodies = [];
   const settleBodies = [];
@@ -550,14 +611,17 @@ const runModeScenario = async ({
       return createJsonResponse([snapshot]);
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.acquire += 1;
-      acquireBodies.push(JSON.parse(init.body));
-      return createJsonResponse(
-        typeof slotHandlerResponse === 'function'
-          ? await slotHandlerResponse({ calls, acquireBodies, authorizeBodies, reportBodies, releaseBodies })
-          : slotHandlerResponse
-      );
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.wait += 1;
+      const payload = JSON.parse(init.body);
+      waitBodies.push(payload);
+      const result = typeof slotHandlerResponse === 'function'
+        ? await slotHandlerResponse({ calls, waitBodies, authorizeBodies, reportBodies, releaseBodies })
+        : slotHandlerResponse;
+      waitResults.push(result);
+      return createFairQueueWaitSseResponse(result, {
+        acceptedDeadlineMs: payload.deadlineMs,
+      });
     }
 
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
@@ -630,7 +694,8 @@ const runModeScenario = async ({
       response,
       responseBodyText,
       calls,
-      acquireBodies,
+      waitBodies,
+      waitResults,
       authorizeBodies,
       reportBodies,
       settleBodies,
@@ -654,7 +719,7 @@ test('none mode does not call slot-handler or breaker RPCs', async () => {
 
   const { response, calls } = await runModeScenario();
   assert.equal(response.status, 200);
-  assert.equal(calls.acquire, 0);
+  assert.equal(calls.wait, 0);
   assert.equal(calls.authorize, 0);
   assert.equal(calls.report, 0);
 });
@@ -671,7 +736,7 @@ test('breaker_only calls authorize/report but never slot-handler', async () => {
     throttleHostPatterns: ['*.sharepoint.com'],
   });
   assert.equal(response.status, 200);
-  assert.equal(calls.acquire, 0);
+  assert.equal(calls.wait, 0);
   assert.equal(calls.authorize, 1);
   assert.equal(calls.report, 1);
   assert.equal(calls.settle, 0);
@@ -701,7 +766,7 @@ test('breaker_only explicitly settles authorized no-sample terminal responses be
   assert.equal(body.code, 404);
   assert.equal(typeof body.message, 'string');
   assert.notEqual(body.message, 'missing');
-  assert.equal(calls.acquire, 0);
+  assert.equal(calls.wait, 0);
   assert.equal(calls.authorize, 1);
   assert.deepEqual(reportBodies, []);
   assert.equal(calls.settle, 1);
@@ -732,7 +797,7 @@ test('breaker_only fails closed when settlement fails on authorized no-sample te
 
   assert.equal(response.status, 503);
   assert.match(JSON.parse(responseBodyText).message, /attempt settlement/i);
-  assert.equal(calls.acquire, 0);
+  assert.equal(calls.wait, 0);
   assert.equal(calls.authorize, 1);
   assert.deepEqual(reportBodies, []);
   assert.equal(calls.settle, 1);
@@ -761,7 +826,7 @@ test('breaker_only settles authorized origin fetch throws before returning the w
 
   assert.equal(response.status, 500);
   assert.equal(JSON.parse(responseBodyText).message, 'origin exploded');
-  assert.equal(calls.acquire, 0);
+  assert.equal(calls.wait, 0);
   assert.equal(calls.authorize, 1);
   assert.deepEqual(reportBodies, []);
   assert.equal(calls.settle, 1);
@@ -790,7 +855,7 @@ test('breaker_only fails closed when settlement fails after origin fetch throws 
 
   assert.equal(response.status, 503);
   assert.match(JSON.parse(responseBodyText).message, /attempt settlement/i);
-  assert.equal(calls.acquire, 0);
+  assert.equal(calls.wait, 0);
   assert.equal(calls.authorize, 1);
   assert.deepEqual(reportBodies, []);
   assert.equal(calls.settle, 1);
@@ -819,7 +884,7 @@ test('queue_breaker settles slot-carried breaker attempt when direct origin fetc
 
   assert.equal(response.status, 500);
   assert.equal(JSON.parse(responseBodyText).message, 'origin exploded');
-  assert.equal(calls.acquire, 1);
+  assert.equal(calls.wait, 1);
   assert.equal(calls.release, 1);
   assert.equal(calls.authorize, 0);
   assert.deepEqual(reportBodies, []);
@@ -837,15 +902,17 @@ test('queue_only calls slot-handler but never breaker RPCs', async () => {
   assert.equal(typeof resolveAdmissionMode, 'function');
   assert.equal(resolveAdmissionMode(config, 'tenant.sharepoint.com'), 'queue_only');
 
-  const { response, calls } = await runModeScenario({
+  const { response, calls, waitBodies } = await runModeScenario({
     fairQueueHostPatterns: ['*.sharepoint.com'],
     trueConcurrencyHostPatterns: ['*.sharepoint.com'],
   });
   assert.equal(response.status, 200);
-  assert.equal(calls.acquire, 1);
+  assert.equal(calls.wait, 1);
   assert.equal(calls.authorize, 0);
   assert.equal(calls.report, 0);
   assert.equal(calls.concurrencyAcquire, 1);
+  assert.equal('breakerEnabled' in waitBodies[0], false);
+  assert.equal('openCapSeconds' in waitBodies[0], false);
 });
 
 test('queue_breaker uses slot-handler READY attempt tokens and skips authorize RPC', async () => {
@@ -857,7 +924,7 @@ test('queue_breaker uses slot-handler READY attempt tokens and skips authorize R
   assert.equal(typeof resolveAdmissionMode, 'function');
   assert.equal(resolveAdmissionMode(config, 'tenant.sharepoint.com'), 'queue_breaker');
 
-  const { response, calls, reportBodies } = await runModeScenario({
+  const { response, calls, reportBodies, waitBodies, waitResults } = await runModeScenario({
     fairQueueHostPatterns: ['*.sharepoint.com'],
     throttleHostPatterns: ['*.sharepoint.com'],
     slotHandlerResponse: {
@@ -865,6 +932,7 @@ test('queue_breaker uses slot-handler READY attempt tokens and skips authorize R
       queryToken: 'query-mode-queue-breaker',
       invocationEpoch: 1,
       slotToken: 'slot-1',
+      releaseOwnerRequired: true,
       meta: {
         attemptVersion: 7,
         attemptTicket: 2,
@@ -873,10 +941,19 @@ test('queue_breaker uses slot-handler READY attempt tokens and skips authorize R
   });
 
   assert.equal(response.status, 200);
-  assert.equal(calls.acquire, 1);
+  assert.equal(calls.wait, 1);
   assert.equal(calls.snapshot, 0);
   assert.equal(calls.authorize, 0);
   assert.equal(calls.report, 1);
+  assert.equal(waitBodies.length, 1);
+  assert.equal(waitBodies[0].queryToken, undefined);
+  assert.equal(waitBodies[0].invocationEpoch, undefined);
+  assert.equal(waitBodies[0].slotToken, undefined);
+  assert.equal(waitBodies[0].releaseOwnerRequired, undefined);
+  assert.equal(typeof waitBodies[0].requestId, 'string');
+  assert.equal(typeof waitBodies[0].deadlineMs, 'number');
+  assert.equal(waitBodies[0].admissionMode, 'queue_breaker');
+  assert.equal(waitResults[0].releaseOwnerRequired, true);
   assert.equal(reportBodies[0].p_attempt_version, 7);
   assert.equal(reportBodies[0].p_attempt_ticket, 2);
 });
@@ -939,13 +1016,17 @@ test('queue_only with true concurrency wait path never calls breaker RPCs', asyn
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      const payload = JSON.parse(init.body);
+      return createFairQueueWaitSseResponse({
         result: 'granted',
         queryToken: 'query-mode-wait',
         invocationEpoch: 1,
         slotToken: 'slot-mode-wait',
+        releaseOwnerRequired: true,
+      }, {
+        acceptedDeadlineMs: payload.deadlineMs,
       });
     }
 
@@ -965,12 +1046,20 @@ test('queue_only with true concurrency wait path never calls breaker RPCs', asyn
           retryAfter: 1,
         });
       }
-      return createJsonResponse({
+      throw new Error('queue_only wait path should not issue a second CQ acquire');
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      calls.push('concurrency-wait-sse');
+      const payload = JSON.parse(init.body);
+      return createTrueConcurrencyWaitSseResponse({
         result: 'granted',
         leaseId: 'lease-mode-wait',
         leaseToken: 'token-mode-wait',
-        expiresAtMs: Date.now() + 1000,
+        expiresAtMs: payload.hardExpireAtMs,
         claimToken: 'claim-token-mode-wait',
+      }, {
+        acceptedDeadlineMs: payload.deadlineMs,
       });
     }
 
@@ -1025,10 +1114,10 @@ test('queue_only with true concurrency wait path never calls breaker RPCs', asyn
     await Promise.allSettled(waitUntilPromises);
     assert.equal(response.status, 200);
     assert.deepEqual(calls, [
-      'fairqueue-acquire',
+      'fairqueue-wait',
       'concurrency-acquire-1',
       'fairqueue-release',
-      'concurrency-acquire-2',
+      'concurrency-wait-sse',
       'concurrency-claim',
       'concurrency-ack-handoff',
       'heartbeat-upgrade',

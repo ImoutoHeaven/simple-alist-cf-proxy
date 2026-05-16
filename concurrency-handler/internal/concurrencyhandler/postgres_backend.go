@@ -127,7 +127,7 @@ func rpcSelectRowJSON(name string, argCount int) (string, error) {
 }
 
 func (p *postgresBackend) Acquire(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
-	query, err := rpcSelectRowJSON(p.cfg.Concurrency.RPC.AcquireFunc, 14)
+	query, err := rpcSelectRowJSON(p.cfg.Concurrency.RPC.AcquireFunc, 11)
 	if err != nil {
 		return nil, err
 	}
@@ -139,9 +139,6 @@ func (p *postgresBackend) Acquire(ctx context.Context, req AcquireRequest) (*Acq
 		req.RequestID,
 		req.HardExpireAtMs,
 		req.NowMs,
-		strings.TrimSpace(req.WaitToken),
-		p.cfg.Concurrency.Wait.WaitPollWindowMs,
-		p.cfg.Concurrency.Wait.WaitReconnectGraceMs,
 		p.cfg.Concurrency.Caps.HostMaxInFlight,
 		p.cfg.Concurrency.Caps.SiteMaxInFlight,
 		p.cfg.Concurrency.Caps.SiteIPMaxInFlight,
@@ -168,11 +165,12 @@ func (p *postgresBackend) Acquire(ctx context.Context, req AcquireRequest) (*Acq
 	return result, rows.Err()
 }
 
-func (p *postgresBackend) ProbeContinueWait(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
-	query, err := rpcSelectRowJSON(fixedContinueWaitProbeFunc, 8)
+func (p *postgresBackend) ProbeWaitState(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
+	query, err := rpcSelectRowJSON(fixedContinueWaitProbeFunc, 9)
 	if err != nil {
 		return nil, err
 	}
+	deadlineMs := waitStateProbeDeadlineMs(req)
 	rows, err := p.db.Query(ctx, query,
 		req.HostnameHash,
 		req.Hostname,
@@ -180,6 +178,7 @@ func (p *postgresBackend) ProbeContinueWait(ctx context.Context, req AcquireRequ
 		canonicalBucket(req.IPBucket),
 		req.RequestID,
 		req.HardExpireAtMs,
+		deadlineMs,
 		req.NowMs,
 		strings.TrimSpace(req.WaitToken),
 	)
@@ -188,7 +187,7 @@ func (p *postgresBackend) ProbeContinueWait(ctx context.Context, req AcquireRequ
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return nil, errors.New("empty continue-wait probe result")
+		return nil, errors.New("empty wait-state probe result")
 	}
 	var raw []byte
 	if err := rows.Scan(&raw); err != nil {

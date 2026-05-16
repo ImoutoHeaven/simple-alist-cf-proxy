@@ -13,8 +13,8 @@ import (
 func testConfigForAcquire(pollWindow time.Duration, grace time.Duration) *Config {
 	return &Config{
 		FairQueue: FairQueueConfig{
-			PollWindowMs: pollWindow.Milliseconds(),
-			GraceMs:      grace.Milliseconds(),
+			AcceptedLeaseMs: pollWindow.Milliseconds(),
+			DetachedGraceMs: grace.Milliseconds(),
 		},
 	}
 }

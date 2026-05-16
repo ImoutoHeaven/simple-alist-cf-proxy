@@ -1,6 +1,7 @@
 package concurrencyhandler
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -34,8 +35,8 @@ func validTestConfig() Config {
 				RequireHardExpiry: true,
 			},
 			Wait: ConcurrencyWaitConfig{
-				WaitPollWindowMs:     10000,
-				WaitReconnectGraceMs: 1500,
+				MaxStreamMs:     10000,
+				KeepaliveMs: 1500,
 			},
 			Sweep: ConcurrencySweepConfig{
 				Enabled:         true,
@@ -147,7 +148,7 @@ func TestParseConfigBytesRequiresAuthEnabled(t *testing.T) {
 		"concurrency": {
 			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
 			"lease": {"requireHardExpiry": true},
-			"wait": {"waitPollWindowMs": 10000, "waitReconnectGraceMs": 1500},
+			"wait": {"maxStreamMs": 10000, "keepaliveMs": 1500},
 			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
 			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
 		}
@@ -173,7 +174,7 @@ func TestParseConfigBytesAppliesDefaults(t *testing.T) {
 		"concurrency": {
 			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
 			"lease": {"requireHardExpiry": true},
-			"wait": {"waitPollWindowMs": 10000, "waitReconnectGraceMs": 1500},
+			"wait": {"maxStreamMs": 10000, "keepaliveMs": 1500},
 			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
 			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
 		}
@@ -218,7 +219,7 @@ func TestParseConfigBytesPreservesCustomTicketStateTable(t *testing.T) {
 		"concurrency": {
 			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
 			"lease": {"requireHardExpiry": true},
-			"wait": {"waitPollWindowMs": 10000, "waitReconnectGraceMs": 1500},
+			"wait": {"maxStreamMs": 10000, "keepaliveMs": 1500},
 			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
 			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
 		}
@@ -360,17 +361,17 @@ func TestParseConfigBytesRejectsMissingConcurrencyCapFields(t *testing.T) {
 		{
 			name:  "missing hostMaxInFlight",
 			field: "hostMaxInFlight",
-			json:  `{"controller":{},"auth":{"enabled":true,"token":"secret"},"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://postgrest.example.test"}},"concurrency":{"caps":{"siteMaxInFlight":32,"siteIpMaxInFlight":4},"lease":{"requireHardExpiry":true},"wait":{"waitPollWindowMs":10000,"waitReconnectGraceMs":1500},"sweep":{"enabled":true,"intervalSeconds":300,"batchSize":500},"rpc":{"acquireFunc":"cq_acquire","releaseFunc":"cq_release","expireFunc":"cq_expire_scope"}}}`,
+			json:  `{"controller":{},"auth":{"enabled":true,"token":"secret"},"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://postgrest.example.test"}},"concurrency":{"caps":{"siteMaxInFlight":32,"siteIpMaxInFlight":4},"lease":{"requireHardExpiry":true},"wait":{"maxStreamMs":10000,"keepaliveMs":1500},"sweep":{"enabled":true,"intervalSeconds":300,"batchSize":500},"rpc":{"acquireFunc":"cq_acquire","releaseFunc":"cq_release","expireFunc":"cq_expire_scope"}}}`,
 		},
 		{
 			name:  "missing siteMaxInFlight",
 			field: "siteMaxInFlight",
-			json:  `{"controller":{},"auth":{"enabled":true,"token":"secret"},"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://postgrest.example.test"}},"concurrency":{"caps":{"hostMaxInFlight":64,"siteIpMaxInFlight":4},"lease":{"requireHardExpiry":true},"wait":{"waitPollWindowMs":10000,"waitReconnectGraceMs":1500},"sweep":{"enabled":true,"intervalSeconds":300,"batchSize":500},"rpc":{"acquireFunc":"cq_acquire","releaseFunc":"cq_release","expireFunc":"cq_expire_scope"}}}`,
+			json:  `{"controller":{},"auth":{"enabled":true,"token":"secret"},"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://postgrest.example.test"}},"concurrency":{"caps":{"hostMaxInFlight":64,"siteIpMaxInFlight":4},"lease":{"requireHardExpiry":true},"wait":{"maxStreamMs":10000,"keepaliveMs":1500},"sweep":{"enabled":true,"intervalSeconds":300,"batchSize":500},"rpc":{"acquireFunc":"cq_acquire","releaseFunc":"cq_release","expireFunc":"cq_expire_scope"}}}`,
 		},
 		{
 			name:  "missing siteIpMaxInFlight",
 			field: "siteIpMaxInFlight",
-			json:  `{"controller":{},"auth":{"enabled":true,"token":"secret"},"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://postgrest.example.test"}},"concurrency":{"caps":{"hostMaxInFlight":64,"siteMaxInFlight":32},"lease":{"requireHardExpiry":true},"wait":{"waitPollWindowMs":10000,"waitReconnectGraceMs":1500},"sweep":{"enabled":true,"intervalSeconds":300,"batchSize":500},"rpc":{"acquireFunc":"cq_acquire","releaseFunc":"cq_release","expireFunc":"cq_expire_scope"}}}`,
+			json:  `{"controller":{},"auth":{"enabled":true,"token":"secret"},"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://postgrest.example.test"}},"concurrency":{"caps":{"hostMaxInFlight":64,"siteMaxInFlight":32},"lease":{"requireHardExpiry":true},"wait":{"maxStreamMs":10000,"keepaliveMs":1500},"sweep":{"enabled":true,"intervalSeconds":300,"batchSize":500},"rpc":{"acquireFunc":"cq_acquire","releaseFunc":"cq_release","expireFunc":"cq_expire_scope"}}}`,
 		},
 	}
 
@@ -400,29 +401,29 @@ func TestConfigValidateRequiresConcurrencyContractFields(t *testing.T) {
 	}
 }
 
-func TestConfigValidateRequiresWaitPollWindowMs(t *testing.T) {
+func TestConfigValidateRequiresMaxStreamMs(t *testing.T) {
 	cfg := validTestConfig()
-	cfg.Concurrency.Wait.WaitPollWindowMs = 0
+	cfg.Concurrency.Wait.MaxStreamMs = 0
 
 	err := cfg.Validate()
 	if err == nil {
-		t.Fatal("expected missing waitPollWindowMs error")
+		t.Fatal("expected missing maxStreamMs error")
 	}
-	if !strings.Contains(err.Error(), "waitPollWindowMs") {
-		t.Fatalf("expected waitPollWindowMs error, got %v", err)
+	if !strings.Contains(err.Error(), "maxStreamMs") {
+		t.Fatalf("expected maxStreamMs error, got %v", err)
 	}
 }
 
-func TestConfigValidateRequiresWaitReconnectGraceMs(t *testing.T) {
+func TestConfigValidateRequiresKeepaliveMs(t *testing.T) {
 	cfg := validTestConfig()
-	cfg.Concurrency.Wait.WaitReconnectGraceMs = 0
+	cfg.Concurrency.Wait.KeepaliveMs = 0
 
 	err := cfg.Validate()
 	if err == nil {
-		t.Fatal("expected missing waitReconnectGraceMs error")
+		t.Fatal("expected missing keepaliveMs error")
 	}
-	if !strings.Contains(err.Error(), "waitReconnectGraceMs") {
-		t.Fatalf("expected waitReconnectGraceMs error, got %v", err)
+	if !strings.Contains(err.Error(), "keepaliveMs") {
+		t.Fatalf("expected keepaliveMs error, got %v", err)
 	}
 }
 
@@ -437,7 +438,7 @@ func TestParseConfigBytesPreservesWaitingTimingValues(t *testing.T) {
 		"concurrency": {
 			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
 			"lease": {"requireHardExpiry": true},
-			"wait": {"waitPollWindowMs": 12000, "waitReconnectGraceMs": 1800},
+			"wait": {"maxStreamMs": 12000, "keepaliveMs": 1800},
 			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
 			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
 		}
@@ -447,11 +448,11 @@ func TestParseConfigBytesPreservesWaitingTimingValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseConfigBytes error: %v", err)
 	}
-	if cfg.Concurrency.Wait.WaitPollWindowMs != 12000 {
-		t.Fatalf("expected waitPollWindowMs 12000, got %d", cfg.Concurrency.Wait.WaitPollWindowMs)
+	if cfg.Concurrency.Wait.MaxStreamMs != 12000 {
+		t.Fatalf("expected maxStreamMs 12000, got %d", cfg.Concurrency.Wait.MaxStreamMs)
 	}
-	if cfg.Concurrency.Wait.WaitReconnectGraceMs != 1800 {
-		t.Fatalf("expected waitReconnectGraceMs 1800, got %d", cfg.Concurrency.Wait.WaitReconnectGraceMs)
+	if cfg.Concurrency.Wait.KeepaliveMs != 1800 {
+		t.Fatalf("expected keepaliveMs 1800, got %d", cfg.Concurrency.Wait.KeepaliveMs)
 	}
 }
 
@@ -466,7 +467,7 @@ func TestParseConfigBytesIgnoresLegacyCancelFuncField(t *testing.T) {
 		"concurrency": {
 			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
 			"lease": {"requireHardExpiry": true},
-			"wait": {"waitPollWindowMs": 12000, "waitReconnectGraceMs": 1800},
+			"wait": {"maxStreamMs": 12000, "keepaliveMs": 1800},
 			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
 			"rpc": {
 				"acquireFunc": "cq_acquire",
@@ -489,5 +490,108 @@ func TestParseConfigBytesIgnoresLegacyCancelFuncField(t *testing.T) {
 	}
 	if cfg.Concurrency.RPC.ExpireFunc != "cq_expire_scope" {
 		t.Fatalf("expected expireFunc preserved, got %q", cfg.Concurrency.RPC.ExpireFunc)
+	}
+}
+
+func TestParseConfigBytesAcceptsStreamWaitConfigKeys(t *testing.T) {
+	data := []byte(`{
+		"controller": {},
+		"auth": {"enabled": true, "token": "secret"},
+		"backend": {
+			"mode": "postgrest",
+			"postgrest": {"baseUrl": "https://postgrest.example.test"}
+		},
+		"concurrency": {
+			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
+			"lease": {"requireHardExpiry": true},
+			"wait": {"maxStreamMs": 12000, "keepaliveMs": 1800},
+			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
+			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
+		}
+	}`)
+
+	cfg, err := ParseConfigBytes(data)
+	if err != nil {
+		t.Fatalf("ParseConfigBytes error: %v", err)
+	}
+
+	waitBytes, err := json.Marshal(cfg.Concurrency.Wait)
+	if err != nil {
+		t.Fatalf("marshal wait config: %v", err)
+	}
+	var waitBody map[string]any
+	if err := json.Unmarshal(waitBytes, &waitBody); err != nil {
+		t.Fatalf("decode wait config json: %v", err)
+	}
+	if waitBody["maxStreamMs"] != float64(12000) {
+		t.Fatalf("expected maxStreamMs 12000, got %v", waitBody)
+	}
+	if waitBody["keepaliveMs"] != float64(1800) {
+		t.Fatalf("expected keepaliveMs 1800, got %v", waitBody)
+	}
+	legacyWaitPollWindowKey := "waitPoll" + "WindowMs"
+	if _, ok := waitBody[legacyWaitPollWindowKey]; ok {
+		t.Fatalf("expected legacy %s key removed, got %v", legacyWaitPollWindowKey, waitBody)
+	}
+	legacyWaitReconnectGraceKey := "waitReconnect" + "GraceMs"
+	if _, ok := waitBody[legacyWaitReconnectGraceKey]; ok {
+		t.Fatalf("expected legacy %s key removed, got %v", legacyWaitReconnectGraceKey, waitBody)
+	}
+}
+
+func TestParseConfigBytesRequiresPositiveStreamWaitConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		json string
+		want string
+	}{
+		{
+			name: "missing maxStreamMs",
+			json: `{
+				"controller": {},
+				"auth": {"enabled": true, "token": "secret"},
+				"backend": {
+					"mode": "postgrest",
+					"postgrest": {"baseUrl": "https://postgrest.example.test"}
+				},
+				"concurrency": {
+					"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
+					"lease": {"requireHardExpiry": true},
+					"wait": {"keepaliveMs": 1800},
+					"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
+					"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
+				}
+			}`,
+			want: "maxStreamMs",
+		},
+		{
+			name: "missing keepaliveMs",
+			json: `{
+				"controller": {},
+				"auth": {"enabled": true, "token": "secret"},
+				"backend": {
+					"mode": "postgrest",
+					"postgrest": {"baseUrl": "https://postgrest.example.test"}
+				},
+				"concurrency": {
+					"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
+					"lease": {"requireHardExpiry": true},
+					"wait": {"maxStreamMs": 12000},
+					"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
+					"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
+				}
+			}`,
+			want: "keepaliveMs",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseConfigBytes([]byte(tc.json))
+			if err == nil {
+				t.Fatal("expected stream wait validation error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q error, got %v", tc.want, err)
+			}
+		})
 	}
 }

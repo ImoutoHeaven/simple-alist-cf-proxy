@@ -2774,7 +2774,7 @@ BEGIN
   IF COALESCE(v_request.waiter_lease_until_ms, 0) <= v_now_ms THEN
     UPDATE concurrency_requests
     SET state = 'expired',
-        terminal_reason = 'waiter_detached_timeout',
+        terminal_reason = 'wait_stream_timeout',
         updated_at_ms = v_now_ms
     WHERE request_id = v_request_id;
 
@@ -2784,7 +2784,7 @@ BEGIN
     expires_at_ms := NULL;
     wait_token := NULL;
     scope := NULL;
-    reason := 'waiter_detached_timeout';
+    reason := 'wait_stream_timeout';
     retry_after := NULL;
     claim_token := NULL;
     RETURN NEXT;
@@ -2978,9 +2978,6 @@ CREATE OR REPLACE FUNCTION cq_acquire(
   p_request_id text,
   p_hard_expire_at_ms bigint,
   p_now_ms bigint,
-  p_wait_token text DEFAULT NULL,
-  p_wait_poll_window_ms integer DEFAULT 0,
-  p_wait_reconnect_grace_ms integer DEFAULT 0,
   p_host_max_in_flight integer DEFAULT 0,
   p_site_max_in_flight integer DEFAULT 0,
   p_site_ip_max_in_flight integer DEFAULT 0,
@@ -2994,8 +2991,6 @@ DECLARE
   v_hostname_hash text := BTRIM(COALESCE(p_hostname_hash, ''));
   v_hostname text := COALESCE(NULLIF(BTRIM(COALESCE(p_hostname, '')), ''), v_hostname_hash);
   v_request_id text := BTRIM(COALESCE(p_request_id, ''));
-  v_authoritative_request_id text := v_request_id;
-  v_wait_token_input text := NULLIF(BTRIM(COALESCE(p_wait_token, '')), '');
   v_request record;
   v_request_row_count bigint := 0;
   v_lease_seed text;
@@ -3004,7 +2999,7 @@ DECLARE
   v_new_lease_id uuid;
   v_new_claim_token text;
   v_retry_after integer := 1;
-  v_waiter_lease_until_ms bigint := 0;
+  v_waiter_lease_until_ms bigint := p_hard_expire_at_ms;
   v_host_count integer := 0;
   v_site_count integer := 0;
   v_site_ip_count integer := 0;
@@ -3022,46 +3017,15 @@ BEGIN
     RAISE EXCEPTION 'cq_acquire hostname_hash is required';
   END IF;
 
-  v_waiter_lease_until_ms := v_now_ms
-    + GREATEST(COALESCE(p_wait_poll_window_ms, 0), 1)
-    + GREATEST(COALESCE(p_wait_reconnect_grace_ms, 0), 1);
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
 
-  IF v_wait_token_input IS NOT NULL THEN
-    SELECT concurrency_requests.request_id
-      INTO v_authoritative_request_id
-    FROM concurrency_requests
-    WHERE concurrency_requests.wait_token = v_wait_token_input;
+  SELECT *
+    INTO v_request
+  FROM concurrency_requests
+  WHERE request_id = v_request_id
+  FOR UPDATE;
 
-    GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
-
-    IF v_request_row_count = 0 THEN
-      RAISE EXCEPTION 'cq_acquire stale wait token';
-    END IF;
-  END IF;
-
-  PERFORM pg_advisory_xact_lock(3, hashtext(v_authoritative_request_id));
-
-  IF v_wait_token_input IS NOT NULL THEN
-    SELECT *
-      INTO v_request
-    FROM concurrency_requests
-    WHERE request_id = v_authoritative_request_id
-    FOR UPDATE;
-
-    GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
-
-    IF v_request_row_count = 0 OR v_request.wait_token IS DISTINCT FROM v_wait_token_input THEN
-      RAISE EXCEPTION 'cq_acquire stale wait token';
-    END IF;
-  ELSE
-    SELECT *
-      INTO v_request
-    FROM concurrency_requests
-    WHERE request_id = v_request_id
-    FOR UPDATE;
-
-    GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
-  END IF;
+  GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
 
   IF v_request_row_count > 0 THEN
     IF v_request.request_id IS DISTINCT FROM v_request_id
@@ -3175,7 +3139,7 @@ BEGIN
         IF COALESCE(v_request.waiter_lease_until_ms, 0) <= v_now_ms THEN
           UPDATE concurrency_requests
           SET state = 'expired',
-              terminal_reason = 'waiter_detached_timeout',
+              terminal_reason = 'wait_stream_timeout',
               updated_at_ms = v_now_ms
           WHERE request_id = v_request_id;
 
@@ -3185,18 +3149,11 @@ BEGIN
           expires_at_ms := NULL;
           wait_token := NULL;
           scope := NULL;
-          reason := 'waiter_detached_timeout';
+          reason := 'wait_stream_timeout';
           retry_after := NULL;
           claim_token := NULL;
           RETURN NEXT;
           RETURN;
-        END IF;
-
-        IF v_wait_token_input IS NOT NULL THEN
-          UPDATE concurrency_requests
-          SET waiter_lease_until_ms = v_waiter_lease_until_ms,
-              updated_at_ms = v_now_ms
-          WHERE request_id = v_request_id;
         END IF;
 
         result := 'wait';
@@ -4585,13 +4542,14 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION cq_continue_wait_probe(
+CREATE OR REPLACE FUNCTION cq_wait_state_probe(
   p_hostname_hash text,
   p_hostname text,
   p_site_bucket text,
   p_ip_bucket text,
   p_request_id text,
   p_hard_expire_at_ms bigint,
+  p_deadline_ms bigint,
   p_now_ms bigint,
   p_wait_token text
 )
@@ -4606,6 +4564,7 @@ DECLARE
   v_wait_token_input text := NULLIF(BTRIM(COALESCE(p_wait_token, '')), '');
   v_request record;
   v_request_row_count bigint := 0;
+  v_effective_deadline_ms bigint := 0;
   v_active_lease concurrency_leases%ROWTYPE;
   v_active_lease_row_count bigint := 0;
   v_transitioned boolean := FALSE;
@@ -4747,10 +4706,12 @@ BEGIN
         RETURN;
       END IF;
 
-      IF COALESCE(v_request.waiter_lease_until_ms, 0) <= v_now_ms THEN
+      v_effective_deadline_ms := LEAST(COALESCE(p_deadline_ms, v_request.hard_expire_at_ms), v_request.hard_expire_at_ms);
+
+      IF v_effective_deadline_ms <= v_now_ms THEN
         UPDATE concurrency_requests
         SET state = 'expired',
-            terminal_reason = 'waiter_detached_timeout',
+            terminal_reason = 'wait_stream_timeout',
             updated_at_ms = v_now_ms
         WHERE request_id = v_request_id;
 
@@ -4760,12 +4721,17 @@ BEGIN
         expires_at_ms := NULL;
         wait_token := NULL;
         scope := NULL;
-        reason := 'waiter_detached_timeout';
+        reason := 'wait_stream_timeout';
         retry_after := NULL;
         claim_token := NULL;
         RETURN NEXT;
         RETURN;
       END IF;
+
+      UPDATE concurrency_requests
+      SET waiter_lease_until_ms = v_effective_deadline_ms,
+          updated_at_ms = v_now_ms
+      WHERE request_id = v_request_id;
 
       result := 'wait';
       lease_id := NULL;

@@ -24,6 +24,7 @@ import (
 
 const (
 	acquirePath   = "/api/v1/concurrency/acquire"
+	waitPath      = "/api/v1/concurrency/wait"
 	claimPath     = "/api/v1/concurrency/claim"
 	ackPath       = "/api/v1/concurrency/ack_handoff"
 	releasePath   = "/api/v1/concurrency/release"
@@ -32,8 +33,8 @@ const (
 )
 
 const (
-	startupProbeInterval  = 100 * time.Millisecond
-	startupProbeTimeout   = 2 * time.Second
+	startupProbeInterval = 100 * time.Millisecond
+	startupProbeTimeout  = 2 * time.Second
 	// Startup recovery may need to rebuild waiting state, replay state, heartbeat
 	// deadlines, and stale-row cleanup before the server can safely serve traffic.
 	startupRecoverTimeout = 30 * time.Second
@@ -68,7 +69,7 @@ type Server struct {
 }
 
 type startupRecoveryActivation struct {
-	survivingHosts      map[string]struct{}
+	survivingHosts     map[string]struct{}
 	heartbeatDeadlines []HeartbeatDeadlineSnapshot
 }
 
@@ -247,6 +248,7 @@ func (s *Server) Close() error {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc(acquirePath, s.handleAcquire)
+	s.mux.HandleFunc(waitPath, s.handleWait)
 	s.mux.HandleFunc(claimPath, s.handleClaim)
 	s.mux.HandleFunc(ackPath, s.handleAckHandoff)
 	s.mux.HandleFunc(releasePath, s.handleRelease)
@@ -1024,7 +1026,11 @@ func (s *Server) recordAcquireOutcome(req AcquireRequest, result *AcquireResult)
 		s.recordAcquireConflict(result.Reason, req)
 		s.clearActiveReplayState(requestID)
 	case "expired":
-		s.recordAcquireTerminalObservability(result, requestID)
+		if result.Reason == "wait_stream_timeout" {
+			s.recordObservability(observabilityContinueWaitTimeout, "request_id="+requestID, "wait_token="+strings.TrimSpace(req.WaitToken))
+		} else {
+			s.recordAcquireTerminalObservability(result, requestID)
+		}
 	}
 }
 
@@ -1037,6 +1043,27 @@ func writeAcquireConflict(w http.ResponseWriter, reason string) {
 
 func writeClaimConflict(w http.ResponseWriter, reason string) {
 	writeJSON(w, http.StatusConflict, &ClaimGrantResult{Result: "conflict", Reason: reason})
+}
+
+type waitSetupFailureResponse struct {
+	Result string `json:"result"`
+	Error  string `json:"error"`
+	Reason string `json:"reason"`
+}
+
+func writeWaitSetupFailure(w http.ResponseWriter, status int, reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "internal error"
+	}
+	if status == http.StatusMethodNotAllowed {
+		w.Header().Set("Allow", http.MethodPost)
+	}
+	writeJSON(w, status, waitSetupFailureResponse{
+		Result: "error",
+		Error:  reason,
+		Reason: reason,
+	})
 }
 
 func writeCancelConflict(w http.ResponseWriter, reason string) {
@@ -1106,6 +1133,40 @@ func validateAcquireRequest(req AcquireRequest) error {
 	}
 	if req.NowMs <= 0 {
 		return errors.New("nowMs is required")
+	}
+	return nil
+}
+
+func validateWaitRequest(req AcquireRequest) error {
+	if strings.TrimSpace(req.Hostname) == "" {
+		return errors.New("hostname is required")
+	}
+	if strings.TrimSpace(req.HostnameHash) == "" {
+		return errors.New("hostnameHash is required")
+	}
+	if strings.TrimSpace(req.SiteBucket) == "" {
+		return errors.New("siteBucket is required")
+	}
+	if strings.TrimSpace(req.IPBucket) == "" {
+		return errors.New("ipBucket is required")
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		return errors.New("requestId is required")
+	}
+	if req.HardExpireAtMs <= 0 {
+		return errors.New("hardExpireAtMs is required")
+	}
+	if strings.TrimSpace(req.WaitToken) == "" {
+		return errors.New("waitToken is required")
+	}
+	if req.DeadlineMs <= 0 {
+		return errors.New("deadlineMs is required")
+	}
+	if strings.TrimSpace(req.TicketHash) == "" {
+		return errors.New("ticketHash is required")
+	}
+	if strings.TrimSpace(req.ClientInstanceID) == "" {
+		return errors.New("clientInstanceId is required")
 	}
 	return nil
 }
@@ -1258,47 +1319,9 @@ func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	var attachedWaiter *attachedWaiter
 	if strings.TrimSpace(req.WaitToken) != "" {
-		if prober, ok := s.backend.(continueWaitProber); ok {
-			probeResult, err := prober.ProbeContinueWait(r.Context(), req)
-			if err != nil {
-				var conflictErr *acquireConflictError
-				if errors.As(err, &conflictErr) {
-					s.recordAcquireConflict(conflictErr.Reason, req)
-					writeAcquireConflict(w, conflictErr.Reason)
-					return
-				}
-				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-				return
-			}
-			if probeResult == nil {
-				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-				return
-			}
-			if err := validateAcquireResult(req, probeResult); err != nil {
-				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-				return
-			}
-			if probeResult.Result != "wait" {
-				s.recordAcquireOutcome(req, probeResult)
-				status, ok := acquireResultStatus(probeResult.Result)
-				if !ok {
-					http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-					return
-				}
-				writeJSON(w, status, probeResult)
-				return
-			}
-		}
-		var ok bool
-		attachedWaiter, ok = s.waitingRuntime.tryAttach(req.WaitToken)
-		if !ok {
-			s.recordAcquireConflict(acquireConflictReasonWaiterAlreadyAttached, req)
-			writeAcquireConflict(w, acquireConflictReasonWaiterAlreadyAttached)
-			return
-		}
-		defer s.releaseAttachedWaiter(attachedWaiter, req)
+		http.Error(w, "/api/v1/concurrency/acquire does not accept waitToken", http.StatusBadRequest)
+		return
 	}
 	result, err := s.backend.Acquire(r.Context(), req)
 	if err != nil {
@@ -1322,61 +1345,151 @@ func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	s.recordAcquireOutcome(req, result)
 	if result.Result == "wait" {
 		req.WaitToken = result.WaitToken
-		s.waitingRuntime.upsertWaitingRequest(req, result.WaitToken, attachedWaiter, s.cfg)
+		s.waitingRuntime.upsertWaitingRequest(req, result.WaitToken, nil, s.cfg)
 		s.ensureHostReactor(req.HostnameHash)
 		s.wakeHostReactor(req.HostnameHash)
-	} else if strings.TrimSpace(req.WaitToken) != "" {
-		s.waitingRuntime.finishRequest(req.RequestID, result)
 	}
-	if attachedWaiter != nil && result.Result == "wait" {
+	s.writeAcquireResultWithCompensation(r.Context(), w, req, result, releaseReasonAcquireDeliveryFailed)
+}
+
+func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeWaitSetupFailure(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if ok, code := s.checkAuth(r); !ok {
+		writeWaitSetupFailure(w, code, strings.ToLower(http.StatusText(code)))
+		return
+	}
+	if !s.isReady() {
+		writeWaitSetupFailure(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+
+	var req AcquireRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeWaitSetupFailure(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := validateWaitRequest(req); err != nil {
+		writeWaitSetupFailure(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	handlerNowMs := time.Now().UnixMilli()
+	req.NowMs = handlerNowMs
+	req.DeadlineMs = s.effectiveWaitDeadlineMs(req, handlerNowMs)
+	releaseClaim, err := s.waitingRuntime.claimWaitToken(r.Context(), req.WaitToken)
+	if err != nil {
+		return
+	}
+	claimHeld := true
+	defer func() {
+		if claimHeld {
+			releaseClaim()
+		}
+	}()
+	if attachedLeaseUntilMs, ok := s.waitingRuntime.attachedWaiterLeaseUntilMs(req.WaitToken); ok {
+		// Preserve the accepted stream's lease while we probe for tuple/terminal precedence.
+		req.DeadlineMs = attachedLeaseUntilMs
+	}
+
+	prober, ok := s.backend.(waitStateProber)
+	if !ok {
+		writeWaitSetupFailure(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	probeResult, err := prober.ProbeWaitState(r.Context(), req)
+	if err != nil {
+		var conflictErr *acquireConflictError
+		if errors.As(err, &conflictErr) {
+			s.recordAcquireConflict(conflictErr.Reason, req)
+			writeAcquireConflict(w, conflictErr.Reason)
+			return
+		}
+		writeWaitSetupFailure(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	if probeResult == nil {
+		writeWaitSetupFailure(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	if err := validateAcquireResult(req, probeResult); err != nil {
+		writeWaitSetupFailure(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	if probeResult.Result != "wait" {
+		s.waitingRuntime.finishByWaitToken(req.WaitToken, probeResult)
+		s.recordAcquireOutcome(req, probeResult)
+	}
+
+	var attachedWaiter *attachedWaiter
+	if probeResult.Result == "wait" {
+		attachedWaiter, ok = s.waitingRuntime.tryAttach(req.WaitToken)
+		if !ok {
+			s.recordAcquireConflict(acquireConflictReasonWaiterAlreadyAttached, req)
+			writeAcquireConflict(w, acquireConflictReasonWaiterAlreadyAttached)
+			return
+		}
+		defer s.releaseAttachedWaiter(attachedWaiter, req)
+		s.waitingRuntime.upsertWaitingRequestWithLeaseDeadline(req, req.WaitToken, attachedWaiter, req.DeadlineMs)
 		s.waitingRuntime.setRequest(attachedWaiter, req)
+		s.recordAcquireOutcome(req, probeResult)
 		s.ensureHostReactor(req.HostnameHash)
 		s.runHostPass(r.Context(), req.HostnameHash)
 		s.wakeHostReactor(req.HostnameHash)
-		if promoted := consumeWaiterDelivery(attachedWaiter); promoted != nil {
-			s.writeAcquireResultWithCompensation(r.Context(), w, req, promoted, releaseReasonGrantDeliveryFailed)
-			return
-		}
-		pollWindow := time.Duration(s.cfg.Concurrency.Wait.WaitPollWindowMs) * time.Millisecond
-		if pollWindow <= 0 {
-			pollWindow = 10 * time.Second
-		}
-		pollTimer := time.NewTimer(pollWindow)
-		defer pollTimer.Stop()
-		waiterSnap, _ := s.waitingRuntime.snapshotAttachedRequest(attachedWaiter)
-		deadlineTimer, deadlineCh := s.newAttachedWaiterDeadlineTimer(waiterSnap.Request, pollWindow)
-		if deadlineTimer != nil {
-			defer deadlineTimer.Stop()
-		}
-		for {
-			select {
-			case delivered := <-attachedWaiter.resultCh:
-				if delivered == nil {
-					http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-					return
-				}
-				s.writeAcquireResultWithCompensation(r.Context(), w, req, delivered, releaseReasonGrantDeliveryFailed)
-				return
-			case <-deadlineCh:
-				deadlineCh = nil
-				if deadlineResult := s.resolveAttachedWaiterDeadline(r.Context(), attachedWaiter); deadlineResult != nil {
-					s.writeAcquireResultWithCompensation(r.Context(), w, req, deadlineResult, releaseReasonGrantDeliveryFailed)
-					return
-				}
-			case <-pollTimer.C:
-				finalResult := s.finalizePollWindowResult(r.Context(), attachedWaiter, result)
-				if finalResult != nil && finalResult.Result == "wait" {
-					waiterSnap, _ := s.waitingRuntime.snapshotAttachedRequest(attachedWaiter)
-					s.recordObservability(observabilityContinueWaitTimeout, "request_id="+strings.TrimSpace(waiterSnap.Request.RequestID), "wait_token="+strings.TrimSpace(waiterSnap.WaitToken))
-				}
-				s.writeAcquireResultWithCompensation(r.Context(), w, req, finalResult, releaseReasonGrantDeliveryFailed)
-				return
-			case <-r.Context().Done():
+	}
+	releaseClaim()
+	claimHeld = false
+
+	if err := writeSSEAccepted(w, req.DeadlineMs); err != nil {
+		return
+	}
+	if err := writeSSEKeepalive(w, time.Now().UnixMilli()); err != nil {
+		return
+	}
+	if probeResult.Result != "wait" {
+		s.writeWaitResultWithCompensation(r.Context(), w, req, probeResult)
+		return
+	}
+	if promoted := consumeWaiterDelivery(attachedWaiter); promoted != nil {
+		s.recordAcquireOutcome(req, promoted)
+		s.writeWaitResultWithCompensation(r.Context(), w, req, promoted)
+		return
+	}
+
+	deadlineDelay := time.Until(time.UnixMilli(req.DeadlineMs))
+	if deadlineDelay < 0 {
+		deadlineDelay = 0
+	}
+	deadlineTimer := time.NewTimer(deadlineDelay)
+	defer deadlineTimer.Stop()
+	keepaliveTicker := time.NewTicker(time.Duration(s.cfg.Concurrency.Wait.KeepaliveMs) * time.Millisecond)
+	defer keepaliveTicker.Stop()
+
+	for {
+		select {
+		case delivered := <-attachedWaiter.resultCh:
+			if delivered == nil {
 				return
 			}
+			s.recordAcquireOutcome(req, delivered)
+			s.writeWaitResultWithCompensation(r.Context(), w, req, delivered)
+			return
+		case <-deadlineTimer.C:
+			finalResult := &AcquireResult{Result: "expired", Reason: "wait_stream_timeout"}
+			s.waitingRuntime.finishByWaitToken(req.WaitToken, finalResult)
+			s.recordAcquireOutcome(req, finalResult)
+			s.writeWaitResultWithCompensation(r.Context(), w, req, finalResult)
+			return
+		case <-keepaliveTicker.C:
+			if err := writeSSEKeepalive(w, time.Now().UnixMilli()); err != nil {
+				return
+			}
+		case <-r.Context().Done():
+			return
 		}
 	}
-	s.writeAcquireResultWithCompensation(r.Context(), w, req, result, releaseReasonAcquireDeliveryFailed)
 }
 
 func (s *Server) releaseAttachedWaiter(waiter *attachedWaiter, req AcquireRequest) {
@@ -1407,6 +1520,82 @@ func (s *Server) writeAcquireResultWithCompensation(ctx context.Context, w http.
 		return false
 	}
 	return err == nil && trackingWriter.err == nil
+}
+
+func (s *Server) effectiveWaitDeadlineMs(req AcquireRequest, nowMs int64) int64 {
+	deadlineMs := req.DeadlineMs
+	serverCapDeadlineMs := nowMs + int64(s.cfg.Concurrency.Wait.MaxStreamMs)
+	if deadlineMs <= 0 || deadlineMs > serverCapDeadlineMs {
+		deadlineMs = serverCapDeadlineMs
+	}
+	if req.HardExpireAtMs > 0 && (deadlineMs <= 0 || req.HardExpireAtMs < deadlineMs) {
+		deadlineMs = req.HardExpireAtMs
+	}
+	if deadlineMs <= 0 {
+		return nowMs
+	}
+	return deadlineMs
+}
+
+func (s *Server) writeWaitResultWithCompensation(ctx context.Context, w http.ResponseWriter, req AcquireRequest, result *AcquireResult) bool {
+	if result == nil || result.Result == "wait" {
+		return false
+	}
+	if err := validateAcquireResult(req, result); err != nil {
+		return false
+	}
+	if err := writeSSEResult(w, result); err != nil {
+		if result.Result == "granted" {
+			s.compensateGrantDelivery(context.Background(), req.RequestID, result, releaseReasonGrantDeliveryFailed, req.NowMs)
+		}
+		return false
+	}
+	if result.Result == "granted" && ctx.Err() != nil {
+		s.compensateGrantDelivery(context.Background(), req.RequestID, result, releaseReasonGrantDeliveryFailed, req.NowMs)
+		return false
+	}
+	return true
+}
+
+func writeSSEAccepted(w http.ResponseWriter, deadlineMs int64) error {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	payload, err := json.Marshal(map[string]int64{"deadlineMs": deadlineMs})
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("event: accepted\ndata: " + string(payload) + "\n\n")); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
+}
+
+func writeSSEKeepalive(w http.ResponseWriter, nowMs int64) error {
+	if _, err := w.Write([]byte(": keepalive " + strconv.FormatInt(nowMs, 10) + "\n\n")); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
+}
+
+func writeSSEResult(w http.ResponseWriter, result *AcquireResult) error {
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("event: result\ndata: " + string(payload) + "\n\n")); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
 }
 
 func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
@@ -1823,17 +2012,18 @@ func (s *Server) processDueWaitingRequests(ctx context.Context, hostnameHash str
 }
 
 func (s *Server) probeWaitingSnapshot(ctx context.Context, snap requestSnapshot, nowMs int64) (*AcquireResult, error) {
-	prober, ok := s.backend.(continueWaitProber)
+	prober, ok := s.backend.(waitStateProber)
 	if !ok {
 		return nil, nil
 	}
-	return prober.ProbeContinueWait(ctx, AcquireRequest{
+	return prober.ProbeWaitState(ctx, AcquireRequest{
 		Hostname:       snap.Hostname,
 		HostnameHash:   snap.HostnameHash,
 		SiteBucket:     snap.SiteBucket,
 		IPBucket:       snap.IPBucket,
 		RequestID:      snap.RequestID,
 		HardExpireAtMs: snap.HardExpireAtMs,
+		DeadlineMs:     requestDeadlineMs(&snap),
 		NowMs:          nowMs,
 		WaitToken:      snap.WaitToken,
 	})
@@ -1877,17 +2067,24 @@ func (s *Server) probeAttachedWaiter(ctx context.Context, waiter *attachedWaiter
 }
 
 func (s *Server) probeAttachedWaiterSnapshot(ctx context.Context, waiterSnap attachedWaiterSnapshot, nowMs int64) (*AcquireResult, error) {
-	prober, ok := s.backend.(continueWaitProber)
+	prober, ok := s.backend.(waitStateProber)
 	if !ok {
 		return nil, nil
 	}
-	return prober.ProbeContinueWait(ctx, AcquireRequest{
+	deadlineMs := waiterSnap.Request.DeadlineMs
+	if deadlineMs <= 0 {
+		if snap, ok := s.waitingRuntime.snapshotForWaitToken(waiterSnap.WaitToken); ok && snap != nil {
+			deadlineMs = requestDeadlineMs(snap)
+		}
+	}
+	return prober.ProbeWaitState(ctx, AcquireRequest{
 		Hostname:       waiterSnap.Request.Hostname,
 		HostnameHash:   waiterSnap.Request.HostnameHash,
 		SiteBucket:     waiterSnap.Request.SiteBucket,
 		IPBucket:       waiterSnap.Request.IPBucket,
 		RequestID:      waiterSnap.Request.RequestID,
 		HardExpireAtMs: waiterSnap.Request.HardExpireAtMs,
+		DeadlineMs:     deadlineMs,
 		NowMs:          nowMs,
 		WaitToken:      waiterSnap.WaitToken,
 	})
@@ -1929,7 +2126,7 @@ func (s *Server) newAttachedWaiterDeadlineTimer(req AcquireRequest, pollWindow t
 
 func (s *Server) nextAttachedWaiterDeadlineMs(req AcquireRequest) int64 {
 	deadlineMs := req.HardExpireAtMs
-	waiterLeaseUntilMs := req.NowMs + int64(s.cfg.Concurrency.Wait.WaitPollWindowMs+s.cfg.Concurrency.Wait.WaitReconnectGraceMs)
+	waiterLeaseUntilMs := req.NowMs + int64(s.cfg.Concurrency.Wait.MaxStreamMs)
 	if waiterLeaseUntilMs > 0 && (deadlineMs <= 0 || waiterLeaseUntilMs < deadlineMs) {
 		deadlineMs = waiterLeaseUntilMs
 	}

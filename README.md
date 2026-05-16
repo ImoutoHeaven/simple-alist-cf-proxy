@@ -20,6 +20,14 @@ simple-alist-cf-proxy 是 AList 下载体系里的 Cloudflare Worker 下载代�
 - landing worker（签发下载票据）
 - Node.js 18+ / Wrangler
 
+## Admission Wait Protocol
+
+- Wait endpoints: `POST /api/v1/fairqueue/wait` and `POST /api/v1/concurrency/wait`
+- Both wait requests use `Accept: text/event-stream`, both handlers reply with `Content-Type: text/event-stream`, and each accepted stream emits one `accepted` event plus one final `result` event.
+- CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP
+- FQ: wait SSE -> accepted -> one final result -> release or abandon HTTP cleanup
+- No compatibility mode, long-poll fallback, or automatic SSE reconnect exists.
+
 ## 快速开始
 
 1. 安装依赖并构建
@@ -123,9 +131,9 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - admission 固定为四种显式路径：`none -> fetch only`、`breaker_only -> authorize -> fetch -> report|settle`、`queue_only -> admit(queue only) -> fetch -> release`、`queue_breaker -> admit(queue + breaker) -> fetch -> report|settle -> release`
 - 命中托管 breaker hostname 时，`breaker_only` 先按权威快照对 `open` 立即 fail-fast，并在实际 fetch 前调用 `download_authorize_breaker_attempt`；`queue_breaker` 直接消费 slot-handler / `fq_admit_batch` 返回的 `attemptVersion` / `attemptTicket`，不会在拿到 slot 后再走第二套 authorize 逻辑。`download_authorize_breaker_attempt` 与 `fq_admit_batch` 共享同一套 authorize helper，而 authorize 也是唯一的 lazy-cleanup / normalization 入口。half-open bookkeeping 固定使用 `HALF_OPEN_RESOLVED_MASK` 与 `HALF_OPEN_SUCCESS_MASK`；`report` 只接受当前 live batch 的有效 ticket 作为 evidence-bearing mutation，`settle` 只负责当前 live batch 的无 sample ticket debt，stale / identity-free / duplicate / expired-batch 调用都会返回 no-mutation snapshot。live `half_open` 批次若 budget 已满但仍有 pending debt，`breaker_only` 不再发 ticket，`queue_breaker` 明确返回 `HALF_OPEN_FULL`；`halfOpenMaxProbeCount` 的有效范围固定为 `1..63`。
 - 上游响应矩阵固定为：`2xx` 继续走现有 body proxy / CQ managed streaming；`3xx` 保持当前 redirect 与 queue-breaker deferred report 行为；`4xx`/`5xx` 会在 deferred flush 之后、body proxy 之前统一进入 terminal classifier，先完成 breaker `report(sample=1)` 或 `settle(no-sample debt)`、CQ release 与 fairqueue cleanup，再返回保留原 upstream status 的 Worker-generated JSON `{ code, message }`，不会再透传 upstream body。
-- 可选 Fair Queue（slot-handler）获取 slot；slot-handler 只透传 backend `THROTTLED` / `HALF_OPEN_FULL` 和 `READY` 对应的 attempt ownership 元数据，不在本地维护 breaker 运行时状态
+- 可选 Fair Queue（slot-handler）获取 slot；Worker 通过 `POST /api/v1/fairqueue/wait` 打开 SSE wait，slot-handler 只透传 backend `THROTTLED` / `HALF_OPEN_FULL` 和 `READY` 对应的 attempt ownership 元数据，不在本地维护 breaker 运行时状态
 - 可选 True Concurrency（`concurrency-handler`）负责真实 in-flight 并发；它与 fairqueue 拆分部署，依赖 `hardExpireAtMs`、hot-path expiry cleanup 与 sweep 回收 lease
-- 当 fairqueue 与 true concurrency 同时启用时，worker 固定按 `fairqueue acquire -> true-concurrency acquire -> /api/v1/concurrency/claim -> /api/v1/concurrency/ack_handoff -> heartbeat websocket upgrade + hello_ack -> origin fetch -> fairqueue release after headers -> true-concurrency release on stream lifecycle` 的主顺序执行；若 `acquire` 先返回 `wait`，则继续用稳定 `waitToken` 续连，直到拿到 `granted` 后再调用 `/claim`
+- 当 fairqueue 与 true concurrency 同时启用时，worker 固定按 `POST /api/v1/fairqueue/wait -> accepted/result -> POST /api/v1/concurrency/acquire -> (wait 时释放未使用的 fairqueue slot) -> POST /api/v1/concurrency/wait -> POST /api/v1/concurrency/claim -> POST /api/v1/concurrency/ack_handoff -> heartbeat websocket upgrade + hello_ack -> origin fetch -> true-concurrency release on stream lifecycle` 的顺序执行；若 CQ fast acquire 返回 `wait`，worker 会先 settle 旧 breaker attempt，再释放未使用的 fairqueue slot，然后再进入 CQ SSE wait
 - 当 `download.trueConcurrency.enabled=true` 时，heartbeat 是 origin fetch 之前的必经步骤；worker 若在 `initialConnectMaxAttempts` 或 `initialConnectMaxElapsedMs` 预算内拿不到 `hello_ack`，会直接 fail closed，不会发起 origin fetch，并以 `heartbeat_connect_failed` 立刻尝试释放 active lease
 - `heartbeat_connect_failed` 的首次 release 若失败，worker 会继续沿用既有 release controller，按 `立即一次 + 2s + 4s + 8s` 的节奏重试，并把清理 promise 绑到 `ctx.waitUntil()`
 - heartbeat `hello` / `heartbeat` 帧只携带 requestId、leaseId、leaseToken、generation、nowMs 等 lease 身份字段，不发送 `downloadedBytes`；stream 中途丢 heartbeat、客户端断开、hard expiry、upstream failure 都会先停掉 heartbeat cleanup，再按当前 reason 处理 active lease
@@ -133,9 +141,9 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 
 ## Fair Queue 与 True Concurrency
 
-- `slot-handler` 仍是 fairqueue、长轮询和 queue-side release 的唯一权威。
+- `slot-handler` 仍是 fairqueue、SSE wait 与 queue-side release 的唯一权威。
 - `concurrency-handler` 是独立 Go 服务，只负责 true-concurrency 的 DB-authoritative `acquire`、`claim`、`release`、`cancel` 和 expiry cleanup。
-- `concurrency-handler` 在生产环境要求按 `waitToken` 做 sticky routing，否则等待中的继续请求不会稳定回到原实例。
+- `concurrency-handler` 在生产环境要求对已接受的 `/api/v1/concurrency/wait` 流保持实例亲和，否则内存中的 attached waiter 无法稳定接收最终结果。
 - `concurrency-handler` HTTP auth 是必需项；`auth.enabled` 必须为 `true`，且 `auth.token` 必须配置。
 - Worker 侧 true-concurrency client contract 由 `handlerAuthKey`、`handlerAuthHeader`、`acquireTimeoutMs` 与 `releaseTimeoutMs` 定义。
 - `concurrency-handler` 的 `backend.mode` 支持 `postgres` 与 `postgrest`，两种模式暴露相同的 true-concurrency 语义，只改变 handler 到数据库的传输方式。

@@ -472,14 +472,6 @@ func seedRuntimeActiveLeases(t *testing.T, db *sql.DB, base runtimeAcquireCall, 
 }
 
 func execRuntimeAcquire(ctx context.Context, db *sql.DB, req runtimeAcquireCall) (*runtimeAcquireResult, error) {
-	waitPollWindowMs := req.WaitPollWindowMs
-	if waitPollWindowMs <= 0 {
-		waitPollWindowMs = 10000
-	}
-	waitReconnectMs := req.WaitReconnectMs
-	if waitReconnectMs <= 0 {
-		waitReconnectMs = 1500
-	}
 	cleanupLimit := req.CleanupLimit
 	if cleanupLimit <= 0 {
 		cleanupLimit = 500
@@ -496,7 +488,7 @@ func execRuntimeAcquire(ctx context.Context, db *sql.DB, req runtimeAcquireCall)
 		       reason,
 		       retry_after,
 		       claim_token
-		FROM cq_acquire($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		FROM cq_acquire($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`,
 		req.HostnameHash,
 		req.Hostname,
@@ -505,9 +497,6 @@ func execRuntimeAcquire(ctx context.Context, db *sql.DB, req runtimeAcquireCall)
 		req.RequestID,
 		req.HardExpireMs,
 		req.NowMs,
-		req.WaitToken,
-		waitPollWindowMs,
-		waitReconnectMs,
 		req.HostMaxInFlight,
 		req.SiteMaxInFlight,
 		req.SiteIPMaxInFlight,
@@ -1058,6 +1047,10 @@ func readRuntimeActiveCounters(t *testing.T, db *sql.DB, hostnameHash, siteBucke
 
 func execRuntimeContinueWaitProbe(ctx context.Context, db *sql.DB, req AcquireRequest) (*runtimeAcquireResult, error) {
 	result := &runtimeAcquireResult{}
+	deadlineMs := req.DeadlineMs
+	if deadlineMs <= 0 {
+		deadlineMs = req.HardExpireAtMs
+	}
 	err := db.QueryRowContext(ctx, `
 		SELECT result,
 		       COALESCE(lease_id::text, ''),
@@ -1068,7 +1061,7 @@ func execRuntimeContinueWaitProbe(ctx context.Context, db *sql.DB, req AcquireRe
 		       reason,
 		       retry_after,
 		       claim_token
-		FROM cq_continue_wait_probe($1, $2, $3, $4, $5, $6, $7, $8)
+		FROM cq_wait_state_probe($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`,
 		req.HostnameHash,
 		req.Hostname,
@@ -1076,6 +1069,47 @@ func execRuntimeContinueWaitProbe(ctx context.Context, db *sql.DB, req AcquireRe
 		canonicalBucket(req.IPBucket),
 		req.RequestID,
 		req.HardExpireAtMs,
+		deadlineMs,
+		req.NowMs,
+		strings.TrimSpace(req.WaitToken),
+	).Scan(
+		&result.Result,
+		&result.LeaseID,
+		&result.LeaseToken,
+		&result.ExpiresAtMs,
+		&result.WaitToken,
+		&result.Scope,
+		&result.Reason,
+		&result.RetryAfter,
+		&result.ClaimToken,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func execRuntimeWaitStateProbe(ctx context.Context, db *sql.DB, req AcquireRequest) (*runtimeAcquireResult, error) {
+	result := &runtimeAcquireResult{}
+	err := db.QueryRowContext(ctx, `
+		SELECT result,
+		       COALESCE(lease_id::text, ''),
+		       COALESCE(lease_token, ''),
+		       COALESCE(expires_at_ms, 0),
+		       wait_token,
+		       scope,
+		       reason,
+		       retry_after,
+		       claim_token
+		FROM cq_wait_state_probe($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`,
+		req.HostnameHash,
+		req.Hostname,
+		canonicalBucket(req.SiteBucket),
+		canonicalBucket(req.IPBucket),
+		req.RequestID,
+		req.HardExpireAtMs,
+		req.DeadlineMs,
 		req.NowMs,
 		strings.TrimSpace(req.WaitToken),
 	).Scan(
@@ -3410,11 +3444,11 @@ func TestRuntimeContinueWaitProbeReturnsExpiredBeforeReplayConflictForExpiredAct
 	nowMs := time.Now().UnixMilli()
 
 	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
-		HostnameHash:      "continue-wait-expired-host",
-		Hostname:          "continue-wait-expired.example.com",
+		HostnameHash:      "wait-stream-expired-host",
+		Hostname:          "wait-stream-expired.example.com",
 		SiteBucket:        "site-a",
 		IPBucket:          "ip-a",
-		RequestID:         "continue-wait-expired-busy",
+		RequestID:         "wait-stream-expired-busy",
 		HardExpireMs:      nowMs + 120_000,
 		NowMs:             nowMs,
 		HostMaxInFlight:   1,
@@ -3429,11 +3463,11 @@ func TestRuntimeContinueWaitProbeReturnsExpiredBeforeReplayConflictForExpiredAct
 	}
 
 	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
-		HostnameHash:      "continue-wait-expired-host",
-		Hostname:          "continue-wait-expired.example.com",
+		HostnameHash:      "wait-stream-expired-host",
+		Hostname:          "wait-stream-expired.example.com",
 		SiteBucket:        "site-b",
 		IPBucket:          "ip-b",
-		RequestID:         "continue-wait-expired-request",
+		RequestID:         "wait-stream-expired-request",
 		HardExpireMs:      nowMs + 120_000,
 		NowMs:             nowMs + 1,
 		HostMaxInFlight:   1,
@@ -3460,8 +3494,8 @@ func TestRuntimeContinueWaitProbeReturnsExpiredBeforeReplayConflictForExpiredAct
 	}
 
 	promoted, err := execRuntimePromoteWaiting(context.Background(), db, PromoteWaitingRequest{
-		RequestID:      "continue-wait-expired-request",
-		HostnameHash:   "continue-wait-expired-host",
+		RequestID:      "wait-stream-expired-request",
+		HostnameHash:   "wait-stream-expired-host",
 		SiteBucket:     "site-b",
 		IPBucket:       "ip-b",
 		HardExpireAtMs: nowMs + 120_000,
@@ -3489,16 +3523,16 @@ func TestRuntimeContinueWaitProbeReturnsExpiredBeforeReplayConflictForExpiredAct
 		SET lease_expires_at_ms = $2::bigint,
 		    updated_at_ms = $3::bigint
 		WHERE request_id = $1
-	`, "continue-wait-expired-request", pastMs, nowMs-500); err != nil {
+	`, "wait-stream-expired-request", pastMs, nowMs-500); err != nil {
 		t.Fatalf("age promoted request into expired active state: %v", err)
 	}
 
 	probe, err := execRuntimeContinueWaitProbe(context.Background(), db, AcquireRequest{
-		HostnameHash:   "continue-wait-expired-host",
-		Hostname:       "continue-wait-expired.example.com",
+		HostnameHash:   "wait-stream-expired-host",
+		Hostname:       "wait-stream-expired.example.com",
 		SiteBucket:     "site-b",
 		IPBucket:       "ip-b",
-		RequestID:      "continue-wait-expired-request",
+		RequestID:      "wait-stream-expired-request",
 		HardExpireAtMs: nowMs + 120_000,
 		NowMs:          nowMs + 10,
 		WaitToken:      waiting.WaitToken.String,
@@ -3837,8 +3871,8 @@ func TestAcquireFastExpiresStaleWaitingRowBeforeReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay stale waiting row: %v", err)
 	}
-	if result.Result != "expired" || result.Reason.String != "waiter_detached_timeout" {
-		t.Fatalf("expected expired waiter_detached_timeout replay, got %+v", result)
+	if result.Result != "expired" || result.Reason.String != "wait_stream_timeout" {
+		t.Fatalf("expected expired wait_stream_timeout replay, got %+v", result)
 	}
 
 	var state, terminalReason string
@@ -3849,8 +3883,113 @@ func TestAcquireFastExpiresStaleWaitingRowBeforeReplay(t *testing.T) {
 	`, "stale-waiting-request").Scan(&state, &terminalReason); err != nil {
 		t.Fatalf("read expired waiting row: %v", err)
 	}
-	if state != "expired" || terminalReason != "waiter_detached_timeout" {
+	if state != "expired" || terminalReason != "wait_stream_timeout" {
 		t.Fatalf("expected expired waiting tombstone, got state=%q terminal_reason=%q", state, terminalReason)
+	}
+}
+
+func TestRuntimeWaitStateProbeExpiresStreamDeadline(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO concurrency_requests (
+			request_id, hostname_hash, hostname, site_bucket, ip_bucket, hard_expire_at_ms,
+			state, wait_token, first_wait_at_ms, waiter_lease_until_ms, created_at_ms, updated_at_ms
+		) VALUES ($1, $2, $3, $4, $5, $6, 'waiting', $7, $8, $9, $8, $8)
+	`, "wait-stream-timeout-request", "wait-stream-host", "wait-stream.example.com", "site-a", "ip-a", nowMs+60_000, "wait-stream-token", nowMs-10_000, nowMs+10_000); err != nil {
+		t.Fatalf("seed waiting row: %v", err)
+	}
+
+	result, err := execRuntimeWaitStateProbe(context.Background(), db, AcquireRequest{
+		HostnameHash:   "wait-stream-host",
+		Hostname:       "wait-stream.example.com",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "wait-stream-timeout-request",
+		HardExpireAtMs: nowMs + 60_000,
+		WaitToken:      "wait-stream-token",
+		DeadlineMs:     nowMs - 1,
+		NowMs:          nowMs,
+	})
+	if err != nil {
+		t.Fatalf("probe wait state: %v", err)
+	}
+	if result.Result != "expired" || result.Reason.String != "wait_stream_timeout" {
+		t.Fatalf("expected expired wait_stream_timeout result, got %+v", result)
+	}
+
+	var state, terminalReason string
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT state, terminal_reason
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, "wait-stream-timeout-request").Scan(&state, &terminalReason); err != nil {
+		t.Fatalf("read wait timeout row: %v", err)
+	}
+	if state != "expired" || terminalReason != "wait_stream_timeout" {
+		t.Fatalf("expected expired wait_stream_timeout tombstone, got state=%q terminal_reason=%q", state, terminalReason)
+	}
+}
+
+func TestRuntimeWaitStateProbeReturnsWaitForFreshWaitingRow(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "wait-probe-host",
+		Hostname:          "wait-probe.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "wait-probe-busy-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed busy lease: %v", err)
+	}
+	if busy.Result != "granted" {
+		t.Fatalf("expected busy lease grant, got %+v", busy)
+	}
+
+	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "wait-probe-host",
+		Hostname:          "wait-probe.example.com",
+		SiteBucket:        "site-b",
+		IPBucket:          "ip-b",
+		RequestID:         "wait-probe-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed waiting request: %v", err)
+	}
+	if waiting.Result != "wait" || !waiting.WaitToken.Valid {
+		t.Fatalf("expected waiting seed, got %+v", waiting)
+	}
+
+	result, err := execRuntimeWaitStateProbe(context.Background(), db, AcquireRequest{
+		HostnameHash:   "wait-probe-host",
+		Hostname:       "wait-probe.example.com",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		RequestID:      "wait-probe-request",
+		HardExpireAtMs: nowMs + 120_000,
+		WaitToken:      waiting.WaitToken.String,
+		DeadlineMs:     nowMs + 30_000,
+		NowMs:          nowMs + 1,
+	})
+	if err != nil {
+		t.Fatalf("probe fresh waiting row: %v", err)
+	}
+	if result.Result != "wait" || result.WaitToken.String != waiting.WaitToken.String {
+		t.Fatalf("expected wait probe result for fresh waiting row, got %+v", result)
 	}
 }
 
@@ -4869,137 +5008,19 @@ func TestRuntimeAcquireSerializesRequestIDAcrossTuplesAndRejectsConflictingReuse
 	}
 }
 
-func TestRuntimeAcquireWaitTokenReconnectLocksAuthoritativeRequestID(t *testing.T) {
-	db := requireRuntimeConcurrencyDB(t)
-	nowMs := time.Now().UnixMilli()
-	hardExpireMs := nowMs + 120_000
-	authoritativeRequestID := "acquire-wait-lock-authoritative"
-	fakeRequestID := "acquire-wait-lock-fake"
-
-	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
-		HostnameHash:      "acquire-wait-lock-host",
-		Hostname:          "acquire-wait-lock.example.com",
-		SiteBucket:        "site-a",
-		IPBucket:          "ip-a",
-		RequestID:         "acquire-wait-lock-busy",
-		HardExpireMs:      hardExpireMs,
-		NowMs:             nowMs,
-		HostMaxInFlight:   1,
-		SiteMaxInFlight:   1,
-		SiteIPMaxInFlight: 1,
-	})
-	if err != nil {
-		t.Fatalf("seed busy lease: %v", err)
-	}
-	if busy.Result != "granted" {
-		t.Fatalf("expected granted busy seed, got %+v", busy)
-	}
-
-	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
-		HostnameHash:      "acquire-wait-lock-host",
-		Hostname:          "acquire-wait-lock.example.com",
-		SiteBucket:        "site-b",
-		IPBucket:          "ip-b",
-		RequestID:         authoritativeRequestID,
-		HardExpireMs:      hardExpireMs,
-		NowMs:             nowMs + 1,
-		HostMaxInFlight:   1,
-		SiteMaxInFlight:   1,
-		SiteIPMaxInFlight: 1,
-	})
-	if err != nil {
-		t.Fatalf("seed waiting request: %v", err)
-	}
-	if waiting.Result != "wait" || !waiting.WaitToken.Valid {
-		t.Fatalf("expected waiting request with token, got %+v", waiting)
-	}
-
-	type acquireOutcome struct {
-		result *runtimeAcquireResult
-		err    error
-	}
-
-	reconnect := func(requestID string) <-chan acquireOutcome {
-		ch := make(chan acquireOutcome, 1)
-		go func() {
-			result, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
-				HostnameHash:      "acquire-wait-lock-host",
-				Hostname:          "acquire-wait-lock.example.com",
-				SiteBucket:        "site-b",
-				IPBucket:          "ip-b",
-				RequestID:         requestID,
-				HardExpireMs:      hardExpireMs,
-				NowMs:             nowMs + 2,
-				WaitToken:         waiting.WaitToken.String,
-				HostMaxInFlight:   1,
-				SiteMaxInFlight:   1,
-				SiteIPMaxInFlight: 1,
-			})
-			ch <- acquireOutcome{result: result, err: err}
-		}()
-		return ch
-	}
-
-	fakeConn, fakeTx := holdRequestIDAdvisoryLock(t, db, fakeRequestID)
-	fakeOutcomeCh := reconnect(fakeRequestID)
-	select {
-	case outcome := <-fakeOutcomeCh:
-		if outcome.err == nil || !strings.Contains(outcome.err.Error(), "cq_acquire request_id tuple mismatch") {
-			_ = fakeTx.Rollback()
-			_ = fakeConn.Close()
-			t.Fatalf("expected reconnect tuple mismatch after ignoring caller lock, got result=%+v err=%v", outcome.result, outcome.err)
-		}
-	case <-time.After(200 * time.Millisecond):
-		if err := fakeTx.Rollback(); err != nil {
-			t.Fatalf("release fake advisory lock: %v", err)
-		}
-		if err := fakeConn.Close(); err != nil {
-			t.Fatalf("close fake advisory lock connection: %v", err)
-		}
-		outcome := <-fakeOutcomeCh
-		t.Fatalf("expected reconnect to ignore caller-supplied advisory lock, but it blocked until fake lock released; result=%+v err=%v", outcome.result, outcome.err)
-	}
-	if err := fakeTx.Rollback(); err != nil {
-		t.Fatalf("release fake advisory lock after early tuple mismatch: %v", err)
-	}
-	if err := fakeConn.Close(); err != nil {
-		t.Fatalf("close fake advisory lock connection after early tuple mismatch: %v", err)
-	}
-
-	authConn, authTx := holdRequestIDAdvisoryLock(t, db, authoritativeRequestID)
-	authOutcomeCh := reconnect(fakeRequestID)
-	select {
-	case outcome := <-authOutcomeCh:
-		_ = authTx.Rollback()
-		_ = authConn.Close()
-		t.Fatalf("expected reconnect to block on the authoritative request_id lock, got early result=%+v err=%v", outcome.result, outcome.err)
-	case <-time.After(200 * time.Millisecond):
-	}
-	if err := authTx.Rollback(); err != nil {
-		t.Fatalf("release authoritative advisory lock: %v", err)
-	}
-	if err := authConn.Close(); err != nil {
-		t.Fatalf("close authoritative advisory lock connection: %v", err)
-	}
-	authOutcome := <-authOutcomeCh
-	if authOutcome.err == nil || !strings.Contains(authOutcome.err.Error(), "cq_acquire request_id tuple mismatch") {
-		t.Fatalf("expected authoritative-lock reconnect to finish with tuple mismatch after unlock, got result=%+v err=%v", authOutcome.result, authOutcome.err)
-	}
-}
-
 func TestRuntimeContinueWaitProbeLocksAuthoritativeRequestID(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 	hardExpireMs := nowMs + 120_000
-	authoritativeRequestID := "continue-wait-lock-authoritative"
-	fakeRequestID := "continue-wait-lock-fake"
+	authoritativeRequestID := "wait-stream-lock-authoritative"
+	fakeRequestID := "wait-stream-lock-fake"
 
 	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
-		HostnameHash:      "continue-wait-lock-host",
-		Hostname:          "continue-wait-lock.example.com",
+		HostnameHash:      "wait-stream-lock-host",
+		Hostname:          "wait-stream-lock.example.com",
 		SiteBucket:        "site-a",
 		IPBucket:          "ip-a",
-		RequestID:         "continue-wait-lock-busy",
+		RequestID:         "wait-stream-lock-busy",
 		HardExpireMs:      hardExpireMs,
 		NowMs:             nowMs,
 		HostMaxInFlight:   1,
@@ -5014,8 +5035,8 @@ func TestRuntimeContinueWaitProbeLocksAuthoritativeRequestID(t *testing.T) {
 	}
 
 	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
-		HostnameHash:      "continue-wait-lock-host",
-		Hostname:          "continue-wait-lock.example.com",
+		HostnameHash:      "wait-stream-lock-host",
+		Hostname:          "wait-stream-lock.example.com",
 		SiteBucket:        "site-b",
 		IPBucket:          "ip-b",
 		RequestID:         authoritativeRequestID,
@@ -5041,8 +5062,8 @@ func TestRuntimeContinueWaitProbeLocksAuthoritativeRequestID(t *testing.T) {
 		ch := make(chan probeOutcome, 1)
 		go func() {
 			result, err := execRuntimeContinueWaitProbe(context.Background(), db, AcquireRequest{
-				HostnameHash:   "continue-wait-lock-host",
-				Hostname:       "continue-wait-lock.example.com",
+				HostnameHash:   "wait-stream-lock-host",
+				Hostname:       "wait-stream-lock.example.com",
 				SiteBucket:     "site-b",
 				IPBucket:       "ip-b",
 				RequestID:      requestID,

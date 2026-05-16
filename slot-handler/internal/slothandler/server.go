@@ -63,8 +63,9 @@ type PostgresConfig struct {
 
 type FairQueueConfig struct {
 	PollIntervalMs          int64                  `json:"pollIntervalMs"`
-	PollWindowMs            int64                  `json:"pollWindowMs"`
-	GraceMs                 int64                  `json:"graceMs"`
+	Wait                    FairQueueWaitConfig    `json:"wait"`
+	AcceptedLeaseMs         int64                  `json:"acceptedLeaseMs"`
+	DetachedGraceMs         int64                  `json:"detachGraceMs"`
 	MinSlotHoldMs           int64                  `json:"minSlotHoldMs"`
 	UtilWindowSec           int                    `json:"utilWindowSec"`
 	MaxBatch                int                    `json:"maxBatch"`
@@ -81,6 +82,11 @@ type FairQueueConfig struct {
 	SiteCaps                SiteCapsConfig         `json:"siteCaps"`
 	RPC                     RPCConfig              `json:"rpc"`
 	Cleanup                 FairQueueCleanupConfig `json:"cleanup"`
+}
+
+type FairQueueWaitConfig struct {
+	MaxStreamMs int64 `json:"maxStreamMs"`
+	KeepaliveMs int64 `json:"keepaliveMs"`
 }
 
 type RPCConfig struct {
@@ -139,6 +145,29 @@ type AcquirePayload struct {
 	QueryToken               string `json:"queryToken,omitempty"`
 }
 
+type FairQueueWaitRequest struct {
+	Hostname                 string `json:"hostname"`
+	HostnameHash             string `json:"hostnameHash"`
+	IPBucket                 string `json:"ipBucket"`
+	SiteBucket               string `json:"siteBucket"`
+	Now                      int64  `json:"now"`
+	DeadlineMs               int64  `json:"deadlineMs"`
+	RequestID                string `json:"requestId"`
+	AdmissionMode            string `json:"admissionMode"`
+	BreakerEnabled           bool   `json:"breakerEnabled,omitempty"`
+	OpenCapSeconds           int    `json:"openCapSeconds,omitempty"`
+	CloseThresholdPercent    int    `json:"closeThresholdPercent,omitempty"`
+	HalfOpenSuccessThreshold int    `json:"halfOpenSuccessThreshold,omitempty"`
+	HalfOpenCloseMode        string `json:"halfOpenCloseMode,omitempty"`
+	HalfOpenMaxProbeCount    int    `json:"halfOpenMaxProbeCount,omitempty"`
+	HalfOpenMaxSeconds       int    `json:"halfOpenMaxSeconds,omitempty"`
+	HalfOpenTimeoutMode      string `json:"halfOpenTimeoutMode,omitempty"`
+	QueryToken               string `json:"queryToken,omitempty"`
+	InvocationEpoch          uint64 `json:"invocationEpoch,omitempty"`
+	SlotToken                string `json:"slotToken,omitempty"`
+	ReleaseOwnerRequired     *bool  `json:"releaseOwnerRequired,omitempty"`
+}
+
 type AcquireResponse struct {
 	Result               string                 `json:"result"`
 	QueryToken           string                 `json:"queryToken,omitempty"`
@@ -153,6 +182,18 @@ type AcquireResponse struct {
 	RetryAfter           int                    `json:"retryAfter,omitempty"`
 	Reason               string                 `json:"reason,omitempty"`
 	Meta                 map[string]interface{} `json:"meta,omitempty"`
+}
+
+type fairQueueWaitAcceptedEvent struct {
+	QueryToken      string `json:"queryToken"`
+	InvocationEpoch uint64 `json:"invocationEpoch"`
+	DeadlineMs      int64  `json:"deadlineMs"`
+}
+
+type fairQueueWaitSetupFailureResponse struct {
+	Result string `json:"result"`
+	Error  string `json:"error,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 type AbandonRequest struct {
@@ -948,8 +989,24 @@ func (c FairQueueConfig) pollInterval() time.Duration {
 	return time.Duration(value) * time.Millisecond
 }
 
+func (c FairQueueWaitConfig) maxStreamDuration() time.Duration {
+	value := c.MaxStreamMs
+	if value <= 0 {
+		value = 10000
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
+func (c FairQueueWaitConfig) keepaliveInterval() time.Duration {
+	value := c.KeepaliveMs
+	if value <= 0 {
+		value = 1500
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
 func (c FairQueueConfig) pollWindowDuration() time.Duration {
-	value := c.PollWindowMs
+	value := c.AcceptedLeaseMs
 	if value <= 0 {
 		value = 6000
 	}
@@ -957,7 +1014,7 @@ func (c FairQueueConfig) pollWindowDuration() time.Duration {
 }
 
 func (c FairQueueConfig) graceDuration() time.Duration {
-	value := c.GraceMs
+	value := c.DetachedGraceMs
 	if value <= 0 {
 		value = 4000
 	}
@@ -1261,6 +1318,8 @@ func validateConfig(cfg Config) (Config, error) {
 	cfg.FairQueue.MaxBatch = cfg.FairQueue.maxBatchSize()
 	cfg.FairQueue.MaxProbeParallel = cfg.FairQueue.maxProbeParallel()
 	cfg.FairQueue.MaxProbeQpsPerHost = cfg.FairQueue.maxProbeQpsPerHost()
+	cfg.FairQueue.AcceptedLeaseMs = cfg.FairQueue.pollWindowDuration().Milliseconds()
+	cfg.FairQueue.DetachedGraceMs = cfg.FairQueue.graceDuration().Milliseconds()
 
 	return cfg, nil
 }
@@ -1597,6 +1656,391 @@ func (s *server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func validateFairQueueWaitRequest(req FairQueueWaitRequest) error {
+	if strings.TrimSpace(req.Hostname) == "" {
+		return errors.New("hostname is required")
+	}
+	if strings.TrimSpace(req.HostnameHash) == "" {
+		return errors.New("hostnameHash is required")
+	}
+	if strings.TrimSpace(req.IPBucket) == "" {
+		return errors.New("ipBucket is required")
+	}
+	if strings.TrimSpace(req.SiteBucket) == "" {
+		return errors.New("siteBucket is required")
+	}
+	if req.Now <= 0 {
+		return errors.New("now is required")
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		return errors.New("requestId is required")
+	}
+	if req.DeadlineMs <= 0 {
+		return errors.New("deadlineMs is required")
+	}
+	if strings.TrimSpace(req.QueryToken) != "" || req.InvocationEpoch != 0 || strings.TrimSpace(req.SlotToken) != "" || req.ReleaseOwnerRequired != nil {
+		return errors.New("initial fairqueue wait request must not include ownership tokens")
+	}
+
+	mode := strings.TrimSpace(req.AdmissionMode)
+	switch mode {
+	case "queue_breaker":
+		if !req.BreakerEnabled {
+			return errors.New("breakerEnabled must be true when admissionMode is queue_breaker")
+		}
+		return validateAcquirePayload(AcquireRequest{
+			HostnameHash:             req.HostnameHash,
+			BreakerEnabled:           req.BreakerEnabled,
+			OpenCapSeconds:           req.OpenCapSeconds,
+			CloseThresholdPercent:    req.CloseThresholdPercent,
+			HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
+			HalfOpenCloseMode:        req.HalfOpenCloseMode,
+			HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
+			HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
+			HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
+		})
+	case "queue_only":
+		if req.BreakerEnabled || req.OpenCapSeconds != 0 || req.CloseThresholdPercent != 0 || req.HalfOpenSuccessThreshold != 0 || strings.TrimSpace(req.HalfOpenCloseMode) != "" || req.HalfOpenMaxProbeCount != 0 || req.HalfOpenMaxSeconds != 0 || strings.TrimSpace(req.HalfOpenTimeoutMode) != "" {
+			return errors.New("queue_only wait request must omit breaker fields")
+		}
+		return nil
+	default:
+		return errors.New("admissionMode must be queue_only or queue_breaker")
+	}
+}
+
+func writeFairQueueWaitSetupFailure(w http.ResponseWriter, status int, reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "internal error"
+	}
+	if status == http.StatusMethodNotAllowed {
+		w.Header().Set("Allow", http.MethodPost)
+	}
+	writeJSON(w, status, fairQueueWaitSetupFailureResponse{
+		Result: "error",
+		Error:  reason,
+		Reason: reason,
+	})
+}
+
+func fairQueueWaitAcquireRequest(req FairQueueWaitRequest) AcquireRequest {
+	return AcquireRequest{
+		Hostname:                 req.Hostname,
+		HostnameHash:             req.HostnameHash,
+		IPBucket:                 req.IPBucket,
+		SiteBucket:               req.SiteBucket,
+		Now:                      req.Now,
+		BreakerEnabled:           req.BreakerEnabled,
+		OpenCapSeconds:           req.OpenCapSeconds,
+		CloseThresholdPercent:    req.CloseThresholdPercent,
+		HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
+		HalfOpenCloseMode:        strings.TrimSpace(req.HalfOpenCloseMode),
+		HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
+		HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
+		HalfOpenTimeoutMode:      strings.TrimSpace(req.HalfOpenTimeoutMode),
+	}
+}
+
+func (s *server) effectiveFairQueueWaitDeadline(req FairQueueWaitRequest, now time.Time) (int64, string) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	nowMs := now.UnixMilli()
+	deadlineMs := nowMs + s.getConfig().FairQueue.Wait.maxStreamDuration().Milliseconds()
+	reason := "wait_stream_timeout"
+	if req.DeadlineMs > 0 && req.DeadlineMs < deadlineMs {
+		deadlineMs = req.DeadlineMs
+		reason = "worker_deadline_exceeded"
+	}
+	if deadlineMs < nowMs {
+		deadlineMs = nowMs
+	}
+	return deadlineMs, reason
+}
+
+func normalizeFairQueueWaitFinalResult(accepted fairQueueWaitAcceptedEvent, resp *AcquireResponse) (*AcquireResponse, error) {
+	if resp == nil {
+		return nil, errors.New("fairqueue wait final result is required")
+	}
+	out := *resp
+	if strings.TrimSpace(out.QueryToken) == "" {
+		out.QueryToken = accepted.QueryToken
+	}
+	if out.InvocationEpoch == 0 {
+		out.InvocationEpoch = accepted.InvocationEpoch
+	}
+	if strings.TrimSpace(out.QueryToken) != accepted.QueryToken || out.InvocationEpoch != accepted.InvocationEpoch {
+		return nil, errors.New("fairqueue wait final result ownership mismatch")
+	}
+
+	switch strings.TrimSpace(out.Result) {
+	case "granted":
+		if strings.TrimSpace(out.SlotToken) == "" {
+			return nil, errors.New("granted result missing slotToken")
+		}
+		out.ReleaseOwnerRequired = true
+		return &out, nil
+	case "throttled", "overloaded", "timeout", "conflict":
+		out.SlotToken = ""
+		out.ReleaseOwnerRequired = false
+		return &out, nil
+	case "pending", "abandoned", "noop", "noop_expired", "noop_epoch_mismatch", "noop_not_found", "noop_attached":
+		return nil, fmt.Errorf("forbidden fairqueue wait final result %q", out.Result)
+	default:
+		return nil, fmt.Errorf("unsupported fairqueue wait final result %q", out.Result)
+	}
+}
+
+func writeFairQueueWaitAccepted(w http.ResponseWriter, accepted fairQueueWaitAcceptedEvent) error {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	payload, err := json.Marshal(accepted)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("event: accepted\ndata: " + string(payload) + "\n\n")); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
+}
+
+func writeSSEKeepalive(w http.ResponseWriter, nowMs int64) error {
+	if _, err := w.Write([]byte(": keepalive " + strconv.FormatInt(nowMs, 10) + "\n\n")); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
+}
+
+func writeFairQueueWaitResult(w http.ResponseWriter, result *AcquireResponse) error {
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("event: result\ndata: " + string(payload) + "\n\n")); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
+}
+
+func (s *server) compensateFairQueueWaitGrantDelivery(token string, invocationEpoch uint64, now time.Time) {
+	if s == nil || token == "" || invocationEpoch == 0 {
+		return
+	}
+	if now.IsZero() {
+		now = s.flowStoreNow()
+	}
+	if handoff, ok := s.flowStore.takeDeliveredGrantHandoff(token, invocationEpoch); ok {
+		s.flowStore.deleteFlow(token)
+		releaseReq := ReleaseRequest{
+			Hostname:      handoff.Hostname,
+			HostnameHash:  handoff.HostnameHash,
+			IPBucket:      handoff.IPBucket,
+			SiteBucket:    handoff.SiteBucket,
+			SlotToken:     handoff.SlotToken,
+			HitUpstreamAt: now.UnixMilli(),
+			Now:           now.UnixMilli(),
+		}
+		s.recordCompensatingRelease()
+		s.compensatingReleaseAsync(releaseReq)
+		return
+	}
+	s.flowStore.deleteFlow(token)
+}
+
+func (s *server) abortFairQueueWait(token string, invocationEpoch uint64, delivered *AcquireResponse, now time.Time) {
+	if s == nil || token == "" || invocationEpoch == 0 {
+		return
+	}
+	if now.IsZero() {
+		now = s.flowStoreNow()
+	}
+	if delivered != nil {
+		if strings.EqualFold(strings.TrimSpace(delivered.Result), "granted") {
+			s.compensateFairQueueWaitGrantDelivery(token, invocationEpoch, now)
+			return
+		}
+		s.flowStore.deleteFlow(token)
+		return
+	}
+	result, releaseReq, hasRelease := s.flowStore.abandonAcceptedInvocation(token, invocationEpoch, now)
+	if result == "abandoned" && hasRelease {
+		s.recordCompensatingRelease()
+		hostKey := fqHostKey(releaseReq.HostnameHash, releaseReq.Hostname)
+		if hostKey != "" {
+			s.wakeHostProbeRunner(hostKey)
+		}
+		s.compensatingReleaseAsync(releaseReq)
+	}
+}
+
+func (s *server) handleWait(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeFairQueueWaitSetupFailure(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.authPassed(r) {
+		writeFairQueueWaitSetupFailure(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	defer r.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeFairQueueWaitSetupFailure(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	var req FairQueueWaitRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeFairQueueWaitSetupFailure(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := validateFairQueueWaitRequest(req); err != nil {
+		writeFairQueueWaitSetupFailure(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	cfg := s.getConfig()
+	if cfg == nil {
+		writeFairQueueWaitSetupFailure(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	store := s.ensureFlowStore(cfg)
+	now := s.flowStoreNow()
+	effectiveDeadlineMs, timeoutReason := s.effectiveFairQueueWaitDeadline(req, now)
+	acquireReq := fairQueueWaitAcquireRequest(req)
+	token := store.newFlowFromAcquireRequest(acquireReq)
+	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1), ownerRoutedGrant: true}
+	resp, err := store.acceptAcquireInvocation(token, acquireReq, waiter, now, time.UnixMilli(effectiveDeadlineMs), cfg.FairQueue.inFlightLimits())
+	if err != nil {
+		if errors.Is(err, errWaiterOverloaded) {
+			store.deleteFlow(token)
+			writeJSON(w, http.StatusServiceUnavailable, overloadedResponse(overloadScopeFromError(err)))
+			return
+		}
+		if errors.Is(err, errWaiterAlreadyAttached) {
+			store.deleteFlow(token)
+			writeJSON(w, http.StatusConflict, conflictResponse())
+			return
+		}
+		s.log.Errorf("FairQueueWait accept failed: %v", err)
+		store.deleteFlow(token)
+		writeFairQueueWaitSetupFailure(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if resp == nil {
+		store.deleteFlow(token)
+		writeFairQueueWaitSetupFailure(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	accepted := fairQueueWaitAcceptedEvent{
+		QueryToken:      strings.TrimSpace(resp.QueryToken),
+		InvocationEpoch: resp.InvocationEpoch,
+		DeadlineMs:      effectiveDeadlineMs,
+	}
+	if accepted.QueryToken == "" {
+		accepted.QueryToken = token
+	}
+	if accepted.InvocationEpoch == 0 {
+		store.deleteFlow(token)
+		writeFairQueueWaitSetupFailure(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	if err := writeFairQueueWaitAccepted(w, accepted); err != nil {
+		s.abortFairQueueWait(token, accepted.InvocationEpoch, nil, now)
+		return
+	}
+	if err := writeSSEKeepalive(w, now.UnixMilli()); err != nil {
+		s.abortFairQueueWait(token, accepted.InvocationEpoch, nil, now)
+		return
+	}
+	hostKey := fqHostKey(acquireReq.HostnameHash, acquireReq.Hostname)
+	s.ensureHostProbeRunner(hostKey)
+	s.wakeHostProbeRunner(hostKey)
+
+	deadlineDelay := time.UnixMilli(effectiveDeadlineMs).Sub(now)
+	if deadlineDelay < 0 {
+		deadlineDelay = 0
+	}
+	deadlineTimer := time.NewTimer(deadlineDelay)
+	defer deadlineTimer.Stop()
+	keepaliveTicker := time.NewTicker(cfg.FairQueue.Wait.keepaliveInterval())
+	defer keepaliveTicker.Stop()
+
+	writeFinal := func(final *AcquireResponse) bool {
+		normalized, err := normalizeFairQueueWaitFinalResult(accepted, final)
+		if err != nil {
+			return false
+		}
+		if err := writeFairQueueWaitResult(w, normalized); err != nil {
+			if normalized.Result == "granted" {
+				s.compensateFairQueueWaitGrantDelivery(token, accepted.InvocationEpoch, s.flowStoreNow())
+			}
+			return false
+		}
+		if normalized.Result == "granted" {
+			if r.Context().Err() != nil {
+				s.compensateFairQueueWaitGrantDelivery(token, accepted.InvocationEpoch, s.flowStoreNow())
+				return false
+			}
+			if s.flowStore.claimAcceptedInvocationGrant(token, accepted.InvocationEpoch) {
+				s.recordGrantClaimed()
+			}
+		}
+		return true
+	}
+
+	for {
+		select {
+		case delivered := <-waiter.resCh:
+			if delivered == nil {
+				return
+			}
+			_ = writeFinal(delivered)
+			return
+		case <-deadlineTimer.C:
+			select {
+			case delivered := <-waiter.resCh:
+				if delivered != nil {
+					_ = writeFinal(delivered)
+				}
+				return
+			default:
+			}
+			now = s.flowStoreNow()
+			store.expireAcceptedInvocationIfCurrent(token, accepted.InvocationEpoch, now)
+			_ = writeFinal(&AcquireResponse{Result: "timeout", Reason: timeoutReason})
+			return
+		case <-keepaliveTicker.C:
+			if err := writeSSEKeepalive(w, s.flowStoreNow().UnixMilli()); err != nil {
+				s.abortFairQueueWait(token, accepted.InvocationEpoch, nil, s.flowStoreNow())
+				return
+			}
+		case <-r.Context().Done():
+			select {
+			case delivered := <-waiter.resCh:
+				s.abortFairQueueWait(token, accepted.InvocationEpoch, delivered, s.flowStoreNow())
+			default:
+				s.abortFairQueueWait(token, accepted.InvocationEpoch, nil, s.flowStoreNow())
+			}
+			return
+		}
+	}
 }
 
 func validateReleaseSlotToken(raw string) error {
@@ -2779,7 +3223,7 @@ func Main() {
 	mux.HandleFunc("/api/v0/health", s.handleInternalHealth)
 	mux.HandleFunc("/api/v0/refresh", s.handleInternalRefresh)
 	mux.HandleFunc("/api/v0/flush", s.handleInternalFlush)
-	mux.HandleFunc("/api/v1/fairqueue/acquire", s.handleAcquire)
+	mux.HandleFunc("/api/v1/fairqueue/wait", s.handleWait)
 	mux.HandleFunc("/api/v1/fairqueue/abandon", s.handleAbandon)
 	mux.HandleFunc("/api/v1/fairqueue/release", s.handleRelease)
 

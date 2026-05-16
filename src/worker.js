@@ -3,7 +3,6 @@ import { createCacheManager } from './cache/factory.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
 import { unifiedCheck, readTicketState, markTicketUsed } from './unified-check.js';
-import { nextOverloadDelayMs } from './fairqueue-overload.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
 import { parseBoolean, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
 import { buildBindingStr, decryptBindingPayload, getClientIp, normalizePath, parseCheckOriginEnv } from './origin-binding.js';
@@ -19,14 +18,12 @@ const DEFAULT_RATE_LIMIT_BLOCK_SECONDS = 600;
 const DEFAULT_RATE_LIMIT_IPV4_SUFFIX = '/32';
 const DEFAULT_RATE_LIMIT_IPV6_SUFFIX = '/60';
 const DEFAULT_SLOT_HANDLER_TIMEOUT_MS = 20000;
-const DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS = 8000;
 const DEFAULT_SLOT_HANDLER_RELEASE_TIMEOUT_MS = 1500;
 const DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER = 'X-CQ-Auth';
-// Must exceed the default CQ wait poll window with explicit slack, or held acquires can time out client-side first.
+// Must exceed the default CQ wait budget with explicit slack, or held acquires can time out client-side first.
 const DEFAULT_TRUE_CONCURRENCY_ACQUIRE_TIMEOUT_MS = 11500;
 const DEFAULT_TRUE_CONCURRENCY_RELEASE_TIMEOUT_MS = 1500;
 const DEFAULT_TRUE_CONCURRENCY_WAIT_TOTAL_MAX_MS = 20000;
-const DEFAULT_TRUE_CONCURRENCY_WAIT_MAX_ATTEMPTS_CAP = 35;
 const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG = Object.freeze({
   enabled: true,
   required: true,
@@ -47,7 +44,6 @@ const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG = Object.freeze({
 });
 const TRUE_CONCURRENCY_RELEASE_RETRY_DELAYS_MS = [0, 2000, 4000, 8000];
 const FINAL_CLEANUP_RELEASE_CONCURRENCY = 2;
-const DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS = 35;
 const DEFAULT_THROTTLE_OPEN_CAP_SECONDS = 60;
 const DEFAULT_THROTTLE_OPEN_THRESHOLD_PERCENT = 30;
 const DEFAULT_THROTTLE_CLOSE_THRESHOLD_PERCENT = 15;
@@ -62,8 +58,6 @@ const MAX_THROTTLE_HALF_OPEN_PROBE_COUNT = 63;
 const DEFAULT_THROTTLE_HALF_OPEN_MAX_SECONDS = 15;
 const DEFAULT_THROTTLE_HALF_OPEN_TIMEOUT_MODE = 'partial-close';
 const DEFAULT_THROTTLE_PROTECT_HTTP_CODES = [429, 499, 500, 502, 503, 504];
-// slot-handler acquire is long-poll based; don't set per-request timeouts below this window.
-const SLOT_HANDLER_LONGPOLL_MS = 6000;
 
 // Fair Queue in-memory state (per Worker instance)
 const FQ_GLOBAL_STATE = {
@@ -1484,14 +1478,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   const slotHandlerTimeoutMs = Number.isFinite(slotHandlerTimeoutMsRaw) && slotHandlerTimeoutMsRaw > 0
     ? slotHandlerTimeoutMsRaw
     : DEFAULT_SLOT_HANDLER_TIMEOUT_MS;
-  const perRequestTimeoutMsRaw = Number(fairQueueConfigRaw.perRequestTimeoutMs);
-  const perRequestTimeoutMs = Number.isFinite(perRequestTimeoutMsRaw) && perRequestTimeoutMsRaw > 0
-    ? perRequestTimeoutMsRaw
-    : DEFAULT_SLOT_HANDLER_PER_REQUEST_TIMEOUT_MS;
-  const maxAttemptsCapRaw = Number(fairQueueConfigRaw.maxAttemptsCap);
-  const maxAttemptsCap = Number.isFinite(maxAttemptsCapRaw) && maxAttemptsCapRaw > 0
-    ? maxAttemptsCapRaw
-    : DEFAULT_SLOT_HANDLER_MAX_ATTEMPTS;
   const slotHandlerUrl = normalizeString(fairQueueConfigRaw.slotHandlerUrl);
   const slotHandlerAuthKey = normalizeString(fairQueueConfigRaw.slotHandlerAuthKey);
   const slotHandlerAuthHeader = normalizeString(fairQueueConfigRaw.slotHandlerAuthHeader) || 'X-FQ-Auth';
@@ -1505,8 +1491,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
   const slotHandlerConfig = {
     url: slotHandlerUrl,
     totalMaxWaitMs: slotHandlerTimeoutMs,
-    perRequestTimeoutMs,
-    maxAttemptsCap,
     authKey: slotHandlerAuthKey,
     authHeader: slotHandlerAuthHeader,
   };
@@ -1564,12 +1548,6 @@ const resolveConfig = (env = {}, bootstrap = null, decision = null) => {
       'waitTotalMaxMs',
       DEFAULT_TRUE_CONCURRENCY_WAIT_TOTAL_MAX_MS,
       'controller trueConcurrency.waitTotalMaxMs',
-    ),
-    waitMaxAttemptsCap: readOptionalPositiveIntegerFromBootstrap(
-      trueConcurrencyConfigRaw,
-      'waitMaxAttemptsCap',
-      DEFAULT_TRUE_CONCURRENCY_WAIT_MAX_ATTEMPTS_CAP,
-      'controller trueConcurrency.waitMaxAttemptsCap',
     ),
     heartbeat: heartbeatConfig,
   };
@@ -1940,7 +1918,7 @@ const applyUnifiedResult = (unifiedResult, options = {}) => {
   return createThrottleProtectedResponse(options.origin || '*', breakerState);
 };
 
-function createFairQueueOverloadedResponse(origin, retryAfterSeconds) {
+function createFairQueueOverloadedResponse(origin, retryAfterSeconds, reason = 'overload_global') {
   const retryAfter = normalizePositiveSeconds(retryAfterSeconds, 60);
   const safeHeaders = new Headers();
   safeHeaders.set("content-type", "application/json;charset=UTF-8");
@@ -1950,8 +1928,9 @@ function createFairQueueOverloadedResponse(origin, retryAfterSeconds) {
 
   return new Response(
     JSON.stringify({
-      code: 503,
-      message: 'Upstream queue overloaded, please retry later'
+      result: 'overloaded',
+      reason,
+      retryAfter,
     }),
     {
       status: 503,
@@ -1973,6 +1952,7 @@ const TRUE_CONCURRENCY_ACK_HANDOFF_RESULTS = new Set(['acknowledged', 'conflict'
 const TRUE_CONCURRENCY_RELEASE_RESULTS = new Set(['released', 'noop', 'expired']);
 const TRUE_CONCURRENCY_CANCEL_RESULTS = new Set(['cancelled', 'noop', 'conflict']);
 const TRUE_CONCURRENCY_WAIT_SCOPES = new Set(['host', 'site', 'site_ip']);
+const TRUE_CONCURRENCY_WAIT_FINAL_RESULTS = new Set(['granted', 'conflict', 'released', 'cancelled', 'expired']);
 const TRUE_CONCURRENCY_ACQUIRE_CONFLICT_REASONS = new Set([
   'request_id_tuple_mismatch',
   'waiter_already_attached',
@@ -2198,6 +2178,59 @@ const normalizeTrueConcurrencyAcquireResult = (data, options = {}) => {
   return {
     result,
     reason,
+  };
+};
+
+const normalizeTrueConcurrencyWaitResult = (data, options = {}) => {
+  const result = readTrueConcurrencyResult('wait', data, TRUE_CONCURRENCY_WAIT_FINAL_RESULTS);
+
+  if (result === 'granted') {
+    if (typeof data?.leaseId !== 'string' || !data.leaseId) {
+      throw new Error('[CQ] wait granted response missing leaseId');
+    }
+    if (typeof data?.leaseToken !== 'string' || !data.leaseToken) {
+      throw new Error('[CQ] wait granted response missing leaseToken');
+    }
+    const expiresAtMs = Number(data?.expiresAtMs);
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= 0) {
+      throw new Error('[CQ] wait granted response missing expiresAtMs');
+    }
+    if (Number.isFinite(options.hardExpireAtMs) && expiresAtMs > options.hardExpireAtMs) {
+      throw new Error('[CQ] wait granted response exceeds hardExpireAtMs');
+    }
+    if (typeof data?.claimToken !== 'string' || !data.claimToken) {
+      throw new Error('[CQ] wait granted response missing claimToken');
+    }
+    return {
+      result: 'granted',
+      leaseId: data.leaseId,
+      leaseToken: data.leaseToken,
+      expiresAtMs,
+      claimToken: data.claimToken,
+    };
+  }
+
+  if (result === 'conflict') {
+    if (typeof data?.reason !== 'string' || !data.reason) {
+      throw new Error('[CQ] wait conflict response missing reason');
+    }
+    if (!TRUE_CONCURRENCY_ACQUIRE_CONFLICT_REASONS.has(data.reason)) {
+      throw new Error('[CQ] wait conflict response has unsupported reason');
+    }
+    return {
+      result: 'conflict',
+      reason: data.reason,
+    };
+  }
+
+  const allowedTerminalReasons = result === 'released'
+    ? TRUE_CONCURRENCY_RELEASED_TERMINAL_REASONS
+    : result === 'cancelled'
+      ? TRUE_CONCURRENCY_CANCELLED_TERMINAL_REASONS
+      : TRUE_CONCURRENCY_EXPIRED_TERMINAL_REASONS;
+  return {
+    result,
+    reason: readTrueConcurrencyTerminalReason('wait', result, data, allowedTerminalReasons),
   };
 };
 
@@ -2538,6 +2571,198 @@ const closeTrueConcurrencyHeartbeatSocket = (ws, reason = '') => {
   }
 };
 
+const createSseAbortError = () => {
+  const error = new Error('Aborted');
+  error.name = 'AbortError';
+  return error;
+};
+
+const parseSseEventBlock = (block) => {
+  if (typeof block !== 'string' || block.length === 0) {
+    return null;
+  }
+
+  let event = '';
+  const dataLines = [];
+
+  for (const rawLine of block.split('\n')) {
+    const line = rawLine.replace(/\r$/, '');
+    if (!line) {
+      continue;
+    }
+    if (line.startsWith(':')) {
+      continue;
+    }
+
+    const colonIndex = line.indexOf(':');
+    if (colonIndex === -1) {
+      throw new Error(`[CQ] invalid SSE frame line: ${line}`);
+    }
+
+    const field = line.slice(0, colonIndex).trim();
+    const value = line.slice(colonIndex + 1).replace(/^ /, '');
+
+    if (field === 'event') {
+      event = value.trim();
+      continue;
+    }
+    if (field === 'data') {
+      dataLines.push(value);
+      continue;
+    }
+    if (field === 'id' || field === 'retry') {
+      continue;
+    }
+
+    throw new Error(`[CQ] unexpected SSE field: ${field}`);
+  }
+
+  if (!event && dataLines.length === 0) {
+    return null;
+  }
+
+  if (!event) {
+    throw new Error('[CQ] SSE frame missing event name');
+  }
+
+  if (dataLines.length === 0) {
+    throw new Error(`[CQ] SSE ${event} frame missing data`);
+  }
+
+  return {
+    event,
+    dataText: dataLines.join('\n'),
+  };
+};
+
+const readSseResult = async (response, signal, allowedFinalResults, options = {}) => {
+  const allowedResults = allowedFinalResults instanceof Set
+    ? allowedFinalResults
+    : Array.isArray(allowedFinalResults)
+      ? new Set(allowedFinalResults)
+      : null;
+
+  if (!allowedResults || allowedResults.size === 0) {
+    throw new Error('[CQ] SSE reader requires an allowed final result set');
+  }
+
+  const body = response?.body;
+  if (!body || typeof body.getReader !== 'function') {
+    throw new Error('[CQ] SSE response missing body');
+  }
+
+  let reader = null;
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let accepted = null;
+  let final = null;
+
+  const onAbort = () => {
+    void reader?.cancel?.().catch(() => {});
+  };
+
+  try {
+    reader = body.getReader();
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+
+    if (signal?.aborted) {
+      throw createSseAbortError();
+    }
+
+    while (true) {
+      if (signal?.aborted) {
+        throw createSseAbortError();
+      }
+
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+
+      let frameSeparatorIndex = buffer.indexOf('\n\n');
+      while (frameSeparatorIndex !== -1) {
+        const rawBlock = buffer.slice(0, frameSeparatorIndex);
+        buffer = buffer.slice(frameSeparatorIndex + 2);
+
+        const parsedBlock = parseSseEventBlock(rawBlock);
+        if (!parsedBlock) {
+          frameSeparatorIndex = buffer.indexOf('\n\n');
+          continue;
+        }
+
+        let data;
+        try {
+          data = JSON.parse(parsedBlock.dataText);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(`[CQ] invalid SSE JSON in ${parsedBlock.event} event: ${message}`);
+        }
+
+        if (parsedBlock.event === 'accepted') {
+          if (accepted) {
+            throw new Error('[CQ] duplicate SSE accepted event');
+          }
+          const deadlineMs = Number(data?.deadlineMs);
+          if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
+            throw new Error('[CQ] SSE accepted event missing deadlineMs');
+          }
+          accepted = {
+            ...data,
+            deadlineMs,
+          };
+          if (typeof options?.onAccepted === 'function') {
+            options.onAccepted(accepted);
+          }
+        } else if (parsedBlock.event === 'result') {
+          if (!accepted) {
+            throw new Error('[CQ] SSE result received before accepted event');
+          }
+          const result = typeof data?.result === 'string' ? data.result : '';
+          if (!result || !allowedResults.has(result)) {
+            throw new Error(`[CQ] unexpected SSE final result: ${result || 'unknown'}`);
+          }
+          final = {
+            ...data,
+            result,
+          };
+          return { accepted, final };
+        } else {
+          throw new Error(`[CQ] unexpected SSE event: ${parsedBlock.event}`);
+        }
+
+        frameSeparatorIndex = buffer.indexOf('\n\n');
+      }
+    }
+
+    if (final) {
+      return { accepted, final };
+    }
+
+    throw new Error('[CQ] missing SSE final result');
+  } catch (error) {
+    if (signal?.aborted || isAbortError(error)) {
+      throw createSseAbortError();
+    }
+    throw error;
+  } finally {
+    signal?.removeEventListener?.('abort', onAbort);
+    try {
+      await reader?.cancel?.();
+    } catch (_error) {
+      // Best-effort cleanup only.
+    }
+    if (typeof reader?.releaseLock === 'function') {
+      try {
+        reader.releaseLock();
+      } catch (_error) {
+        // Best-effort cleanup only.
+      }
+    }
+  }
+};
+
 const createConcurrencyHandlerClient = (config) => {
   const handlerCfg = config.concurrencyHandlerConfig || {};
   const baseUrl = normalizePostgrestBaseUrl(handlerCfg.url);
@@ -2548,6 +2773,7 @@ const createConcurrencyHandlerClient = (config) => {
   const authKey = normalizeStringValue(handlerCfg.authKey);
   const authHeader = normalizeStringValue(handlerCfg.authHeader, DEFAULT_TRUE_CONCURRENCY_AUTH_HEADER);
   const acquireUrl = `${baseUrl}/api/v1/concurrency/acquire`;
+  const waitUrl = `${baseUrl}/api/v1/concurrency/wait`;
   const claimUrl = `${baseUrl}/api/v1/concurrency/claim`;
   const ackHandoffUrl = `${baseUrl}/api/v1/concurrency/ack_handoff`;
   const releaseUrl = `${baseUrl}/api/v1/concurrency/release`;
@@ -2564,8 +2790,11 @@ const createConcurrencyHandlerClient = (config) => {
     DEFAULT_TRUE_CONCURRENCY_RELEASE_TIMEOUT_MS,
   );
 
-  const buildHeaders = () => {
-    const headers = { 'Content-Type': 'application/json' };
+  const buildHeaders = (extraHeaders = null) => {
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(extraHeaders && typeof extraHeaders === 'object' ? extraHeaders : {}),
+    };
     if (authKey) {
       headers[authHeader] = authKey;
     }
@@ -2616,8 +2845,28 @@ const createConcurrencyHandlerClient = (config) => {
     }
   };
 
+  const postEventStream = async (url, payload, signal, options = {}) => {
+    const allowedStatuses = Array.isArray(options.allowedStatuses) && options.allowedStatuses.length > 0
+      ? options.allowedStatuses
+      : [200];
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: buildHeaders({ Accept: 'text/event-stream' }),
+      body: JSON.stringify(payload),
+      signal,
+    });
+    if (!allowedStatuses.includes(response.status)) {
+      throw new Error(`[CQ] handler request failed with status ${response.status}`);
+    }
+    return response;
+  };
+
   return {
     async acquire(_ctx, plan, signal, timeoutMs = acquireTimeoutMs) {
+      if (typeof plan.waitToken === 'string' && plan.waitToken) {
+        throw new Error('[CQ] fast acquire does not accept waitToken');
+      }
       const payload = {
         hostname: plan.hostname,
         hostnameHash: plan.hostnameHash,
@@ -2627,9 +2876,6 @@ const createConcurrencyHandlerClient = (config) => {
         hardExpireAtMs: plan.hardExpireAtMs,
         nowMs: plan.nowMs,
       };
-      if (typeof plan.waitToken === 'string' && plan.waitToken) {
-        payload.waitToken = plan.waitToken;
-      }
       const { data } = await postJson(acquireUrl, payload, {
         timeoutMs,
         signal,
@@ -2638,6 +2884,49 @@ const createConcurrencyHandlerClient = (config) => {
       return normalizeTrueConcurrencyAcquireResult(data, {
         hardExpireAtMs: plan.hardExpireAtMs,
       });
+    },
+
+    async wait(_ctx, plan, signal) {
+      const response = await postEventStream(waitUrl, {
+        hostnameHash: plan.hostnameHash,
+        hostname: plan.hostname,
+        siteBucket: plan.siteBucket,
+        ipBucket: plan.ipBucket,
+        requestId: plan.requestId,
+        hardExpireAtMs: plan.hardExpireAtMs,
+        waitToken: plan.waitToken,
+        deadlineMs: plan.deadlineMs,
+        ticketHash: plan.ticketHash,
+        clientInstanceId: plan.clientInstanceId,
+      }, signal, {
+        allowedStatuses: [200, 409, 410],
+      });
+
+      const contentType = String(response?.headers?.get?.('content-type') || '').toLowerCase();
+      if (contentType.includes('text/event-stream')) {
+        const { accepted, final } = await readSseResult(response, signal, TRUE_CONCURRENCY_WAIT_FINAL_RESULTS);
+        return {
+          accepted,
+          final: normalizeTrueConcurrencyWaitResult(final, {
+            hardExpireAtMs: plan.hardExpireAtMs,
+          }),
+        };
+      }
+
+      let data;
+      try {
+        data = await response.json();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`[CQ] handler response parse failed: ${message}`);
+      }
+
+      return {
+        accepted: null,
+        final: normalizeTrueConcurrencyWaitResult(data, {
+          hardExpireAtMs: plan.hardExpireAtMs,
+        }),
+      };
     },
 
     async release(_ctx, lease, reason, signal) {
@@ -3574,28 +3863,15 @@ const createSlotHandlerClient = (config) => {
     throw new Error('[FQ] slot-handler backend enabled but FAIR_QUEUE_SLOT_HANDLER_URL is missing');
   }
 
-  const acquireUrl = `${baseUrl}/api/v1/fairqueue/acquire`;
+  const waitUrl = `${baseUrl}/api/v1/fairqueue/wait`;
   const releaseUrl = `${baseUrl}/api/v1/fairqueue/release`;
   const abandonUrl = `${baseUrl}/api/v1/fairqueue/abandon`;
   const authKey = slotCfg.authKey || '';
   const authHeader = normalizeStringValue(slotCfg.authHeader, 'X-FQ-Auth');
-  const perRequestTimeoutMsRaw = Number(slotCfg.perRequestTimeoutMs);
-  let perRequestTimeoutMs =
-    Number.isFinite(perRequestTimeoutMsRaw) && perRequestTimeoutMsRaw > 0 ? perRequestTimeoutMsRaw : 8000;
-  const minPerRequestTimeoutMs = SLOT_HANDLER_LONGPOLL_MS + 2000;
-  if (perRequestTimeoutMs < minPerRequestTimeoutMs) {
-    console.warn(
-      `[FQ] perRequestTimeoutMs too small (${perRequestTimeoutMs}ms), clamped to ${minPerRequestTimeoutMs}ms to cover long-poll window`
-    );
-    perRequestTimeoutMs = minPerRequestTimeoutMs;
-  }
   const totalMaxWaitMsRaw = Number(slotCfg.totalMaxWaitMs);
   const totalMaxWaitMs =
     Number.isFinite(totalMaxWaitMsRaw) && totalMaxWaitMsRaw > 0 ? totalMaxWaitMsRaw : 20000;
   const releaseTimeoutMs = DEFAULT_SLOT_HANDLER_RELEASE_TIMEOUT_MS;
-  const maxAttemptsCapRaw = Number(slotCfg.maxAttemptsCap);
-  const maxAttemptsCap =
-    Number.isFinite(maxAttemptsCapRaw) && maxAttemptsCapRaw > 0 ? maxAttemptsCapRaw : 35;
 
   const buildHeaders = () => {
     const headers = { 'Content-Type': 'application/json' };
@@ -3634,18 +3910,20 @@ const createSlotHandlerClient = (config) => {
     }
   };
 
-  const computeMaxAttempts = () => {
-    const attempts = Math.ceil(totalMaxWaitMs / perRequestTimeoutMs);
-    const safeAttempts = Number.isFinite(attempts) && attempts > 0 ? attempts : 1;
-    return Math.max(1, Math.min(maxAttemptsCap, safeAttempts));
-  };
-
-  const computeErrorBackoffMs = (streak) => {
-    const base = 150;
-    const step = 150;
-    const max = 1200;
-    const n = Number.isFinite(streak) && streak > 0 ? Math.floor(streak) : 0;
-    return Math.min(max, base + step * n);
+  const postEventStream = async (url, payload, signal, allowedStatuses = [200]) => {
+    const response = await fetch(url, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      headers: {
+        ...buildHeaders(),
+        Accept: 'text/event-stream',
+      },
+      signal,
+    });
+    if (!allowedStatuses.includes(response.status)) {
+      throw new Error(`[FQ] slot-handler request failed: status ${response.status}`);
+    }
+    return response;
   };
 
   const isRetryableReleaseStatus = (status) => status === 429 || status >= 500;
@@ -3656,57 +3934,27 @@ const createSlotHandlerClient = (config) => {
     return error;
   };
 
-  const sleepWithAbort = (ms, signal) => {
-    const delayMs = Math.max(0, Math.trunc(ms));
-    if (!delayMs) {
-      return Promise.resolve();
-    }
-    return new Promise((resolve, reject) => {
-      let done = false;
-      let timer = null;
-      const cleanup = () => {
-        if (!signal || typeof signal.removeEventListener !== 'function') {
-          return;
-        }
-        signal.removeEventListener('abort', onAbort);
-      };
-      const onAbort = () => {
-        if (done) return;
-        done = true;
-        if (timer !== null) {
-          clearTimeout(timer);
-        }
-        cleanup();
-        reject(createAbortError());
-      };
-      if (signal && signal.aborted) {
-        onAbort();
-        return;
-      }
-      if (signal && typeof signal.addEventListener === 'function') {
-        signal.addEventListener('abort', onAbort, { once: true });
-      }
-      timer = setTimeout(() => {
-        if (done) return;
-        done = true;
-        cleanup();
-        resolve();
-      }, delayMs);
-    });
-  };
-
   return {
     async waitForSlot(ctx, fqContext, signal) {
-      const maxAttempts = computeMaxAttempts();
-      const hostKey = deriveProviderHostBucket(fqContext?.hostname);
-      let queryToken = typeof fqContext?.queryToken === 'string' && fqContext.queryToken
-        ? fqContext.queryToken
-        : null;
-      let invocationEpoch = readFairQueueInvocationEpoch(fqContext?.invocationEpoch);
-      let pendingStreak = 0;
-      let overloadStreak = 0;
-      let errorStreak = 0;
       const startedAt = Date.now();
+      const requestId = typeof fqContext?.requestId === 'string' && fqContext.requestId
+        ? fqContext.requestId
+        : createTrueConcurrencyRequestId();
+      const admissionMode = typeof fqContext?.admissionMode === 'string' && fqContext.admissionMode
+        ? fqContext.admissionMode
+        : fqContext?.breakerEnabled === true
+          ? 'queue_breaker'
+          : 'queue_only';
+      const hardExpireAtMs = Number.isFinite(Number(fqContext?.hardExpireAtMs)) && Number(fqContext.hardExpireAtMs) > 0
+        ? Number(fqContext.hardExpireAtMs)
+        : startedAt + totalMaxWaitMs;
+      const waitDeadlineMs = Math.min(
+        hardExpireAtMs,
+        startedAt + totalMaxWaitMs,
+      );
+      fqContext.requestId = requestId;
+      fqContext.admissionMode = admissionMode;
+      fqContext.hardExpireAtMs = hardExpireAtMs;
 
       const throwIfAborted = () => {
         if (signal && signal.aborted) {
@@ -3714,180 +3962,60 @@ const createSlotHandlerClient = (config) => {
         }
       };
 
-      // Both limits apply: exit when either maxAttempts OR totalMaxWaitMs is exceeded.
-      // With default maxAttempts=35 and typical in-flight duration ~6s, time limit
-      // will normally trigger first. The attempts limit prevents runaway loops when
-      // responses are abnormally fast (e.g., immediate "pending" responses).
-      for (let attempt = 1; attempt <= maxAttempts && Date.now() - startedAt < totalMaxWaitMs; attempt++) {
-        throwIfAborted();
-        const requestStart = Date.now();
-        const elapsedTotalMs = requestStart - startedAt;
-        if (elapsedTotalMs >= totalMaxWaitMs) {
-          return { kind: 'timeout', reason: 'slot-handler-timeout' };
+      const applyAcceptedOwnership = (result, payload) => {
+        const queryToken = typeof payload?.queryToken === 'string' && payload.queryToken
+          ? payload.queryToken
+          : null;
+        const invocationEpoch = readFairQueueInvocationEpoch(payload?.invocationEpoch);
+        if (!queryToken || invocationEpoch === null) {
+          console.error(`[FQ] slot-handler ${result} response missing accepted ownership fields`);
+          return false;
         }
-        const remainingMs = totalMaxWaitMs - elapsedTotalMs;
-        const requestTimeoutMs = Math.min(perRequestTimeoutMs, remainingMs);
-        const now = requestStart;
+        fqContext.queryToken = queryToken;
+        fqContext.invocationEpoch = invocationEpoch;
+        return true;
+      };
 
-        const globalOverloadedRemain = getGlobalOverloadedRemainingSeconds(now);
-        if (globalOverloadedRemain > 0) {
-          return {
-            kind: 'overloaded',
-            scope: 'global',
-            retryAfter: globalOverloadedRemain,
-          };
+      const buildOverloadedResult = (reason, retryAfterValue) => {
+        const normalizedReason = typeof reason === 'string' && reason.trim() ? reason.trim() : 'overload_unknown';
+        const retryAfterRaw = Number(retryAfterValue);
+        const retryAfter = Number.isFinite(retryAfterRaw) && retryAfterRaw > 0
+          ? Math.ceil(retryAfterRaw)
+          : 60;
+        if (normalizedReason === 'overload_global') {
+          markGlobalOverloaded(retryAfter);
         }
-
-        const overloadedRemainMs = getScopedOverloadRemainingMs(
-          hostKey,
-          fqContext?.siteBucket,
-          fqContext?.ipBucket,
-          now,
-        );
-        if (overloadedRemainMs > 0) {
-          const delayMs = Math.min(overloadedRemainMs, requestTimeoutMs);
-          if (Date.now() - startedAt + delayMs >= totalMaxWaitMs) {
-            return { kind: 'timeout', reason: 'slot-handler-overloaded' };
-          }
-          await sleepWithAbort(delayMs, signal);
-          continue;
-        }
-
-        // New slot-handler protocol: every acquire poll must include full context.
-        const payload = {
-          hostname: fqContext.hostname,
-          hostnameHash: fqContext.hostnameHash,
-          ipBucket: fqContext.ipBucket,
-          siteBucket: fqContext.siteBucket,
-          now,
-          ...(queryToken ? { queryToken } : {}),
+        return {
+          kind: 'overloaded',
+          scope: normalizedReason.replace(/^overload_/, '') || 'unknown',
+          reason: normalizedReason,
+          retryAfter,
         };
-        if (fqContext?.breakerEnabled === true) {
-          payload.breakerEnabled = true;
-          if (Number.isFinite(fqContext?.openCapSeconds)) {
-            payload.openCapSeconds = Math.trunc(fqContext.openCapSeconds);
-          }
-          if (Number.isFinite(fqContext?.closeThresholdPercent)) {
-            payload.closeThresholdPercent = Math.trunc(fqContext.closeThresholdPercent);
-          }
-          if (Number.isFinite(fqContext?.halfOpenSuccessThreshold)) {
-            payload.halfOpenSuccessThreshold = Math.trunc(fqContext.halfOpenSuccessThreshold);
-          }
-          if (typeof fqContext?.halfOpenCloseMode === 'string' && fqContext.halfOpenCloseMode) {
-            payload.halfOpenCloseMode = fqContext.halfOpenCloseMode;
-          }
-          if (Number.isFinite(fqContext?.halfOpenMaxProbeCount)) {
-            payload.halfOpenMaxProbeCount = Math.trunc(fqContext.halfOpenMaxProbeCount);
-          }
-          if (Number.isFinite(fqContext?.halfOpenMaxSeconds)) {
-            payload.halfOpenMaxSeconds = Math.trunc(fqContext.halfOpenMaxSeconds);
-          }
-          if (typeof fqContext?.halfOpenTimeoutMode === 'string' && fqContext.halfOpenTimeoutMode) {
-            payload.halfOpenTimeoutMode = fqContext.halfOpenTimeoutMode;
-          }
-        }
+      };
 
-        let res;
-        try {
-          res = await fetchWithTimeout(acquireUrl, payload, requestTimeoutMs, signal);
-        } catch (error) {
-          if (signal && signal.aborted) {
-            throw createAbortError();
-          }
-          const message = error instanceof Error ? error.message : String(error);
-          console.error('[FQ] slot-handler acquire error:', message);
-          const delayMs = computeErrorBackoffMs(errorStreak);
-          errorStreak += 1;
-          if (Date.now() - startedAt + delayMs >= totalMaxWaitMs) {
-            return { kind: 'timeout', reason: 'slot-handler-unreachable' };
-          }
-          await sleepWithAbort(delayMs, signal);
-          continue;
-        }
-
-        if (!res.ok) {
-          if (res.status === 409) {
-            let data;
-            try {
-              data = await res.json();
-            } catch (error) {
-              const message = error instanceof Error ? error.message : String(error);
-              console.error('[FQ] slot-handler conflict response parse error:', message);
+      const finalizeWaitResult = (finalPayload) => {
+        switch (finalPayload?.result) {
+          case 'granted': {
+            if (!applyAcceptedOwnership('granted', finalPayload)) {
               return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
-
-            if (data?.result === 'conflict') {
-              pendingStreak = 0;
-              overloadStreak = 0;
-              return { kind: 'conflict' };
+            if (typeof finalPayload?.slotToken !== 'string' || !finalPayload.slotToken) {
+              console.error('[FQ] slot-handler granted response missing slotToken');
+              return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
-
-            console.error(`[FQ] unexpected slot-handler conflict result: ${data?.result}`);
-            return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
-          }
-          console.error(`[FQ] slot-handler acquire failed: status ${res.status}`);
-          return { kind: 'timeout', reason: 'slot-handler-bad-status' };
-        }
-
-        let data;
-        try {
-          data = await res.json();
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          console.error('[FQ] slot-handler response parse error:', message);
-          const delayMs = computeErrorBackoffMs(errorStreak);
-          errorStreak += 1;
-          if (Date.now() - startedAt + delayMs >= totalMaxWaitMs) {
-            return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
-          }
-          await sleepWithAbort(delayMs, signal);
-          continue;
-        }
-
-        errorStreak = 0;
-
-        const responseQueryToken = typeof data?.queryToken === 'string' && data.queryToken
-          ? data.queryToken
-          : null;
-        const responseInvocationEpoch = readFairQueueInvocationEpoch(data?.invocationEpoch);
-        const responseReleaseOwnerRequired = readReleaseOwnerRequired(data?.releaseOwnerRequired);
-
-        const applyAcceptedOwnership = (result) => {
-          if (!responseQueryToken || responseInvocationEpoch === null) {
-            console.error(
-              `[FQ] slot-handler ${result} response missing accepted ownership fields`,
-            );
-            return false;
-          }
-          queryToken = responseQueryToken;
-          fqContext.queryToken = responseQueryToken;
-          invocationEpoch = responseInvocationEpoch;
-          fqContext.invocationEpoch = responseInvocationEpoch;
-          return true;
-        };
-
-        switch (data?.result) {
-          case 'granted':
-            pendingStreak = 0;
-            overloadStreak = 0;
-            {
-              if (!applyAcceptedOwnership('granted')) {
-                return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
-              }
-              const { attemptVersion, attemptTicket } = readSlotHandlerAttempt(data);
-              fqContext.grantPromoted = true;
-              fqContext.slotToken = data.slotToken;
-              fqContext.releaseOwnerRequired = responseReleaseOwnerRequired ? true : undefined;
-              fqContext.slotAcquiredAt = Date.now();
-              fqContext.attemptVersion = Number.isFinite(attemptVersion) && Number.isFinite(attemptTicket)
-                ? attemptVersion
-                : null;
-              fqContext.attemptTicket = Number.isFinite(attemptVersion) && Number.isFinite(attemptTicket)
-                ? attemptTicket
-                : null;
-              if (typeof testHooks?.onGrantPromotion === 'function') {
-                testHooks.onGrantPromotion(fqContext);
-              }
+            const { attemptVersion, attemptTicket } = readSlotHandlerAttempt(finalPayload);
+            fqContext.grantPromoted = true;
+            fqContext.slotToken = finalPayload.slotToken;
+            fqContext.releaseOwnerRequired = true;
+            fqContext.slotAcquiredAt = Date.now();
+            fqContext.attemptVersion = Number.isFinite(attemptVersion) && Number.isFinite(attemptTicket)
+              ? attemptVersion
+              : null;
+            fqContext.attemptTicket = Number.isFinite(attemptVersion) && Number.isFinite(attemptTicket)
+              ? attemptTicket
+              : null;
+            if (typeof testHooks?.onGrantPromotion === 'function') {
+              testHooks.onGrantPromotion(fqContext);
             }
             console.log(`[FQ] slot granted via slot-handler host=${fqContext.hostname}`);
             return {
@@ -3895,21 +4023,18 @@ const createSlotHandlerClient = (config) => {
               attemptVersion: fqContext.attemptVersion,
               attemptTicket: fqContext.attemptTicket,
             };
-          case 'throttled':
-            pendingStreak = 0;
-            overloadStreak = 0;
-            if (!applyAcceptedOwnership('throttled')) {
+          }
+          case 'throttled': {
+            if (!applyAcceptedOwnership('throttled', finalPayload)) {
               return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
-            const throttleCode = Number.isFinite(data?.throttleCode) ? data.throttleCode : 503;
-            const breakerSnapshot = readSlotHandlerBreakerSnapshot(data);
+            const throttleCode = Number.isFinite(finalPayload?.throttleCode) ? finalPayload.throttleCode : 503;
+            const breakerSnapshot = readSlotHandlerBreakerSnapshot(finalPayload);
             const openBreaker = breakerSnapshot
               ? readOpenBreakerSnapshot(breakerSnapshot, 0)
               : null;
-            const rawRetryAfter = Number(data?.retryAfter);
+            const rawRetryAfter = Number(finalPayload?.retryAfter);
             clearAbandonedFairQueueMetadata(fqContext);
-            queryToken = null;
-            invocationEpoch = null;
             return {
               kind: 'throttled',
               throttleCode,
@@ -3917,72 +4042,181 @@ const createSlotHandlerClient = (config) => {
                 ?? (Number.isFinite(rawRetryAfter) && rawRetryAfter > 0 ? Math.ceil(rawRetryAfter) : null),
               breakerSnapshot,
             };
-          case 'overloaded': {
-            pendingStreak = 0;
-            const reason = typeof data?.reason === 'string' ? data.reason : '';
-            const isGlobalOverload = reason === 'overload_global';
-            if (isGlobalOverload) {
-              const retryAfterRaw = Number(data?.retryAfter);
-              const retryAfter = Number.isFinite(retryAfterRaw) && retryAfterRaw > 0
-                ? Math.ceil(retryAfterRaw)
-                : 60;
-              markGlobalOverloaded(retryAfter);
-              return {
-                kind: 'overloaded',
-                scope: 'global',
-                retryAfter,
-              };
-            }
-
-            const delayMs = nextOverloadDelayMs(overloadStreak);
-            overloadStreak += 1;
-            if (reason === 'overload_host') {
-              markHostOverloaded(hostKey, delayMs);
-            } else if (reason === 'overload_site') {
-              markSiteOverloaded(hostKey, fqContext?.siteBucket, delayMs);
-            } else if (reason === 'overload_ip') {
-              markIpOverloaded(hostKey, fqContext?.siteBucket, fqContext?.ipBucket, delayMs);
-            }
-            const elapsed = Date.now() - startedAt;
-            if (elapsed + delayMs >= totalMaxWaitMs) {
-              return { kind: 'timeout', reason: 'slot-handler-overloaded' };
-            }
-            await sleepWithAbort(delayMs, signal);
-            continue;
           }
-          case 'timeout':
-            pendingStreak = 0;
-            overloadStreak = 0;
-            clearAbandonedFairQueueMetadata(fqContext);
-            queryToken = null;
-            invocationEpoch = null;
-            return { kind: 'timeout', reason: 'slot-handler-timeout' };
-          case 'pending':
-            if (!applyAcceptedOwnership('pending')) {
+          case 'overloaded':
+            if (!applyAcceptedOwnership('overloaded', finalPayload)) {
               return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
-            pendingStreak += 1;
-            overloadStreak = 0;
-            {
-              // Avoid busy-looping when slot-handler responds pending quickly.
-              const elapsedMs = Date.now() - requestStart;
-              if (elapsedMs < 200) {
-                const base = 100;
-                const jitter = Math.floor(Math.random() * 100);
-                const extra = Math.min(200, pendingStreak * 20);
-                await sleepWithAbort(base + jitter + extra, signal);
-              }
+            clearAbandonedFairQueueMetadata(fqContext);
+            return buildOverloadedResult(finalPayload?.reason, finalPayload?.retryAfter);
+          case 'timeout':
+            if (!applyAcceptedOwnership('timeout', finalPayload)) {
+              return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
-            continue;
-          default: {
-            const message = `[FQ] unexpected slot-handler result: ${data?.result}`;
-            console.error(message);
+            clearAbandonedFairQueueMetadata(fqContext);
+            return {
+              kind: 'timeout',
+              reason: typeof finalPayload?.reason === 'string' && finalPayload.reason
+                ? finalPayload.reason
+                : 'slot-handler-timeout',
+            };
+          case 'conflict':
+            if (!applyAcceptedOwnership('conflict', finalPayload)) {
+              return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
+            }
+            clearAbandonedFairQueueMetadata(fqContext);
+            return {
+              kind: 'conflict',
+              reason: typeof finalPayload?.reason === 'string' && finalPayload.reason
+                ? finalPayload.reason
+                : null,
+            };
+          default:
+            console.error(`[FQ] unexpected slot-handler result: ${finalPayload?.result}`);
             return { kind: 'timeout', reason: 'slot-handler-unexpected' };
-          }
+        }
+      };
+
+      throwIfAborted();
+      if (
+        fqContext?.queryToken
+        || readFairQueueInvocationEpoch(fqContext?.invocationEpoch) !== null
+        || fqContext?.slotToken
+        || fqContext?.releaseOwnerRequired === true
+      ) {
+        throw new Error('[FQ] initial wait request must not include ownership tokens');
+      }
+      if (Date.now() >= waitDeadlineMs) {
+        return { kind: 'timeout', reason: 'worker_deadline_exceeded' };
+      }
+
+      const globalOverloadedRemain = getGlobalOverloadedRemainingSeconds(startedAt);
+      if (globalOverloadedRemain > 0) {
+        return {
+          kind: 'overloaded',
+          scope: 'global',
+          reason: 'overload_global',
+          retryAfter: globalOverloadedRemain,
+        };
+      }
+
+      const payload = {
+        hostname: fqContext.hostname,
+        hostnameHash: fqContext.hostnameHash,
+        ipBucket: fqContext.ipBucket,
+        siteBucket: fqContext.siteBucket,
+        now: startedAt,
+        deadlineMs: waitDeadlineMs,
+        requestId,
+        admissionMode,
+      };
+      if (admissionMode === 'queue_breaker') {
+        payload.breakerEnabled = true;
+        if (Number.isFinite(fqContext?.openCapSeconds)) {
+          payload.openCapSeconds = Math.trunc(fqContext.openCapSeconds);
+        }
+        if (Number.isFinite(fqContext?.closeThresholdPercent)) {
+          payload.closeThresholdPercent = Math.trunc(fqContext.closeThresholdPercent);
+        }
+        if (Number.isFinite(fqContext?.halfOpenSuccessThreshold)) {
+          payload.halfOpenSuccessThreshold = Math.trunc(fqContext.halfOpenSuccessThreshold);
+        }
+        if (typeof fqContext?.halfOpenCloseMode === 'string' && fqContext.halfOpenCloseMode) {
+          payload.halfOpenCloseMode = fqContext.halfOpenCloseMode;
+        }
+        if (Number.isFinite(fqContext?.halfOpenMaxProbeCount)) {
+          payload.halfOpenMaxProbeCount = Math.trunc(fqContext.halfOpenMaxProbeCount);
+        }
+        if (Number.isFinite(fqContext?.halfOpenMaxSeconds)) {
+          payload.halfOpenMaxSeconds = Math.trunc(fqContext.halfOpenMaxSeconds);
+        }
+        if (typeof fqContext?.halfOpenTimeoutMode === 'string' && fqContext.halfOpenTimeoutMode) {
+          payload.halfOpenTimeoutMode = fqContext.halfOpenTimeoutMode;
         }
       }
 
-      return { kind: 'timeout', reason: 'slot-handler-timeout' };
+      const waitController = new AbortController();
+      let localAbortTriggered = false;
+      const abortWaitForBudget = () => {
+        localAbortTriggered = true;
+        waitController.abort();
+      };
+      const abortWaitForClient = () => waitController.abort();
+      const waitTimeoutMs = Math.max(0, waitDeadlineMs - Date.now());
+      const waitTimer = setTimeout(abortWaitForBudget, waitTimeoutMs);
+      if (typeof waitTimer?.unref === 'function') {
+        waitTimer.unref();
+      }
+      if (signal) {
+        if (signal.aborted) {
+          waitController.abort();
+        } else {
+          signal.addEventListener('abort', abortWaitForClient, { once: true });
+        }
+      }
+
+      try {
+        const response = await postEventStream(waitUrl, payload, waitController.signal, [200, 409, 410, 503]);
+        const contentType = String(response?.headers?.get?.('content-type') || '').toLowerCase();
+
+        if (contentType.includes('text/event-stream')) {
+          const { final } = await readSseResult(
+            response,
+            waitController.signal,
+            new Set(['granted', 'throttled', 'overloaded', 'timeout', 'conflict']),
+            {
+              onAccepted(accepted) {
+                if (!applyAcceptedOwnership('accepted', accepted)) {
+                  throw new Error('[FQ] slot-handler accepted event missing ownership fields');
+                }
+              },
+            },
+          );
+          return finalizeWaitResult(final);
+        }
+
+        let data;
+        try {
+          data = await response.json();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(`[FQ] slot-handler response parse error: ${message}`);
+        }
+
+        if (data?.result === 'overloaded') {
+          const setupOverloadWithoutOwnership = (
+            (data?.queryToken === undefined || data?.queryToken === null)
+            && readFairQueueInvocationEpoch(data?.invocationEpoch) === null
+          );
+          if (setupOverloadWithoutOwnership) {
+            return buildOverloadedResult(data?.reason, data?.retryAfter);
+          }
+        }
+
+        if (typeof data?.result === 'string') {
+          console.error(`[FQ] slot-handler /wait setup must use SSE for result=${data.result}`);
+          return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
+        }
+        throw new Error(`[FQ] unexpected slot-handler setup result: ${data?.result}`);
+      } catch (error) {
+        if (signal?.aborted) {
+          throw createAbortError();
+        }
+        if (localAbortTriggered && !signal?.aborted) {
+          return { kind: 'timeout', reason: 'worker_deadline_exceeded' };
+        }
+        if (isAbortError(error)) {
+          throw createAbortError();
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[FQ] slot-handler wait error:', message);
+        return { kind: 'timeout', reason: 'slot-handler-unreachable' };
+      } finally {
+        clearTimeout(waitTimer);
+        if (signal) {
+          signal.removeEventListener('abort', abortWaitForClient);
+        }
+      }
     },
 
     async releaseSlot(ctx, fqContext) {
@@ -5162,6 +5396,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     hostnameHash,
     ipBucket,
     siteBucket,
+    requestId: createTrueConcurrencyRequestId(),
+    admissionMode: mode,
+    hardExpireAtMs,
     nowMs: Date.now(),
     deferredReportStatusCode: null,
     deferredReportArmed: false,
@@ -5404,13 +5641,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     const nowMs = Date.now();
-    const elapsedMs = nowMs - cqWaitBudget.startedAtMs;
-    const remainingMs = cqWaitBudget.totalMaxMs - elapsedMs;
+    const remainingMs = cqWaitBudget.deadlineMs - nowMs;
+    const localAbortTriggered = cqWaitBudget.localAbortTriggered === true;
 
     return {
       nowMs,
       remainingMs,
-      exhausted: remainingMs <= 0 || cqWaitBudget.attempts >= cqWaitBudget.maxAttemptsCap,
+      deadlineMs: cqWaitBudget.deadlineMs,
+      exhausted: localAbortTriggered || remainingMs <= 0,
+      localAbortTriggered,
       timeoutMs: Math.min(config.concurrencyHandlerConfig.acquireTimeoutMs, remainingMs),
     };
   };
@@ -5483,24 +5722,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   };
 
-  const replayCurrentTrueConcurrencyAcquireAfterWaitError = async (phase, error) => {
-    if (!cqPlan?.waitToken || !concurrencyClient || didClientAbort()) {
-      throw error;
-    }
-
-    const waitBudgetWindow = readCurrentTrueConcurrencyWaitBudgetWindow();
-    if (waitBudgetWindow?.exhausted) {
-      return null;
-    }
-
-    cqWaitBudget.attempts += 1;
-
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[CQ] continue-wait acquire failed during ${phase}, replaying immutable tuple:`, message);
-    cqPlan.nowMs = waitBudgetWindow.nowMs;
-    return concurrencyClient.acquire(ctx, cqPlan, clientSignal, waitBudgetWindow.timeoutMs);
-  };
-
   const releaseUnusedFairQueueGrantIfNeeded = async (phase) => {
     if (!needFairQueue || !fqContext?.slotToken) {
       return true;
@@ -5548,8 +5769,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return createFairQueueTimeoutResponse();
     }
 
-    if (fqResult.kind === 'overloaded' && fqResult.scope === 'global') {
-      return createFairQueueOverloadedResponse(origin, fqResult.retryAfter);
+    if (fqResult.kind === 'overloaded') {
+      return createFairQueueOverloadedResponse(origin, fqResult.retryAfter, fqResult.reason);
     }
 
     return null;
@@ -5761,13 +5982,12 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     }
 
     // Worker CQ behavior matrix:
-    // queue_only + CQ: FQ acquire -> CQ fast acquire.
-    // granted => fetch -> FQ early release after headers -> CQ release.
-    // wait => FQ immediate unused-grant release -> continue-wait via stable waitToken -> granted -> fetch -> CQ release.
-    // terminal/conflict => FQ immediate unused-grant release -> terminal response with waiting request cleanup via CQ cancel.
-    // queue_breaker + CQ: FQ acquire(granted + attempt) -> CQ fast acquire.
-    // wait => settle old breaker attempt -> FQ immediate unused-grant release -> continue-wait.
-    // granted after wait => fresh breaker authorize -> fetch or immediate CQ release on breaker deny.
+    // queue_only + CQ: FQ wait SSE grant -> CQ fast acquire.
+    // CQ wait => unused FQ grant release -> CQ wait SSE -> granted -> fetch -> CQ release.
+    // terminal/conflict => unused FQ grant release -> terminal response with CQ cleanup.
+    // queue_breaker + CQ: FQ wait SSE grant(+attempt) -> CQ fast acquire.
+    // CQ wait => settle old breaker attempt -> unused FQ grant release -> CQ wait SSE.
+    // CQ grant after wait => fresh breaker authorize -> fetch or immediate CQ release on breaker deny.
 
     let nextPlan = null;
     if (needTrueConcurrency) {
@@ -5829,12 +6049,15 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         let acquireResult = await concurrencyClient.acquire(ctx, cqPlan, clientSignal);
 
         if (acquireResult.result === 'wait') {
-          cqPlan.waitToken = acquireResult.waitToken;
+          const nextCqWaitToken = acquireResult.waitToken;
+          cqPlan.waitToken = nextCqWaitToken;
+          const startedAtMs = Date.now();
+          const waitDeadlineMs = Math.min(cqPlan.hardExpireAtMs, startedAtMs + config.concurrencyHandlerConfig.waitTotalMaxMs);
           cqWaitBudget = {
-            startedAtMs: Date.now(),
-            attempts: 1,
+            startedAtMs,
             totalMaxMs: config.concurrencyHandlerConfig.waitTotalMaxMs,
-            maxAttemptsCap: config.concurrencyHandlerConfig.waitMaxAttemptsCap,
+            deadlineMs: waitDeadlineMs,
+            localAbortTriggered: false,
           };
           if (resolveAdmissionMode(config, cqPlan.hostname) === 'queue_breaker' || !needFairQueue) {
             const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
@@ -5853,30 +6076,53 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
             return createErrorResponse(origin, 503, 'Fair queue unavailable');
           }
 
-          while (acquireResult.result === 'wait') {
-            const waitBudgetWindow = readCurrentTrueConcurrencyWaitBudgetWindow();
-            if (!waitBudgetWindow || waitBudgetWindow.exhausted) {
-              return createTrueConcurrencyWaitBudgetExhaustedResponse();
-            }
+          const waitBudgetWindow = readCurrentTrueConcurrencyWaitBudgetWindow();
+          if (!waitBudgetWindow || waitBudgetWindow.exhausted) {
+            return createTrueConcurrencyWaitBudgetExhaustedResponse();
+          }
 
-            cqWaitBudget.attempts += 1;
-            cqPlan.nowMs = waitBudgetWindow.nowMs;
-            try {
-              acquireResult = await concurrencyClient.acquire(
-                ctx,
-                cqPlan,
-                clientSignal,
-                waitBudgetWindow.timeoutMs,
-              );
-            } catch (error) {
-              const replayedAcquireResult = await replayCurrentTrueConcurrencyAcquireAfterWaitError(
-                phase,
-                error,
-              );
-              if (!replayedAcquireResult) {
+          cqPlan.deadlineMs = waitBudgetWindow.deadlineMs;
+          const waitController = new AbortController();
+          const abortWaitForBudget = () => {
+            if (cqWaitBudget) {
+              cqWaitBudget.localAbortTriggered = true;
+            }
+            waitController.abort();
+          };
+          const abortWaitForClient = () => waitController.abort();
+          const waitTimeoutMs = Math.max(0, waitBudgetWindow.deadlineMs - Date.now());
+          const waitTimer = setTimeout(abortWaitForBudget, waitTimeoutMs);
+          if (typeof waitTimer?.unref === 'function') {
+            waitTimer.unref();
+          }
+          if (clientSignal) {
+            if (clientSignal.aborted) {
+              waitController.abort();
+            } else {
+              clientSignal.addEventListener('abort', abortWaitForClient, { once: true });
+            }
+          }
+
+          try {
+            const waitResult = await concurrencyClient.wait(ctx, cqPlan, waitController.signal);
+            acquireResult = waitResult.final;
+            cqAcquireDispatched = false;
+            cqWaitBudget = null;
+            delete cqPlan.deadlineMs;
+            delete cqPlan.waitToken;
+          } catch (error) {
+            if (isAbortError(error) && !didClientAbort()) {
+              const remainingWaitBudget = readCurrentTrueConcurrencyWaitBudgetWindow();
+              if (!remainingWaitBudget || remainingWaitBudget.exhausted) {
+                delete cqPlan.deadlineMs;
                 return createTrueConcurrencyWaitBudgetExhaustedResponse();
               }
-              acquireResult = replayedAcquireResult;
+            }
+            throw error;
+          } finally {
+            clearTimeout(waitTimer);
+            if (clientSignal) {
+              clientSignal.removeEventListener('abort', abortWaitForClient);
             }
           }
         }
@@ -7033,6 +7279,7 @@ export const __fairQueueTestHooks = {
   createTrueConcurrencyHeartbeatManager,
   createConcurrencyReleaseController,
   createSlotHandlerClient,
+  readSseResult,
   normalizeTrueConcurrencyReleaseReason,
   deriveOpenSeconds,
   finalizeFairQueueContext,

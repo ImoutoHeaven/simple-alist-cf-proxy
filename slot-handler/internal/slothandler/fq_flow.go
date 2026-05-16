@@ -66,6 +66,7 @@ type readyGrantCommitResult struct {
 	committed           bool
 	newlyCommitted      bool
 	waiterAttached      bool
+	ownerRoutedGrant    bool
 	readyLatched        bool
 	committedGrantEpoch uint64
 	invocationEpoch     uint64
@@ -108,7 +109,8 @@ type fqFlowSnapshot struct {
 type fqWaiter struct {
 	// resCh is owned by the caller (acquire handler). Scheduler will eventually
 	// deliver a result by sending on this channel.
-	resCh chan *AcquireResponse
+	resCh             chan *AcquireResponse
+	ownerRoutedGrant bool
 }
 
 func snapshotFromFlow(f *fqFlow) fqFlowSnapshot {
@@ -1271,6 +1273,7 @@ func (s *flowStore) commitReadyGrantLocked(f *fqFlow, slotToken string, attemptV
 	}
 	result.committed = true
 	result.waiterAttached = f.waiter != nil
+	result.ownerRoutedGrant = f.waiter != nil && f.waiter.ownerRoutedGrant
 	result.invocationEpoch = f.invocationEpoch
 	if f.grantCommitted {
 		result.readyLatched = !f.readyLatchedUntil.IsZero() && now.Before(f.readyLatchedUntil)
@@ -2311,6 +2314,35 @@ func (s *flowStore) deliverGrantedToAcceptedInvocation(token string, invocationE
 	}
 }
 
+func (s *flowStore) claimAcceptedInvocationGrant(token string, invocationEpoch uint64) bool {
+	if s == nil || token == "" || invocationEpoch == 0 {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil || f.waiter == nil || f.invocationEpoch != invocationEpoch || !f.grantCommitted || strings.TrimSpace(f.slotToken) == "" {
+		return false
+	}
+	s.discardDeliveredGrantHandoffLocked(token, invocationEpoch)
+	s.transitionToClaimedActiveGrantLocked(f)
+	return true
+}
+
+func (s *flowStore) acceptedInvocationOwnerRouted(token string, invocationEpoch uint64) bool {
+	if s == nil || token == "" || invocationEpoch == 0 {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	return f != nil && f.waiter != nil && f.invocationEpoch == invocationEpoch && f.waiter.ownerRoutedGrant
+}
+
 // deliverToWaiter sends a result to the currently attached waiter (if any).
 // Intended for tests and token-level delivery helpers.
 func (s *flowStore) deliverToWaiter(token string, resp *AcquireResponse) bool {
@@ -2411,6 +2443,37 @@ func (s *flowStore) abandonDetachedInvocation(token string, invocationEpoch uint
 		return "noop_epoch_mismatch", ReleaseRequest{}, false
 	}
 	releaseReq, hasRelease := s.consumeCommittedGrantLocked(f, now)
+	s.removeFlowLocked(f)
+	return "abandoned", releaseReq, hasRelease
+}
+
+func (s *flowStore) abandonAcceptedInvocation(token string, invocationEpoch uint64, now time.Time) (string, ReleaseRequest, bool) {
+	if s == nil || token == "" || invocationEpoch == 0 {
+		return "noop_not_found", ReleaseRequest{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f := s.byToken[token]
+	if f == nil || isFlowExpiredAt(f, now) {
+		return "noop_not_found", ReleaseRequest{}, false
+	}
+	if f.grantClaimed {
+		return "noop_not_found", ReleaseRequest{}, false
+	}
+	if f.invocationEpoch != invocationEpoch {
+		return "noop_epoch_mismatch", ReleaseRequest{}, false
+	}
+	if f.waiter != nil {
+		s.decrementInFlightLocked(f)
+		f.waiter = nil
+	}
+	if f.timer != nil {
+		safeStopTimer(f.timer)
+		f.timer = nil
+	}
+	releaseReq, hasRelease := s.consumeCommittedGrantLocked(f, now)
+	s.discardDeliveredGrantHandoffLocked(token, invocationEpoch)
 	s.removeFlowLocked(f)
 	return "abandoned", releaseReq, hasRelease
 }

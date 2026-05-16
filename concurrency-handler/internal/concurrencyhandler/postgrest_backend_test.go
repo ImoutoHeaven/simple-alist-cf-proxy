@@ -515,7 +515,84 @@ func TestPostgrestAcquireNormalizesWaitResult(t *testing.T) {
 	}
 }
 
-func TestPostgrestAcquireIncludesWaitTokenWhenProvided(t *testing.T) {
+func TestPostgrestProbeWaitStateIncludesWaitTokenWhenProvided(t *testing.T) {
+	req := validAcquireRequest()
+	req.WaitToken = "wait-1"
+	req.DeadlineMs = 9000
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"wait","wait_token":"wait-1","scope":"host","retry_after":1}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	if _, err := backend.ProbeWaitState(context.Background(), req); err != nil {
+		t.Fatalf("ProbeWaitState error: %v", err)
+	}
+	if gotPath != "/rpc/cq_wait_state_probe" {
+		t.Fatalf("expected wait-state probe rpc path, got %s", gotPath)
+	}
+	if gotBody["p_wait_token"] != "wait-1" {
+		t.Fatalf("expected wait token payload, got %v", gotBody)
+	}
+}
+
+func TestPostgrestProbeWaitStateIncludesDeadlineAndOmitsLegacyWaitTiming(t *testing.T) {
+	req := validAcquireRequest()
+	req.WaitToken = "wait-1"
+	req.DeadlineMs = 12000
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"result":"wait","wait_token":"wait-1","scope":"host","retry_after":1}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	cfg.Concurrency.Wait.MaxStreamMs = 12000
+	cfg.Concurrency.Wait.KeepaliveMs = 1800
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	if _, err := backend.ProbeWaitState(context.Background(), req); err != nil {
+		t.Fatalf("ProbeWaitState error: %v", err)
+	}
+	if gotBody["p_deadline_ms"] != float64(12000) {
+		t.Fatalf("expected deadline payload, got %v", gotBody)
+	}
+	if _, ok := gotBody["p_wait_poll_window_ms"]; ok {
+		t.Fatalf("did not expect legacy wait poll window payload, got %v", gotBody)
+	}
+	if _, ok := gotBody["p_wait_reconnect_grace_ms"]; ok {
+		t.Fatalf("did not expect legacy wait reconnect grace payload, got %v", gotBody)
+	}
+}
+
+func TestPostgrestProbeWaitStateDefaultsDeadlineToHardExpiry(t *testing.T) {
 	req := validAcquireRequest()
 	req.WaitToken = "wait-1"
 	var gotBody map[string]any
@@ -538,45 +615,11 @@ func TestPostgrestAcquireIncludesWaitTokenWhenProvided(t *testing.T) {
 	cfg.Backend.Postgrest.BaseURL = srv.URL
 	backend := newPostgrestBackend(cfg, srv.Client())
 
-	if _, err := backend.Acquire(context.Background(), req); err != nil {
-		t.Fatalf("Acquire error: %v", err)
+	if _, err := backend.ProbeWaitState(context.Background(), req); err != nil {
+		t.Fatalf("ProbeWaitState error: %v", err)
 	}
-	if gotBody["p_wait_token"] != "wait-1" {
-		t.Fatalf("expected wait token payload, got %v", gotBody)
-	}
-}
-
-func TestPostgrestAcquireIncludesWaitTimingConfig(t *testing.T) {
-	var gotBody map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body: %v", err)
-		}
-		if err := json.Unmarshal(body, &gotBody); err != nil {
-			t.Fatalf("decode body: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"result":"wait","wait_token":"wait-1","scope":"host","retry_after":1}]`))
-	}))
-	defer srv.Close()
-
-	cfg := validTestConfig()
-	cfg.Backend.Mode = "postgrest"
-	cfg.Backend.Postgres.DSN = ""
-	cfg.Backend.Postgrest.BaseURL = srv.URL
-	cfg.Concurrency.Wait.WaitPollWindowMs = 12000
-	cfg.Concurrency.Wait.WaitReconnectGraceMs = 1800
-	backend := newPostgrestBackend(cfg, srv.Client())
-
-	if _, err := backend.Acquire(context.Background(), validAcquireRequest()); err != nil {
-		t.Fatalf("Acquire error: %v", err)
-	}
-	if gotBody["p_wait_poll_window_ms"] != float64(12000) {
-		t.Fatalf("expected wait poll window payload, got %v", gotBody)
-	}
-	if gotBody["p_wait_reconnect_grace_ms"] != float64(1800) {
-		t.Fatalf("expected wait reconnect grace payload, got %v", gotBody)
+	if gotBody["p_deadline_ms"] != float64(5000) {
+		t.Fatalf("expected deadline fallback payload 5000, got %v", gotBody)
 	}
 }
 

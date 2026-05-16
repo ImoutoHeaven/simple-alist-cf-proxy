@@ -328,18 +328,31 @@ describe('init.sql breaker RPC definitions', () => {
     expect(initSql).not.toMatch(/ALTER TABLE\s+concurrency_requests\s+ALTER COLUMN\s+handoff_state\s+SET\s+NOT\s+NULL/i);
   });
 
-  it('encodes waiting-model acquire timing and wait-token replay in cq_acquire', () => {
+  it('encodes fast-only waiting acquisition in cq_acquire', () => {
     const acquireBody = readFunctionBody('cq_acquire');
 
-    expect(acquireBody).toMatch(/p_wait_token\s+text DEFAULT NULL/i);
-    expect(acquireBody).toMatch(/p_wait_poll_window_ms\s+integer DEFAULT 0/i);
-    expect(acquireBody).toMatch(/p_wait_reconnect_grace_ms\s+integer DEFAULT 0/i);
     expect(acquireBody).toMatch(/v_now_ms\s+bigint := COALESCE\(p_now_ms, \(EXTRACT\(EPOCH FROM clock_timestamp\(\)\) \* 1000\)::bigint\)/i);
-    expect(acquireBody).toMatch(/v_waiter_lease_until_ms := v_now_ms[\s\S]*?p_wait_poll_window_ms[\s\S]*?p_wait_reconnect_grace_ms/i);
-    expect(acquireBody).toMatch(/WHERE concurrency_requests\.wait_token = v_wait_token_input/i);
-    expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire stale wait token'/i);
-    expect(acquireBody).toMatch(/IF v_wait_token_input IS NOT NULL THEN[\s\S]*?UPDATE concurrency_requests[\s\S]*?SET waiter_lease_until_ms = v_waiter_lease_until_ms/i);
+    expect(acquireBody).toMatch(/v_waiter_lease_until_ms\s+bigint := p_hard_expire_at_ms/i);
+    expect(acquireBody).not.toMatch(/WHERE concurrency_requests\.wait_token = v_wait_token_input/i);
+    expect(acquireBody).not.toMatch(/RAISE EXCEPTION 'cq_acquire stale wait token'/i);
     expect(acquireBody).toMatch(/INSERT INTO concurrency_requests[\s\S]*?state,[\s\S]*?'waiting'[\s\S]*?wait_token,[\s\S]*?waiter_lease_until_ms/i);
+  });
+
+  it('removes legacy wait-state SQL surface from the CQ acquire path', () => {
+    expect(initSql).not.toMatch(/CREATE OR REPLACE FUNCTION\s+cq_continue_wait_probe\(/i);
+    expect(initSql).not.toMatch(/p_wait_poll_window_ms/i);
+    expect(initSql).not.toMatch(/p_wait_reconnect_grace_ms/i);
+    expect(initSql).not.toMatch(/cq_acquire\s*\([^)]*p_wait_token/s);
+  });
+
+  it('defines deadline-driven cq_wait_state_probe for SSE wait streams', () => {
+    const probeBody = readFunctionBody('cq_wait_state_probe');
+
+    expect(probeBody).toMatch(/p_deadline_ms\s+bigint/i);
+    expect(probeBody).toMatch(/v_effective_deadline_ms\s+bigint/i);
+    expect(probeBody).toMatch(/waiter_lease_until_ms\s*=\s*v_effective_deadline_ms/i);
+    expect(probeBody).toMatch(/terminal_reason\s*=\s*'wait_stream_timeout'/i);
+    expect(probeBody).toMatch(/reason\s*:=\s*'wait_stream_timeout'/i);
   });
 
   it('documents request-ledger replay, cancel tombstones, and release idempotency', () => {
@@ -357,7 +370,7 @@ describe('init.sql breaker RPC definitions', () => {
     expect(acquireBody).toMatch(/FOR UPDATE/i);
     expect(acquireBody).toMatch(/tuple/i);
     expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire request_id tuple mismatch'/i);
-    expect(acquireBody).toMatch(/RAISE EXCEPTION 'cq_acquire stale wait token'/i);
+    expect(acquireBody).toMatch(/WHEN 'waiting' THEN[\s\S]*?terminal_reason = 'wait_stream_timeout'[\s\S]*?result := 'wait'/i);
     expect(acquireBody).toMatch(/WHEN 'active' THEN[\s\S]*?result := 'expired'[\s\S]*?result := 'conflict'/i);
     expect(acquireBody).toMatch(/WHEN 'released' THEN[\s\S]*?result := 'released'/i);
     expect(acquireBody).toMatch(/WHEN 'cancelled' THEN[\s\S]*?result := 'cancelled'/i);
@@ -425,9 +438,9 @@ describe('init.sql breaker RPC definitions', () => {
 
   it('serializes request_id before request-ledger lookup and tuple-scoped counter locks', () => {
     const acquireBody = readFunctionBody('cq_acquire');
-    const requestLockIndex = acquireBody.search(/pg_advisory_xact_lock\(\s*3\s*,\s*hashtext\(v_authoritative_request_id\)\s*\)/i);
+    const requestLockIndex = acquireBody.search(/pg_advisory_xact_lock\(\s*3\s*,\s*hashtext\(v_request_id\)\s*\)/i);
     const hostLockIndex = acquireBody.search(/PERFORM\s+1\s+FROM\s+concurrency_host_counters\s+WHERE hostname_hash = v_hostname_hash\s+FOR UPDATE;/i);
-    const requestRowIndex = acquireBody.search(/FROM\s+concurrency_requests\s+WHERE request_id = v_authoritative_request_id\s+FOR UPDATE/i);
+    const requestRowIndex = acquireBody.search(/FROM\s+concurrency_requests\s+WHERE request_id = v_request_id\s+FOR UPDATE/i);
 
     expect(requestLockIndex).toBeGreaterThan(-1);
     expect(hostLockIndex).toBeGreaterThan(requestLockIndex);
@@ -439,7 +452,7 @@ describe('init.sql breaker RPC definitions', () => {
     const releaseBody = readFunctionBody('cq_release');
     const claimBody = readFunctionBody('cq_claim_grant');
     const promoteBody = readFunctionBody('cq_promote_waiting_request');
-    const probeBody = readFunctionBody('cq_continue_wait_probe');
+    const probeBody = readFunctionBody('cq_wait_state_probe');
 
     expect(helperBody).toMatch(/FROM concurrency_requests[\s\S]*?WHERE request_id = p_request_id[\s\S]*?FOR UPDATE/i);
     expect(helperBody).toMatch(/FROM concurrency_leases[\s\S]*?WHERE request_id = p_request_id[\s\S]*?AND state = 'active'[\s\S]*?FOR UPDATE/i);
@@ -520,44 +533,23 @@ describe('init.sql breaker RPC definitions', () => {
     expect(leaseLockIndex).toBeGreaterThan(requestLockIndex);
   });
 
-  it('resolves authoritative wait-token request ids before entering request advisory locking in reconnect paths', () => {
-    const acquireBody = readFunctionBody('cq_acquire');
-    const probeBody = readFunctionBody('cq_continue_wait_probe');
-
-    const acquireResolveIndex = expectPatternIndex(
-      acquireBody,
-      /SELECT\s+concurrency_requests\.request_id\s+INTO\s+v_authoritative_request_id\s+FROM\s+concurrency_requests\s+WHERE concurrency_requests\.wait_token = v_wait_token_input/i,
-      'expected cq_acquire to resolve the authoritative request id from wait_token before advisory locking',
-    );
-    const acquireLockIndex = expectPatternIndex(
-      acquireBody,
-      /pg_advisory_xact_lock\(3, hashtext\(v_authoritative_request_id\)\)/i,
-      'expected cq_acquire to enter request advisory locking with the authoritative request id',
-    );
-    const acquireRequestRowIndex = expectPatternIndex(
-      acquireBody,
-      /FROM\s+concurrency_requests\s+WHERE request_id = v_authoritative_request_id\s+FOR UPDATE/i,
-      'expected cq_acquire to lock the authoritative request row after entering advisory locking',
-    );
-
-    expect(acquireLockIndex).toBeGreaterThan(acquireResolveIndex);
-    expect(acquireRequestRowIndex).toBeGreaterThan(acquireLockIndex);
-    expect(acquireBody).not.toMatch(/pg_advisory_xact_lock\(3, hashtext\(v_request_id\)\)/i);
+  it('resolves authoritative wait-token request ids before entering request advisory locking in wait-state probe paths', () => {
+    const probeBody = readFunctionBody('cq_wait_state_probe');
 
     const probeResolveIndex = expectPatternIndex(
       probeBody,
       /SELECT\s+concurrency_requests\.request_id\s+INTO\s+v_authoritative_request_id\s+FROM\s+concurrency_requests\s+WHERE concurrency_requests\.wait_token = v_wait_token_input/i,
-      'expected cq_continue_wait_probe to resolve the authoritative request id from wait_token before advisory locking',
+      'expected cq_wait_state_probe to resolve the authoritative request id from wait_token before advisory locking',
     );
     const probeLockIndex = expectPatternIndex(
       probeBody,
       /pg_advisory_xact_lock\(3, hashtext\(v_authoritative_request_id\)\)/i,
-      'expected cq_continue_wait_probe to enter request advisory locking with the authoritative request id',
+      'expected cq_wait_state_probe to enter request advisory locking with the authoritative request id',
     );
     const probeRequestRowIndex = expectPatternIndex(
       probeBody,
       /FROM\s+concurrency_requests\s+WHERE request_id = v_authoritative_request_id\s+FOR UPDATE/i,
-      'expected cq_continue_wait_probe to lock the authoritative request row after entering advisory locking',
+      'expected cq_wait_state_probe to lock the authoritative request row after entering advisory locking',
     );
 
     expect(probeLockIndex).toBeGreaterThan(probeResolveIndex);

@@ -1333,10 +1333,16 @@ func (s *server) probeOnceWithLimit(parentCtx context.Context, hostKey string, n
 			s.activeSlots.AddLease(res.slotToken, hostKey, siteKey, snap.IPBucket, ttl, now)
 		}
 		if commit.waiterAttached {
-			delivered := store.deliverGrantedToAcceptedInvocation(snap.Token, commit.invocationEpoch, readyAcquireResponse(snap.Token, commit.invocationEpoch, res))
+			granted := readyAcquireResponse(snap.Token, commit.invocationEpoch, res)
+			if commit.ownerRoutedGrant {
+				markReleaseOwnerRequired(granted)
+			}
+			delivered := store.deliverGrantedToAcceptedInvocation(snap.Token, commit.invocationEpoch, granted)
 			if delivered {
-				s.recordGrantClaimed()
-				store.deleteFlow(snap.Token)
+				if !commit.ownerRoutedGrant {
+					s.recordGrantClaimed()
+					store.deleteFlow(snap.Token)
+				}
 				return
 			}
 			releaseReq, ok := store.clearCommittedGrantForProbe(snap.Token, now)
@@ -1482,6 +1488,19 @@ func (s *server) probeOnceWithLimit(parentCtx context.Context, hostKey string, n
 					denySeconds = 3
 				}
 				sched.setBucketDenyUntil(snap.SiteBucket, snap.IPBucket, now.Add(time.Duration(denySeconds)*time.Second))
+				if store.acceptedInvocationOwnerRouted(snap.Token, snap.InvocationEpoch) {
+					s.incrementMetric("overloaded")
+					s.incrementMetric("overloaded_ip")
+					if store.deliverToAcceptedInvocation(snap.Token, snap.InvocationEpoch, &AcquireResponse{
+						Result:          "overloaded",
+						QueryToken:      snap.Token,
+						InvocationEpoch: snap.InvocationEpoch,
+						Reason:          "overload_ip",
+						RetryAfter:      denySeconds,
+					}) {
+						store.deleteFlow(snap.Token)
+					}
+				}
 				markStructuralHandled(snap)
 			case "WAIT":
 				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)

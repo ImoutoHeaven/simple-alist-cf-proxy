@@ -23,6 +23,8 @@ const DEFAULT_TRUE_CONCURRENCY_HEARTBEAT = {
   reconnectSafetyMarginMs: 1000,
 };
 
+const LEGACY_WAIT_MAX_ATTEMPTS_KEY = 'waitMax' + 'AttemptsCap';
+
 const buildTrueConcurrency = (overrides = {}) => {
   const config = {
     enabled: true,
@@ -162,20 +164,15 @@ test('resolveConfig exposes true concurrency config with deterministic defaults'
     acquireTimeoutMs: 11500,
     releaseTimeoutMs: 1500,
     waitTotalMaxMs: 20000,
-    waitMaxAttemptsCap: 35,
     heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
   });
+  assert.equal(Object.hasOwn(config.concurrencyHandlerConfig, LEGACY_WAIT_MAX_ATTEMPTS_KEY), false);
 });
 
 test('resolveConfig rejects malformed CQ wait budget bootstrap values', () => {
   assert.throws(
     () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({ waitTotalMaxMs: 12.5 })), { download: {} }),
     /waitTotalMaxMs/
-  );
-
-  assert.throws(
-    () => resolveConfig({}, buildBootstrap(buildTrueConcurrency({ waitMaxAttemptsCap: 0 })), { download: {} }),
-    /waitMaxAttemptsCap/
   );
 });
 
@@ -353,7 +350,7 @@ test('resolveConfig rejects unsupported true concurrency site bucket modes', () 
   );
 });
 
-test('concurrency client sends wait acquire to the normalized endpoint with auth header and timeout signal', async () => {
+test('concurrency client sends fast acquire to the normalized endpoint with auth header and timeout signal', async () => {
   const calls = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
@@ -388,7 +385,6 @@ test('concurrency client sends wait acquire to the normalized endpoint with auth
       requestId: 'req-1',
       hardExpireAtMs: 5000,
       nowMs: 101,
-      waitToken: 'wait-1',
     });
 
     assert.deepEqual(result, { result: 'wait', waitToken: 'wait-1', scope: 'host', retryAfter: 2 });
@@ -405,7 +401,6 @@ test('concurrency client sends wait acquire to the normalized endpoint with auth
       requestId: 'req-1',
       hardExpireAtMs: 5000,
       nowMs: 101,
-      waitToken: 'wait-1',
     });
   } finally {
     globalThis.fetch = originalFetch;
@@ -446,7 +441,6 @@ test('concurrency client honors per-call acquire timeout override', async () => 
         requestId: 'req-1',
         hardExpireAtMs: 5000,
         nowMs: 101,
-        waitToken: 'wait-1',
       }, undefined, 25),
       (error) => {
         assert.equal(error?.name, 'AbortError');
@@ -972,41 +966,54 @@ test('resolveConfig omits legacy precheck timeout from true concurrency config',
     acquireTimeoutMs: 11500,
     releaseTimeoutMs: 1500,
     waitTotalMaxMs: 20000,
-    waitMaxAttemptsCap: 35,
     heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
   });
+  assert.equal(Object.hasOwn(config.concurrencyHandlerConfig, LEGACY_WAIT_MAX_ATTEMPTS_KEY), false);
 });
 
-test('concurrency client normalizes wait responses and forwards waitToken on continue-wait acquire', async () => {
+test('concurrency client keeps acquire fast-only and sends waitToken only to CQ SSE wait', async () => {
   const originalFetch = globalThis.fetch;
-  const seenBodies = [];
+  const seenRequests = [];
+  const encoder = new TextEncoder();
 
   globalThis.fetch = async (url, init = {}) => {
-    assert.equal(url, 'https://cq.example.test/api/v1/concurrency/acquire');
     assert.equal(init.headers['X-CQ-Auth'], 'cq-secret');
     const body = JSON.parse(init.body);
-    seenBodies.push(body);
-    if (seenBodies.length === 1) {
+    seenRequests.push({ url, body, headers: init.headers });
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
       return new Response(JSON.stringify({
-        result: 'wait',
-        waitToken: 'wait-1',
-        scope: 'host',
-        retryAfter: 2,
+        ...(body.waitToken
+          ? {
+              result: 'granted',
+              leaseId: 'legacy-should-not-run',
+              leaseToken: 'legacy-should-not-run',
+              expiresAtMs: 5000,
+              claimToken: 'legacy-should-not-run',
+            }
+          : {
+              result: 'wait',
+              waitToken: 'wait-1',
+              scope: 'host',
+              retryAfter: 2,
+            }),
       }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
     }
 
-    return new Response(JSON.stringify({
-      result: 'granted',
-      leaseId: 'lease-1',
-      leaseToken: 'token-1',
-      expiresAtMs: 5000,
-      claimToken: 'claim-token-1',
+    assert.equal(url, 'https://cq.example.test/api/v1/concurrency/wait');
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: accepted\n'));
+        controller.enqueue(encoder.encode('data: {"deadlineMs":5000}\n\n'));
+        controller.enqueue(encoder.encode('event: result\n'));
+        controller.enqueue(encoder.encode('data: {"result":"granted","leaseId":"lease-1","leaseToken":"token-1","expiresAtMs":5000,"claimToken":"claim-token-1"}\n\n'));
+        controller.close();
+      },
     }), {
       status: 200,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'text/event-stream' },
     });
   };
 
@@ -1035,26 +1042,52 @@ test('concurrency client normalizes wait responses and forwards waitToken on con
       retryAfter: 2,
     });
 
-    const second = await client.acquire(null, {
+    await assert.rejects(
+      () => client.acquire(null, {
+        hostname: 'tenant.sharepoint.com',
+        hostnameHash: 'host-hash',
+        siteBucket: 'site-hash',
+        ipBucket: 'ip-hash',
+        requestId: 'req-1',
+        hardExpireAtMs: 5000,
+        nowMs: 222,
+        waitToken: 'wait-1',
+      }),
+      /fast acquire does not accept waitToken/i,
+    );
+
+    const second = await client.wait(null, {
       hostname: 'tenant.sharepoint.com',
       hostnameHash: 'host-hash',
       siteBucket: 'site-hash',
       ipBucket: 'ip-hash',
       requestId: 'req-1',
       hardExpireAtMs: 5000,
-      nowMs: 222,
       waitToken: 'wait-1',
-    });
+      deadlineMs: 5000,
+      ticketHash: 'ticket-hash-1',
+      clientInstanceId: 'worker-1',
+    }, new AbortController().signal);
     assert.deepEqual(second, {
-      result: 'granted',
-      leaseId: 'lease-1',
-      leaseToken: 'token-1',
-      expiresAtMs: 5000,
-      claimToken: 'claim-token-1',
+      accepted: { deadlineMs: 5000 },
+      final: {
+        result: 'granted',
+        leaseId: 'lease-1',
+        leaseToken: 'token-1',
+        expiresAtMs: 5000,
+        claimToken: 'claim-token-1',
+      },
     });
 
-    assert.equal(Object.hasOwn(seenBodies[0], 'waitToken'), false);
-    assert.equal(seenBodies[1].waitToken, 'wait-1');
+    assert.equal(seenRequests.length, 2);
+    assert.equal(seenRequests[0].url, 'https://cq.example.test/api/v1/concurrency/acquire');
+    assert.equal(Object.hasOwn(seenRequests[0].body, 'waitToken'), false);
+    assert.equal(seenRequests[1].url, 'https://cq.example.test/api/v1/concurrency/wait');
+    assert.equal(seenRequests[1].headers.Accept, 'text/event-stream');
+    assert.equal(seenRequests[1].body.waitToken, 'wait-1');
+    assert.equal(seenRequests[1].body.deadlineMs, 5000);
+    assert.equal(seenRequests[1].body.ticketHash, 'ticket-hash-1');
+    assert.equal(seenRequests[1].body.clientInstanceId, 'worker-1');
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -10,6 +10,81 @@ const createJsonResponse = (payload) => new Response(JSON.stringify(payload), {
   headers: { 'content-type': 'application/json' },
 });
 
+const createStreamingSseResponse = (frames, init = {}) => {
+  const encoder = new TextEncoder();
+  let index = 0;
+
+  return new Response(new ReadableStream({
+    pull(controller) {
+      if (index >= frames.length) {
+        controller.close();
+        return;
+      }
+
+      controller.enqueue(encoder.encode(frames[index]));
+      index += 1;
+      if (index >= frames.length) {
+        controller.close();
+      }
+    },
+  }), {
+    status: init.status ?? 200,
+    headers: {
+      'content-type': 'text/event-stream',
+      ...(init.headers || {}),
+    },
+  });
+};
+
+const createFairQueueWaitSseResponse = (finalPayload, options = {}) => {
+  const acceptedPayload = {
+    queryToken: options.queryToken ?? finalPayload.queryToken ?? 'fq-q-default',
+    invocationEpoch: options.invocationEpoch ?? finalPayload.invocationEpoch ?? 1,
+    deadlineMs: options.acceptedDeadlineMs ?? finalPayload.deadlineMs ?? (Date.now() + 1_000),
+  };
+
+  return createStreamingSseResponse([
+    'event: accepted\n',
+    `data: ${JSON.stringify(acceptedPayload)}\n\n`,
+    ': keepalive 1710000000001\n\n',
+    'event: result\n',
+    `data: ${JSON.stringify({
+      ...finalPayload,
+      queryToken: finalPayload.queryToken ?? acceptedPayload.queryToken,
+      invocationEpoch: finalPayload.invocationEpoch ?? acceptedPayload.invocationEpoch,
+    })}\n\n`,
+  ], options);
+};
+
+const createAcceptedOnlyFairQueueWaitResponse = ({
+  queryToken = 'fq-q-default',
+  invocationEpoch = 1,
+  deadlineMs = Date.now() + 1_000,
+  onAccepted = null,
+  onCancel = null,
+} = {}) => {
+  const encoder = new TextEncoder();
+  const acceptedFrame = encoder.encode(
+    `event: accepted\ndata: ${JSON.stringify({ queryToken, invocationEpoch, deadlineMs })}\n\n`,
+  );
+
+  return new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(acceptedFrame);
+      onAccepted?.();
+    },
+    pull() {
+      return new Promise(() => {});
+    },
+    cancel() {
+      onCancel?.();
+    },
+  }), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  });
+};
+
 const encodeBase64Url = (input) => Buffer.from(input)
   .toString('base64')
   .replace(/\+/g, '-')
@@ -502,7 +577,7 @@ test('slot-handler client abandon skips without valid invocationEpoch', async ()
   }
 });
 
-test('finalizer abandons when queryToken exists without slotToken', async () => {
+test('terminal timeout result does not emit abandon after accepted tuple', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const abandonBodies = [];
@@ -528,11 +603,14 @@ test('finalizer abandons when queryToken exists without slotToken', async () => 
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      return createJsonResponse({
-        result: 'pending',
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      const payload = JSON.parse(init.body);
+      return createFairQueueWaitSseResponse({
+        result: 'timeout',
         queryToken: 'query-timeout',
         invocationEpoch: 4,
+      }, {
+        acceptedDeadlineMs: payload.deadlineMs,
       });
     }
 
@@ -559,7 +637,7 @@ test('finalizer abandons when queryToken exists without slotToken', async () => 
     await Promise.allSettled(waitUntilPromises);
 
     assert.equal(response.status, 503);
-    assert.deepEqual(abandonBodies, [{ queryToken: 'query-timeout', invocationEpoch: 4 }]);
+    assert.deepEqual(abandonBodies, []);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -567,12 +645,11 @@ test('finalizer abandons when queryToken exists without slotToken', async () => 
   }
 });
 
-test('timeout early-return emits exactly one abandon for one accepted tuple', async () => {
+test('timeout early-return does not emit abandon after terminal SSE result', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const abandonBodies = [];
   const releaseBodies = [];
-  const firstAbandon = createDeferred();
   let abandonCalls = 0;
   delete globalThis.bootstrapCache;
 
@@ -595,20 +672,20 @@ test('timeout early-return emits exactly one abandon for one accepted tuple', as
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      return createJsonResponse({
-        result: 'pending',
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      const payload = JSON.parse(init.body);
+      return createFairQueueWaitSseResponse({
+        result: 'timeout',
         queryToken: 'query-timeout-single-owner',
         invocationEpoch: 14,
+      }, {
+        acceptedDeadlineMs: payload.deadlineMs,
       });
     }
 
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/abandon') {
       abandonCalls += 1;
       abandonBodies.push(JSON.parse(init.body));
-      if (abandonCalls === 1) {
-        return await firstAbandon.promise;
-      }
       return createJsonResponse({ result: 'ok' });
     }
 
@@ -629,12 +706,10 @@ test('timeout early-return emits exactly one abandon for one accepted tuple', as
 
     assert.equal(response.status, 503);
     await waitForNextTurn();
-    assert.equal(abandonCalls, 1);
-
-    firstAbandon.resolve(createJsonResponse({ result: 'ok' }));
     await Promise.allSettled(waitUntilPromises);
 
-    assert.deepEqual(abandonBodies, [{ queryToken: 'query-timeout-single-owner', invocationEpoch: 14 }]);
+    assert.equal(abandonCalls, 0);
+    assert.deepEqual(abandonBodies, []);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -642,12 +717,11 @@ test('timeout early-return emits exactly one abandon for one accepted tuple', as
   }
 });
 
-test('timeout early-return retries cleanup once serially without final replay', async () => {
+test('timeout early-return does not schedule retry cleanup after terminal SSE result', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const abandonBodies = [];
   const releaseBodies = [];
-  const firstAbandon = createDeferred();
   let abandonCalls = 0;
   let activeAbandonCalls = 0;
   let maxActiveAbandonCalls = 0;
@@ -672,11 +746,14 @@ test('timeout early-return retries cleanup once serially without final replay', 
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      return createJsonResponse({
-        result: 'pending',
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      const payload = JSON.parse(init.body);
+      return createFairQueueWaitSseResponse({
+        result: 'timeout',
         queryToken: 'query-timeout-retry',
         invocationEpoch: 18,
+      }, {
+        acceptedDeadlineMs: payload.deadlineMs,
       });
     }
 
@@ -686,9 +763,6 @@ test('timeout early-return retries cleanup once serially without final replay', 
       maxActiveAbandonCalls = Math.max(maxActiveAbandonCalls, activeAbandonCalls);
       abandonBodies.push(JSON.parse(init.body));
       try {
-        if (abandonCalls === 1) {
-          return await firstAbandon.promise;
-        }
         return createJsonResponse({ result: 'ok' });
       } finally {
         activeAbandonCalls -= 1;
@@ -712,17 +786,11 @@ test('timeout early-return retries cleanup once serially without final replay', 
 
     assert.equal(response.status, 503);
     await waitForNextTurn();
-    assert.equal(abandonCalls, 1);
-
-    firstAbandon.resolve(new Response('fail once', { status: 400 }));
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(abandonCalls, 2);
-    assert.equal(maxActiveAbandonCalls, 1);
-    assert.deepEqual(abandonBodies, [
-      { queryToken: 'query-timeout-retry', invocationEpoch: 18 },
-      { queryToken: 'query-timeout-retry', invocationEpoch: 18 },
-    ]);
+    assert.equal(abandonCalls, 0);
+    assert.equal(maxActiveAbandonCalls, 0);
+    assert.deepEqual(abandonBodies, []);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -733,7 +801,7 @@ test('timeout early-return retries cleanup once serially without final replay', 
 test('client abort before grant uses abandon cleanup', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
-  const acquireBodies = [];
+  const waitBodies = [];
   const abandonBodies = [];
   const releaseBodies = [];
   delete globalThis.bootstrapCache;
@@ -759,13 +827,13 @@ test('client abort before grant uses abandon cleanup', async () => {
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      acquireBodies.push(JSON.parse(init.body));
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      waitBodies.push(JSON.parse(init.body));
       setTimeout(() => controller.abort(), 0);
-      return createJsonResponse({
-        result: 'pending',
-        queryToken: 'query-abort',
-        invocationEpoch: 9,
+      return createAcceptedOnlyFairQueueWaitResponse({
+        queryToken: 'fq-q1',
+        invocationEpoch: 1,
+        deadlineMs: Date.now() + 1_000,
       });
     }
 
@@ -793,9 +861,9 @@ test('client abort before grant uses abandon cleanup', async () => {
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(acquireBodies.length, 1);
+    assert.equal(waitBodies.length, 1);
     assert.equal(response.status, 499);
-    assert.deepEqual(abandonBodies, [{ queryToken: 'query-abort', invocationEpoch: 9 }]);
+    assert.deepEqual(abandonBodies, [{ queryToken: 'fq-q1', invocationEpoch: 1 }]);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -829,13 +897,16 @@ test('throttled terminal handling clears ownership tuple without issuing abandon
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      const payload = JSON.parse(init.body);
+      return createFairQueueWaitSseResponse({
         result: 'throttled',
         queryToken: 'query-throttled',
         invocationEpoch: 6,
         throttleCode: 503,
         retryAfter: 4,
+      }, {
+        acceptedDeadlineMs: payload.deadlineMs,
       });
     }
 
@@ -947,8 +1018,6 @@ test('grant promotion suppresses abandon during abort/final cleanup race', async
     slotHandlerConfig: {
       url: 'https://slot-handler.example.com',
       totalMaxWaitMs: 20000,
-      perRequestTimeoutMs: 8000,
-      maxAttemptsCap: 8,
       authKey: '',
     },
     testHooks: {
@@ -979,18 +1048,16 @@ test('grant promotion suppresses abandon during abort/final cleanup race', async
   const promotedSnapshots = [];
   const originalFetch = globalThis.fetch;
 
-  globalThis.fetch = async () => new Response(JSON.stringify({
+  globalThis.fetch = async () => createFairQueueWaitSseResponse({
     result: 'granted',
     queryToken: 'query-granted',
     invocationEpoch: 5,
     slotToken: 'slot-granted',
+    releaseOwnerRequired: true,
     meta: {
       attemptVersion: 7,
       attemptTicket: 11,
     },
-  }), {
-    status: 200,
-    headers: { 'content-type': 'application/json' },
   });
 
   try {

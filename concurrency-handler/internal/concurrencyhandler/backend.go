@@ -9,14 +9,17 @@ import (
 )
 
 type AcquireRequest struct {
-	Hostname       string `json:"hostname"`
-	HostnameHash   string `json:"hostnameHash"`
-	SiteBucket     string `json:"siteBucket"`
-	IPBucket       string `json:"ipBucket"`
-	RequestID      string `json:"requestId"`
-	HardExpireAtMs int64  `json:"hardExpireAtMs"`
-	NowMs          int64  `json:"nowMs"`
-	WaitToken      string `json:"waitToken,omitempty"`
+	Hostname         string `json:"hostname"`
+	HostnameHash     string `json:"hostnameHash"`
+	SiteBucket       string `json:"siteBucket"`
+	IPBucket         string `json:"ipBucket"`
+	RequestID        string `json:"requestId"`
+	HardExpireAtMs   int64  `json:"hardExpireAtMs"`
+	NowMs            int64  `json:"nowMs,omitempty"`
+	WaitToken        string `json:"waitToken,omitempty"`
+	DeadlineMs       int64  `json:"deadlineMs,omitempty"`
+	TicketHash       string `json:"ticketHash,omitempty"`
+	ClientInstanceID string `json:"clientInstanceId,omitempty"`
 }
 
 type AcquireResult struct {
@@ -29,6 +32,13 @@ type AcquireResult struct {
 	Reason      string `json:"reason,omitempty"`
 	RetryAfter  int    `json:"retryAfter,omitempty"`
 	ClaimToken  string `json:"claimToken,omitempty"`
+}
+
+func waitStateProbeDeadlineMs(req AcquireRequest) int64 {
+	if req.DeadlineMs > 0 {
+		return req.DeadlineMs
+	}
+	return req.HardExpireAtMs
 }
 
 type ClaimGrantRequest struct {
@@ -175,7 +185,7 @@ type ExpireScopeResult struct {
 }
 
 const (
-	fixedContinueWaitProbeFunc                  = "cq_continue_wait_probe"
+	fixedContinueWaitProbeFunc                  = "cq_wait_state_probe"
 	fixedPromoteWaitingFunc                     = "cq_promote_waiting_request"
 	fixedClaimGrantFunc                         = "cq_claim_grant"
 	fixedAckHandoffFunc                         = "cq_ack_handoff"
@@ -266,8 +276,8 @@ type Backend interface {
 	ExpireScope(ctx context.Context, req ExpireScopeRequest) (*ExpireScopeResult, error)
 }
 
-type continueWaitProber interface {
-	ProbeContinueWait(ctx context.Context, req AcquireRequest) (*AcquireResult, error)
+type waitStateProber interface {
+	ProbeWaitState(ctx context.Context, req AcquireRequest) (*AcquireResult, error)
 }
 
 type ackHandoffer interface {
@@ -404,7 +414,7 @@ func validateAcquireResult(req AcquireRequest, result *AcquireResult) error {
 		}
 	case "expired":
 		switch result.Reason {
-		case "hard_expired", "waiter_detached_timeout":
+		case "hard_expired", "wait_stream_timeout", "waiter_detached_timeout":
 		default:
 			return fmt.Errorf("invalid acquire expired reason %q", result.Reason)
 		}

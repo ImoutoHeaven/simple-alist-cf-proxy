@@ -18,6 +18,26 @@ var acceptAcquireInvocationForAcquire = func(store *flowStore, token string, req
 	return store.acceptAcquireInvocation(token, req, w, now, leaseUntil, limits)
 }
 
+func (s *server) ensureFlowStore(cfg *Config) *flowStore {
+	if s == nil || cfg == nil {
+		return nil
+	}
+	s.mu.RLock()
+	store := s.flowStore
+	s.mu.RUnlock()
+	if store != nil {
+		return store
+	}
+	grace := cfg.FairQueue.graceDuration()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.flowStore == nil {
+		s.flowStore = newFlowStore(grace)
+		s.wireFlowStoreRuntimeLocked(cfg)
+	}
+	return s.flowStore
+}
+
 func acquireInvocationLeaseDuration(cfg *Config) time.Duration {
 	if cfg == nil {
 		return 10 * time.Second
@@ -62,7 +82,7 @@ func detectOverloadScope(store *flowStore, hostKey, siteBucket, ipBucket string,
 	return scope
 }
 
-// handleAcquireSlotFlow implements token-stable acquire semantics for fair-queue long polling.
+// handleAcquireSlotFlow implements token-stable fair-queue wait admission semantics.
 func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) (*AcquireResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -73,20 +93,7 @@ func (s *server) handleAcquireSlotFlow(ctx context.Context, req AcquireRequest) 
 		return nil, errors.New("config not loaded")
 	}
 
-	// Ensure flowStore exists (tests may call without updateRuntime).
-	s.mu.RLock()
-	store := s.flowStore
-	s.mu.RUnlock()
-	if store == nil {
-		grace := cfg.FairQueue.graceDuration()
-		s.mu.Lock()
-		if s.flowStore == nil {
-			s.flowStore = newFlowStore(grace)
-			s.wireFlowStoreRuntimeLocked(cfg)
-		}
-		store = s.flowStore
-		s.mu.Unlock()
-	}
+	store := s.ensureFlowStore(cfg)
 
 	nowFn := time.Now
 	if store != nil && store.nowFn != nil {

@@ -11,6 +11,7 @@ const {
   createSlotHandlerClient,
   createTrueConcurrencyHeartbeatManager,
   normalizeTrueConcurrencyReleaseReason,
+  readSseResult,
 } = __fairQueueTestHooks;
 
 const createJsonResponse = (payload, init = {}) => new Response(JSON.stringify(payload), {
@@ -20,6 +21,110 @@ const createJsonResponse = (payload, init = {}) => new Response(JSON.stringify(p
     ...(init.headers || {}),
   },
 });
+
+const createStreamingSseResponse = (frames, init = {}) => {
+  const encoder = new TextEncoder();
+  let index = 0;
+
+  return new Response(new ReadableStream({
+    pull(controller) {
+      if (index >= frames.length) {
+        controller.close();
+        return;
+      }
+
+      controller.enqueue(encoder.encode(frames[index]));
+      index += 1;
+      if (index >= frames.length) {
+        controller.close();
+      }
+    },
+  }), {
+    status: init.status ?? 200,
+    headers: {
+      'content-type': 'text/event-stream',
+      ...(init.headers || {}),
+    },
+  });
+};
+
+const createTrueConcurrencyWaitSseResponse = (finalPayload, options = {}) => {
+  const acceptedDeadlineMs = Number.isFinite(options.acceptedDeadlineMs)
+    ? options.acceptedDeadlineMs
+    : Date.now() + 1_000;
+
+  return createStreamingSseResponse([
+    'event: accepted\n',
+    `data: ${JSON.stringify({ deadlineMs: acceptedDeadlineMs })}\n\n`,
+    ': keepalive 1710000000001\n\n',
+    'event: result\n',
+    `data: ${JSON.stringify(finalPayload)}\n\n`,
+  ], options);
+};
+
+const createFairQueueWaitSseResponse = (finalPayload, options = {}) => {
+  const acceptedPayload = {
+    queryToken: options.queryToken ?? finalPayload.queryToken ?? 'fq-q-default',
+    invocationEpoch: options.invocationEpoch ?? finalPayload.invocationEpoch ?? 1,
+    deadlineMs: options.acceptedDeadlineMs ?? finalPayload.deadlineMs ?? (Date.now() + 1_000),
+  };
+
+  return createStreamingSseResponse([
+    'event: accepted\n',
+    `data: ${JSON.stringify(acceptedPayload)}\n\n`,
+    ': keepalive 1710000000001\n\n',
+    'event: result\n',
+    `data: ${JSON.stringify({
+      ...finalPayload,
+      queryToken: finalPayload.queryToken ?? acceptedPayload.queryToken,
+      invocationEpoch: finalPayload.invocationEpoch ?? acceptedPayload.invocationEpoch,
+    })}\n\n`,
+  ], options);
+};
+
+const createFairQueueWaitResponseFromInit = (init, finalPayload, options = {}) => {
+  const requestBody = JSON.parse(init.body);
+  return createFairQueueWaitSseResponse(
+    finalPayload.result === 'granted' && finalPayload.releaseOwnerRequired === undefined
+      ? { ...finalPayload, releaseOwnerRequired: true }
+      : finalPayload,
+    {
+      ...options,
+      acceptedDeadlineMs: requestBody.deadlineMs,
+    },
+  );
+};
+
+const normalizeFairQueueTestUrl = (url) => url;
+
+const createPendingTrueConcurrencyWaitSseResponse = ({
+  acceptedDeadlineMs = Date.now() + 1_000,
+  onAccepted = null,
+  onCancel = null,
+} = {}) => {
+  const encoder = new TextEncoder();
+  const acceptedFrame = encoder.encode(
+    `event: accepted\ndata: ${JSON.stringify({ deadlineMs: acceptedDeadlineMs })}\n\n`,
+  );
+
+  return new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(acceptedFrame);
+      onAccepted?.();
+    },
+    pull() {
+      return new Promise(() => {});
+    },
+    cancel() {
+      onCancel?.();
+    },
+  }), {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream',
+    },
+  });
+};
 
 const encodeBase64Url = (input) => Buffer.from(input)
   .toString('base64')
@@ -474,6 +579,86 @@ test('signed worker request fixtures include ticketNonce and idle_timeout', asyn
   assertSignedRequestPayloadContract(await buildSignedWorkerRequest());
 });
 
+test('SSE parser accepts accepted and result frames from a streaming response', async () => {
+  const cqFrames = [
+    'event: accepted\n',
+    'data: {"deadlineMs":1710000000000}\n\n',
+    ': keepalive 1710000000001\n\n',
+    'event: result\n',
+    'data: {"result":"granted","leaseId":"lease-1","leaseToken":"token-1","expiresAtMs":1710000009000,"claimToken":"claim-1"}\n\n',
+  ];
+
+  const controller = new AbortController();
+  const result = await readSseResult(
+    createStreamingSseResponse(cqFrames),
+    controller.signal,
+    new Set(['granted', 'conflict', 'released', 'cancelled', 'expired']),
+  );
+
+  assert.equal(result.accepted.deadlineMs, 1710000000000);
+  assert.equal(result.final.result, 'granted');
+  assert.equal(result.final.claimToken, 'claim-1');
+});
+
+test('SSE parser rejects malformed JSON payloads', async () => {
+  const malformedFrames = [
+    'event: result\n',
+    'data: {not-json}\n\n',
+  ];
+
+  const controller = new AbortController();
+
+  await assert.rejects(
+    () => readSseResult(
+      createStreamingSseResponse(malformedFrames),
+      controller.signal,
+      new Set(['granted', 'conflict', 'released', 'cancelled', 'expired']),
+    ),
+    /invalid sse json/i,
+  );
+});
+
+test('SSE parser cancels and releases the reader when the signal is already aborted', async () => {
+  let cancelled = false;
+  let released = false;
+
+  const response = {
+    body: {
+      getReader() {
+        return {
+          async read() {
+            throw new Error('read should not run for a pre-aborted signal');
+          },
+          async cancel() {
+            cancelled = true;
+          },
+          releaseLock() {
+            released = true;
+          },
+        };
+      },
+    },
+  };
+
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    () => readSseResult(
+      response,
+      controller.signal,
+      new Set(['granted', 'conflict', 'released', 'cancelled', 'expired']),
+    ),
+    (error) => {
+      assert.equal(error?.name, 'AbortError');
+      return true;
+    },
+  );
+
+  assert.equal(cancelled, true);
+  assert.equal(released, true);
+});
+
 const createClaimGrantResponseFromRequest = (init) => {
   const body = JSON.parse(init.body);
   const suffix = body.claimToken.replace(/^claim-token-?/, '') || '1';
@@ -513,7 +698,7 @@ const setHeartbeatMock = (handler = null) => {
 };
 
 const fetchWithDefaultAckHandoff = async (input, init = {}) => {
-  const url = typeof input === 'string' ? input : input.url;
+  const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
   const ticketStateResponse = await handleTicketStateRpc(url, init);
   if (ticketStateResponse) {
     return ticketStateResponse;
@@ -658,7 +843,7 @@ const captureAdmissionPayloads = async ({
   let concurrencyReleaseBody = null;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -679,10 +864,10 @@ const captureAdmissionPayloads = async ({
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
       fairQueueAcquireBody = JSON.parse(init.body);
-      return createJsonResponse({
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-sitebucket',
         invocationEpoch: 1,
@@ -755,7 +940,7 @@ test('dual mode performs fairqueue acquire before concurrency acquire and origin
 
   crypto.randomUUID = () => 'req-dual-1';
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -775,9 +960,9 @@ test('dual mode performs fairqueue acquire before concurrency acquire and origin
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-1',
         invocationEpoch: 1,
@@ -847,7 +1032,7 @@ test('dual mode performs fairqueue acquire before concurrency acquire and origin
     assert.equal(await response.text(), 'ok');
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls.slice(0, 4), [
-      'fairqueue-acquire',
+      'fairqueue-wait',
       'concurrency-acquire',
       'concurrency-claim',
       'origin-fetch',
@@ -864,7 +1049,7 @@ test('dual mode fast terminal CQ hard expiry releases fairqueue and returns link
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -884,9 +1069,9 @@ test('dual mode fast terminal CQ hard expiry releases fairqueue and returns link
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-fast-terminal',
         invocationEpoch: 1,
@@ -915,7 +1100,7 @@ test('dual mode fast terminal CQ hard expiry releases fairqueue and returns link
     const body = await readJson(response);
     assert.equal(response.status, 401);
     assert.equal(body.message, 'link expired');
-    assert.deepEqual(calls, ['fairqueue-acquire', 'concurrency-acquire', 'fairqueue-release']);
+    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -927,7 +1112,7 @@ test('dual mode fast expired CQ result returns link expired after releasing fair
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -947,9 +1132,9 @@ test('dual mode fast expired CQ result returns link expired after releasing fair
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-expired-terminal',
         invocationEpoch: 1,
@@ -982,7 +1167,7 @@ test('dual mode fast expired CQ result returns link expired after releasing fair
     assert.equal(body.message, 'link expired');
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls, [
-      'fairqueue-acquire',
+      'fairqueue-wait',
       'concurrency-acquire',
       'fairqueue-release',
     ]);
@@ -997,7 +1182,7 @@ test('dual mode proceeds without precheck and still completes fairqueue then con
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -1017,9 +1202,9 @@ test('dual mode proceeds without precheck and still completes fairqueue then con
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-malformed-precheck',
         invocationEpoch: 1,
@@ -1082,7 +1267,7 @@ test('dual mode proceeds without precheck and still completes fairqueue then con
     assert.equal(await response.text(), 'ok');
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls.slice(0, 4), [
-      'fairqueue-acquire',
+      'fairqueue-wait',
       'concurrency-acquire',
       'concurrency-claim',
       'origin-fetch',
@@ -1098,7 +1283,7 @@ test('dual mode fast terminal CQ hard expiry returns link expired after waiting 
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -1118,9 +1303,9 @@ test('dual mode fast terminal CQ hard expiry returns link expired after waiting 
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-1',
         invocationEpoch: 1,
@@ -1151,7 +1336,7 @@ test('dual mode fast terminal CQ hard expiry returns link expired after waiting 
     const body = await readJson(response);
     assert.equal(response.status, 401);
     assert.equal(body.message, 'link expired');
-    assert.deepEqual(calls, ['fairqueue-acquire', 'concurrency-acquire', 'fairqueue-release']);
+    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -1164,7 +1349,7 @@ test('queue_breaker dual mode settles breaker attempt before returning link expi
   const reportBodies = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -1184,13 +1369,14 @@ test('queue_breaker dual mode settles breaker attempt before returning link expi
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-qb-cq-deny',
         invocationEpoch: 1,
         slotToken: 'slot-qb-cq-deny',
+        releaseOwnerRequired: true,
         meta: {
           attemptVersion: 17,
           attemptTicket: 3,
@@ -1234,7 +1420,7 @@ test('queue_breaker dual mode settles breaker attempt before returning link expi
     assert.equal(response.status, 401);
     assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, [
-      'fairqueue-acquire',
+      'fairqueue-wait',
       'concurrency-acquire',
       'breaker-settle',
       'fairqueue-release',
@@ -1254,7 +1440,7 @@ test('breaker_only with true concurrency authorizes breaker only after CQ claim 
   let ackBody = null;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -1375,7 +1561,7 @@ test('breaker_only with true concurrency does not authorize or settle before CQ 
   const settleBodies = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -1456,7 +1642,7 @@ test('breaker_only with true concurrency authorizes after ack_handoff and settle
   const settleBodies = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -1593,7 +1779,7 @@ test('breaker_only with true concurrency reports protected auth refresh failures
   let linkFetchCount = 0;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       const bootstrap = buildRuntimeBootstrap({
@@ -1748,7 +1934,7 @@ test('breaker_only with true concurrency returns authority unavailable when no-s
   const originBody = createTrackedTextBody('expired');
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -1867,7 +2053,7 @@ test('breaker_only with true concurrency returns generated JSON for protected te
   const reportBodies = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2009,7 +2195,7 @@ test('breaker_only with true concurrency returns generated JSON for non-protecte
   const originBody = createTrackedTextBody('forbidden');
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2146,7 +2332,7 @@ test('breaker_only with true concurrency fails closed and cancels the upstream b
   const originBody = createTrackedTextBody('boom');
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2281,7 +2467,7 @@ test('breaker_only with true concurrency checks handler readiness before authori
   let advancedClock = false;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2360,7 +2546,7 @@ test('breaker_only with true concurrency does not authorize or settle on client-
   const abortController = new AbortController();
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2441,9 +2627,10 @@ test('breaker_only with true concurrency waits and only authorizes after CQ clai
   const originalFetch = globalThis.fetch;
   const calls = [];
   const settleBodies = [];
+  let waitRequest = null;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2487,22 +2674,26 @@ test('breaker_only with true concurrency waits and only authorizes after CQ clai
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      const body = JSON.parse(init.body);
-      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
-      if (!body.waitToken) {
-        return createJsonResponse({
-          result: 'wait',
-          waitToken: 'breaker-only-wait-token',
-          scope: 'host',
-          retryAfter: 1,
-        });
-      }
+      calls.push('concurrency-acquire-fast');
       return createJsonResponse({
+        result: 'wait',
+        waitToken: 'breaker-only-wait-token',
+        scope: 'host',
+        retryAfter: 1,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      calls.push('concurrency-wait-sse');
+      waitRequest = JSON.parse(init.body);
+      return createTrueConcurrencyWaitSseResponse({
         result: 'granted',
         leaseId: 'lease-breaker-only-wait',
         leaseToken: 'token-breaker-only-wait',
-        expiresAtMs: body.hardExpireAtMs,
+        expiresAtMs: waitRequest.hardExpireAtMs,
         claimToken: 'claim-token-breaker-only-wait',
+      }, {
+        acceptedDeadlineMs: waitRequest.deadlineMs,
       });
     }
 
@@ -2561,12 +2752,14 @@ test('breaker_only with true concurrency waits and only authorizes after CQ clai
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls.slice(0, 6), [
       'concurrency-acquire-fast',
-      'concurrency-acquire-continue',
+      'concurrency-wait-sse',
       'concurrency-claim',
       'concurrency-ack-handoff',
       'authorize-breaker-attempt',
       'origin-fetch',
     ]);
+    assert.equal(waitRequest?.waitToken, 'breaker-only-wait-token');
+    assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true);
     assert.equal(settleBodies.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -2580,7 +2773,7 @@ test('breaker_only with true concurrency does not authorize or settle before ter
   const settleBodies = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2670,7 +2863,7 @@ test('breaker_only with true concurrency does not authorize or settle before acq
 
   crypto.randomUUID = () => 'req-breaker-only-acquire-failure';
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2772,7 +2965,7 @@ test('breaker_only with true concurrency does not authorize or settle after clai
   let releaseBody = null;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2888,7 +3081,7 @@ test('queue_breaker dual mode settles breaker attempt when target expires before
   let advancedClock = false;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -2908,18 +3101,25 @@ test('queue_breaker dual mode settles breaker attempt when target expires before
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
       advancedClock = true;
-      return createJsonResponse({
+      const payload = JSON.parse(init.body);
+      assert.equal(typeof payload.requestId, 'string');
+      assert.equal(typeof payload.deadlineMs, 'number');
+      assert.equal(payload.admissionMode, 'queue_breaker');
+      return createFairQueueWaitSseResponse({
         result: 'granted',
         queryToken: 'query-expire-before-cq',
         invocationEpoch: 1,
         slotToken: 'slot-expire-before-cq',
+        releaseOwnerRequired: true,
         meta: {
           attemptVersion: 61,
           attemptTicket: 4,
         },
+      }, {
+        acceptedDeadlineMs: payload.deadlineMs,
       });
     }
 
@@ -2963,7 +3163,7 @@ test('queue_breaker dual mode settles breaker attempt when target expires before
     await Promise.allSettled(waitUntilPromises);
     assert.equal(response.status, 401);
     assert.deepEqual(calls, [
-      'fairqueue-acquire',
+      'fairqueue-wait',
       'breaker-settle',
       'fairqueue-release',
     ]);
@@ -2986,7 +3186,7 @@ test('dual mode malformed concurrency acquire result fails closed after fairqueu
   const fairQueueReleaseBodies = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -3005,9 +3205,9 @@ test('dual mode malformed concurrency acquire result fails closed after fairqueu
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-malformed-acquire',
         invocationEpoch: 1,
@@ -3044,7 +3244,7 @@ test('dual mode malformed concurrency acquire result fails closed after fairqueu
     await Promise.allSettled(waitUntilPromises);
     assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
-    assert.deepEqual(calls, ['fairqueue-acquire', 'concurrency-acquire', 'fairqueue-release', 'concurrency-cancel']);
+    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release', 'concurrency-cancel']);
     assert.equal(fairQueueReleaseBodies.length, 1);
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
   } finally {
@@ -3063,7 +3263,7 @@ test('true concurrency malformed acquire response still triggers best-effort can
 
   crypto.randomUUID = () => 'req-ambiguous-acquire-1';
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -3135,7 +3335,7 @@ test('true concurrency acquire fetch rejection after dispatch still triggers bes
 
   crypto.randomUUID = () => 'req-ambiguous-reject-1';
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -3204,7 +3404,7 @@ test('true concurrency non-200 acquire response after dispatch still triggers be
 
   crypto.randomUUID = () => 'req-ambiguous-status-1';
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -3272,7 +3472,7 @@ test('true concurrency only skips precheck and fairqueue and acks handoff before
   const heartbeatSocket = createFakeHeartbeatSocket();
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -3295,9 +3495,9 @@ test('true concurrency only skips precheck and fairqueue and acks handoff before
       return createJsonResponse({ result: 'allow' });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({ result: 'granted', queryToken: 'q', invocationEpoch: 1, slotToken: 's' });
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, { result: 'granted', queryToken: 'q', invocationEpoch: 1, slotToken: 's' });
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
@@ -3365,7 +3565,7 @@ test('true concurrency only skips precheck and fairqueue and acks handoff before
     assert.equal(helloPayload.leaseToken, 'token-1');
     assert.equal(Object.hasOwn(helloPayload, 'downloadedBytes'), false);
     assert.equal(calls.includes('precheck'), false);
-    assert.equal(calls.includes('fairqueue-acquire'), false);
+    assert.equal(calls.includes('fairqueue-wait'), false);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -3379,7 +3579,7 @@ test('true concurrency heartbeat hello timeout retries initial connect before or
   let releaseBody = null;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -3496,7 +3696,7 @@ test('true concurrency heartbeat_connect_failed schedules release retry cleanup 
   };
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -3597,7 +3797,7 @@ test('true concurrency initial heartbeat terminal mapping suppresses duplicate r
       let releaseBody = null;
 
       globalThis.fetch = async (input, init = {}) => {
-        const url = typeof input === 'string' ? input : input.url;
+        const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
         if (url === 'https://controller.example.test/api/v0/bootstrap') {
           return createJsonResponse(buildRuntimeBootstrap({
@@ -3691,9 +3891,10 @@ test('true concurrency claim success must ack_handoff before queue_breaker autho
   const settleBodies = [];
   const authorizeBodies = [];
   let ackBody = null;
+  let waitRequest = null;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -3713,9 +3914,9 @@ test('true concurrency claim success must ack_handoff before queue_breaker autho
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-handoff-queue-breaker',
         invocationEpoch: 1,
@@ -3728,22 +3929,26 @@ test('true concurrency claim success must ack_handoff before queue_breaker autho
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      const body = JSON.parse(init.body);
-      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
-      if (!body.waitToken) {
-        return createJsonResponse({
-          result: 'wait',
-          waitToken: 'wait-handoff-queue-breaker',
-          scope: 'host',
-          retryAfter: 1,
-        });
-      }
+      calls.push('concurrency-acquire-fast');
       return createJsonResponse({
+        result: 'wait',
+        waitToken: 'wait-handoff-queue-breaker',
+        scope: 'host',
+        retryAfter: 1,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      calls.push('concurrency-wait-sse');
+      waitRequest = JSON.parse(init.body);
+      return createTrueConcurrencyWaitSseResponse({
         result: 'granted',
         leaseId: 'lease-handoff-queue-breaker',
         leaseToken: 'token-handoff-queue-breaker',
-        expiresAtMs: body.hardExpireAtMs,
+        expiresAtMs: waitRequest.hardExpireAtMs,
         claimToken: 'claim-token-handoff-queue-breaker',
+      }, {
+        acceptedDeadlineMs: waitRequest.deadlineMs,
       });
     }
 
@@ -3832,6 +4037,8 @@ test('true concurrency claim success must ack_handoff before queue_breaker autho
     assert.ok(authorizeIndex > ackIndex);
     assert.ok(originIndex > authorizeIndex);
     assert.equal(ackBody?.handoffToken, 'handoff-handoff-queue-breaker');
+    assert.equal(waitRequest?.waitToken, 'wait-handoff-queue-breaker');
+    assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true);
     assert.equal(settleBodies.length, 1);
     assert.equal(settleBodies[0].p_attempt_version, 91);
     assert.equal(settleBodies[0].p_attempt_ticket, 12);
@@ -3875,7 +4082,7 @@ test('true concurrency ack_handoff transport or availability or malformed-succes
       let releaseBody = null;
 
       globalThis.fetch = async (input, init = {}) => {
-        const url = typeof input === 'string' ? input : input.url;
+        const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
         if (url === 'https://controller.example.test/api/v0/bootstrap') {
           return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -3968,7 +4175,7 @@ test('true concurrency explicit ack_handoff terminal response does not release a
       const calls = [];
 
       globalThis.fetch = async (input, init = {}) => {
-        const url = typeof input === 'string' ? input : input.url;
+        const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
         if (url === 'https://controller.example.test/api/v0/bootstrap') {
           return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -4034,7 +4241,7 @@ test('true concurrency explicit ack_handoff conflict fails closed and waits for 
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -4096,7 +4303,7 @@ test('true concurrency claim terminal replay with claim_handoff_timeout fails cl
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -4149,7 +4356,7 @@ test('true concurrency acquire terminal replay with claim_handoff_timeout fails 
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -4191,7 +4398,7 @@ test('true concurrency acquire terminal replay with heartbeat_timeout fails clos
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -4233,7 +4440,7 @@ test('true concurrency claim terminal replay with heartbeat_timeout fails closed
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -4317,7 +4524,7 @@ test('true concurrency claim failure releases acquired lease before origin fetch
       let releaseBody = null;
 
       globalThis.fetch = async (input, init = {}) => {
-        const url = typeof input === 'string' ? input : input.url;
+        const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
         if (url === 'https://controller.example.test/api/v0/bootstrap') {
           return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -4372,7 +4579,7 @@ test('true concurrency claim terminal response does not fetch origin', async () 
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -4418,7 +4625,7 @@ test('true concurrency claim conflict grant_unclaimed releases acquired lease be
   let releaseBody = null;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -4469,7 +4676,7 @@ test('true concurrency only fast hard expiry returns link expired without fairqu
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -4508,7 +4715,7 @@ test('true concurrency only fast hard expiry returns link expired without fairqu
       throw new Error('release should not run for direct expired terminal response');
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire' || url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait' || url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       throw new Error('fairqueue should not be involved for true-concurrency-only expiry');
     }
 
@@ -4535,7 +4742,7 @@ test('expired true concurrency link rejects before handler calls', async () => {
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
     calls.push(url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
@@ -4582,7 +4789,7 @@ test('dual mode treats CQ failure after fairqueue admission as unavailable and r
 
   Date.now = () => nowMs;
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -4601,10 +4808,10 @@ test('dual mode treats CQ failure after fairqueue admission as unavailable and r
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
       nowMs += 900;
-      return createJsonResponse({
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-expire-1',
         invocationEpoch: 1,
@@ -4649,7 +4856,7 @@ test('dual mode treats CQ failure after fairqueue admission as unavailable and r
     assert.match(body.message, /true concurrency unavailable/i);
     assert.equal(calls.includes('concurrency-acquire'), true);
     assert.equal(calls.includes('origin-fetch'), false);
-    assert.deepEqual(calls, ['fairqueue-acquire', 'concurrency-acquire', 'fairqueue-release', 'concurrency-cancel']);
+    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release', 'concurrency-cancel']);
     assert.equal(fairQueueReleaseBodies.length, 1);
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
   } finally {
@@ -4667,7 +4874,7 @@ test('dual mode client-aborted CQ acquire releases the fairqueue grant as unused
   const cancelBodies = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -4686,9 +4893,9 @@ test('dual mode client-aborted CQ acquire releases the fairqueue grant as unused
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-abort-1',
         invocationEpoch: 1,
@@ -4730,7 +4937,7 @@ test('dual mode client-aborted CQ acquire releases the fairqueue grant as unused
 
     assert.equal(response.status, 499);
     assert.equal(body.message, 'client aborted request');
-    assert.deepEqual(calls, ['fairqueue-acquire', 'concurrency-acquire', 'fairqueue-release', 'concurrency-cancel']);
+    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release', 'concurrency-cancel']);
     assert.equal(fairQueueReleaseBodies.length, 1);
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
     assert.equal(cancelBodies.length, 1);
@@ -4746,7 +4953,7 @@ test('non-positive payloadSign expiry is rejected before admission handlers run'
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     calls.push(url);
 
@@ -4793,7 +5000,7 @@ test('non-positive payloadSign expiry is rejected before admission handlers run'
     assert.match(body.message, /payloadsign expire invalid/i);
     assert.equal(calls.includes('https://cq.example.test/api/v1/concurrency/precheck'), false);
     assert.equal(calls.includes('https://cq.example.test/api/v1/concurrency/acquire'), false);
-    assert.equal(calls.includes('https://slot-handler.example.test/api/v1/fairqueue/acquire'), false);
+    assert.equal(calls.includes('https://slot-handler.example.test/api/v1/fairqueue/wait'), false);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -4806,7 +5013,7 @@ for (const idlePolicy of ['first_use', 'renewable']) {
     const calls = [];
 
     globalThis.fetch = async (input, init = {}) => {
-      const url = typeof input === 'string' ? input : input.url;
+      const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
       calls.push(url);
 
       if (url === 'https://controller.example.test/api/v0/bootstrap') {
@@ -4861,7 +5068,7 @@ test('unused first_use ticket with row idle_timeout_seconds 0 is denied immediat
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
     calls.push(url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
@@ -4916,7 +5123,7 @@ test('renewable ticket rejects after first use when idle_lease_expires_at is in 
   const nowSeconds = Math.floor(Date.now() / 1000);
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap());
@@ -4971,7 +5178,7 @@ test('renewable ticket rejects after first use when idle_lease_expires_at is abs
   const nowSeconds = Math.floor(Date.now() / 1000);
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap());
@@ -5026,7 +5233,7 @@ test('first_use ticket ignores idle_lease_expires_at after first use and still r
   const nowSeconds = Math.floor(Date.now() / 1000);
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap());
@@ -5082,7 +5289,7 @@ test('heartbeat hello forwards ticketHash alongside request and lease identity',
   );
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
@@ -5160,7 +5367,7 @@ test('heartbeat refresh forwards ticketHash alongside generation and lease ident
   );
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -5238,7 +5445,7 @@ test('disabled mode accepts signed payloads without ticketNonce and idle_timeout
   const originCalls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -5299,7 +5506,7 @@ test('disabled mode never resolves ticket state during admission', async () => {
   const originCalls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -5361,7 +5568,7 @@ test('used ticket skips idle denial and relies on hard expiry only', async () =>
   const firstUsedAt = Math.floor(Date.now() / 1000) - 1800;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap());
@@ -5427,7 +5634,7 @@ test('enabled mode accepts signed idle_timeout: 0 as present ticket-state data',
   const originCalls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap());
@@ -5485,7 +5692,7 @@ test('streamed 200 content without content-length still marks the ticket used be
   const originCalls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap());
@@ -5553,7 +5760,7 @@ for (const interstitialCase of [
     const originCalls = [];
 
     globalThis.fetch = async (input, init = {}) => {
-      const url = typeof input === 'string' ? input : input.url;
+      const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
       if (url === 'https://controller.example.test/api/v0/bootstrap') {
         return createJsonResponse(buildRuntimeBootstrap());
@@ -5623,7 +5830,7 @@ for (const syntheticTextAttachmentCase of [
     const originCalls = [];
 
     globalThis.fetch = async (input, init = {}) => {
-      const url = typeof input === 'string' ? input : input.url;
+      const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
       if (url === 'https://controller.example.test/api/v0/bootstrap') {
         return createJsonResponse(buildRuntimeBootstrap());
@@ -5705,7 +5912,7 @@ for (const textualPathCase of [
     const originCalls = [];
 
     globalThis.fetch = async (input, init = {}) => {
-      const url = typeof input === 'string' ? input : input.url;
+      const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
       if (url === 'https://controller.example.test/api/v0/bootstrap') {
         return createJsonResponse(buildRuntimeBootstrap());
@@ -5776,7 +5983,7 @@ for (const cryptedTextAttachmentCase of [
     const originCalls = [];
 
     globalThis.fetch = async (input, init = {}) => {
-      const url = typeof input === 'string' ? input : input.url;
+      const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
       if (url === 'https://controller.example.test/api/v0/bootstrap') {
         return createJsonResponse(buildRuntimeBootstrap());
@@ -5857,7 +6064,7 @@ for (const attachmentTextCase of [
     const originCalls = [];
 
     globalThis.fetch = async (input, init = {}) => {
-      const url = typeof input === 'string' ? input : input.url;
+      const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
       if (url === 'https://controller.example.test/api/v0/bootstrap') {
         return createJsonResponse(buildRuntimeBootstrap());
@@ -5960,7 +6167,7 @@ test('numeric-ish signed payload expireTime and idle_timeout fields are rejected
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
     calls.push(url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
@@ -6014,7 +6221,7 @@ test('missing ticket-state row is rejected as unauthorized protocol mismatch', a
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
     calls.push(url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
@@ -6088,7 +6295,7 @@ test('missing or malformed ticketNonce is rejected before ticket-state read', as
     const calls = [];
 
     globalThis.fetch = async (input, init = {}) => {
-      const url = typeof input === 'string' ? input : input.url;
+      const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
       calls.push(url);
 
       if (url === 'https://controller.example.test/api/v0/bootstrap') {
@@ -6137,7 +6344,7 @@ test('concurrent content responses treat already_used as success', async () => {
   let markResultCount = 0;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap());
@@ -6207,7 +6414,7 @@ test('content response fails when mark ticket used returns storage_error', async
   const originBody = createTrackedTextBody('should-not-be-released');
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap());
@@ -6262,7 +6469,7 @@ test('fairqueue-only same-target redirect retires old state and reacquires a new
   const originFetches = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -6280,9 +6487,9 @@ test('fairqueue-only same-target redirect retires old state and reacquires a new
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
       fairQueueAcquireBodies.push(JSON.parse(init.body));
-      return createJsonResponse({
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: `query-fq-${fairQueueAcquireBodies.length}`,
         invocationEpoch: fairQueueAcquireBodies.length,
@@ -6345,7 +6552,7 @@ test('fairqueue-only refresh target rotation retires old state and reacquires a 
   let linkRequestCount = 0;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -6368,9 +6575,9 @@ test('fairqueue-only refresh target rotation retires old state and reacquires a 
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
       fairQueueAcquireBodies.push(JSON.parse(init.body));
-      return createJsonResponse({
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: `query-refresh-fq-${fairQueueAcquireBodies.length}`,
         invocationEpoch: fairQueueAcquireBodies.length,
@@ -6429,7 +6636,7 @@ test('true concurrency acquire success followed by origin fetch failure releases
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -6453,9 +6660,9 @@ test('true concurrency acquire success followed by origin fetch failure releases
       return createJsonResponse({ result: 'allow' });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-1',
         invocationEpoch: 1,
@@ -6520,7 +6727,7 @@ test('dual mode attempts early fairqueue release after origin headers and falls 
   });
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -6544,9 +6751,9 @@ test('dual mode attempts early fairqueue release after origin headers and falls 
       return createJsonResponse({ result: 'allow' });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-1',
         invocationEpoch: 1,
@@ -6623,7 +6830,7 @@ test('true concurrency managed streaming releases after body completion and does
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -6698,7 +6905,7 @@ test('true concurrency managed streaming reconnects after heartbeat_ack timeout 
   let releaseBody = null;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -6821,7 +7028,7 @@ test('true concurrency managed streaming aborts after websocket close exhausts r
   let releaseBody = null;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -6966,7 +7173,7 @@ test('true concurrency heartbeat terminal reasons map duplicate-release suppress
       });
 
       globalThis.fetch = async (input, init = {}) => {
-        const url = typeof input === 'string' ? input : input.url;
+        const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
         if (url === 'https://controller.example.test/api/v0/bootstrap') {
           return createJsonResponse(buildRuntimeBootstrap({
@@ -7072,7 +7279,7 @@ test('true concurrency managed streaming releases upstream_failure after a mid-s
   const heartbeatSocket = createFakeHeartbeatSocket();
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -7174,7 +7381,7 @@ test('true concurrency managed streaming prefers IdentityTransformStream fallbac
   };
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -7249,7 +7456,7 @@ test('true concurrency managed streaming binds CQ cleanup to waitUntil for post-
   const heartbeatSocket = createFakeHeartbeatSocket();
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -7332,7 +7539,7 @@ test('true concurrency header-only response releases immediately', async () => {
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -7915,7 +8122,7 @@ test('true concurrency managed streaming releases on client abort', async () => 
   const heartbeatSocket = createFakeHeartbeatSocket();
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -7997,7 +8204,7 @@ test('true concurrency acquire abort returns 499 client abort response', async (
   });
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -8072,7 +8279,7 @@ test('true concurrency managed streaming releases when client is already aborted
   const calls = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -8181,7 +8388,7 @@ test('true concurrency managed streaming releases on hard-expiry cutoff', async 
   };
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -8288,7 +8495,7 @@ test('redirect to new target releases old lease and reruns target admission with
 
   crypto.randomUUID = () => `req-${requestIds.length + 1}`;
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -8312,9 +8519,9 @@ test('redirect to new target releases old lease and reruns target admission with
       return createJsonResponse({ result: 'allow' });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push(`fairqueue-acquire:${JSON.parse(init.body).hostname}`);
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push(`fairqueue-wait:${JSON.parse(init.body).hostname}`);
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-1',
         invocationEpoch: 1,
@@ -8401,7 +8608,7 @@ test('same-host redirect still rotates admission state and reacquires with a new
   };
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -8424,9 +8631,9 @@ test('same-host redirect still rotates admission state and reacquires with a new
       return createJsonResponse({ result: 'allow' });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
       fairQueueAcquireBodies.push(JSON.parse(init.body));
-      return createJsonResponse({
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: `query-${fairQueueAcquireBodies.length}`,
         invocationEpoch: fairQueueAcquireBodies.length,
@@ -8518,7 +8725,7 @@ test('relative redirect resolves to an absolute upstream target before target pr
   };
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -8541,8 +8748,8 @@ test('relative redirect resolves to an absolute upstream target before target pr
       return createJsonResponse({ result: 'allow' });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: `query-relative-${requestCounter}`,
         invocationEpoch: requestCounter,
@@ -8633,7 +8840,7 @@ test('same-origin worker redirect releases old admission state before recursion'
   };
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -8660,10 +8867,10 @@ test('same-origin worker redirect releases old admission state before recursion'
       return createJsonResponse({ result: 'allow' });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
       fairQueueAcquireCount += 1;
-      calls.push(`fairqueue-acquire:${fairQueueAcquireCount}`);
-      return createJsonResponse({
+      calls.push(`fairqueue-wait:${fairQueueAcquireCount}`);
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: `query-recursive-${fairQueueAcquireCount}`,
         invocationEpoch: fairQueueAcquireCount,
@@ -8741,13 +8948,15 @@ test('same-origin worker redirect releases old admission state before recursion'
   }
 });
 
-test('queue_only fast wait releases unused fairqueue grant before continue-wait and then releases CQ after origin fetch', async () => {
+test('queue_only fast wait releases unused fairqueue grant before CQ SSE wait and then releases CQ after origin fetch', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const fairQueueReleaseBodies = [];
+  let fairQueueWaitRequest = null;
+  let waitRequest = null;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -8766,33 +8975,41 @@ test('queue_only fast wait releases unused fairqueue grant before continue-wait 
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      fairQueueWaitRequest = JSON.parse(init.body);
+      return createFairQueueWaitSseResponse({
         result: 'granted',
         queryToken: 'query-wait-1',
         invocationEpoch: 1,
         slotToken: 'slot-wait-1',
+        releaseOwnerRequired: true,
+      }, {
+        acceptedDeadlineMs: fairQueueWaitRequest.deadlineMs,
       });
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      const body = JSON.parse(init.body);
-      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
-      if (!body.waitToken) {
-        return createJsonResponse({
-          result: 'wait',
-          waitToken: 'wait-token-1',
-          scope: 'host',
-          retryAfter: 1,
-        });
-      }
+      calls.push('concurrency-acquire-fast');
       return createJsonResponse({
+        result: 'wait',
+        waitToken: 'wait-token-1',
+        scope: 'host',
+        retryAfter: 1,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      calls.push('concurrency-wait-sse');
+      waitRequest = JSON.parse(init.body);
+      return createTrueConcurrencyWaitSseResponse({
         result: 'granted',
         leaseId: 'lease-wait-1',
         leaseToken: 'token-wait-1',
-        expiresAtMs: body.hardExpireAtMs,
+        expiresAtMs: waitRequest.hardExpireAtMs,
         claimToken: 'claim-token-wait-1',
+      }, {
+        acceptedDeadlineMs: waitRequest.deadlineMs,
       });
     }
 
@@ -8833,32 +9050,43 @@ test('queue_only fast wait releases unused fairqueue grant before continue-wait 
     await Promise.allSettled(waitUntilPromises);
 
     assert.deepEqual(calls, [
-      'fairqueue-acquire',
+      'fairqueue-wait',
       'concurrency-acquire-fast',
       'fairqueue-release',
-      'concurrency-acquire-continue',
+      'concurrency-wait-sse',
       'origin-fetch',
       'concurrency-release',
     ]);
+    assert.equal(fairQueueWaitRequest.queryToken, undefined);
+    assert.equal(fairQueueWaitRequest.invocationEpoch, undefined);
+    assert.equal(fairQueueWaitRequest.slotToken, undefined);
+    assert.equal(fairQueueWaitRequest.releaseOwnerRequired, undefined);
+    assert.equal(typeof fairQueueWaitRequest.requestId, 'string');
+    assert.equal(typeof fairQueueWaitRequest.deadlineMs, 'number');
+    assert.equal(fairQueueWaitRequest.admissionMode, 'queue_only');
     assert.equal(fairQueueReleaseBodies.length, 1);
+    assert.equal(fairQueueReleaseBodies[0].releaseOwnerRequired, true);
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
+    assert.equal(waitRequest?.waitToken, 'wait-token-1');
+    assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('queue_only replays acquire after continue-wait timeout abort and recovers the active lease', async () => {
+test('true concurrency wait grant claims, acknowledges handoff, starts heartbeat, and fetches origin in order', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
-  const continueBodies = [];
+  let waitRequest = null;
+  let heartbeatHeaders = null;
+  const heartbeatSocket = createFakeHeartbeatSocket();
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
-        fairQueueHostPatterns: ['*.sharepoint.com'],
         trueConcurrencyHostPatterns: ['*.sharepoint.com'],
       }));
     }
@@ -8873,56 +9101,54 @@ test('queue_only replays acquire after continue-wait timeout abort and recovers 
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
-        result: 'granted',
-        queryToken: 'query-replay-1',
-        invocationEpoch: 1,
-        slotToken: 'slot-replay-1',
-      });
-    }
-
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      const body = JSON.parse(init.body);
-      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
-      if (!body.waitToken) {
-        return createJsonResponse({
-          result: 'wait',
-          waitToken: 'wait-replay-1',
-          scope: 'host',
-          retryAfter: 1,
-        });
-      }
-      continueBodies.push(body);
-      if (continueBodies.length === 1) {
-        const error = new Error('The operation was aborted.');
-        error.name = 'AbortError';
-        throw error;
-      }
+      calls.push('concurrency-acquire-fast');
       return createJsonResponse({
-        result: 'granted',
-        leaseId: 'lease-replay-1',
-        leaseToken: 'token-replay-1',
-        expiresAtMs: body.hardExpireAtMs,
-        claimToken: 'claim-token-replay-1',
+        result: 'wait',
+        waitToken: 'wait-token-1',
+        scope: 'host',
+        retryAfter: 1,
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
-      calls.push('fairqueue-release');
-      return createJsonResponse({ result: 'ok' });
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      calls.push('concurrency-wait-sse');
+      waitRequest = JSON.parse(init.body);
+      return createTrueConcurrencyWaitSseResponse({
+        result: 'granted',
+        leaseId: 'lease-wait-1',
+        leaseToken: 'token-wait-1',
+        expiresAtMs: waitRequest.hardExpireAtMs,
+        claimToken: 'claim-token-wait-1',
+      }, {
+        acceptedDeadlineMs: waitRequest.deadlineMs,
+      });
     }
 
     if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
       calls.push('origin-fetch');
-      return new Response('replay-ok', {
+      return new Response('wait-ok', {
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
       });
     }
     if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
       return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      calls.push('concurrency-ack-handoff');
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      calls.push('heartbeat-upgrade');
+      heartbeatHeaders = init.headers;
+      return {
+        status: 101,
+        webSocket: heartbeatSocket,
+      };
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/release') {
@@ -8930,148 +9156,81 @@ test('queue_only replays acquire after continue-wait timeout abort and recovers 
       return createJsonResponse({ result: 'released' });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      throw new Error('cancel should not run after timeout abort replay recovery');
-    }
-
     throw new Error(`Unexpected fetch URL in test: ${url}`);
   };
 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    assert.equal(await response.text(), 'replay-ok');
+    assert.equal(await response.text(), 'wait-ok');
     await Promise.allSettled(waitUntilPromises);
 
     assert.deepEqual(calls, [
-      'fairqueue-acquire',
       'concurrency-acquire-fast',
-      'fairqueue-release',
-      'concurrency-acquire-continue',
-      'concurrency-acquire-continue',
+      'concurrency-wait-sse',
+      'concurrency-claim',
+      'concurrency-ack-handoff',
+      'heartbeat-upgrade',
       'origin-fetch',
       'concurrency-release',
     ]);
-    assert.equal(continueBodies.length, 2);
-    assert.equal(continueBodies[0].waitToken, 'wait-replay-1');
-    assert.equal(continueBodies[1].waitToken, 'wait-replay-1');
-    assert.equal(continueBodies[0].requestId, continueBodies[1].requestId);
+    assert.equal(waitRequest?.waitToken, 'wait-token-1');
+    assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true);
+    assert.equal(heartbeatHeaders?.Upgrade, 'websocket');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('CQ wait attempt budget counts timeout-replayed continue-wait acquires against the cap', async () => {
+test('CQ SSE wait elapsed budget exhaustion cancels accepted CQ request and returns the existing unavailable surface', async () => {
   const originalFetch = globalThis.fetch;
+  const originalDateNow = Date.now;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
   const calls = [];
   const cancelBodies = [];
-  const continueBodies = [];
+  let waitAccepted = false;
+  let waitRequest = null;
+  let waitStreamCancelled = false;
+  const fixedNowMs = 1_000;
 
-  globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
-
-    if (url === 'https://controller.example.test/api/v0/bootstrap') {
-      const bootstrap = buildRuntimeBootstrap({
-        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+  Date.now = () => fixedNowMs;
+  globalThis.setTimeout = (callback, delay = 0, ...args) => {
+    const handle = { cleared: false, delay };
+    if (delay === 25) {
+      queueMicrotask(() => {
+        if (!handle.cleared) {
+          callback(...args);
+        }
       });
-      bootstrap.download.trueConcurrency.waitTotalMaxMs = 20000;
-      bootstrap.download.trueConcurrency.waitMaxAttemptsCap = 3;
-      return createJsonResponse(bootstrap);
+      return handle;
     }
-
-    if (url === 'https://alist.example.com/api/fs/link') {
-      return createJsonResponse({
-        code: 200,
-        data: {
-          url: 'https://tenant.sharepoint.com/sites/demo/file',
-          header: {},
-        },
-      });
-    }
-
-    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      const body = JSON.parse(init.body);
-      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
-      if (!body.waitToken) {
-        return createJsonResponse({
-          result: 'wait',
-          waitToken: 'wait-replay-budget-1',
-          scope: 'host',
-          retryAfter: 1,
-        });
+    const realHandle = originalSetTimeout(callback, delay, ...args);
+    return {
+      cleared: false,
+      realHandle,
+    };
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (handle && typeof handle === 'object') {
+      handle.cleared = true;
+      if ('realHandle' in handle) {
+        return originalClearTimeout(handle.realHandle);
       }
-
-      continueBodies.push(body);
-      if (continueBodies.length === 1) {
-        const abortError = new Error('The operation was aborted.');
-        abortError.name = 'AbortError';
-        throw abortError;
-      }
-
-      if (continueBodies.length === 2) {
-        return createJsonResponse({
-          result: 'wait',
-          waitToken: 'wait-replay-budget-1',
-          scope: 'host',
-          retryAfter: 1,
-        });
-      }
-
-      throw new Error('worker must not issue a fourth CQ acquire attempt after timeout replay reaches the cap');
+      return undefined;
     }
-
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      cancelBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
-    if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
-      throw new Error('origin fetch should not run after replayed wait attempt cap exhaustion');
-    }
-
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
+    return originalClearTimeout(handle);
   };
 
-  try {
-    const { ctx, waitUntilPromises } = createTestContext();
-    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
-    await Promise.allSettled(waitUntilPromises);
-
-    assert.equal(response.status, 503);
-    assert.match(body.message, /wait budget exhausted/i);
-    assert.deepEqual(calls, [
-      'concurrency-acquire-fast',
-      'concurrency-acquire-continue',
-      'concurrency-acquire-continue',
-      'concurrency-cancel',
-    ]);
-    assert.equal(continueBodies.length, 2);
-    assert.equal(cancelBodies.length, 1);
-    assert.equal(cancelBodies[0].reason, 'worker_aborted');
-  } finally {
-    globalThis.fetch = originalFetch;
-    delete globalThis.bootstrapCache;
-  }
-});
-
-test('CQ wait elapsed budget exhaustion cancels CQ request and returns the existing unavailable surface', async () => {
-  const originalFetch = globalThis.fetch;
-  const calls = [];
-  const cancelBodies = [];
-
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       const bootstrap = buildRuntimeBootstrap({
         trueConcurrencyHostPatterns: ['*.sharepoint.com'],
       });
       bootstrap.download.trueConcurrency.waitTotalMaxMs = 25;
-      bootstrap.download.trueConcurrency.waitMaxAttemptsCap = 35;
       return createJsonResponse(bootstrap);
     }
 
@@ -9086,27 +9245,32 @@ test('CQ wait elapsed budget exhaustion cancels CQ request and returns the exist
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      const body = JSON.parse(init.body);
-      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
-      if (!body.waitToken) {
-        return createJsonResponse({
-          result: 'wait',
-          waitToken: 'wait-budget-elapsed-1',
-          scope: 'host',
-          retryAfter: 1,
-        });
-      }
-      await new Promise((resolve, reject) => {
-        const abortError = new Error('The operation was aborted.');
-        abortError.name = 'AbortError';
-        init.signal?.addEventListener('abort', () => reject(abortError), { once: true });
-        setTimeout(() => resolve(), 1000);
+      calls.push('concurrency-acquire-fast');
+      return createJsonResponse({
+        result: 'wait',
+        waitToken: 'wait-budget-elapsed-1',
+        scope: 'host',
+        retryAfter: 1,
       });
-      throw new Error('continue-wait acquire should abort before resolving');
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      calls.push('concurrency-wait-sse');
+      waitRequest = JSON.parse(init.body);
+      return createPendingTrueConcurrencyWaitSseResponse({
+        acceptedDeadlineMs: waitRequest.deadlineMs,
+        onAccepted() {
+          waitAccepted = true;
+        },
+        onCancel() {
+          waitStreamCancelled = true;
+        },
+      });
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
       calls.push('concurrency-cancel');
+      assert.equal(waitAccepted, true);
       cancelBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'cancelled' });
     }
@@ -9126,34 +9290,37 @@ test('CQ wait elapsed budget exhaustion cancels CQ request and returns the exist
 
     assert.equal(response.status, 503);
     assert.match(body.message, /wait budget exhausted/i);
-    assert.deepEqual(calls, [
-      'concurrency-acquire-fast',
-      'concurrency-acquire-continue',
-      'concurrency-cancel',
-    ]);
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse', 'concurrency-cancel']);
+    assert.equal(waitRequest?.waitToken, 'wait-budget-elapsed-1');
+    assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true);
+    assert.equal(waitStreamCancelled, true);
     assert.equal(cancelBodies.length, 1);
     assert.equal(cancelBodies[0].reason, 'worker_aborted');
   } finally {
     globalThis.fetch = originalFetch;
+    Date.now = originalDateNow;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('CQ wait attempt budget exhaustion hard-fails before a third acquire call', async () => {
+test('client-aborted CQ SSE wait cancels the accepted request before origin fetch', async () => {
   const originalFetch = globalThis.fetch;
+  const abortController = new AbortController();
   const calls = [];
   const cancelBodies = [];
+  let waitAccepted = false;
+  let waitRequest = null;
+  let waitStreamCancelled = false;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
-      const bootstrap = buildRuntimeBootstrap({
+      return createJsonResponse(buildRuntimeBootstrap({
         trueConcurrencyHostPatterns: ['*.sharepoint.com'],
-      });
-      bootstrap.download.trueConcurrency.waitTotalMaxMs = 20000;
-      bootstrap.download.trueConcurrency.waitMaxAttemptsCap = 2;
-      return createJsonResponse(bootstrap);
+      }));
     }
 
     if (url === 'https://alist.example.com/api/fs/link') {
@@ -9167,24 +9334,39 @@ test('CQ wait attempt budget exhaustion hard-fails before a third acquire call',
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      const body = JSON.parse(init.body);
-      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
+      calls.push('concurrency-acquire-fast');
       return createJsonResponse({
         result: 'wait',
-        waitToken: 'wait-budget-attempt-1',
+        waitToken: 'wait-client-abort-1',
         scope: 'host',
         retryAfter: 1,
       });
     }
 
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      calls.push('concurrency-wait-sse');
+      waitRequest = JSON.parse(init.body);
+      return createPendingTrueConcurrencyWaitSseResponse({
+        acceptedDeadlineMs: waitRequest.deadlineMs,
+        onAccepted() {
+          waitAccepted = true;
+          setTimeout(() => abortController.abort(), 0);
+        },
+        onCancel() {
+          waitStreamCancelled = true;
+        },
+      });
+    }
+
     if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
       calls.push('concurrency-cancel');
+      assert.equal(waitAccepted, true);
       cancelBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'cancelled' });
     }
 
     if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
-      throw new Error('origin fetch should not run after wait attempt budget exhaustion');
+      throw new Error('origin fetch should not run after client-aborted CQ SSE wait');
     }
 
     throw new Error(`Unexpected fetch URL in test: ${url}`);
@@ -9192,14 +9374,16 @@ test('CQ wait attempt budget exhaustion hard-fails before a third acquire call',
 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
-    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const request = await buildSignedWorkerRequest({ signal: abortController.signal });
+    const response = await worker.fetch(request, buildWorkerEnv(), ctx);
     const body = await readJson(response);
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
-    assert.equal(calls.filter((call) => call === 'concurrency-acquire-continue').length, 1);
-    assert.equal(calls.includes('concurrency-cancel'), true);
-    assert.match(body.message, /wait budget exhausted/i);
+    assert.equal(response.status, 499);
+    assert.equal(body.message, 'client aborted request');
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse', 'concurrency-cancel']);
+    assert.equal(waitRequest?.waitToken, 'wait-client-abort-1');
+    assert.equal(waitStreamCancelled, true);
     assert.equal(cancelBodies.length, 1);
     assert.equal(cancelBodies[0].reason, 'worker_aborted');
   } finally {
@@ -9214,7 +9398,7 @@ test('queue_only aborts CQ wait and cancels request when unused fairqueue releas
   const cancelBodies = [];
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -9233,9 +9417,9 @@ test('queue_only aborts CQ wait and cancels request when unused fairqueue releas
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-release-fail-1',
         invocationEpoch: 1,
@@ -9244,17 +9428,18 @@ test('queue_only aborts CQ wait and cancels request when unused fairqueue releas
     }
 
     if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      const body = JSON.parse(init.body);
-      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
-      if (!body.waitToken) {
-        return createJsonResponse({
-          result: 'wait',
-          waitToken: 'wait-release-fail-1',
-          scope: 'host',
-          retryAfter: 1,
-        });
-      }
-      throw new Error('worker must not continue waiting after failed fairqueue release');
+      calls.push('concurrency-acquire-fast');
+      return createJsonResponse({
+        result: 'wait',
+        waitToken: 'wait-release-fail-1',
+        scope: 'host',
+        retryAfter: 1,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      calls.push('concurrency-wait-sse');
+      throw new Error('worker must not open CQ SSE wait after failed fairqueue release');
     }
 
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
@@ -9284,11 +9469,11 @@ test('queue_only aborts CQ wait and cancels request when unused fairqueue releas
     assert.equal(response.status, 503);
     assert.match(body.message, /fair queue/i);
     assert.deepEqual(calls.slice(0, 3), [
-      'fairqueue-acquire',
+      'fairqueue-wait',
       'concurrency-acquire-fast',
       'fairqueue-release',
     ]);
-    assert.equal(calls.includes('concurrency-acquire-continue'), false);
+    assert.equal(calls.includes('concurrency-wait-sse'), false);
     assert.equal(calls.includes('origin-fetch'), false);
     assert.equal(calls.filter((call) => call === 'concurrency-cancel').length, 1);
     assert.equal(cancelBodies.length, 1);
@@ -9299,104 +9484,105 @@ test('queue_only aborts CQ wait and cancels request when unused fairqueue releas
   }
 });
 
-test('queue_only wait hard expiry cancels CQ request after unused fairqueue release and returns link expired', async () => {
+test('true concurrency wait terminal SSE results map to existing terminal surfaces without cancel cleanup', async () => {
   const originalFetch = globalThis.fetch;
-  const calls = [];
-  const fairQueueReleaseBodies = [];
-  const cancelBodies = [];
-
-  globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
-
-    if (url === 'https://controller.example.test/api/v0/bootstrap') {
-      return createJsonResponse(buildRuntimeBootstrap({
-        fairQueueHostPatterns: ['*.sharepoint.com'],
-        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
-      }));
-    }
-
-    if (url === 'https://alist.example.com/api/fs/link') {
-      return createJsonResponse({
-        code: 200,
-        data: {
-          url: 'https://tenant.sharepoint.com/sites/demo/file',
-          header: {},
-        },
-      });
-    }
-
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
-        result: 'granted',
-        queryToken: 'query-terminal-1',
-        invocationEpoch: 1,
-        slotToken: 'slot-terminal-1',
-      });
-    }
-
-    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
-      const body = JSON.parse(init.body);
-      calls.push(body.waitToken ? 'concurrency-acquire-continue' : 'concurrency-acquire-fast');
-      if (!body.waitToken) {
-        return createJsonResponse({
-          result: 'wait',
-          waitToken: 'wait-token-terminal',
-          scope: 'host',
-          retryAfter: 1,
-        });
-      }
-      return createJsonResponse({
-        result: 'expired',
-        reason: 'hard_expired',
-      }, { status: 410 });
-    }
-
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
-      calls.push('fairqueue-release');
-      fairQueueReleaseBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'ok' });
-    }
-
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      cancelBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'cancelled' });
-    }
-    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
-      return createClaimGrantResponseFromRequest(init);
-    }
-
-    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
-      calls.push('concurrency-release');
-      throw new Error('release should not run for waiting-only terminal cleanup');
-    }
-
-    if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
-      throw new Error('origin fetch should not run after wait terminal');
-    }
-
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
-  };
-
   try {
-    const { ctx, waitUntilPromises } = createTestContext();
-    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
-    await Promise.allSettled(waitUntilPromises);
+    for (const scenario of [
+      {
+        name: 'expired',
+        finalPayload: { result: 'expired', reason: 'hard_expired' },
+        expectedStatus: 401,
+        expectedMessage: 'link expired',
+      },
+      {
+        name: 'cancelled',
+        finalPayload: { result: 'cancelled', reason: 'request_cancelled' },
+        expectedStatus: 503,
+        expectedMessagePattern: /true concurrency cancelled/i,
+      },
+      {
+        name: 'released',
+        finalPayload: { result: 'released', reason: 'already_released' },
+        expectedStatus: 503,
+        expectedMessagePattern: /true concurrency released/i,
+      },
+      {
+        name: 'conflict',
+        finalPayload: { result: 'conflict', reason: 'stale_wait_token' },
+        expectedStatus: 503,
+        expectedMessagePattern: /true concurrency conflict/i,
+      },
+    ]) {
+      const calls = [];
+      const cancelBodies = [];
+      let waitRequest = null;
 
-    assert.equal(response.status, 401);
-    assert.equal(body.message, 'link expired');
-    assert.deepEqual(calls, [
-      'fairqueue-acquire',
-      'concurrency-acquire-fast',
-      'fairqueue-release',
-      'concurrency-acquire-continue',
-      'concurrency-cancel',
-    ]);
-    assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
-    assert.equal(cancelBodies.length, 1);
-    assert.equal(cancelBodies[0].reason, 'worker_aborted');
+      globalThis.fetch = async (input, init = {}) => {
+        const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+        if (url === 'https://controller.example.test/api/v0/bootstrap') {
+          return createJsonResponse(buildRuntimeBootstrap({
+            trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+          }));
+        }
+
+        if (url === 'https://alist.example.com/api/fs/link') {
+          return createJsonResponse({
+            code: 200,
+            data: {
+              url: 'https://tenant.sharepoint.com/sites/demo/file',
+              header: {},
+            },
+          });
+        }
+
+        if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+          calls.push('concurrency-acquire-fast');
+          return createJsonResponse({
+            result: 'wait',
+            waitToken: 'wait-token-terminal',
+            scope: 'host',
+            retryAfter: 1,
+          });
+        }
+
+        if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+          calls.push('concurrency-wait-sse');
+          waitRequest = JSON.parse(init.body);
+          return createTrueConcurrencyWaitSseResponse(scenario.finalPayload, {
+            acceptedDeadlineMs: waitRequest.deadlineMs,
+          });
+        }
+
+        if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
+          calls.push('concurrency-cancel');
+          cancelBodies.push(JSON.parse(init.body));
+          return createJsonResponse({ result: 'cancelled' });
+        }
+
+        if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
+          throw new Error(`origin fetch should not run after ${scenario.name} CQ wait result`);
+        }
+
+        throw new Error(`Unexpected fetch URL in test: ${url}`);
+      };
+
+      const { ctx, waitUntilPromises } = createTestContext();
+      const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+      const body = await readJson(response);
+      await Promise.allSettled(waitUntilPromises);
+
+      assert.equal(response.status, scenario.expectedStatus, scenario.name);
+      if (scenario.expectedMessage) {
+        assert.equal(body.message, scenario.expectedMessage, scenario.name);
+      } else {
+        assert.match(body.message, scenario.expectedMessagePattern, scenario.name);
+      }
+      assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse'], scenario.name);
+      assert.equal(waitRequest?.waitToken, 'wait-token-terminal', scenario.name);
+      assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true, scenario.name);
+      assert.equal(cancelBodies.length, 0, scenario.name);
+    }
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -9755,9 +9941,9 @@ test('Google Drive HEAD probe failure waits for in-flight fairqueue header relea
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-invalid-head',
         invocationEpoch: 1,
@@ -9836,6 +10022,7 @@ test('Google Drive HEAD probe failure waits for in-flight fairqueue header relea
     assert.equal(releaseBodies.length, 1);
     assert.equal(releaseBodies[0].slotToken, 'slot-invalid-head');
     assert.equal(concurrencyReleaseBody?.reason, 'origin_fetch_failure');
+    assert.equal(calls.includes('fairqueue-wait'), true);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -10424,9 +10611,9 @@ test('Google Drive full-range mismatch waits for in-flight fairqueue header rele
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/acquire') {
-      calls.push('fairqueue-acquire');
-      return createJsonResponse({
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
         result: 'granted',
         queryToken: 'query-range-mismatch',
         invocationEpoch: 1,
@@ -10505,6 +10692,7 @@ test('Google Drive full-range mismatch waits for in-flight fairqueue header rele
     assert.equal(releaseBodies.length, 1);
     assert.equal(releaseBodies[0].slotToken, 'slot-range-mismatch');
     assert.equal(concurrencyReleaseBody?.reason, 'origin_fetch_failure');
+    assert.equal(calls.includes('fairqueue-wait'), true);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -11026,7 +11214,7 @@ test('mode-only siteBucket payload keeps SharePoint site buckets aligned across 
   assert.equal(result.bodyText, 'ok');
   assert.equal(result.fairQueueAcquireBody?.siteBucket, expectedSiteBucket);
   assert.equal(result.concurrencyAcquireBody?.siteBucket, expectedSiteBucket);
-  assert.deepEqual(result.calls.slice(0, 3), ['fairqueue-acquire', 'concurrency-acquire', 'origin-fetch']);
+  assert.deepEqual(result.calls.slice(0, 3), ['fairqueue-wait', 'concurrency-acquire', 'origin-fetch']);
 });
 
 test('modes-only siteBucket payload derives one stable Google Drive site bucket across Google host families', async () => {
@@ -11179,7 +11367,7 @@ test('breaker authority uses actual Google Drive hostnames', async () => {
   let linkCallCount = 0;
 
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
       return createJsonResponse(buildRuntimeBootstrap({
@@ -11347,8 +11535,6 @@ test('recognized Google host overload stays scoped to actual host authority', as
     slotHandlerConfig: {
       url: 'https://slot-handler.example.test',
       totalMaxWaitMs: 300,
-      perRequestTimeoutMs: 8000,
-      maxAttemptsCap: 8,
       authKey: '',
     },
   });
@@ -11377,7 +11563,7 @@ test('recognized Google host overload stays scoped to actual host authority', as
         reason: 'overload_host',
       });
     }
-    return createJsonResponse({
+    return createFairQueueWaitResponseFromInit({ body: JSON.stringify({ deadlineMs: Date.now() + 1_000 }) }, {
       result: 'granted',
       queryToken: 'google-overload-grant',
       invocationEpoch: 1,
@@ -11387,7 +11573,12 @@ test('recognized Google host overload stays scoped to actual host authority', as
 
   try {
     const first = await client.waitForSlot({}, driveContext);
-    assert.equal(first.kind, 'timeout');
+    assert.deepEqual(first, {
+      kind: 'overloaded',
+      scope: 'host',
+      reason: 'overload_host',
+      retryAfter: 60,
+    });
 
     const second = await client.waitForSlot({}, googleApisContext);
     assert.equal(second.kind, 'granted');

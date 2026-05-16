@@ -110,7 +110,10 @@ func TestPostgresAcquireCallsConfiguredRPCAndNormalizesGrantedResult(t *testing.
 	if len(client.queries) != 1 {
 		t.Fatalf("expected one query, got %d", len(client.queries))
 	}
-	if got := client.queries[0].args[12]; got != 4 {
+	if len(client.queries[0].args) != 11 {
+		t.Fatalf("expected 11 fast acquire args, got %d", len(client.queries[0].args))
+	}
+	if got := client.queries[0].args[9]; got != 4 {
 		t.Fatalf("expected site_ip cap argument 4, got %v", got)
 	}
 }
@@ -427,32 +430,52 @@ func TestPostgresAcquireNormalizesWaitResult(t *testing.T) {
 	}
 }
 
-func TestPostgresAcquireIncludesWaitTokenWhenProvided(t *testing.T) {
+func TestPostgresProbeWaitStateIncludesWaitTokenAndDeadline(t *testing.T) {
 	req := validAcquireRequest()
 	req.WaitToken = "wait-1"
+	req.DeadlineMs = 9000
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		if len(args) != 14 {
-			t.Fatalf("expected 14 acquire args, got %d", len(args))
+		if !strings.Contains(query, "cq_wait_state_probe") {
+			t.Fatalf("expected wait-state probe rpc query, got %s", query)
 		}
-		if got := args[7]; got != "wait-1" {
+		if len(args) != 9 {
+			t.Fatalf("expected 9 wait-state probe args, got %d", len(args))
+		}
+		if got := args[6]; got != int64(9000) {
+			t.Fatalf("expected deadline argument 9000, got %v", got)
+		}
+		if got := args[8]; got != "wait-1" {
 			t.Fatalf("expected wait token argument wait-1, got %v", got)
-		}
-		if got := args[8]; got != 10000 {
-			t.Fatalf("expected wait poll window argument 10000, got %v", got)
-		}
-		if got := args[9]; got != 1500 {
-			t.Fatalf("expected wait reconnect grace argument 1500, got %v", got)
 		}
 		return &stubRows{rows: [][]any{{`{"result":"wait","wait_token":"wait-1","scope":"host","retry_after":1}`}}}, nil
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
-	result, err := backend.Acquire(context.Background(), req)
+	result, err := backend.ProbeWaitState(context.Background(), req)
 	if err != nil {
-		t.Fatalf("Acquire error: %v", err)
+		t.Fatalf("ProbeWaitState error: %v", err)
 	}
 	if result.WaitToken != "wait-1" {
 		t.Fatalf("expected wait token replay result, got %+v", result)
+	}
+}
+
+func TestPostgresProbeWaitStateDefaultsDeadlineToHardExpiry(t *testing.T) {
+	req := validAcquireRequest()
+	req.WaitToken = "wait-1"
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if len(args) != 9 {
+			t.Fatalf("expected 9 wait-state probe args, got %d", len(args))
+		}
+		if got := args[6]; got != int64(5000) {
+			t.Fatalf("expected deadline fallback to hard expiry 5000, got %v", got)
+		}
+		return &stubRows{rows: [][]any{{`{"result":"wait","wait_token":"wait-1","scope":"host","retry_after":1}`}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	if _, err := backend.ProbeWaitState(context.Background(), req); err != nil {
+		t.Fatalf("ProbeWaitState error: %v", err)
 	}
 }
 

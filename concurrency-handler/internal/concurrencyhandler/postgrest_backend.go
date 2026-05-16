@@ -132,22 +132,17 @@ func (b *postgrestBackend) Acquire(ctx context.Context, req AcquireRequest) (*Ac
 		ClaimToken  *string `json:"claim_token"`
 	}{}
 	payload := map[string]any{
-		"p_hostname_hash":           req.HostnameHash,
-		"p_hostname":                req.Hostname,
-		"p_site_bucket":             canonicalBucket(req.SiteBucket),
-		"p_ip_bucket":               canonicalBucket(req.IPBucket),
-		"p_request_id":              req.RequestID,
-		"p_hard_expire_at_ms":       req.HardExpireAtMs,
-		"p_now_ms":                  req.NowMs,
-		"p_wait_poll_window_ms":     b.cfg.Concurrency.Wait.WaitPollWindowMs,
-		"p_wait_reconnect_grace_ms": b.cfg.Concurrency.Wait.WaitReconnectGraceMs,
-		"p_host_max_in_flight":      b.cfg.Concurrency.Caps.HostMaxInFlight,
-		"p_site_max_in_flight":      b.cfg.Concurrency.Caps.SiteMaxInFlight,
-		"p_site_ip_max_in_flight":   b.cfg.Concurrency.Caps.SiteIPMaxInFlight,
-		"p_cleanup_limit":           boundedExpireLimit(b.cfg.Concurrency.Sweep.BatchSize, 500),
-	}
-	if strings.TrimSpace(req.WaitToken) != "" {
-		payload["p_wait_token"] = req.WaitToken
+		"p_hostname_hash":         req.HostnameHash,
+		"p_hostname":              req.Hostname,
+		"p_site_bucket":           canonicalBucket(req.SiteBucket),
+		"p_ip_bucket":             canonicalBucket(req.IPBucket),
+		"p_request_id":            req.RequestID,
+		"p_hard_expire_at_ms":     req.HardExpireAtMs,
+		"p_now_ms":                req.NowMs,
+		"p_host_max_in_flight":    b.cfg.Concurrency.Caps.HostMaxInFlight,
+		"p_site_max_in_flight":    b.cfg.Concurrency.Caps.SiteMaxInFlight,
+		"p_site_ip_max_in_flight": b.cfg.Concurrency.Caps.SiteIPMaxInFlight,
+		"p_cleanup_limit":         boundedExpireLimit(b.cfg.Concurrency.Sweep.BatchSize, 500),
 	}
 	err := b.doRPC(ctx, b.cfg.Concurrency.RPC.AcquireFunc, payload, result)
 	if err != nil {
@@ -170,7 +165,7 @@ func (b *postgrestBackend) Acquire(ctx context.Context, req AcquireRequest) (*Ac
 	return serviceResult, nil
 }
 
-func (b *postgrestBackend) ProbeContinueWait(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
+func (b *postgrestBackend) ProbeWaitState(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
 	result := &struct {
 		Result      string  `json:"result"`
 		LeaseID     *string `json:"lease_id"`
@@ -182,6 +177,7 @@ func (b *postgrestBackend) ProbeContinueWait(ctx context.Context, req AcquireReq
 		RetryAfter  *int    `json:"retry_after"`
 		ClaimToken  *string `json:"claim_token"`
 	}{}
+	deadlineMs := waitStateProbeDeadlineMs(req)
 	err := b.doRPC(ctx, fixedContinueWaitProbeFunc, map[string]any{
 		"p_hostname_hash":     req.HostnameHash,
 		"p_hostname":          req.Hostname,
@@ -189,6 +185,7 @@ func (b *postgrestBackend) ProbeContinueWait(ctx context.Context, req AcquireReq
 		"p_ip_bucket":         canonicalBucket(req.IPBucket),
 		"p_request_id":        req.RequestID,
 		"p_hard_expire_at_ms": req.HardExpireAtMs,
+		"p_deadline_ms":       deadlineMs,
 		"p_now_ms":            req.NowMs,
 		"p_wait_token":        strings.TrimSpace(req.WaitToken),
 	}, result)

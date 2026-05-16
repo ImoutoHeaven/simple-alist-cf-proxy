@@ -76,8 +76,8 @@ type ConcurrencyLeaseConfig struct {
 }
 
 type ConcurrencyWaitConfig struct {
-	WaitPollWindowMs     int `json:"waitPollWindowMs"`
-	WaitReconnectGraceMs int `json:"waitReconnectGraceMs"`
+	MaxStreamMs int `json:"maxStreamMs"`
+	KeepaliveMs int `json:"keepaliveMs"`
 }
 
 type ConcurrencySweepConfig struct {
@@ -232,11 +232,11 @@ func (c *Config) Validate() error {
 	if !c.Concurrency.Lease.RequireHardExpiry {
 		return errors.New("concurrency.lease.requireHardExpiry must be true in v1")
 	}
-	if c.Concurrency.Wait.WaitPollWindowMs <= 0 {
-		return errors.New("concurrency.wait.waitPollWindowMs is required")
+	if c.Concurrency.Wait.MaxStreamMs <= 0 {
+		return errors.New("concurrency.wait.maxStreamMs is required")
 	}
-	if c.Concurrency.Wait.WaitReconnectGraceMs <= 0 {
-		return errors.New("concurrency.wait.waitReconnectGraceMs is required")
+	if c.Concurrency.Wait.KeepaliveMs <= 0 {
+		return errors.New("concurrency.wait.keepaliveMs is required")
 	}
 	if c.Concurrency.Sweep.IntervalSeconds <= 0 {
 		return errors.New("concurrency.sweep.intervalSeconds is required")

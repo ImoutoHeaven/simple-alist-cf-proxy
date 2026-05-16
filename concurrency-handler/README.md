@@ -6,7 +6,8 @@
 
 It is responsible only for:
 
-- wait-token aware `acquire`
+- fast `acquire`
+- SSE `wait`
 - grant-binding `claim`
 - active-lease handoff acknowledgement via `ack_handoff`
 - authenticated heartbeat WebSocket lifecycle
@@ -14,11 +15,19 @@ It is responsible only for:
 - request-level `cancel`
 - bounded expiry cleanup through `ExpireScope`
 
-It does not do fairqueue scheduling, but it does own server-side waiting semantics for true-concurrency admission: fast acquire may return `wait`, the worker reconnects with a stable `waitToken`, and CQ later replays `granted` or terminal outcomes from the request ledger.
+It does not do fairqueue scheduling, but it does own server-side waiting semantics for true-concurrency admission: fast `acquire` may return `wait`, and the worker then opens `POST /api/v1/concurrency/wait` as one SSE stream that yields exactly one `accepted` event and one final `result` event.
 
-Production deployments require sticky routing for `waitToken` continuation. All HTTP endpoints require auth; `auth.enabled` must be `true` and `auth.token` must be set.
+Production deployments require sticky routing for accepted wait streams. All HTTP endpoints require auth; `auth.enabled` must be `true` and `auth.token` must be set.
 
 Process startup and concurrency business readiness are separate. The process may start while Postgres or PostgREST is still unreachable. Until startup probe and recovery complete, `acquire`, `claim`, `ack_handoff`, `heartbeat`, `release`, and `cancel` return `503 Service Unavailable`.
+
+## Admission Wait Protocol
+
+- Wait endpoints across the download stack: `POST /api/v1/fairqueue/wait` and `POST /api/v1/concurrency/wait`
+- Both wait requests use `Accept: text/event-stream`, both handlers reply with `Content-Type: text/event-stream`, and each accepted stream emits one `accepted` event plus one final `result` event.
+- CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP
+- FQ: wait SSE -> accepted -> one final result -> release or abandon HTTP cleanup
+- No compatibility mode, long-poll fallback, or automatic SSE reconnect exists.
 
 ## Worker Coordination
 
@@ -26,20 +35,21 @@ When a target enables true concurrency only, Worker runs:
 
 1. compute `hardExpireAtMs`
 2. `acquire(fast)`
-3. if CQ returns `wait`, continue waiting with the returned `waitToken`
-4. once CQ returns `granted`, call `claim`
-5. if `claim` returns `granted`, call `ack_handoff`
-6. if `ack_handoff` returns `acknowledged`, open `GET /api/v1/concurrency/heartbeat` with WebSocket upgrade, send `hello`, and wait for `hello_ack`
-7. only after accepted heartbeat, start origin fetch
-8. managed streaming response with periodic `heartbeat` -> `heartbeat_ack`
-9. best-effort `release`
+3. if CQ returns `wait`, open `POST /api/v1/concurrency/wait` with `Accept: text/event-stream`
+4. wait for one `accepted` event and one final `result` event
+5. once CQ returns `granted`, call `claim`
+6. if `claim` returns `granted`, call `ack_handoff`
+7. if `ack_handoff` returns `acknowledged`, open `GET /api/v1/concurrency/heartbeat` with WebSocket upgrade, send `hello`, and wait for `hello_ack`
+8. only after accepted heartbeat, start origin fetch
+9. managed streaming response with periodic `heartbeat` -> `heartbeat_ack`
+10. best-effort `release`
 
 When a target enables both fairqueue and true concurrency, Worker runs:
 
 1. compute `hardExpireAtMs`
-2. `slot-handler` fairqueue acquire
+2. `slot-handler` `POST /api/v1/fairqueue/wait`
 3. `concurrency-handler acquire(fast)`
-4. if CQ returns `wait`, release the physical fairqueue slot immediately with unused-grant semantics and continue waiting through the stable `waitToken`
+4. if CQ returns `wait`, settle the prior breaker attempt, release the physical fairqueue slot immediately with unused-grant semantics, and open `POST /api/v1/concurrency/wait`
 5. once CQ returns `granted`, call `claim`
 6. if `claim` returns `granted`, call `ack_handoff`
 7. if `ack_handoff` returns `acknowledged`, open the authenticated heartbeat WebSocket, send `hello`, and wait for `hello_ack`
@@ -59,16 +69,16 @@ The Worker-side client contract is: send `handlerAuthKey` in `handlerAuthHeader`
 ## HTTP API
 
 - `POST /api/v1/concurrency/acquire`
+- `POST /api/v1/concurrency/wait`
 - `POST /api/v1/concurrency/claim`
 - `POST /api/v1/concurrency/ack_handoff`
 - `GET /api/v1/concurrency/heartbeat` with `Upgrade: websocket`
 - `POST /api/v1/concurrency/release`
 - `POST /api/v1/concurrency/cancel`
 
-`acquire` serves both:
+`acquire` is fast-only. It decides immediate admission and may return `wait`, but it never attaches or replays a waiting request.
 
-- initial fast acquire
-- continue-wait attach/replay via `waitToken`
+`wait` is the only CQ waiting endpoint. The request body carries the immutable wait tuple, `waitToken`, `deadlineMs`, `ticketHash`, and `clientInstanceId`. On success it sends one `accepted` event, keepalive comments, one final `result` event, and then closes the stream.
 
 Granted `acquire` results include a `claimToken`. Worker must call `claim` before origin fetch.
 
@@ -80,6 +90,16 @@ Granted `acquire` results include a `claimToken`. Worker must call `claim` befor
 - `410 released`
 - `410 cancelled`
 - `410 expired`
+
+`wait` final results are delivered only by SSE and use exactly these values:
+
+- `granted`
+- `conflict`
+- `released`
+- `cancelled`
+- `expired`
+
+`wait` never emits `wait`, never auto-reconnects, and never upgrades `claim`, `ack_handoff`, `release`, `cancel`, or heartbeat onto SSE.
 
 `claim` finalizes delivery of a granted lease before origin fetch. It returns exactly these normalized outcomes:
 
@@ -221,8 +241,8 @@ Both modes normalize to the same service-level waiting contract: `granted|wait|c
 - `caps.siteMaxInFlight`
 - `caps.siteIpMaxInFlight`
 - `lease.requireHardExpiry`
-- `wait.waitPollWindowMs`
-- `wait.waitReconnectGraceMs`
+- `wait.maxStreamMs`
+- `wait.keepaliveMs`
 - `sweep.enabled`
 - `sweep.intervalSeconds`
 - `sweep.batchSize`
@@ -259,7 +279,7 @@ The cap fields are required and each accepts integers `>= 0`.
 - `host=0, site=32, siteIp=4` means host is unlimited while site and site+ip caps still gate admission.
 - `host=0, site=0, siteIp=0` removes cap-based waiting, but does not disable CQ acquire, release, cancel, request-ledger, or sweep behavior.
 
-`wait.waitPollWindowMs` and `wait.waitReconnectGraceMs` define the waiting-request attach lifetime used to compute `waiter_lease_until_ms`.
+`wait.maxStreamMs` caps a single accepted SSE wait stream. `wait.keepaliveMs` controls the keepalive comment cadence for accepted waiters.
 
 `claim` and `cancel` are fixed to the authoritative database functions `cq_claim_grant` and `cq_cancel`; they are not user-configurable.
 

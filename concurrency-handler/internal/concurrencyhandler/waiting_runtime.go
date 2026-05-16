@@ -1,6 +1,7 @@
 package concurrencyhandler
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ type waitingRuntime struct {
 	mu                       sync.Mutex
 	requestsByID             map[string]*requestSnapshot
 	requestIDByToken         map[string]string
+	waitTokenClaims          map[string]chan struct{}
 	observedWaitTokens       map[string]struct{}
 	observedActiveRequestIDs map[string]struct{}
 	tupleQueues              map[string][]string
@@ -56,12 +58,49 @@ func newWaitingRuntime() *waitingRuntime {
 	return &waitingRuntime{
 		requestsByID:             make(map[string]*requestSnapshot),
 		requestIDByToken:         make(map[string]string),
+		waitTokenClaims:          make(map[string]chan struct{}),
 		observedWaitTokens:       make(map[string]struct{}),
 		observedActiveRequestIDs: make(map[string]struct{}),
 		tupleQueues:              make(map[string][]string),
 		hostTupleQueues:          make(map[string]map[string]struct{}),
 		waiters:                  make(map[string]*attachedWaiter),
 		hostReactors:             make(map[string]*hostReactor),
+	}
+}
+
+func (r *waitingRuntime) claimWaitToken(ctx context.Context, waitToken string) (func(), error) {
+	if r == nil {
+		return func() {}, nil
+	}
+	token := strings.TrimSpace(waitToken)
+	if token == "" {
+		return func() {}, nil
+	}
+	for {
+		r.mu.Lock()
+		claimDone := r.waitTokenClaims[token]
+		if claimDone == nil {
+			claimDone = make(chan struct{})
+			r.waitTokenClaims[token] = claimDone
+			r.mu.Unlock()
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					r.mu.Lock()
+					if r.waitTokenClaims[token] == claimDone {
+						delete(r.waitTokenClaims, token)
+					}
+					r.mu.Unlock()
+					close(claimDone)
+				})
+			}, nil
+		}
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-claimDone:
+		}
 	}
 }
 
@@ -189,7 +228,13 @@ func (r *waitingRuntime) upsertWaitingRequest(req AcquireRequest, waitToken stri
 	if r == nil {
 		return
 	}
-	waiterLeaseUntilMs := req.NowMs + int64(cfg.Concurrency.Wait.WaitPollWindowMs+cfg.Concurrency.Wait.WaitReconnectGraceMs)
+	waiterLeaseUntilMs := req.HardExpireAtMs
+	if waiter != nil {
+		waiterLeaseUntilMs = req.NowMs + int64(cfg.Concurrency.Wait.MaxStreamMs)
+		if req.HardExpireAtMs > 0 && (waiterLeaseUntilMs <= 0 || req.HardExpireAtMs < waiterLeaseUntilMs) {
+			waiterLeaseUntilMs = req.HardExpireAtMs
+		}
+	}
 	r.upsertWaitingRequestWithLeaseDeadline(req, waitToken, waiter, waiterLeaseUntilMs)
 }
 
@@ -355,6 +400,31 @@ func (r *waitingRuntime) hasAttachedWaiter(waitToken string) bool {
 	return ok && waiter != nil && !waiter.released
 }
 
+func (r *waitingRuntime) attachedWaiterLeaseUntilMs(waitToken string) (int64, bool) {
+	if r == nil {
+		return 0, false
+	}
+	token := strings.TrimSpace(waitToken)
+	if token == "" {
+		return 0, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	waiter, ok := r.waiters[token]
+	if !ok || waiter == nil || waiter.released {
+		return 0, false
+	}
+	requestID := r.requestIDByToken[token]
+	if requestID == "" {
+		return 0, false
+	}
+	snap := r.requestsByID[requestID]
+	if snap == nil || snap.WaiterLeaseUntilMs <= 0 {
+		return 0, false
+	}
+	return snap.WaiterLeaseUntilMs, true
+}
+
 func (r *waitingRuntime) snapshotAttached() []*attachedWaiter {
 	if r == nil {
 		return nil
@@ -408,12 +478,12 @@ func (r *waitingRuntime) grantEligibleHeads(hostnameHash string, nowMs int64) []
 	var heads []requestSnapshot
 	for tupleKey := range r.hostTupleQueues[hostnameHash] {
 		queue := r.tupleQueues[tupleKey]
-		if len(queue) == 0 {
-			continue
-		}
-		snap := r.requestsByID[queue[0]]
-		if r.isGrantEligibleLocked(snap, nowMs) {
-			heads = append(heads, *snap)
+		for _, requestID := range queue {
+			snap := r.requestsByID[requestID]
+			if r.isGrantEligibleLocked(snap, nowMs) {
+				heads = append(heads, *snap)
+				break
+			}
 		}
 	}
 	sortRequestSnapshots(heads)

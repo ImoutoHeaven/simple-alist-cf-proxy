@@ -65,6 +65,47 @@ func TestWaitingRuntimePromotesTupleHeadOnly(t *testing.T) {
 	}
 }
 
+func TestWaitingRuntimeSkipsDetachedTupleHeadForPromotion(t *testing.T) {
+	runtime := newWaitingRuntime()
+	cfg := validTestConfig()
+	baseNowMs := time.Now().UnixMilli()
+
+	detachedReq := AcquireRequest{
+		Hostname:       "tuple.example.com",
+		HostnameHash:   "tuple-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "request-detached",
+		HardExpireAtMs: baseNowMs + 20_000,
+		NowMs:          baseNowMs,
+	}
+	attachedReq := AcquireRequest{
+		Hostname:       "tuple.example.com",
+		HostnameHash:   "tuple-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "request-attached",
+		HardExpireAtMs: baseNowMs + 20_000,
+		NowMs:          baseNowMs + 1,
+	}
+
+	attachedWaiter, ok := runtime.tryAttach("wait-attached")
+	if !ok || attachedWaiter == nil {
+		t.Fatal("expected attached waiter to succeed")
+	}
+
+	runtime.upsertWaitingRequest(detachedReq, "wait-detached", nil, cfg)
+	runtime.upsertWaitingRequest(attachedReq, "wait-attached", attachedWaiter, cfg)
+
+	headers := runtime.grantEligibleHeads("tuple-host", baseNowMs+100)
+	if len(headers) != 1 {
+		t.Fatalf("expected one promotable attached request, got %d", len(headers))
+	}
+	if headers[0].RequestID != "request-attached" {
+		t.Fatalf("expected detached tuple head to be skipped in favor of attached waiter, got %s", headers[0].RequestID)
+	}
+}
+
 func TestWaitingRuntimeReschedulesToNearestDeadline(t *testing.T) {
 	runtime := newWaitingRuntime()
 	cfg := validTestConfig()
@@ -106,13 +147,13 @@ func TestWaitingRuntimeReschedulesToNearestDeadline(t *testing.T) {
 	}
 
 	runtime.finishRequest("request-2", &AcquireResult{Result: "expired", Reason: "hard_expired"})
-	expectedWaiterLeaseDeadline := firstReq.NowMs + int64(cfg.Concurrency.Wait.WaitPollWindowMs+cfg.Concurrency.Wait.WaitReconnectGraceMs)
+	expectedWaiterLeaseDeadline := firstReq.NowMs + int64(cfg.Concurrency.Wait.MaxStreamMs)
 	if got := runtime.nextWakeAtMs("deadline-host"); got != expectedWaiterLeaseDeadline {
 		t.Fatalf("expected waiter-lease wake at %d, got %d", expectedWaiterLeaseDeadline, got)
 	}
 }
 
-func TestWaitingRuntimeFastWaitReplayWithoutAttachPreservesWaiterLease(t *testing.T) {
+func TestWaitingRuntimeFastWaitReplayWithoutAttachKeepsHardExpiryDeadline(t *testing.T) {
 	runtime := newWaitingRuntime()
 	cfg := validTestConfig()
 	baseNowMs := time.Now().UnixMilli()
@@ -131,7 +172,12 @@ func TestWaitingRuntimeFastWaitReplayWithoutAttachPreservesWaiterLease(t *testin
 	if !ok || snap == nil {
 		t.Fatal("expected waiting snapshot after first fast wait")
 	}
-	originalWaiterLeaseUntilMs := snap.WaiterLeaseUntilMs
+	if snap.WaiterLeaseUntilMs != firstReq.HardExpireAtMs {
+		t.Fatalf("expected detached fast wait to keep hard-expiry deadline %d before /wait attach, got %d", firstReq.HardExpireAtMs, snap.WaiterLeaseUntilMs)
+	}
+	if got := runtime.nextWakeAtMs("replay-host"); got != firstReq.HardExpireAtMs {
+		t.Fatalf("expected detached fast wait to wake on hard expiry %d, got %d", firstReq.HardExpireAtMs, got)
+	}
 
 	replayReq := firstReq
 	replayReq.NowMs = baseNowMs + 6_000
@@ -140,8 +186,8 @@ func TestWaitingRuntimeFastWaitReplayWithoutAttachPreservesWaiterLease(t *testin
 	if !ok || replayedSnap == nil {
 		t.Fatal("expected waiting snapshot after fast replay")
 	}
-	if replayedSnap.WaiterLeaseUntilMs != originalWaiterLeaseUntilMs {
-		t.Fatalf("expected fast wait replay not to refresh waiter lease, got before=%d after=%d", originalWaiterLeaseUntilMs, replayedSnap.WaiterLeaseUntilMs)
+	if replayedSnap.WaiterLeaseUntilMs != firstReq.HardExpireAtMs {
+		t.Fatalf("expected fast wait replay to keep hard-expiry deadline %d, got %d", firstReq.HardExpireAtMs, replayedSnap.WaiterLeaseUntilMs)
 	}
 }
 

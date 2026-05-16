@@ -62,7 +62,7 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 - `download.db.rateLimit.*`：窗口、限额、block 时间、`pgErrorHandle` 等
 - `download.throttleProfiles.<name>`：只定义 breaker profile；controller/bootstrap breaker 字段集合保持不变，固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`closeThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`、`protectHttpCodes`
 - worker 在解析 bootstrap 时会校验 `halfOpenSuccessThreshold <= halfOpenMaxProbeCount`，并拒绝 `halfOpenMaxProbeCount > 63`，因为 SQL 用 signed `BIGINT` mask 记录 half-open 当前批次 ticket 状态；`halfOpenTimeoutMode` 继续决定 half-open timeout 后的终态
-- `download.fairQueue.*`：slot-handler 地址、鉴权 key、鉴权 header 名、等待超时、轮询策略、siteBucket 计算方式等（worker 侧解析字段）；其中 `slotHandlerAuthHeader` 由 controller 同步下发，默认值为 `X-FQ-Auth`
+- `download.fairQueue.*`：slot-handler 地址、鉴权 key、鉴权 header 名、SSE wait 预算、siteBucket 计算方式等（worker 侧解析字段）；其中 `slotHandlerAuthHeader` 由 controller 同步下发，默认值为 `X-FQ-Auth`
 - `download.fairQueue.siteBucket` / `download.trueConcurrency.siteBucket` 共用同一套归一化规则：`mode` / `modes` 仅接受 `host`、`sharepoint`、`googledrive`；`modes` 去掉空白项后只要还有至少一个有效值就覆盖 `mode`，重复值按首次出现保留；若 `modes` 缺失、不是数组或清理后为空，则回退到 `mode`；若两者都为空，则默认启用 `['sharepoint']`
 - `download.trueConcurrency.*`：`concurrency-handler` 地址、`handlerAuthKey`、`handlerAuthHeader`、`acquireTimeoutMs`、`releaseTimeoutMs` 与 `siteBucket` 计算方式；`siteBucket` 归一化后按 `googledrive -> sharepoint -> host -> unknown` 取值，provider-specific 模式优先于 host fallback
 - slot-handler in-flight limits（slot-handler 配置项，写在 slot-handler 的 config 中，worker 不解析）：
@@ -71,6 +71,14 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
   - `siteMaxInFlightFlow`：按 siteBucket 维度的 in-flight 上限
   - `ipBucketMaxInFlightFlow`：按 ipBucket 维度的 in-flight 上限
 - `decision.download.*`：`pathAction` / `checkOriginMode` / `throttleProfile`；worker 仅在字段缺失时使用 `default`，若命中的 selector 不存在则直接报错，不做静默 fallback
+
+## 4.1 Admission Wait Protocol
+
+- Wait endpoints: `POST /api/v1/fairqueue/wait` and `POST /api/v1/concurrency/wait`
+- Both wait requests use `Accept: text/event-stream`, both handlers reply with `Content-Type: text/event-stream`, and each accepted stream emits one `accepted` event plus one final `result` event.
+- CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP
+- FQ: wait SSE -> accepted -> one final result -> release or abandon HTTP cleanup
+- No compatibility mode, long-poll fallback, or automatic SSE reconnect exists.
 
 ## 5. 请求处理流程
 
@@ -140,48 +148,24 @@ admission 固定为四种显式运行模式：
      - `protectHttpCodes` 命中的 terminal `4xx`/`5xx` 继续走 `download_report_breaker_sample(sample=1)`；非 protected terminal `4xx`/`5xx` 不允许写 `sample=0`，只在 live attempt 存在时走 `download_settle_breaker_attempt` 结清 no-sample debt。`2xx/3xx` 仍是 `sample=0` 的唯一路径；`Retry-After` 只解析数值秒，先做 cap，再把非数值场景交给 SQL 里的指数回退；受保护的 `half_open` attempt 仍会立即重新 `open`。
 
 11. **Fair Queue（slot-handler）**
-    - 当 hostname 命中 `download.fairQueue.hostPatterns`，调用 slot-handler `/api/v1/fairqueue/acquire` 轮询，并附带 `siteBucket`。
+    - 当 hostname 命中 `download.fairQueue.hostPatterns`，worker 调用 slot-handler `POST /api/v1/fairqueue/wait`，并附带 `siteBucket`、`requestId`、`deadlineMs`、`admissionMode` 与必要的 breaker tuple。
+    - wait 请求发送 `Accept: text/event-stream`；slot-handler 在接受请求后发送一个 `accepted` 事件，其中包含 `queryToken`、`invocationEpoch` 与 `deadlineMs`，随后只会再发送一个最终 `result` 事件并关闭流。
+    - FQ 最终结果固定为 `granted` / `throttled` / `overloaded` / `timeout` / `conflict`。accepted 之前的鉴权失败、JSON 失败、缺字段或 pre-attachment overload 走非 SSE JSON HTTP 响应；accepted 之后的结果全部通过 SSE 发送。
     - `queue_only` 与 `queue_breaker` 都走 slot-handler admission；区别只在 `queue_breaker` 会额外携带 `breakerEnabled` 与完整 canonical breaker tuple（`openCapSeconds`、`closeThresholdPercent`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`），让 backend 原子决定 queue slot 与 breaker attempt。
-    - worker 把返回的 `queryToken` 视为一次稳定的 admission 会话标识；同 token 续轮询时 `hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket`、`breakerEnabled` 与这组 canonical breaker tuple 必须保持一致，slot-handler 只做校验，不会把新参数覆写回旧 flow。
-    - acquire / release 请求使用 `download.fairQueue.slotHandlerAuthHeader` 指定的鉴权 header 名发送 `slotHandlerAuthKey`，不再假定 header 名固定写死。
-    - `acquire` 轮询同时受 `maxAttempts` 与 `totalMaxWaitMs` 约束，任一达到即结束等待。
-    - 支持 `pending` / `granted` / `throttled` / `overloaded` / `timeout`；其中 `throttled` 仅表示 slot-handler 透传 backend `THROTTLED` 结果，worker 不把它当作本地 breaker 权威。
-    - scoped overload 与 global overload 退避会在内存中做短期抑制，但这只属于 fair-queue 退避，不参与 breaker 状态机。
-    - `overloaded` 由 slot-handler 返回 `reason=overload_<scope>`（`global|host|site|ip`）与可选 `retryAfter`。
-    - overload 行为矩阵：
-        - `overload_global`：worker 立即 fail-fast 返回 `503`；优先使用 slot-handler 的 `retryAfter`，若缺失/非法则按 worker 默认值回填 `Retry-After`。
-        - `overload_host|overload_site|overload_ip`：worker 继续轮询，使用严格阶梯等待（0.5s 起步、每轮 +0.5s、单次最多 2.0s，不加 jitter）。
-        - 当 `queryToken` 仍然有效且 scoped overload 只是要求退避时，slot-handler 会刷新 detached token 的 grace，避免 worker 在退避窗口内把原 token 自己等到过期。
-        - scoped overload（host/site/ip）仍受 `slotHandlerTimeoutMs` 总等待上限约束。
-        - worker 维护 host 级 overloaded 冷却窗口与本地退避 `delayMs`，在下一次 acquire 前先等待剩余冷却时间，避免对同一 host 高频空转重试。
-        - `download.fairQueue.slotHandlerTimeoutMs` 由 controller 下发，worker 内映射为 `slotHandlerConfig.totalMaxWaitMs`，用于总等待上限。
-        - `overloaded` 退避 streak 在收到非 overloaded 结果（如 `pending`/`granted`/`throttled`/`409`）时重置。
-        - 若 token 已 stale、sticky miss 到别的实例，或携带的 `hostname`/`hostnameHash`/`ipBucket`/canonical `siteBucket`、`breakerEnabled` 或 canonical breaker tuple 与原 flow 不匹配，slot-handler 仍会返回 `timeout`；worker 侧统一退化为 `503`，不会承诺自动恢复原排队位置。
-        - acquire invocation lease 只约束 queue participation 与 attached waiter；`attached committed unclaimed` 等 acquire-owned flow 仍受这段 lease 管理。
-        - `detached ready latched` 的 grant 一旦被 worker claim 并返回 `granted`，就转为 `claimed active grant`；该 grant 归 worker 持有，slot-handler 仅保留本地 flow 以等待 after-use `release` cleanup。
-        - claim 之后的 cleanup 只走 after-use `release`；acquire lease expiry 不决定 `claimed active grant` 的生命周期，也不会回收 worker 已持有的 slot。
-        - redirect / refresh 命中新 target 导致 fair-queue context 变化时，worker 仍沿用现有 inline release -> reacquire 路径；这部分 release 行为未变。
-        - 请求终止出口的 finally cleanup 会补偿未完成的 release：先按 `slotToken` 去重，再按 `hostnameHash || hostname` 分组；同一 host 串行，不同 host 固定最多 `2` 组并发。这个有界并发只用于 finally cleanup，不影响 redirect / refresh 的 inline release。
-        - 完成后发送 `/api/v1/fairqueue/release`；若运行环境支持 `ctx.waitUntil`，finally cleanup 会后台执行。
-        - claimed-active-grant 的 after-use `release` 除了 `slotToken` 外，还会额外携带可选 owner tuple：`queryToken + invocationEpoch`，并发送 `X-FQ-Owner-Token` / `X-FQ-Owner-Epoch` header，方便 LB / gateway 基于 claim owner 做 release sticky 路由。
-    - release 契约：缺失/空或格式非法的 `slotToken` 返回 `4xx`（当前为 `400`）；语法合法但未知/已释放的 `slotToken` 仍返回 `200` 幂等成功。
-    - 只有 acquire `granted` 明确声明 `releaseOwnerRequired=true` 的 claim path，worker 后续 `release` 才会带上这组 owner tuple；普通 waiter-delivered `granted` 仍只按 host/hash/site/ip + `slotToken` 走 after-use cleanup。
-    - 带 owner tuple 的 claimed-path `release` 若落到错误实例、owner route miss，slot-handler 会 fail-closed 返回 `503`，不会先释放 backend capacity 再本地静默 no-op；这是为了避免 split-brain 下留下永久残留的 claimed flow。
-    - release 返回非 `2xx` 视为失败：slot-handler 在 backend release 失败时返回 `502`。
-    - release 每次尝试使用固定 `1500ms` 专用超时，与 acquire long-poll 的 `perRequestTimeoutMs` / timeout clamp 解耦；超时按可重试失败处理。
-    - release 重试策略保持不变：仅在网络错误、超时、`429` 或 `>=500` 时重试（最多 3 次，指数退避）；非可重试 `4xx` 不重试。
-    - 轮询探测受 `utilWindowSec` 与 `maxBatch` / `maxProbeParallel` / `maxProbeQpsPerHost` 控制。
-    - 若 slot-handler 不可用或 fair-queue 接口异常，按 fail-closed 返回 `503`，不绕过排队保护。
-    - 多实例 slot-handler 需要 sticky 路由：同一 `queryToken` 的轮询应稳定落到同一实例，否则会出现 `query_token_stale`/`timeout`，worker 侧退化为 `503`。
-    - `release` 只在 claimed-path owner tuple 存在时需要 owner-routing：LB 至少要能基于 `X-FQ-Owner-Token`（或 request body 中的 `queryToken`）把这类 after-use cleanup 路由回 claim owner；如果做不到，slot-handler 会把 owner route miss 显式返回 `503`，而不是静默吞掉本地 cleanup miss。
+    - worker 在收到 `accepted` 后保存 `queryToken + invocationEpoch` 作为 pre-grant cleanup ownership；收到 `granted` 后再保存 `slotToken` 与 `releaseOwnerRequired=true` 用于 after-use `release`。
+    - scoped overload 与 global overload 退避会在内存中做短期抑制，但这只属于 fair-queue 退避，不参与 breaker 状态机。`overload_global` 仍由 worker fail-fast 为 `503`；scope overload 仍受总 wait budget 约束。
+    - release 契约保持 backend-authoritative 与幂等；`slotToken` 语法合法但未知/已释放时仍返回 `200`。带 owner tuple 的 release 仍要求命中 claim owner，否则 fail-closed `503`，避免 split-brain cleanup 漏掉已授予 slot。
+    - 当 worker 在 accepted 之后、grant 之前放弃等待时，调用 `/api/v1/fairqueue/abandon`；一旦已收到 `granted`，cleanup 只走 `/api/v1/fairqueue/release`。
+    - 多实例 slot-handler 仍需要 sticky routing：已接受的 `queryToken` 流需要稳定落到同一实例，否则内存中的 attached waiter 无法稳定接收最终结果。
 
 12. **True Concurrency（concurrency-handler）**
     - Breaker、FairQueue、true-concurrency 与缓存 unified-check 都按真实上游 hostname 与对应 hash 作为 authority。
-    - worker 发给 `concurrency-handler` 的 `acquire` / continue-wait payload 固定携带 actual `hostname`、`hostnameHash`、`siteBucket`、`ipBucket`、`requestId` 与 `hardExpireAtMs`。
-    - `acquire` 返回 `granted` 时，worker 会用 `requestId + claimToken` 调用 `POST /api/v1/concurrency/claim` 绑定 active lease，再发起 origin fetch；返回 `wait` 时使用稳定 `waitToken` 续连，直到后续 `granted` 后再进入 `/claim`。
-    - 当 fairqueue 与 true-concurrency 同时启用时，执行顺序固定为 `FairQueue acquire -> true-concurrency acquire -> /api/v1/concurrency/claim -> origin fetch -> FairQueue release after headers -> true-concurrency release on stream lifecycle`。
-    - `concurrency-handler` 在生产环境必须对同一 `waitToken` 做 sticky routing；否则 wait continuation 会退化为失败。
-    - `concurrency-handler` HTTP auth 是必需项；worker 使用 `handlerAuthHeader` 发送 `handlerAuthKey`，`acquireTimeoutMs` 定义 `/acquire` 与 `/claim` 超时，`releaseTimeoutMs` 定义 `/release` 与 `/cancel` 超时。
+    - worker 发给 `concurrency-handler` 的 fast `acquire` payload 固定携带 actual `hostname`、`hostnameHash`、`siteBucket`、`ipBucket`、`requestId` 与 `hardExpireAtMs`；当 fast acquire 返回 `wait` 时，再打开 `POST /api/v1/concurrency/wait` SSE，并携带 wait tuple、`waitToken`、`deadlineMs`、`ticketHash` 与 `clientInstanceId`。
+    - `POST /api/v1/concurrency/wait` 同样使用 `Accept: text/event-stream`，先发送一个 `accepted` 事件，再发送一个最终 `result` 事件；最终结果固定为 `granted` / `conflict` / `released` / `cancelled` / `expired`。
+    - `concurrency-handler` 返回 `granted` 时，worker 会用 `requestId + claimToken` 调用 `POST /api/v1/concurrency/claim` 绑定 active lease，再调用 `POST /api/v1/concurrency/ack_handoff`，随后建立 heartbeat WebSocket 并等待 `hello_ack`，最后才发起 origin fetch。
+    - 当 fairqueue 与 true-concurrency 同时启用时，执行顺序固定为 `POST /api/v1/fairqueue/wait -> accepted/result -> POST /api/v1/concurrency/acquire -> (wait 时 settle breaker 并释放未使用的 fairqueue slot) -> POST /api/v1/concurrency/wait -> claim -> ack_handoff -> heartbeat -> origin fetch -> release`。
+    - `concurrency-handler` 在生产环境必须对已接受的 `/api/v1/concurrency/wait` 流保持 sticky routing；否则 attached waiter 的最终投递会失败。
+    - `concurrency-handler` HTTP auth 是必需项；worker 使用 `handlerAuthHeader` 发送 `handlerAuthKey`，`acquireTimeoutMs` 定义 fast `/acquire` 与 `/claim` 超时，`releaseTimeoutMs` 定义 `/release` 与 `/cancel` 超时。
 
 13. **上游请求与响应封装**
      - 支持 3xx 重定向与 401/410 触发的 refresh（`refresh=true`）重试一次。
