@@ -2836,7 +2836,6 @@ test('queue_breaker cancels CQ wait when old attempt settlement fails before CQ 
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const calls = [];
-  const cancelBodies = [];
   delete globalThis.bootstrapCache;
 
   globalThis.fetch = async (input, init = {}) => {
@@ -2908,12 +2907,6 @@ test('queue_breaker cancels CQ wait when old attempt settlement fails before CQ 
       return createJsonResponse({ result: 'ok' });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      cancelBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://tenant.sharepoint.com/file') {
       throw new Error('origin fetch should not run after breaker settle failure');
     }
@@ -2945,10 +2938,7 @@ test('queue_breaker cancels CQ wait when old attempt settlement fails before CQ 
       'concurrency-acquire-fast',
       'breaker-settle',
       'fairqueue-release',
-      'concurrency-cancel',
     ]);
-    assert.equal(cancelBodies.length, 1);
-    assert.equal(cancelBodies[0].reason, 'worker_aborted');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -3539,7 +3529,6 @@ test('worker settles live breaker_only attempt before refresh enters true concur
   const waitUntilPromises = [];
   const calls = [];
   const settleBodies = [];
-  const cancelBodies = [];
   let linkFetchCount = 0;
   delete globalThis.bootstrapCache;
 
@@ -3628,12 +3617,6 @@ test('worker settles live breaker_only attempt before refresh enters true concur
       });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('cq-cancel');
-      cancelBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://files.office.com/stale') {
       calls.push('origin-fetch-401');
       return new Response('expired', {
@@ -3677,9 +3660,7 @@ test('worker settles live breaker_only attempt before refresh enters true concur
       'link-2',
       'breaker-settle',
       'cq-acquire',
-      'cq-cancel',
     ]);
-    assert.equal(cancelBodies.length, 1);
     assert.equal(settleBodies.length, 1);
     assert.equal(settleBodies[0].p_attempt_version, 91);
     assert.equal(settleBodies[0].p_attempt_ticket, 6);
@@ -5337,7 +5318,6 @@ test('queue_breaker dual mode reports actual Google redirect when CQ wait later 
   const concurrencyAcquireBodies = [];
   const concurrencyWaitBodies = [];
   const concurrencyReleaseBodies = [];
-  const concurrencyCancelBodies = [];
   const reportBodies = [];
   const settleBodies = [];
   delete globalThis.bootstrapCache;
@@ -5480,11 +5460,6 @@ test('queue_breaker dual mode reports actual Google redirect when CQ wait later 
       return createJsonResponse({ result: 'acknowledged' });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      concurrencyCancelBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
       throw new Error('queue_breaker redirect lifecycle should not call direct breaker authorize');
     }
@@ -5552,7 +5527,6 @@ test('queue_breaker dual mode reports actual Google redirect when CQ wait later 
       ['drive.google.com', 'www.googleapis.com'],
     );
     assert.equal(concurrencyReleaseBodies.length, 1);
-    assert.equal(concurrencyCancelBodies.length, 0);
     assert.deepEqual(
       settleBodies,
       [],

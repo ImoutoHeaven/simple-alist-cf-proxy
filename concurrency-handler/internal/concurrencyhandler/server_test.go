@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -19,6 +20,8 @@ import (
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
+
+const cancelPath = "/api/v1/concurrency/cancel"
 
 type heartbeatHelloFrame struct {
 	Type             string `json:"type"`
@@ -141,6 +144,8 @@ func lookupTestStructStringField(target any, fieldName string) string {
 }
 
 type stubBackend struct {
+	terminalizeMu             sync.Mutex
+	terminalizeCalls          []TerminalizeWaitingRequest
 	acquireResult             *AcquireResult
 	acquireErr                error
 	acquireFn                 func(context.Context, AcquireRequest) (*AcquireResult, error)
@@ -159,11 +164,12 @@ type stubBackend struct {
 	promoteResult             *AcquireResult
 	promoteErr                error
 	promoteFn                 func(context.Context, PromoteWaitingRequest) (*AcquireResult, error)
-	cancelResult              *CancelResult
-	cancelErr                 error
-	cancelFn                  func(context.Context, CancelRequest) (*CancelResult, error)
+	terminalizeWaitingResult  *TerminalizeWaitingResult
+	terminalizeWaitingErr     error
+	terminalizeWaitingFn      func(context.Context, TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error)
 	expireResult              *ExpireScopeResult
 	expireErr                 error
+	expireFn                  func(context.Context, ExpireScopeRequest) (*ExpireScopeResult, error)
 	heartbeatOpenResult       *HeartbeatResult
 	heartbeatOpenErr          error
 	heartbeatOpenFn           func(context.Context, HeartbeatOpenRequest) (*HeartbeatResult, error)
@@ -212,6 +218,34 @@ type probingBackend struct {
 	probeFn func(context.Context, AcquireRequest) (*AcquireResult, error)
 }
 
+type reservedProbeBackend struct {
+	*stubBackend
+	mu                 sync.Mutex
+	reserved           bool
+	consumed           bool
+	released           int
+	releaseErr         error
+	releaseErrs        []error
+	releaseResults     []*ReleaseWaitReservationResult
+	promoteResult      *AcquireResult
+	promoteErr         error
+	promoteNil         bool
+	terminalizeResults []*TerminalizeWaitingResult
+}
+
+type setupProbeFailureBackend struct {
+	*stubBackend
+	Reserved     bool
+	ReleaseCalls int
+	ReleaseReq   ReleaseWaitReservationRequest
+}
+
+type cancelAwarePromoteBackend struct {
+	*stubBackend
+	promoteEntered chan context.Context
+	releasePromote chan struct{}
+}
+
 type startupRecoveryFailBackend struct {
 	*stubBackend
 	startupProbeErr error
@@ -233,10 +267,22 @@ type activeReplayCleanupBackend struct {
 	*stubBackend
 }
 
+type noProbeBackend struct{}
+
 type failingResponseWriter struct {
 	header http.Header
 	status int
 	writes int
+}
+
+type flushTrackingResponseWriter struct {
+	header    http.Header
+	status    int
+	writes    [][]byte
+	flushes   int
+	flushErr  error
+	writeErr  error
+	writeOnce bool
 }
 
 func (b *firstContinueWaitBlocksBackend) Acquire(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
@@ -287,8 +333,15 @@ func (b *firstContinueWaitBlocksBackend) PromoteWaiting(ctx context.Context, req
 	return b.inner.PromoteWaiting(ctx, req)
 }
 
-func (b *firstContinueWaitBlocksBackend) Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error) {
-	return b.inner.Cancel(ctx, req)
+func (b *firstContinueWaitBlocksBackend) PromoteAttachedWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+	if promoter, ok := b.inner.(attachedWaitingPromoter); ok {
+		return promoter.PromoteAttachedWaiting(ctx, req)
+	}
+	return b.inner.PromoteWaiting(ctx, req)
+}
+
+func (b *firstContinueWaitBlocksBackend) TerminalizeWaiting(ctx context.Context, req TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
+	return b.inner.TerminalizeWaiting(ctx, req)
 }
 
 func (b *firstContinueWaitBlocksBackend) ExpireScope(ctx context.Context, req ExpireScopeRequest) (*ExpireScopeResult, error) {
@@ -331,8 +384,15 @@ func (b *continueWaitSignalsBackend) PromoteWaiting(ctx context.Context, req Pro
 	return b.inner.PromoteWaiting(ctx, req)
 }
 
-func (b *continueWaitSignalsBackend) Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error) {
-	return b.inner.Cancel(ctx, req)
+func (b *continueWaitSignalsBackend) PromoteAttachedWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+	if promoter, ok := b.inner.(attachedWaitingPromoter); ok {
+		return promoter.PromoteAttachedWaiting(ctx, req)
+	}
+	return b.inner.PromoteWaiting(ctx, req)
+}
+
+func (b *continueWaitSignalsBackend) TerminalizeWaiting(ctx context.Context, req TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
+	return b.inner.TerminalizeWaiting(ctx, req)
 }
 
 func (b *continueWaitSignalsBackend) ExpireScope(ctx context.Context, req ExpireScopeRequest) (*ExpireScopeResult, error) {
@@ -373,6 +433,21 @@ func (b *promoteBlocksAfterCommitBackend) ClaimGrant(ctx context.Context, req Cl
 
 func (b *promoteBlocksAfterCommitBackend) PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
 	result, err := b.inner.PromoteWaiting(ctx, req)
+	return b.blockAfterGrantedPromotion(result, err)
+}
+
+func (b *promoteBlocksAfterCommitBackend) PromoteAttachedWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+	var result *AcquireResult
+	var err error
+	if promoter, ok := b.inner.(attachedWaitingPromoter); ok {
+		result, err = promoter.PromoteAttachedWaiting(ctx, req)
+	} else {
+		result, err = b.inner.PromoteWaiting(ctx, req)
+	}
+	return b.blockAfterGrantedPromotion(result, err)
+}
+
+func (b *promoteBlocksAfterCommitBackend) blockAfterGrantedPromotion(result *AcquireResult, err error) (*AcquireResult, error) {
 	if err == nil && result != nil && result.Result == "granted" {
 		b.promoteOnce.Do(func() {
 			close(b.promoteCommitted)
@@ -382,8 +457,8 @@ func (b *promoteBlocksAfterCommitBackend) PromoteWaiting(ctx context.Context, re
 	return result, err
 }
 
-func (b *promoteBlocksAfterCommitBackend) Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error) {
-	return b.inner.Cancel(ctx, req)
+func (b *promoteBlocksAfterCommitBackend) TerminalizeWaiting(ctx context.Context, req TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
+	return b.inner.TerminalizeWaiting(ctx, req)
 }
 
 func (b *promoteBlocksAfterCommitBackend) ExpireScope(ctx context.Context, req ExpireScopeRequest) (*ExpireScopeResult, error) {
@@ -395,6 +470,136 @@ func (b *probingBackend) ProbeWaitState(ctx context.Context, req AcquireRequest)
 		return b.probeFn(ctx, req)
 	}
 	return &AcquireResult{Result: "wait", WaitToken: req.WaitToken, Scope: "host", RetryAfter: 1}, nil
+}
+
+func (b *reservedProbeBackend) usesSQLBackedPromotion() {}
+
+func (b *reservedProbeBackend) ProbeWaitState(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.consumed {
+		return &AcquireResult{Result: "released", Reason: "final_cleanup"}, nil
+	}
+	if b.reserved {
+		return &AcquireResult{Result: "conflict", Reason: acquireConflictReasonWaiterAlreadyAttached}, nil
+	}
+	b.reserved = true
+	return &AcquireResult{Result: "wait", WaitToken: req.WaitToken, Scope: "host", RetryAfter: 1}, nil
+}
+
+func (b *reservedProbeBackend) PromoteWaiting(_ context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+	if b.promoteErr != nil {
+		return nil, b.promoteErr
+	}
+	if b.promoteNil {
+		return nil, nil
+	}
+	if b.promoteResult != nil {
+		return cloneAcquireResult(b.promoteResult), nil
+	}
+	return &AcquireResult{Result: "wait", WaitToken: req.WaitToken, Scope: "host", RetryAfter: 1}, nil
+}
+
+func (b *reservedProbeBackend) ReleaseWaitReservation(_ context.Context, req ReleaseWaitReservationRequest) (*ReleaseWaitReservationResult, error) {
+	b.mu.Lock()
+	if len(b.releaseErrs) > 0 {
+		err := b.releaseErrs[0]
+		b.releaseErrs = b.releaseErrs[1:]
+		b.released++
+		b.mu.Unlock()
+		return nil, err
+	}
+	if b.releaseErr != nil {
+		err := b.releaseErr
+		b.released++
+		b.mu.Unlock()
+		return nil, err
+	}
+	if len(b.releaseResults) > 0 {
+		result := b.releaseResults[0]
+		b.releaseResults = b.releaseResults[1:]
+		if result != nil && result.Result == "released" {
+			b.reserved = false
+			if req.Consume {
+				b.consumed = true
+			}
+		}
+		b.released++
+		b.mu.Unlock()
+		if result == nil {
+			return &ReleaseWaitReservationResult{Result: "noop", Reason: "not_found"}, nil
+		}
+		return result, nil
+	}
+	b.reserved = false
+	if req.Consume {
+		b.consumed = true
+	}
+	b.released++
+	b.mu.Unlock()
+	return &ReleaseWaitReservationResult{Result: "released"}, nil
+}
+
+func (b *reservedProbeBackend) TerminalizeWaiting(_ context.Context, req TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.terminalizeResults) > 0 {
+		result := b.terminalizeResults[0]
+		b.terminalizeResults = b.terminalizeResults[1:]
+		return result, nil
+	}
+	if b.stubBackend != nil {
+		return b.stubBackend.TerminalizeWaiting(context.Background(), req)
+	}
+	return &TerminalizeWaitingResult{Result: "released", Reason: req.Reason}, nil
+}
+
+func (b *setupProbeFailureBackend) ProbeWaitState(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
+	b.Reserved = true
+	return nil, context.Canceled
+}
+
+func (b *setupProbeFailureBackend) ReleaseWaitReservation(_ context.Context, req ReleaseWaitReservationRequest) (*ReleaseWaitReservationResult, error) {
+	b.ReleaseCalls++
+	b.ReleaseReq = req
+	b.Reserved = false
+	return &ReleaseWaitReservationResult{Result: "released"}, nil
+}
+
+func (b *cancelAwarePromoteBackend) usesSQLBackedPromotion() {}
+
+func (b *cancelAwarePromoteBackend) ProbeWaitState(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
+	return &AcquireResult{Result: "wait", WaitToken: req.WaitToken, Scope: "host", RetryAfter: 1}, nil
+}
+
+func (b *cancelAwarePromoteBackend) PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+	b.promoteEntered <- ctx
+	<-b.releasePromote
+	return &AcquireResult{Result: "wait", WaitToken: req.WaitToken, Scope: "host", RetryAfter: 1}, nil
+}
+
+func (b *noProbeBackend) Acquire(context.Context, AcquireRequest) (*AcquireResult, error) {
+	return &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: time.Now().Add(time.Minute).UnixMilli(), ClaimToken: "claim-1"}, nil
+}
+
+func (b *noProbeBackend) ClaimGrant(context.Context, ClaimGrantRequest) (*ClaimGrantResult, error) {
+	return &ClaimGrantResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: time.Now().Add(time.Minute).UnixMilli()}, nil
+}
+
+func (b *noProbeBackend) Release(context.Context, ReleaseRequest) (*ReleaseResult, error) {
+	return &ReleaseResult{Result: "released", RequestID: "request-1"}, nil
+}
+
+func (b *noProbeBackend) PromoteWaiting(context.Context, PromoteWaitingRequest) (*AcquireResult, error) {
+	return &AcquireResult{Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 1}, nil
+}
+
+func (b *noProbeBackend) TerminalizeWaiting(context.Context, TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
+	return &TerminalizeWaitingResult{Result: "released"}, nil
+}
+
+func (b *noProbeBackend) ExpireScope(context.Context, ExpireScopeRequest) (*ExpireScopeResult, error) {
+	return &ExpireScopeResult{ExpiredCount: 0}, nil
 }
 
 func (b *startupRecoveryFailBackend) StartupProbe(context.Context) error {
@@ -454,6 +659,143 @@ func (w *failingResponseWriter) Write([]byte) (int, error) {
 	return 0, errors.New("forced write failure")
 }
 
+func (w *flushTrackingResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *flushTrackingResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *flushTrackingResponseWriter) Write(data []byte) (int, error) {
+	w.writes = append(w.writes, append([]byte(nil), data...))
+	if w.writeErr != nil && !w.writeOnce {
+		w.writeOnce = true
+		return 0, w.writeErr
+	}
+	return len(data), nil
+}
+
+func (w *flushTrackingResponseWriter) Flush() {
+	w.flushes++
+}
+
+type sequenceFailResponseWriter struct {
+	header      http.Header
+	status      int
+	writes      int
+	failOnWrite int
+	failErr     error
+	flushes     int
+	body        bytes.Buffer
+}
+
+type blockingAcceptedResponseWriter struct {
+	header          http.Header
+	status          int
+	acceptedStarted chan struct{}
+	allowAccepted   chan struct{}
+	acceptedOnce    sync.Once
+	resultStarted   chan struct{}
+	allowResult     chan struct{}
+	blockResult     bool
+	resultOnce      sync.Once
+	mu              sync.Mutex
+	body            bytes.Buffer
+	flushes         int
+}
+
+func (w *sequenceFailResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *sequenceFailResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *sequenceFailResponseWriter) Write(data []byte) (int, error) {
+	w.writes++
+	if w.failOnWrite > 0 && w.writes == w.failOnWrite {
+		if w.failErr == nil {
+			w.failErr = errors.New("forced write failure")
+		}
+		return 0, w.failErr
+	}
+	return w.body.Write(data)
+}
+
+func (w *sequenceFailResponseWriter) Flush() {
+	w.flushes++
+}
+
+func newBlockingAcceptedResponseWriter() *blockingAcceptedResponseWriter {
+	return &blockingAcceptedResponseWriter{
+		acceptedStarted: make(chan struct{}),
+		allowAccepted:   make(chan struct{}),
+		resultStarted:   make(chan struct{}),
+		allowResult:     make(chan struct{}),
+	}
+}
+
+func newBlockingAcceptedAndResultResponseWriter() *blockingAcceptedResponseWriter {
+	w := newBlockingAcceptedResponseWriter()
+	w.blockResult = true
+	return w
+}
+
+func (w *blockingAcceptedResponseWriter) Header() http.Header {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *blockingAcceptedResponseWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	w.status = status
+	w.mu.Unlock()
+}
+
+func (w *blockingAcceptedResponseWriter) Write(data []byte) (int, error) {
+	if strings.Contains(string(data), "event: accepted\n") {
+		w.acceptedOnce.Do(func() { close(w.acceptedStarted) })
+		<-w.allowAccepted
+	}
+	if w.blockResult && strings.Contains(string(data), "event: result\n") {
+		w.resultOnce.Do(func() { close(w.resultStarted) })
+		<-w.allowResult
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Write(data)
+}
+
+func (w *blockingAcceptedResponseWriter) Flush() {
+	w.mu.Lock()
+	w.flushes++
+	w.mu.Unlock()
+}
+
+func (w *blockingAcceptedResponseWriter) BodyString() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.String()
+}
+
+func (w *blockingAcceptedResponseWriter) Code() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.status
+}
+
 type recordingPromoteBackend struct {
 	mu            sync.Mutex
 	promoteCalls  []PromoteWaitingRequest
@@ -502,8 +844,8 @@ func (b *recordingPromoteBackend) PromoteWaiting(_ context.Context, req PromoteW
 	return cloneAcquireResult(result), nil
 }
 
-func (b *recordingPromoteBackend) Cancel(context.Context, CancelRequest) (*CancelResult, error) {
-	return &CancelResult{Result: "cancelled"}, nil
+func (b *recordingPromoteBackend) TerminalizeWaiting(context.Context, TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
+	return &TerminalizeWaitingResult{Result: "released"}, nil
 }
 
 func (b *recordingPromoteBackend) ExpireScope(context.Context, ExpireScopeRequest) (*ExpireScopeResult, error) {
@@ -610,14 +952,26 @@ func (s *stubBackend) PromoteWaiting(ctx context.Context, req PromoteWaitingRequ
 	return s.promoteResult, s.promoteErr
 }
 
-func (s *stubBackend) Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error) {
-	if s.cancelFn != nil {
-		return s.cancelFn(ctx, req)
+func (s *stubBackend) TerminalizeWaiting(ctx context.Context, req TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
+	s.terminalizeMu.Lock()
+	s.terminalizeCalls = append(s.terminalizeCalls, req)
+	s.terminalizeMu.Unlock()
+	if s.terminalizeWaitingFn != nil {
+		return s.terminalizeWaitingFn(ctx, req)
 	}
-	return s.cancelResult, s.cancelErr
+	return s.terminalizeWaitingResult, s.terminalizeWaitingErr
 }
 
-func (s *stubBackend) ExpireScope(_ context.Context, _ ExpireScopeRequest) (*ExpireScopeResult, error) {
+func (s *stubBackend) snapshotTerminalizeCalls() []TerminalizeWaitingRequest {
+	s.terminalizeMu.Lock()
+	defer s.terminalizeMu.Unlock()
+	return append([]TerminalizeWaitingRequest(nil), s.terminalizeCalls...)
+}
+
+func (s *stubBackend) ExpireScope(ctx context.Context, req ExpireScopeRequest) (*ExpireScopeResult, error) {
+	if s.expireFn != nil {
+		return s.expireFn(ctx, req)
+	}
 	return s.expireResult, s.expireErr
 }
 
@@ -1324,7 +1678,6 @@ func TestBusinessEndpointsReturn503BeforeStartupRecoveryReady(t *testing.T) {
 			claimResult:   &ClaimGrantResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: 5000, HandoffToken: "handoff-token", HandoffDeadlineMs: 4000},
 			ackResult:     &AckHandoffResult{Result: "acknowledged", HeartbeatDeadlineMs: 4000},
 			releaseResult: &ReleaseResult{Result: "released", RequestID: "request-1"},
-			cancelResult:  &CancelResult{Result: "cancelled"},
 			heartbeatOpenResult: &HeartbeatResult{
 				Result:              "accepted",
 				Generation:          1,
@@ -1350,17 +1703,6 @@ func TestBusinessEndpointsReturn503BeforeStartupRecoveryReady(t *testing.T) {
 	claimReq := ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-token", NowMs: 1000}
 	ackReq := AckHandoffRequest{RequestID: "request-1", HandoffToken: "handoff-token", NowMs: 1000}
 	releaseReq := validReleaseRequest()
-	cancelReq := CancelRequest{
-		RequestID:      "request-1",
-		Hostname:       "example.com",
-		HostnameHash:   "host-hash",
-		SiteBucket:     "site-a",
-		IPBucket:       "ip-a",
-		HardExpireAtMs: 5000,
-		Reason:         "worker_aborted",
-		NowMs:          1000,
-	}
-
 	for _, tc := range []struct {
 		method string
 		path   string
@@ -1371,7 +1713,6 @@ func TestBusinessEndpointsReturn503BeforeStartupRecoveryReady(t *testing.T) {
 		{method: http.MethodPost, path: ackPath, body: ackReq},
 		{method: http.MethodGet, path: heartbeatPath},
 		{method: http.MethodPost, path: releasePath, body: releaseReq},
-		{method: http.MethodPost, path: cancelPath, body: cancelReq},
 	} {
 		var rec *httptest.ResponseRecorder
 		if tc.method == http.MethodGet {
@@ -1494,6 +1835,45 @@ func TestHeartbeatRouteRegisteredWhenEnabled(t *testing.T) {
 
 	if rec.Code != http.StatusUpgradeRequired {
 		t.Fatalf("expected registered heartbeat route to reject non-upgrade GET with 426, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestConcurrencyCancelRouteIsRemoved(t *testing.T) {
+	server := newTestServerInstance(t, &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released"}})
+	rec := postJSON(t, server.Handler(), cancelPath, map[string]any{
+		"requestId":      "cancelled-active-request",
+		"hostname":       "cancel.example.com",
+		"hostnameHash":   "cancel-host",
+		"siteBucket":     "site-a",
+		"ipBucket":       "ip-a",
+		"hardExpireAtMs": time.Now().Add(time.Minute).UnixMilli(),
+		"nowMs":          time.Now().UnixMilli(),
+	}, "secret")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected removed cancel route to return 404, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestConcurrencyPublicDocsOmitCancelContract(t *testing.T) {
+	for _, path := range []string{
+		"../../README.md",
+		"../../../README.md",
+		"../../../download-worker-architecture.md",
+	} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		text := string(content)
+		if strings.Contains(text, "/api/v1/concurrency/cancel") {
+			t.Fatalf("expected %s to omit public cancel route", path)
+		}
+		if strings.Contains(text, "releaseTimeoutMs` for `/release` and `/cancel`") {
+			t.Fatalf("expected %s to omit release/cancel timeout contract", path)
+		}
+		if strings.Contains(text, "request-level `cancel`") {
+			t.Fatalf("expected %s to omit request-level cancel contract", path)
+		}
 	}
 }
 
@@ -2081,19 +2461,6 @@ func TestHandleReleaseCancelsHeartbeatScheduleAndWakesWaiters(t *testing.T) {
 	}
 }
 
-func TestHandleCancelCancelsHeartbeatSchedule(t *testing.T) {
-	server := newTestServerInstance(t, &stubBackend{cancelResult: &CancelResult{Result: "cancelled"}})
-	server.heartbeatRuntime.schedule("cancelled-active-request", time.Now().Add(time.Minute).UnixMilli())
-
-	rec := postJSON(t, server.Handler(), cancelPath, CancelRequest{RequestID: "cancelled-active-request", Hostname: "cancel.example.com", HostnameHash: "cancel-host", SiteBucket: "site-a", IPBucket: "ip-a", HardExpireAtMs: time.Now().Add(time.Minute).UnixMilli(), Reason: "worker_aborted", NowMs: time.Now().UnixMilli()}, "secret")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected cancel 200, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	if got := server.heartbeatRuntime.scheduledDeadline("cancelled-active-request"); got != 0 {
-		t.Fatalf("expected cancel to clear heartbeat schedule, got %d", got)
-	}
-}
-
 func TestHeartbeatRuntimeExpiryCancelsScheduleAndWakesWaiters(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -2332,6 +2699,368 @@ func TestReleaseAttachedWaiterCompensatesBufferedGrantedResultOnDisconnect(t *te
 	assertObservabilityCount(t, counts, observabilityGrantDeliveryFailed, 1)
 }
 
+func TestCompensateGrantDeliveryUsesServerOwnedContextWhenCallerCancelled(t *testing.T) {
+	called := make(chan struct{}, 1)
+	backend := &stubBackend{releaseFn: func(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error) {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("expected active server-owned compensation context, got %v", err)
+		}
+		if req.Reason != releaseReasonGrantDeliveryFailed {
+			t.Fatalf("expected grant delivery failure reason, got %+v", req)
+		}
+		called <- struct{}{}
+		return &ReleaseResult{Result: "released", RequestID: "cancelled-caller-request"}, nil
+	}}
+	server := newTestServerInstance(t, backend)
+
+	callerCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	server.compensateGrantDelivery(callerCtx, "cancelled-caller-request", &AcquireResult{
+		Result:     "granted",
+		LeaseID:    "lease-cancelled-caller",
+		LeaseToken: "token-cancelled-caller",
+	}, releaseReasonGrantDeliveryFailed, time.Now().UnixMilli())
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected compensating release call")
+	}
+}
+
+func TestWaiterDisconnectTerminatesWaitingRowState(t *testing.T) {
+	nowMs := time.Now().UnixMilli()
+	db := requireRuntimeConcurrencyDB(t)
+
+	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "wait-disconnect-host",
+		Hostname:          "wait-disconnect.example.com",
+		SiteBucket:        "site-busy",
+		IPBucket:          "ip-busy",
+		RequestID:         "busy-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed busy lease: %v", err)
+	}
+	if busy.Result != "granted" {
+		t.Fatalf("expected busy lease grant, got %+v", busy)
+	}
+
+	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "wait-disconnect-host",
+		Hostname:          "wait-disconnect.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "wait-disconnect-request",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed waiting request: %v", err)
+	}
+	if waiting.Result != "wait" || !waiting.WaitToken.Valid {
+		t.Fatalf("expected waiting request, got %+v", waiting)
+	}
+
+	cfg := validTestConfig()
+	cfg.Concurrency.Caps.HostMaxInFlight = 1
+	cfg.Concurrency.Caps.SiteMaxInFlight = 1
+	cfg.Concurrency.Caps.SiteIPMaxInFlight = 1
+	backend := &continueWaitSignalsBackend{
+		inner:             &postgresBackend{cfg: cfg, db: &sqlDBClient{db: db}},
+		waitToken:         waiting.WaitToken.String,
+		attachRefreshDone: make(chan struct{}),
+	}
+	server := newTestServerInstanceWithConfig(t, cfg, backend)
+	handler := server.Handler()
+	req := AcquireRequest{
+		Hostname:         "wait-disconnect.example.com",
+		HostnameHash:     "wait-disconnect-host",
+		SiteBucket:       "site-a",
+		IPBucket:         "ip-a",
+		RequestID:        "wait-disconnect-request",
+		HardExpireAtMs:   nowMs + 120_000,
+		NowMs:            nowMs,
+		WaitToken:        waiting.WaitToken.String,
+		DeadlineMs:       nowMs + 30_000,
+		TicketHash:       "ticket-hash-1",
+		ClientInstanceID: "client-1",
+	}
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req))).WithContext(reqCtx)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(rec, httpReq)
+		close(done)
+	}()
+
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		return strings.Contains(rec.Body.String(), "event: accepted\n")
+	}, "expected wait handler to accept SSE stream before disconnect")
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); !ok || snap.RequestID != req.RequestID {
+		t.Fatalf("expected accepted wait to retain waiting snapshot before disconnect, got %+v ok=%v", snap, ok)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for wait disconnect")
+	}
+
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); ok {
+		t.Fatalf("expected disconnect to remove waiting snapshot, got %+v", snap)
+	}
+	if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("expected disconnect to remove attached waiter")
+	}
+
+	var requestState, terminalReason string
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT state, COALESCE(terminal_reason, '')
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, req.RequestID).Scan(&requestState, &terminalReason); err != nil {
+		t.Fatalf("read waiting request state after disconnect: %v", err)
+	}
+	if requestState != "released" || terminalReason != "final_cleanup" {
+		t.Fatalf("expected accepted wait disconnect to terminalize waiting row, got state=%q reason=%q", requestState, terminalReason)
+	}
+
+	replay, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "wait-disconnect-host",
+		Hostname:          "wait-disconnect.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         req.RequestID,
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs + 1,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("replay acquire after disconnect: %v", err)
+	}
+	if replay.Result != "released" || replay.Reason.String != "final_cleanup" {
+		t.Fatalf("expected terminal replay after disconnect, got %+v", replay)
+	}
+}
+
+func TestWaiterDisconnectRetriesFinalCleanupFromHostReactor(t *testing.T) {
+	cfg := validTestConfig()
+	terminalizeCalls := 0
+	backend := &stubBackend{
+		probeResult: &AcquireResult{Result: "wait", WaitToken: "wait-disconnect-token", Scope: "host", RetryAfter: 1},
+		terminalizeWaitingFn: func(_ context.Context, _ TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
+			terminalizeCalls++
+			if terminalizeCalls == 1 {
+				return nil, errors.New("db down")
+			}
+			return &TerminalizeWaitingResult{Result: "released", Reason: "final_cleanup"}, nil
+		},
+	}
+	server := newTestServerInstanceWithConfig(t, cfg, backend)
+	handler := server.Handler()
+	nowMs := time.Now().UnixMilli()
+	req := AcquireRequest{
+		Hostname:         "wait-disconnect.example.com",
+		HostnameHash:     "wait-disconnect-host",
+		SiteBucket:       "site-a",
+		IPBucket:         "ip-a",
+		RequestID:        "wait-disconnect-request",
+		HardExpireAtMs:   nowMs + 120_000,
+		NowMs:            nowMs,
+		WaitToken:        "wait-disconnect-token",
+		DeadlineMs:       nowMs + 30_000,
+		TicketHash:       "ticket-hash-1",
+		ClientInstanceID: "client-1",
+	}
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req))).WithContext(reqCtx)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(rec, httpReq)
+		close(done)
+	}()
+
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		return strings.Contains(rec.Body.String(), "event: accepted\n")
+	}, "expected wait handler to accept SSE stream before disconnect")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for wait disconnect")
+	}
+
+	if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("dead waiter must not be active")
+	}
+
+	server.runHostPass(context.Background(), req.HostnameHash)
+
+	got := backend.snapshotTerminalizeCalls()
+	if len(got) != 2 {
+		t.Fatalf("expected handler cleanup and reactor retry, got %d calls: %+v", len(got), got)
+	}
+	if got[1].Reason != "final_cleanup" {
+		t.Fatalf("worker cleanup reason = %q, want final_cleanup", got[1].Reason)
+	}
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); ok {
+		t.Fatalf("expected worker cleanup to remove snapshot, got %+v", snap)
+	}
+	nextWaiter, ok := server.waitingRuntime.tryAttach(req.WaitToken)
+	if !ok || nextWaiter == nil {
+		t.Fatal("expected wait token to be attachable after disconnected cleanup retry")
+	}
+	server.waitingRuntime.release(nextWaiter)
+}
+
+func TestWaiterDisconnectDropsLocalStateWhenAlreadyTerminalized(t *testing.T) {
+	cfg := validTestConfig()
+	server := newTestServerInstanceWithConfig(t, cfg, &stubBackend{
+		probeResult:              &AcquireResult{Result: "wait", WaitToken: "wait-disconnect-token", Scope: "host", RetryAfter: 1},
+		terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "noop", Reason: "already_terminal"},
+	})
+	handler := server.Handler()
+	nowMs := time.Now().UnixMilli()
+	req := AcquireRequest{
+		Hostname:         "wait-disconnect.example.com",
+		HostnameHash:     "wait-disconnect-host",
+		SiteBucket:       "site-a",
+		IPBucket:         "ip-a",
+		RequestID:        "wait-disconnect-request",
+		HardExpireAtMs:   nowMs + 120_000,
+		NowMs:            nowMs,
+		WaitToken:        "wait-disconnect-token",
+		DeadlineMs:       nowMs + 30_000,
+		TicketHash:       "ticket-hash-1",
+		ClientInstanceID: "client-1",
+	}
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req))).WithContext(reqCtx)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(rec, httpReq)
+		close(done)
+	}()
+
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		return strings.Contains(rec.Body.String(), "event: accepted\n")
+	}, "expected wait handler to accept SSE stream before disconnect")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for wait disconnect")
+	}
+
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); ok {
+		t.Fatalf("expected already-terminal disconnect path to drop waiting snapshot, got %+v", snap)
+	}
+	if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("expected already-terminal disconnect path to drop attached waiter state")
+	}
+}
+
+func TestWaiterDisconnectAdvancesNextAttachedHead(t *testing.T) {
+	cfg := validTestConfig()
+	baseNowMs := time.Now().UnixMilli()
+	backend := &recordingPromoteBackend{
+		resultsByID: map[string]*AcquireResult{
+			"waiting-request-2": {Result: "granted", LeaseID: "lease-2", LeaseToken: "token-2", ExpiresAtMs: baseNowMs + 9_999},
+		},
+		probeResults: map[string]*AcquireResult{
+			"waiting-request-1": {Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 1},
+			"waiting-request-2": {Result: "wait", WaitToken: "wait-2", Scope: "host", RetryAfter: 1},
+		},
+	}
+	server := newTestServerInstanceWithConfig(t, cfg, backend)
+	handler := server.Handler()
+
+	waiter2, ok := server.waitingRuntime.tryAttach("wait-2")
+	if !ok || waiter2 == nil {
+		t.Fatal("expected second waiter attach")
+	}
+	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "disconnect-advance.example.com", HostnameHash: "disconnect-advance-host", SiteBucket: "site-b", IPBucket: "ip-b1", RequestID: "waiting-request-2", HardExpireAtMs: baseNowMs + 20_000, NowMs: baseNowMs + 1, WaitToken: "wait-2"}, "wait-2", waiter2, cfg)
+
+	firstReq := AcquireRequest{
+		Hostname:         "disconnect-advance.example.com",
+		HostnameHash:     "disconnect-advance-host",
+		SiteBucket:       "site-a",
+		IPBucket:         "ip-a1",
+		RequestID:        "waiting-request-1",
+		HardExpireAtMs:   baseNowMs + 20_000,
+		NowMs:            baseNowMs,
+		WaitToken:        "wait-1",
+		DeadlineMs:       baseNowMs + 15_000,
+		TicketHash:       "ticket-hash-1",
+		ClientInstanceID: "client-1",
+	}
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, firstReq))).WithContext(reqCtx)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(rec, httpReq)
+		close(done)
+	}()
+
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		return strings.Contains(rec.Body.String(), "event: accepted\n")
+	}, "expected first waiter accepted before disconnect advancement")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first waiter disconnect")
+	}
+
+	select {
+	case delivered := <-waiter2.resultCh:
+		if delivered == nil || delivered.Result != "granted" || delivered.LeaseID != "lease-2" {
+			t.Fatalf("expected next attached head granted after disconnect, got %+v", delivered)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timed out waiting for next attached head to advance after disconnect")
+	}
+}
+
 func TestAcquireReturnsWaitWithStableToken(t *testing.T) {
 	handler := newTestServer(t, &stubBackend{acquireResult: &AcquireResult{Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 2}})
 	rec := postJSON(t, handler, "/api/v1/concurrency/acquire", validAcquireRequest(), "secret")
@@ -2341,6 +3070,392 @@ func TestAcquireReturnsWaitWithStableToken(t *testing.T) {
 	body := decodeBody(t, rec)
 	if body["result"] != "wait" || body["waitToken"] != "wait-1" || body["scope"] != "host" || body["retryAfter"] != float64(2) {
 		t.Fatalf("expected wait body with stable token, got %v", body)
+	}
+}
+
+func TestHandleAcquireWaitDoesNotCreateActiveWaitingRequest(t *testing.T) {
+	server := newTestServerInstance(t, &stubBackend{acquireResult: &AcquireResult{Result: "wait", WaitToken: "wait-provisional", Scope: "host", RetryAfter: 1}})
+	rec := postJSON(t, server.Handler(), acquirePath, validAcquireRequest(), "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["result"] != "wait" || body["waitToken"] != "wait-provisional" || body["scope"] != "host" || body["retryAfter"] != float64(1) {
+		t.Fatalf("expected provisional wait body, got %v", body)
+	}
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken("wait-provisional"); ok {
+		t.Fatalf("fast acquire wait must not create active waiting snapshot, got %+v", snap)
+	}
+	if server.waitingRuntime.hasAttachedWaiter("wait-provisional") {
+		t.Fatal("fast acquire wait must not attach an active waiter")
+	}
+	if reactor := server.waitingRuntime.hostReactors["host-hash"]; reactor != nil {
+		t.Fatalf("fast acquire wait must not start a host reactor, got %+v", reactor)
+	}
+}
+
+func TestHandleWaitCreatesActiveWaiterAfterAcceptedSSE(t *testing.T) {
+	server := newTestServerInstance(t, &probingBackend{
+		stubBackend: &stubBackend{},
+		probeFn: func(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
+			if req.WaitToken != "wait-attach" {
+				t.Fatalf("unexpected wait token: %+v", req)
+			}
+			return &AcquireResult{Result: "wait", WaitToken: "wait-attach", Scope: "host", RetryAfter: 1}, nil
+		},
+	})
+	req := withWaitRequestFields(validAcquireRequest())
+	req.Hostname = "wait.example.com"
+	req.HostnameHash = "wait-host"
+	req.SiteBucket = "site-a"
+	req.IPBucket = "ip-a"
+	req.RequestID = "wait-attach-request"
+	req.HardExpireAtMs = time.Now().Add(time.Minute).UnixMilli()
+	req.WaitToken = "wait-attach"
+	req.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req))).WithContext(reqCtx)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	rec := newBlockingAcceptedResponseWriter()
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(rec, httpReq)
+		close(done)
+	}()
+
+	select {
+	case <-rec.acceptedStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for accepted SSE write to start")
+	}
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken("wait-attach"); ok {
+		t.Fatalf("active waiter snapshot must not exist before accepted write succeeds, got %+v", snap)
+	}
+	if server.waitingRuntime.hasAttachedWaiter("wait-attach") {
+		t.Fatal("attached waiter must not be active before accepted write succeeds")
+	}
+	if reactor := server.waitingRuntime.hostReactors["wait-host"]; reactor != nil {
+		t.Fatalf("host reactor must not start before accepted attachment, got %+v", reactor)
+	}
+
+	close(rec.allowAccepted)
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		_, ok := server.waitingRuntime.snapshotForWaitToken("wait-attach")
+		return ok && server.waitingRuntime.hasAttachedWaiter("wait-attach") && server.waitingRuntime.hostReactors["wait-host"] != nil
+	}, "expected accepted wait to promote active waiter and start host reactor")
+	if !strings.Contains(rec.BodyString(), "event: accepted\n") {
+		t.Fatalf("expected accepted SSE event, got %q", rec.BodyString())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for wait stream cleanup")
+	}
+}
+
+func TestHandleWaitPreSSETerminalClearsProvisionalWaitTokenObservation(t *testing.T) {
+	server := newTestServerInstance(t, &stubBackend{
+		acquireResult: &AcquireResult{Result: "wait", WaitToken: "wait-pre-sse-terminal", Scope: "host", RetryAfter: 1},
+		probeResult:   &AcquireResult{Result: "expired", Reason: "hard_expired"},
+	})
+	baseReq := validAcquireRequest()
+	baseReq.Hostname = "pre-sse-terminal.example.com"
+	baseReq.HostnameHash = "pre-sse-terminal-host"
+	baseReq.SiteBucket = "site-a"
+	baseReq.IPBucket = "ip-a"
+	baseReq.RequestID = "pre-sse-terminal-request"
+	baseReq.HardExpireAtMs = time.Now().Add(time.Minute).UnixMilli()
+	baseReq.NowMs = time.Now().UnixMilli()
+
+	acquireRec := postJSON(t, server.Handler(), acquirePath, baseReq, "secret")
+	if acquireRec.Code != http.StatusOK {
+		t.Fatalf("expected acquire wait 200, got %d body=%s", acquireRec.Code, acquireRec.Body.String())
+	}
+	if !server.waitingRuntime.isReplayWaitToken("wait-pre-sse-terminal") {
+		t.Fatal("expected provisional token observation before /wait terminal response")
+	}
+
+	waitReq := withWaitRequestFields(baseReq)
+	waitReq.WaitToken = "wait-pre-sse-terminal"
+	waitReq.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+	waitRec := postJSON(t, server.Handler(), waitPath, waitReq, "secret")
+	if waitRec.Code != http.StatusGone {
+		t.Fatalf("expected pre-SSE terminal expired response, got %d body=%s", waitRec.Code, waitRec.Body.String())
+	}
+	if server.waitingRuntime.isReplayWaitToken("wait-pre-sse-terminal") {
+		t.Fatal("expected pre-SSE terminal response to clear provisional wait-token tracking")
+	}
+	if server.waitingRuntime.hasAttachedWaiter("wait-pre-sse-terminal") {
+		t.Fatal("pre-SSE terminal response must not attach an active waiter")
+	}
+}
+
+func TestHandleAcquireWaitTokenCanAttachAfterAcceptedSSE(t *testing.T) {
+	server := newTestServerInstance(t, &stubBackend{
+		acquireResult: &AcquireResult{Result: "wait", WaitToken: "wait-from-acquire", Scope: "host", RetryAfter: 1},
+		probeResult:   &AcquireResult{Result: "wait", WaitToken: "wait-from-acquire", Scope: "host", RetryAfter: 1},
+	})
+	baseReq := validAcquireRequest()
+	baseReq.Hostname = "acquire-wait.example.com"
+	baseReq.HostnameHash = "acquire-wait-host"
+	baseReq.SiteBucket = "site-a"
+	baseReq.IPBucket = "ip-a"
+	baseReq.RequestID = "acquire-wait-request"
+	baseReq.HardExpireAtMs = time.Now().Add(time.Minute).UnixMilli()
+	baseReq.NowMs = time.Now().UnixMilli()
+
+	acquireRec := postJSON(t, server.Handler(), acquirePath, baseReq, "secret")
+	if acquireRec.Code != http.StatusOK {
+		t.Fatalf("expected acquire wait 200, got %d body=%s", acquireRec.Code, acquireRec.Body.String())
+	}
+	acquireBody := decodeBody(t, acquireRec)
+	if acquireBody["result"] != "wait" || acquireBody["waitToken"] != "wait-from-acquire" {
+		t.Fatalf("expected acquire to return provisional wait token, got %v", acquireBody)
+	}
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken("wait-from-acquire"); ok {
+		t.Fatalf("fast acquire must not create active snapshot before wait attach, got %+v", snap)
+	}
+
+	waitReq := withWaitRequestFields(baseReq)
+	waitReq.WaitToken = "wait-from-acquire"
+	waitReq.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, waitReq))).WithContext(reqCtx)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	rec := newBlockingAcceptedResponseWriter()
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(rec, httpReq)
+		close(done)
+	}()
+
+	select {
+	case <-rec.acceptedStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected acquired provisional token to reach accepted SSE attachment")
+	}
+	close(rec.allowAccepted)
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		_, ok := server.waitingRuntime.snapshotForWaitToken("wait-from-acquire")
+		return ok && server.waitingRuntime.hasAttachedWaiter("wait-from-acquire")
+	}, "expected acquire-provided token to become active after accepted SSE")
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for wait stream cleanup")
+	}
+}
+
+func TestHandleWaitAcceptedTerminalResultCreatesActiveWaiterUntilFinalDelivery(t *testing.T) {
+	nowMs := time.Now().UnixMilli()
+	tests := []struct {
+		name   string
+		result *AcquireResult
+	}{
+		{name: "granted", result: &AcquireResult{Result: "granted", LeaseID: "lease-terminal", LeaseToken: "token-terminal", ExpiresAtMs: nowMs + 30_000, ClaimToken: "claim-terminal"}},
+		{name: "released", result: &AcquireResult{Result: "released", Reason: "final_cleanup"}},
+		{name: "cancelled", result: &AcquireResult{Result: "cancelled", Reason: "request_cancelled"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			waitToken := "wait-terminal-" + tc.name
+			server := newTestServerInstance(t, &stubBackend{probeResult: cloneAcquireResult(tc.result)})
+			req := withWaitRequestFields(validAcquireRequest())
+			req.Hostname = "terminal.example.com"
+			req.HostnameHash = "terminal-host-" + tc.name
+			req.SiteBucket = "site-a"
+			req.IPBucket = "ip-a"
+			req.RequestID = "terminal-request-" + tc.name
+			req.HardExpireAtMs = nowMs + 60_000
+			req.WaitToken = waitToken
+			req.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+
+			httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req)))
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("X-CQ-Auth", "secret")
+			rec := newBlockingAcceptedAndResultResponseWriter()
+			done := make(chan struct{})
+			go func() {
+				server.Handler().ServeHTTP(rec, httpReq)
+				close(done)
+			}()
+
+			select {
+			case <-rec.acceptedStarted:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for accepted SSE write to start")
+			}
+			close(rec.allowAccepted)
+			select {
+			case <-rec.resultStarted:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for terminal result write to start")
+			}
+			if snap, ok := server.waitingRuntime.snapshotForWaitToken(waitToken); !ok || snap.RequestID != req.RequestID {
+				t.Fatalf("accepted terminal lifecycle must create active snapshot before final delivery, got %+v ok=%v", snap, ok)
+			}
+			if !server.waitingRuntime.hasAttachedWaiter(waitToken) {
+				t.Fatal("accepted terminal lifecycle must have attached waiter before final delivery")
+			}
+
+			close(rec.allowResult)
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for terminal result delivery")
+			}
+			if snap, ok := server.waitingRuntime.snapshotForWaitToken(waitToken); ok {
+				t.Fatalf("terminal result cleanup must remove active snapshot, got %+v", snap)
+			}
+			if server.waitingRuntime.hasAttachedWaiter(waitToken) {
+				t.Fatal("terminal result cleanup must remove attached waiter")
+			}
+		})
+	}
+}
+
+func TestHandleWaitSetupTerminalDoesNotCreateActiveWaiter(t *testing.T) {
+	baseReq := withWaitRequestFields(validAcquireRequest())
+	baseReq.Hostname = "wait.example.com"
+	baseReq.HostnameHash = "wait-host"
+	baseReq.SiteBucket = "site-a"
+	baseReq.IPBucket = "ip-a"
+	baseReq.RequestID = "wait-setup-request"
+	baseReq.HardExpireAtMs = time.Now().Add(time.Minute).UnixMilli()
+	baseReq.WaitToken = "wait-setup"
+	baseReq.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+
+	tests := []struct {
+		name       string
+		server     func(t *testing.T) *Server
+		request    func(AcquireRequest) any
+		wantStatus int
+		wantResult string
+		wantReason string
+		wantError  string
+	}{
+		{
+			name:       "missing wait token",
+			server:     func(t *testing.T) *Server { return newTestServerInstance(t, &stubBackend{}) },
+			request:    func(req AcquireRequest) any { req.WaitToken = ""; return req },
+			wantStatus: http.StatusBadRequest,
+			wantResult: "error",
+			wantReason: "waitToken is required",
+			wantError:  "waitToken is required",
+		},
+		{
+			name: "stale provisional token",
+			server: func(t *testing.T) *Server {
+				return newTestServerInstance(t, &stubBackend{probeErr: &acquireConflictError{Reason: acquireConflictReasonStaleWaitToken}})
+			},
+			request:    func(req AcquireRequest) any { return req },
+			wantStatus: http.StatusConflict,
+			wantResult: "conflict",
+			wantReason: acquireConflictReasonStaleWaitToken,
+		},
+		{
+			name: "tuple mismatch",
+			server: func(t *testing.T) *Server {
+				return newTestServerInstance(t, &stubBackend{probeErr: &acquireConflictError{Reason: acquireConflictReasonRequestIDTupleMismatch}})
+			},
+			request:    func(req AcquireRequest) any { return req },
+			wantStatus: http.StatusConflict,
+			wantResult: "conflict",
+			wantReason: acquireConflictReasonRequestIDTupleMismatch,
+		},
+		{
+			name: "already consumed provisional token",
+			server: func(t *testing.T) *Server {
+				server := newTestServerInstance(t, &stubBackend{probeResult: &AcquireResult{Result: "wait", WaitToken: "wait-setup", Scope: "host", RetryAfter: 1}})
+				server.waitingRuntime.markWaitTokenConsumed("wait-setup")
+				return server
+			},
+			request:    func(req AcquireRequest) any { return req },
+			wantStatus: http.StatusConflict,
+			wantResult: "conflict",
+			wantReason: acquireConflictReasonWaiterAlreadyAttached,
+		},
+		{
+			name: "expired provisional token",
+			server: func(t *testing.T) *Server {
+				return newTestServerInstance(t, &stubBackend{probeResult: &AcquireResult{Result: "expired", Reason: "hard_expired", WaitToken: "wait-setup"}})
+			},
+			request:    func(req AcquireRequest) any { return req },
+			wantStatus: http.StatusGone,
+			wantResult: "expired",
+			wantReason: "hard_expired",
+		},
+		{
+			name: "wait admission overload",
+			server: func(t *testing.T) *Server {
+				return newTestServerInstance(t, &stubBackend{probeErr: errors.New("wait admission overloaded")})
+			},
+			request:    func(req AcquireRequest) any { return req },
+			wantStatus: http.StatusServiceUnavailable,
+			wantResult: "error",
+			wantReason: "wait admission overloaded",
+			wantError:  "wait admission overloaded",
+		},
+		{
+			name:       "unavailable prober",
+			server:     func(t *testing.T) *Server { return newTestServerInstance(t, &noProbeBackend{}) },
+			request:    func(req AcquireRequest) any { return req },
+			wantStatus: http.StatusServiceUnavailable,
+			wantResult: "error",
+			wantReason: "service unavailable",
+			wantError:  "service unavailable",
+		},
+		{
+			name: "probe error",
+			server: func(t *testing.T) *Server {
+				return newTestServerInstance(t, &stubBackend{probeErr: errors.New("db down")})
+			},
+			request:    func(req AcquireRequest) any { return req },
+			wantStatus: http.StatusServiceUnavailable,
+			wantResult: "error",
+			wantReason: "service unavailable",
+			wantError:  "service unavailable",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := tc.server(t)
+			reqBody := tc.request(baseReq)
+			rec := postJSON(t, server.Handler(), waitPath, reqBody, "secret")
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("expected status %d, got %d body=%s", tc.wantStatus, rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Type"); got == "text/event-stream" {
+				t.Fatalf("setup terminal response must not accept SSE, got content-type %q body=%s", got, rec.Body.String())
+			}
+			body := decodeBody(t, rec)
+			if body["result"] != tc.wantResult || body["reason"] != tc.wantReason {
+				t.Fatalf("expected result/reason %q/%q, got %v", tc.wantResult, tc.wantReason, body)
+			}
+			if tc.wantError != "" && body["error"] != tc.wantError {
+				t.Fatalf("expected error %q, got %v", tc.wantError, body)
+			}
+			waitToken := baseReq.WaitToken
+			if bodyReq, ok := reqBody.(AcquireRequest); ok {
+				waitToken = bodyReq.WaitToken
+			}
+			if snap, ok := server.waitingRuntime.snapshotForWaitToken(waitToken); ok {
+				t.Fatalf("setup terminal response must not create waiting snapshot, got %+v", snap)
+			}
+			if server.waitingRuntime.hasAttachedWaiter(waitToken) {
+				t.Fatal("setup terminal response must not leave attached waiter")
+			}
+		})
 	}
 }
 
@@ -2593,8 +3708,9 @@ func TestConcurrencyWaitReturnsExpiredOnStreamDeadline(t *testing.T) {
 	cfg := validTestConfig()
 	cfg.Concurrency.Wait.MaxStreamMs = 20
 	cfg.Concurrency.Wait.KeepaliveMs = 5
+	backend := &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "expired", Reason: "wait_stream_timeout"}}
 	server := newTestServerInstanceWithConfig(t, cfg, &probingBackend{
-		stubBackend: &stubBackend{},
+		stubBackend: backend,
 		probeFn: func(context.Context, AcquireRequest) (*AcquireResult, error) {
 			return &AcquireResult{Result: "wait", WaitToken: "wait-token-1", Scope: "host", RetryAfter: 1}, nil
 		},
@@ -2620,6 +3736,674 @@ func TestConcurrencyWaitReturnsExpiredOnStreamDeadline(t *testing.T) {
 	}
 	if result["reason"] != "wait_stream_timeout" {
 		t.Fatalf("expected wait_stream_timeout reason, got %v", result)
+	}
+	if got := backend.snapshotTerminalizeCalls(); len(got) != 1 || got[0].RequestID != "wait-request" || got[0].Reason != "wait_stream_timeout" {
+		t.Fatalf("expected deadline path to terminalize backend with wait_stream_timeout, got %+v", got)
+	}
+	if _, ok := server.waitingRuntime.snapshotForWaitToken("wait-token-1"); ok {
+		t.Fatal("expected deadline cleanup to clear local waiting snapshot")
+	}
+}
+
+func TestConcurrencyWaitSuppressesStreamDeadlineFinalWhenTerminalizeFails(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Concurrency.Wait.MaxStreamMs = 20
+	cfg.Concurrency.Wait.KeepaliveMs = 5
+	backend := &stubBackend{terminalizeWaitingErr: errors.New("terminalize failed")}
+	server := newTestServerInstanceWithConfig(t, cfg, &probingBackend{
+		stubBackend: backend,
+		probeFn: func(context.Context, AcquireRequest) (*AcquireResult, error) {
+			return &AcquireResult{Result: "wait", WaitToken: "wait-token-1", Scope: "host", RetryAfter: 1}, nil
+		},
+	})
+
+	rec := postJSON(t, server.Handler(), "/api/v1/concurrency/wait", map[string]any{
+		"hostname":         "wait.example.com",
+		"hostnameHash":     "wait-host",
+		"siteBucket":       "site-a",
+		"ipBucket":         "ip-a",
+		"requestId":        "wait-request",
+		"hardExpireAtMs":   time.Now().Add(time.Minute).UnixMilli(),
+		"waitToken":        "wait-token-1",
+		"deadlineMs":       time.Now().Add(5 * time.Millisecond).UnixMilli(),
+		"ticketHash":       "ticket-hash-1",
+		"clientInstanceId": "client-1",
+	}, "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected accepted wait stream 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	_, _, result := parseSSEStream(t, rec.Body.String())
+	if result["result"] == "expired" && result["reason"] == "wait_stream_timeout" {
+		t.Fatalf("terminalization failure must suppress expired wait_stream_timeout SSE final, got body=%q", rec.Body.String())
+	}
+	if got := backend.snapshotTerminalizeCalls(); len(got) != 1 || got[0].RequestID != "wait-request" || got[0].Reason != "wait_stream_timeout" {
+		t.Fatalf("expected deadline path to terminalize backend with wait_stream_timeout once, got %+v", got)
+	}
+	if _, ok := server.waitingRuntime.snapshotForWaitToken("wait-token-1"); !ok {
+		t.Fatal("terminalization failure must not falsely finish local waiting runtime as terminal expired")
+	}
+	counts := snapshotObservabilityCounts(t, server)
+	assertObservabilityCount(t, counts, observabilityWaitStreamTimeout, 0)
+}
+
+func TestConcurrencyWaitSuppressesStreamDeadlineFinalWhenTerminalizeReplayIsIncompatible(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Concurrency.Wait.MaxStreamMs = 20
+	cfg.Concurrency.Wait.KeepaliveMs = 5
+	backend := &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "noop", Reason: "already_terminal"}}
+	server := newTestServerInstanceWithConfig(t, cfg, &probingBackend{
+		stubBackend: backend,
+		probeFn: func(context.Context, AcquireRequest) (*AcquireResult, error) {
+			return &AcquireResult{Result: "wait", WaitToken: "wait-token-1", Scope: "host", RetryAfter: 1}, nil
+		},
+	})
+
+	rec := postJSON(t, server.Handler(), "/api/v1/concurrency/wait", map[string]any{
+		"hostname":         "wait.example.com",
+		"hostnameHash":     "wait-host",
+		"siteBucket":       "site-a",
+		"ipBucket":         "ip-a",
+		"requestId":        "wait-request",
+		"hardExpireAtMs":   time.Now().Add(time.Minute).UnixMilli(),
+		"waitToken":        "wait-token-1",
+		"deadlineMs":       time.Now().Add(5 * time.Millisecond).UnixMilli(),
+		"ticketHash":       "ticket-hash-1",
+		"clientInstanceId": "client-1",
+	}, "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected accepted wait stream 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	_, _, result := parseSSEStream(t, rec.Body.String())
+	if result["result"] == "expired" && result["reason"] == "wait_stream_timeout" {
+		t.Fatalf("incompatible already-terminal replay must suppress expired wait_stream_timeout SSE final, got body=%q", rec.Body.String())
+	}
+	if got := backend.snapshotTerminalizeCalls(); len(got) != 1 || got[0].RequestID != "wait-request" || got[0].Reason != "wait_stream_timeout" {
+		t.Fatalf("expected deadline path to terminalize backend with wait_stream_timeout once, got %+v", got)
+	}
+	counts := snapshotObservabilityCounts(t, server)
+	assertObservabilityCount(t, counts, observabilityWaitStreamTimeout, 0)
+}
+
+func TestContinueWaitAcceptedWriteFailureDoesNotEstablishOrTerminalizeActiveWaiter(t *testing.T) {
+	backend := &stubBackend{probeResult: &AcquireResult{Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 1}, terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released"}}
+	server := newTestServerInstance(t, backend)
+	req := validAcquireRequest()
+	nowMs := time.Now().UnixMilli()
+	req.NowMs = nowMs
+	req.HardExpireAtMs = nowMs + 60_000
+	req.WaitToken = "wait-1"
+	req.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+	rec := &sequenceFailResponseWriter{failOnWrite: 1}
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req)))
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	server.Handler().ServeHTTP(rec, httpReq)
+	if got := backend.snapshotTerminalizeCalls(); len(got) != 0 {
+		t.Fatalf("accepted write failure before active waiter establishment must not terminalize backend, got %+v", got)
+	}
+	if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("expected accepted write failure to clear local attached waiter")
+	}
+	if _, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); ok {
+		t.Fatal("expected accepted write failure not to leave active waiter snapshot")
+	}
+}
+
+func TestContinueWaitSQLBackedReservationRejectsDuplicateBeforeAccepted(t *testing.T) {
+	backend := &reservedProbeBackend{stubBackend: &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released"}}}
+	server := newTestServerInstance(t, backend)
+	baseReq := withWaitRequestFields(validAcquireRequest())
+	baseReq.Hostname = "reserved-attach.example.com"
+	baseReq.HostnameHash = "reserved-attach-host"
+	baseReq.SiteBucket = "site-a"
+	baseReq.IPBucket = "ip-a"
+	baseReq.RequestID = "reserved-attach-request"
+	baseReq.HardExpireAtMs = time.Now().Add(time.Minute).UnixMilli()
+	baseReq.WaitToken = "wait-reserved-attach"
+	baseReq.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	firstReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, baseReq))).WithContext(reqCtx)
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstReq.Header.Set("X-CQ-Auth", "secret")
+	firstRec := newBlockingAcceptedResponseWriter()
+	firstDone := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(firstRec, firstReq)
+		close(firstDone)
+	}()
+
+	select {
+	case <-firstRec.acceptedStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first accepted write to start")
+	}
+
+	secondRec := postJSON(t, server.Handler(), waitPath, baseReq, "secret")
+	if secondRec.Code != http.StatusConflict {
+		t.Fatalf("expected duplicate attach to be rejected before accepted SSE, got %d body=%s", secondRec.Code, secondRec.Body.String())
+	}
+	if got := secondRec.Header().Get("Content-Type"); got == "text/event-stream" {
+		t.Fatalf("duplicate attach must not accept SSE, got content-type %q body=%s", got, secondRec.Body.String())
+	}
+	secondBody := decodeBody(t, secondRec)
+	if secondBody["result"] != "conflict" || secondBody["reason"] != acquireConflictReasonWaiterAlreadyAttached {
+		t.Fatalf("expected waiter_already_attached conflict, got %v", secondBody)
+	}
+
+	close(firstRec.allowAccepted)
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		_, ok := server.waitingRuntime.snapshotForWaitToken(baseReq.WaitToken)
+		return ok && server.waitingRuntime.hasAttachedWaiter(baseReq.WaitToken)
+	}, "expected first accepted stream to promote active waiter")
+	cancel()
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first waiter cleanup")
+	}
+}
+
+func TestContinueWaitAcceptedWriteFailureReleasesSQLReservation(t *testing.T) {
+	backend := &reservedProbeBackend{stubBackend: &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released"}}}
+	server := newTestServerInstance(t, backend)
+	req := withWaitRequestFields(validAcquireRequest())
+	req.RequestID = "accepted-write-failure-request"
+	req.WaitToken = "wait-accepted-write-failure"
+	req.HardExpireAtMs = time.Now().Add(time.Minute).UnixMilli()
+	req.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+	rec := &sequenceFailResponseWriter{failOnWrite: 1}
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req)))
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	server.Handler().ServeHTTP(rec, httpReq)
+
+	backend.mu.Lock()
+	released := backend.released
+	reserved := backend.reserved
+	backend.mu.Unlock()
+	if released != 1 || reserved {
+		t.Fatalf("expected accepted write failure to release reservation once, released=%d reserved=%v", released, reserved)
+	}
+
+	retryCtx, retryCancel := context.WithCancel(context.Background())
+	defer retryCancel()
+	retryReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req))).WithContext(retryCtx)
+	retryReq.Header.Set("Content-Type", "application/json")
+	retryReq.Header.Set("X-CQ-Auth", "secret")
+	retryRec := httptest.NewRecorder()
+	retryDone := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(retryRec, retryReq)
+		close(retryDone)
+	}()
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		return strings.Contains(retryRec.Body.String(), "event: accepted\n")
+	}, "expected retry after failed accepted write to accept SSE")
+	retryCancel()
+	select {
+	case <-retryDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for retry wait cleanup")
+	}
+}
+
+func TestContinueWaitSetupProbeFailureReleasesReservationWithoutConsuming(t *testing.T) {
+	got := &setupProbeFailureBackend{stubBackend: &stubBackend{}}
+	server := newTestServerInstance(t, got)
+	req := withWaitRequestFields(validAcquireRequest())
+	req.RequestID = "setup-probe-failure-request"
+	req.WaitToken = "wait-setup-probe-failure"
+	req.HardExpireAtMs = time.Now().Add(time.Minute).UnixMilli()
+	req.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+
+	rec := postJSON(t, server.Handler(), waitPath, req, "secret")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected setup failure 503, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["result"] != "error" {
+		t.Fatalf("expected setup failure result=error, got %v", body)
+	}
+	if got.ReleaseCalls != 1 {
+		t.Fatalf("expected one reservation release, got %d", got.ReleaseCalls)
+	}
+	if got.ReleaseReq.Consume {
+		t.Fatalf("setup failure must release without consuming")
+	}
+	if got.ReleaseReq.RequestID != req.RequestID || got.ReleaseReq.WaitToken != req.WaitToken {
+		t.Fatalf("released wrong reservation: %+v", got.ReleaseReq)
+	}
+}
+
+func TestContinueWaitAcceptedDisconnectDoesNotCancelSQLPromotion(t *testing.T) {
+	backend := &cancelAwarePromoteBackend{
+		stubBackend:    &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released"}},
+		promoteEntered: make(chan context.Context, 1),
+		releasePromote: make(chan struct{}),
+	}
+	server := newTestServerInstance(t, backend)
+	req := withWaitRequestFields(validAcquireRequest())
+	req.RequestID = "accepted-disconnect-request"
+	req.WaitToken = "wait-accepted-disconnect"
+	req.HardExpireAtMs = time.Now().Add(time.Minute).UnixMilli()
+	req.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+	reqCtx, cancel := context.WithCancel(context.Background())
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req))).WithContext(reqCtx)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(rec, httpReq)
+		close(done)
+	}()
+
+	var promoteCtx context.Context
+	select {
+	case promoteCtx = <-backend.promoteEntered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for SQL promotion")
+	}
+	cancel()
+	select {
+	case <-promoteCtx.Done():
+		t.Fatal("accepted SQL promotion used request context and was canceled by client disconnect")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(backend.releasePromote)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for disconnect cleanup")
+	}
+	if got := backend.snapshotTerminalizeCalls(); len(got) != 1 || got[0].RequestID != req.RequestID || got[0].Reason != "final_cleanup" {
+		t.Fatalf("expected post-accepted disconnect cleanup after promotion, got %+v", got)
+	}
+}
+
+func TestContinueWaitSQLPromotionFailureReleasesReservationAndSendsTerminal(t *testing.T) {
+	tests := []struct {
+		name          string
+		promoteResult *AcquireResult
+		promoteErr    error
+		promoteNil    bool
+	}{
+		{name: "error", promoteErr: errors.New("promotion unavailable")},
+		{name: "nil", promoteNil: true},
+		{name: "invalid", promoteResult: &AcquireResult{Result: "wait", WaitToken: "", Scope: "host", RetryAfter: 1}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &reservedProbeBackend{
+				stubBackend:   &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released"}},
+				promoteResult: tc.promoteResult,
+				promoteErr:    tc.promoteErr,
+				promoteNil:    tc.promoteNil,
+			}
+			server := newTestServerInstance(t, backend)
+			req := withWaitRequestFields(validAcquireRequest())
+			req.RequestID = "promotion-failure-request-" + tc.name
+			req.WaitToken = "wait-promotion-failure-" + tc.name
+			req.HardExpireAtMs = time.Now().Add(time.Minute).UnixMilli()
+			req.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+			rec := postJSON(t, server.Handler(), waitPath, req, "secret")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected accepted SSE response despite promotion failure, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			streamText := rec.Body.String()
+			if !strings.Contains(streamText, "event: accepted\n") {
+				t.Fatalf("expected accepted SSE before promotion failure terminal, got %q", streamText)
+			}
+			_, _, result := parseSSEStream(t, streamText)
+			if result["result"] != "released" || result["reason"] != "final_cleanup" {
+				t.Fatalf("expected final_cleanup terminal SSE after promotion failure, got %v body=%q", result, streamText)
+			}
+
+			backend.mu.Lock()
+			released := backend.released
+			reserved := backend.reserved
+			backend.mu.Unlock()
+			if released != 1 || reserved {
+				t.Fatalf("expected promotion failure to release SQL reservation once, released=%d reserved=%v", released, reserved)
+			}
+			if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+				t.Fatal("promotion failure must not leave local attached waiter")
+			}
+			if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); ok {
+				t.Fatalf("promotion failure must not leave active waiter snapshot, got %+v", snap)
+			}
+
+			duplicateRec := postJSON(t, server.Handler(), waitPath, req, "secret")
+			if duplicateRec.Code != http.StatusOK {
+				t.Fatalf("expected duplicate attach after accepted promotion failure to replay terminal SSE, got %d body=%s", duplicateRec.Code, duplicateRec.Body.String())
+			}
+			_, _, duplicateBody := parseSSEStream(t, duplicateRec.Body.String())
+			if duplicateBody["result"] == "conflict" && duplicateBody["reason"] == acquireConflictReasonWaiterAlreadyAttached {
+				t.Fatalf("promotion failure replay must not be consumed-token conflict: %v", duplicateBody)
+			}
+			if duplicateBody["result"] != "released" || duplicateBody["reason"] != "final_cleanup" {
+				t.Fatalf("expected promotion failure replay to be durable terminal result, got %v body=%q", duplicateBody, duplicateRec.Body.String())
+			}
+		})
+	}
+}
+
+func TestContinueWaitSQLPromotionFailureReleaseFailureRetriesFromHostReactor(t *testing.T) {
+	backend := &reservedProbeBackend{
+		stubBackend:        &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released", Reason: "final_cleanup"}},
+		promoteErr:         errors.New("promotion unavailable"),
+		releaseErr:         errors.New("release unavailable"),
+		terminalizeResults: []*TerminalizeWaitingResult{{Result: "released", Reason: "final_cleanup"}},
+	}
+	server := newTestServerInstance(t, backend)
+	nowMs := time.Now().UnixMilli()
+	req := withWaitRequestFields(validAcquireRequest())
+	req.RequestID = "promotion-release-failure-request"
+	req.WaitToken = "wait-promotion-release-failure"
+	req.HostnameHash = "promotion-release-failure-host"
+	req.HardExpireAtMs = nowMs + 60_000
+	req.DeadlineMs = nowMs + 10_000
+
+	rec := postJSON(t, server.Handler(), waitPath, req, "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected accepted SSE response despite promotion failure, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	streamText := rec.Body.String()
+	if !strings.Contains(streamText, "event: accepted\n") {
+		t.Fatalf("expected accepted SSE before promotion failure terminal, got %q", streamText)
+	}
+	_, _, result := parseSSEStream(t, streamText)
+	if result["result"] != "released" || result["reason"] != "final_cleanup" {
+		t.Fatalf("expected best available final_cleanup SSE after promotion failure, got %v body=%q", result, streamText)
+	}
+	if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("promotion failure cleanup intent must not remain active")
+	}
+	candidates := server.waitingRuntime.disconnectedCleanupCandidates(req.HostnameHash)
+	if len(candidates) != 1 || candidates[0].Request.RequestID != req.RequestID || candidates[0].Reason != "final_cleanup" {
+		t.Fatalf("expected retained final_cleanup retry candidate, got %+v", candidates)
+	}
+
+	backend.mu.Lock()
+	backend.releaseErr = nil
+	backend.mu.Unlock()
+	server.runHostPass(context.Background(), req.HostnameHash)
+
+	backend.mu.Lock()
+	released := backend.released
+	consumed := backend.consumed
+	backend.mu.Unlock()
+	if released != 2 || !consumed {
+		t.Fatalf("expected worker retry to consume reserved SQL marker, released=%d consumed=%v", released, consumed)
+	}
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); ok {
+		t.Fatalf("expected worker retry to clear promotion failure snapshot, got %+v", snap)
+	}
+	if candidates := server.waitingRuntime.disconnectedCleanupCandidates(req.HostnameHash); len(candidates) != 0 {
+		t.Fatalf("expected worker retry to clear cleanup candidates, got %+v", candidates)
+	}
+}
+
+func TestContinueWaitSQLPromotionFailureAmbiguousReleaseRetryUsesAlreadyTerminalReplay(t *testing.T) {
+	backend := &reservedProbeBackend{
+		stubBackend:        &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "noop", Reason: "already_terminal"}},
+		promoteErr:         errors.New("promotion unavailable"),
+		releaseErrs:        []error{errors.New("release unavailable")},
+		releaseResults:     []*ReleaseWaitReservationResult{{Result: "noop", Reason: "already_terminal"}},
+		terminalizeResults: []*TerminalizeWaitingResult{{Result: "noop", Reason: "already_terminal"}},
+	}
+	server := newTestServerInstance(t, backend)
+	nowMs := time.Now().UnixMilli()
+	req := withWaitRequestFields(validAcquireRequest())
+	req.RequestID = "promotion-ambiguous-release-request"
+	req.WaitToken = "wait-promotion-ambiguous-release"
+	req.HostnameHash = "promotion-ambiguous-release-host"
+	req.HardExpireAtMs = nowMs + 60_000
+	req.DeadlineMs = nowMs + 10_000
+
+	rec := postJSON(t, server.Handler(), waitPath, req, "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected accepted SSE response despite promotion failure, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	_, _, result := parseSSEStream(t, rec.Body.String())
+	if result["result"] != "released" || result["reason"] != "final_cleanup" {
+		t.Fatalf("expected final_cleanup SSE after promotion failure, got %v", result)
+	}
+	if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("promotion failure cleanup intent must not remain active")
+	}
+	if candidates := server.waitingRuntime.disconnectedCleanupCandidates(req.HostnameHash); len(candidates) != 1 {
+		t.Fatalf("expected one retained cleanup candidate after ambiguous release failure, got %+v", candidates)
+	}
+
+	server.runHostPass(context.Background(), req.HostnameHash)
+
+	backend.mu.Lock()
+	released := backend.released
+	backend.mu.Unlock()
+	if released < 2 {
+		t.Fatalf("expected release retry plus terminal replay, got %d release calls", released)
+	}
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); ok {
+		t.Fatalf("expected ambiguous release retry to clear snapshot via already-terminal replay, got %+v", snap)
+	}
+	if candidates := server.waitingRuntime.disconnectedCleanupCandidates(req.HostnameHash); len(candidates) != 0 {
+		t.Fatalf("expected ambiguous release retry to clear cleanup candidate, got %+v", candidates)
+	}
+}
+
+func TestContinueWaitImmediateSQLPromotionResultEstablishesActiveWaiterBeforeFinalCleanup(t *testing.T) {
+	tests := []struct {
+		name          string
+		promoteResult *AcquireResult
+		assertResult  func(t *testing.T, result map[string]any, body string)
+	}{
+		{
+			name: "granted",
+			promoteResult: &AcquireResult{
+				Result:      "granted",
+				LeaseID:     "lease-immediate",
+				LeaseToken:  "lease-token-immediate",
+				ExpiresAtMs: time.Now().Add(30 * time.Second).UnixMilli(),
+				ClaimToken:  "claim-token-immediate",
+			},
+			assertResult: func(t *testing.T, result map[string]any, body string) {
+				t.Helper()
+				if result["result"] != "granted" || result["leaseToken"] != "lease-token-immediate" || result["claimToken"] != "claim-token-immediate" {
+					t.Fatalf("expected immediate granted result SSE, got %v body=%q", result, body)
+				}
+			},
+		},
+		{
+			name:          "released",
+			promoteResult: &AcquireResult{Result: "released", Reason: "already_released"},
+			assertResult: func(t *testing.T, result map[string]any, body string) {
+				t.Helper()
+				if result["result"] != "released" || result["reason"] != "already_released" {
+					t.Fatalf("expected immediate released result SSE, got %v body=%q", result, body)
+				}
+			},
+		},
+		{
+			name:          "cancelled",
+			promoteResult: &AcquireResult{Result: "cancelled", Reason: "request_cancelled"},
+			assertResult: func(t *testing.T, result map[string]any, body string) {
+				t.Helper()
+				if result["result"] != "cancelled" || result["reason"] != "request_cancelled" {
+					t.Fatalf("expected immediate cancelled result SSE, got %v body=%q", result, body)
+				}
+			},
+		},
+		{
+			name:          "expired",
+			promoteResult: &AcquireResult{Result: "expired", Reason: "hard_expired"},
+			assertResult: func(t *testing.T, result map[string]any, body string) {
+				t.Helper()
+				if result["result"] != "expired" || result["reason"] != "hard_expired" {
+					t.Fatalf("expected immediate expired result SSE, got %v body=%q", result, body)
+				}
+			},
+		},
+		{
+			name:          "conflict",
+			promoteResult: &AcquireResult{Result: "conflict", Reason: acquireConflictReasonWaiterAlreadyAttached},
+			assertResult: func(t *testing.T, result map[string]any, body string) {
+				t.Helper()
+				if result["result"] != "conflict" || result["reason"] != acquireConflictReasonWaiterAlreadyAttached {
+					t.Fatalf("expected immediate conflict result SSE, got %v body=%q", result, body)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			nowMs := time.Now().UnixMilli()
+			req := withWaitRequestFields(validAcquireRequest())
+			req.RequestID = "promotion-immediate-" + tc.name + "-request"
+			req.WaitToken = "wait-promotion-immediate-" + tc.name
+			req.HardExpireAtMs = nowMs + 60_000
+			req.DeadlineMs = nowMs + 10_000
+			if tc.promoteResult.Result == "granted" {
+				tc.promoteResult.ExpiresAtMs = nowMs + 30_000
+			}
+			backend := &reservedProbeBackend{
+				stubBackend:   &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released"}},
+				promoteResult: tc.promoteResult,
+			}
+			server := newTestServerInstance(t, backend)
+			rec := newBlockingAcceptedAndResultResponseWriter()
+			httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req)))
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("X-CQ-Auth", "secret")
+			done := make(chan struct{})
+			go func() {
+				server.Handler().ServeHTTP(rec, httpReq)
+				close(done)
+			}()
+
+			select {
+			case <-rec.acceptedStarted:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for accepted event")
+			}
+			close(rec.allowAccepted)
+			select {
+			case <-rec.resultStarted:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for final result write")
+			}
+			if !server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+				t.Fatal("expected immediate promotion result to establish active waiter before final SSE cleanup")
+			}
+			if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); !ok || snap.RequestID != req.RequestID || snap.WaiterLeaseUntilMs != req.DeadlineMs {
+				t.Fatalf("expected active waiter snapshot before final cleanup, got ok=%v snap=%+v", ok, snap)
+			}
+			close(rec.allowResult)
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for immediate promotion result cleanup")
+			}
+			if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+				t.Fatal("expected final result cleanup to remove attached waiter")
+			}
+			if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); ok {
+				t.Fatalf("expected final result cleanup to remove active snapshot, got %+v", snap)
+			}
+			events, _, result := parseSSEStream(t, rec.BodyString())
+			if len(events) < 2 || events[0] != "accepted" || events[1] != "result" {
+				t.Fatalf("expected accepted then result SSE events, got events=%v body=%q", events, rec.BodyString())
+			}
+			tc.assertResult(t, result, rec.BodyString())
+		})
+	}
+}
+
+func TestContinueWaitTerminalizesOnKeepaliveWriteFailure(t *testing.T) {
+	backend := &stubBackend{probeResult: &AcquireResult{Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 1}, terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released"}}
+	cfg := validTestConfig()
+	cfg.Concurrency.Wait.MaxStreamMs = 200
+	cfg.Concurrency.Wait.KeepaliveMs = 5
+	server := newTestServerInstanceWithConfig(t, cfg, backend)
+	req := validAcquireRequest()
+	nowMs := time.Now().UnixMilli()
+	req.NowMs = nowMs
+	req.HardExpireAtMs = nowMs + 60_000
+	req.WaitToken = "wait-1"
+	req.DeadlineMs = time.Now().Add(100 * time.Millisecond).UnixMilli()
+	rec := &sequenceFailResponseWriter{failOnWrite: 2}
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req)))
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	server.Handler().ServeHTTP(rec, httpReq)
+	if got := backend.snapshotTerminalizeCalls(); len(got) != 1 || got[0].RequestID != req.RequestID || got[0].Reason != "final_cleanup" {
+		t.Fatalf("expected keepalive write failure to terminalize backend with final_cleanup, got %+v", got)
+	}
+	if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("expected keepalive write failure to clear local attached waiter")
+	}
+}
+
+func TestContinueWaitTerminalizesOnRecurringKeepaliveWriteFailure(t *testing.T) {
+	backend := &stubBackend{probeResult: &AcquireResult{Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 1}, terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released"}}
+	cfg := validTestConfig()
+	cfg.Concurrency.Wait.MaxStreamMs = 300
+	cfg.Concurrency.Wait.KeepaliveMs = 5
+	server := newTestServerInstanceWithConfig(t, cfg, backend)
+	req := validAcquireRequest()
+	nowMs := time.Now().UnixMilli()
+	req.NowMs = nowMs
+	req.HardExpireAtMs = nowMs + 60_000
+	req.WaitToken = "wait-1"
+	req.DeadlineMs = time.Now().Add(200 * time.Millisecond).UnixMilli()
+	rec := &sequenceFailResponseWriter{failOnWrite: 3}
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req)))
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	server.Handler().ServeHTTP(rec, httpReq)
+	if got := backend.snapshotTerminalizeCalls(); len(got) != 1 || got[0].RequestID != req.RequestID || got[0].Reason != "final_cleanup" {
+		t.Fatalf("expected recurring keepalive write failure to terminalize backend with final_cleanup, got %+v", got)
+	}
+	if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("expected recurring keepalive write failure to clear local attached waiter")
+	}
+}
+
+func TestContinueWaitTerminalizesOnRequestCancellation(t *testing.T) {
+	backend := &stubBackend{probeResult: &AcquireResult{Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 1}, terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "released"}}
+	server := newTestServerInstance(t, backend)
+	req := validAcquireRequest()
+	nowMs := time.Now().UnixMilli()
+	req.NowMs = nowMs
+	req.HardExpireAtMs = nowMs + 60_000
+	req.WaitToken = "wait-1"
+	req.DeadlineMs = time.Now().Add(10 * time.Second).UnixMilli()
+	reqCtx, cancel := context.WithCancel(context.Background())
+	httpReq := httptest.NewRequest(http.MethodPost, waitPath, bytes.NewReader(encodeWaitRequestBody(t, req))).WithContext(reqCtx)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-CQ-Auth", "secret")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(rec, httpReq)
+		close(done)
+	}()
+	waitForConditionWithMessage(t, time.Second, func() bool { return strings.Contains(rec.Body.String(), "event: accepted\n") }, "expected wait stream to accept before cancel")
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for cancelled wait to exit")
+	}
+	if got := backend.snapshotTerminalizeCalls(); len(got) != 1 || got[0].RequestID != req.RequestID || got[0].Reason != "final_cleanup" {
+		t.Fatalf("expected cancel path to terminalize backend with final_cleanup, got %+v", got)
+	}
+	if server.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("expected cancel path to clear local attached waiter")
 	}
 }
 
@@ -2946,7 +4730,7 @@ func TestAcquireAllZeroCapsDoNotProduceCapWait(t *testing.T) {
 	}
 }
 
-func TestAcquireReplayWaitPreservesGenericHostScope(t *testing.T) {
+func TestAcquireReplayWaitPreservesProvisionalScope(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 	hostnameHash := "replay-generic-host-scope"
@@ -3011,8 +4795,8 @@ func TestAcquireReplayWaitPreservesGenericHostScope(t *testing.T) {
 	if replayBody["result"] != "wait" {
 		t.Fatalf("expected wait, got %v", replayBody)
 	}
-	if replayBody["scope"] != "host" {
-		t.Fatalf("expected scope=host, got %v", replayBody)
+	if replayBody["scope"] != "site" {
+		t.Fatalf("expected scope=site, got %v", replayBody)
 	}
 }
 
@@ -3043,8 +4827,12 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 			{Hostname: "probe.example.com", HostnameHash: "probe-host", SiteBucket: "site-c", IPBucket: "ip-c", RequestID: "probe-expired-detached-request", HardExpireAtMs: nowMs + 60_000, NowMs: nowMs + 2, WaitToken: "wait-probe-detached"},
 		} {
 			rec := postWaitRequest(t, handler, req, "secret")
-			if rec.Code != http.StatusOK {
-				t.Fatalf("expected probe short-circuit success status, got %d body=%s", rec.Code, rec.Body.String())
+			wantStatus := http.StatusOK
+			if strings.Contains(req.RequestID, "expired") {
+				wantStatus = http.StatusGone
+			}
+			if rec.Code != wantStatus {
+				t.Fatalf("expected probe short-circuit status %d, got %d body=%s", wantStatus, rec.Code, rec.Body.String())
 			}
 		}
 
@@ -3102,9 +4890,9 @@ func TestObservabilityCountsAcquireFastGrantAndWait(t *testing.T) {
 		}
 
 		counts := snapshotObservabilityCounts(t, server)
-		assertObservabilityCount(t, counts, observabilityAcquireReplayWait, 1)
+		assertObservabilityCount(t, counts, observabilityAcquireReplayWait, 0)
 		assertObservabilityCount(t, counts, observabilityAcquireReplayActive, 0)
-		assertObservabilityCount(t, counts, observabilityAcquireFastWait, 0)
+		assertObservabilityCount(t, counts, observabilityAcquireFastWait, 1)
 		assertObservabilityCount(t, counts, observabilityAcquireFastGranted, 0)
 	})
 
@@ -3354,7 +5142,7 @@ func TestObservabilityCountsContinueWaitAttachTimeoutAndPromotion(t *testing.T) 
 		}
 
 		counts := snapshotObservabilityCounts(t, server)
-		assertObservabilityCount(t, counts, observabilityContinueWaitAttached, 1)
+		assertObservabilityCount(t, counts, observabilityWaitStreamAttached, 1)
 		assertObservabilityCount(t, counts, observabilityGrantPromoted, 1)
 	})
 
@@ -3363,7 +5151,7 @@ func TestObservabilityCountsContinueWaitAttachTimeoutAndPromotion(t *testing.T) 
 		cfg.Concurrency.Wait.MaxStreamMs = 25
 		cfg.Concurrency.Wait.KeepaliveMs = 5
 		nowMs := time.Now().UnixMilli()
-		server := newTestServerInstanceWithConfig(t, cfg, &stubBackend{acquireFn: func(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
+		server := newTestServerInstanceWithConfig(t, cfg, &stubBackend{terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "expired", Reason: "wait_stream_timeout"}, acquireFn: func(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
 			if strings.TrimSpace(req.WaitToken) == "" {
 				t.Fatalf("expected wait request with waitToken")
 			}
@@ -3388,8 +5176,8 @@ func TestObservabilityCountsContinueWaitAttachTimeoutAndPromotion(t *testing.T) 
 		}
 
 		counts := snapshotObservabilityCounts(t, server)
-		assertObservabilityCount(t, counts, "continue_wait_attached", 1)
-		assertObservabilityCount(t, counts, "continue_wait_timeout", 1)
+		assertObservabilityCount(t, counts, observabilityWaitStreamAttached, 1)
+		assertObservabilityCount(t, counts, observabilityWaitStreamTimeout, 1)
 	})
 
 	t.Run("promotion delivery failure and expiry", func(t *testing.T) {
@@ -3524,7 +5312,7 @@ func TestObservabilityCountsConflictAndDenyReasons(t *testing.T) {
 		assertObservabilityCount(t, counts, observabilityConflictWaiterAlreadyAttached, 1)
 	})
 
-	t.Run("conflicts release and cancel", func(t *testing.T) {
+	t.Run("conflicts and release", func(t *testing.T) {
 		server := newTestServerInstance(t, &stubBackend{
 			acquireFn: func(_ context.Context, req AcquireRequest) (*AcquireResult, error) {
 				switch req.RequestID {
@@ -3541,9 +5329,6 @@ func TestObservabilityCountsConflictAndDenyReasons(t *testing.T) {
 					return &ReleaseResult{Result: "released", RequestID: "released-request"}, nil
 				}
 				return &ReleaseResult{Result: "noop", Reason: "expired", RequestID: "expired-request"}, nil
-			},
-			cancelFn: func(_ context.Context, req CancelRequest) (*CancelResult, error) {
-				return &CancelResult{Result: "cancelled"}, nil
 			},
 		})
 		handler := server.Handler()
@@ -3581,9 +5366,6 @@ func TestObservabilityCountsConflictAndDenyReasons(t *testing.T) {
 		if rec := postJSON(t, handler, releasePath, validReleaseRequest(), "secret"); rec.Code != http.StatusOK {
 			t.Fatalf("expected noop response 200, got %d body=%s", rec.Code, rec.Body.String())
 		}
-		if rec := postJSON(t, handler, cancelPath, CancelRequest{RequestID: "cancelled-request", Hostname: "cancel.example.com", HostnameHash: "host-hash", SiteBucket: "site-a", IPBucket: "ip-a", HardExpireAtMs: 50_000, Reason: "worker_aborted", NowMs: 5_000}, "secret"); rec.Code != http.StatusOK {
-			t.Fatalf("expected cancelled response 200, got %d body=%s", rec.Code, rec.Body.String())
-		}
 
 		counts := snapshotObservabilityCounts(t, server)
 		assertObservabilityCount(t, counts, "conflict_tuple_mismatch", 1)
@@ -3591,7 +5373,6 @@ func TestObservabilityCountsConflictAndDenyReasons(t *testing.T) {
 		assertObservabilityCount(t, counts, "conflict_stale_wait_token", 1)
 		assertObservabilityCount(t, counts, "release_released", 1)
 		assertObservabilityCount(t, counts, "release_noop", 1)
-		assertObservabilityCount(t, counts, "cancelled", 1)
 	})
 
 	t.Run("reactor deny scopes", func(t *testing.T) {
@@ -3701,58 +5482,6 @@ func TestReleaseUsesServerOwnedContextAfterClientCancel(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected release 200 after client cancel, got %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestCancelUsesServerOwnedContextAfterClientCancel(t *testing.T) {
-	cancelEntered := make(chan struct{})
-	allowCancel := make(chan struct{})
-	backend := &stubBackend{cancelFn: func(ctx context.Context, req CancelRequest) (*CancelResult, error) {
-		if req.RequestID != "cancelled-active-request" {
-			t.Fatalf("unexpected cancel request: %+v", req)
-		}
-		close(cancelEntered)
-		<-allowCancel
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return &CancelResult{Result: "cancelled"}, nil
-	}}
-	server := newTestServerInstance(t, backend)
-	server.heartbeatRuntime.schedule("cancelled-active-request", time.Now().Add(time.Minute).UnixMilli())
-
-	reqCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	req := httptest.NewRequest(http.MethodPost, cancelPath, bytes.NewReader(encodeJSONBody(t, CancelRequest{
-		RequestID:      "cancelled-active-request",
-		Hostname:       "cancel.example.com",
-		HostnameHash:   "cancel-host",
-		SiteBucket:     "site-a",
-		IPBucket:       "ip-a",
-		HardExpireAtMs: time.Now().Add(time.Minute).UnixMilli(),
-		Reason:         "worker_aborted",
-		NowMs:          time.Now().UnixMilli(),
-	}))).WithContext(reqCtx)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-CQ-Auth", "secret")
-	rec := httptest.NewRecorder()
-
-	done := make(chan struct{})
-	go func() {
-		server.Handler().ServeHTTP(rec, req)
-		close(done)
-	}()
-
-	<-cancelEntered
-	cancel()
-	close(allowCancel)
-	<-done
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected cancel 200 after client cancel, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	if got := server.heartbeatRuntime.scheduledDeadline("cancelled-active-request"); got != 0 {
-		t.Fatalf("expected cancel to clear heartbeat schedule, got %d", got)
 	}
 }
 
@@ -4123,7 +5852,7 @@ func TestContinueWaitReturnsExpiredOnStreamDeadlineWithoutWake(t *testing.T) {
 	cfg := validTestConfig()
 	cfg.Concurrency.Wait.MaxStreamMs = 25
 	cfg.Concurrency.Wait.KeepaliveMs = 5
-	handler := newTestServerInstanceWithConfig(t, cfg, &stubBackend{probeResult: &AcquireResult{Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 1}}).Handler()
+	handler := newTestServerInstanceWithConfig(t, cfg, &stubBackend{probeResult: &AcquireResult{Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 1}, terminalizeWaitingResult: &TerminalizeWaitingResult{Result: "expired", Reason: "wait_stream_timeout"}}).Handler()
 	req := validAcquireRequest()
 	req.WaitToken = "wait-1"
 	data := encodeWaitRequestBody(t, req)
@@ -4152,7 +5881,7 @@ func TestContinueWaitReturnsExpiredOnStreamDeadlineWithoutWake(t *testing.T) {
 	}
 }
 
-func TestContinueWaitStreamsTerminalProbeResultImmediately(t *testing.T) {
+func TestContinueWaitReturnsExpiredProbeResultAsSetupTerminal(t *testing.T) {
 	cfg := validTestConfig()
 	server := newTestServerInstanceWithConfig(t, cfg, &probingBackend{
 		stubBackend: &stubBackend{},
@@ -4164,18 +5893,46 @@ func TestContinueWaitStreamsTerminalProbeResultImmediately(t *testing.T) {
 	req := validAcquireRequest()
 	req.WaitToken = "wait-1"
 	req = withWaitRequestFields(req)
-	server.waitingRuntime.upsertWaitingRequest(req, req.WaitToken, nil, cfg)
 	rec := postWaitRequest(t, handler, req, "secret")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected immediate terminal wait response 200, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusGone {
+		t.Fatalf("expected expired setup terminal 410, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	body := decodeSSEResult(t, rec)
+	if got := rec.Header().Get("Content-Type"); got == "text/event-stream" {
+		t.Fatalf("expired setup terminal must not accept SSE, got content-type %q body=%s", got, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
 	if body["result"] != "expired" || body["reason"] != "hard_expired" {
-		t.Fatalf("expected expired terminal SSE body, got %v", body)
+		t.Fatalf("expected expired terminal JSON body, got %v", body)
 	}
 	if _, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); ok {
-		t.Fatal("expected immediate terminal wait response to clear local waiting snapshot")
+		t.Fatal("expected expired setup terminal to leave no local waiting snapshot")
 	}
+}
+
+func TestWriteWaitResultRequiresResultWriteAndFlushWithoutObservedTermination(t *testing.T) {
+	nowMs := time.Now().UnixMilli()
+	server := newTestServerInstance(t, &stubBackend{})
+	req := AcquireRequest{RequestID: "flush-request", NowMs: nowMs}
+	granted := &AcquireResult{Result: "granted", LeaseID: "lease-flush", LeaseToken: "token-flush", ExpiresAtMs: nowMs + 60_000, ClaimToken: "claim-flush"}
+
+	successWriter := &flushTrackingResponseWriter{}
+	if ok := server.writeWaitResultWithCompensation(context.Background(), successWriter, req, granted); !ok {
+		t.Fatal("expected successful wait result delivery after write and flush")
+	}
+	if successWriter.flushes != 1 {
+		t.Fatalf("expected one flush for reliable result delivery, got %d", successWriter.flushes)
+	}
+
+	failedWriter := &flushTrackingResponseWriter{writeErr: errors.New("forced result write failure")}
+	if ok := server.writeWaitResultWithCompensation(context.Background(), failedWriter, req, granted); ok {
+		t.Fatal("expected write failure to make result delivery unreliable")
+	}
+	if failedWriter.flushes != 0 {
+		t.Fatalf("expected failed result write to skip flush, got %d", failedWriter.flushes)
+	}
+
+	counts := snapshotObservabilityCounts(t, server)
+	assertObservabilityCount(t, counts, observabilityGrantDeliveryFailed, 1)
 }
 
 func TestContinueWaitRealPathRejectsConcurrentAttachWithoutRefreshingLease(t *testing.T) {
@@ -4220,7 +5977,17 @@ func TestContinueWaitRealPathRejectsConcurrentAttachWithoutRefreshingLease(t *te
 		t.Fatalf("expected waiting request, got %+v", waiting)
 	}
 
-	originalWaiterLeaseUntilMs := readWaiterLeaseUntilMs(t, db, "attach-request")
+	var preAttachRows int
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, "attach-request").Scan(&preAttachRows); err != nil {
+		t.Fatalf("count pre-attach request rows: %v", err)
+	}
+	if preAttachRows != 0 {
+		t.Fatalf("expected no durable waiting row before accepted /wait, got %d", preAttachRows)
+	}
 
 	cfg := validTestConfig()
 	cfg.Concurrency.Caps.HostMaxInFlight = 1
@@ -4280,14 +6047,27 @@ func TestContinueWaitRealPathRejectsConcurrentAttachWithoutRefreshingLease(t *te
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	if waiterLeaseBeforeFirstAttach := readWaiterLeaseUntilMs(t, db, "attach-request"); waiterLeaseBeforeFirstAttach != originalWaiterLeaseUntilMs {
-		t.Fatalf("expected second /wait request not to refresh waiter lease before first attach, got before=%d after=%d", originalWaiterLeaseUntilMs, waiterLeaseBeforeFirstAttach)
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, "attach-request").Scan(&preAttachRows); err != nil {
+		t.Fatalf("count request rows before accepted attach: %v", err)
+	}
+	if preAttachRows != 0 {
+		t.Fatalf("expected second /wait request not to create durable waiter before first attach, got %d rows", preAttachRows)
 	}
 
 	close(backend.releaseFirst)
 
 	waitForConditionWithMessage(t, 2*time.Second, func() bool {
-		return readWaiterLeaseUntilMs(t, db, "attach-request") == firstReq.DeadlineMs
+		var waiterLeaseUntilMs int64
+		err := db.QueryRowContext(context.Background(), `
+			SELECT waiter_lease_until_ms
+			FROM concurrency_requests
+			WHERE request_id = $1
+		`, "attach-request").Scan(&waiterLeaseUntilMs)
+		return err == nil && waiterLeaseUntilMs == firstReq.DeadlineMs
 	}, "expected first /wait request to own durable waiter lease")
 
 	var secondRec *httptest.ResponseRecorder
@@ -4402,7 +6182,7 @@ func TestContinueWaitRealPathPreservesTupleMismatchPrecedenceOverAttachConflict(
 	}
 }
 
-func TestContinueWaitRealPathPreservesTerminalReplayPrecedenceOverAttachConflict(t *testing.T) {
+func TestContinueWaitRealPathRejectsDuplicateAttachBeforeTerminalReplay(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 
@@ -4468,27 +6248,27 @@ func TestContinueWaitRealPathPreservesTerminalReplayPrecedenceOverAttachConflict
 	}
 	firstReq = withWaitRequestFields(firstReq)
 
-	var cancelResult string
-	var cancelReason sql.NullString
+	var terminalizeResult string
+	var terminalizeReason sql.NullString
 	if err := db.QueryRowContext(context.Background(), `
 		SELECT result, reason
-		FROM cq_cancel($1, $2, $3, $4, $5, $6, $7, $8)
-	`, "waiting-request", "terminal.example.com", "terminal-host", "site-b", "ip-b", nowMs+120_000, "worker_aborted", nowMs+2).Scan(&cancelResult, &cancelReason); err != nil {
-		t.Fatalf("cancel waiting request: %v", err)
+		FROM cq_terminalize_waiting($1, $2, $3, $4, $5, $6, $7, $8)
+	`, "waiting-request", "terminal.example.com", "terminal-host", "site-b", "ip-b", nowMs+120_000, "final_cleanup", nowMs+2).Scan(&terminalizeResult, &terminalizeReason); err != nil {
+		t.Fatalf("terminalize waiting request: %v", err)
 	}
-	if cancelResult != "cancelled" {
-		t.Fatalf("expected cancelled transition, got result=%q reason=%q", cancelResult, cancelReason.String)
+	if terminalizeResult != "noop" || terminalizeReason.String != "already_terminal" {
+		t.Fatalf("expected provisional pre-SSE terminalize noop, got result=%q reason=%q", terminalizeResult, terminalizeReason.String)
 	}
 
 	secondReq := firstReq
 	secondReq.NowMs = nowMs + 3
 	secondRec := serveJSONRequest(handler, http.MethodPost, waitPath, encodeJSONBody(t, secondReq), "secret")
-	if secondRec.Code != http.StatusOK {
-		t.Fatalf("expected terminal replay SSE 200, got %d body=%s", secondRec.Code, secondRec.Body.String())
+	if secondRec.Code != http.StatusConflict {
+		t.Fatalf("expected duplicate attached waiter conflict 409, got %d body=%s", secondRec.Code, secondRec.Body.String())
 	}
-	body := decodeSSEResult(t, secondRec)
-	if body["result"] != "cancelled" || body["reason"] != "request_cancelled" {
-		t.Fatalf("expected cancelled replay to win precedence, got %v", body)
+	body := decodeBody(t, secondRec)
+	if body["result"] != "conflict" || body["reason"] != acquireConflictReasonWaiterAlreadyAttached {
+		t.Fatalf("expected duplicate attached waiter conflict body, got %v", body)
 	}
 }
 
@@ -4904,21 +6684,20 @@ func TestContinueWaitRealPathPromotesOnlyCurrentlyAttachedWaiters(t *testing.T) 
 		t.Fatalf("expected granted body for attached waiter, got %v", body)
 	}
 
-	var detachedState string
-	var detachedLeaseID sql.NullString
+	var detachedRows int
 	if err := db.QueryRowContext(context.Background(), `
-		SELECT state, NULLIF(COALESCE(lease_id::text, ''), '')
+		SELECT COUNT(*)
 		FROM concurrency_requests
 		WHERE request_id = $1
-	`, "detached-request").Scan(&detachedState, &detachedLeaseID); err != nil {
-		t.Fatalf("read detached waiting request: %v", err)
+	`, "detached-request").Scan(&detachedRows); err != nil {
+		t.Fatalf("count detached waiting request rows: %v", err)
 	}
-	if detachedState != "waiting" || detachedLeaseID.Valid {
-		t.Fatalf("expected detached waiter to remain waiting without lease, got state=%q leaseID=%q", detachedState, detachedLeaseID.String)
+	if detachedRows != 0 {
+		t.Fatalf("expected detached provisional waiter to remain non-durable, got %d rows", detachedRows)
 	}
 }
 
-func TestAcquireFastReplayWaitKeepsLocalHardExpiryDeadline(t *testing.T) {
+func TestAcquireFastReplayWaitStaysProvisionalBeforeWaitAttach(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 
@@ -4984,12 +6763,8 @@ func TestAcquireFastReplayWaitKeepsLocalHardExpiryDeadline(t *testing.T) {
 	if firstBody["result"] != "wait" || firstBody["waitToken"] != waiting.WaitToken.String {
 		t.Fatalf("expected first fast replay wait body, got %v", firstBody)
 	}
-	firstSnap, ok := server.waitingRuntime.snapshotForWaitToken(waiting.WaitToken.String)
-	if !ok || firstSnap == nil {
-		t.Fatal("expected local waiting snapshot after first fast replay")
-	}
-	if firstSnap.WaiterLeaseUntilMs != fastReq.HardExpireAtMs {
-		t.Fatalf("expected fast acquire replay to keep local hard-expiry deadline %d before /wait attach, got %d", fastReq.HardExpireAtMs, firstSnap.WaiterLeaseUntilMs)
+	if firstSnap, ok := server.waitingRuntime.snapshotForWaitToken(waiting.WaitToken.String); ok || firstSnap != nil {
+		t.Fatalf("expected no local waiting snapshot after provisional fast replay, got %+v", firstSnap)
 	}
 
 	replayReq := fastReq
@@ -5002,12 +6777,8 @@ func TestAcquireFastReplayWaitKeepsLocalHardExpiryDeadline(t *testing.T) {
 	if secondBody["result"] != "wait" || secondBody["waitToken"] != waiting.WaitToken.String {
 		t.Fatalf("expected second fast replay wait body, got %v", secondBody)
 	}
-	secondSnap, ok := server.waitingRuntime.snapshotForWaitToken(waiting.WaitToken.String)
-	if !ok || secondSnap == nil {
-		t.Fatal("expected local waiting snapshot after second fast replay")
-	}
-	if secondSnap.WaiterLeaseUntilMs != fastReq.HardExpireAtMs {
-		t.Fatalf("expected fast waiting replay to keep local hard-expiry deadline %d, got %d", fastReq.HardExpireAtMs, secondSnap.WaiterLeaseUntilMs)
+	if secondSnap, ok := server.waitingRuntime.snapshotForWaitToken(waiting.WaitToken.String); ok || secondSnap != nil {
+		t.Fatalf("expected no local waiting snapshot after provisional fast replay, got %+v", secondSnap)
 	}
 }
 
@@ -5128,65 +6899,93 @@ func TestRunHostPassStopsImmediatelyAfterHostDeny(t *testing.T) {
 	}
 }
 
-func TestCancelImmediatelyAdvancesNextAttachedHeadAfterHostDeny(t *testing.T) {
+func TestRunHostPassLoopsUntilCleanupMakesNoFurtherProgress(t *testing.T) {
 	cfg := validTestConfig()
 	baseNowMs := time.Now().UnixMilli()
-	backend := &recordingPromoteBackend{
-		resultsByID: map[string]*AcquireResult{
-			"waiting-request-1": {Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 1},
-			"waiting-request-2": {Result: "granted", LeaseID: "lease-2", LeaseToken: "token-2", ExpiresAtMs: baseNowMs + 9_999},
-		},
-		probeResults: map[string]*AcquireResult{},
+	var (
+		mu          sync.Mutex
+		expireCalls []ExpireScopeRequest
+	)
+	backend := &stubBackend{}
+	backend.promoteFn = func(_ context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+		return &AcquireResult{Result: "wait", WaitToken: req.RequestID, Scope: "host", RetryAfter: 1}, nil
+	}
+	backend.expireFn = func(_ context.Context, req ExpireScopeRequest) (*ExpireScopeResult, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		expireCalls = append(expireCalls, req)
+		if len(expireCalls) == 1 {
+			return &ExpireScopeResult{ExpiredCount: 1, ExpiredRequestIDs: []string{"expired-request-1"}}, nil
+		}
+		return &ExpireScopeResult{ExpiredCount: 0}, nil
 	}
 	server := newTestServerInstanceWithConfig(t, cfg, backend)
-	handler := server.Handler()
+	waiter, ok := server.waitingRuntime.tryAttach("wait-1")
+	if !ok || waiter == nil {
+		t.Fatal("expected attached waiter")
+	}
+	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "cleanup.example.com", HostnameHash: "cleanup-host", SiteBucket: "site-a", IPBucket: "ip-a1", RequestID: "waiting-request-1", HardExpireAtMs: baseNowMs + 20_000, NowMs: baseNowMs, WaitToken: "wait-1"}, "wait-1", waiter, cfg)
 
-	waiter1, ok := server.waitingRuntime.tryAttach("wait-1")
-	if !ok || waiter1 == nil {
+	server.runHostPass(context.Background(), "cleanup-host")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(expireCalls) != 2 {
+		t.Fatalf("expected host cleanup to loop until no further progress, got %d expire calls", len(expireCalls))
+	}
+	if expireCalls[0].Scope != "host" || expireCalls[0].HostnameHash != "cleanup-host" {
+		t.Fatalf("unexpected first expire scope request: %+v", expireCalls[0])
+	}
+}
+
+func TestRunHostPassRestartsFromFrontAfterHostCleanupProgress(t *testing.T) {
+	cfg := validTestConfig()
+	baseNowMs := time.Now().UnixMilli()
+	var (
+		expireCalls  int
+		promoteCalls []string
+	)
+	backend := &stubBackend{}
+	backend.promoteFn = func(_ context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+		promoteCalls = append(promoteCalls, req.RequestID)
+		if req.RequestID == "waiting-site-a-1" {
+			return &AcquireResult{Result: "wait", WaitToken: "wait-a1", Scope: "host", RetryAfter: 1}, nil
+		}
+		return &AcquireResult{Result: "granted", LeaseID: "lease-b1", LeaseToken: "token-b1", ExpiresAtMs: baseNowMs + 9_999}, nil
+	}
+	backend.expireFn = func(_ context.Context, req ExpireScopeRequest) (*ExpireScopeResult, error) {
+		expireCalls++
+		if expireCalls == 1 {
+			return &ExpireScopeResult{ExpiredCount: 1, ExpiredRequestIDs: []string{"expired-request-1"}}, nil
+		}
+		return &ExpireScopeResult{ExpiredCount: 0}, nil
+	}
+	server := newTestServerInstanceWithConfig(t, cfg, backend)
+	waiterA1, ok := server.waitingRuntime.tryAttach("wait-a1")
+	if !ok || waiterA1 == nil {
 		t.Fatal("expected first waiter attach")
 	}
-	waiter2, ok := server.waitingRuntime.tryAttach("wait-2")
-	if !ok || waiter2 == nil {
+	waiterB1, ok := server.waitingRuntime.tryAttach("wait-b1")
+	if !ok || waiterB1 == nil {
 		t.Fatal("expected second waiter attach")
 	}
-	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "cancel-advance.example.com", HostnameHash: "cancel-advance-host", SiteBucket: "site-a", IPBucket: "ip-a1", RequestID: "waiting-request-1", HardExpireAtMs: baseNowMs + 20_000, NowMs: baseNowMs, WaitToken: "wait-1"}, "wait-1", waiter1, cfg)
-	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "cancel-advance.example.com", HostnameHash: "cancel-advance-host", SiteBucket: "site-b", IPBucket: "ip-b1", RequestID: "waiting-request-2", HardExpireAtMs: baseNowMs + 20_000, NowMs: baseNowMs + 1, WaitToken: "wait-2"}, "wait-2", waiter2, cfg)
+	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "restart.example.com", HostnameHash: "restart-host", SiteBucket: "site-a", IPBucket: "ip-a1", RequestID: "waiting-site-a-1", HardExpireAtMs: baseNowMs + 20_000, NowMs: baseNowMs, WaitToken: "wait-a1"}, "wait-a1", waiterA1, cfg)
+	server.waitingRuntime.upsertWaitingRequest(AcquireRequest{Hostname: "restart.example.com", HostnameHash: "restart-host", SiteBucket: "site-b", IPBucket: "ip-b1", RequestID: "waiting-site-b-1", HardExpireAtMs: baseNowMs + 20_000, NowMs: baseNowMs + 1, WaitToken: "wait-b1"}, "wait-b1", waiterB1, cfg)
 
-	server.runHostPass(context.Background(), "cancel-advance-host")
-	calls := backend.snapshotPromoteCalls()
-	if len(calls) != 1 || calls[0].RequestID != "waiting-request-1" {
-		t.Fatalf("expected first host pass stopped by waiting-request-1 host deny, got %+v", calls)
+	server.runHostPass(context.Background(), "restart-host")
+
+	if len(promoteCalls) != 2 {
+		t.Fatalf("expected cleanup restart to re-run only the front host head, got %+v", promoteCalls)
+	}
+	if promoteCalls[0] != "waiting-site-a-1" || promoteCalls[1] != "waiting-site-a-1" {
+		t.Fatalf("expected cleanup progress to restart host pass from the front before later heads, got %+v", promoteCalls)
 	}
 	select {
-	case delivered := <-waiter2.resultCh:
-		t.Fatalf("expected no delivery before cancel, got %+v", delivered)
+	case delivered := <-waiterB1.resultCh:
+		t.Fatalf("expected no later-head delivery before host pass restart, got %+v", delivered)
 	default:
 	}
-
-	cancelRec := postJSON(t, handler, cancelPath, CancelRequest{
-		RequestID:      "waiting-request-1",
-		Hostname:       "cancel-advance.example.com",
-		HostnameHash:   "cancel-advance-host",
-		SiteBucket:     "site-a",
-		IPBucket:       "ip-a1",
-		HardExpireAtMs: baseNowMs + 20_000,
-		Reason:         "worker_aborted",
-		NowMs:          baseNowMs + 200,
-	}, "secret")
-	if cancelRec.Code != http.StatusOK {
-		t.Fatalf("expected cancel 200, got %d body=%s", cancelRec.Code, cancelRec.Body.String())
-	}
-	if body := decodeBody(t, cancelRec); body["result"] != "cancelled" {
-		t.Fatalf("expected cancelled body, got %v", body)
-	}
-
-	select {
-	case delivered := <-waiter2.resultCh:
-		if delivered == nil || delivered.Result != "granted" || delivered.LeaseID != "lease-2" {
-			t.Fatalf("expected next attached head granted after cancel, got %+v", delivered)
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("timed out waiting for next attached head to advance after cancel")
+	if expireCalls != 2 {
+		t.Fatalf("expected cleanup to run until no further progress, got %d calls", expireCalls)
 	}
 }
 
@@ -5244,10 +7043,58 @@ func TestRunHostPassUsesReactorTimeForExpiredAttachedHead(t *testing.T) {
 	}
 }
 
-func TestContinueWaitRealPathReturnsExpiredBeforePollWindowWhenHardExpiryLandsDuringHold(t *testing.T) {
+func TestRunHostPassSkipsDueProbeForDisconnectedCleanupAfterRetryFailure(t *testing.T) {
+	cfg := validTestConfig()
+	baseNowMs := time.Now().UnixMilli()
+	var probeCalls int
+	backend := &stubBackend{
+		terminalizeWaitingErr: errors.New("db down"),
+		probeFn: func(context.Context, AcquireRequest) (*AcquireResult, error) {
+			probeCalls++
+			return &AcquireResult{Result: "expired", Reason: "wait_stream_timeout"}, nil
+		},
+	}
+	server := newTestServerInstanceWithConfig(t, cfg, backend)
+	req := AcquireRequest{
+		Hostname:       "disconnect-due.example.com",
+		HostnameHash:   "disconnect-due-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "disconnected-expired-request",
+		HardExpireAtMs: baseNowMs + 60_000,
+		NowMs:          baseNowMs,
+		WaitToken:      "wait-disconnected-expired",
+	}
+	waiter, ok := server.waitingRuntime.tryAttach(req.WaitToken)
+	if !ok || waiter == nil {
+		t.Fatal("expected attached waiter")
+	}
+	server.waitingRuntime.upsertWaitingRequestWithLeaseDeadline(req, req.WaitToken, waiter, baseNowMs-1)
+	server.waitingRuntime.markDisconnected(waiter)
+	server.waitingRuntime.recordDisconnectedCleanup(waiter, "final_cleanup")
+
+	server.runHostPass(context.Background(), req.HostnameHash)
+
+	if got := backend.snapshotTerminalizeCalls(); len(got) != 1 || got[0].RequestID != req.RequestID || got[0].Reason != "final_cleanup" {
+		t.Fatalf("expected one failed final_cleanup retry, got %+v", got)
+	}
+	if probeCalls != 0 {
+		t.Fatalf("disconnected cleanup candidate must not be probed for wait_stream_timeout, got %d probe calls", probeCalls)
+	}
+	if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); !ok || snap.RequestID != req.RequestID {
+		t.Fatalf("expected disconnected cleanup candidate to remain scheduled, got snap=%+v ok=%v", snap, ok)
+	}
+	candidates := server.waitingRuntime.disconnectedCleanupCandidates(req.HostnameHash)
+	if len(candidates) != 1 || candidates[0].Request.RequestID != req.RequestID || candidates[0].Reason != "final_cleanup" {
+		t.Fatalf("expected cleanup candidate retained for retry, got %+v", candidates)
+	}
+}
+
+func TestContinueWaitRealPathReturnsExpiredBeforePollWindowWhenStreamDeadlineLandsDuringHold(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
-	hardExpireAtMs := nowMs + 60
+	hardExpireAtMs := nowMs + 120_000
+	streamDeadlineMs := nowMs + 60
 
 	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
 		HostnameHash:      "poll-expire-host",
@@ -5301,6 +7148,7 @@ func TestContinueWaitRealPathReturnsExpiredBeforePollWindowWhenHardExpiryLandsDu
 		IPBucket:       "ip-a",
 		RequestID:      "waiting-request",
 		HardExpireAtMs: hardExpireAtMs,
+		DeadlineMs:     streamDeadlineMs,
 		NowMs:          nowMs + 1,
 		WaitToken:      waiting.WaitToken.String,
 	}
@@ -5314,17 +7162,17 @@ func TestContinueWaitRealPathReturnsExpiredBeforePollWindowWhenHardExpiryLandsDu
 	select {
 	case continueRec = <-continueDone:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for poll-window expiry delivery")
+		t.Fatal("timed out waiting for stream deadline expiry delivery")
 	}
 	if continueRec.Code != http.StatusOK {
-		t.Fatalf("expected wait SSE hard expiry 200, got %d body=%s", continueRec.Code, continueRec.Body.String())
+		t.Fatalf("expected wait SSE stream deadline 200, got %d body=%s", continueRec.Code, continueRec.Body.String())
 	}
 	body := decodeSSEResult(t, continueRec)
 	if body["result"] != "expired" || body["reason"] != "wait_stream_timeout" {
-		t.Fatalf("expected wait_stream_timeout SSE body after wait hold, got %v", body)
+		t.Fatalf("expected wait_stream_timeout SSE body after wait stream deadline, got %v", body)
 	}
 	if elapsed := time.Since(startedAt); elapsed >= 200*time.Millisecond {
-		t.Fatalf("expected hard expiry delivery before poll window end, got elapsed=%s", elapsed)
+		t.Fatalf("expected stream deadline delivery before poll window end, got elapsed=%s", elapsed)
 	}
 }
 
@@ -5518,7 +7366,7 @@ func TestContinueWaitRealPathSweepExpiryPromotesAttachedWaiter(t *testing.T) {
 	}
 }
 
-func TestStartupRecoveryDropsDetachedWaitingRowsAndRebuildsLiveHeads(t *testing.T) {
+func TestStartupRecoveryDoesNotRebuildWaitingRowsWithoutLiveSSE(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 
@@ -5582,20 +7430,20 @@ func TestStartupRecoveryDropsDetachedWaitingRowsAndRebuildsLiveHeads(t *testing.
 		t.Fatalf("expected detached waiting row expired on startup, got state=%q terminal_reason=%q", detachedState, detachedReason.String)
 	}
 
-	if _, ok := server.waitingRuntime.snapshotForWaitToken("wait-live-head"); !ok {
-		t.Fatal("expected startup recovery to rebuild live waiting head")
+	if _, ok := server.waitingRuntime.snapshotForWaitToken("wait-live-head"); ok {
+		t.Fatal("expected startup recovery not to rebuild waiting row without live SSE")
 	}
-	if _, ok := server.waitingRuntime.snapshotForWaitToken("wait-live-tail"); !ok {
-		t.Fatal("expected startup recovery to rebuild live waiting tail")
+	if _, ok := server.waitingRuntime.snapshotForWaitToken("wait-live-tail"); ok {
+		t.Fatal("expected startup recovery not to rebuild waiting row without live SSE")
 	}
 
 	queue := server.waitingRuntime.tupleQueues[makeTupleKey("recover-host", "site-b", "ip-a")]
-	if len(queue) != 2 || queue[0] != "live-head" || queue[1] != "live-tail" {
-		t.Fatalf("expected startup recovery to preserve tuple FIFO order, got %v", queue)
+	if len(queue) != 0 {
+		t.Fatalf("expected startup recovery to leave no waiting FIFO entries without live SSE, got %v", queue)
 	}
 }
 
-func TestStartupRecoveryStartsHostReactorDeadlineLoop(t *testing.T) {
+func TestStartupRecoveryDoesNotStartHostReactorForWaitingRowsWithoutLiveSSE(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 
@@ -5616,29 +7464,9 @@ func TestStartupRecoveryStartsHostReactorDeadlineLoop(t *testing.T) {
 	waitForServerReady(t, server)
 	defer func() { _ = server.Close() }()
 
-	if _, ok := server.waitingRuntime.snapshotForWaitToken("wait-startup-reactor"); !ok {
-		t.Fatal("expected startup recovery to rebuild waiting row before reactor deadline handling")
+	if _, ok := server.waitingRuntime.snapshotForWaitToken("wait-startup-reactor"); ok {
+		t.Fatal("expected startup recovery not to rebuild waiting row without live SSE")
 	}
-
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		var state, terminalReason sql.NullString
-		if err := db.QueryRowContext(context.Background(), `
-			SELECT state, terminal_reason
-			FROM concurrency_requests
-			WHERE request_id = $1
-		`, "startup-reactor-request").Scan(&state, &terminalReason); err != nil {
-			t.Fatalf("read startup reactor request state: %v", err)
-		}
-		if state.String == "expired" && terminalReason.String == "wait_stream_timeout" {
-			if _, ok := server.waitingRuntime.snapshotForWaitToken("wait-startup-reactor"); ok {
-				t.Fatal("expected startup reactor deadline loop to remove expired waiting row from runtime")
-			}
-			return
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	t.Fatal("expected startup-restored host reactor loop to expire waiting row by deadline")
 }
 
 func TestAcquireRejectsMissingSiteBucket(t *testing.T) {
@@ -5717,46 +7545,6 @@ func TestReleaseRejectsUnsupportedReason(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "unsupported release reason") {
 		t.Fatalf("expected unsupported release reason error, got %q", rec.Body.String())
-	}
-}
-
-func TestCancelReturnsConflictForActiveLease(t *testing.T) {
-	handler := newTestServer(t, &stubBackend{cancelErr: &cancelConflictError{Reason: "must_release_active_lease"}})
-	rec := postJSON(t, handler, "/api/v1/concurrency/cancel", map[string]any{
-		"requestId":      "request-1",
-		"hostname":       "example.com",
-		"hostnameHash":   "host-hash",
-		"siteBucket":     "site-a",
-		"ipBucket":       "ip-a",
-		"hardExpireAtMs": 5000,
-		"reason":         "worker_aborted",
-		"nowMs":          1000,
-	}, "secret")
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("expected 409, got %d", rec.Code)
-	}
-	body := decodeBody(t, rec)
-	if body["result"] != "conflict" || body["reason"] != "must_release_active_lease" {
-		t.Fatalf("expected active lease conflict body, got %v", body)
-	}
-}
-
-func TestCancelRejectsMissingHostname(t *testing.T) {
-	handler := newTestServer(t, &stubBackend{})
-	rec := postJSON(t, handler, cancelPath, map[string]any{
-		"requestId":      "request-1",
-		"hostnameHash":   "host-hash",
-		"siteBucket":     "site-a",
-		"ipBucket":       "ip-a",
-		"hardExpireAtMs": 5000,
-		"reason":         "worker_aborted",
-		"nowMs":          1000,
-	}, "secret")
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "hostname is required") {
-		t.Fatalf("expected hostname validation error, got %s", rec.Body.String())
 	}
 }
 

@@ -1,17 +1,19 @@
 package slothandler
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -62,34 +64,6 @@ func (w *scriptedSSEWriter) BodyString() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return string(bytes.Join(w.writes, nil))
-}
-
-func newAcquireHandlerTestServer() *server {
-	s := newTestServer()
-	cfg := &Config{
-		Auth: AuthConfig{Enabled: false},
-		FairQueue: FairQueueConfig{
-			AcceptedLeaseMs: 5,
-		},
-	}
-	s.updateRuntime(cfg, &stubBackend{}, "test", true)
-	return s
-}
-
-func handleAcquireRequest(s *server, body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPost, "/internal/fairqueue-legacy-validate", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-	s.handleAcquire(rec, req)
-	return rec
-}
-
-func handleAcquireJSONRequest(t *testing.T, s *server, payload any) *httptest.ResponseRecorder {
-	t.Helper()
-	body, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatalf("marshal acquire request: %v", err)
-	}
-	return handleAcquireRequest(s, string(body))
 }
 
 func handleFairQueueWaitRequest(s *server, body string) *httptest.ResponseRecorder {
@@ -270,518 +244,6 @@ func requireHandleAcquireResponseContract(t *testing.T, rec *httptest.ResponseRe
 	return decoded.body
 }
 
-func TestAcquireRequestOmitsLegacyThrottleWindowField(t *testing.T) {
-	if _, ok := reflect.TypeOf(AcquireRequest{}).FieldByName("ThrottleTimeWindow"); ok {
-		t.Fatalf("AcquireRequest must not expose legacy ThrottleTimeWindow field")
-	}
-	if _, ok := reflect.TypeOf(AcquirePayload{}).FieldByName("ThrottleTimeWindow"); ok {
-		t.Fatalf("AcquirePayload must not expose legacy ThrottleTimeWindow field")
-	}
-}
-
-func TestAcquireRequestExposesFullCanonicalBreakerTuple(t *testing.T) {
-	for _, field := range []string{
-		"OpenCapSeconds",
-		"CloseThresholdPercent",
-		"HalfOpenSuccessThreshold",
-		"HalfOpenCloseMode",
-	} {
-		if _, ok := reflect.TypeOf(AcquireRequest{}).FieldByName(field); !ok {
-			t.Fatalf("AcquireRequest must expose %s", field)
-		}
-		if _, ok := reflect.TypeOf(AcquirePayload{}).FieldByName(field); !ok {
-			t.Fatalf("AcquirePayload must expose %s", field)
-		}
-	}
-}
-
-func TestServerGoOmitsLegacyThrottleWindowRequestPlumbing(t *testing.T) {
-	path := filepath.Join(moduleRootDir(t), "internal", "slothandler", "server.go")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read server.go: %v", err)
-	}
-	text := strings.ToLower(string(raw))
-	for _, banned := range []string{"throttletimewindowseconds", "sanitizethrottlewindowseconds"} {
-		if strings.Contains(text, banned) {
-			t.Fatalf("server.go still contains legacy throttle window request plumbing: %s", banned)
-		}
-	}
-}
-
-func TestHandleAcquireRequiresHostnameOrHash(t *testing.T) {
-	s := newTestServer()
-	s.cfg = &Config{Auth: AuthConfig{Enabled: false}}
-
-	body := strings.NewReader(`{"ipBucket":"ip1","siteBucket":"s1","now":123}`)
-	req := httptest.NewRequest(http.MethodPost, "/internal/fairqueue-legacy-validate", body)
-	rec := httptest.NewRecorder()
-
-	s.handleAcquire(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), "hostname or hostnameHash is required") {
-		t.Fatalf("expected missing hostname error, got %q", rec.Body.String())
-	}
-}
-
-func TestHandleAcquireBreakerEnabledRequiresHostnameHash(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	rec := handleAcquireRequest(s, `{"hostname":"example.com","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true,"halfOpenMaxProbeCount":4,"halfOpenMaxSeconds":15,"halfOpenTimeoutMode":"open"}`)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "hostnameHash is required when breakerEnabled is true") {
-		t.Fatalf("expected missing hostnameHash phrase, got %q", rec.Body.String())
-	}
-}
-
-func TestHandleAcquireBreakerEnabledRequiresHalfOpenSettings(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	rec := handleAcquireRequest(s, `{"hostnameHash":"h1","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true}`)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "half-open settings are required when breakerEnabled is true") {
-		t.Fatalf("expected missing half-open settings phrase, got %q", rec.Body.String())
-	}
-}
-
-func TestHandleAcquireBreakerEnabledRequiresFullCanonicalBreakerTuple(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	rec := handleAcquireRequest(s, `{"hostnameHash":"h1","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true,"halfOpenMaxProbeCount":4,"halfOpenMaxSeconds":15,"halfOpenTimeoutMode":"open"}`)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "full breaker settings are required when breakerEnabled is true") {
-		t.Fatalf("expected missing canonical breaker tuple phrase, got %q", rec.Body.String())
-	}
-}
-
-func TestHandleAcquireBreakerEnabledRejectsZeroProbeCount(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
-	req.Now = 123
-	req.HalfOpenMaxProbeCount = 0
-	req.HalfOpenTimeoutMode = "open"
-	rec := handleAcquireJSONRequest(t, s, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "halfOpenMaxProbeCount must be between 1 and 63") {
-		t.Fatalf("expected probe count range phrase, got %q", rec.Body.String())
-	}
-}
-
-func TestHandleAcquireBreakerEnabledRejectsNegativeProbeCount(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
-	req.Now = 123
-	req.HalfOpenMaxProbeCount = -1
-	req.HalfOpenTimeoutMode = "open"
-	rec := handleAcquireJSONRequest(t, s, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "halfOpenMaxProbeCount must be between 1 and 63") {
-		t.Fatalf("expected probe count range phrase, got %q", rec.Body.String())
-	}
-}
-
-func TestHandleAcquireBreakerEnabledRejectsProbeCountOver63(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
-	req.Now = 123
-	req.HalfOpenMaxProbeCount = 64
-	req.HalfOpenTimeoutMode = "open"
-	rec := handleAcquireJSONRequest(t, s, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "halfOpenMaxProbeCount must be between 1 and 63") {
-		t.Fatalf("expected probe count range phrase, got %q", rec.Body.String())
-	}
-}
-
-func TestHandleAcquireBreakerEnabledRejectsNonPositiveHalfOpenSeconds(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
-	req.Now = 123
-	req.HalfOpenMaxSeconds = 0
-	req.HalfOpenTimeoutMode = "open"
-	rec := handleAcquireJSONRequest(t, s, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "halfOpenMaxSeconds must be greater than 0") {
-		t.Fatalf("expected half-open seconds phrase, got %q", rec.Body.String())
-	}
-}
-
-func TestHandleAcquireBreakerEnabledRejectsInvalidTimeoutMode(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
-	req.Now = 123
-	req.HalfOpenTimeoutMode = "invalid-mode"
-	rec := handleAcquireJSONRequest(t, s, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "invalid halfOpenTimeoutMode") {
-		t.Fatalf("expected invalid timeout mode phrase, got %q", rec.Body.String())
-	}
-}
-
-func TestHandleAcquireBreakerEnabledAcceptsWhitespaceWrappedTimeoutMode(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
-	req.Now = 123
-	req.HalfOpenTimeoutMode = " open "
-	rec := handleAcquireJSONRequest(t, s, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d body=%q", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHandleAcquireBreakerEnabledAcceptsZeroCloseThresholdPercent(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip1", "s1")
-	req.Now = 123
-	req.CloseThresholdPercent = 0
-	rec := handleAcquireJSONRequest(t, s, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d body=%q", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHandleAcquireValidationFailureHasNoFlowSideEffects(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-
-	hostname := "example.com"
-	hostKey := fqHostKey("", hostname)
-
-	s.flowSchedMu.Lock()
-	s.flowSched = map[string]*fqHostFlowScheduler{}
-	s.flowSchedMu.Unlock()
-
-	s.flowRunnerMu.Lock()
-	s.flowRunners = map[string]*fqHostProbeRunner{}
-	s.flowRunnerMu.Unlock()
-
-	s.mu.RLock()
-	store := s.flowStore
-	s.mu.RUnlock()
-	if store == nil {
-		t.Fatalf("expected flowStore to exist")
-	}
-	store.mu.Lock()
-	startFlows := len(store.byToken)
-	store.mu.Unlock()
-	if startFlows != 0 {
-		t.Fatalf("expected empty flowStore at start, got %d flows", startFlows)
-	}
-
-	rec := handleAcquireRequest(s, `{"hostname":"example.com","ipBucket":"ip1","siteBucket":"s1","now":123,"breakerEnabled":true,"halfOpenMaxProbeCount":4,"halfOpenMaxSeconds":15,"halfOpenTimeoutMode":"open"}`)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d body=%q", rec.Code, rec.Body.String())
-	}
-
-	store.mu.Lock()
-	endFlows := len(store.byToken)
-	store.mu.Unlock()
-	if endFlows != 0 {
-		t.Fatalf("expected no flows created on validation failure, got %d", endFlows)
-	}
-
-	s.flowRunnerMu.Lock()
-	_, runnerOK := s.flowRunners[hostKey]
-	runnerCount := len(s.flowRunners)
-	s.flowRunnerMu.Unlock()
-	if runnerOK || runnerCount != 0 {
-		t.Fatalf("expected no probe runners on validation failure, got runners=%d host_present=%v", runnerCount, runnerOK)
-	}
-
-	s.flowSchedMu.Lock()
-	_, schedOK := s.flowSched[hostKey]
-	schedCount := len(s.flowSched)
-	s.flowSchedMu.Unlock()
-	if schedOK || schedCount != 0 {
-		t.Fatalf("expected no schedulers on validation failure, got sched=%d host_present=%v", schedCount, schedOK)
-	}
-}
-
-func TestHandleAcquireResponseContractPending(t *testing.T) {
-	s := newAcquireHandlerTestServer()
-	s.flowStore.afterFunc = nil
-
-	body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip-pending",
-		SiteBucket:   "s1",
-	}), http.StatusOK, "pending", true, true)
-	if body.SlotToken != "" {
-		t.Fatalf("expected pending response to omit slotToken, got %+v", body)
-	}
-}
-
-func TestHandleAcquireResponseContractGranted(t *testing.T) {
-	now := time.Date(2026, 3, 28, 14, 0, 0, 0, time.UTC)
-	s := newTestServer()
-	cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-	s.flowStore.nowFn = func() time.Time { return now }
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip-granted", "s1")
-	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now.Add(5*time.Millisecond), now.Add(2*time.Second))
-	commitReadyGrant(t, s.flowStore, tok, "slot-granted", 31, 7, 300*time.Millisecond, now)
-
-	body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-		Hostname:                 req.Hostname,
-		HostnameHash:             req.HostnameHash,
-		IPBucket:                 req.IPBucket,
-		SiteBucket:               req.SiteBucket,
-		BreakerEnabled:           req.BreakerEnabled,
-		OpenCapSeconds:           req.OpenCapSeconds,
-		CloseThresholdPercent:    req.CloseThresholdPercent,
-		HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
-		HalfOpenCloseMode:        req.HalfOpenCloseMode,
-		HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
-		QueryToken:               tok,
-	}), http.StatusOK, "granted", true, true)
-	if body.QueryToken != tok {
-		t.Fatalf("expected granted response to retain token %q, got %+v", tok, body)
-	}
-	if strings.TrimSpace(body.SlotToken) == "" {
-		t.Fatalf("expected granted response to include slotToken, got %+v", body)
-	}
-}
-
-func TestHandleAcquireResponseContractThrottled(t *testing.T) {
-	now := time.Date(2026, 3, 28, 14, 5, 0, 0, time.UTC)
-	backend := &sequenceBackend{seq: []*admitResult{{
-		status:           "THROTTLED",
-		throttleCode:     429,
-		breakerOpenUntil: int(now.Add(15 * time.Second).Unix()),
-		breakerReason:    "http_429",
-		breakerVersion:   3,
-	}}}
-	s := newTestServer()
-	cfg := testConfigForAcquire(50*time.Millisecond, 40*time.Millisecond)
-	s.updateRuntime(cfg, backend, "test", false)
-	s.flowStore.afterFunc = nil
-	s.flowStore.nowFn = func() time.Time { return now }
-	defer s.stopAllHostProbeRunners()
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip-throttled", "s1")
-	body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, req), http.StatusOK, "throttled", true, true)
-	if body.QueryToken == "" {
-		t.Fatalf("expected throttled response to include queryToken, got %+v", body)
-	}
-}
-
-func TestHandleAcquireResponseContractOverloaded(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-	globalMax := 1
-	cfg.FairQueue.GlobalMaxInFlightFlow = &globalMax
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
-	now := time.Date(2026, 3, 28, 14, 10, 0, 0, time.UTC)
-	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-	tok := s.flowStore.newFlow("h1", "example.com", "ip-blocker", "s-blocker")
-	if _, err := s.flowStore.attachWaiterWithLimits(tok, waiter, now, cfg.FairQueue.inFlightLimits()); err != nil {
-		t.Fatalf("attach blocker waiter: %v", err)
-	}
-
-	requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip-overloaded",
-		SiteBucket:   "s1",
-	}), http.StatusOK, "overloaded", false, false)
-}
-
-func TestHandleAcquireResponseContractTimeout(t *testing.T) {
-	now := time.Date(2026, 3, 28, 14, 15, 0, 0, time.UTC)
-	s := newTestServer()
-	cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-	s.flowStore.nowFn = func() time.Time { return now }
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip-timeout", "s1")
-	tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now, now.Add(2*time.Second))
-	now = now.Add(cfg.FairQueue.graceDuration())
-
-	requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-		Hostname:                 req.Hostname,
-		HostnameHash:             req.HostnameHash,
-		IPBucket:                 req.IPBucket,
-		SiteBucket:               req.SiteBucket,
-		BreakerEnabled:           req.BreakerEnabled,
-		OpenCapSeconds:           req.OpenCapSeconds,
-		CloseThresholdPercent:    req.CloseThresholdPercent,
-		HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
-		HalfOpenCloseMode:        req.HalfOpenCloseMode,
-		HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
-		QueryToken:               tok,
-	}), http.StatusOK, "timeout", false, false)
-}
-
-func TestHandleAcquireResponseContractConflict(t *testing.T) {
-	now := time.Date(2026, 3, 28, 14, 20, 0, 0, time.UTC)
-	s := newTestServer()
-	cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-	s.flowStore.nowFn = func() time.Time { return now }
-
-	req := atomicBreakerAcquireRequest("example.com", "h1", "ip-conflict", "s1")
-	tok := s.flowStore.newFlowFromAcquireRequest(req)
-	if _, err := s.flowStore.acceptAcquireInvocation(tok, req, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now, now.Add(2*time.Second), cfg.FairQueue.inFlightLimits()); err != nil {
-		t.Fatalf("acceptAcquireInvocation: %v", err)
-	}
-
-	requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-		Hostname:                 req.Hostname,
-		HostnameHash:             req.HostnameHash,
-		IPBucket:                 req.IPBucket,
-		SiteBucket:               req.SiteBucket,
-		BreakerEnabled:           req.BreakerEnabled,
-		OpenCapSeconds:           req.OpenCapSeconds,
-		CloseThresholdPercent:    req.CloseThresholdPercent,
-		HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
-		HalfOpenCloseMode:        req.HalfOpenCloseMode,
-		HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
-		HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
-		HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
-		QueryToken:               tok,
-	}), http.StatusConflict, "conflict", false, false)
-}
-
-func TestHandleAcquirePreAttachPathsNeverReturnThrottled(t *testing.T) {
-	t.Run("overloaded", func(t *testing.T) {
-		s := newTestServer()
-		cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-		globalMax := 1
-		cfg.FairQueue.GlobalMaxInFlightFlow = &globalMax
-		s.updateRuntime(cfg, &stubBackend{}, "test", false)
-		s.flowStore.afterFunc = nil
-
-		now := time.Date(2026, 3, 28, 14, 25, 0, 0, time.UTC)
-		blocker := s.flowStore.newFlow("h1", "example.com", "ip-blocker", "s-blocker")
-		if _, err := s.flowStore.attachWaiterWithLimits(blocker, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now, cfg.FairQueue.inFlightLimits()); err != nil {
-			t.Fatalf("attach blocker waiter: %v", err)
-		}
-
-		body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-			Hostname:     "example.com",
-			HostnameHash: "h1",
-			IPBucket:     "ip-overloaded",
-			SiteBucket:   "s1",
-		}), http.StatusOK, "overloaded", false, false)
-		if body.Result == "throttled" {
-			t.Fatalf("pre-attach overload path must not return throttled")
-		}
-	})
-
-	t.Run("timeout", func(t *testing.T) {
-		now := time.Date(2026, 3, 28, 14, 26, 0, 0, time.UTC)
-		s := newTestServer()
-		cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-		s.updateRuntime(cfg, &stubBackend{}, "test", false)
-		s.flowStore.afterFunc = nil
-		s.flowStore.nowFn = func() time.Time { return now }
-
-		req := atomicBreakerAcquireRequest("example.com", "h1", "ip-timeout", "s1")
-		tok := createAcceptedDetachedFlow(t, s.flowStore, req, now, now, now.Add(2*time.Second))
-		now = now.Add(cfg.FairQueue.graceDuration())
-
-		body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-			Hostname:                 req.Hostname,
-			HostnameHash:             req.HostnameHash,
-			IPBucket:                 req.IPBucket,
-			SiteBucket:               req.SiteBucket,
-			BreakerEnabled:           req.BreakerEnabled,
-			OpenCapSeconds:           req.OpenCapSeconds,
-			CloseThresholdPercent:    req.CloseThresholdPercent,
-			HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
-			HalfOpenCloseMode:        req.HalfOpenCloseMode,
-			HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
-			HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
-			HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
-			QueryToken:               tok,
-		}), http.StatusOK, "timeout", false, false)
-		if body.Result == "throttled" {
-			t.Fatalf("pre-attach timeout path must not return throttled")
-		}
-	})
-
-	t.Run("conflict", func(t *testing.T) {
-		now := time.Date(2026, 3, 28, 14, 27, 0, 0, time.UTC)
-		s := newTestServer()
-		cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
-		s.updateRuntime(cfg, &stubBackend{}, "test", false)
-		s.flowStore.afterFunc = nil
-		s.flowStore.nowFn = func() time.Time { return now }
-
-		req := atomicBreakerAcquireRequest("example.com", "h1", "ip-conflict", "s1")
-		tok := s.flowStore.newFlowFromAcquireRequest(req)
-		if _, err := s.flowStore.acceptAcquireInvocation(tok, req, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now, now.Add(2*time.Second), cfg.FairQueue.inFlightLimits()); err != nil {
-			t.Fatalf("acceptAcquireInvocation: %v", err)
-		}
-
-		body := requireHandleAcquireResponseContract(t, handleAcquireJSONRequest(t, s, AcquireRequest{
-			Hostname:                 req.Hostname,
-			HostnameHash:             req.HostnameHash,
-			IPBucket:                 req.IPBucket,
-			SiteBucket:               req.SiteBucket,
-			BreakerEnabled:           req.BreakerEnabled,
-			OpenCapSeconds:           req.OpenCapSeconds,
-			CloseThresholdPercent:    req.CloseThresholdPercent,
-			HalfOpenSuccessThreshold: req.HalfOpenSuccessThreshold,
-			HalfOpenCloseMode:        req.HalfOpenCloseMode,
-			HalfOpenMaxProbeCount:    req.HalfOpenMaxProbeCount,
-			HalfOpenMaxSeconds:       req.HalfOpenMaxSeconds,
-			HalfOpenTimeoutMode:      req.HalfOpenTimeoutMode,
-			QueryToken:               tok,
-		}), http.StatusConflict, "conflict", false, false)
-		if body.Result == "throttled" {
-			t.Fatalf("pre-attach conflict path must not return throttled")
-		}
-	})
-}
-
 func TestFairQueueWaitSSEGrantedContract(t *testing.T) {
 	now := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
 	backend := &sequenceBackend{seq: []*admitResult{{
@@ -908,37 +370,626 @@ func TestFairQueueWaitGrantedReleaseUsesOwnerRoutedIdentity(t *testing.T) {
 	}
 }
 
-func TestFairQueueWaitSSEOverloadedFinalContract(t *testing.T) {
+func seedFairQueueWaitInFlightBlocker(t *testing.T, s *server, cfg *Config, now time.Time, hostHash, host, ip, site string) string {
+	t.Helper()
+	token := s.flowStore.newFlow(hostHash, host, ip, site)
+	if _, err := s.flowStore.attachWaiterWithLimits(token, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now, cfg.FairQueue.inFlightLimits()); err != nil {
+		t.Fatalf("attach scoped overload blocker: %v", err)
+	}
+	return token
+}
+
+func TestFairQueueWaitScopedOverloadHoldsAndTimesOut(t *testing.T) {
 	now := time.Date(2026, 5, 14, 12, 10, 0, 0, time.UTC)
-	backend := &sequenceBackend{seq: []*admitResult{{status: "IP_TOO_MANY"}}}
+	tests := []struct {
+		name        string
+		setLimits   func(*FairQueueConfig)
+		blockerIP   string
+		blockerSite string
+	}{
+		{
+			name: "host",
+			setLimits: func(fq *FairQueueConfig) {
+				limit := 1
+				fq.HostMaxInFlightFlow = &limit
+			},
+			blockerIP:   "ip-other",
+			blockerSite: "site-other",
+		},
+		{
+			name: "site",
+			setLimits: func(fq *FairQueueConfig) {
+				hostLimit := 2
+				siteLimit := 1
+				fq.HostMaxInFlightFlow = &hostLimit
+				fq.SiteMaxInFlightFlow = &siteLimit
+			},
+			blockerIP:   "ip-other",
+			blockerSite: "site-wait",
+		},
+		{
+			name: "ip",
+			setLimits: func(fq *FairQueueConfig) {
+				hostLimit := 2
+				siteLimit := 2
+				ipLimit := 1
+				fq.HostMaxInFlightFlow = &hostLimit
+				fq.SiteMaxInFlightFlow = &siteLimit
+				fq.IPBucketMaxInFlightFlow = &ipLimit
+			},
+			blockerIP:   "ip-wait",
+			blockerSite: "site-wait",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer()
+			cfg := testConfigForAcquire(100*time.Millisecond, 40*time.Millisecond)
+			cfg.Auth.Enabled = false
+			cfg.FairQueue.PollIntervalMs = 1
+			tc.setLimits(&cfg.FairQueue)
+			s.updateRuntime(cfg, &stubBackend{}, "test", false)
+			s.flowStore.afterFunc = nil
+			s.flowStore.nowFn = func() time.Time { return now }
+			defer s.stopAllHostProbeRunners()
+
+			seedFairQueueWaitInFlightBlocker(t, s, cfg, now, "wait-host", "wait.example.com", tc.blockerIP, tc.blockerSite)
+			payload := fairQueueWaitRequestPayload(now)
+			payload["deadlineMs"] = now.Add(30 * time.Millisecond).UnixMilli()
+
+			rec := handleFairQueueWaitJSONRequest(t, s, payload)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected scoped overload to start SSE hold, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+				t.Fatalf("expected text/event-stream for scoped hold, got %q body=%s", got, rec.Body.String())
+			}
+			events, accepted, final := parseFairQueueWaitSSEStream(t, rec.Body.String())
+			if !reflect.DeepEqual(events, []string{"accepted", "result"}) {
+				t.Fatalf("expected accepted/result events, got %v stream=%q", events, rec.Body.String())
+			}
+			if accepted.QueryToken == "" || accepted.InvocationEpoch == 0 || accepted.DeadlineMs != payload["deadlineMs"] {
+				t.Fatalf("accepted event missing hold identity/deadline: %+v", accepted)
+			}
+			got := decodeAcquireResponseFromMap(t, final)
+			if got.Result != "timeout" || got.Reason != "worker_deadline_exceeded" {
+				t.Fatalf("expected scoped hold to end through wait deadline timeout, got %+v", got)
+			}
+			if got.Reason == "overload_host" || got.Reason == "overload_site" || got.Reason == "overload_ip" {
+				t.Fatalf("scoped hold must not return scoped overloaded terminal result, got %+v", got)
+			}
+		})
+	}
+}
+
+func TestFairQueueWaitScopedOverloadRetryAtDeadlineReturnsWaitTimeout(t *testing.T) {
+	start := time.Date(2026, 5, 14, 12, 10, 15, 0, time.UTC)
+	deadline := start.Add(1500 * time.Millisecond)
 	s := newTestServer()
-	cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
+	cfg := testConfigForAcquire(2*time.Second, 40*time.Millisecond)
 	cfg.Auth.Enabled = false
 	cfg.FairQueue.PollIntervalMs = 1
-	cfg.FairQueue.IPCooldownSeconds = 2
+	hostLimit := 1
+	cfg.FairQueue.HostMaxInFlightFlow = &hostLimit
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+	logicalDeadlineReached := atomic.Bool{}
+	s.flowStore.nowFn = func() time.Time {
+		if logicalDeadlineReached.Load() {
+			return deadline
+		}
+		return start
+	}
+	defer s.stopAllHostProbeRunners()
+
+	seedFairQueueWaitInFlightBlocker(t, s, cfg, start, "wait-host", "wait.example.com", "ip-other", "site-other")
+	go func() {
+		time.Sleep(900 * time.Millisecond)
+		logicalDeadlineReached.Store(true)
+	}()
+	payload := fairQueueWaitRequestPayload(start)
+	payload["deadlineMs"] = deadline.UnixMilli()
+
+	rec := handleFairQueueWaitJSONRequest(t, s, payload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected scoped overload to start SSE hold, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	events, _, final := parseFairQueueWaitSSEStream(t, rec.Body.String())
+	if !reflect.DeepEqual(events, []string{"accepted", "result"}) {
+		t.Fatalf("expected accepted/result events, got %v stream=%q", events, rec.Body.String())
+	}
+	got := decodeAcquireResponseFromMap(t, final)
+	if got.Result != "timeout" || got.Reason != "worker_deadline_exceeded" {
+		t.Fatalf("expected retry at deadline to use wait deadline timeout, got %+v stream=%q", got, rec.Body.String())
+	}
+}
+
+func TestFairQueueWaitScopedOverloadClearsAndGrants(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 10, 30, 0, time.UTC)
+	backend := &sequenceBackend{seq: []*admitResult{{
+		status:         "READY",
+		slotToken:      validReleaseSlotToken(),
+		attemptVersion: 17,
+		attemptTicket:  5,
+	}}}
+	s := newTestServer()
+	cfg := testConfigForAcquire(1500*time.Millisecond, 40*time.Millisecond)
+	cfg.Auth.Enabled = false
+	cfg.FairQueue.PollIntervalMs = 1
+	hostLimit := 1
+	cfg.FairQueue.HostMaxInFlightFlow = &hostLimit
 	s.updateRuntime(cfg, backend, "test", false)
 	s.flowStore.afterFunc = nil
 	s.flowStore.nowFn = func() time.Time { return now }
+	defer s.stopAllHostProbeRunners()
+
+	blocker := seedFairQueueWaitInFlightBlocker(t, s, cfg, now, "wait-host", "wait.example.com", "ip-other", "site-other")
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		s.flowStore.deleteFlow(blocker)
+	}()
+	payload := fairQueueWaitRequestPayload(now)
+	payload["deadlineMs"] = now.Add(1500 * time.Millisecond).UnixMilli()
+
+	rec := handleFairQueueWaitJSONRequest(t, s, payload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected scoped overload to start SSE hold, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("expected text/event-stream for scoped hold, got %q body=%s", got, rec.Body.String())
+	}
+	events, accepted, final := parseFairQueueWaitSSEStream(t, rec.Body.String())
+	if !reflect.DeepEqual(events, []string{"accepted", "result"}) {
+		t.Fatalf("expected accepted/result events, got %v stream=%q", events, rec.Body.String())
+	}
+	got := decodeAcquireResponseFromMap(t, final)
+	if got.Result != "granted" {
+		t.Fatalf("expected held wait to enter probe path and grant after capacity clears, got %+v", got)
+	}
+	if got.QueryToken != accepted.QueryToken || got.InvocationEpoch != accepted.InvocationEpoch || got.SlotToken == "" {
+		t.Fatalf("expected granted result to carry accepted ownership, got %+v accepted=%+v", got, accepted)
+	}
+}
+
+func TestFairQueueWaitScopedOverloadClearsAfterFirstRetryDespiteKeepalives(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 10, 45, 0, time.UTC)
+	backend := &sequenceBackend{seq: []*admitResult{{
+		status:         "READY",
+		slotToken:      validReleaseSlotToken(),
+		attemptVersion: 19,
+		attemptTicket:  6,
+	}}}
+	s := newTestServer()
+	cfg := testConfigForAcquire(4*time.Second, 40*time.Millisecond)
+	cfg.Auth.Enabled = false
+	cfg.FairQueue.PollIntervalMs = 1
+	cfg.FairQueue.Wait.KeepaliveMs = 100
+	hostLimit := 1
+	cfg.FairQueue.HostMaxInFlightFlow = &hostLimit
+	s.updateRuntime(cfg, backend, "test", false)
+	s.flowStore.afterFunc = nil
+	s.flowStore.nowFn = func() time.Time { return now }
+	defer s.stopAllHostProbeRunners()
+
+	blocker := seedFairQueueWaitInFlightBlocker(t, s, cfg, now, "wait-host", "wait.example.com", "ip-other", "site-other")
+	go func() {
+		// Keep the scoped overload present for the first 1s retry, then clear it
+		// before the second 2s retry. Short keepalives must not reset that retry.
+		time.Sleep(1200 * time.Millisecond)
+		s.flowStore.deleteFlow(blocker)
+	}()
+	payload := fairQueueWaitRequestPayload(now)
+	payload["deadlineMs"] = now.Add(4 * time.Second).UnixMilli()
+
+	rec := handleFairQueueWaitJSONRequest(t, s, payload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected scoped overload to start SSE hold, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	events, accepted, final := parseFairQueueWaitSSEStream(t, rec.Body.String())
+	if !reflect.DeepEqual(events, []string{"accepted", "result"}) {
+		t.Fatalf("expected accepted/result events, got %v stream=%q", events, rec.Body.String())
+	}
+	got := decodeAcquireResponseFromMap(t, final)
+	if got.Result != "granted" {
+		t.Fatalf("expected held wait to preserve the second retry through keepalives and grant, got %+v stream=%q", got, rec.Body.String())
+	}
+	if got.QueryToken != accepted.QueryToken || got.InvocationEpoch != accepted.InvocationEpoch || got.SlotToken == "" {
+		t.Fatalf("expected granted result to carry accepted ownership, got %+v accepted=%+v", got, accepted)
+	}
+}
+
+func TestScopedAdmissionRetryDelaySequence(t *testing.T) {
+	got := []time.Duration{
+		scopedAdmissionRetryDelay(0),
+		scopedAdmissionRetryDelay(1),
+		scopedAdmissionRetryDelay(2),
+		scopedAdmissionRetryDelay(3),
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 4 * time.Second}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected no-cap scoped retry sequence %v, got %v", want, got)
+	}
+}
+
+func TestFairQueueWaitScopedOverloadTransitionsToGlobalOverload(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 11, 0, 0, time.UTC)
+	s := newTestServer()
+	cfg := testConfigForAcquire(4*time.Second, 40*time.Millisecond)
+	cfg.Auth.Enabled = false
+	cfg.FairQueue.PollIntervalMs = 1
+	cfg.FairQueue.Wait.KeepaliveMs = 100
+	globalLimit := 2
+	hostLimit := 1
+	cfg.FairQueue.GlobalMaxInFlightFlow = &globalLimit
+	cfg.FairQueue.HostMaxInFlightFlow = &hostLimit
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+	s.flowStore.nowFn = func() time.Time { return now }
+	defer s.stopAllHostProbeRunners()
+
+	seedFairQueueWaitInFlightBlocker(t, s, cfg, now, "wait-host", "wait.example.com", "ip-other", "site-other")
+	go func() {
+		time.Sleep(1200 * time.Millisecond)
+		seedFairQueueWaitInFlightBlocker(t, s, cfg, now, "other-host", "other.example.com", "ip-global", "site-global")
+	}()
+	payload := fairQueueWaitRequestPayload(now)
+	payload["deadlineMs"] = now.Add(4 * time.Second).UnixMilli()
+
+	rec := handleFairQueueWaitJSONRequest(t, s, payload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected scoped overload to start SSE hold, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("expected text/event-stream for scoped hold, got %q body=%s", got, rec.Body.String())
+	}
+	events, accepted, final := parseFairQueueWaitSSEStream(t, rec.Body.String())
+	if !reflect.DeepEqual(events, []string{"accepted", "result"}) {
+		t.Fatalf("expected accepted/result events, got %v stream=%q", events, rec.Body.String())
+	}
+	got := decodeAcquireResponseFromMap(t, final)
+	if got.Result != "overloaded" || got.Reason != "overload_global" {
+		t.Fatalf("expected scoped hold retry to terminate on global overload, got %+v", got)
+	}
+	if got.QueryToken != accepted.QueryToken || got.InvocationEpoch != accepted.InvocationEpoch {
+		t.Fatalf("expected global overload final to carry accepted ownership, got %+v accepted=%+v", got, accepted)
+	}
+}
+
+func TestFairQueueWaitFinalResultCarriesAcceptedOwnership(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 12, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		result *AcquireResponse
+	}{
+		{name: "granted", result: &AcquireResponse{Result: "granted", SlotToken: validReleaseSlotToken()}},
+		{name: "throttled", result: &AcquireResponse{Result: "throttled", Reason: "try_acquire_throttled", ThrottleCode: 429, RetryAfter: 2}},
+		{name: "overloaded", result: &AcquireResponse{Result: "overloaded", Reason: "overload_host", RetryAfter: 1}},
+		{name: "timeout", result: &AcquireResponse{Result: "timeout", Reason: "wait_stream_timeout"}},
+		{name: "conflict", result: &AcquireResponse{Result: "conflict", Reason: "waiter_already_attached"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &stubBackend{}
+			s := newTestServer()
+			cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
+			cfg.Auth.Enabled = false
+			s.updateRuntime(cfg, backend, "test", false)
+			s.flowStore.afterFunc = nil
+			s.flowStore.nowFn = func() time.Time { return now }
+			s.flowStore.afterAcceptAcquireInvocationHook = func(token string, invocationEpoch uint64) {
+				result := *tc.result
+				if result.Result == "granted" {
+					s.flowStore.deliverGrantedToAcceptedInvocation(token, invocationEpoch, &result)
+					return
+				}
+				s.flowStore.deliverToAcceptedInvocation(token, invocationEpoch, &result)
+			}
+			defer func() {
+				s.flowStore.afterAcceptAcquireInvocationHook = nil
+			}()
+			defer s.stopAllHostProbeRunners()
+
+			rec := handleFairQueueWaitJSONRequest(t, s, fairQueueWaitRequestPayload(now))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected wait sse 200, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			_, accepted, final := parseFairQueueWaitSSEStream(t, rec.Body.String())
+			got := decodeAcquireResponseFromMap(t, final)
+			if got.Result != tc.result.Result {
+				t.Fatalf("expected %s final result, got %+v", tc.result.Result, got)
+			}
+			if got.QueryToken != accepted.QueryToken || got.InvocationEpoch != accepted.InvocationEpoch {
+				t.Fatalf("expected final result to repeat accepted ownership, got %+v accepted=%+v", got, accepted)
+			}
+		})
+	}
+}
+
+func TestFairQueueWaitInvalidBackendFinalStillEmitsTerminalResult(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 12, 30, 0, time.UTC)
+	s := newTestServer()
+	cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
+	cfg.Auth.Enabled = false
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+	s.flowStore.nowFn = func() time.Time { return now }
+	s.flowStore.afterAcceptAcquireInvocationHook = func(token string, invocationEpoch uint64) {
+		s.flowStore.deliverToAcceptedInvocation(token, invocationEpoch, &AcquireResponse{
+			Result:          "timeout",
+			Reason:          "backend_supplied_wrong_owner",
+			QueryToken:      "wrong-query-token",
+			InvocationEpoch: invocationEpoch + 1,
+		})
+	}
+	defer func() {
+		s.flowStore.afterAcceptAcquireInvocationHook = nil
+	}()
 	defer s.stopAllHostProbeRunners()
 
 	rec := handleFairQueueWaitJSONRequest(t, s, fairQueueWaitRequestPayload(now))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected wait sse 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	_, accepted, final := parseFairQueueWaitSSEStream(t, rec.Body.String())
+	streamText := rec.Body.String()
+	if strings.Count(streamText, "event: result\n") != 1 {
+		t.Fatalf("expected one terminal result event after accepted, got %q", streamText)
+	}
+	_, accepted, final := parseFairQueueWaitSSEStream(t, streamText)
 	got := decodeAcquireResponseFromMap(t, final)
-	if got.Result != "overloaded" {
-		t.Fatalf("expected overloaded final result, got %+v", got)
+	if got.Result != "timeout" || got.Reason != "slot-handler-invalid-response" {
+		t.Fatalf("expected invalid backend final to degrade to timeout invalid-response, got %+v", got)
 	}
 	if got.QueryToken != accepted.QueryToken || got.InvocationEpoch != accepted.InvocationEpoch {
-		t.Fatalf("expected overloaded final to repeat accepted ownership, got %+v accepted=%+v", got, accepted)
-	}
-	if got.Reason != "overload_ip" || got.RetryAfter <= 0 {
-		t.Fatalf("expected overloaded final shape, got %+v", got)
+		t.Fatalf("expected fallback final to repeat accepted ownership, got %+v accepted=%+v", got, accepted)
 	}
 }
 
-func TestFairQueueWaitPreAttachOverloadReturns503JSON(t *testing.T) {
+func TestFairQueueWaitSSECanExceedFifteenSecondWriteTimeout(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 13, 0, 0, time.UTC)
+	backend := &stubBackend{}
+	s := newTestServer()
+	cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
+	cfg.Auth.Enabled = false
+	cfg.FairQueue.Wait.MaxStreamMs = 16_000
+	s.updateRuntime(cfg, backend, "test", false)
+	s.flowStore.afterFunc = nil
+	s.flowStore.nowFn = func() time.Time { return now }
+	s.flowStore.afterAcceptAcquireInvocationHook = func(token string, invocationEpoch uint64) {
+		go func() {
+			time.Sleep(80 * time.Millisecond)
+			s.flowStore.deliverGrantedToAcceptedInvocation(token, invocationEpoch, &AcquireResponse{Result: "granted", SlotToken: validReleaseSlotToken()})
+		}()
+	}
+	defer func() {
+		s.flowStore.afterAcceptAcquireInvocationHook = nil
+	}()
+	defer s.stopAllHostProbeRunners()
+
+	if got := s.getConfig().FairQueue.Wait.MaxStreamMs; got <= 15_000 {
+		t.Fatalf("expected test config to exceed 15s, got %d", got)
+	}
+
+	handler := http.HandlerFunc(s.handleWait)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	httpServer := &http.Server{Handler: handler, WriteTimeout: 50 * time.Millisecond, ReadTimeout: time.Second}
+	s.registerOnShutdown(httpServer)
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- httpServer.Serve(ln)
+	}()
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(closeCtx)
+		if err := <-serveErrCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("serve: %v", err)
+		}
+	}()
+
+	body := mustMarshalJSONForTest(t, fairQueueWaitRequestPayload(now))
+	req, err := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/api/v1/fairqueue/wait", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("wait request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected wait sse 200, got %d body=%s", resp.StatusCode, string(bodyBytes))
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read wait body: %v", err)
+	}
+	_, accepted, final := parseFairQueueWaitSSEStream(t, string(raw))
+	got := decodeAcquireResponseFromMap(t, final)
+	if got.Result != "granted" {
+		t.Fatalf("expected granted final result, got %+v", got)
+	}
+	if got.QueryToken != accepted.QueryToken || got.InvocationEpoch != accepted.InvocationEpoch {
+		t.Fatalf("expected final result to repeat accepted ownership, got %+v accepted=%+v", got, accepted)
+	}
+}
+
+func TestFairQueueWaitSSECanExceedFifteenSecondWriteTimeoutOverHTTP2(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	backend := &stubBackend{}
+	s := newTestServer()
+	cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
+	cfg.Auth.Enabled = false
+	cfg.FairQueue.Wait.MaxStreamMs = 16_000
+	s.updateRuntime(cfg, backend, "test", false)
+	s.flowStore.afterFunc = nil
+	s.flowStore.nowFn = func() time.Time { return now }
+	s.flowStore.afterAcceptAcquireInvocationHook = func(token string, invocationEpoch uint64) {
+		go func() {
+			time.Sleep(80 * time.Millisecond)
+			s.flowStore.deliverGrantedToAcceptedInvocation(token, invocationEpoch, &AcquireResponse{Result: "granted", SlotToken: validReleaseSlotToken()})
+		}()
+	}
+	defer func() {
+		s.flowStore.afterAcceptAcquireInvocationHook = nil
+	}()
+	defer s.stopAllHostProbeRunners()
+
+	handler := http.HandlerFunc(s.handleWait)
+	server := httptest.NewUnstartedServer(handler)
+	server.EnableHTTP2 = true
+	server.Config.WriteTimeout = 50 * time.Millisecond
+	server.Config.ReadTimeout = time.Second
+	server.StartTLS()
+	defer server.Close()
+
+	body := mustMarshalJSONForTest(t, fairQueueWaitRequestPayload(now))
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/fairqueue/wait", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("wait request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.ProtoMajor != 2 {
+		t.Fatalf("expected HTTP/2 transport, got %s", resp.Proto)
+	}
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected wait sse 200, got %d body=%s", resp.StatusCode, string(bodyBytes))
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read wait body: %v", err)
+	}
+	_, accepted, final := parseFairQueueWaitSSEStream(t, string(raw))
+	got := decodeAcquireResponseFromMap(t, final)
+	if got.Result != "granted" {
+		t.Fatalf("expected granted final result, got %+v", got)
+	}
+	if got.QueryToken != accepted.QueryToken || got.InvocationEpoch != accepted.InvocationEpoch {
+		t.Fatalf("expected final result to repeat accepted ownership, got %+v accepted=%+v", got, accepted)
+	}
+}
+
+func TestFairQueueWaitSSEAcceptedHTTP1ClosesOnServerShutdown(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	s := newTestServer()
+	cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
+	cfg.Auth.Enabled = false
+	cfg.FairQueue.Wait.MaxStreamMs = 16_000
+	s.updateRuntime(cfg, &stubBackend{}, "test", false)
+	s.flowStore.afterFunc = nil
+	s.flowStore.nowFn = func() time.Time { return now }
+	defer s.stopAllHostProbeRunners()
+
+	handler := http.HandlerFunc(s.handleWait)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	httpServer := &http.Server{Handler: handler, WriteTimeout: 50 * time.Millisecond, ReadTimeout: time.Second}
+	s.registerOnShutdown(httpServer)
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- httpServer.Serve(ln)
+	}()
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(closeCtx)
+		_ = ln.Close()
+		if err := <-serveErrCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("serve: %v", err)
+		}
+	}()
+
+	body := mustMarshalJSONForTest(t, fairQueueWaitRequestPayload(now))
+	req, err := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/api/v1/fairqueue/wait", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("wait request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected wait sse 200, got %d body=%s", resp.StatusCode, string(bodyBytes))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	acceptedFrame := make([]string, 0, 4)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read accepted frame: %v", err)
+		}
+		acceptedFrame = append(acceptedFrame, line)
+		if line == "\n" {
+			break
+		}
+	}
+	acceptedStream := strings.Join(acceptedFrame, "")
+	if !strings.Contains(acceptedStream, "event: accepted\n") {
+		t.Fatalf("expected first SSE frame to be accepted, got %q", acceptedStream)
+	}
+
+	shutdownErrCh := make(chan error, 1)
+	go func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		shutdownErrCh <- httpServer.Shutdown(shutdownCtx)
+	}()
+
+	readDone := make(chan struct {
+		payload string
+		err     error
+	}, 1)
+	go func() {
+		rest, err := io.ReadAll(reader)
+		readDone <- struct {
+			payload string
+			err     error
+		}{payload: string(rest), err: err}
+	}()
+
+	var readResult struct {
+		payload string
+		err     error
+	}
+	select {
+	case readResult = <-readDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected server shutdown to close accepted HTTP/1.x SSE stream promptly")
+	}
+	if readResult.err != nil && !errors.Is(readResult.err, io.EOF) && !strings.Contains(readResult.err.Error(), "use of closed network connection") {
+		t.Fatalf("expected shutdown to close accepted SSE stream cleanly, got %v payload=%q", readResult.err, readResult.payload)
+	}
+	if strings.Contains(readResult.payload, "event: result\n") {
+		t.Fatalf("expected shutdown-terminated accepted SSE stream to close without final result, got %q", readResult.payload)
+	}
+
+	select {
+	case err := <-shutdownErrCh:
+		if err != nil {
+			t.Fatalf("shutdown: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected server shutdown to return after closing accepted HTTP/1.x SSE stream")
+	}
+}
+
+func TestFairQueueWaitGlobalOverloadReturns503JSON(t *testing.T) {
 	now := time.Date(2026, 5, 14, 12, 15, 0, 0, time.UTC)
 	s := newTestServer()
 	cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
@@ -1014,7 +1065,11 @@ func TestFairQueueWaitSetupFailuresReturnJSON(t *testing.T) {
 				s.updateRuntime(cfg, &stubBackend{}, "test", false)
 				return s
 			},
-			body:       mustMarshalJSONForTest(t, func() map[string]any { payload := fairQueueWaitRequestPayload(now); delete(payload, "siteBucket"); return payload }()),
+			body: mustMarshalJSONForTest(t, func() map[string]any {
+				payload := fairQueueWaitRequestPayload(now)
+				delete(payload, "siteBucket")
+				return payload
+			}()),
 			wantStatus: http.StatusBadRequest,
 			wantReason: "siteBucket is required",
 		},
@@ -1027,7 +1082,11 @@ func TestFairQueueWaitSetupFailuresReturnJSON(t *testing.T) {
 				s.updateRuntime(cfg, &stubBackend{}, "test", false)
 				return s
 			},
-			body:       mustMarshalJSONForTest(t, func() map[string]any { payload := fairQueueWaitRequestPayload(now); delete(payload, "now"); return payload }()),
+			body: mustMarshalJSONForTest(t, func() map[string]any {
+				payload := fairQueueWaitRequestPayload(now)
+				delete(payload, "now")
+				return payload
+			}()),
 			wantStatus: http.StatusBadRequest,
 			wantReason: "now is required",
 		},
@@ -1077,7 +1136,7 @@ func TestFairQueueWaitSetupFailuresReturnJSON(t *testing.T) {
 	}
 }
 
-func TestFairQueueWaitCancelAfterAcceptedUsesAbandonCleanup(t *testing.T) {
+func TestFairQueueWaitCancelledConnectionTerminatesWaiter(t *testing.T) {
 	now := time.Date(2026, 5, 14, 12, 25, 0, 0, time.UTC)
 	backend := &releaseRecordingBackend{released: make(chan ReleaseRequest, 2)}
 	s := newTestServer()
@@ -1115,7 +1174,7 @@ func TestFairQueueWaitCancelAfterAcceptedUsesAbandonCleanup(t *testing.T) {
 			return nil
 		}
 		captured = <-acceptedStateCh
-		committer, ok := any(s.flowStore).(flowReadyCommitter)
+		committer, ok := any(s.flowStore).(flowGrantedSlotCommitter)
 		if !ok || !committer.commitReadyGrant(captured.token, "slot-wait-cancel", 41, 9, 0, now) {
 			callbackErr = errors.New("commitReadyGrant failed during accepted cancel test")
 		}
@@ -1144,7 +1203,7 @@ func TestFairQueueWaitCancelAfterAcceptedUsesAbandonCleanup(t *testing.T) {
 		t.Fatalf("expected accepted event before cancel, got %q", writer.BodyString())
 	}
 	if snap, ok := s.flowStore.getSnapshot(captured.token); ok {
-		t.Fatalf("expected accepted cancel to remove wait flow immediately instead of leaving reconnect state: %+v", snap)
+		t.Fatalf("expected accepted cancel to remove wait flow immediately, got %+v", snap)
 	}
 
 	reqs := collectReleaseRequests(t, backend.released, 150*time.Millisecond)
@@ -1195,7 +1254,7 @@ func TestFairQueueWaitAcceptedWriteFailureCompensatesCommittedGrant(t *testing.T
 			return nil
 		}
 		captured = <-acceptedStateCh
-		committer, ok := any(s.flowStore).(flowReadyCommitter)
+		committer, ok := any(s.flowStore).(flowGrantedSlotCommitter)
 		if !ok || !committer.commitReadyGrant(captured.token, "slot-accepted-write-fail", 43, 11, 0, now) {
 			callbackErr = errors.New("commitReadyGrant failed during accepted write failure test")
 			return injectedWriteErr

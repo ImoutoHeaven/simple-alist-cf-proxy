@@ -1,297 +1,10 @@
 package slothandler
 
 import (
-	"context"
+	"errors"
 	"testing"
 	"time"
 )
-
-func TestAcquireOverloadedByGlobalLimit(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-	globalMax := 1
-	cfg.FairQueue.GlobalMaxInFlightFlow = &globalMax
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
-	now := time.Now()
-	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-	if _, err := s.flowStore.attachWaiterWithLimits(tok, waiter, now, cfg.FairQueue.inFlightLimits()); err != nil {
-		t.Fatalf("attach waiter: %v", err)
-	}
-
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip1",
-		SiteBucket:   "s1",
-	})
-	if err != nil {
-		t.Fatalf("handleAcquireSlot: %v", err)
-	}
-	if resp.Result != "overloaded" {
-		t.Fatalf("expected overloaded, got %s", resp.Result)
-	}
-	if resp.QueryToken != "" {
-		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
-	}
-	if resp.InvocationEpoch != 0 {
-		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
-	}
-}
-
-func TestAcquireOverloadedByIPBucketScope(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-	ipBucketMax := 1
-	cfg.FairQueue.IPBucketMaxInFlightFlow = &ipBucketMax
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
-	now := time.Now()
-	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-	if _, err := s.flowStore.attachWaiterWithLimits(tok, waiter, now, cfg.FairQueue.inFlightLimits()); err != nil {
-		t.Fatalf("attach waiter: %v", err)
-	}
-
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip1",
-		SiteBucket:   "s1",
-	})
-	if err != nil {
-		t.Fatalf("handleAcquireSlot: %v", err)
-	}
-	if resp.Result != "overloaded" {
-		t.Fatalf("expected overloaded, got %s", resp.Result)
-	}
-	if resp.QueryToken != "" {
-		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
-	}
-	if resp.InvocationEpoch != 0 {
-		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
-	}
-
-	// different site bucket should not be affected by the ip bucket limit
-	resp2, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip1",
-		SiteBucket:   "s2",
-	})
-	if err != nil {
-		t.Fatalf("handleAcquireSlot: %v", err)
-	}
-	if resp2.Result == "overloaded" {
-		t.Fatalf("expected non-overloaded for different siteBucket")
-	}
-}
-
-func TestAcquireOverloadedByHostLimit(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-	hostMax := 1
-	cfg.FairQueue.HostMaxInFlightFlow = &hostMax
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
-	now := time.Now()
-	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-	if _, err := s.flowStore.attachWaiterWithLimits(tok, waiter, now, cfg.FairQueue.inFlightLimits()); err != nil {
-		t.Fatalf("attach waiter: %v", err)
-	}
-
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip2",
-		SiteBucket:   "s2",
-	})
-	if err != nil {
-		t.Fatalf("handleAcquireSlot: %v", err)
-	}
-	if resp.Result != "overloaded" {
-		t.Fatalf("expected overloaded, got %s", resp.Result)
-	}
-	if resp.QueryToken != "" {
-		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
-	}
-	if resp.InvocationEpoch != 0 {
-		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
-	}
-
-	resp2, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "other.example.com",
-		HostnameHash: "h2",
-		IPBucket:     "ip1",
-		SiteBucket:   "s1",
-	})
-	if err != nil {
-		t.Fatalf("handleAcquireSlot: %v", err)
-	}
-	if resp2.Result == "overloaded" {
-		t.Fatalf("expected non-overloaded for different host")
-	}
-}
-
-func TestAcquireOverloadedBySiteLimit(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-	siteMax := 1
-	cfg.FairQueue.SiteMaxInFlightFlow = &siteMax
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
-	now := time.Now()
-	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-	if _, err := s.flowStore.attachWaiterWithLimits(tok, waiter, now, cfg.FairQueue.inFlightLimits()); err != nil {
-		t.Fatalf("attach waiter: %v", err)
-	}
-
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip2",
-		SiteBucket:   "s1",
-	})
-	if err != nil {
-		t.Fatalf("handleAcquireSlot: %v", err)
-	}
-	if resp.Result != "overloaded" {
-		t.Fatalf("expected overloaded, got %s", resp.Result)
-	}
-	if resp.QueryToken != "" {
-		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
-	}
-	if resp.InvocationEpoch != 0 {
-		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
-	}
-
-	resp2, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip1",
-		SiteBucket:   "s2",
-	})
-	if err != nil {
-		t.Fatalf("handleAcquireSlot: %v", err)
-	}
-	if resp2.Result == "overloaded" {
-		t.Fatalf("expected non-overloaded for different siteBucket")
-	}
-}
-
-func TestAcquireOverloadedByGlobalLimitWithEmptyHostKey(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-	globalMax := 1
-	cfg.FairQueue.GlobalMaxInFlightFlow = &globalMax
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
-	now := time.Now()
-	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-	if _, err := s.flowStore.attachWaiterWithLimits(tok, waiter, now, cfg.FairQueue.inFlightLimits()); err != nil {
-		t.Fatalf("attach waiter: %v", err)
-	}
-
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "",
-		HostnameHash: "",
-		IPBucket:     "ip2",
-		SiteBucket:   "s2",
-	})
-	if err != nil {
-		t.Fatalf("handleAcquireSlot: %v", err)
-	}
-	if resp.Result != "overloaded" {
-		t.Fatalf("expected overloaded, got %s", resp.Result)
-	}
-	if resp.QueryToken != "" {
-		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
-	}
-	if resp.InvocationEpoch != 0 {
-		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
-	}
-}
-
-func TestAcquireOverloadedWithExistingToken(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-	globalMax := 1
-	cfg.FairQueue.GlobalMaxInFlightFlow = &globalMax
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
-	now := time.Now()
-	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-	if _, err := s.flowStore.attachWaiterWithLimits(tok, waiter, now, cfg.FairQueue.inFlightLimits()); err != nil {
-		t.Fatalf("attach waiter: %v", err)
-	}
-
-	resumed := s.flowStore.newFlow("h1", "example.com", "ip2", "s2")
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip2",
-		SiteBucket:   "s2",
-		QueryToken:   resumed,
-	})
-	if err != nil {
-		t.Fatalf("handleAcquireSlot: %v", err)
-	}
-	if resp.Result != "overloaded" {
-		t.Fatalf("expected overloaded, got %s", resp.Result)
-	}
-	if resp.QueryToken != "" {
-		t.Fatalf("expected overloaded response to omit queryToken, got %q", resp.QueryToken)
-	}
-	if resp.InvocationEpoch != 0 {
-		t.Fatalf("expected overloaded response to omit invocationEpoch, got %d", resp.InvocationEpoch)
-	}
-}
-
-func TestAcquireOverloadedResponseContainsScope(t *testing.T) {
-	s := newTestServer()
-	cfg := testConfigForAcquire(5*time.Millisecond, 20*time.Millisecond)
-	globalMax := 1
-	cfg.FairQueue.GlobalMaxInFlightFlow = &globalMax
-	s.updateRuntime(cfg, &stubBackend{}, "test", false)
-	s.flowStore.afterFunc = nil
-
-	now := time.Now()
-	tok := s.flowStore.newFlow("h1", "example.com", "ip1", "s1")
-	waiter := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
-	if _, err := s.flowStore.attachWaiterWithLimits(tok, waiter, now, cfg.FairQueue.inFlightLimits()); err != nil {
-		t.Fatalf("attach waiter: %v", err)
-	}
-
-	resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-		Hostname:     "example.com",
-		HostnameHash: "h1",
-		IPBucket:     "ip1",
-		SiteBucket:   "s1",
-	})
-	if err != nil {
-		t.Fatalf("handleAcquireSlot: %v", err)
-	}
-	if resp.Result != "overloaded" {
-		t.Fatalf("expected overloaded, got %s", resp.Result)
-	}
-	if resp.Reason != "overload_global" {
-		t.Fatalf("expected reason overload_global, got %q", resp.Reason)
-	}
-	if resp.RetryAfter <= 0 {
-		t.Fatalf("expected positive retryAfter, got %d", resp.RetryAfter)
-	}
-}
 
 func TestAcquireOverloadedReasonMapping(t *testing.T) {
 	t.Run("unknown_scope_stays_unknown", func(t *testing.T) {
@@ -367,15 +80,11 @@ func TestAcquireOverloadedReasonMapping(t *testing.T) {
 				t.Fatalf("attach waiter: %v", err)
 			}
 
-			resp, err := s.handleAcquireSlot(context.Background(), AcquireRequest{
-				Hostname:     "example.com",
-				HostnameHash: "h1",
-				IPBucket:     tc.reqIP,
-				SiteBucket:   tc.reqSite,
-			})
-			if err != nil {
-				t.Fatalf("handleAcquireSlot: %v", err)
+			overloaded, scope := s.flowStore.overloadScopeByCounters("h1", tc.reqSite, tc.reqIP, cfg.FairQueue.inFlightLimits())
+			if !overloaded {
+				t.Fatalf("expected overloaded")
 			}
+			resp := overloadedResponse(scope)
 			if resp.Result != "overloaded" {
 				t.Fatalf("expected overloaded, got %s", resp.Result)
 			}
@@ -422,6 +131,95 @@ func TestOverloadScopePriority(t *testing.T) {
 				t.Fatalf("expected scope %q, got %q", tc.expected, scope)
 			}
 		})
+	}
+}
+
+func TestScopedHoldAcceptedInvocationIsNotInFlightUntilAdmitted(t *testing.T) {
+	store := newFlowStore(5 * time.Second)
+	store.afterFunc = nil
+	now := time.Unix(100, 0)
+	leaseUntil := now.Add(30 * time.Second)
+	limits := inFlightLimits{global: 10, host: 1, site: 1, ip: 1}
+	req := AcquireRequest{HostnameHash: "h1", Hostname: "example.com", IPBucket: "ip1", SiteBucket: "s1"}
+
+	seedToken := store.newFlow("h1", "example.com", "ip1", "s1")
+	if ok, err := store.attachWaiterWithLimits(seedToken, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now, limits); !ok || err != nil {
+		t.Fatalf("seed attach waiter: ok=%t err=%v", ok, err)
+	}
+
+	heldToken := store.newFlowFromAcquireRequest(req)
+	accepted, err := store.allocateAcceptedInvocationForHold(heldToken, req, now, leaseUntil)
+	if err != nil {
+		t.Fatalf("allocateAcceptedInvocationForHold err=%v", err)
+	}
+	if accepted == nil || accepted.QueryToken != heldToken || accepted.InvocationEpoch == 0 {
+		t.Fatalf("expected accepted ownership, got %+v", accepted)
+	}
+	if accepted.Result != "pending" {
+		t.Fatalf("expected pending accepted response, got %q", accepted.Result)
+	}
+
+	if store.inFlightGlobal != 1 || store.inFlightByHost["h1"] != 1 || store.inFlightBySite[flowSiteKey("h1", "s1")] != 1 || store.inFlightByIP[flowIPKey("h1", "s1", "ip1")] != 1 {
+		t.Fatalf("hold must not change in-flight counters: global=%d host=%d site=%d ip=%d", store.inFlightGlobal, store.inFlightByHost["h1"], store.inFlightBySite[flowSiteKey("h1", "s1")], store.inFlightByIP[flowIPKey("h1", "s1", "ip1")])
+	}
+
+	overloadedResp, err := store.tryAdmitAcceptedInvocation(heldToken, accepted.InvocationEpoch, req, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now.Add(time.Second), limits)
+	if err == nil || !errors.Is(err, errWaiterOverloaded) || overloadScopeFromError(err) != "host" {
+		t.Fatalf("expected host overload without mutation, resp=%+v err=%v", overloadedResp, err)
+	}
+	if store.inFlightGlobal != 1 || store.inFlightByHost["h1"] != 1 || store.inFlightBySite[flowSiteKey("h1", "s1")] != 1 || store.inFlightByIP[flowIPKey("h1", "s1", "ip1")] != 1 {
+		t.Fatalf("overloaded retry must not change in-flight counters: global=%d host=%d site=%d ip=%d", store.inFlightGlobal, store.inFlightByHost["h1"], store.inFlightBySite[flowSiteKey("h1", "s1")], store.inFlightByIP[flowIPKey("h1", "s1", "ip1")])
+	}
+
+	if !store.detachWaiter(seedToken) {
+		t.Fatalf("expected seed detach")
+	}
+	w := &fqWaiter{resCh: make(chan *AcquireResponse, 1)}
+	admitted, err := store.tryAdmitAcceptedInvocation(heldToken, accepted.InvocationEpoch, req, w, now.Add(2*time.Second), limits)
+	if err != nil {
+		t.Fatalf("tryAdmitAcceptedInvocation err=%v", err)
+	}
+	if admitted == nil || admitted.QueryToken != heldToken || admitted.InvocationEpoch != accepted.InvocationEpoch || admitted.Result != "pending" {
+		t.Fatalf("expected same accepted invocation admitted pending, got %+v", admitted)
+	}
+	if store.inFlightGlobal != 1 || store.inFlightByHost["h1"] != 1 || store.inFlightBySite[flowSiteKey("h1", "s1")] != 1 || store.inFlightByIP[flowIPKey("h1", "s1", "ip1")] != 1 {
+		t.Fatalf("admission must increment counters exactly once: global=%d host=%d site=%d ip=%d", store.inFlightGlobal, store.inFlightByHost["h1"], store.inFlightBySite[flowSiteKey("h1", "s1")], store.inFlightByIP[flowIPKey("h1", "s1", "ip1")])
+	}
+
+	readmit, err := store.tryAdmitAcceptedInvocation(heldToken, accepted.InvocationEpoch, req, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, now.Add(3*time.Second), limits)
+	if err == nil && (readmit == nil || readmit.Result != "timeout") {
+		t.Fatalf("expected waiter-already-attached or stale ownership, resp=%+v err=%v", readmit, err)
+	}
+	if err != nil && !errors.Is(err, errWaiterAlreadyAttached) {
+		t.Fatalf("expected waiter-already-attached or stale ownership, got err=%v", err)
+	}
+	if store.inFlightGlobal != 1 || store.inFlightByHost["h1"] != 1 || store.inFlightBySite[flowSiteKey("h1", "s1")] != 1 || store.inFlightByIP[flowIPKey("h1", "s1", "ip1")] != 1 {
+		t.Fatalf("re-admission must not double count: global=%d host=%d site=%d ip=%d", store.inFlightGlobal, store.inFlightByHost["h1"], store.inFlightBySite[flowSiteKey("h1", "s1")], store.inFlightByIP[flowIPKey("h1", "s1", "ip1")])
+	}
+}
+
+func TestAcceptedInvocationInFlightAdmissionRefusesExpiredHold(t *testing.T) {
+	store := newFlowStore(5 * time.Second)
+	store.afterFunc = nil
+	now := time.Unix(200, 0)
+	leaseUntil := now.Add(time.Second)
+	req := AcquireRequest{HostnameHash: "h1", Hostname: "example.com", IPBucket: "ip1", SiteBucket: "s1"}
+	token := store.newFlowFromAcquireRequest(req)
+
+	accepted, err := store.allocateAcceptedInvocationForHold(token, req, now, leaseUntil)
+	if err != nil {
+		t.Fatalf("allocateAcceptedInvocationForHold err=%v", err)
+	}
+
+	resp, err := store.tryAdmitAcceptedInvocation(token, accepted.InvocationEpoch, req, &fqWaiter{resCh: make(chan *AcquireResponse, 1)}, leaseUntil, inFlightLimits{})
+	if err != nil {
+		t.Fatalf("expected stale response without error, got %v", err)
+	}
+	if resp == nil || resp.Result != "timeout" || resp.Reason != "query_token_stale" {
+		t.Fatalf("expected stale timeout for expired hold, got %+v", resp)
+	}
+	if store.inFlightGlobal != 0 || store.inFlightByHost["h1"] != 0 || store.inFlightBySite[flowSiteKey("h1", "s1")] != 0 || store.inFlightByIP[flowIPKey("h1", "s1", "ip1")] != 0 {
+		t.Fatalf("expired hold must not mutate counters: global=%d host=%d site=%d ip=%d", store.inFlightGlobal, store.inFlightByHost["h1"], store.inFlightBySite[flowSiteKey("h1", "s1")], store.inFlightByIP[flowIPKey("h1", "s1", "ip1")])
 	}
 }
 

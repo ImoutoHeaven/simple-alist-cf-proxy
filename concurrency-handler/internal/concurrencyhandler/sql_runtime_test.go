@@ -530,7 +530,7 @@ func execRuntimePromoteWaiting(ctx context.Context, db *sql.DB, req PromoteWaiti
 		       reason,
 		       retry_after,
 		       claim_token
-		FROM cq_promote_waiting_request($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		FROM cq_promote_waiting_request($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`,
 		req.RequestID,
 		req.HostnameHash,
@@ -541,6 +541,7 @@ func execRuntimePromoteWaiting(ctx context.Context, db *sql.DB, req PromoteWaiti
 		cfg.Concurrency.Caps.HostMaxInFlight,
 		cfg.Concurrency.Caps.SiteMaxInFlight,
 		cfg.Concurrency.Caps.SiteIPMaxInFlight,
+		req.WaitToken,
 	).Scan(
 		&result.Result,
 		&result.LeaseID,
@@ -552,6 +553,18 @@ func execRuntimePromoteWaiting(ctx context.Context, db *sql.DB, req PromoteWaiti
 		&result.RetryAfter,
 		&result.ClaimToken,
 	)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func execRuntimeReleaseWaitReservation(ctx context.Context, db *sql.DB, req ReleaseWaitReservationRequest) (*ReleaseWaitReservationResult, error) {
+	result := &ReleaseWaitReservationResult{}
+	err := db.QueryRowContext(ctx, `
+		SELECT result, COALESCE(reason, '')
+		FROM cq_release_wait_reservation($1, $2, $3, $4)
+	`, req.RequestID, req.WaitToken, req.NowMs, req.Consume).Scan(&result.Result, &result.Reason)
 	if err != nil {
 		return nil, err
 	}
@@ -1090,8 +1103,16 @@ func execRuntimeContinueWaitProbe(ctx context.Context, db *sql.DB, req AcquireRe
 }
 
 func execRuntimeWaitStateProbe(ctx context.Context, db *sql.DB, req AcquireRequest) (*runtimeAcquireResult, error) {
+	return execRuntimeWaitStateProbeFunc(ctx, db, "cq_wait_state_probe", req)
+}
+
+func execRuntimeAttachedWaitStateProbe(ctx context.Context, db *sql.DB, req AcquireRequest) (*runtimeAcquireResult, error) {
+	return execRuntimeWaitStateProbeFunc(ctx, db, "cq_attached_wait_state_probe", req)
+}
+
+func execRuntimeWaitStateProbeFunc(ctx context.Context, db *sql.DB, funcName string, req AcquireRequest) (*runtimeAcquireResult, error) {
 	result := &runtimeAcquireResult{}
-	err := db.QueryRowContext(ctx, `
+	err := db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT result,
 		       COALESCE(lease_id::text, ''),
 		       COALESCE(lease_token, ''),
@@ -1101,8 +1122,8 @@ func execRuntimeWaitStateProbe(ctx context.Context, db *sql.DB, req AcquireReque
 		       reason,
 		       retry_after,
 		       claim_token
-		FROM cq_wait_state_probe($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`,
+		FROM %s($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, funcName),
 		req.HostnameHash,
 		req.Hostname,
 		canonicalBucket(req.SiteBucket),
@@ -1235,7 +1256,7 @@ func TestRuntimeAcquireReturnsExpiredWhenNowPastHardExpiry(t *testing.T) {
 	}
 }
 
-func TestRuntimeAcquireCreatesWaitingRequestWithStableWaitToken(t *testing.T) {
+func TestRuntimeAcquireWaitIsProvisionalUntilAcceptedPromotion(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 
@@ -1283,6 +1304,62 @@ func TestRuntimeAcquireCreatesWaitingRequestWithStableWaitToken(t *testing.T) {
 		t.Fatalf("expected retry_after > 0, got %+v", result)
 	}
 
+	var requestRows int
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, "waiting-request").Scan(&requestRows); err != nil {
+		t.Fatalf("count provisional request rows: %v", err)
+	}
+	if requestRows != 0 {
+		t.Fatalf("expected no durable waiting row before accepted /wait, got %d", requestRows)
+	}
+
+	probe, err := execRuntimeWaitStateProbe(context.Background(), db, AcquireRequest{
+		HostnameHash:   "waiting-host",
+		Hostname:       "waiting.example.com",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		RequestID:      "waiting-request",
+		HardExpireAtMs: nowMs + 120_000,
+		DeadlineMs:     nowMs + 90_000,
+		NowMs:          nowMs + 1,
+		WaitToken:      result.WaitToken.String,
+	})
+	if err != nil {
+		t.Fatalf("probe provisional wait token: %v", err)
+	}
+	if probe.Result != "wait" || probe.WaitToken.String != result.WaitToken.String {
+		t.Fatalf("expected provisional wait probe to return wait with token, got %+v", probe)
+	}
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, "waiting-request").Scan(&requestRows); err != nil {
+		t.Fatalf("count post-probe request rows: %v", err)
+	}
+	if requestRows != 0 {
+		t.Fatalf("expected no durable waiting row before accepted promotion, got %d", requestRows)
+	}
+
+	promoted, err := execRuntimePromoteWaiting(context.Background(), db, PromoteWaitingRequest{
+		RequestID:      "waiting-request",
+		HostnameHash:   "waiting-host",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 2,
+		WaitToken:      result.WaitToken.String,
+	}, Config{Concurrency: ConcurrencyConfig{Caps: ConcurrencyCapsConfig{HostMaxInFlight: 1, SiteMaxInFlight: 1, SiteIPMaxInFlight: 1}}})
+	if err != nil {
+		t.Fatalf("promote accepted wait: %v", err)
+	}
+	if promoted.Result != "wait" || promoted.WaitToken.String != result.WaitToken.String {
+		t.Fatalf("expected accepted promotion to create queued waiter, got %+v", promoted)
+	}
+
 	var state, waitToken string
 	var waiterLeaseUntilMs int64
 	if err := db.QueryRowContext(context.Background(), `
@@ -1290,16 +1367,449 @@ func TestRuntimeAcquireCreatesWaitingRequestWithStableWaitToken(t *testing.T) {
 		FROM concurrency_requests
 		WHERE request_id = $1
 	`, "waiting-request").Scan(&state, &waitToken, &waiterLeaseUntilMs); err != nil {
-		t.Fatalf("read waiting request: %v", err)
+		t.Fatalf("read promoted waiting request: %v", err)
 	}
 	if state != "waiting" {
-		t.Fatalf("expected waiting request state, got %q", state)
+		t.Fatalf("expected accepted waiter state, got %q", state)
 	}
 	if waitToken != result.WaitToken.String {
 		t.Fatalf("expected stored wait token %q, got %q", result.WaitToken.String, waitToken)
 	}
 	if waiterLeaseUntilMs <= nowMs {
 		t.Fatalf("expected waiter_lease_until_ms > now, got %d now=%d", waiterLeaseUntilMs, nowMs)
+	}
+}
+
+func TestRuntimeAcceptedWaitTokenRejectsDuplicateAttachAtSQLBoundary(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "duplicate-attach-host",
+		Hostname:          "duplicate-attach.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "duplicate-attach-busy",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed busy lease: %v", err)
+	}
+	if busy.Result != "granted" {
+		t.Fatalf("expected busy lease, got %+v", busy)
+	}
+
+	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "duplicate-attach-host",
+		Hostname:          "duplicate-attach.example.com",
+		SiteBucket:        "site-b",
+		IPBucket:          "ip-b",
+		RequestID:         "duplicate-attach-waiting",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs + 1,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed provisional wait: %v", err)
+	}
+	if waiting.Result != "wait" || !waiting.WaitToken.Valid {
+		t.Fatalf("expected provisional wait token, got %+v", waiting)
+	}
+
+	firstProbe, err := execRuntimeWaitStateProbe(context.Background(), db, AcquireRequest{
+		HostnameHash:   "duplicate-attach-host",
+		Hostname:       "duplicate-attach.example.com",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		RequestID:      "duplicate-attach-waiting",
+		HardExpireAtMs: nowMs + 120_000,
+		DeadlineMs:     nowMs + 90_000,
+		NowMs:          nowMs + 2,
+		WaitToken:      waiting.WaitToken.String,
+	})
+	if err != nil {
+		t.Fatalf("probe provisional wait: %v", err)
+	}
+	if firstProbe.Result != "wait" {
+		t.Fatalf("expected first probe wait, got %+v", firstProbe)
+	}
+
+	duplicateProbeWhileReserved, err := execRuntimeWaitStateProbe(context.Background(), db, AcquireRequest{
+		HostnameHash:   "duplicate-attach-host",
+		Hostname:       "duplicate-attach.example.com",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		RequestID:      "duplicate-attach-waiting",
+		HardExpireAtMs: nowMs + 120_000,
+		DeadlineMs:     nowMs + 91_000,
+		NowMs:          nowMs + 3,
+		WaitToken:      waiting.WaitToken.String,
+	})
+	if err != nil {
+		t.Fatalf("probe duplicate while reservation is held: %v", err)
+	}
+	if duplicateProbeWhileReserved.Result != "conflict" || duplicateProbeWhileReserved.Reason.String != acquireConflictReasonWaiterAlreadyAttached {
+		t.Fatalf("expected duplicate probe to conflict before accepted SSE, got %+v", duplicateProbeWhileReserved)
+	}
+
+	releasedReservation, err := execRuntimeReleaseWaitReservation(context.Background(), db, ReleaseWaitReservationRequest{
+		RequestID: "duplicate-attach-waiting",
+		WaitToken: waiting.WaitToken.String,
+		NowMs:     nowMs + 4,
+	})
+	if err != nil {
+		t.Fatalf("release failed accepted-write reservation: %v", err)
+	}
+	if releasedReservation.Result != "released" {
+		t.Fatalf("expected accepted write failure to release reservation, got %+v", releasedReservation)
+	}
+
+	retryAfterAcceptedWriteFailure, err := execRuntimeWaitStateProbe(context.Background(), db, AcquireRequest{
+		HostnameHash:   "duplicate-attach-host",
+		Hostname:       "duplicate-attach.example.com",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		RequestID:      "duplicate-attach-waiting",
+		HardExpireAtMs: nowMs + 120_000,
+		DeadlineMs:     nowMs + 92_000,
+		NowMs:          nowMs + 5,
+		WaitToken:      waiting.WaitToken.String,
+	})
+	if err != nil {
+		t.Fatalf("retry probe after released accepted-write reservation: %v", err)
+	}
+	if retryAfterAcceptedWriteFailure.Result != "wait" || retryAfterAcceptedWriteFailure.WaitToken.String != waiting.WaitToken.String {
+		t.Fatalf("expected released reservation retry to wait before accepted promotion, got %+v", retryAfterAcceptedWriteFailure)
+	}
+
+	firstPromote, err := execRuntimePromoteWaiting(context.Background(), db, PromoteWaitingRequest{
+		RequestID:      "duplicate-attach-waiting",
+		HostnameHash:   "duplicate-attach-host",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 6,
+		WaitToken:      waiting.WaitToken.String,
+	}, Config{Concurrency: ConcurrencyConfig{Caps: ConcurrencyCapsConfig{HostMaxInFlight: 1, SiteMaxInFlight: 1, SiteIPMaxInFlight: 1}}})
+	if err != nil {
+		t.Fatalf("promote accepted wait: %v", err)
+	}
+	if firstPromote.Result != "wait" || firstPromote.WaitToken.String != waiting.WaitToken.String {
+		t.Fatalf("expected accepted promotion to wait, got %+v", firstPromote)
+	}
+
+	secondPromote, err := execRuntimePromoteWaiting(context.Background(), db, PromoteWaitingRequest{
+		RequestID:      "duplicate-attach-waiting",
+		HostnameHash:   "duplicate-attach-host",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 7,
+		WaitToken:      waiting.WaitToken.String,
+	}, Config{Concurrency: ConcurrencyConfig{Caps: ConcurrencyCapsConfig{HostMaxInFlight: 1, SiteMaxInFlight: 1, SiteIPMaxInFlight: 1}}})
+	if err != nil {
+		t.Fatalf("promote duplicate accepted waiter: %v", err)
+	}
+	if secondPromote.Result != "conflict" || secondPromote.Reason.String != acquireConflictReasonWaiterAlreadyAttached {
+		t.Fatalf("expected duplicate accepted promotion waiter_already_attached conflict, got %+v", secondPromote)
+	}
+
+	attachedProbe, err := execRuntimeAttachedWaitStateProbe(context.Background(), db, AcquireRequest{
+		HostnameHash:   "duplicate-attach-host",
+		Hostname:       "duplicate-attach.example.com",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		RequestID:      "duplicate-attach-waiting",
+		HardExpireAtMs: nowMs + 120_000,
+		DeadlineMs:     nowMs + 96_000,
+		NowMs:          nowMs + 6,
+		WaitToken:      waiting.WaitToken.String,
+	})
+	if err != nil {
+		t.Fatalf("probe attached waiter after promotion: %v", err)
+	}
+	if attachedProbe.Result != "wait" || attachedProbe.WaitToken.String != waiting.WaitToken.String {
+		t.Fatalf("expected internal attached waiter probe to observe live wait, got %+v", attachedProbe)
+	}
+
+	secondProbe, err := execRuntimeWaitStateProbe(context.Background(), db, AcquireRequest{
+		HostnameHash:   "duplicate-attach-host",
+		Hostname:       "duplicate-attach.example.com",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		RequestID:      "duplicate-attach-waiting",
+		HardExpireAtMs: nowMs + 120_000,
+		DeadlineMs:     nowMs + 95_000,
+		NowMs:          nowMs + 7,
+		WaitToken:      waiting.WaitToken.String,
+	})
+	if err != nil {
+		t.Fatalf("probe duplicate attach: %v", err)
+	}
+	if secondProbe.Result != "conflict" || secondProbe.Reason.String != acquireConflictReasonWaiterAlreadyAttached {
+		t.Fatalf("expected duplicate probe waiter_already_attached conflict, got %+v", secondProbe)
+	}
+
+	var waitingRows int
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		FROM concurrency_requests
+		WHERE request_id = $1 AND state = 'waiting' AND wait_token = $2
+	`, "duplicate-attach-waiting", waiting.WaitToken.String).Scan(&waitingRows); err != nil {
+		t.Fatalf("count durable waiting rows: %v", err)
+	}
+	if waitingRows != 1 {
+		t.Fatalf("expected exactly one durable waiting row, got %d", waitingRows)
+	}
+}
+
+func TestRuntimeReleasedSetupWaitReservationAllowsRetry(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "setup-release-reservation-host",
+		Hostname:          "setup-release-reservation.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "setup-release-reservation-busy",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed busy lease: %v", err)
+	}
+	if busy.Result != "granted" {
+		t.Fatalf("expected busy lease, got %+v", busy)
+	}
+
+	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "setup-release-reservation-host",
+		Hostname:          "setup-release-reservation.example.com",
+		SiteBucket:        "site-b",
+		IPBucket:          "ip-b",
+		RequestID:         "setup-release-reservation-waiting",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs + 1,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed provisional wait: %v", err)
+	}
+	if waiting.Result != "wait" || !waiting.WaitToken.Valid {
+		t.Fatalf("expected provisional wait token, got %+v", waiting)
+	}
+
+	probeReq := AcquireRequest{
+		HostnameHash:   "setup-release-reservation-host",
+		Hostname:       "setup-release-reservation.example.com",
+		SiteBucket:     "site-b",
+		IPBucket:       "ip-b",
+		RequestID:      "setup-release-reservation-waiting",
+		HardExpireAtMs: nowMs + 120_000,
+		DeadlineMs:     nowMs + 90_000,
+		WaitToken:      waiting.WaitToken.String,
+	}
+
+	firstProbeReq := probeReq
+	firstProbeReq.NowMs = nowMs + 2
+	firstProbe, err := execRuntimeWaitStateProbe(context.Background(), db, firstProbeReq)
+	if err != nil {
+		t.Fatalf("reserve provisional wait: %v", err)
+	}
+	if firstProbe.Result != "wait" || firstProbe.WaitToken.String != waiting.WaitToken.String {
+		t.Fatalf("expected reservation probe to wait, got %+v", firstProbe)
+	}
+
+	releasedReservation, err := execRuntimeReleaseWaitReservation(context.Background(), db, ReleaseWaitReservationRequest{
+		RequestID: "setup-release-reservation-waiting",
+		WaitToken: waiting.WaitToken.String,
+		NowMs:     nowMs + 3,
+		Consume:   false,
+	})
+	if err != nil {
+		t.Fatalf("release setup reservation: %v", err)
+	}
+	if releasedReservation.Result != "released" {
+		t.Fatalf("expected setup reservation release, got %+v", releasedReservation)
+	}
+
+	retryProbeReq := probeReq
+	retryProbeReq.NowMs = nowMs + 4
+	retryProbeReq.DeadlineMs = nowMs + 91_000
+	retryProbe, err := execRuntimeWaitStateProbe(context.Background(), db, retryProbeReq)
+	if err != nil {
+		t.Fatalf("retry probe after released setup reservation: %v", err)
+	}
+	if retryProbe.Result != "wait" || retryProbe.WaitToken.String != waiting.WaitToken.String {
+		t.Fatalf("expected released setup reservation retry to wait, got %+v", retryProbe)
+	}
+}
+
+func TestRuntimeAcceptedPromotionFailureTerminalizesProvisionalToken(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+	cfg := Config{Concurrency: ConcurrencyConfig{Caps: ConcurrencyCapsConfig{HostMaxInFlight: 1, SiteMaxInFlight: 1, SiteIPMaxInFlight: 1}}}
+
+	busy, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "promotion-failure-consumed-host",
+		Hostname:          "promotion-failure-consumed.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-a",
+		RequestID:         "promotion-failure-consumed-busy",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed busy lease: %v", err)
+	}
+	if busy.Result != "granted" {
+		t.Fatalf("expected busy lease, got %+v", busy)
+	}
+
+	waiting, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "promotion-failure-consumed-host",
+		Hostname:          "promotion-failure-consumed.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-b",
+		RequestID:         "promotion-failure-consumed-waiting",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs + 1,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed provisional wait: %v", err)
+	}
+	if waiting.Result != "wait" || !waiting.WaitToken.Valid {
+		t.Fatalf("expected provisional wait token, got %+v", waiting)
+	}
+
+	reserved, err := execRuntimeWaitStateProbe(context.Background(), db, AcquireRequest{
+		HostnameHash:   "promotion-failure-consumed-host",
+		Hostname:       "promotion-failure-consumed.example.com",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-b",
+		RequestID:      "promotion-failure-consumed-waiting",
+		HardExpireAtMs: nowMs + 120_000,
+		DeadlineMs:     nowMs + 90_000,
+		NowMs:          nowMs + 2,
+		WaitToken:      waiting.WaitToken.String,
+	})
+	if err != nil {
+		t.Fatalf("reserve provisional wait: %v", err)
+	}
+	if reserved.Result != "wait" {
+		t.Fatalf("expected reservation probe to wait, got %+v", reserved)
+	}
+
+	consumed, err := execRuntimeReleaseWaitReservation(context.Background(), db, ReleaseWaitReservationRequest{
+		RequestID: "promotion-failure-consumed-waiting",
+		WaitToken: waiting.WaitToken.String,
+		NowMs:     nowMs + 3,
+		Consume:   true,
+	})
+	if err != nil {
+		t.Fatalf("consume accepted promotion failure reservation: %v", err)
+	}
+	if consumed.Result != "released" {
+		t.Fatalf("expected consume release result, got %+v", consumed)
+	}
+
+	replayedConsume, err := execRuntimeReleaseWaitReservation(context.Background(), db, ReleaseWaitReservationRequest{
+		RequestID: "promotion-failure-consumed-waiting",
+		WaitToken: waiting.WaitToken.String,
+		NowMs:     nowMs + 4,
+		Consume:   true,
+	})
+	if err != nil {
+		t.Fatalf("replay consumed accepted promotion failure reservation: %v", err)
+	}
+	if replayedConsume.Result != "noop" || replayedConsume.Reason != "already_terminal" {
+		t.Fatalf("expected idempotent already-terminal consume replay, got %+v", replayedConsume)
+	}
+
+	duplicateAcquire, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
+		HostnameHash:      "promotion-failure-consumed-host",
+		Hostname:          "promotion-failure-consumed.example.com",
+		SiteBucket:        "site-a",
+		IPBucket:          "ip-b",
+		RequestID:         "promotion-failure-consumed-waiting",
+		HardExpireMs:      nowMs + 120_000,
+		NowMs:             nowMs + 5,
+		HostMaxInFlight:   1,
+		SiteMaxInFlight:   1,
+		SiteIPMaxInFlight: 1,
+	})
+	if err != nil {
+		t.Fatalf("duplicate acquire after terminalized token: %v", err)
+	}
+	if duplicateAcquire.Result != "released" || duplicateAcquire.Reason.String != "final_cleanup" {
+		t.Fatalf("expected terminal replay after accepted promotion failure, got %+v", duplicateAcquire)
+	}
+
+	if promoted, err := execRuntimePromoteWaiting(context.Background(), db, PromoteWaitingRequest{
+		RequestID:      "promotion-failure-consumed-waiting",
+		HostnameHash:   "promotion-failure-consumed-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-b",
+		HardExpireAtMs: nowMs + 120_000,
+		NowMs:          nowMs + 6,
+		WaitToken:      waiting.WaitToken.String,
+	}, cfg); err == nil && promoted.Result == "wait" {
+		t.Fatalf("consumed token must not promote into durable waiter, got %+v", promoted)
+	}
+
+	var provisionalRows int
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		FROM concurrency_wait_tokens
+		WHERE wait_token = $1
+	`, waiting.WaitToken.String).Scan(&provisionalRows); err != nil {
+		t.Fatalf("count consumed provisional token rows: %v", err)
+	}
+	if provisionalRows != 0 {
+		t.Fatalf("expected accepted promotion failure to remove provisional marker, got %d", provisionalRows)
+	}
+
+	var waitingRows int
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		FROM concurrency_requests
+		WHERE request_id = $1 AND state = 'waiting'
+	`, "promotion-failure-consumed-waiting").Scan(&waitingRows); err != nil {
+		t.Fatalf("count durable waiting rows: %v", err)
+	}
+	if waitingRows != 0 {
+		t.Fatalf("expected consumed failed-promotion token to create no durable waiting row, got %d", waitingRows)
+	}
+
+	var state string
+	var terminalReason sql.NullString
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT state, terminal_reason
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, "promotion-failure-consumed-waiting").Scan(&state, &terminalReason); err != nil {
+		t.Fatalf("read durable terminal request: %v", err)
+	}
+	if state != "released" || terminalReason.String != "final_cleanup" {
+		t.Fatalf("expected durable final cleanup request, state=%q reason=%q", state, terminalReason.String)
 	}
 }
 
@@ -2372,7 +2882,7 @@ func TestRuntimeHeartbeatOpenTransfersRenewalOwnershipOnlyAfterPreviousOwnerTurn
 	}
 }
 
-func TestRuntimeHeartbeatOpenBlocksTerminalOwnerTakeoverUntilPreservedHeartbeatDeadlineExpires(t *testing.T) {
+func TestRuntimeHeartbeatOpenTransfersRenewalOwnershipAfterTerminalOwnerRelease(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 	ticketHash := "heartbeat-renewable-terminal-owner-ticket"
@@ -2433,8 +2943,8 @@ func TestRuntimeHeartbeatOpenBlocksTerminalOwnerTakeoverUntilPreservedHeartbeatD
 	if ownerAfterRelease.State != "released" {
 		t.Fatalf("expected request A to be terminal before takeover, got %+v", ownerAfterRelease)
 	}
-	if !ownerAfterRelease.HeartbeatDeadlineMs.Valid || ownerAfterRelease.HeartbeatDeadlineMs.Int64 != openA.DeadlineMs.Int64 {
-		t.Fatalf("expected terminal owner to preserve heartbeat deadline %d, got %+v", openA.DeadlineMs.Int64, ownerAfterRelease)
+	if ownerAfterRelease.HeartbeatDeadlineMs.Valid || ownerAfterRelease.HeartbeatGraceUntilMs.Valid {
+		t.Fatalf("expected terminal owner to clear renewable heartbeat liveness fields, got %+v", ownerAfterRelease)
 	}
 
 	grantB, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
@@ -2481,37 +2991,15 @@ func TestRuntimeHeartbeatOpenBlocksTerminalOwnerTakeoverUntilPreservedHeartbeatD
 		t.Fatalf("expected accepted heartbeat open after terminal owner release, got %+v", openB)
 	}
 
-	beforeStale := readRuntimeTicketState(t, db, ticketHash)
-	if !beforeStale.IdleRenewOwnerLeaseID.Valid || beforeStale.IdleRenewOwnerLeaseID.String != grantA.LeaseID {
-		t.Fatalf("expected released owner lease A to keep renewal ownership until stale cutoff, got %+v", beforeStale)
+	updated := readRuntimeTicketState(t, db, ticketHash)
+	if !updated.IdleRenewOwnerLeaseID.Valid || updated.IdleRenewOwnerLeaseID.String != grantB.LeaseID {
+		t.Fatalf("expected terminal owner to stop blocking renewal ownership by lease B, got %+v", updated)
 	}
-
-	refreshReqB := HeartbeatRefreshRequest{
-		RequestID:          "heartbeat-renewable-terminal-owner-request-b",
-		LeaseID:            grantB.LeaseID,
-		LeaseToken:         grantB.LeaseToken,
-		Generation:         openB.Generation.Int64,
-		NowMs:              openA.DeadlineMs.Int64 + 1,
-		HeartbeatTimeoutMs: 15_000,
+	if !updated.IdleRenewOwnerLastHeartbeatAt.Valid || updated.IdleRenewOwnerLastHeartbeatAt.Int64 < openReqB.NowMs/1000 {
+		t.Fatalf("expected terminal-owner handoff to refresh last heartbeat timestamp, got %+v", updated)
 	}
-	setTestStructStringField(&refreshReqB, "TicketHash", ticketHash)
-	refreshB, err := execRuntimeHeartbeatRefresh(context.Background(), db, refreshReqB)
-	if err != nil {
-		t.Fatalf("heartbeat refresh b after terminal owner stale cutoff: %v", err)
-	}
-	if refreshB.Result != "accepted" {
-		t.Fatalf("expected accepted heartbeat refresh after terminal owner stale cutoff, got %+v", refreshB)
-	}
-
-	afterStale := readRuntimeTicketState(t, db, ticketHash)
-	if !afterStale.IdleRenewOwnerLeaseID.Valid || afterStale.IdleRenewOwnerLeaseID.String != grantB.LeaseID {
-		t.Fatalf("expected takeover after preserved heartbeat deadline expiry to move renewal owner to lease B, got %+v", afterStale)
-	}
-	if !afterStale.IdleRenewOwnerLastHeartbeatAt.Valid || afterStale.IdleRenewOwnerLastHeartbeatAt.Int64 < refreshReqB.NowMs/1000 {
-		t.Fatalf("expected takeover after preserved heartbeat deadline expiry to refresh last heartbeat timestamp, got %+v", afterStale)
-	}
-	if afterStale.IdleLeaseExpiresAt < beforeStale.IdleLeaseExpiresAt {
-		t.Fatalf("expected takeover after preserved heartbeat deadline expiry to avoid shortening lease expiry, before=%+v after=%+v", beforeStale, afterStale)
+	if openA.DeadlineMs.Int64 > openReqB.NowMs && updated.IdleRenewOwnerLeaseID.String != grantB.LeaseID {
+		t.Fatalf("expected takeover before old heartbeat deadline %d, got %+v", openA.DeadlineMs.Int64, updated)
 	}
 }
 
@@ -3226,8 +3714,8 @@ func TestRuntimeReleaseDuringConnectedHeartbeatClearsHeartbeatState(t *testing.T
 	if request.State != "released" || request.HeartbeatState.String != "none" {
 		t.Fatalf("expected connected heartbeat release cleanup, got %+v", request)
 	}
-	if !request.HeartbeatDeadlineMs.Valid || request.HeartbeatDeadlineMs.Int64 != open.DeadlineMs.Int64 {
-		t.Fatalf("expected connected heartbeat release to preserve deadline %d, got %+v", open.DeadlineMs.Int64, request)
+	if request.HeartbeatDeadlineMs.Valid {
+		t.Fatalf("expected connected heartbeat release to clear deadline liveness, got %+v", request)
 	}
 	if request.HeartbeatGraceUntilMs.Valid {
 		t.Fatalf("expected connected heartbeat release to keep grace empty, got %+v", request)
@@ -3281,7 +3769,7 @@ func TestRuntimeReleaseDuringGraceHeartbeatClearsHeartbeatState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("heartbeat open: %v", err)
 	}
-	disconnect, err := execRuntimeHeartbeatDisconnect(context.Background(), db, HeartbeatDisconnectRequest{
+	_, err = execRuntimeHeartbeatDisconnect(context.Background(), db, HeartbeatDisconnectRequest{
 		RequestID:        "heartbeat-release-grace-request",
 		LeaseID:          grant.LeaseID,
 		LeaseToken:       grant.LeaseToken,
@@ -3307,11 +3795,11 @@ func TestRuntimeReleaseDuringGraceHeartbeatClearsHeartbeatState(t *testing.T) {
 	if request.State != "released" || request.HeartbeatState.String != "none" {
 		t.Fatalf("expected grace heartbeat release cleanup, got %+v", request)
 	}
-	if !request.HeartbeatDeadlineMs.Valid || request.HeartbeatDeadlineMs.Int64 != disconnect.DeadlineMs.Int64 {
-		t.Fatalf("expected grace heartbeat release to preserve deadline %d, got %+v", disconnect.DeadlineMs.Int64, request)
+	if request.HeartbeatDeadlineMs.Valid {
+		t.Fatalf("expected grace heartbeat release to clear deadline liveness, got %+v", request)
 	}
-	if !request.HeartbeatGraceUntilMs.Valid || request.HeartbeatGraceUntilMs.Int64 != disconnect.DeadlineMs.Int64 {
-		t.Fatalf("expected grace heartbeat release to preserve grace deadline %d, got %+v", disconnect.DeadlineMs.Int64, request)
+	if request.HeartbeatGraceUntilMs.Valid {
+		t.Fatalf("expected grace heartbeat release to clear grace liveness, got %+v", request)
 	}
 	if !request.HeartbeatTerminalReason.Valid || request.HeartbeatTerminalReason.String != request.TerminalReason.String {
 		t.Fatalf("expected grace heartbeat release to mirror terminal reason into heartbeat cleanup, got %+v", request)
@@ -3798,51 +4286,114 @@ func TestRuntimeClaimGrantExpiresHardExpiredActiveLease(t *testing.T) {
 	}
 }
 
-func TestRuntimeCancelAbsentRowCreatesCancelledTombstone(t *testing.T) {
+func TestRuntimeClaimGrantReplaysWaitStreamTimeoutExpiredRequest(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()
 
-	var cancelResult string
-	var cancelReason sql.NullString
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO concurrency_requests (
+			request_id, hostname_hash, hostname, site_bucket, ip_bucket, hard_expire_at_ms,
+			state, terminal_reason, claim_token, created_at_ms, updated_at_ms
+		) VALUES ($1, $2, $3, $4, $5, $6, 'expired', 'wait_stream_timeout', $7, $8, $8)
+	`, "claim-wait-stream-timeout-request", "claim-wait-stream-timeout-host", "claim-wait-stream-timeout.example.com", "site-a", "ip-a", nowMs+60_000, "claim-wait-stream-timeout-token", nowMs); err != nil {
+		t.Fatalf("seed expired request: %v", err)
+	}
+
+	claim, err := execRuntimeClaimGrant(context.Background(), db, "claim-wait-stream-timeout-request", "claim-wait-stream-timeout-token", nowMs+1)
+	if err != nil {
+		t.Fatalf("claim expired wait_stream_timeout request: %v", err)
+	}
+	if claim.Result != "expired" || claim.Reason.String != "wait_stream_timeout" {
+		t.Fatalf("expected expired wait_stream_timeout claim replay, got %+v", claim)
+	}
+	if claim.LeaseID != "" || claim.LeaseToken != "" || claim.ExpiresAtMs != 0 || claim.HandoffToken.Valid || claim.HandoffDeadlineMs.Valid {
+		t.Fatalf("expected expired claim replay without grant payload, got %+v", claim)
+	}
+}
+
+func TestRuntimeTerminalizeWaitingAbsentRowIsNoop(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	var result string
+	var reason sql.NullString
 	if err := db.QueryRowContext(context.Background(), `
 		SELECT result, reason
-		FROM cq_cancel($1, $2, $3, $4, $5, $6, $7, $8)
-	`, "cancelled-request", "cancel.example.com", "cancel-host", "site-a", "ip-a", nowMs+60_000, "worker_aborted", nowMs).Scan(&cancelResult, &cancelReason); err != nil {
-		t.Fatalf("cancel absent row: %v", err)
+		FROM cq_terminalize_waiting($1, $2, $3, $4, $5, $6, $7, $8)
+	`, "missing-request", "terminalize.example.com", "terminalize-host", "site-a", "ip-a", nowMs+60_000, "final_cleanup", nowMs).Scan(&result, &reason); err != nil {
+		t.Fatalf("terminalize absent row: %v", err)
 	}
-	if cancelResult != "cancelled" {
-		t.Fatalf("expected cancelled result, got result=%q reason=%q", cancelResult, cancelReason.String)
+	if result != "noop" || reason.String != "already_terminal" {
+		t.Fatalf("expected noop already_terminal result, got result=%q reason=%q", result, reason.String)
 	}
 
-	var state, terminalReason, hostname string
+	var rowCount int
 	if err := db.QueryRowContext(context.Background(), `
-		SELECT state, terminal_reason, hostname
+		SELECT COUNT(*)
 		FROM concurrency_requests
 		WHERE request_id = $1
-	`, "cancelled-request").Scan(&state, &terminalReason, &hostname); err != nil {
-		t.Fatalf("read cancelled tombstone: %v", err)
+	`, "missing-request").Scan(&rowCount); err != nil {
+		t.Fatalf("count missing request rows after noop terminalization: %v", err)
 	}
-	if state != "cancelled" || terminalReason != "request_cancelled" {
-		t.Fatalf("expected cancelled tombstone, got state=%q terminal_reason=%q", state, terminalReason)
+	if rowCount != 0 {
+		t.Fatalf("expected noop terminalization to avoid creating tombstones, got %d rows", rowCount)
 	}
-	if hostname != "cancel.example.com" {
-		t.Fatalf("expected cancelled tombstone hostname to persist actual host, got %q", hostname)
+}
+
+func TestRuntimeTerminalizeWaitingWaitStreamTimeoutRequiresExpiredAuthority(t *testing.T) {
+	db := requireRuntimeConcurrencyDB(t)
+	nowMs := time.Now().UnixMilli()
+
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO concurrency_requests (
+			request_id, hostname_hash, hostname, site_bucket, ip_bucket, hard_expire_at_ms,
+			state, wait_token, first_wait_at_ms, waiter_lease_until_ms, created_at_ms, updated_at_ms
+		) VALUES ($1, $2, $3, $4, $5, $6, 'waiting', $7, $8, $9, $8, $8)
+	`, "terminalize-timeout-request", "terminalize-timeout-host", "terminalize-timeout.example.com", "site-a", "ip-a", nowMs+60_000, "wait-terminalize-timeout", nowMs-1_000, nowMs+10_000); err != nil {
+		t.Fatalf("seed waiting row: %v", err)
 	}
 
-	replay, err := execRuntimeAcquire(context.Background(), db, runtimeAcquireCall{
-		HostnameHash: "cancel-host",
-		Hostname:     "cancel.example.com",
-		SiteBucket:   "site-a",
-		IPBucket:     "ip-a",
-		RequestID:    "cancelled-request",
-		HardExpireMs: nowMs + 60_000,
-		NowMs:        nowMs,
-	})
-	if err != nil {
-		t.Fatalf("replay acquire after cancel tombstone: %v", err)
+	var result, reason string
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason
+		FROM cq_terminalize_waiting($1, $2, $3, $4, $5, $6, $7, $8)
+	`, "terminalize-timeout-request", "terminalize-timeout.example.com", "terminalize-timeout-host", "site-a", "ip-a", nowMs+60_000, "wait_stream_timeout", nowMs).Scan(&result, &reason); err != nil {
+		t.Fatalf("terminalize wait timeout: %v", err)
 	}
-	if replay.Result != "cancelled" || replay.Reason.String != "request_cancelled" {
-		t.Fatalf("expected cancelled replay, got %+v", replay)
+	if result != "expired" || reason != "wait_stream_timeout" {
+		t.Fatalf("expected terminalize wait timeout to prove expired authority, got result=%q reason=%q", result, reason)
+	}
+
+	var state, terminalReason string
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT state, terminal_reason
+		FROM concurrency_requests
+		WHERE request_id = $1
+	`, "terminalize-timeout-request").Scan(&state, &terminalReason); err != nil {
+		t.Fatalf("read terminalized waiting row: %v", err)
+	}
+	if state != "expired" || terminalReason != "wait_stream_timeout" {
+		t.Fatalf("expected expired wait_stream_timeout row, got state=%q terminal_reason=%q", state, terminalReason)
+	}
+
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO concurrency_requests (
+			request_id, hostname_hash, hostname, site_bucket, ip_bucket, hard_expire_at_ms,
+			state, terminal_reason, created_at_ms, updated_at_ms
+		) VALUES ($1, $2, $3, $4, $5, $6, 'released', 'final_cleanup', $7, $7)
+	`, "terminalize-released-request", "terminalize-released-host", "terminalize-released.example.com", "site-a", "ip-a", nowMs+60_000, nowMs); err != nil {
+		t.Fatalf("seed released row: %v", err)
+	}
+
+	var replayResult, replayReason string
+	if err := db.QueryRowContext(context.Background(), `
+		SELECT result, reason
+		FROM cq_terminalize_waiting($1, $2, $3, $4, $5, $6, $7, $8)
+	`, "terminalize-released-request", "terminalize-released.example.com", "terminalize-released-host", "site-a", "ip-a", nowMs+60_000, "wait_stream_timeout", nowMs).Scan(&replayResult, &replayReason); err != nil {
+		t.Fatalf("terminalize released wait timeout replay: %v", err)
+	}
+	if replayResult != "noop" || replayReason != "already_terminal" {
+		t.Fatalf("expected incompatible released replay to remain noop already_terminal, got result=%q reason=%q", replayResult, replayReason)
 	}
 }
 

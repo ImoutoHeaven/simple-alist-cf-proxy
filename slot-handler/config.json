@@ -29,8 +29,7 @@
   },
   "fairQueue": {
     "pollIntervalMs": 500,
-    "acceptedLeaseMs": 6000,
-    "detachGraceMs": 4000,
+    "terminalCleanupGraceMs": 4000,
     "wait": {
       "maxStreamMs": 10000,
       "keepaliveMs": 1500

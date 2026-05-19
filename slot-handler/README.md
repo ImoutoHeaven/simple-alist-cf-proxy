@@ -3,7 +3,7 @@
 slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排队与 slot 管理。
 
 它负责：
-- 接收 worker 的 `wait` / `release` / `abandon` 请求
+- 接收 worker 的 `wait` / `release` 请求
 - 在内存中维护 flow（`queryToken`）、accepted invocation（`invocationEpoch`）与 attached waiter
 - 通过 PostgREST 或 Postgres 调用数据库 RPC，分配/释放 slot
 
@@ -15,15 +15,16 @@ slot-handler 是独立的 Go HTTP 服务，为 download worker 提供公平排�
 
 - Wait endpoints across the download stack: `POST /api/v1/fairqueue/wait` and `POST /api/v1/concurrency/wait`
 - Both wait requests use `Accept: text/event-stream`, both handlers reply with `Content-Type: text/event-stream`, and each accepted stream emits one `accepted` event plus one final `result` event.
+- FQ final SSE result events repeat the accepted ownership tuple: `queryToken` and `invocationEpoch`.
 - CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP
-- FQ: wait SSE -> accepted -> one final result -> release or abandon HTTP cleanup
-- No compatibility mode, long-poll fallback, or automatic SSE reconnect exists.
+- FQ: wait SSE -> accepted -> one final result -> disconnect is terminal, granted slots release after use
+- fairqueue wait 只认已 accepted 的 SSE stream 作为 active waiter；断开即终态。
 - 当目标同时启用 fairqueue 与 true concurrency 时，worker 先打开 `POST /api/v1/fairqueue/wait`；FQ `granted` 后再做 CQ fast `acquire`。若 CQ 返回 `wait`，worker 会先 settle 前一个 breaker attempt，再释放未使用的 fairqueue slot，然后打开 `POST /api/v1/concurrency/wait`。只有 CQ SSE `granted` 之后，worker 才会继续 `claim -> ack_handoff -> heartbeat -> origin fetch`。
 
 ## 2. 核心模型
 
 - `queryToken` 标识一个 live fairqueue flow，并绑定创建时的 canonical admission tuple（`hostname`、`hostnameHash`、`ipBucket`、`siteBucket` 与 `queue_breaker` 所需 breaker tuple）。
-- `invocationEpoch` 标识当前 accepted wait stream。worker 只有在收到 `accepted` 事件后才持有这组 ownership，并且只能用它做 pre-grant `/abandon`。
+- `invocationEpoch` 标识当前 accepted wait stream。worker 只有在收到 `accepted` 事件后才持有这组 ownership；若连接在 grant 前断开，slot-handler 会把这条 wait 当作终态清理。
 - `slotToken` 只在 `granted` 最终结果里出现；收到 `granted` 后，worker 改用 `/release` 做 after-use cleanup，并携带 `releaseOwnerRequired=true` 所要求的 owner tuple。
 - attached waiter 只负责当前 SSE 流的交付，不改变数据库作为 slot 权威的事实。grant 已提交但未成功交付时，slot-handler 会做补偿 release，避免留下无主 slot。
 
@@ -47,6 +48,8 @@ accepted 事件字段：
 - `invocationEpoch`
 - `deadlineMs`
 
+最终 `result` 事件必须重复 `accepted` 事件里的 `queryToken` 与 `invocationEpoch`。
+
 最终 `result` 事件只允许：
 - `granted`
 - `throttled`
@@ -63,24 +66,19 @@ accepted 之前的鉴权失败、JSON 失败、缺字段或 pre-attachment overl
 - `slotToken` 语法合法但 slot 已未知或已释放时，仍按幂等 no-op 返回 `200`。
 - 带 owner tuple 的 release 需要命中 claim owner；owner route miss 会 fail-closed 为 `503`，避免 split-brain 下把本地 flow 留成永久残留。
 
-### POST /api/v1/fairqueue/abandon
-
-- pre-grant cleanup 路径，只接受 `queryToken + invocationEpoch`。
-- 结果只会是 `abandoned`、`noop_not_found`、`noop_attached` 或 `noop_epoch_mismatch`。
-- 一旦 worker 已收到 `granted`，cleanup 就不能再走 `/abandon`，而是改走 `/release`。
-
 ## 4. 调度、原子 admission 与清理边界
 
 - 每个 hostKey 都有后台 reactor，负责唤醒调度、批量 probe 与最终结果交付；数据库仍是最终 slot 权威。
 - `queue_only` 只做 queue admission；`queue_breaker` 在同一条 backend admission 路径里携带 `breakerEnabled` 与 canonical breaker tuple，让 backend 原子决定 queue slot 与 breaker attempt。
 - slot-handler 不保留 breaker 运行时本地权威；`throttled`、`breakerOpenUntil`、`breakerReason`、`breakerVersion` 都直接透传 backend 结果。
-- worker 在 accepted 之后、grant 之前放弃等待时走 `/abandon`；worker 在 grant 之后结束请求、上游失败或客户端断开时走 `/release`。
+- accepted SSE 连接断开就是 waiter 终态；若 grant 已提交但最终结果未可靠写回，slot-handler 会补偿 release。worker 在 grant 之后结束请求、上游失败或客户端断开时仍走 `/release`。
 
 ## 5. 配置（config.json）
 
 `fairQueue` 关键字段：
 - `wait.maxStreamMs`：单条已 accepted SSE wait stream 的最大时长
 - `wait.keepaliveMs`：accepted stream 的 keepalive 注释帧间隔
+- `terminalCleanupGraceMs`：accepted SSE waiter 断开后的服务端终态清理缓冲时间
 - `pollIntervalMs`：host reactor 的最小探测节拍
 - `utilWindowSec`：利用率采样窗口
 - `maxBatch` / `maxProbeParallel` / `maxProbeQpsPerHost`：probe 调度参数
@@ -91,7 +89,7 @@ accepted 之前的鉴权失败、JSON 失败、缺字段或 pre-attachment overl
 - `rpc`：数据库函数名
 - `cleanup`：后台 DB cleanup 节奏
 
-`slot-handler/config.json` 中的 wait 配置已经以 SSE stream 为中心：公开等待接口只描述 `text/event-stream`、`accepted` 事件与最终 `result` 事件，不再暴露任何 worker 侧 polling/reconnect 协议。
+`slot-handler/config.json` 中的 wait 配置已经以 SSE stream 为中心：公开等待接口只描述 `text/event-stream`、`accepted` 事件与最终 `result` 事件；worker 不会为同一条 wait 重新挂接，服务端在断流后负责终态清理。
 
 ## 6. Backend 与 SQL
 
@@ -111,7 +109,7 @@ accepted 之前的鉴权失败、JSON 失败、缺字段或 pre-attachment overl
 
 ## 8. 与 download worker 的关系
 
-- worker 调用 `POST /api/v1/fairqueue/wait`；拿到 `accepted` 后保存 `queryToken + invocationEpoch`，拿到 `granted` 后保存 `slotToken` 与 `releaseOwnerRequired=true`。
+- worker 调用 `POST /api/v1/fairqueue/wait`；拿到 `accepted` 后保存 `queryToken + invocationEpoch`，并要求最终 `result` 事件重复这组 ownership；拿到 `granted` 后再保存 `slotToken` 与 `releaseOwnerRequired=true`。
 - `queue_only` 只走 fairqueue；`queue_breaker` 由 slot-handler 原子完成 queue + breaker admission，再由 worker 在响应后回写 `report` 或 `settle`。slot-handler 不保存任何 breaker 运行时状态。
 - `overloaded` 仍按 scope 分流处理：`overload_global` 走 fail-fast `503`，`overload_host|overload_site|overload_ip` 走有界退避。worker 总 wait budget 到点后会主动放弃等待，而不是自动重连 SSE。
 

@@ -76,9 +76,10 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 
 - Wait endpoints: `POST /api/v1/fairqueue/wait` and `POST /api/v1/concurrency/wait`
 - Both wait requests use `Accept: text/event-stream`, both handlers reply with `Content-Type: text/event-stream`, and each accepted stream emits one `accepted` event plus one final `result` event.
+- FQ final SSE result events repeat the accepted ownership tuple: `queryToken` and `invocationEpoch`.
 - CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP
-- FQ: wait SSE -> accepted -> one final result -> release or abandon HTTP cleanup
-- No compatibility mode, long-poll fallback, or automatic SSE reconnect exists.
+- FQ: wait SSE -> accepted -> one final result -> disconnect is terminal, granted slots release after use
+- FQ 与 CQ wait 都只认已 accepted 的 SSE stream 作为 active waiter；断开即终态。
 
 ## 5. 请求处理流程
 
@@ -149,13 +150,13 @@ admission 固定为四种显式运行模式：
 
 11. **Fair Queue（slot-handler）**
     - 当 hostname 命中 `download.fairQueue.hostPatterns`，worker 调用 slot-handler `POST /api/v1/fairqueue/wait`，并附带 `siteBucket`、`requestId`、`deadlineMs`、`admissionMode` 与必要的 breaker tuple。
-    - wait 请求发送 `Accept: text/event-stream`；slot-handler 在接受请求后发送一个 `accepted` 事件，其中包含 `queryToken`、`invocationEpoch` 与 `deadlineMs`，随后只会再发送一个最终 `result` 事件并关闭流。
+    - wait 请求发送 `Accept: text/event-stream`；slot-handler 在接受请求后发送一个 `accepted` 事件，其中包含 `queryToken`、`invocationEpoch` 与 `deadlineMs`，随后只会再发送一个最终 `result` 事件并关闭流；最终 `result` 会重复 `accepted` 里的 `queryToken` 与 `invocationEpoch`。
     - FQ 最终结果固定为 `granted` / `throttled` / `overloaded` / `timeout` / `conflict`。accepted 之前的鉴权失败、JSON 失败、缺字段或 pre-attachment overload 走非 SSE JSON HTTP 响应；accepted 之后的结果全部通过 SSE 发送。
     - `queue_only` 与 `queue_breaker` 都走 slot-handler admission；区别只在 `queue_breaker` 会额外携带 `breakerEnabled` 与完整 canonical breaker tuple（`openCapSeconds`、`closeThresholdPercent`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`），让 backend 原子决定 queue slot 与 breaker attempt。
-    - worker 在收到 `accepted` 后保存 `queryToken + invocationEpoch` 作为 pre-grant cleanup ownership；收到 `granted` 后再保存 `slotToken` 与 `releaseOwnerRequired=true` 用于 after-use `release`。
+    - worker 在收到 `accepted` 后保存 `queryToken + invocationEpoch` 作为 pre-grant cleanup ownership，并要求最终 `result` 事件重复这组 ownership；收到 `granted` 后再保存 `slotToken` 与 `releaseOwnerRequired=true` 用于 after-use `release`。
     - scoped overload 与 global overload 退避会在内存中做短期抑制，但这只属于 fair-queue 退避，不参与 breaker 状态机。`overload_global` 仍由 worker fail-fast 为 `503`；scope overload 仍受总 wait budget 约束。
     - release 契约保持 backend-authoritative 与幂等；`slotToken` 语法合法但未知/已释放时仍返回 `200`。带 owner tuple 的 release 仍要求命中 claim owner，否则 fail-closed `503`，避免 split-brain cleanup 漏掉已授予 slot。
-    - 当 worker 在 accepted 之后、grant 之前放弃等待时，调用 `/api/v1/fairqueue/abandon`；一旦已收到 `granted`，cleanup 只走 `/api/v1/fairqueue/release`。
+    - accepted SSE 连接一旦断开，该 wait 就是终态；若 grant 已提交但未可靠交付，slot-handler 会在服务端补偿 release。worker 只有在拿到 `granted` 后才会调用 `/api/v1/fairqueue/release`。
     - 多实例 slot-handler 仍需要 sticky routing：已接受的 `queryToken` 流需要稳定落到同一实例，否则内存中的 attached waiter 无法稳定接收最终结果。
 
 12. **True Concurrency（concurrency-handler）**
@@ -165,7 +166,7 @@ admission 固定为四种显式运行模式：
     - `concurrency-handler` 返回 `granted` 时，worker 会用 `requestId + claimToken` 调用 `POST /api/v1/concurrency/claim` 绑定 active lease，再调用 `POST /api/v1/concurrency/ack_handoff`，随后建立 heartbeat WebSocket 并等待 `hello_ack`，最后才发起 origin fetch。
     - 当 fairqueue 与 true-concurrency 同时启用时，执行顺序固定为 `POST /api/v1/fairqueue/wait -> accepted/result -> POST /api/v1/concurrency/acquire -> (wait 时 settle breaker 并释放未使用的 fairqueue slot) -> POST /api/v1/concurrency/wait -> claim -> ack_handoff -> heartbeat -> origin fetch -> release`。
     - `concurrency-handler` 在生产环境必须对已接受的 `/api/v1/concurrency/wait` 流保持 sticky routing；否则 attached waiter 的最终投递会失败。
-    - `concurrency-handler` HTTP auth 是必需项；worker 使用 `handlerAuthHeader` 发送 `handlerAuthKey`，`acquireTimeoutMs` 定义 fast `/acquire` 与 `/claim` 超时，`releaseTimeoutMs` 定义 `/release` 与 `/cancel` 超时。
+    - `concurrency-handler` HTTP auth 是必需项；worker 使用 `handlerAuthHeader` 发送 `handlerAuthKey`，`acquireTimeoutMs` 定义 fast `/acquire` 与 `/claim` 超时，`releaseTimeoutMs` 定义 `/release` 超时。accepted CQ wait 断开后的 waiting cleanup 由服务端负责，未进入 accepted SSE 的 orphan 则留给 expiry / sweep。
 
 13. **上游请求与响应封装**
      - 支持 3xx 重定向与 401/410 触发的 refresh（`refresh=true`）重试一次。

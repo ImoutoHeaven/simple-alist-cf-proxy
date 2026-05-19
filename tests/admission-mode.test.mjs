@@ -520,6 +520,7 @@ const runModeScenario = async ({
     queryToken: 'query-mode-default',
     invocationEpoch: 1,
     slotToken: 'slot-1',
+    releaseOwnerRequired: true,
   },
 } = {}) => {
   const { bootstrap } = createModeHarness({ fairQueueHostPatterns, throttleHostPatterns, trueConcurrencyHostPatterns });
@@ -533,7 +534,6 @@ const runModeScenario = async ({
     concurrencyAcquire: 0,
     concurrencyClaim: 0,
     concurrencyRelease: 0,
-    concurrencyCancel: 0,
   };
   const waitBodies = [];
   const waitResults = [];
@@ -543,7 +543,6 @@ const runModeScenario = async ({
   const releaseBodies = [];
   const concurrencyAcquireBodies = [];
   const concurrencyReleaseBodies = [];
-  const concurrencyCancelBodies = [];
   const waitUntilPromises = [];
   const originalFetch = globalThis.fetch;
 
@@ -660,12 +659,6 @@ const runModeScenario = async ({
       return createJsonResponse({ result: 'released' });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.concurrencyCancel += 1;
-      concurrencyCancelBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://tenant.sharepoint.com/file') {
       if (upstreamResponse instanceof Response) {
         return upstreamResponse;
@@ -702,7 +695,6 @@ const runModeScenario = async ({
       releaseBodies,
       concurrencyAcquireBodies,
       concurrencyReleaseBodies,
-      concurrencyCancelBodies,
     };
   } finally {
     globalThis.fetch = originalFetch;
@@ -710,6 +702,15 @@ const runModeScenario = async ({
     __fairQueueTestHooks.clearOverloadedByHost?.();
   }
 };
+
+test('mode harness exposes only active CQ acquire and release surfaces', async () => {
+  const result = await runModeScenario({
+    trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+  });
+
+  assert.equal(Object.hasOwn(result.calls, 'concurrencyCancel'), false);
+  assert.equal(Object.hasOwn(result, 'concurrencyCancelBodies'), false);
+});
 
 test('none mode does not call slot-handler or breaker RPCs', async () => {
   const { config } = createModeHarness();
@@ -872,6 +873,7 @@ test('queue_breaker settles slot-carried breaker attempt when direct origin fetc
       queryToken: 'query-mode-queue-breaker-throw',
       invocationEpoch: 1,
       slotToken: 'slot-queue-breaker-throw',
+      releaseOwnerRequired: true,
       meta: {
         attemptVersion: 17,
         attemptTicket: 12,

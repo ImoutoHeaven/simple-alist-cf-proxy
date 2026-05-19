@@ -12,10 +12,14 @@ type waitingRuntime struct {
 	requestsByID             map[string]*requestSnapshot
 	requestIDByToken         map[string]string
 	waitTokenClaims          map[string]chan struct{}
-	observedWaitTokens       map[string]struct{}
+	observedWaitTokens       map[string]int64
+	consumedWaitTokens       map[string]struct{}
+	disconnectedCleanup      map[string]string
+	reservationCleanup       map[string]struct{}
 	observedActiveRequestIDs map[string]struct{}
 	tupleQueues              map[string][]string
 	hostTupleQueues          map[string]map[string]struct{}
+	reservedWaiters          map[string]*attachedWaiter
 	waiters                  map[string]*attachedWaiter
 	hostReactors             map[string]*hostReactor
 }
@@ -35,16 +39,23 @@ type requestSnapshot struct {
 }
 
 type attachedWaiter struct {
-	waitToken string
-	request   AcquireRequest
-	resultCh  chan *AcquireResult
-	doneCh    chan struct{}
-	released  bool
+	waitToken    string
+	request      AcquireRequest
+	resultCh     chan *AcquireResult
+	doneCh       chan struct{}
+	released     bool
+	disconnected bool
 }
 
 type attachedWaiterSnapshot struct {
 	WaitToken string
 	Request   AcquireRequest
+}
+
+type disconnectedCleanupSnapshot struct {
+	Request            requestSnapshot
+	Reason             string
+	ReleaseReservation bool
 }
 
 type hostReactor struct {
@@ -59,10 +70,14 @@ func newWaitingRuntime() *waitingRuntime {
 		requestsByID:             make(map[string]*requestSnapshot),
 		requestIDByToken:         make(map[string]string),
 		waitTokenClaims:          make(map[string]chan struct{}),
-		observedWaitTokens:       make(map[string]struct{}),
+		observedWaitTokens:       make(map[string]int64),
+		consumedWaitTokens:       make(map[string]struct{}),
+		disconnectedCleanup:      make(map[string]string),
+		reservationCleanup:       make(map[string]struct{}),
 		observedActiveRequestIDs: make(map[string]struct{}),
 		tupleQueues:              make(map[string][]string),
 		hostTupleQueues:          make(map[string]map[string]struct{}),
+		reservedWaiters:          make(map[string]*attachedWaiter),
 		waiters:                  make(map[string]*attachedWaiter),
 		hostReactors:             make(map[string]*hostReactor),
 	}
@@ -119,6 +134,10 @@ func (r *waitingRuntime) isReplayWaitToken(waitToken string) bool {
 }
 
 func (r *waitingRuntime) markWaitTokenObserved(waitToken string) {
+	r.markWaitTokenObservedUntil(waitToken, 0)
+}
+
+func (r *waitingRuntime) markWaitTokenObservedUntil(waitToken string, expiresAtMs int64) {
 	if r == nil {
 		return
 	}
@@ -127,7 +146,61 @@ func (r *waitingRuntime) markWaitTokenObserved(waitToken string) {
 		return
 	}
 	r.mu.Lock()
-	r.observedWaitTokens[token] = struct{}{}
+	r.observedWaitTokens[token] = expiresAtMs
+	r.mu.Unlock()
+}
+
+func (r *waitingRuntime) clearWaitTokenTracking(waitToken string) {
+	if r == nil {
+		return
+	}
+	token := strings.TrimSpace(waitToken)
+	if token == "" {
+		return
+	}
+	r.mu.Lock()
+	delete(r.observedWaitTokens, token)
+	delete(r.consumedWaitTokens, token)
+	r.mu.Unlock()
+}
+
+func (r *waitingRuntime) cleanupExpiredWaitTokenTracking(nowMs int64) {
+	if r == nil || nowMs <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for token, expiresAtMs := range r.observedWaitTokens {
+		if expiresAtMs > 0 && expiresAtMs <= nowMs {
+			delete(r.observedWaitTokens, token)
+		}
+	}
+}
+
+func (r *waitingRuntime) isWaitTokenConsumed(waitToken string) bool {
+	if r == nil {
+		return false
+	}
+	token := strings.TrimSpace(waitToken)
+	if token == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.consumedWaitTokens[token]
+	return ok
+}
+
+func (r *waitingRuntime) markWaitTokenConsumed(waitToken string) {
+	if r == nil {
+		return
+	}
+	token := strings.TrimSpace(waitToken)
+	if token == "" {
+		return
+	}
+	r.mu.Lock()
+	r.consumedWaitTokens[token] = struct{}{}
 	r.mu.Unlock()
 }
 
@@ -185,6 +258,9 @@ func (r *waitingRuntime) tryAttach(waitToken string) (*attachedWaiter, bool) {
 	if _, exists := r.waiters[token]; exists {
 		return nil, false
 	}
+	if _, exists := r.reservedWaiters[token]; exists {
+		return nil, false
+	}
 	waiter := &attachedWaiter{
 		waitToken: token,
 		resultCh:  make(chan *AcquireResult, 1),
@@ -192,6 +268,79 @@ func (r *waitingRuntime) tryAttach(waitToken string) (*attachedWaiter, bool) {
 	}
 	r.waiters[token] = waiter
 	return waiter, true
+}
+
+func (r *waitingRuntime) reserveAttach(waitToken string) (*attachedWaiter, bool) {
+	if r == nil {
+		return &attachedWaiter{resultCh: make(chan *AcquireResult, 1), doneCh: make(chan struct{})}, true
+	}
+	token := strings.TrimSpace(waitToken)
+	if token == "" {
+		return &attachedWaiter{resultCh: make(chan *AcquireResult, 1), doneCh: make(chan struct{})}, true
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.waiters[token]; exists {
+		return nil, false
+	}
+	if _, exists := r.reservedWaiters[token]; exists {
+		return nil, false
+	}
+	waiter := &attachedWaiter{
+		waitToken: token,
+		resultCh:  make(chan *AcquireResult, 1),
+		doneCh:    make(chan struct{}),
+	}
+	r.reservedWaiters[token] = waiter
+	return waiter, true
+}
+
+func (r *waitingRuntime) promoteReservedAttach(waitToken string, waiter *attachedWaiter) bool {
+	if r == nil || waiter == nil {
+		return false
+	}
+	token := strings.TrimSpace(waitToken)
+	if token == "" {
+		token = strings.TrimSpace(waiter.waitToken)
+	}
+	if token == "" {
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if waiter.released {
+		delete(r.reservedWaiters, token)
+		return false
+	}
+	if current := r.reservedWaiters[token]; current != waiter {
+		return false
+	}
+	if _, exists := r.waiters[token]; exists {
+		delete(r.reservedWaiters, token)
+		return false
+	}
+	delete(r.reservedWaiters, token)
+	waiter.waitToken = token
+	r.waiters[token] = waiter
+	return true
+}
+
+func (r *waitingRuntime) releaseReservedAttach(waiter *attachedWaiter) {
+	if r == nil || waiter == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if waiter.released {
+		return
+	}
+	if token := strings.TrimSpace(waiter.waitToken); token != "" && r.reservedWaiters[token] == waiter {
+		delete(r.reservedWaiters, token)
+	}
+	waiter.released = true
+	close(waiter.doneCh)
 }
 
 func (r *waitingRuntime) setRequest(waiter *attachedWaiter, req AcquireRequest) {
@@ -334,7 +483,7 @@ func (r *waitingRuntime) restoreWaitingRequest(snap requestSnapshot) {
 	copy.TupleKey = tupleKey
 	r.requestsByID[requestID] = &copy
 	r.requestIDByToken[waitToken] = requestID
-	r.observedWaitTokens[waitToken] = struct{}{}
+	r.observedWaitTokens[waitToken] = snap.HardExpireAtMs
 	r.ensureRequestQueuedLocked(hostnameHash, tupleKey, requestID)
 	r.refreshHostNextWakeLocked(hostnameHash)
 }
@@ -362,6 +511,102 @@ func (r *waitingRuntime) release(waiter *attachedWaiter) *AcquireResult {
 	return delivered
 }
 
+func (r *waitingRuntime) markDisconnected(waiter *attachedWaiter) {
+	if r == nil || waiter == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if waiter.released {
+		return
+	}
+	waiter.disconnected = true
+}
+
+func (r *waitingRuntime) recordDisconnectedCleanup(waiter *attachedWaiter, reason string) {
+	if r == nil || waiter == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if waiter.released || !waiter.disconnected {
+		return
+	}
+	requestID := strings.TrimSpace(waiter.request.RequestID)
+	if requestID == "" && waiter.waitToken != "" {
+		requestID = r.requestIDByToken[waiter.waitToken]
+	}
+	if requestID == "" || r.requestsByID[requestID] == nil {
+		return
+	}
+	r.disconnectedCleanup[requestID] = reason
+}
+
+func (r *waitingRuntime) recordCleanupCandidate(req AcquireRequest, reason string) {
+	if r == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return
+	}
+	r.upsertWaitingRequestWithLeaseDeadline(req, req.WaitToken, nil, req.DeadlineMs)
+	requestID := strings.TrimSpace(req.RequestID)
+	if requestID == "" {
+		return
+	}
+	r.mu.Lock()
+	r.disconnectedCleanup[requestID] = reason
+	r.reservationCleanup[requestID] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *waitingRuntime) disconnectedCleanupCandidates(hostnameHash string) []disconnectedCleanupSnapshot {
+	if r == nil {
+		return nil
+	}
+	hostnameHash = strings.TrimSpace(hostnameHash)
+	if hostnameHash == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]disconnectedCleanupSnapshot, 0, len(r.disconnectedCleanup))
+	for requestID, reason := range r.disconnectedCleanup {
+		snap := r.requestsByID[requestID]
+		if snap == nil || snap.HostnameHash != hostnameHash {
+			continue
+		}
+		_, releaseReservation := r.reservationCleanup[requestID]
+		out = append(out, disconnectedCleanupSnapshot{Request: *snap, Reason: reason, ReleaseReservation: releaseReservation})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		left := requestDeadlineMs(&out[i].Request)
+		right := requestDeadlineMs(&out[j].Request)
+		if left != right {
+			return left < right
+		}
+		return out[i].Request.RequestID < out[j].Request.RequestID
+	})
+	return out
+}
+
+func (r *waitingRuntime) hasBufferedDelivery(waiter *attachedWaiter) bool {
+	if r == nil || waiter == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if waiter.released || waiter.disconnected {
+		return false
+	}
+	return len(waiter.resultCh) > 0
+}
+
 func (r *waitingRuntime) deliver(waitToken string, result *AcquireResult) bool {
 	if r == nil {
 		return false
@@ -374,7 +619,7 @@ func (r *waitingRuntime) deliver(waitToken string, result *AcquireResult) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	waiter := r.waiters[token]
-	if waiter == nil || waiter.released {
+	if waiter == nil || waiter.released || waiter.disconnected {
 		return false
 	}
 
@@ -397,7 +642,7 @@ func (r *waitingRuntime) hasAttachedWaiter(waitToken string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	waiter, ok := r.waiters[token]
-	return ok && waiter != nil && !waiter.released
+	return ok && waiter != nil && !waiter.released && !waiter.disconnected
 }
 
 func (r *waitingRuntime) attachedWaiterLeaseUntilMs(waitToken string) (int64, bool) {
@@ -411,7 +656,7 @@ func (r *waitingRuntime) attachedWaiterLeaseUntilMs(waitToken string) (int64, bo
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	waiter, ok := r.waiters[token]
-	if !ok || waiter == nil || waiter.released {
+	if !ok || waiter == nil || waiter.released || waiter.disconnected {
 		return 0, false
 	}
 	requestID := r.requestIDByToken[token]
@@ -433,7 +678,7 @@ func (r *waitingRuntime) snapshotAttached() []*attachedWaiter {
 	defer r.mu.Unlock()
 	out := make([]*attachedWaiter, 0, len(r.waiters))
 	for _, waiter := range r.waiters {
-		if waiter == nil || waiter.released {
+		if waiter == nil || waiter.released || waiter.disconnected {
 			continue
 		}
 		out = append(out, waiter)
@@ -449,7 +694,7 @@ func (r *waitingRuntime) snapshotAttachedRequests() []attachedWaiterSnapshot {
 	defer r.mu.Unlock()
 	out := make([]attachedWaiterSnapshot, 0, len(r.waiters))
 	for _, waiter := range r.waiters {
-		if waiter == nil || waiter.released {
+		if waiter == nil || waiter.released || waiter.disconnected {
 			continue
 		}
 		out = append(out, attachedWaiterSnapshot{WaitToken: waiter.waitToken, Request: waiter.request})
@@ -463,7 +708,7 @@ func (r *waitingRuntime) snapshotAttachedRequest(waiter *attachedWaiter) (attach
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if waiter.released {
+	if waiter.released || waiter.disconnected {
 		return attachedWaiterSnapshot{}, false
 	}
 	return attachedWaiterSnapshot{WaitToken: waiter.waitToken, Request: waiter.request}, true
@@ -499,6 +744,9 @@ func (r *waitingRuntime) dueRequests(hostnameHash string, nowMs int64) []request
 	var due []requestSnapshot
 	for tupleKey := range r.hostTupleQueues[hostnameHash] {
 		for _, requestID := range r.tupleQueues[tupleKey] {
+			if _, pendingCleanup := r.disconnectedCleanup[requestID]; pendingCleanup {
+				continue
+			}
 			snap := r.requestsByID[requestID]
 			if snap == nil || snap.State != "waiting" {
 				continue
@@ -695,7 +943,7 @@ func (r *waitingRuntime) isGrantEligibleLocked(snap *requestSnapshot, nowMs int6
 		return false
 	}
 	waiter := r.waiters[snap.WaitToken]
-	if waiter == nil || waiter.released {
+	if waiter == nil || waiter.released || waiter.disconnected {
 		return false
 	}
 	if snap.WaiterLeaseUntilMs <= nowMs || snap.HardExpireAtMs <= nowMs {
@@ -710,10 +958,22 @@ func (r *waitingRuntime) removeRequestLocked(requestID string) *requestSnapshot 
 		return nil
 	}
 	delete(r.requestsByID, requestID)
-	if snap.WaitToken != "" {
-		delete(r.requestIDByToken, snap.WaitToken)
-		delete(r.observedWaitTokens, snap.WaitToken)
+	if token := strings.TrimSpace(snap.WaitToken); token != "" {
+		tokenOwner := r.requestIDByToken[token]
+		if waiter := r.waiters[token]; waiter != nil && tokenOwner == requestID && (waiter.disconnected || waiter.released) {
+			waiterRequestID := strings.TrimSpace(waiter.request.RequestID)
+			if waiterRequestID == "" || waiterRequestID == requestID {
+				delete(r.waiters, token)
+			}
+		}
+		if tokenOwner == requestID {
+			delete(r.requestIDByToken, token)
+			delete(r.observedWaitTokens, token)
+			delete(r.consumedWaitTokens, token)
+		}
 	}
+	delete(r.disconnectedCleanup, requestID)
+	delete(r.reservationCleanup, requestID)
 	r.removeRequestFromTupleQueueLocked(snap.TupleKey, requestID)
 	r.refreshHostNextWakeLocked(snap.HostnameHash)
 	copy := *snap

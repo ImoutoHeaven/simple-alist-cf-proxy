@@ -66,7 +66,6 @@ func benchmarkListInFlightByHostLegacyScan(s *flowStore, hostKey string, now tim
 			CreatedAt:    f.CreatedAt,
 			LocalVT:      f.LocalVT,
 			HasWaiter:    true,
-			ExpireAt:     f.expireAt,
 		})
 	}
 	return res
@@ -149,7 +148,7 @@ func setupMixedExpiredScenario(b *testing.B) (*flowStore, string, time.Time) {
 			// Keep expired entries outside the queried host so repeated lookups
 			// in one timed iteration remain workload-equivalent.
 			if j == 1 {
-				setBenchmarkFlowExpiry(b, store, tok, now.Add(-time.Second))
+				setBenchmarkFlowLeaseExpiry(b, store, tok, now.Add(-time.Second))
 			}
 		}
 	}
@@ -171,7 +170,7 @@ func addInFlightBenchmarkFlow(b *testing.B, store *flowStore, hostHash, host, ip
 	return tok
 }
 
-func setBenchmarkFlowExpiry(b *testing.B, store *flowStore, token string, expireAt time.Time) {
+func setBenchmarkFlowLeaseExpiry(b *testing.B, store *flowStore, token string, leaseUntil time.Time) {
 	b.Helper()
 
 	store.mu.Lock()
@@ -181,5 +180,5 @@ func setBenchmarkFlowExpiry(b *testing.B, store *flowStore, token string, expire
 	if f == nil {
 		b.Fatalf("missing flow for token %q", token)
 	}
-	f.expireAt = expireAt
+	f.invocationLeaseUntil = leaseUntil
 }

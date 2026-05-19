@@ -205,6 +205,21 @@ func TestPostgresClaimGrantAllowsClaimHandoffTimeoutReleasedResult(t *testing.T)
 	}
 }
 
+func TestPostgresClaimGrantAllowsWaitStreamTimeoutExpiredResult(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{"expired", nil, nil, nil, nil, nil, "wait_stream_timeout"}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.ClaimGrant(context.Background(), ClaimGrantRequest{RequestID: "request-1", ClaimToken: "claim-1", NowMs: 1000})
+	if err != nil {
+		t.Fatalf("ClaimGrant error: %v", err)
+	}
+	if result.Result != "expired" || result.Reason != "wait_stream_timeout" {
+		t.Fatalf("expected expired wait_stream_timeout claim result, got %+v", result)
+	}
+}
+
 func TestPostgresBackendClaimGrantTerminalAllowsClaimHandoffTimeoutReason(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
 		return &stubRows{rows: [][]any{{"released", nil, nil, nil, nil, nil, "claim_handoff_timeout"}}}, nil
@@ -460,6 +475,36 @@ func TestPostgresProbeWaitStateIncludesWaitTokenAndDeadline(t *testing.T) {
 	}
 }
 
+func TestPostgresProbeAttachedWaitStateUsesAttachedRPC(t *testing.T) {
+	req := validAcquireRequest()
+	req.WaitToken = "wait-1"
+	req.DeadlineMs = 9000
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "cq_attached_wait_state_probe") {
+			t.Fatalf("expected attached wait-state probe rpc query, got %s", query)
+		}
+		if len(args) != 9 {
+			t.Fatalf("expected 9 attached wait-state probe args, got %d", len(args))
+		}
+		if got := args[6]; got != int64(9000) {
+			t.Fatalf("expected deadline argument 9000, got %v", got)
+		}
+		if got := args[8]; got != "wait-1" {
+			t.Fatalf("expected wait token argument wait-1, got %v", got)
+		}
+		return &stubRows{rows: [][]any{{`{"result":"wait","wait_token":"wait-1","scope":"host","retry_after":1}`}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.ProbeAttachedWaitState(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ProbeAttachedWaitState error: %v", err)
+	}
+	if result.WaitToken != "wait-1" {
+		t.Fatalf("expected wait token replay result, got %+v", result)
+	}
+}
+
 func TestPostgresProbeWaitStateDefaultsDeadlineToHardExpiry(t *testing.T) {
 	req := validAcquireRequest()
 	req.WaitToken = "wait-1"
@@ -615,11 +660,14 @@ func TestPostgresPromoteWaitingUsesFixedRPCAndNormalizesGrantedResult(t *testing
 		if !strings.Contains(query, "row_to_json(result_row) FROM cq_promote_waiting_request(") {
 			t.Fatalf("promote waiting must use fixed authoritative function, got %s", query)
 		}
-		if len(args) != 9 {
-			t.Fatalf("expected 9 promote args, got %d", len(args))
+		if len(args) != 10 {
+			t.Fatalf("expected 10 promote args, got %d", len(args))
 		}
 		if got := args[0]; got != "waiting-request" {
 			t.Fatalf("expected request id waiting-request, got %v", got)
+		}
+		if got := args[9]; got != "wait-token-1" {
+			t.Fatalf("expected wait token wait-token-1, got %v", got)
 		}
 		return &stubRows{rows: [][]any{{`{"result":"granted","lease_id":"lease-2","lease_token":"token-2","expires_at_ms":2400,"claim_token":"claim-2"}`}}}, nil
 	}}
@@ -632,6 +680,7 @@ func TestPostgresPromoteWaitingUsesFixedRPCAndNormalizesGrantedResult(t *testing
 		IPBucket:       "ip-a",
 		HardExpireAtMs: 5000,
 		NowMs:          1000,
+		WaitToken:      "wait-token-1",
 	})
 	if err != nil {
 		t.Fatalf("PromoteWaiting error: %v", err)
@@ -653,13 +702,13 @@ func TestPostgresPromoteWaitingRejectsGrantedResultWithoutClaimToken(t *testing.
 	}
 }
 
-func TestPostgresCancelUsesFixedRPCWhenSQLContractExists(t *testing.T) {
+func TestPostgresTerminalizeWaitingUsesFixedRPCWhenSQLContractExists(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		if !strings.Contains(query, "FROM cq_cancel(") {
-			t.Fatalf("cancel must use fixed database-authoritative function, got %s", query)
+		if !strings.Contains(query, "FROM cq_terminalize_waiting(") {
+			t.Fatalf("terminalize waiting must use fixed database-authoritative function, got %s", query)
 		}
 		if len(args) != 8 {
-			t.Fatalf("expected 8 cancel args, got %d", len(args))
+			t.Fatalf("expected 8 terminalize waiting args, got %d", len(args))
 		}
 		if got := args[0]; got != "request-1" {
 			t.Fatalf("expected request id request-1, got %v", got)
@@ -667,50 +716,77 @@ func TestPostgresCancelUsesFixedRPCWhenSQLContractExists(t *testing.T) {
 		if got := args[1]; got != "example.com" {
 			t.Fatalf("expected hostname example.com, got %v", got)
 		}
-		return &stubRows{rows: [][]any{{"cancelled", nil}}}, nil
+		if got := args[6]; got != "wait_stream_timeout" {
+			t.Fatalf("expected terminal reason wait_stream_timeout, got %v", got)
+		}
+		return &stubRows{rows: [][]any{{"expired", "wait_stream_timeout"}}}, nil
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
-	result, err := backend.Cancel(context.Background(), CancelRequest{
+	result, err := backend.TerminalizeWaiting(context.Background(), TerminalizeWaitingRequest{
 		RequestID:      "request-1",
 		Hostname:       "example.com",
 		HostnameHash:   "host-hash",
 		SiteBucket:     "site-a",
 		IPBucket:       "ip-a",
 		HardExpireAtMs: 5000,
-		Reason:         "worker_aborted",
+		Reason:         "wait_stream_timeout",
 		NowMs:          1000,
 	})
 	if err != nil {
-		t.Fatalf("Cancel error: %v", err)
+		t.Fatalf("TerminalizeWaiting error: %v", err)
 	}
-	if result.Result != "cancelled" {
-		t.Fatalf("unexpected cancel result: %+v", result)
+	if result.Result != "expired" || result.Reason != "wait_stream_timeout" {
+		t.Fatalf("unexpected terminalize waiting result: %+v", result)
 	}
 }
 
-func TestPostgresCancelClassifiesActiveLeaseConflict(t *testing.T) {
+func TestPostgresTerminalizeWaitingClassifiesActiveLeaseConflict(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
-		return nil, errors.New("pq: cq_cancel must release active lease")
+		return nil, errors.New("pq: cq_terminalize_waiting must release active lease")
 	}}
 
 	backend := &postgresBackend{cfg: validTestConfig(), db: client}
-	_, err := backend.Cancel(context.Background(), CancelRequest{
+	_, err := backend.TerminalizeWaiting(context.Background(), TerminalizeWaitingRequest{
 		RequestID:      "request-1",
 		Hostname:       "example.com",
 		HostnameHash:   "host-hash",
 		SiteBucket:     "site-a",
 		IPBucket:       "ip-a",
 		HardExpireAtMs: 5000,
-		Reason:         "worker_aborted",
+		Reason:         "final_cleanup",
 		NowMs:          1000,
 	})
-	var conflictErr *cancelConflictError
+	var conflictErr *terminalizeWaitingConflictError
 	if !errors.As(err, &conflictErr) {
-		t.Fatalf("expected cancelConflictError, got %v", err)
+		t.Fatalf("expected terminalizeWaitingConflictError, got %v", err)
 	}
-	if conflictErr.Reason != cancelConflictReasonMustReleaseActiveLease {
+	if conflictErr.Reason != terminalizeWaitingConflictReasonMustReleaseActiveLease {
 		t.Fatalf("expected must_release_active_lease reason, got %+v", conflictErr)
+	}
+}
+
+func TestPostgresReleaseWaitReservationPassesConsumeFlag(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "FROM cq_release_wait_reservation(") {
+			t.Fatalf("release wait reservation must use fixed rpc, got %s", query)
+		}
+		if len(args) != 4 {
+			t.Fatalf("expected 4 release wait reservation args, got %d", len(args))
+		}
+		if args[0] != "request-1" || args[1] != "wait-1" || args[2] != int64(1234) || args[3] != true {
+			t.Fatalf("unexpected release wait reservation args: %v", args)
+		}
+		return &stubRows{rows: [][]any{{"released", nil}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.ReleaseWaitReservation(context.Background(), ReleaseWaitReservationRequest{RequestID: "request-1", WaitToken: "wait-1", NowMs: 1234, Consume: true})
+	if err != nil {
+		t.Fatalf("ReleaseWaitReservation error: %v", err)
+	}
+	if result.Result != "released" || result.Reason != "" {
+		t.Fatalf("unexpected release wait reservation result: %+v", result)
 	}
 }
 

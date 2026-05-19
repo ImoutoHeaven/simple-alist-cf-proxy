@@ -5,7 +5,7 @@
     "dev": "wrangler dev",
     "deploy": "npm run build && wrangler deploy",
     "test": "npm run test:vitest && npm run test:node",
-    "test:vitest": "vitest run init.sql.test.js",
+    "test:vitest": "vitest run init.sql.test.js --exclude '.worktrees/**'",
     "test:node": "node --test tests/*.test.mjs",
     "test:watch": "vitest init.sql.test.js"
   },

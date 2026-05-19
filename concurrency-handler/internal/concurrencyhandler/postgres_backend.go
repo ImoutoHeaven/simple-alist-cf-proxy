@@ -166,7 +166,15 @@ func (p *postgresBackend) Acquire(ctx context.Context, req AcquireRequest) (*Acq
 }
 
 func (p *postgresBackend) ProbeWaitState(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
-	query, err := rpcSelectRowJSON(fixedContinueWaitProbeFunc, 9)
+	return p.probeWaitStateFunc(ctx, fixedContinueWaitProbeFunc, req)
+}
+
+func (p *postgresBackend) ProbeAttachedWaitState(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
+	return p.probeWaitStateFunc(ctx, fixedAttachedWaitProbeFunc, req)
+}
+
+func (p *postgresBackend) probeWaitStateFunc(ctx context.Context, funcName string, req AcquireRequest) (*AcquireResult, error) {
+	query, err := rpcSelectRowJSON(funcName, 9)
 	if err != nil {
 		return nil, err
 	}
@@ -404,13 +412,47 @@ func (p *postgresBackend) Release(ctx context.Context, req ReleaseRequest) (*Rel
 }
 
 func (p *postgresBackend) PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
-	query, err := rpcSelectRowJSON(fixedPromoteWaitingFunc, 9)
+	return p.promoteWaitingFunc(ctx, fixedPromoteWaitingFunc, req)
+}
+
+func (p *postgresBackend) PromoteAttachedWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+	return p.promoteWaitingFunc(ctx, fixedPromoteAttachedWaitingFunc, req)
+}
+
+func (p *postgresBackend) usesSQLBackedPromotion() {}
+
+func (p *postgresBackend) ReleaseWaitReservation(ctx context.Context, req ReleaseWaitReservationRequest) (*ReleaseWaitReservationResult, error) {
+	query, err := rpcSelectAll(fixedReleaseWaitReservationFunc, 4)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := p.db.Query(
-		ctx,
-		query,
+	rows, err := p.db.Query(ctx, query, req.RequestID, req.WaitToken, req.NowMs, req.Consume)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, errors.New("empty release wait reservation result")
+	}
+	result := &ReleaseWaitReservationResult{}
+	var reason sql.NullString
+	if err := rows.Scan(&result.Result, &reason); err != nil {
+		return nil, err
+	}
+	result.Reason = reason.String
+	return result, rows.Err()
+}
+
+func (p *postgresBackend) promoteWaitingFunc(ctx context.Context, funcName string, req PromoteWaitingRequest) (*AcquireResult, error) {
+	argCount := 9
+	if funcName == fixedPromoteWaitingFunc {
+		argCount = 10
+	}
+	query, err := rpcSelectRowJSON(funcName, argCount)
+	if err != nil {
+		return nil, err
+	}
+	args := []any{
 		req.RequestID,
 		req.HostnameHash,
 		canonicalBucket(req.SiteBucket),
@@ -420,6 +462,14 @@ func (p *postgresBackend) PromoteWaiting(ctx context.Context, req PromoteWaiting
 		p.cfg.Concurrency.Caps.HostMaxInFlight,
 		p.cfg.Concurrency.Caps.SiteMaxInFlight,
 		p.cfg.Concurrency.Caps.SiteIPMaxInFlight,
+	}
+	if funcName == fixedPromoteWaitingFunc {
+		args = append(args, req.WaitToken)
+	}
+	rows, err := p.db.Query(
+		ctx,
+		query,
+		args...,
 	)
 	if err != nil {
 		return nil, classifyAcquireConflict(err)
@@ -442,8 +492,8 @@ func (p *postgresBackend) PromoteWaiting(ctx context.Context, req PromoteWaiting
 	return result, rows.Err()
 }
 
-func (p *postgresBackend) Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error) {
-	query, err := rpcSelectAll(fixedCancelFunc, 8)
+func (p *postgresBackend) TerminalizeWaiting(ctx context.Context, req TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
+	query, err := rpcSelectAll(fixedTerminalizeWaitingFunc, 8)
 	if err != nil {
 		return nil, err
 	}
@@ -460,19 +510,19 @@ func (p *postgresBackend) Cancel(ctx context.Context, req CancelRequest) (*Cance
 		req.NowMs,
 	)
 	if err != nil {
-		return nil, classifyCancelConflict(err)
+		return nil, classifyTerminalizeWaitingConflict(err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return nil, errors.New("empty cancel result")
+		return nil, errors.New("empty terminalize waiting result")
 	}
-	result := &CancelResult{}
+	result := &TerminalizeWaitingResult{}
 	var reason sql.NullString
 	if err := rows.Scan(&result.Result, &reason); err != nil {
 		return nil, err
 	}
 	result.Reason = reason.String
-	if err := validateCancelResult(result); err != nil {
+	if err := validateTerminalizeWaitingResult(result); err != nil {
 		return nil, err
 	}
 	return result, rows.Err()

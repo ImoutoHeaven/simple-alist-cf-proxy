@@ -2010,6 +2010,23 @@ CREATE INDEX IF NOT EXISTS concurrency_requests_heartbeat_deadline_idx
   ON concurrency_requests (heartbeat_deadline_ms, request_id)
   WHERE state = 'active' AND heartbeat_deadline_ms IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS concurrency_wait_tokens (
+  wait_token text PRIMARY KEY,
+  request_id text NOT NULL UNIQUE,
+  hostname_hash text NOT NULL,
+  hostname text NOT NULL,
+  site_bucket text NOT NULL,
+  ip_bucket text NOT NULL,
+  hard_expire_at_ms bigint NOT NULL,
+  waiter_lease_until_ms bigint NOT NULL,
+  attach_reserved_at_ms bigint,
+  accepted_at_ms bigint,
+  scope text NOT NULL CHECK (scope IN ('host', 'site', 'site_ip')),
+  retry_after integer NOT NULL DEFAULT 1,
+  created_at_ms bigint NOT NULL,
+  updated_at_ms bigint NOT NULL
+);
+
 CREATE OR REPLACE FUNCTION cq_apply_heartbeat_terminal_cleanup_trigger()
 RETURNS trigger AS $$
 BEGIN
@@ -2093,6 +2110,8 @@ BEGIN
       claim_state = CASE WHEN p_claim_state IS NOT NULL THEN p_claim_state ELSE claim_state END,
       handoff_state = CASE WHEN p_handoff_state IS NOT NULL THEN p_handoff_state ELSE handoff_state END,
       heartbeat_state = 'none',
+      heartbeat_deadline_ms = NULL,
+      heartbeat_grace_until_ms = NULL,
       heartbeat_terminal_reason = p_terminal_reason,
       updated_at_ms = p_now_ms
   WHERE request_id = p_request_id
@@ -2183,7 +2202,10 @@ BEGIN
 
     GET DIAGNOSTICS v_owner_row_count = ROW_COUNT;
 
-    IF v_owner_row_count > 0 AND COALESCE(v_owner_request.heartbeat_deadline_ms, 0) > v_now_ms THEN
+    IF v_owner_row_count > 0
+      AND v_owner_request.state = 'active'
+      AND COALESCE(v_owner_request.heartbeat_state, 'none') IN ('connected', 'grace')
+      AND COALESCE(v_owner_request.heartbeat_deadline_ms, 0) > v_now_ms THEN
       v_owner_is_stale := FALSE;
     END IF;
   END IF;
@@ -2505,14 +2527,14 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION cq_cancel(
+CREATE OR REPLACE FUNCTION cq_terminalize_waiting(
   p_request_id text,
   p_hostname text,
   p_hostname_hash text,
   p_site_bucket text,
   p_ip_bucket text,
   p_hard_expire_at_ms bigint,
-  p_reason text,
+  p_terminal_reason text,
   p_now_ms bigint DEFAULT NULL
 )
 RETURNS TABLE(result text, reason text) AS $$
@@ -2523,6 +2545,7 @@ DECLARE
   v_hostname_hash text := BTRIM(COALESCE(p_hostname_hash, ''));
   v_site_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_site_bucket, '')), ''), 'unknown');
   v_ip_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_ip_bucket, '')), ''), 'unknown');
+  v_terminal_reason text := COALESCE(NULLIF(BTRIM(COALESCE(p_terminal_reason, '')), ''), 'final_cleanup');
   v_request record;
   v_request_row_count bigint := 0;
 BEGIN
@@ -2544,31 +2567,8 @@ BEGIN
   GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
 
   IF v_request_row_count = 0 THEN
-    INSERT INTO concurrency_requests (
-      request_id,
-      hostname_hash,
-      hostname,
-      site_bucket,
-      ip_bucket,
-      hard_expire_at_ms,
-      state,
-      terminal_reason,
-      created_at_ms,
-      updated_at_ms
-    ) VALUES (
-      v_request_id,
-      v_hostname_hash,
-      v_hostname,
-      v_site_bucket,
-      v_ip_bucket,
-      p_hard_expire_at_ms,
-      'cancelled',
-      'request_cancelled',
-      v_now_ms,
-      v_now_ms
-    );
-    result := 'cancelled';
-    reason := NULL;
+    result := 'noop';
+    reason := 'already_terminal';
     RETURN NEXT;
     RETURN;
   END IF;
@@ -2578,32 +2578,49 @@ BEGIN
     OR v_request.site_bucket IS DISTINCT FROM v_site_bucket
     OR v_request.ip_bucket IS DISTINCT FROM v_ip_bucket
     OR v_request.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms THEN
-    RAISE EXCEPTION 'cq_cancel request_id tuple mismatch';
+    RAISE EXCEPTION 'cq_terminalize_waiting request_id tuple mismatch';
   END IF;
 
   IF v_request.state = 'active' THEN
-    RAISE EXCEPTION 'cq_cancel must release active lease';
+    RAISE EXCEPTION 'cq_terminalize_waiting must release active lease';
   END IF;
 
   IF v_request.state = 'waiting' THEN
+    IF v_terminal_reason = 'wait_stream_timeout' THEN
+      UPDATE concurrency_requests
+      SET state = 'expired',
+          terminal_reason = v_terminal_reason,
+          updated_at_ms = v_now_ms
+      WHERE request_id = v_request_id;
+      result := 'expired';
+      reason := v_terminal_reason;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
     UPDATE concurrency_requests
-    SET state = 'cancelled',
-        terminal_reason = 'request_cancelled',
+    SET state = 'released',
+        terminal_reason = v_terminal_reason,
         updated_at_ms = v_now_ms
     WHERE request_id = v_request_id;
-    result := 'cancelled';
+    result := 'released';
     reason := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
 
-  result := 'noop';
-  reason := 'already_terminal';
+  IF v_request.state = 'expired' AND v_request.terminal_reason = 'wait_stream_timeout' AND v_terminal_reason = 'wait_stream_timeout' THEN
+    result := 'expired';
+    reason := 'wait_stream_timeout';
+  ELSE
+    result := 'noop';
+    reason := 'already_terminal';
+  END IF;
   RETURN NEXT;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION cq_promote_waiting_request(
+CREATE OR REPLACE FUNCTION cq_promote_waiting_request_impl(
   p_request_id text,
   p_hostname_hash text,
   p_site_bucket text,
@@ -2612,7 +2629,9 @@ CREATE OR REPLACE FUNCTION cq_promote_waiting_request(
   p_now_ms bigint,
   p_host_max_in_flight integer DEFAULT 0,
   p_site_max_in_flight integer DEFAULT 0,
-  p_site_ip_max_in_flight integer DEFAULT 0
+  p_site_ip_max_in_flight integer DEFAULT 0,
+  p_wait_token text DEFAULT NULL,
+  p_allow_existing_waiting boolean DEFAULT FALSE
 )
 RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, wait_token text, scope text, reason text, retry_after integer, claim_token text) AS $$
 DECLARE
@@ -2636,6 +2655,10 @@ DECLARE
   v_active_lease concurrency_leases%ROWTYPE;
   v_active_lease_row_count bigint := 0;
   v_transitioned boolean := FALSE;
+  v_provisional record;
+  v_provisional_row_count bigint := 0;
+  v_created_from_provisional boolean := FALSE;
+  v_wait_token_input text := NULLIF(BTRIM(COALESCE(p_wait_token, '')), '');
 BEGIN
   IF v_request_id = '' THEN
     RAISE EXCEPTION 'cq_promote_waiting_request request_id is required';
@@ -2656,7 +2679,100 @@ BEGIN
   GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
 
   IF v_request_row_count = 0 THEN
-    RAISE EXCEPTION 'cq_promote_waiting_request request not found';
+    SELECT *
+      INTO v_provisional
+    FROM concurrency_wait_tokens
+    WHERE request_id = v_request_id
+    FOR UPDATE;
+
+    GET DIAGNOSTICS v_provisional_row_count = ROW_COUNT;
+
+    IF v_provisional_row_count = 0 THEN
+      result := 'conflict';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := 'waiter_already_attached';
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    IF v_provisional.hostname_hash IS DISTINCT FROM v_hostname_hash
+      OR v_provisional.site_bucket IS DISTINCT FROM v_site_bucket
+      OR v_provisional.ip_bucket IS DISTINCT FROM v_ip_bucket
+      OR v_provisional.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms THEN
+      RAISE EXCEPTION 'cq_acquire request_id tuple mismatch';
+    END IF;
+
+    IF v_wait_token_input IS NOT NULL AND v_provisional.wait_token IS DISTINCT FROM v_wait_token_input THEN
+      result := 'conflict';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := 'stale_wait_token';
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    IF v_wait_token_input IS NOT NULL AND v_provisional.attach_reserved_at_ms IS NULL THEN
+      result := 'conflict';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := 'waiter_already_attached';
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    INSERT INTO concurrency_requests (
+      request_id,
+      hostname_hash,
+      hostname,
+      site_bucket,
+      ip_bucket,
+      hard_expire_at_ms,
+      state,
+      wait_token,
+      first_wait_at_ms,
+      waiter_lease_until_ms,
+      created_at_ms,
+      updated_at_ms
+    ) VALUES (
+      v_request_id,
+      v_hostname_hash,
+      v_provisional.hostname,
+      v_site_bucket,
+      v_ip_bucket,
+      p_hard_expire_at_ms,
+      'waiting',
+      v_provisional.wait_token,
+      v_now_ms,
+      v_provisional.waiter_lease_until_ms,
+      v_now_ms,
+      v_now_ms
+    );
+
+    v_created_from_provisional := TRUE;
+
+    DELETE FROM concurrency_wait_tokens WHERE request_id = v_request_id;
+
+    SELECT *
+      INTO v_request
+    FROM concurrency_requests
+    WHERE request_id = v_request_id
+    FOR UPDATE;
   END IF;
 
   IF v_request.hostname_hash IS DISTINCT FROM v_hostname_hash
@@ -2746,6 +2862,19 @@ BEGIN
       RETURN NEXT;
       RETURN;
     WHEN 'waiting' THEN
+      IF NOT COALESCE(p_allow_existing_waiting, FALSE) AND NOT v_created_from_provisional THEN
+        result := 'conflict';
+        lease_id := NULL;
+        lease_token := NULL;
+        expires_at_ms := NULL;
+        wait_token := NULL;
+        scope := NULL;
+        reason := 'waiter_already_attached';
+        retry_after := NULL;
+        claim_token := NULL;
+        RETURN NEXT;
+        RETURN;
+      END IF;
       NULL;
     ELSE
       RAISE EXCEPTION 'cq_promote_waiting_request invalid request state: %', v_request.state;
@@ -2970,6 +3099,170 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION cq_promote_waiting_request(
+  p_request_id text,
+  p_hostname_hash text,
+  p_site_bucket text,
+  p_ip_bucket text,
+  p_hard_expire_at_ms bigint,
+  p_now_ms bigint,
+  p_host_max_in_flight integer DEFAULT 0,
+  p_site_max_in_flight integer DEFAULT 0,
+  p_site_ip_max_in_flight integer DEFAULT 0,
+  p_wait_token text DEFAULT NULL
+)
+RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, wait_token text, scope text, reason text, retry_after integer, claim_token text) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT *
+  FROM cq_promote_waiting_request_impl(
+    p_request_id,
+    p_hostname_hash,
+    p_site_bucket,
+    p_ip_bucket,
+    p_hard_expire_at_ms,
+    p_now_ms,
+    p_host_max_in_flight,
+    p_site_max_in_flight,
+    p_site_ip_max_in_flight,
+    p_wait_token,
+    FALSE
+  );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_promote_attached_waiting_request(
+  p_request_id text,
+  p_hostname_hash text,
+  p_site_bucket text,
+  p_ip_bucket text,
+  p_hard_expire_at_ms bigint,
+  p_now_ms bigint,
+  p_host_max_in_flight integer DEFAULT 0,
+  p_site_max_in_flight integer DEFAULT 0,
+  p_site_ip_max_in_flight integer DEFAULT 0
+)
+RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, wait_token text, scope text, reason text, retry_after integer, claim_token text) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT *
+  FROM cq_promote_waiting_request_impl(
+    p_request_id,
+    p_hostname_hash,
+    p_site_bucket,
+    p_ip_bucket,
+    p_hard_expire_at_ms,
+    p_now_ms,
+    p_host_max_in_flight,
+    p_site_max_in_flight,
+    p_site_ip_max_in_flight,
+    NULL,
+    TRUE
+  );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_release_wait_reservation(
+  p_request_id text,
+  p_wait_token text,
+  p_now_ms bigint DEFAULT NULL,
+  p_consume boolean DEFAULT FALSE
+)
+RETURNS TABLE(result text, reason text) AS $$
+DECLARE
+  v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_wait_token text := NULLIF(BTRIM(COALESCE(p_wait_token, '')), '');
+  v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
+  v_wait_row concurrency_wait_tokens%ROWTYPE;
+  v_request_row concurrency_requests%ROWTYPE;
+  v_row_count bigint := 0;
+BEGIN
+  IF v_request_id = '' OR v_wait_token IS NULL THEN
+    result := 'noop';
+    reason := 'invalid_request';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+
+  SELECT *
+    INTO v_wait_row
+  FROM concurrency_wait_tokens
+  WHERE request_id = v_request_id
+    AND wait_token = v_wait_token
+    AND attach_reserved_at_ms IS NOT NULL
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_row_count = ROW_COUNT;
+
+  IF v_row_count > 0 THEN
+    IF COALESCE(p_consume, FALSE) THEN
+      INSERT INTO concurrency_requests (
+        request_id,
+        hostname_hash,
+        hostname,
+        site_bucket,
+        ip_bucket,
+        hard_expire_at_ms,
+        state,
+        wait_token,
+        terminal_reason,
+        created_at_ms,
+        updated_at_ms
+      ) VALUES (
+        v_wait_row.request_id,
+        v_wait_row.hostname_hash,
+        v_wait_row.hostname,
+        v_wait_row.site_bucket,
+        v_wait_row.ip_bucket,
+        v_wait_row.hard_expire_at_ms,
+        'released',
+        v_wait_row.wait_token,
+        'final_cleanup',
+        v_wait_row.created_at_ms,
+        v_now_ms
+      );
+
+      DELETE FROM concurrency_wait_tokens
+      WHERE request_id = v_request_id
+        AND wait_token = v_wait_token;
+    ELSE
+      UPDATE concurrency_wait_tokens
+      SET attach_reserved_at_ms = NULL,
+          accepted_at_ms = NULL,
+          updated_at_ms = v_now_ms
+      WHERE request_id = v_request_id
+        AND wait_token = v_wait_token;
+    END IF;
+
+    result := 'released';
+    reason := NULL;
+  ELSE
+    SELECT *
+      INTO v_request_row
+    FROM concurrency_requests
+    WHERE request_id = v_request_id
+      AND wait_token = v_wait_token
+      AND state = 'released'
+      AND terminal_reason = 'final_cleanup'
+    FOR UPDATE;
+
+    GET DIAGNOSTICS v_row_count = ROW_COUNT;
+
+    IF v_row_count > 0 AND COALESCE(p_consume, FALSE) THEN
+      result := 'noop';
+      reason := 'already_terminal';
+    ELSE
+      result := 'noop';
+      reason := 'not_found';
+    END IF;
+  END IF;
+
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION cq_acquire(
   p_hostname_hash text,
   p_hostname text,
@@ -2999,7 +3292,6 @@ DECLARE
   v_new_lease_id uuid;
   v_new_claim_token text;
   v_retry_after integer := 1;
-  v_waiter_lease_until_ms bigint := p_hard_expire_at_ms;
   v_host_count integer := 0;
   v_site_count integer := 0;
   v_site_ip_count integer := 0;
@@ -3008,6 +3300,8 @@ DECLARE
   v_active_lease concurrency_leases%ROWTYPE;
   v_active_lease_row_count bigint := 0;
   v_transitioned boolean := FALSE;
+  v_provisional record;
+  v_provisional_row_count bigint := 0;
 BEGIN
   IF v_request_id = '' THEN
     RAISE EXCEPTION 'cq_acquire request_id is required';
@@ -3170,6 +3464,50 @@ BEGIN
     END CASE;
   END IF;
 
+  SELECT *
+    INTO v_provisional
+  FROM concurrency_wait_tokens
+  WHERE request_id = v_request_id
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_provisional_row_count = ROW_COUNT;
+
+  IF v_provisional_row_count > 0 THEN
+    IF v_provisional.hostname_hash IS DISTINCT FROM v_hostname_hash
+      OR v_provisional.site_bucket IS DISTINCT FROM v_site_bucket
+      OR v_provisional.ip_bucket IS DISTINCT FROM v_ip_bucket
+      OR v_provisional.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms THEN
+      RAISE EXCEPTION 'cq_acquire request_id tuple mismatch';
+    END IF;
+
+    IF v_provisional.hard_expire_at_ms <= v_now_ms THEN
+      DELETE FROM concurrency_wait_tokens WHERE request_id = v_request_id;
+      result := 'expired';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := 'hard_expired';
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    result := 'wait';
+    lease_id := NULL;
+    lease_token := NULL;
+    expires_at_ms := NULL;
+    wait_token := v_provisional.wait_token;
+    scope := v_provisional.scope;
+    reason := NULL;
+    retry_after := v_provisional.retry_after;
+    claim_token := NULL;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
   IF p_hard_expire_at_ms IS NULL OR p_hard_expire_at_ms <= v_now_ms THEN
     result := 'expired';
     lease_id := NULL;
@@ -3271,33 +3609,38 @@ BEGIN
     v_lease_seed := v_request_id || '|' || v_hostname_hash || '|' || v_site_bucket || '|' || v_ip_bucket || '|' || p_hard_expire_at_ms::text;
     v_new_wait_token := md5(v_lease_seed || '|wait_token');
 
-    INSERT INTO concurrency_requests (
+    INSERT INTO concurrency_wait_tokens (
+      wait_token,
       request_id,
       hostname_hash,
       hostname,
       site_bucket,
       ip_bucket,
       hard_expire_at_ms,
-      state,
-      wait_token,
-      first_wait_at_ms,
       waiter_lease_until_ms,
+      scope,
+      retry_after,
       created_at_ms,
       updated_at_ms
     ) VALUES (
+      v_new_wait_token,
       v_request_id,
       v_hostname_hash,
       v_hostname,
       v_site_bucket,
       v_ip_bucket,
       p_hard_expire_at_ms,
-      'waiting',
-      v_new_wait_token,
-      v_now_ms,
-      v_waiter_lease_until_ms,
+      p_hard_expire_at_ms,
+      v_wait_scope,
+      v_retry_after,
       v_now_ms,
       v_now_ms
-    );
+    ) ON CONFLICT (request_id) DO UPDATE SET
+      wait_token = EXCLUDED.wait_token,
+      waiter_lease_until_ms = EXCLUDED.waiter_lease_until_ms,
+      scope = EXCLUDED.scope,
+      retry_after = EXCLUDED.retry_after,
+      updated_at_ms = EXCLUDED.updated_at_ms;
 
     result := 'wait';
     lease_id := NULL;
@@ -4568,6 +4911,8 @@ DECLARE
   v_active_lease concurrency_leases%ROWTYPE;
   v_active_lease_row_count bigint := 0;
   v_transitioned boolean := FALSE;
+  v_provisional record;
+  v_provisional_row_count bigint := 0;
 BEGIN
   IF v_wait_token_input IS NULL THEN
     RAISE EXCEPTION 'cq_acquire stale wait token';
@@ -4581,7 +4926,90 @@ BEGIN
   GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
 
   IF v_request_row_count = 0 THEN
-    RAISE EXCEPTION 'cq_acquire stale wait token';
+    SELECT *
+      INTO v_provisional
+    FROM concurrency_wait_tokens
+    WHERE concurrency_wait_tokens.wait_token = v_wait_token_input
+    FOR UPDATE;
+
+    GET DIAGNOSTICS v_provisional_row_count = ROW_COUNT;
+
+    IF v_provisional_row_count = 0 THEN
+      RAISE EXCEPTION 'cq_acquire stale wait token';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(3, hashtext(v_provisional.request_id));
+
+    IF v_provisional.request_id IS DISTINCT FROM v_request_id
+      OR v_provisional.hostname_hash IS DISTINCT FROM v_hostname_hash
+      OR v_provisional.site_bucket IS DISTINCT FROM v_site_bucket
+      OR v_provisional.ip_bucket IS DISTINCT FROM v_ip_bucket
+      OR v_provisional.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms THEN
+      RAISE EXCEPTION 'cq_acquire request_id tuple mismatch';
+    END IF;
+
+    IF v_provisional.hard_expire_at_ms <= v_now_ms THEN
+      DELETE FROM concurrency_wait_tokens WHERE concurrency_wait_tokens.wait_token = v_wait_token_input;
+      result := 'expired';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := 'hard_expired';
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    v_effective_deadline_ms := LEAST(COALESCE(p_deadline_ms, v_provisional.hard_expire_at_ms), v_provisional.hard_expire_at_ms);
+    IF v_effective_deadline_ms <= v_now_ms THEN
+      DELETE FROM concurrency_wait_tokens WHERE concurrency_wait_tokens.wait_token = v_wait_token_input;
+      result := 'expired';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := 'wait_stream_timeout';
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    IF v_provisional.accepted_at_ms IS NOT NULL OR v_provisional.attach_reserved_at_ms IS NOT NULL THEN
+      result := 'conflict';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := 'waiter_already_attached';
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    UPDATE concurrency_wait_tokens
+    SET waiter_lease_until_ms = v_effective_deadline_ms,
+        attach_reserved_at_ms = v_now_ms,
+        updated_at_ms = v_now_ms
+    WHERE concurrency_wait_tokens.wait_token = v_wait_token_input;
+
+    result := 'wait';
+    lease_id := NULL;
+    lease_token := NULL;
+    expires_at_ms := NULL;
+    wait_token := v_provisional.wait_token;
+    scope := v_provisional.scope;
+    reason := NULL;
+    retry_after := v_provisional.retry_after;
+    claim_token := NULL;
+    RETURN NEXT;
+    RETURN;
   END IF;
 
   PERFORM pg_advisory_xact_lock(3, hashtext(v_authoritative_request_id));
@@ -4600,6 +5028,195 @@ BEGIN
 
   IF v_request.request_id IS DISTINCT FROM v_request_id
     OR v_request.hostname_hash IS DISTINCT FROM v_hostname_hash
+    OR v_request.site_bucket IS DISTINCT FROM v_site_bucket
+    OR v_request.ip_bucket IS DISTINCT FROM v_ip_bucket
+    OR v_request.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms THEN
+    RAISE EXCEPTION 'cq_acquire request_id tuple mismatch';
+  END IF;
+
+  CASE v_request.state
+    WHEN 'active' THEN
+      SELECT *
+        INTO v_active_lease
+      FROM concurrency_leases
+      WHERE request_id = v_request_id
+        AND state = 'active'
+      FOR UPDATE;
+
+      GET DIAGNOSTICS v_active_lease_row_count = ROW_COUNT;
+
+      IF v_request.hard_expire_at_ms <= v_now_ms
+        OR COALESCE(v_request.lease_expires_at_ms, 0) <= v_now_ms
+        OR (v_active_lease_row_count > 0 AND (v_active_lease.hard_expire_at_ms <= v_now_ms OR v_active_lease.expires_at_ms <= v_now_ms)) THEN
+        v_transitioned := cq_apply_request_terminal_transition(v_request_id, 'expired', 'hard_expired', v_now_ms);
+
+        result := 'expired';
+        lease_id := NULL;
+        lease_token := NULL;
+        expires_at_ms := NULL;
+        wait_token := NULL;
+        scope := NULL;
+        reason := CASE
+          WHEN v_transitioned THEN 'hard_expired'
+          ELSE COALESCE(v_request.terminal_reason, 'hard_expired')
+        END;
+        retry_after := NULL;
+        claim_token := NULL;
+        RETURN NEXT;
+        RETURN;
+      END IF;
+
+      result := 'conflict';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := CASE WHEN v_request.claim_state = 'claimed' THEN 'grant_already_claimed' ELSE 'grant_unclaimed' END;
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    WHEN 'released' THEN
+      result := 'released';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := COALESCE(v_request.terminal_reason, 'already_released');
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    WHEN 'cancelled' THEN
+      result := 'cancelled';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := 'request_cancelled';
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    WHEN 'expired' THEN
+      result := 'expired';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := COALESCE(v_request.terminal_reason, 'hard_expired');
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+    WHEN 'waiting' THEN
+      IF v_request.hard_expire_at_ms <= v_now_ms THEN
+        UPDATE concurrency_requests
+        SET state = 'expired',
+            terminal_reason = 'hard_expired',
+            updated_at_ms = v_now_ms
+        WHERE request_id = v_request_id;
+
+        result := 'expired';
+        lease_id := NULL;
+        lease_token := NULL;
+        expires_at_ms := NULL;
+        wait_token := NULL;
+        scope := NULL;
+        reason := 'hard_expired';
+        retry_after := NULL;
+        claim_token := NULL;
+        RETURN NEXT;
+        RETURN;
+      END IF;
+
+      v_effective_deadline_ms := LEAST(COALESCE(p_deadline_ms, v_request.hard_expire_at_ms), v_request.hard_expire_at_ms);
+
+      IF v_effective_deadline_ms <= v_now_ms THEN
+        UPDATE concurrency_requests
+        SET state = 'expired',
+            terminal_reason = 'wait_stream_timeout',
+            updated_at_ms = v_now_ms
+        WHERE request_id = v_request_id;
+
+        result := 'expired';
+        lease_id := NULL;
+        lease_token := NULL;
+        expires_at_ms := NULL;
+        wait_token := NULL;
+        scope := NULL;
+        reason := 'wait_stream_timeout';
+        retry_after := NULL;
+        claim_token := NULL;
+        RETURN NEXT;
+        RETURN;
+      END IF;
+
+      result := 'conflict';
+      lease_id := NULL;
+      lease_token := NULL;
+      expires_at_ms := NULL;
+      wait_token := NULL;
+      scope := NULL;
+      reason := 'waiter_already_attached';
+      retry_after := NULL;
+      claim_token := NULL;
+      RETURN NEXT;
+      RETURN;
+  END CASE;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cq_attached_wait_state_probe(
+  p_hostname_hash text,
+  p_hostname text,
+  p_site_bucket text,
+  p_ip_bucket text,
+  p_request_id text,
+  p_hard_expire_at_ms bigint,
+  p_deadline_ms bigint,
+  p_now_ms bigint,
+  p_wait_token text
+)
+RETURNS TABLE(result text, lease_id uuid, lease_token text, expires_at_ms bigint, wait_token text, scope text, reason text, retry_after integer, claim_token text) AS $$
+DECLARE
+  v_now_ms bigint := COALESCE(p_now_ms, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint);
+  v_site_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_site_bucket, '')), ''), 'unknown');
+  v_ip_bucket text := COALESCE(NULLIF(BTRIM(COALESCE(p_ip_bucket, '')), ''), 'unknown');
+  v_hostname_hash text := BTRIM(COALESCE(p_hostname_hash, ''));
+  v_request_id text := BTRIM(COALESCE(p_request_id, ''));
+  v_wait_token_input text := NULLIF(BTRIM(COALESCE(p_wait_token, '')), '');
+  v_request concurrency_requests%ROWTYPE;
+  v_request_row_count bigint := 0;
+  v_effective_deadline_ms bigint := 0;
+  v_active_lease concurrency_leases%ROWTYPE;
+  v_active_lease_row_count bigint := 0;
+  v_transitioned boolean := FALSE;
+BEGIN
+  IF v_wait_token_input IS NULL THEN
+    RAISE EXCEPTION 'cq_acquire stale wait token';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(3, hashtext(v_request_id));
+
+  SELECT *
+    INTO v_request
+  FROM concurrency_requests
+  WHERE concurrency_requests.request_id = v_request_id
+    AND concurrency_requests.wait_token = v_wait_token_input
+  FOR UPDATE;
+
+  GET DIAGNOSTICS v_request_row_count = ROW_COUNT;
+
+  IF v_request_row_count = 0 THEN
+    RAISE EXCEPTION 'cq_acquire stale wait token';
+  END IF;
+
+  IF v_request.hostname_hash IS DISTINCT FROM v_hostname_hash
     OR v_request.site_bucket IS DISTINCT FROM v_site_bucket
     OR v_request.ip_bucket IS DISTINCT FROM v_ip_bucket
     OR v_request.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms THEN

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -142,14 +143,15 @@ func TestFairQueueConfigJSONUsesSSEWaitNames(t *testing.T) {
 		t.Fatalf("read config.json: %v", err)
 	}
 	text := string(raw)
-	for _, want := range []string{"\"maxStreamMs\"", "\"keepaliveMs\"", "\"acceptedLeaseMs\"", "\"detachGraceMs\""} {
+	for _, want := range []string{"\"maxStreamMs\"", "\"keepaliveMs\"", "\"terminalCleanupGraceMs\""} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected config.json to contain %s", want)
 		}
 	}
 	legacyPollWindowKey := "\"poll" + "WindowMs\""
 	legacyGraceKey := "\"grace" + "Ms\""
-	for _, banned := range []string{legacyPollWindowKey, legacyGraceKey} {
+	legacyDetachKey := "\"detach" + "GraceMs\""
+	for _, banned := range []string{legacyPollWindowKey, legacyGraceKey, legacyDetachKey} {
 		if strings.Contains(text, banned) {
 			t.Fatalf("expected config.json to omit legacy key %s", banned)
 		}
@@ -165,10 +167,84 @@ func TestFairQueueConfigJSONUsesSSEWaitNames(t *testing.T) {
 	if cfg.FairQueue.Wait.KeepaliveMs != 1500 {
 		t.Fatalf("expected wait.keepaliveMs to load as 1500, got %d", cfg.FairQueue.Wait.KeepaliveMs)
 	}
-	if cfg.FairQueue.AcceptedLeaseMs != 6000 {
-		t.Fatalf("expected acceptedLeaseMs to load as 6000, got %d", cfg.FairQueue.AcceptedLeaseMs)
+	if cfg.FairQueue.TerminalCleanupGraceMs != 4000 {
+		t.Fatalf("expected terminalCleanupGraceMs to load as 4000, got %d", cfg.FairQueue.TerminalCleanupGraceMs)
 	}
-	if cfg.FairQueue.DetachedGraceMs != 4000 {
-		t.Fatalf("expected detachGraceMs to load as 4000, got %d", cfg.FairQueue.DetachedGraceMs)
+}
+
+func TestFairQueueConfigNoLongerExposesAcceptedLeaseMsAsPublicWaitKnob(t *testing.T) {
+	path := filepath.Join(moduleRootDir(t), "config.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config.json: %v", err)
+	}
+	text := string(raw)
+	if strings.Contains(text, "acceptedLeaseMs") {
+		t.Fatalf("expected config.json to omit acceptedLeaseMs")
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("decode config.json: %v", err)
+	}
+	if cfg.FairQueue.Wait.MaxStreamMs != 10000 {
+		t.Fatalf("expected wait.maxStreamMs to load as 10000, got %d", cfg.FairQueue.Wait.MaxStreamMs)
+	}
+	if cfg.FairQueue.Wait.KeepaliveMs != 1500 {
+		t.Fatalf("expected wait.keepaliveMs to load as 1500, got %d", cfg.FairQueue.Wait.KeepaliveMs)
+	}
+	if cfg.FairQueue.TerminalCleanupGraceMs != 4000 {
+		t.Fatalf("expected terminalCleanupGraceMs to load as 4000, got %d", cfg.FairQueue.TerminalCleanupGraceMs)
+	}
+
+	configWithAcceptedLease := []byte(`{
+		"listen":":8080",
+		"auth":{"enabled":false},
+		"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://example.test"}},
+		"fairQueue":{
+			"acceptedLeaseMs":6000,
+			"terminalCleanupGraceMs":4000,
+			"wait":{"maxStreamMs":10000,"keepaliveMs":1500},
+			"rpc":{"tryAcquireFunc":"fq_admit_batch","releaseFunc":"fq_release_dual"}
+		}
+	}`)
+	if _, err := parseAndValidateConfig(configWithAcceptedLease); err == nil {
+		t.Fatalf("expected parseAndValidateConfig to reject acceptedLeaseMs")
+	}
+
+	configWithLegacyDetachGrace := []byte(`{
+		"listen":":8080",
+		"auth":{"enabled":false},
+		"backend":{"mode":"postgrest","postgrest":{"baseUrl":"https://example.test"}},
+		"fairQueue":{
+			"detachGraceMs":4000,
+			"wait":{"maxStreamMs":10000,"keepaliveMs":1500},
+			"rpc":{"tryAcquireFunc":"fq_admit_batch","releaseFunc":"fq_release_dual"}
+		}
+	}`)
+	if _, err := parseAndValidateConfig(configWithLegacyDetachGrace); err == nil {
+		t.Fatalf("expected parseAndValidateConfig to reject detachGraceMs")
+	}
+}
+
+func TestFairQueueWaitDoesNotRetainDetachedReconnectState(t *testing.T) {
+	for _, banned := range []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{name: "fqFlow.expireAt", typ: reflect.TypeOf(fqFlow{})},
+		{name: "fqFlow.readyLatchedAt", typ: reflect.TypeOf(fqFlow{})},
+		{name: "fqFlow.readyLatchedUntil", typ: reflect.TypeOf(fqFlow{})},
+		{name: "fqFlow.readyTimer", typ: reflect.TypeOf(fqFlow{})},
+		{name: "fqFlowSnapshot.ExpireAt", typ: reflect.TypeOf(fqFlowSnapshot{})},
+		{name: "fqFlowSnapshot.ReadyLatchedAt", typ: reflect.TypeOf(fqFlowSnapshot{})},
+		{name: "fqFlowSnapshot.ReadyLatchedUntil", typ: reflect.TypeOf(fqFlowSnapshot{})},
+	} {
+		t.Run(banned.name, func(t *testing.T) {
+			field := banned.name[strings.LastIndex(banned.name, ".")+1:]
+			if _, ok := banned.typ.FieldByName(field); ok {
+				t.Fatalf("expected %s removed from the accepted-SSE-only FQ model", banned.name)
+			}
+		})
 	}
 }

@@ -63,8 +63,9 @@ func TestRepoDocsDescribeSSEWaitProtocol(t *testing.T) {
 		"/api/v1/fairqueue/wait",
 		"text/event-stream",
 		"CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP",
-		"FQ: wait SSE -> accepted -> one final result -> release or abandon HTTP cleanup",
-		"No compatibility mode, long-poll fallback, or automatic SSE reconnect exists.",
+		"FQ: wait SSE -> accepted -> one final result -> disconnect is terminal, granted slots release after use",
+		"active waiter",
+		"final SSE result events repeat the accepted ownership tuple",
 	}
 	legacyContinueWaitLongPolling := "continue" + "-wait long " + "poll" + "ing"
 	legacyReconnectWithQueryToken := "reconnect with query" + "Token"
@@ -83,9 +84,13 @@ func TestRepoDocsDescribeSSEWaitProtocol(t *testing.T) {
 		legacyWaitReconnectGraceKey,
 		legacyPerRequestTimeoutKey,
 		legacyMaxAttemptsCapKey,
+		"detachGraceMs",
 		"waitToken 续连",
 		"acquire 轮询",
 		"长轮询",
+		"No compatibility mode, long-poll fallback, or automatic SSE reconnect exists.",
+		"/api/v1/fairqueue/abandon",
+		"pre-grant `/abandon`",
 	}
 
 	for _, doc := range docs {
@@ -99,6 +104,41 @@ func TestRepoDocsDescribeSSEWaitProtocol(t *testing.T) {
 			if strings.Contains(text, token) {
 				t.Fatalf("expected %s to omit legacy wait polling phrase %q", doc.name, token)
 			}
+		}
+	}
+}
+
+func TestFairQueueAbandonRouteIsRemoved(t *testing.T) {
+	path := filepath.Join(moduleRootDir(t), "internal", "slothandler", "server.go")
+	text := readTextFile(t, path)
+	for _, token := range []string{"/api/v1/fairqueue/abandon", "/api/v1/fairqueue/acquire", "handleAbandon("} {
+		if strings.Contains(text, token) {
+			t.Fatalf("expected server.go to omit removed fairqueue abandon route token %q", token)
+		}
+	}
+}
+
+func TestSlotHandlerReadmeOmitsAbandonContract(t *testing.T) {
+	path := filepath.Join(moduleRootDir(t), "README.md")
+	text := readTextFile(t, path)
+	for _, token := range []string{"/api/v1/fairqueue/abandon", "/api/v1/fairqueue/acquire", "release or abandon HTTP cleanup", "pre-grant `/abandon`"} {
+		if strings.Contains(text, token) {
+			t.Fatalf("expected slot-handler README to omit removed fairqueue abandon contract token %q", token)
+		}
+	}
+}
+
+func TestSlotHandlerMetricsSnapshotOmitsReadyLatchMetrics(t *testing.T) {
+	s := newTestServer()
+	s.updateRuntime(&Config{FairQueue: FairQueueConfig{}}, &stubBackend{}, "test", true)
+
+	snap := s.collectMetricsSnapshot()
+	for _, name := range []string{"ready_latch_expire_count", "ready_latched_count", "ready_latch_age_ms"} {
+		if _, ok := snap.Counts[name]; ok {
+			t.Fatalf("expected counts to omit ready-latch metric %q, got %+v", name, snap.Counts)
+		}
+		if _, ok := snap.Metrics[name]; ok {
+			t.Fatalf("expected metrics to omit ready-latch metric %q, got %+v", name, snap.Metrics)
 		}
 	}
 }

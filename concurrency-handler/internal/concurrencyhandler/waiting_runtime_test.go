@@ -289,6 +289,167 @@ func TestWaitingRuntimeDeliversOnlyToCurrentAttachedWaiter(t *testing.T) {
 	}
 }
 
+func TestWaitingRuntimeDisconnectedCleanupCandidateIsNotActiveOrGrantEligible(t *testing.T) {
+	runtime := newWaitingRuntime()
+	cfg := validTestConfig()
+	baseNowMs := time.Now().UnixMilli()
+	req := AcquireRequest{
+		Hostname:       "disconnect.example.com",
+		HostnameHash:   "disconnect-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "request-disconnected",
+		HardExpireAtMs: baseNowMs + 60_000,
+		NowMs:          baseNowMs,
+		WaitToken:      "wait-disconnected",
+	}
+	waiter, ok := runtime.tryAttach(req.WaitToken)
+	if !ok || waiter == nil {
+		t.Fatal("expected waiter attach")
+	}
+	runtime.upsertWaitingRequest(req, req.WaitToken, waiter, cfg)
+	runtime.markDisconnected(waiter)
+	runtime.recordDisconnectedCleanup(waiter, "final_cleanup")
+
+	if runtime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("disconnected waiter must not be active")
+	}
+	if got := runtime.grantEligibleHeads(req.HostnameHash, baseNowMs+1); len(got) != 0 {
+		t.Fatalf("disconnected waiter must not be grant eligible, got %+v", got)
+	}
+	if runtime.deliver(req.WaitToken, &AcquireResult{Result: "granted", LeaseID: "lease-1", LeaseToken: "token-1", ExpiresAtMs: baseNowMs + 10_000}) {
+		t.Fatal("disconnected waiter must not receive delivery")
+	}
+
+	candidates := runtime.disconnectedCleanupCandidates(req.HostnameHash)
+	if len(candidates) != 1 {
+		t.Fatalf("expected one cleanup candidate, got %+v", candidates)
+	}
+	if candidates[0].Request.RequestID != req.RequestID || candidates[0].Reason != "final_cleanup" {
+		t.Fatalf("unexpected cleanup candidate: %+v", candidates[0])
+	}
+}
+
+func TestWaitingRuntimeFinishRequestRemovesDisconnectedWaiter(t *testing.T) {
+	runtime := newWaitingRuntime()
+	cfg := validTestConfig()
+	baseNowMs := time.Now().UnixMilli()
+	req := AcquireRequest{
+		Hostname:       "disconnect-finish.example.com",
+		HostnameHash:   "disconnect-finish-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "request-disconnected-finish",
+		HardExpireAtMs: baseNowMs + 60_000,
+		NowMs:          baseNowMs,
+		WaitToken:      "wait-disconnected-finish",
+	}
+
+	waiter, ok := runtime.tryAttach(req.WaitToken)
+	if !ok || waiter == nil {
+		t.Fatal("expected waiter attach")
+	}
+	runtime.upsertWaitingRequest(req, req.WaitToken, waiter, cfg)
+	runtime.markDisconnected(waiter)
+	runtime.recordDisconnectedCleanup(waiter, "final_cleanup")
+
+	runtime.finishRequest(req.RequestID, &AcquireResult{Result: "released", Reason: "final_cleanup"})
+
+	if snap, ok := runtime.snapshotForWaitToken(req.WaitToken); ok {
+		t.Fatalf("expected finishRequest to remove snapshot, got %+v", snap)
+	}
+	if runtime.hasAttachedWaiter(req.WaitToken) {
+		t.Fatal("expected disconnected waiter not to be active")
+	}
+	if candidates := runtime.disconnectedCleanupCandidates(req.HostnameHash); len(candidates) != 0 {
+		t.Fatalf("expected cleanup candidate to be cleared, got %+v", candidates)
+	}
+	nextWaiter, ok := runtime.tryAttach(req.WaitToken)
+	if !ok || nextWaiter == nil {
+		t.Fatal("expected same wait token to attach after disconnected cleanup finish")
+	}
+	runtime.release(nextWaiter)
+}
+
+func TestWaitingRuntimeFinishRequestPreservesNewerSameTokenOwner(t *testing.T) {
+	runtime := newWaitingRuntime()
+	cfg := validTestConfig()
+	baseNowMs := time.Now().UnixMilli()
+	waitToken := "wait-reused-owner"
+	oldReq := AcquireRequest{
+		Hostname:       "old-owner.example.com",
+		HostnameHash:   "old-owner-host",
+		SiteBucket:     "site-a",
+		IPBucket:       "ip-a",
+		RequestID:      "request-old-owner",
+		HardExpireAtMs: baseNowMs + 60_000,
+		NowMs:          baseNowMs,
+		WaitToken:      waitToken,
+	}
+	oldWaiter := &attachedWaiter{
+		waitToken:    waitToken,
+		resultCh:     make(chan *AcquireResult, 1),
+		doneCh:       make(chan struct{}),
+		disconnected: true,
+	}
+	runtime.upsertWaitingRequest(oldReq, waitToken, oldWaiter, cfg)
+
+	newReq := oldReq
+	newReq.Hostname = "new-owner.example.com"
+	newReq.HostnameHash = "new-owner-host"
+	newReq.RequestID = "request-new-owner"
+	newReq.NowMs = baseNowMs + 1
+	newWaiter := &attachedWaiter{
+		waitToken: waitToken,
+		resultCh:  make(chan *AcquireResult, 1),
+		doneCh:    make(chan struct{}),
+	}
+	runtime.upsertWaitingRequest(newReq, waitToken, newWaiter, cfg)
+	runtime.markWaitTokenObserved(waitToken)
+	runtime.markWaitTokenConsumed(waitToken)
+
+	runtime.finishRequest(oldReq.RequestID, &AcquireResult{Result: "released", Reason: "final_cleanup"})
+
+	snap, ok := runtime.snapshotForWaitToken(waitToken)
+	if !ok || snap.RequestID != newReq.RequestID {
+		t.Fatalf("expected same-token newer owner snapshot to remain, got ok=%v snap=%+v", ok, snap)
+	}
+	if !runtime.hasAttachedWaiter(waitToken) {
+		t.Fatal("expected newer active waiter to remain attached")
+	}
+	if !runtime.isReplayWaitToken(waitToken) {
+		t.Fatal("expected wait-token observation to remain for newer owner")
+	}
+	if !runtime.isWaitTokenConsumed(waitToken) {
+		t.Fatal("expected consumed wait-token tracking to remain for newer owner")
+	}
+	runtime.release(newWaiter)
+}
+
+func TestWaitingRuntimeDisconnectedCleanupCandidatesAreDeadlineOrdered(t *testing.T) {
+	runtime := newWaitingRuntime()
+	baseNowMs := time.Now().UnixMilli()
+	firstReq := AcquireRequest{HostnameHash: "cleanup-host", SiteBucket: "site-b", IPBucket: "ip-b", RequestID: "request-late", HardExpireAtMs: baseNowMs + 60_000, NowMs: baseNowMs, WaitToken: "wait-late"}
+	secondReq := AcquireRequest{HostnameHash: "cleanup-host", SiteBucket: "site-a", IPBucket: "ip-a", RequestID: "request-early", HardExpireAtMs: baseNowMs + 30_000, NowMs: baseNowMs + 1, WaitToken: "wait-early"}
+	for _, req := range []AcquireRequest{firstReq, secondReq} {
+		waiter, ok := runtime.tryAttach(req.WaitToken)
+		if !ok || waiter == nil {
+			t.Fatalf("expected waiter attach for %s", req.WaitToken)
+		}
+		runtime.upsertWaitingRequestWithLeaseDeadline(req, req.WaitToken, waiter, req.HardExpireAtMs)
+		runtime.markDisconnected(waiter)
+		runtime.recordDisconnectedCleanup(waiter, "final_cleanup")
+	}
+
+	candidates := runtime.disconnectedCleanupCandidates("cleanup-host")
+	if len(candidates) != 2 {
+		t.Fatalf("expected two cleanup candidates, got %+v", candidates)
+	}
+	if candidates[0].Request.RequestID != "request-early" || candidates[1].Request.RequestID != "request-late" {
+		t.Fatalf("expected deadline ordering [request-early request-late], got [%s %s]", candidates[0].Request.RequestID, candidates[1].Request.RequestID)
+	}
+}
+
 func TestWaitingRuntimeDeliverFailsAfterWaiterReleased(t *testing.T) {
 	runtime := newWaitingRuntime()
 	waiter, ok := runtime.tryAttach("wait-race")
@@ -431,6 +592,44 @@ func TestWaitingRuntimeMarksWaitTokenAsReplayAfterFirstObservation(t *testing.T)
 	runtime.finishByWaitToken("wait-replay", &AcquireResult{Result: "granted"})
 	if runtime.isReplayWaitToken("wait-replay") {
 		t.Fatal("expected finished wait-token to clear replay tracking")
+	}
+}
+
+func TestWaitingRuntimeFinishClearsConsumedWaitToken(t *testing.T) {
+	runtime := newWaitingRuntime()
+	cfg := validTestConfig()
+	req := validAcquireRequest()
+	req.RequestID = "consumed-cleanup-request"
+	req.WaitToken = "wait-consumed-cleanup"
+	req.NowMs = time.Now().UnixMilli()
+	req.HardExpireAtMs = req.NowMs + 60_000
+
+	waiter, ok := runtime.tryAttach(req.WaitToken)
+	if !ok || waiter == nil {
+		t.Fatal("expected waiter attach")
+	}
+	runtime.upsertWaitingRequest(req, req.WaitToken, waiter, cfg)
+	runtime.markWaitTokenConsumed(req.WaitToken)
+	if !runtime.isWaitTokenConsumed(req.WaitToken) {
+		t.Fatal("expected wait token to be consumed before cleanup")
+	}
+
+	runtime.finishByWaitToken(req.WaitToken, &AcquireResult{Result: "released", Reason: "final_cleanup"})
+	if runtime.isWaitTokenConsumed(req.WaitToken) {
+		t.Fatal("expected finished wait-token to clear consumed tracking")
+	}
+}
+
+func TestWaitingRuntimeCleanupExpiredWaitTokenTrackingClearsProvisionalObservation(t *testing.T) {
+	runtime := newWaitingRuntime()
+	runtime.markWaitTokenObservedUntil("wait-provisional-expired", 100)
+	if !runtime.isReplayWaitToken("wait-provisional-expired") {
+		t.Fatal("expected provisional wait token to be tracked before expiry cleanup")
+	}
+
+	runtime.cleanupExpiredWaitTokenTracking(101)
+	if runtime.isReplayWaitToken("wait-provisional-expired") {
+		t.Fatal("expected expired provisional wait-token observation to be cleaned")
 	}
 }
 

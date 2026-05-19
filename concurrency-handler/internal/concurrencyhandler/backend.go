@@ -152,9 +152,22 @@ type PromoteWaitingRequest struct {
 	IPBucket       string
 	HardExpireAtMs int64
 	NowMs          int64
+	WaitToken      string
 }
 
-type CancelRequest struct {
+type ReleaseWaitReservationRequest struct {
+	RequestID string
+	WaitToken string
+	NowMs     int64
+	Consume   bool
+}
+
+type ReleaseWaitReservationResult struct {
+	Result string `json:"result"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type TerminalizeWaitingRequest struct {
 	RequestID      string `json:"requestId"`
 	Hostname       string `json:"hostname"`
 	HostnameHash   string `json:"hostnameHash"`
@@ -165,7 +178,7 @@ type CancelRequest struct {
 	NowMs          int64  `json:"nowMs"`
 }
 
-type CancelResult struct {
+type TerminalizeWaitingResult struct {
 	Result string `json:"result"`
 	Reason string `json:"reason,omitempty"`
 }
@@ -185,42 +198,44 @@ type ExpireScopeResult struct {
 }
 
 const (
-	fixedContinueWaitProbeFunc                  = "cq_wait_state_probe"
-	fixedPromoteWaitingFunc                     = "cq_promote_waiting_request"
-	fixedClaimGrantFunc                         = "cq_claim_grant"
-	fixedAckHandoffFunc                         = "cq_ack_handoff"
-	fixedCancelFunc                             = "cq_cancel"
-	acquireConflictReasonRequestIDTupleMismatch = "request_id_tuple_mismatch"
-	acquireConflictReasonStaleWaitToken         = "stale_wait_token"
-	acquireConflictReasonWaiterAlreadyAttached  = "waiter_already_attached"
-	acquireConflictReasonGrantUnclaimed         = "grant_unclaimed"
-	acquireConflictReasonGrantAlreadyClaimed    = "grant_already_claimed"
-	ackHandoffConflictReasonTokenMismatch       = "handoff_token_mismatch"
-	cancelConflictReasonMustReleaseActiveLease  = "must_release_active_lease"
-	releaseReasonGrantDeliveryFailed            = "grant_delivery_failed"
-	releaseReasonAcquireDeliveryFailed          = "acquire_delivery_failed"
-	observabilityAcquireFastGranted             = "acquire_fast_granted"
-	observabilityAcquireFastWait                = "acquire_fast_wait"
-	observabilityAcquireReplayWait              = "acquire_replay_wait"
-	observabilityAcquireReplayActive            = "acquire_replay_active"
-	observabilityContinueWaitAttached           = "continue_wait_attached"
-	observabilityContinueWaitTimeout            = "continue_wait_timeout"
-	observabilityGrantPromoted                  = "grant_promoted"
-	observabilityGrantDeliveryFailed            = "grant_delivery_failed"
-	observabilityAcquireDeliveryFailed          = "acquire_delivery_failed"
-	observabilityClaimGranted                   = "claim_granted"
-	observabilityClaimConflict                  = "claim_conflict"
-	observabilityCancelled                      = "cancelled"
-	observabilityExpiredHard                    = "expired_hard"
-	observabilityExpiredWaiterDetached          = "expired_waiter_detached"
-	observabilityReleaseReleased                = "release_released"
-	observabilityReleaseNoop                    = "release_noop"
-	observabilityConflictTupleMismatch          = "conflict_tuple_mismatch"
-	observabilityConflictWaiterAlreadyAttached  = "conflict_waiter_already_attached"
-	observabilityConflictStaleWaitToken         = "conflict_stale_wait_token"
-	observabilityDenyHost                       = "deny_host"
-	observabilityDenySite                       = "deny_site"
-	observabilityDenySiteIP                     = "deny_site_ip"
+	fixedContinueWaitProbeFunc                             = "cq_wait_state_probe"
+	fixedAttachedWaitProbeFunc                             = "cq_attached_wait_state_probe"
+	fixedPromoteWaitingFunc                                = "cq_promote_waiting_request"
+	fixedPromoteAttachedWaitingFunc                        = "cq_promote_attached_waiting_request"
+	fixedReleaseWaitReservationFunc                        = "cq_release_wait_reservation"
+	fixedClaimGrantFunc                                    = "cq_claim_grant"
+	fixedAckHandoffFunc                                    = "cq_ack_handoff"
+	fixedTerminalizeWaitingFunc                            = "cq_terminalize_waiting"
+	acquireConflictReasonRequestIDTupleMismatch            = "request_id_tuple_mismatch"
+	acquireConflictReasonStaleWaitToken                    = "stale_wait_token"
+	acquireConflictReasonWaiterAlreadyAttached             = "waiter_already_attached"
+	acquireConflictReasonGrantUnclaimed                    = "grant_unclaimed"
+	acquireConflictReasonGrantAlreadyClaimed               = "grant_already_claimed"
+	ackHandoffConflictReasonTokenMismatch                  = "handoff_token_mismatch"
+	terminalizeWaitingConflictReasonMustReleaseActiveLease = "must_release_active_lease"
+	releaseReasonGrantDeliveryFailed                       = "grant_delivery_failed"
+	releaseReasonAcquireDeliveryFailed                     = "acquire_delivery_failed"
+	observabilityAcquireFastGranted                        = "acquire_fast_granted"
+	observabilityAcquireFastWait                           = "acquire_fast_wait"
+	observabilityAcquireReplayWait                         = "acquire_replay_wait"
+	observabilityAcquireReplayActive                       = "acquire_replay_active"
+	observabilityWaitStreamAttached                        = "wait_stream_attached"
+	observabilityWaitStreamTimeout                         = "wait_stream_timeout"
+	observabilityGrantPromoted                             = "grant_promoted"
+	observabilityGrantDeliveryFailed                       = "grant_delivery_failed"
+	observabilityAcquireDeliveryFailed                     = "acquire_delivery_failed"
+	observabilityClaimGranted                              = "claim_granted"
+	observabilityClaimConflict                             = "claim_conflict"
+	observabilityExpiredHard                               = "expired_hard"
+	observabilityExpiredWaiterDetached                     = "expired_waiter_detached"
+	observabilityReleaseReleased                           = "release_released"
+	observabilityReleaseNoop                               = "release_noop"
+	observabilityConflictTupleMismatch                     = "conflict_tuple_mismatch"
+	observabilityConflictWaiterAlreadyAttached             = "conflict_waiter_already_attached"
+	observabilityConflictStaleWaitToken                    = "conflict_stale_wait_token"
+	observabilityDenyHost                                  = "deny_host"
+	observabilityDenySite                                  = "deny_site"
+	observabilityDenySiteIP                                = "deny_site_ip"
 )
 
 type acquireConflictError struct {
@@ -245,22 +260,22 @@ func (e *acquireConflictError) Unwrap() error {
 	return e.cause
 }
 
-type cancelConflictError struct {
+type terminalizeWaitingConflictError struct {
 	Reason string
 	cause  error
 }
 
-func (e *cancelConflictError) Error() string {
+func (e *terminalizeWaitingConflictError) Error() string {
 	if e == nil {
-		return "cancel conflict"
+		return "terminalize waiting conflict"
 	}
 	if e.cause != nil {
 		return e.cause.Error()
 	}
-	return "cancel conflict: " + e.Reason
+	return "terminalize waiting conflict: " + e.Reason
 }
 
-func (e *cancelConflictError) Unwrap() error {
+func (e *terminalizeWaitingConflictError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
@@ -272,12 +287,16 @@ type Backend interface {
 	ClaimGrant(ctx context.Context, req ClaimGrantRequest) (*ClaimGrantResult, error)
 	Release(ctx context.Context, req ReleaseRequest) (*ReleaseResult, error)
 	PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error)
-	Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error)
+	TerminalizeWaiting(ctx context.Context, req TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error)
 	ExpireScope(ctx context.Context, req ExpireScopeRequest) (*ExpireScopeResult, error)
 }
 
 type waitStateProber interface {
 	ProbeWaitState(ctx context.Context, req AcquireRequest) (*AcquireResult, error)
+}
+
+type attachedWaitStateProber interface {
+	ProbeAttachedWaitState(ctx context.Context, req AcquireRequest) (*AcquireResult, error)
 }
 
 type ackHandoffer interface {
@@ -475,7 +494,7 @@ func validateClaimGrantResult(result *ClaimGrantResult) error {
 		return nil
 	case "expired":
 		switch result.Reason {
-		case "hard_expired", "waiter_detached_timeout":
+		case "hard_expired", "waiter_detached_timeout", "wait_stream_timeout":
 			return nil
 		default:
 			return fmt.Errorf("invalid claim expired reason %q", result.Reason)
@@ -592,16 +611,16 @@ func classifyAcquireConflict(err error) error {
 	}
 }
 
-func classifyCancelConflict(err error) error {
+func classifyTerminalizeWaitingConflict(err error) error {
 	if err == nil {
 		return nil
 	}
 	message := strings.ToLower(strings.TrimSpace(err.Error()))
 	switch {
-	case strings.Contains(message, "cq_cancel request_id tuple mismatch"):
-		return &cancelConflictError{Reason: acquireConflictReasonRequestIDTupleMismatch, cause: err}
-	case strings.Contains(message, "cq_cancel must release active lease"):
-		return &cancelConflictError{Reason: cancelConflictReasonMustReleaseActiveLease, cause: err}
+	case strings.Contains(message, "cq_terminalize_waiting request_id tuple mismatch"):
+		return &terminalizeWaitingConflictError{Reason: acquireConflictReasonRequestIDTupleMismatch, cause: err}
+	case strings.Contains(message, "cq_terminalize_waiting must release active lease"):
+		return &terminalizeWaitingConflictError{Reason: terminalizeWaitingConflictReasonMustReleaseActiveLease, cause: err}
 	default:
 		return err
 	}
@@ -642,20 +661,25 @@ func validateReleaseResult(result *ReleaseResult) error {
 	}
 }
 
-func validateCancelResult(result *CancelResult) error {
+func validateTerminalizeWaitingResult(result *TerminalizeWaitingResult) error {
 	if result == nil {
-		return errors.New("missing cancel result")
+		return errors.New("missing terminalize waiting result")
 	}
 	switch result.Result {
-	case "cancelled":
+	case "released":
+		return nil
+	case "expired":
+		if result.Reason != "wait_stream_timeout" {
+			return fmt.Errorf("invalid terminalize waiting expired reason %q", result.Reason)
+		}
 		return nil
 	case "noop":
 		if result.Reason != "already_terminal" {
-			return fmt.Errorf("invalid cancel noop reason %q", result.Reason)
+			return fmt.Errorf("invalid terminalize waiting noop reason %q", result.Reason)
 		}
 		return nil
 	default:
-		return fmt.Errorf("invalid cancel result %q", result.Result)
+		return fmt.Errorf("invalid terminalize waiting result %q", result.Result)
 	}
 }
 

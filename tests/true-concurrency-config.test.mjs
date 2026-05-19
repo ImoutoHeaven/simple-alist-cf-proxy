@@ -1093,51 +1093,15 @@ test('concurrency client keeps acquire fast-only and sends waitToken only to CQ 
   }
 });
 
-test('concurrency client sends cancel payload and parses cancelled results', async () => {
-  const originalFetch = globalThis.fetch;
-  const originalNow = Date.now;
-  Date.now = () => 999;
+test('concurrency client no longer exposes cancel', () => {
+  const client = createConcurrencyHandlerClient({
+    concurrencyHandlerConfig: {
+      url: 'https://cq.example.test/',
+      authKey: 'cq-secret',
+      releaseTimeoutMs: 1500,
+    },
+  });
 
-  globalThis.fetch = async (url, init = {}) => {
-    assert.equal(url, 'https://cq.example.test/api/v1/concurrency/cancel');
-    assert.equal(init.headers['X-CQ-Auth'], 'cq-secret');
-    assert.deepEqual(JSON.parse(init.body), {
-      requestId: 'req-1',
-      hostname: 'tenant.sharepoint.com',
-      hostnameHash: 'host-hash',
-      siteBucket: 'site-hash',
-      ipBucket: 'ip-hash',
-      hardExpireAtMs: 5000,
-      reason: 'worker_aborted',
-      nowMs: 999,
-    });
-    return new Response(JSON.stringify({ result: 'cancelled' }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
-  };
-
-  try {
-    const client = createConcurrencyHandlerClient({
-      concurrencyHandlerConfig: {
-        url: 'https://cq.example.test/',
-        authKey: 'cq-secret',
-        releaseTimeoutMs: 1500,
-      },
-    });
-
-    const result = await client.cancel(null, {
-      requestId: 'req-1',
-      hostname: 'tenant.sharepoint.com',
-      hostnameHash: 'host-hash',
-      siteBucket: 'site-hash',
-      ipBucket: 'ip-hash',
-      hardExpireAtMs: 5000,
-    }, 'worker_aborted');
-
-    assert.deepEqual(result, { result: 'cancelled' });
-  } finally {
-    globalThis.fetch = originalFetch;
-    Date.now = originalNow;
-  }
+  assert.equal('cancel' in client, false);
+  assert.equal(typeof client.cancel, 'undefined');
 });

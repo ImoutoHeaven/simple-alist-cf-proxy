@@ -88,19 +88,7 @@ type throttledLatch struct {
 const (
 	probeModeSteady  probeMode = "steady"
 	probeModeFill    probeMode = "fill"
-	readyLatchTTL              = 300 * time.Millisecond
-	readyLatchTTLMax           = time.Second
 )
-
-func clampReadyLatchTTL(ttl time.Duration) time.Duration {
-	if ttl <= 0 {
-		return 0
-	}
-	if ttl > readyLatchTTLMax {
-		return readyLatchTTLMax
-	}
-	return ttl
-}
 
 func (s *server) flowStoreNow() time.Time {
 	if s == nil {
@@ -723,14 +711,6 @@ func (s *server) cleanupExpiredHostDeadlines(hostKey string, now time.Time) {
 	if store == nil {
 		return
 	}
-	for _, snap := range store.listQueueVisibleByHost(hostKey, now) {
-		if snap.Token == "" {
-			continue
-		}
-		if !snap.ReadyLatchedUntil.IsZero() && !now.Before(snap.ReadyLatchedUntil) {
-			s.expireReadyLatchAndRelease(snap.Token, snap.CommittedGrantEpoch, now)
-		}
-	}
 }
 
 func (s *server) hostProbeReactorState(r *fqHostProbeRunner, hostKey string, now time.Time) hostProbeReactorState {
@@ -757,9 +737,7 @@ func (s *server) hostProbeReactorState(r *fqHostProbeRunner, hostKey string, now
 	nextWakeAt := time.Time{}
 	for _, snap := range queueVisible {
 		nextWakeAt = minNonZeroTime(nextWakeAt, hostSchedulerBucketDenyUntil(sites, snap.SiteBucket, snap.IPBucket))
-		nextWakeAt = minNonZeroTime(nextWakeAt, snap.ReadyLatchedUntil)
 		nextWakeAt = minNonZeroTime(nextWakeAt, snap.InvocationLeaseUntil)
-		nextWakeAt = minNonZeroTime(nextWakeAt, snap.ExpireAt)
 	}
 	if !nextWakeAt.IsZero() && !nextWakeAt.After(now) {
 		nextWakeAt = time.Time{}
@@ -1164,32 +1142,6 @@ func (s *server) compensatingReleaseAsync(req ReleaseRequest) {
 	go s.releaseSlotCompensating(context.Background(), req)
 }
 
-func (s *server) expireReadyLatchAndRelease(token string, epoch uint64, now time.Time) {
-	if s == nil || token == "" || epoch == 0 {
-		return
-	}
-	s.mu.RLock()
-	store := s.flowStore
-	s.mu.RUnlock()
-	if store == nil {
-		return
-	}
-	expired, releaseReq, ok := store.expireReadyLatchForProbe(token, epoch, now)
-	if !expired {
-		return
-	}
-	s.recordReadyLatchExpired()
-	if !ok {
-		return
-	}
-	s.recordCompensatingRelease()
-	hostKey := fqHostKey(releaseReq.HostnameHash, releaseReq.Hostname)
-	if hostKey != "" {
-		s.wakeHostProbeRunner(hostKey)
-	}
-	s.compensatingReleaseAsync(releaseReq)
-}
-
 // probeOnce performs one scheduling decision for the given host.
 // It is intentionally deterministic/testable via injected `now`.
 //
@@ -1311,7 +1263,7 @@ func (s *server) probeOnceWithLimit(parentCtx context.Context, hostKey string, n
 			sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)
 			return
 		}
-		commit := store.commitReadyGrantForProbe(snap.Token, res.slotToken, res.attemptVersion, res.attemptTicket, clampReadyLatchTTL(readyLatchTTL), now)
+		commit := store.commitReadyGrantForProbe(snap.Token, res.slotToken, res.attemptVersion, res.attemptTicket, 0, now)
 		if !commit.committed {
 			if strings.TrimSpace(res.slotToken) != "" {
 				compensateReady(snap, res)
@@ -1351,20 +1303,10 @@ func (s *server) probeOnceWithLimit(parentCtx context.Context, hostKey string, n
 			}
 			return
 		}
-		if !commit.readyLatched {
-			releaseReq, ok := store.clearCommittedGrantForProbe(snap.Token, now)
-			if ok {
-				releaseAsync(releaseReq)
-			}
-			return
+		releaseReq, ok := store.clearCommittedGrantForProbe(snap.Token, now)
+		if ok {
+			releaseAsync(releaseReq)
 		}
-		_ = store.armReadyLatchExpiry(snap.Token, commit.committedGrantEpoch, now, func(token string, epoch uint64) {
-			expireNow := time.Now()
-			if store.nowFn != nil {
-				expireNow = store.nowFn()
-			}
-			s.expireReadyLatchAndRelease(token, epoch, expireNow)
-		})
 	}
 
 	applySubBatch := func(sub probeSubBatchResult) {

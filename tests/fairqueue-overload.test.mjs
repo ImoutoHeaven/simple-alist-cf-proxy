@@ -706,6 +706,70 @@ test('slot-handler client marks owner-routed release only when granted response 
   }
 });
 
+test('slot-handler client preserves releaseOwnerRequired false from granted responses', async () => {
+  const { createSlotHandlerClient } = __fairQueueTestHooks;
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  let releaseSeenBody = null;
+  let releaseSeenOwnerTokenHeader = null;
+  let releaseSeenOwnerEpochHeader = null;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).endsWith('/api/v1/fairqueue/wait')) {
+      return createFairQueueWaitSseResponse({
+        result: 'granted',
+        queryToken: 'query-granted-direct',
+        invocationEpoch: 13,
+        slotToken: 'slot-direct',
+        releaseOwnerRequired: false,
+      });
+    }
+
+    if (String(url).endsWith('/api/v1/fairqueue/release')) {
+      releaseSeenBody = JSON.parse(init.body);
+      const headers = new Headers(init.headers);
+      releaseSeenOwnerTokenHeader = headers.get('X-FQ-Owner-Token');
+      releaseSeenOwnerEpochHeader = headers.get('X-FQ-Owner-Epoch');
+      return new Response(null, { status: 204 });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const granted = await client.waitForSlot({}, fqContext);
+    assert.equal(granted.kind, 'granted');
+    assert.equal(fqContext.releaseOwnerRequired, false);
+
+    const released = await client.releaseSlot({}, {
+      ...fqContext,
+      slotToken: 'slot-direct',
+      queryToken: 'query-granted-direct',
+      invocationEpoch: 13,
+    });
+
+    assert.equal(released, true);
+    assert.equal(releaseSeenBody.releaseOwnerRequired, false);
+    assert.equal(releaseSeenOwnerTokenHeader, null);
+    assert.equal(releaseSeenOwnerEpochHeader, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('slot-handler client rejects granted SSE final results missing repeated ownership', async () => {
   const { createSlotHandlerClient } = __fairQueueTestHooks;
   const client = createSlotHandlerClient({
@@ -818,6 +882,88 @@ test('slot-handler client rejects throttled SSE final results missing repeated o
   }
 });
 
+test('slot-handler client rejects final FQ results without accepted ownership', async () => {
+	const { createSlotHandlerClient } = __fairQueueTestHooks;
+	const finalResults = [
+		{ result: 'granted', slotToken: 'slot-1' },
+		{ result: 'throttled', throttleCode: 503 },
+		{ result: 'overloaded', reason: 'overload_host', retryAfter: 1 },
+		{ result: 'timeout', reason: 'wait_stream_timeout' },
+		{ result: 'conflict', reason: 'owner_mismatch' },
+	];
+
+	for (const finalPayload of finalResults) {
+		const client = createSlotHandlerClient({
+			slotHandlerConfig: {
+				url: 'https://slot-handler.example.com',
+				totalMaxWaitMs: 20000,
+				authKey: '',
+			},
+		});
+		const fqContext = {
+			hostname: 'example.com',
+			hostnameHash: 'host-hash',
+			ipBucket: 'ip-bucket',
+			siteBucket: 'site-bucket',
+		};
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = async () => createStreamingSseResponse([
+			'event: accepted\n',
+			`data: ${JSON.stringify({ queryToken: 'query-owned', invocationEpoch: 3, deadlineMs: Date.now() + 1_000 })}\n\n`,
+			'event: result\n',
+			`data: ${JSON.stringify(finalPayload)}\n\n`,
+		]);
+
+		try {
+			const result = await client.waitForSlot({}, fqContext);
+			assert.deepEqual(result, { kind: 'timeout', reason: 'slot-handler-invalid-response' });
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	}
+});
+
+test('slot-handler client rejects final FQ results with mismatched accepted ownership', async () => {
+	const { createSlotHandlerClient } = __fairQueueTestHooks;
+	const finalResults = [
+		{ result: 'granted', slotToken: 'slot-1' },
+		{ result: 'throttled', throttleCode: 503 },
+		{ result: 'overloaded', reason: 'overload_host', retryAfter: 1 },
+		{ result: 'timeout', reason: 'wait_stream_timeout' },
+		{ result: 'conflict', reason: 'owner_mismatch' },
+	];
+
+	for (const finalPayload of finalResults) {
+		const client = createSlotHandlerClient({
+			slotHandlerConfig: {
+				url: 'https://slot-handler.example.com',
+				totalMaxWaitMs: 20000,
+				authKey: '',
+			},
+		});
+		const fqContext = {
+			hostname: 'example.com',
+			hostnameHash: 'host-hash',
+			ipBucket: 'ip-bucket',
+			siteBucket: 'site-bucket',
+		};
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = async () => createStreamingSseResponse([
+			'event: accepted\n',
+			`data: ${JSON.stringify({ queryToken: 'query-owned', invocationEpoch: 3, deadlineMs: Date.now() + 1_000 })}\n\n`,
+			'event: result\n',
+			`data: ${JSON.stringify({ ...finalPayload, queryToken: 'query-other', invocationEpoch: 4 })}\n\n`,
+		]);
+
+		try {
+			const result = await client.waitForSlot({}, fqContext);
+			assert.deepEqual(result, { kind: 'timeout', reason: 'slot-handler-invalid-response' });
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	}
+});
+
 test('slot-handler client clears full ownership tuple on timeout responses', async () => {
   const { createSlotHandlerClient } = __fairQueueTestHooks;
   const client = createSlotHandlerClient({
@@ -854,8 +1000,8 @@ test('slot-handler client clears full ownership tuple on timeout responses', asy
 });
 
 test('slot-handler client clears accepted tuple on overloaded SSE results', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
       url: 'https://slot-handler.example.com',
@@ -892,13 +1038,13 @@ test('slot-handler client clears accepted tuple on overloaded SSE results', asyn
     assert.equal(fqContext.invocationEpoch, null);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 
 test('slot-handler client clears accepted tuple on conflict responses', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
       url: 'https://slot-handler.example.com',
@@ -928,19 +1074,90 @@ test('slot-handler client clears accepted tuple on conflict responses', async ()
     assert.equal(fqContext.invocationEpoch, null);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 
-test('conflict final result does not emit abandon after accepted tuple', async () => {
-  const { clearOverloadedByHost } = __fairQueueTestHooks;
+test('slot-handler client maps setup-time JSON conflict responses', async () => {
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 50,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: 'conflict',
+    reason: 'waiter_already_attached',
+  }), {
+    status: 409,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(result, { kind: 'conflict', reason: 'waiter_already_attached' });
+    assert.equal(fqContext.queryToken, undefined);
+    assert.equal(fqContext.invocationEpoch, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearFairQueueOverloadState();
+  }
+});
+
+test('slot-handler client maps setup-time JSON conflict with missing reason', async () => {
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 50,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ result: 'conflict' }), {
+    status: 409,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  try {
+    const result = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(result, { kind: 'conflict', reason: null });
+    assert.equal(fqContext.queryToken, undefined);
+    assert.equal(fqContext.invocationEpoch, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearFairQueueOverloadState();
+  }
+});
+
+test('conflict final result ends on the server-owned terminal cleanup path', async () => {
+  const { clearFairQueueOverloadState } = __fairQueueTestHooks;
   const waitUntilPromises = [];
-  const abandonBodies = [];
   const releaseBodies = [];
-  let abandonCalls = 0;
   const originalFetch = globalThis.fetch;
   delete globalThis.bootstrapCache;
-  clearOverloadedByHost();
+  clearFairQueueOverloadState();
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -969,12 +1186,6 @@ test('conflict final result does not emit abandon after accepted tuple', async (
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/abandon') {
-      abandonCalls += 1;
-      abandonBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'ok' });
-    }
-
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       releaseBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'ok' });
@@ -995,25 +1206,88 @@ test('conflict final result does not emit abandon after accepted tuple', async (
     await Promise.allSettled(waitUntilPromises);
     await waitForNextTurn();
 
-    assert.equal(abandonCalls, 0);
-    assert.deepEqual(abandonBodies, []);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
     delete globalThis.bootstrapCache;
   }
 });
 
-test('global overload final result does not emit abandon after accepted tuple', async () => {
-  const { clearOverloadedByHost } = __fairQueueTestHooks;
+test('fair queue setup-time JSON conflict returns terminal response without release', async () => {
+  const { clearFairQueueOverloadState } = __fairQueueTestHooks;
   const waitUntilPromises = [];
-  const abandonBodies = [];
-  const releaseBodies = [];
-  let abandonCalls = 0;
+  let releaseCallCount = 0;
   const originalFetch = globalThis.fetch;
   delete globalThis.bootstrapCache;
-  clearOverloadedByHost();
+  clearFairQueueOverloadState();
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ fairQueueHostPatterns: ['*.sharepoint.com'] }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/start',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      return new Response(JSON.stringify({
+        result: 'conflict',
+        reason: 'waiter_already_attached',
+      }), {
+        status: 409,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      releaseCallCount += 1;
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(await buildSignedWorkerRequest('/downloads/fairqueue-setup-conflict.bin'), buildWorkerEnv(), {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      code: 503,
+      message: 'Upstream queue timeout, please retry later',
+    });
+    await waitForNextTurn();
+    await Promise.allSettled(waitUntilPromises);
+    await waitForNextTurn();
+
+    assert.equal(releaseCallCount, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearFairQueueOverloadState();
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('global overload final result ends on the server-owned terminal cleanup path', async () => {
+  const { clearFairQueueOverloadState } = __fairQueueTestHooks;
+  const waitUntilPromises = [];
+  const releaseBodies = [];
+  const originalFetch = globalThis.fetch;
+  delete globalThis.bootstrapCache;
+  clearFairQueueOverloadState();
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -1044,12 +1318,6 @@ test('global overload final result does not emit abandon after accepted tuple', 
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/abandon') {
-      abandonCalls += 1;
-      abandonBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'ok' });
-    }
-
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       releaseBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'ok' });
@@ -1070,12 +1338,10 @@ test('global overload final result does not emit abandon after accepted tuple', 
     await Promise.allSettled(waitUntilPromises);
     await waitForNextTurn();
 
-    assert.equal(abandonCalls, 0);
-    assert.deepEqual(abandonBodies, []);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
     delete globalThis.bootstrapCache;
   }
 });
@@ -1147,8 +1413,8 @@ test('resolveConfig wires controller slotHandlerAuthHeader into slot-handler req
 });
 
 test('global overload should fail fast with Retry-After', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -1203,13 +1469,190 @@ test('global overload should fail fast with Retry-After', async () => {
     assert.ok(elapsedMs < 200, `expected fail-fast global overload, got ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
+  }
+});
+
+test('host-scoped overload does not suppress a repeat wait for the same host', async () => {
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return createFairQueueWaitSseResponse({
+        result: 'overloaded',
+        reason: 'overload_host',
+        retryAfter: 4,
+      });
+    }
+    return createFairQueueWaitSseResponse({
+      result: 'granted',
+      queryToken: 'query-host-repeat-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-host-repeat-grant',
+      releaseOwnerRequired: true,
+    });
+  };
+
+  try {
+    const first = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(first, {
+      kind: 'overloaded',
+      scope: 'host',
+      reason: 'overload_host',
+      retryAfter: 4,
+    });
+    assert.equal(fetchCalls, 1);
+
+    const second = await client.waitForSlot({}, fqContext);
+
+    assert.equal(second.kind, 'granted');
+    assert.equal(fetchCalls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearFairQueueOverloadState();
+  }
+});
+
+test('site-scoped overload does not suppress a repeat wait for the same host and site', async () => {
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket-a',
+    siteBucket: 'site-bucket-a',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return createFairQueueWaitSseResponse({
+        result: 'overloaded',
+        reason: 'overload_site',
+        retryAfter: 3,
+      });
+    }
+    return createFairQueueWaitSseResponse({
+      result: 'granted',
+      queryToken: 'query-site-repeat-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-site-repeat-grant',
+      releaseOwnerRequired: true,
+    });
+  };
+
+  try {
+    const first = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(first, {
+      kind: 'overloaded',
+      scope: 'site',
+      reason: 'overload_site',
+      retryAfter: 3,
+    });
+    assert.equal(fetchCalls, 1);
+
+    const second = await client.waitForSlot({}, fqContext);
+
+    assert.equal(second.kind, 'granted');
+    assert.equal(fetchCalls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearFairQueueOverloadState();
+  }
+});
+
+test('ip-scoped overload does not suppress a repeat wait for the same host, site, and ip', async () => {
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
+
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      totalMaxWaitMs: 20000,
+      authKey: '',
+    },
+  });
+
+  const fqContext = {
+    hostname: 'example.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket-a',
+    siteBucket: 'site-bucket-a',
+  };
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return createFairQueueWaitSseResponse({
+        result: 'overloaded',
+        reason: 'overload_ip',
+        retryAfter: 2,
+      });
+    }
+    return createFairQueueWaitSseResponse({
+      result: 'granted',
+      queryToken: 'query-ip-repeat-grant',
+      invocationEpoch: 1,
+      slotToken: 'slot-ip-repeat-grant',
+      releaseOwnerRequired: true,
+    });
+  };
+
+  try {
+    const first = await client.waitForSlot({}, fqContext);
+    assert.deepEqual(first, {
+      kind: 'overloaded',
+      scope: 'ip',
+      reason: 'overload_ip',
+      retryAfter: 2,
+    });
+    assert.equal(fetchCalls, 1);
+
+    const second = await client.waitForSlot({}, fqContext);
+
+    assert.equal(second.kind, 'granted');
+    assert.equal(fetchCalls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearFairQueueOverloadState();
   }
 });
 
 test('global overload cooldown should suppress repeated wait calls', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -1271,13 +1714,13 @@ test('global overload cooldown should suppress repeated wait calls', async () =>
     assert.ok(elapsedMs < 200, `expected cached global overload short-circuit, got ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 
-test('host-scoped overload setup failure should fail fast without retry loop', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+test('host-scoped setup-time JSON overload maps to terminal overloaded response', async () => {
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -1320,16 +1763,16 @@ test('host-scoped overload setup failure should fail fast without retry loop', a
       retryAfter: 2,
     });
     assert.equal(fetchCalls, 1);
-    assert.ok(elapsedMs < FAIL_FAST_WAIT_MAX_MS, `expected fail-fast host overload, got ${elapsedMs}ms`);
+    assert.ok(elapsedMs < FAIL_FAST_WAIT_MAX_MS, `expected setup-time host overload mapping, got ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 
-test('site-scoped overload setup failure should fail fast without retry loop', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+test('site-scoped setup-time JSON overload maps to terminal overloaded response', async () => {
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -1372,16 +1815,16 @@ test('site-scoped overload setup failure should fail fast without retry loop', a
       retryAfter: 2,
     });
     assert.equal(fetchCalls, 1);
-    assert.ok(elapsedMs < FAIL_FAST_WAIT_MAX_MS, `expected fail-fast site overload, got ${elapsedMs}ms`);
+    assert.ok(elapsedMs < FAIL_FAST_WAIT_MAX_MS, `expected setup-time site overload mapping, got ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 
-test('ip-scoped overload setup failure should fail fast without retry loop', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+test('ip-scoped setup-time JSON overload maps to terminal overloaded response', async () => {
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -1424,16 +1867,16 @@ test('ip-scoped overload setup failure should fail fast without retry loop', asy
       retryAfter: 2,
     });
     assert.equal(fetchCalls, 1);
-    assert.ok(elapsedMs < FAIL_FAST_WAIT_MAX_MS, `expected fail-fast ip overload, got ${elapsedMs}ms`);
+    assert.ok(elapsedMs < FAIL_FAST_WAIT_MAX_MS, `expected setup-time ip overload mapping, got ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 
 test('site-scoped overload does not suppress other sites under same host', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -1498,13 +1941,13 @@ test('site-scoped overload does not suppress other sites under same host', async
     assert.ok(elapsedMs < 250, `expected no host-wide suppression for other site, got ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 
 test('ip-scoped overload does not suppress other ip buckets under same host and site', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -1569,19 +2012,16 @@ test('ip-scoped overload does not suppress other ip buckets under same host and 
     assert.ok(elapsedMs < 250, `expected no host-wide suppression for other ip bucket, got ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 
-test('unknown scoped overload reason does not create scoped cooldown state', async () => {
+test('unknown scoped overload reason does not suppress later requests', async () => {
   const {
     createSlotHandlerClient,
-    clearOverloadedByHost,
-    getHostOverloadedRemainingMs,
-    getSiteOverloadedRemainingMs,
-    getIpOverloadedRemainingMs,
+    clearFairQueueOverloadState,
   } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -1635,9 +2075,6 @@ test('unknown scoped overload reason does not create scoped cooldown state', asy
       reason: 'unexpected_overload_scope',
       retryAfter: 60,
     });
-    assert.equal(getHostOverloadedRemainingMs(siteAContext.hostname), 0);
-    assert.equal(getSiteOverloadedRemainingMs(siteAContext.hostname, siteAContext.siteBucket), 0);
-    assert.equal(getIpOverloadedRemainingMs(siteAContext.hostname, siteAContext.siteBucket, siteAContext.ipBucket), 0);
 
     const startedAt = Date.now();
     const second = await client.waitForSlot({}, siteBContext);
@@ -1645,16 +2082,16 @@ test('unknown scoped overload reason does not create scoped cooldown state', asy
 
     assert.equal(second.kind, 'granted');
     assert.equal(fetchCalls, 2);
-    assert.ok(elapsedMs < 250, `expected unknown scoped overload not to suppress later requests, got ${elapsedMs}ms`);
+    assert.ok(elapsedMs < 250, `expected unknown overload not to suppress later requests, got ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 
-test('ip-scoped keys with embedded delimiters do not collide', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+test('ip-scoped overload with embedded delimiters does not suppress later requests', async () => {
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -1715,46 +2152,13 @@ test('ip-scoped keys with embedded delimiters do not collide', async () => {
     assert.equal(fetchCalls, 2);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
-  }
-});
-
-test('scoped overload maps opportunistically clean expired entries', async () => {
-  const {
-    clearOverloadedByHost,
-    markSiteOverloaded,
-    markIpOverloaded,
-    getSiteOverloadedRemainingMs,
-    getIpOverloadedRemainingMs,
-    getOverloadedMapSizes,
-  } = __fairQueueTestHooks;
-
-  clearOverloadedByHost();
-
-  try {
-    for (let i = 0; i < 24; i += 1) {
-      markSiteOverloaded('cleanup.example', `site-${i}`, 1);
-      markIpOverloaded('cleanup.example', `site-${i}`, `ip-${i}`, 1);
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 10));
-
-    const before = getOverloadedMapSizes();
-    getSiteOverloadedRemainingMs('cleanup.example', 'fresh-site');
-    getIpOverloadedRemainingMs('cleanup.example', 'fresh-site', 'fresh-ip');
-    const after = getOverloadedMapSizes();
-
-    assert.ok(before.site > 0 && before.ip > 0);
-    assert.ok(after.site < before.site, `expected site map cleanup: ${before.site} -> ${after.site}`);
-    assert.ok(after.ip < before.ip, `expected ip map cleanup: ${before.ip} -> ${after.ip}`);
-  } finally {
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 
 test('scoped overload setup failure leaves ownership metadata empty', async () => {
-  const { createSlotHandlerClient, clearOverloadedByHost } = __fairQueueTestHooks;
-  clearOverloadedByHost();
+  const { createSlotHandlerClient, clearFairQueueOverloadState } = __fairQueueTestHooks;
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -1796,7 +2200,7 @@ test('scoped overload setup failure leaves ownership metadata empty', async () =
     assert.equal(fqContext.slotToken, undefined);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 

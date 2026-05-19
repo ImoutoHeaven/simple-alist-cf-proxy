@@ -28,7 +28,6 @@ const (
 	claimPath     = "/api/v1/concurrency/claim"
 	ackPath       = "/api/v1/concurrency/ack_handoff"
 	releasePath   = "/api/v1/concurrency/release"
-	cancelPath    = "/api/v1/concurrency/cancel"
 	heartbeatPath = "/api/v1/concurrency/heartbeat"
 )
 
@@ -40,6 +39,7 @@ const (
 	startupRecoverTimeout = 30 * time.Second
 	releaseTimeout        = 5 * time.Second
 	releaseWakeTimeout    = 5 * time.Second
+	promoteWaitTimeout    = 5 * time.Second
 )
 
 type startupLifecycleState int
@@ -84,8 +84,20 @@ type sweepTicker interface {
 	Stop()
 }
 
-type continueWaitPromoter interface {
+type waitingPromoter interface {
 	PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error)
+}
+
+type attachedWaitingPromoter interface {
+	PromoteAttachedWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error)
+}
+
+type waitReservationReleaser interface {
+	ReleaseWaitReservation(ctx context.Context, req ReleaseWaitReservationRequest) (*ReleaseWaitReservationResult, error)
+}
+
+type sqlBackedPromotionMarker interface {
+	usesSQLBackedPromotion()
 }
 
 type startupWaitingLoader interface {
@@ -252,7 +264,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc(claimPath, s.handleClaim)
 	s.mux.HandleFunc(ackPath, s.handleAckHandoff)
 	s.mux.HandleFunc(releasePath, s.handleRelease)
-	s.mux.HandleFunc(cancelPath, s.handleCancel)
 	if s.heartbeatRuntime != nil {
 		s.mux.HandleFunc(heartbeatPath, s.handleHeartbeat)
 	}
@@ -463,6 +474,7 @@ func (s *Server) runSweepPass(ctx context.Context) error {
 		return nil
 	}
 	nowMs := time.Now().UnixMilli()
+	s.waitingRuntime.cleanupExpiredWaitTokenTracking(nowMs)
 	overdueAny, err := s.recoverOverdueHandoffPendingAt(ctx, nowMs)
 	if err != nil {
 		return err
@@ -1004,7 +1016,7 @@ func (s *Server) recordAcquireOutcome(req AcquireRequest, result *AcquireResult)
 			} else {
 				s.recordObservability(observabilityAcquireFastWait, "request_id="+requestID, "wait_token="+strings.TrimSpace(result.WaitToken))
 			}
-			s.waitingRuntime.markWaitTokenObserved(result.WaitToken)
+			s.waitingRuntime.markWaitTokenObservedUntil(result.WaitToken, req.HardExpireAtMs)
 		case "conflict":
 			s.recordAcquireConflict(result.Reason, req)
 			s.clearActiveReplayState(requestID)
@@ -1020,14 +1032,14 @@ func (s *Server) recordAcquireOutcome(req AcquireRequest, result *AcquireResult)
 		s.observability.markActiveRequest(requestID)
 		s.waitingRuntime.markActiveRequestObserved(requestID)
 	case "wait":
-		s.recordObservability(observabilityContinueWaitAttached, "request_id="+requestID, "wait_token="+strings.TrimSpace(result.WaitToken))
+		s.recordObservability(observabilityWaitStreamAttached, "request_id="+requestID, "wait_token="+strings.TrimSpace(result.WaitToken))
 		s.waitingRuntime.markWaitTokenObserved(result.WaitToken)
 	case "conflict":
 		s.recordAcquireConflict(result.Reason, req)
 		s.clearActiveReplayState(requestID)
 	case "expired":
 		if result.Reason == "wait_stream_timeout" {
-			s.recordObservability(observabilityContinueWaitTimeout, "request_id="+requestID, "wait_token="+strings.TrimSpace(req.WaitToken))
+			s.recordObservability(observabilityWaitStreamTimeout, "request_id="+requestID, "wait_token="+strings.TrimSpace(req.WaitToken))
 		} else {
 			s.recordAcquireTerminalObservability(result, requestID)
 		}
@@ -1063,13 +1075,6 @@ func writeWaitSetupFailure(w http.ResponseWriter, status int, reason string) {
 		Result: "error",
 		Error:  reason,
 		Reason: reason,
-	})
-}
-
-func writeCancelConflict(w http.ResponseWriter, reason string) {
-	writeJSON(w, http.StatusConflict, map[string]string{
-		"result": "conflict",
-		"reason": reason,
 	})
 }
 
@@ -1186,34 +1191,6 @@ func validateReleaseRequest(req ReleaseRequest) error {
 	case "stream_complete", "client_disconnect", "hard_expiry", "upstream_failure", "origin_fetch_failure", "heartbeat_connect_failed", "heartbeat_lost", "final_cleanup":
 	default:
 		return errors.New("unsupported release reason")
-	}
-	if req.NowMs <= 0 {
-		return errors.New("nowMs is required")
-	}
-	return nil
-}
-
-func validateCancelRequest(req CancelRequest) error {
-	if strings.TrimSpace(req.RequestID) == "" {
-		return errors.New("requestId is required")
-	}
-	if strings.TrimSpace(req.Hostname) == "" {
-		return errors.New("hostname is required")
-	}
-	if strings.TrimSpace(req.HostnameHash) == "" {
-		return errors.New("hostnameHash is required")
-	}
-	if strings.TrimSpace(req.SiteBucket) == "" {
-		return errors.New("siteBucket is required")
-	}
-	if strings.TrimSpace(req.IPBucket) == "" {
-		return errors.New("ipBucket is required")
-	}
-	if req.HardExpireAtMs <= 0 {
-		return errors.New("hardExpireAtMs is required")
-	}
-	if strings.TrimSpace(req.Reason) == "" {
-		return errors.New("reason is required")
 	}
 	if req.NowMs <= 0 {
 		return errors.New("nowMs is required")
@@ -1343,12 +1320,6 @@ func (s *Server) handleAcquire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordAcquireOutcome(req, result)
-	if result.Result == "wait" {
-		req.WaitToken = result.WaitToken
-		s.waitingRuntime.upsertWaitingRequest(req, result.WaitToken, nil, s.cfg)
-		s.ensureHostReactor(req.HostnameHash)
-		s.wakeHostReactor(req.HostnameHash)
-	}
 	s.writeAcquireResultWithCompensation(r.Context(), w, req, result, releaseReasonAcquireDeliveryFailed)
 }
 
@@ -1393,13 +1364,22 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 		// Preserve the accepted stream's lease while we probe for tuple/terminal precedence.
 		req.DeadlineMs = attachedLeaseUntilMs
 	}
+	if s.waitingRuntime.isWaitTokenConsumed(req.WaitToken) && !s.waitingRuntime.hasAttachedWaiter(req.WaitToken) {
+		if _, ok := s.waitingRuntime.snapshotForWaitToken(req.WaitToken); !ok {
+			s.recordAcquireConflict(acquireConflictReasonWaiterAlreadyAttached, req)
+			writeAcquireConflict(w, acquireConflictReasonWaiterAlreadyAttached)
+			return
+		}
+	}
 
 	prober, ok := s.backend.(waitStateProber)
 	if !ok {
 		writeWaitSetupFailure(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
-	probeResult, err := prober.ProbeWaitState(r.Context(), req)
+	probeCtx, cancelProbe := context.WithTimeout(s.serverOwnedContext(), promoteWaitTimeout)
+	probeResult, err := prober.ProbeWaitState(probeCtx, req)
+	cancelProbe()
 	if err != nil {
 		var conflictErr *acquireConflictError
 		if errors.As(err, &conflictErr) {
@@ -1407,49 +1387,141 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 			writeAcquireConflict(w, conflictErr.Reason)
 			return
 		}
+		if strings.TrimSpace(err.Error()) == "wait admission overloaded" {
+			s.releaseWaitReservation(req, false)
+			writeWaitSetupFailure(w, http.StatusServiceUnavailable, "wait admission overloaded")
+			return
+		}
+		s.releaseWaitReservation(req, false)
 		writeWaitSetupFailure(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
 	if probeResult == nil {
+		s.releaseWaitReservation(req, false)
 		writeWaitSetupFailure(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
 	if err := validateAcquireResult(req, probeResult); err != nil {
+		s.releaseWaitReservation(req, false)
 		writeWaitSetupFailure(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
-	if probeResult.Result != "wait" {
-		s.waitingRuntime.finishByWaitToken(req.WaitToken, probeResult)
+	if probeResult.Result == "conflict" {
+		s.recordAcquireConflict(probeResult.Reason, req)
+		s.waitingRuntime.clearWaitTokenTracking(req.WaitToken)
+		writeAcquireConflict(w, probeResult.Reason)
+		return
+	}
+	if probeResult.Result == "expired" {
 		s.recordAcquireOutcome(req, probeResult)
+		s.waitingRuntime.clearWaitTokenTracking(req.WaitToken)
+		writeJSON(w, http.StatusGone, probeResult)
+		return
 	}
 
 	var attachedWaiter *attachedWaiter
-	if probeResult.Result == "wait" {
-		attachedWaiter, ok = s.waitingRuntime.tryAttach(req.WaitToken)
+	shouldReleaseAttachedWaiter := false
+	if probeResult.Result == "wait" || probeResult.Result == "granted" || probeResult.Result == "released" || probeResult.Result == "cancelled" {
+		attachedWaiter, ok = s.waitingRuntime.reserveAttach(req.WaitToken)
 		if !ok {
 			s.recordAcquireConflict(acquireConflictReasonWaiterAlreadyAttached, req)
 			writeAcquireConflict(w, acquireConflictReasonWaiterAlreadyAttached)
 			return
 		}
-		defer s.releaseAttachedWaiter(attachedWaiter, req)
+		shouldReleaseAttachedWaiter = true
+		defer func() {
+			if shouldReleaseAttachedWaiter {
+				s.releaseAttachedWaiter(attachedWaiter, req)
+			}
+		}()
+		if usesSQLBackedPromotion(s.backend) && claimHeld {
+			releaseClaim()
+			claimHeld = false
+		}
+	}
+	if err := writeSSEAccepted(w, req.DeadlineMs); err != nil {
+		if attachedWaiter != nil {
+			s.waitingRuntime.releaseReservedAttach(attachedWaiter)
+			shouldReleaseAttachedWaiter = false
+		}
+		s.releaseWaitReservation(req, false)
+		return
+	}
+	if attachedWaiter != nil {
+		if probeResult.Result == "wait" && usesSQLBackedPromotion(s.backend) {
+			finishPromotionFailure := func() {
+				s.waitingRuntime.releaseReservedAttach(attachedWaiter)
+				shouldReleaseAttachedWaiter = false
+				if !s.releaseWaitReservation(req, true) {
+					s.waitingRuntime.recordCleanupCandidate(req, "final_cleanup")
+					s.ensureHostReactor(req.HostnameHash)
+					s.wakeHostReactor(req.HostnameHash)
+				}
+				finalResult := &AcquireResult{Result: "released", Reason: "final_cleanup"}
+				s.recordAcquireOutcome(req, finalResult)
+				s.writeWaitResultWithCompensation(context.Background(), w, req, finalResult)
+			}
+			promoteCtx, cancelPromote := context.WithTimeout(s.serverOwnedContext(), promoteWaitTimeout)
+			promotedResult, err := s.backend.PromoteWaiting(promoteCtx, PromoteWaitingRequest{
+				RequestID:      req.RequestID,
+				HostnameHash:   req.HostnameHash,
+				SiteBucket:     req.SiteBucket,
+				IPBucket:       req.IPBucket,
+				HardExpireAtMs: req.HardExpireAtMs,
+				NowMs:          time.Now().UnixMilli(),
+				WaitToken:      req.WaitToken,
+			})
+			cancelPromote()
+			if err != nil || promotedResult == nil {
+				finishPromotionFailure()
+				return
+			}
+			if err := validateAcquireResult(req, promotedResult); err != nil {
+				finishPromotionFailure()
+				return
+			}
+			probeResult = promotedResult
+		}
+		if !s.waitingRuntime.promoteReservedAttach(req.WaitToken, attachedWaiter) {
+			s.waitingRuntime.releaseReservedAttach(attachedWaiter)
+			return
+		}
 		s.waitingRuntime.upsertWaitingRequestWithLeaseDeadline(req, req.WaitToken, attachedWaiter, req.DeadlineMs)
 		s.waitingRuntime.setRequest(attachedWaiter, req)
-		s.recordAcquireOutcome(req, probeResult)
+		s.waitingRuntime.markWaitTokenConsumed(req.WaitToken)
+		if probeResult.Result != "wait" {
+			s.recordAcquireOutcome(req, probeResult)
+			s.writeWaitResultWithCompensation(r.Context(), w, req, probeResult)
+			s.waitingRuntime.finishByWaitToken(req.WaitToken, probeResult)
+			return
+		}
+		if probeResult.Result == "wait" {
+			s.recordAcquireOutcome(req, probeResult)
+		}
 		s.ensureHostReactor(req.HostnameHash)
 		s.runHostPass(r.Context(), req.HostnameHash)
 		s.wakeHostReactor(req.HostnameHash)
 	}
-	releaseClaim()
-	claimHeld = false
-
-	if err := writeSSEAccepted(w, req.DeadlineMs); err != nil {
-		return
+	if claimHeld {
+		releaseClaim()
+		claimHeld = false
 	}
 	if err := writeSSEKeepalive(w, time.Now().UnixMilli()); err != nil {
+		if attachedWaiter != nil {
+			terminalized := s.terminalizeAttachedWaiting(req, "final_cleanup", nil)
+			bufferedDelivery := s.waitingRuntime.hasBufferedDelivery(attachedWaiter)
+			if !terminalized && !bufferedDelivery {
+				s.waitingRuntime.markDisconnected(attachedWaiter)
+				s.recordDisconnectedCleanupAndWake(attachedWaiter, "final_cleanup")
+			}
+			shouldReleaseAttachedWaiter = terminalized || bufferedDelivery
+		}
 		return
 	}
 	if probeResult.Result != "wait" {
+		s.recordAcquireOutcome(req, probeResult)
 		s.writeWaitResultWithCompensation(r.Context(), w, req, probeResult)
+		s.waitingRuntime.finishByWaitToken(req.WaitToken, probeResult)
 		return
 	}
 	if promoted := consumeWaiterDelivery(attachedWaiter); promoted != nil {
@@ -1478,15 +1550,38 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-deadlineTimer.C:
 			finalResult := &AcquireResult{Result: "expired", Reason: "wait_stream_timeout"}
-			s.waitingRuntime.finishByWaitToken(req.WaitToken, finalResult)
+			cleanupConfirmed := s.terminalizeAttachedWaiting(req, "wait_stream_timeout", finalResult)
+			bufferedDelivery := s.waitingRuntime.hasBufferedDelivery(attachedWaiter)
+			if !cleanupConfirmed && !bufferedDelivery {
+				s.waitingRuntime.markDisconnected(attachedWaiter)
+				s.waitingRuntime.recordDisconnectedCleanup(attachedWaiter, "wait_stream_timeout")
+			}
+			shouldReleaseAttachedWaiter = cleanupConfirmed || bufferedDelivery
+			if !cleanupConfirmed {
+				return
+			}
 			s.recordAcquireOutcome(req, finalResult)
 			s.writeWaitResultWithCompensation(r.Context(), w, req, finalResult)
 			return
 		case <-keepaliveTicker.C:
 			if err := writeSSEKeepalive(w, time.Now().UnixMilli()); err != nil {
+				terminalized := s.terminalizeAttachedWaiting(req, "final_cleanup", nil)
+				bufferedDelivery := s.waitingRuntime.hasBufferedDelivery(attachedWaiter)
+				if !terminalized && !bufferedDelivery {
+					s.waitingRuntime.markDisconnected(attachedWaiter)
+					s.recordDisconnectedCleanupAndWake(attachedWaiter, "final_cleanup")
+				}
+				shouldReleaseAttachedWaiter = terminalized || bufferedDelivery
 				return
 			}
 		case <-r.Context().Done():
+			terminalized := s.terminalizeAttachedWaiting(req, "final_cleanup", nil)
+			bufferedDelivery := s.waitingRuntime.hasBufferedDelivery(attachedWaiter)
+			if !terminalized && !bufferedDelivery {
+				s.waitingRuntime.markDisconnected(attachedWaiter)
+				s.recordDisconnectedCleanupAndWake(attachedWaiter, "final_cleanup")
+			}
+			shouldReleaseAttachedWaiter = terminalized || bufferedDelivery
 			return
 		}
 	}
@@ -1501,6 +1596,20 @@ func (s *Server) releaseAttachedWaiter(waiter *attachedWaiter, req AcquireReques
 		return
 	}
 	s.compensateGrantDelivery(context.Background(), strings.TrimSpace(req.RequestID), delivered, releaseReasonGrantDeliveryFailed, 0)
+}
+
+func (s *Server) recordDisconnectedCleanupAndWake(waiter *attachedWaiter, reason string) {
+	if s == nil || waiter == nil {
+		return
+	}
+	s.waitingRuntime.recordDisconnectedCleanup(waiter, reason)
+	hostnameHash := strings.TrimSpace(waiter.request.HostnameHash)
+	if hostnameHash == "" {
+		return
+	}
+	s.ensureHostReactor(hostnameHash)
+	s.runHostPass(context.Background(), hostnameHash)
+	s.wakeHostReactor(hostnameHash)
 }
 
 func (s *Server) writeAcquireResultWithCompensation(ctx context.Context, w http.ResponseWriter, req AcquireRequest, result *AcquireResult, compensationReason string) bool {
@@ -1555,6 +1664,41 @@ func (s *Server) writeWaitResultWithCompensation(ctx context.Context, w http.Res
 		return false
 	}
 	return true
+}
+
+func usesSQLBackedPromotion(backend Backend) bool {
+	if _, ok := backend.(sqlBackedPromotionMarker); ok {
+		return true
+	}
+	switch backend.(type) {
+	case *postgresBackend, *postgrestBackend:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) releaseWaitReservation(req AcquireRequest, consume bool) bool {
+	ctx, cancel := context.WithTimeout(s.serverOwnedContext(), releaseTimeout)
+	defer cancel()
+	return s.releaseWaitReservationWithContext(ctx, req, consume)
+}
+
+func (s *Server) releaseWaitReservationWithContext(ctx context.Context, req AcquireRequest, consume bool) bool {
+	releaser, ok := s.backend.(waitReservationReleaser)
+	if !ok || strings.TrimSpace(req.WaitToken) == "" || strings.TrimSpace(req.RequestID) == "" {
+		return false
+	}
+	result, err := releaser.ReleaseWaitReservation(ctx, ReleaseWaitReservationRequest{
+		RequestID: req.RequestID,
+		WaitToken: req.WaitToken,
+		NowMs:     time.Now().UnixMilli(),
+		Consume:   consume,
+	})
+	if err != nil || result == nil {
+		return false
+	}
+	return result.Result == "released" || (result.Result == "noop" && result.Reason == "already_terminal")
 }
 
 func writeSSEAccepted(w http.ResponseWriter, deadlineMs int64) error {
@@ -1717,67 +1861,8 @@ func (s *Server) wakeAttachedWaitersAsync() {
 	}()
 }
 
-func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if ok, code := s.checkAuth(r); !ok {
-		http.Error(w, http.StatusText(code), code)
-		return
-	}
-	if !s.isReady() {
-		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	var req CancelRequest
-	if err := decodeJSON(r, &req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-	if err := validateCancelRequest(req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	cancelCtx, cancel := context.WithTimeout(s.serverOwnedContext(), releaseTimeout)
-	defer cancel()
-	result, err := s.backend.Cancel(cancelCtx, req)
-	if err != nil {
-		var conflictErr *cancelConflictError
-		if errors.As(err, &conflictErr) {
-			writeCancelConflict(w, conflictErr.Reason)
-			return
-		}
-		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	if result == nil {
-		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	if result.Result == "cancelled" {
-		s.recordObservability(observabilityCancelled, "request_id="+strings.TrimSpace(req.RequestID))
-		s.clearActiveReplayState(req.RequestID)
-		if s.heartbeatRuntime != nil {
-			s.heartbeatRuntime.cancel(req.RequestID)
-		}
-		if snap := s.waitingRuntime.finishRequest(req.RequestID, nil); snap != nil && snap.WaitToken != "" {
-			s.waitingRuntime.deliver(snap.WaitToken, &AcquireResult{Result: "cancelled", Reason: "request_cancelled"})
-		}
-		s.ensureHostReactor(req.HostnameHash)
-		s.runHostPass(context.Background(), req.HostnameHash)
-		s.wakeHostReactor(req.HostnameHash)
-	}
-	s.deliverTerminalToAttachedWaiters(context.Background(), time.Now().UnixMilli())
-	writeJSON(w, http.StatusOK, result)
-}
-
 func (s *Server) tryPromoteWaiter(ctx context.Context, waiter *attachedWaiter, nowMs int64) *AcquireResult {
 	if waiter == nil {
-		return nil
-	}
-	promoter, ok := s.backend.(continueWaitPromoter)
-	if !ok {
 		return nil
 	}
 	waiterSnap, ok := s.waitingRuntime.snapshotAttachedRequest(waiter)
@@ -1785,14 +1870,23 @@ func (s *Server) tryPromoteWaiter(ctx context.Context, waiter *attachedWaiter, n
 		return nil
 	}
 	req := waiterSnap.Request
-	result, err := promoter.PromoteWaiting(ctx, PromoteWaitingRequest{
+	promoteReq := PromoteWaitingRequest{
 		RequestID:      req.RequestID,
 		HostnameHash:   req.HostnameHash,
 		SiteBucket:     req.SiteBucket,
 		IPBucket:       req.IPBucket,
 		HardExpireAtMs: req.HardExpireAtMs,
 		NowMs:          nowMs,
-	})
+	}
+	var result *AcquireResult
+	var err error
+	if attachedPromoter, ok := s.backend.(attachedWaitingPromoter); ok {
+		result, err = attachedPromoter.PromoteAttachedWaiting(ctx, promoteReq)
+	} else if promoter, ok := s.backend.(waitingPromoter); ok {
+		result, err = promoter.PromoteWaiting(ctx, promoteReq)
+	} else {
+		return nil
+	}
 	if err != nil || result == nil {
 		return nil
 	}
@@ -1953,52 +2047,144 @@ func (s *Server) runHostPass(ctx context.Context, hostnameHash string) {
 	if hostnameHash == "" {
 		return
 	}
-	nowMs := time.Now().UnixMilli()
-	s.processDueWaitingRequests(ctx, hostnameHash, nowMs)
-	promoter, ok := s.backend.(continueWaitPromoter)
-	if !ok {
+	if err := ctx.Err(); err != nil {
 		return
 	}
-	headers := s.waitingRuntime.grantEligibleHeads(hostnameHash, nowMs)
-	blockedSites := make(map[string]struct{})
-	for _, head := range headers {
-		if _, blocked := blockedSites[head.SiteBucket]; blocked {
-			continue
-		}
-		result, err := promoter.PromoteWaiting(ctx, PromoteWaitingRequest{
-			RequestID:      head.RequestID,
-			HostnameHash:   head.HostnameHash,
-			SiteBucket:     head.SiteBucket,
-			IPBucket:       head.IPBucket,
-			HardExpireAtMs: head.HardExpireAtMs,
-			NowMs:          nowMs,
-		})
-		if err != nil || result == nil {
-			continue
-		}
-		if result.Result == "wait" {
+	for {
+		nowMs := time.Now().UnixMilli()
+		s.processDisconnectedWaiterCleanups(ctx, hostnameHash, nowMs)
+		s.processDueWaitingRequests(ctx, hostnameHash, nowMs)
+		headers := s.waitingRuntime.grantEligibleHeads(hostnameHash, nowMs)
+		blockedSites := make(map[string]struct{})
+		hostCleanupProgress := false
+	headerLoop:
+		for _, head := range headers {
+			if _, blocked := blockedSites[head.SiteBucket]; blocked {
+				continue
+			}
+			promoteReq := PromoteWaitingRequest{
+				RequestID:      head.RequestID,
+				HostnameHash:   head.HostnameHash,
+				SiteBucket:     head.SiteBucket,
+				IPBucket:       head.IPBucket,
+				HardExpireAtMs: head.HardExpireAtMs,
+				NowMs:          nowMs,
+			}
+			var result *AcquireResult
+			var err error
+			if attachedPromoter, ok := s.backend.(attachedWaitingPromoter); ok {
+				result, err = attachedPromoter.PromoteAttachedWaiting(ctx, promoteReq)
+			} else if promoter, ok := s.backend.(waitingPromoter); ok {
+				result, err = promoter.PromoteWaiting(ctx, promoteReq)
+			} else {
+				return
+			}
+			if err != nil || result == nil {
+				continue
+			}
+			if result.Result == "wait" {
+				switch result.Scope {
+				case "host":
+					s.recordObservability(observabilityDenyHost, "request_id="+head.RequestID)
+				case "site":
+					s.recordObservability(observabilityDenySite, "request_id="+head.RequestID)
+				case "site_ip":
+					s.recordObservability(observabilityDenySiteIP, "request_id="+head.RequestID)
+				}
+			}
+			s.handleHostPassResult(head, result)
+			if result.Result != "wait" {
+				continue
+			}
 			switch result.Scope {
-			case "host":
-				s.recordObservability(observabilityDenyHost, "request_id="+head.RequestID)
-			case "site":
-				s.recordObservability(observabilityDenySite, "request_id="+head.RequestID)
 			case "site_ip":
-				s.recordObservability(observabilityDenySiteIP, "request_id="+head.RequestID)
+				continue
+			case "site":
+				blockedSites[head.SiteBucket] = struct{}{}
+			case "host":
+				progress, err := s.runHostCleanupPass(ctx, hostnameHash, nowMs)
+				if err != nil || !progress {
+					return
+				}
+				hostCleanupProgress = true
+				break headerLoop
 			}
 		}
-		s.handleHostPassResult(head, result)
-		if result.Result != "wait" {
-			continue
-		}
-		switch result.Scope {
-		case "site_ip":
-			continue
-		case "site":
-			blockedSites[head.SiteBucket] = struct{}{}
-		case "host":
+		if !hostCleanupProgress {
 			return
 		}
 	}
+}
+
+func (s *Server) processDisconnectedWaiterCleanups(_ context.Context, hostnameHash string, nowMs int64) {
+	if s == nil {
+		return
+	}
+	for _, candidate := range s.waitingRuntime.disconnectedCleanupCandidates(hostnameHash) {
+		cleanupCtx, cancel := context.WithTimeout(s.serverOwnedContext(), releaseTimeout)
+		finalResult := terminalResultForCleanupReason(candidate.Reason)
+		terminalized := false
+		if candidate.ReleaseReservation {
+			terminalized = s.releaseWaitReservationWithContext(cleanupCtx, acquireRequestFromSnapshot(candidate.Request), true)
+		} else {
+			result, err := s.backend.TerminalizeWaiting(cleanupCtx, TerminalizeWaitingRequest{
+				RequestID:      candidate.Request.RequestID,
+				Hostname:       candidate.Request.Hostname,
+				HostnameHash:   candidate.Request.HostnameHash,
+				SiteBucket:     candidate.Request.SiteBucket,
+				IPBucket:       candidate.Request.IPBucket,
+				HardExpireAtMs: candidate.Request.HardExpireAtMs,
+				Reason:         candidate.Reason,
+				NowMs:          nowMs,
+			})
+			terminalized = err == nil && terminalizeWaitingResultCompatibleWithFinal(result, finalResult)
+		}
+		cancel()
+		if !terminalized {
+			continue
+		}
+		s.waitingRuntime.finishRequest(candidate.Request.RequestID, finalResult)
+		s.clearActiveReplayState(candidate.Request.RequestID)
+	}
+}
+
+func acquireRequestFromSnapshot(snap requestSnapshot) AcquireRequest {
+	return AcquireRequest{
+		Hostname:       snap.Hostname,
+		HostnameHash:   snap.HostnameHash,
+		SiteBucket:     snap.SiteBucket,
+		IPBucket:       snap.IPBucket,
+		RequestID:      snap.RequestID,
+		HardExpireAtMs: snap.HardExpireAtMs,
+		DeadlineMs:     requestDeadlineMs(&snap),
+		WaitToken:      snap.WaitToken,
+	}
+}
+
+func (s *Server) runHostCleanupPass(ctx context.Context, hostnameHash string, nowMs int64) (bool, error) {
+	if hostnameHash == "" {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	result, err := s.backend.ExpireScope(ctx, ExpireScopeRequest{
+		Scope:        "host",
+		HostnameHash: hostnameHash,
+		NowMs:        nowMs,
+		Limit:        s.cfg.Concurrency.Sweep.BatchSize,
+	})
+	if err != nil {
+		return false, err
+	}
+	if result == nil || result.ExpiredCount <= 0 {
+		return false, nil
+	}
+	for _, requestID := range result.ExpiredRequestIDs {
+		s.recordObservability(observabilityExpiredHard, "request_id="+strings.TrimSpace(requestID))
+		s.clearActiveReplayState(requestID)
+	}
+	return true, nil
 }
 
 func (s *Server) processDueWaitingRequests(ctx context.Context, hostnameHash string, nowMs int64) {
@@ -2067,6 +2253,7 @@ func (s *Server) probeAttachedWaiter(ctx context.Context, waiter *attachedWaiter
 }
 
 func (s *Server) probeAttachedWaiterSnapshot(ctx context.Context, waiterSnap attachedWaiterSnapshot, nowMs int64) (*AcquireResult, error) {
+	attachedProber, hasAttachedProber := s.backend.(attachedWaitStateProber)
 	prober, ok := s.backend.(waitStateProber)
 	if !ok {
 		return nil, nil
@@ -2077,7 +2264,7 @@ func (s *Server) probeAttachedWaiterSnapshot(ctx context.Context, waiterSnap att
 			deadlineMs = requestDeadlineMs(snap)
 		}
 	}
-	return prober.ProbeWaitState(ctx, AcquireRequest{
+	req := AcquireRequest{
 		Hostname:       waiterSnap.Request.Hostname,
 		HostnameHash:   waiterSnap.Request.HostnameHash,
 		SiteBucket:     waiterSnap.Request.SiteBucket,
@@ -2087,7 +2274,11 @@ func (s *Server) probeAttachedWaiterSnapshot(ctx context.Context, waiterSnap att
 		DeadlineMs:     deadlineMs,
 		NowMs:          nowMs,
 		WaitToken:      waiterSnap.WaitToken,
-	})
+	}
+	if hasAttachedProber {
+		return attachedProber.ProbeAttachedWaitState(ctx, req)
+	}
+	return prober.ProbeWaitState(ctx, req)
 }
 
 func (s *Server) compensateGrantDelivery(ctx context.Context, requestID string, result *AcquireResult, reason string, nowMs int64) {
@@ -2097,7 +2288,9 @@ func (s *Server) compensateGrantDelivery(ctx context.Context, requestID string, 
 	if nowMs <= 0 {
 		nowMs = time.Now().UnixMilli()
 	}
-	_, _ = s.backend.Release(ctx, ReleaseRequest{LeaseID: result.LeaseID, LeaseToken: result.LeaseToken, Reason: reason, NowMs: nowMs})
+	releaseCtx, cancel := context.WithTimeout(s.serverOwnedContext(), releaseTimeout)
+	defer cancel()
+	_, _ = s.backend.Release(releaseCtx, ReleaseRequest{LeaseID: result.LeaseID, LeaseToken: result.LeaseToken, Reason: reason, NowMs: nowMs})
 	if reason == releaseReasonAcquireDeliveryFailed {
 		s.recordObservability(observabilityAcquireDeliveryFailed, "request_id="+strings.TrimSpace(requestID))
 	} else {
@@ -2106,31 +2299,73 @@ func (s *Server) compensateGrantDelivery(ctx context.Context, requestID string, 
 	s.clearActiveReplayState(requestID)
 }
 
-func (s *Server) newAttachedWaiterDeadlineTimer(req AcquireRequest, pollWindow time.Duration) (*time.Timer, <-chan time.Time) {
-	deadlineMs := s.nextAttachedWaiterDeadlineMs(req)
-	if deadlineMs <= 0 {
-		return nil, nil
+func (s *Server) terminalizeAttachedWaiting(req AcquireRequest, terminalReason string, finalResult *AcquireResult) bool {
+	if s == nil {
+		return false
 	}
-	nowMs := time.Now().UnixMilli()
-	pollDeadlineMs := nowMs + pollWindow.Milliseconds()
-	if deadlineMs > pollDeadlineMs {
-		return nil, nil
+	terminalReason = strings.TrimSpace(terminalReason)
+	if terminalReason == "" {
+		terminalReason = "final_cleanup"
 	}
-	delay := time.Duration(deadlineMs-nowMs) * time.Millisecond
-	if delay < 0 {
-		delay = 0
+	requestID := strings.TrimSpace(req.RequestID)
+	cleanupConfirmed := requestID == ""
+	if requestID != "" {
+		ctx, cancel := context.WithTimeout(s.serverOwnedContext(), releaseTimeout)
+		defer cancel()
+		result, err := s.backend.TerminalizeWaiting(ctx, TerminalizeWaitingRequest{
+			RequestID:      requestID,
+			Hostname:       req.Hostname,
+			HostnameHash:   req.HostnameHash,
+			SiteBucket:     req.SiteBucket,
+			IPBucket:       req.IPBucket,
+			HardExpireAtMs: req.HardExpireAtMs,
+			Reason:         terminalReason,
+			NowMs:          time.Now().UnixMilli(),
+		})
+		switch {
+		case err != nil || result == nil:
+			return false
+		case terminalizeWaitingResultCompatibleWithFinal(result, finalResult):
+			cleanupConfirmed = true
+		default:
+			return false
+		}
+		if cleanupConfirmed {
+			s.clearActiveReplayState(requestID)
+		}
 	}
-	timer := time.NewTimer(delay)
-	return timer, timer.C
+	if !cleanupConfirmed {
+		return false
+	}
+	if requestID != "" {
+		s.waitingRuntime.finishRequest(requestID, finalResult)
+	} else {
+		s.waitingRuntime.finishByWaitToken(req.WaitToken, finalResult)
+	}
+	hostnameHash := strings.TrimSpace(req.HostnameHash)
+	if hostnameHash != "" {
+		s.ensureHostReactor(hostnameHash)
+		s.runHostPass(context.Background(), hostnameHash)
+		s.wakeHostReactor(hostnameHash)
+	}
+	return true
 }
 
-func (s *Server) nextAttachedWaiterDeadlineMs(req AcquireRequest) int64 {
-	deadlineMs := req.HardExpireAtMs
-	waiterLeaseUntilMs := req.NowMs + int64(s.cfg.Concurrency.Wait.MaxStreamMs)
-	if waiterLeaseUntilMs > 0 && (deadlineMs <= 0 || waiterLeaseUntilMs < deadlineMs) {
-		deadlineMs = waiterLeaseUntilMs
+func terminalizeWaitingResultCompatibleWithFinal(result *TerminalizeWaitingResult, finalResult *AcquireResult) bool {
+	if result == nil {
+		return false
 	}
-	return deadlineMs
+	if finalResult != nil && finalResult.Result == "expired" && finalResult.Reason == "wait_stream_timeout" {
+		return result.Result == "expired" && result.Reason == "wait_stream_timeout"
+	}
+	return result.Result == "released" || (result.Result == "noop" && result.Reason == "already_terminal")
+}
+
+func terminalResultForCleanupReason(reason string) *AcquireResult {
+	if strings.TrimSpace(reason) == "wait_stream_timeout" {
+		return &AcquireResult{Result: "expired", Reason: "wait_stream_timeout"}
+	}
+	return nil
 }
 
 func consumeWaiterDelivery(waiter *attachedWaiter) *AcquireResult {

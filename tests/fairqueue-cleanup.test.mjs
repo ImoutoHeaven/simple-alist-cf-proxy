@@ -379,7 +379,7 @@ test('slowFailDelay is bypassed under node test runner', async () => {
   assert.ok(elapsedMs < 100, `expected node test slowFailDelay bypass, got ${elapsedMs}ms`);
 });
 
-test('slot-handler client sends abandon with queryToken invocationEpoch and auth header', async () => {
+test('slot-handler client exposes no pre-grant worker cleanup method', async () => {
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
       url: 'https://slot-handler.example.com',
@@ -387,32 +387,10 @@ test('slot-handler client sends abandon with queryToken invocationEpoch and auth
       authHeader: 'X-FQ-Auth',
     },
   });
-  const fqContext = { queryToken: 'query-1', invocationEpoch: 7 };
-  let seenUrl = null;
-  let seenBody = null;
-  let seenAuthHeader = null;
-
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init) => {
-    seenUrl = String(url);
-    seenBody = JSON.parse(init.body);
-    seenAuthHeader = new Headers(init.headers).get('X-FQ-Auth');
-    return new Response(null, { status: 204 });
-  };
-
-  try {
-    const ok = await client.abandonWait({}, fqContext);
-    assert.equal(ok, true);
-    assert.match(seenUrl, /\/api\/v1\/fairqueue\/abandon$/);
-    assert.equal(seenAuthHeader, 'secret');
-    assert.deepEqual(seenBody, { queryToken: 'query-1', invocationEpoch: 7 });
-    assert.equal(Object.hasOwn(seenBody, 'cleanupRetired'), false);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  assert.equal(typeof client.abandonWait, 'undefined');
 });
 
-test('slot-handler client abandon noops once slotToken exists', async () => {
+test('slot-handler client release remains the only public cleanup method', async () => {
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
       url: 'https://slot-handler.example.com',
@@ -421,23 +399,8 @@ test('slot-handler client abandon noops once slotToken exists', async () => {
     },
   });
 
-  let fetchCalls = 0;
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
-    fetchCalls += 1;
-    return new Response(null, { status: 204 });
-  };
-
-  try {
-    const ok = await client.abandonWait({}, {
-      queryToken: 'query-1',
-      slotToken: 'slot-1',
-    });
-    assert.equal(ok, true);
-    assert.equal(fetchCalls, 0);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  assert.equal(typeof client.releaseSlot, 'function');
+  assert.equal(typeof client.waitForSlot, 'function');
 });
 
 test('slot-handler client sends claimed release with full release identity and owner routing headers', async () => {
@@ -550,7 +513,7 @@ test('slot-handler client sends direct release with full release identity but no
   }
 });
 
-test('slot-handler client abandon skips without valid invocationEpoch', async () => {
+test('slot-handler client preserves granted false release ownership into direct release cleanup', async () => {
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
       url: 'https://slot-handler.example.com',
@@ -558,29 +521,67 @@ test('slot-handler client abandon skips without valid invocationEpoch', async ()
       authHeader: 'X-FQ-Auth',
     },
   });
+  const fqContext = {
+    hostname: 'tenant.sharepoint.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+  };
 
-  let fetchCalls = 0;
+  let seenGrantReleaseOwnerRequired = null;
+  let seenReleaseBody = null;
+  let seenOwnerTokenHeader = null;
+  let seenOwnerEpochHeader = null;
+
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
-    fetchCalls += 1;
-    return new Response(null, { status: 204 });
+  globalThis.fetch = async (url, init = {}) => {
+    const requestUrl = String(url);
+    if (requestUrl.endsWith('/api/v1/fairqueue/wait')) {
+      return createFairQueueWaitSseResponse({
+        result: 'granted',
+        queryToken: 'query-granted-direct-release',
+        invocationEpoch: 22,
+        slotToken: 'slot-granted-direct-release',
+        releaseOwnerRequired: false,
+      });
+    }
+
+    if (requestUrl.endsWith('/api/v1/fairqueue/release')) {
+      seenReleaseBody = JSON.parse(init.body);
+      const headers = new Headers(init.headers);
+      seenOwnerTokenHeader = headers.get('X-FQ-Owner-Token');
+      seenOwnerEpochHeader = headers.get('X-FQ-Owner-Epoch');
+      return new Response(null, { status: 204 });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${requestUrl}`);
   };
 
   try {
-    const missingEpoch = await client.abandonWait({}, { queryToken: 'query-1' });
-    const zeroEpoch = await client.abandonWait({}, { queryToken: 'query-2', invocationEpoch: 0 });
-    assert.equal(missingEpoch, true);
-    assert.equal(zeroEpoch, true);
-    assert.equal(fetchCalls, 0);
+    const granted = await client.waitForSlot({}, fqContext);
+    seenGrantReleaseOwnerRequired = fqContext.releaseOwnerRequired;
+    assert.equal(granted.kind, 'granted');
+    assert.equal(seenGrantReleaseOwnerRequired, false);
+
+    const released = await client.releaseSlot({}, {
+      ...fqContext,
+      slotToken: 'slot-granted-direct-release',
+      queryToken: 'query-granted-direct-release',
+      invocationEpoch: 22,
+    });
+
+    assert.equal(released, true);
+    assert.equal(seenReleaseBody.releaseOwnerRequired, false);
+    assert.equal(seenOwnerTokenHeader, null);
+    assert.equal(seenOwnerEpochHeader, null);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test('terminal timeout result does not emit abandon after accepted tuple', async () => {
+test('terminal timeout result relies on server-owned waiter cleanup after accepted tuple', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
-  const abandonBodies = [];
   const releaseBodies = [];
   delete globalThis.bootstrapCache;
 
@@ -614,11 +615,6 @@ test('terminal timeout result does not emit abandon after accepted tuple', async
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/abandon') {
-      abandonBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'ok' });
-    }
-
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       releaseBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'ok' });
@@ -637,7 +633,6 @@ test('terminal timeout result does not emit abandon after accepted tuple', async
     await Promise.allSettled(waitUntilPromises);
 
     assert.equal(response.status, 503);
-    assert.deepEqual(abandonBodies, []);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -645,12 +640,10 @@ test('terminal timeout result does not emit abandon after accepted tuple', async
   }
 });
 
-test('timeout early-return does not emit abandon after terminal SSE result', async () => {
+test('timeout early-return keeps cleanup on the server-owned terminal path', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
-  const abandonBodies = [];
   const releaseBodies = [];
-  let abandonCalls = 0;
   delete globalThis.bootstrapCache;
 
   globalThis.fetch = async (input, init = {}) => {
@@ -683,12 +676,6 @@ test('timeout early-return does not emit abandon after terminal SSE result', asy
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/abandon') {
-      abandonCalls += 1;
-      abandonBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'ok' });
-    }
-
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       releaseBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'ok' });
@@ -708,8 +695,6 @@ test('timeout early-return does not emit abandon after terminal SSE result', asy
     await waitForNextTurn();
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(abandonCalls, 0);
-    assert.deepEqual(abandonBodies, []);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -717,14 +702,10 @@ test('timeout early-return does not emit abandon after terminal SSE result', asy
   }
 });
 
-test('timeout early-return does not schedule retry cleanup after terminal SSE result', async () => {
+test('timeout early-return does not schedule worker cleanup after terminal SSE result', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
-  const abandonBodies = [];
   const releaseBodies = [];
-  let abandonCalls = 0;
-  let activeAbandonCalls = 0;
-  let maxActiveAbandonCalls = 0;
   delete globalThis.bootstrapCache;
 
   globalThis.fetch = async (input, init = {}) => {
@@ -757,18 +738,6 @@ test('timeout early-return does not schedule retry cleanup after terminal SSE re
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/abandon') {
-      abandonCalls += 1;
-      activeAbandonCalls += 1;
-      maxActiveAbandonCalls = Math.max(maxActiveAbandonCalls, activeAbandonCalls);
-      abandonBodies.push(JSON.parse(init.body));
-      try {
-        return createJsonResponse({ result: 'ok' });
-      } finally {
-        activeAbandonCalls -= 1;
-      }
-    }
-
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       releaseBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'ok' });
@@ -788,9 +757,6 @@ test('timeout early-return does not schedule retry cleanup after terminal SSE re
     await waitForNextTurn();
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(abandonCalls, 0);
-    assert.equal(maxActiveAbandonCalls, 0);
-    assert.deepEqual(abandonBodies, []);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -798,11 +764,10 @@ test('timeout early-return does not schedule retry cleanup after terminal SSE re
   }
 });
 
-test('client abort before grant uses abandon cleanup', async () => {
+test('client abort before grant relies on terminal SSE disconnect cleanup', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const waitBodies = [];
-  const abandonBodies = [];
   const releaseBodies = [];
   delete globalThis.bootstrapCache;
 
@@ -837,11 +802,6 @@ test('client abort before grant uses abandon cleanup', async () => {
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/abandon') {
-      abandonBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'ok' });
-    }
-
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       releaseBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'ok' });
@@ -863,7 +823,6 @@ test('client abort before grant uses abandon cleanup', async () => {
 
     assert.equal(waitBodies.length, 1);
     assert.equal(response.status, 499);
-    assert.deepEqual(abandonBodies, [{ queryToken: 'fq-q1', invocationEpoch: 1 }]);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -871,10 +830,9 @@ test('client abort before grant uses abandon cleanup', async () => {
   }
 });
 
-test('throttled terminal handling clears ownership tuple without issuing abandon', async () => {
+test('throttled terminal handling clears ownership tuple on the terminal cleanup path', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
-  const abandonBodies = [];
   const releaseBodies = [];
   delete globalThis.bootstrapCache;
 
@@ -910,11 +868,6 @@ test('throttled terminal handling clears ownership tuple without issuing abandon
       });
     }
 
-    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/abandon') {
-      abandonBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'ok' });
-    }
-
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       releaseBodies.push(JSON.parse(init.body));
       return createJsonResponse({ result: 'ok' });
@@ -933,7 +886,6 @@ test('throttled terminal handling clears ownership tuple without issuing abandon
     await Promise.allSettled(waitUntilPromises);
 
     assert.equal(response.status, 503);
-    assert.deepEqual(abandonBodies, []);
     assert.deepEqual(releaseBodies, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -941,42 +893,37 @@ test('throttled terminal handling clears ownership tuple without issuing abandon
   }
 });
 
-test('reconcile retires pre-grant context through abandon', async () => {
+test('reconcile retires pre-grant context without worker cleanup calls', async () => {
   assert.equal(
     typeof __fairQueueTestHooks.reconcileFairQueueContextForTarget,
     'function',
-    'reconcile cleanup helper missing: pre-grant abandon routing is not implemented yet',
+    'reconcile cleanup helper missing',
   );
 
   const cleanupCalls = [];
+  const fqContext = {
+    hostname: 'a.sharepoint.com',
+    hostnameHash: 'hash-a',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-a',
+    queryToken: 'query-pre-grant',
+    invocationEpoch: 3,
+  };
   await __fairQueueTestHooks.reconcileFairQueueContextForTarget({
     fairQueueClient: {
       async releaseSlot(_ctx, contextToRelease) {
         cleanupCalls.push({ kind: 'release', token: contextToRelease.slotToken });
         return true;
       },
-      async abandonWait(_ctx, contextToAbandon) {
-        cleanupCalls.push({
-          kind: 'abandon',
-          token: contextToAbandon.queryToken,
-          invocationEpoch: contextToAbandon.invocationEpoch,
-        });
-        return true;
-      },
     },
-    fqContext: {
-      hostname: 'a.sharepoint.com',
-      hostnameHash: 'hash-a',
-      ipBucket: 'ip-bucket',
-      siteBucket: 'site-a',
-      queryToken: 'query-pre-grant',
-      invocationEpoch: 3,
-    },
+    fqContext,
     targetUrl: 'https://b.sharepoint.com/final',
     phase: 'redirect',
   });
 
-  assert.deepEqual(cleanupCalls, [{ kind: 'abandon', token: 'query-pre-grant', invocationEpoch: 3 }]);
+  assert.deepEqual(cleanupCalls, []);
+  assert.equal(fqContext.queryToken, null);
+  assert.equal(fqContext.invocationEpoch, null);
 });
 
 test('finalizer prefers release when slotToken exists', async () => {
@@ -991,10 +938,6 @@ test('finalizer prefers release when slotToken exists', async () => {
     fairQueueClient: {
       async releaseSlot(_ctx, contextToRelease) {
         cleanupCalls.push({ kind: 'release', token: contextToRelease.slotToken });
-        return true;
-      },
-      async abandonWait(_ctx, contextToAbandon) {
-        cleanupCalls.push({ kind: 'abandon', token: contextToAbandon.queryToken });
         return true;
       },
     },
@@ -1013,7 +956,7 @@ test('finalizer prefers release when slotToken exists', async () => {
   assert.deepEqual(cleanupCalls, [{ kind: 'release', token: 'slot-1' }]);
 });
 
-test('grant promotion suppresses abandon during abort/final cleanup race', async () => {
+test('grant promotion keeps final cleanup on release-only path', async () => {
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
       url: 'https://slot-handler.example.com',
@@ -1102,14 +1045,6 @@ test('grant promotion suppresses abandon during abort/final cleanup race', async
         });
         return true;
       },
-      async abandonWait(_ctx, contextToAbandon) {
-        cleanupCalls.push({
-          kind: 'abandon',
-          queryToken: contextToAbandon.queryToken,
-          grantPromoted: contextToAbandon.grantPromoted,
-        });
-        return true;
-      },
     },
     fqContext: promotedContext,
     phase: 'final cleanup',
@@ -1124,14 +1059,6 @@ test('grant promotion suppresses abandon during abort/final cleanup race', async
           slotToken: contextToRelease.slotToken,
           queryToken: contextToRelease.queryToken,
           grantPromoted: contextToRelease.grantPromoted,
-        });
-        return true;
-      },
-      async abandonWait(_ctx, contextToAbandon) {
-        cleanupCalls.push({
-          kind: 'abandon',
-          queryToken: contextToAbandon.queryToken,
-          grantPromoted: contextToAbandon.grantPromoted,
         });
         return true;
       },
@@ -1171,9 +1098,6 @@ test('successful release clears slotToken queryToken and attempt metadata', asyn
       async releaseSlot() {
         return true;
       },
-      async abandonWait() {
-        throw new Error('release cleanup should not abandon');
-      },
     },
     fqContext,
     phase: 'release cleanup',
@@ -1188,7 +1112,7 @@ test('successful release clears slotToken queryToken and attempt metadata', asyn
   assert.equal(fqContext.slotAcquiredAt, null);
 });
 
-test('successful abandon clears queryToken and pre-grant queue metadata', async () => {
+test('successful pre-grant terminal cleanup clears queryToken and pre-grant queue metadata', async () => {
   const fqContext = {
     hostname: 'tenant.sharepoint.com',
     hostnameHash: 'host-hash',
@@ -1207,12 +1131,9 @@ test('successful abandon clears queryToken and pre-grant queue metadata', async 
       async releaseSlot() {
         throw new Error('pre-grant cleanup should not release');
       },
-      async abandonWait() {
-        return true;
-      },
     },
     fqContext,
-    phase: 'abandon cleanup',
+    phase: 'terminal cleanup',
   });
 
   assert.equal(finalized, true);
@@ -1225,7 +1146,7 @@ test('successful abandon clears queryToken and pre-grant queue metadata', async 
   assert.equal(fqContext.deferredReportStatusCode, null);
 });
 
-test('late cleanup keeps stale and newer abandon identities distinct by invocationEpoch', () => {
+test('late cleanup batches pre-grant contexts by host without synthesizing release ownership', () => {
   const cleanupGroups = __fairQueueTestHooks.buildFinalCleanupGroups([
     {
       hostname: 'tenant-a.sharepoint.com',
@@ -1241,17 +1162,27 @@ test('late cleanup keeps stale and newer abandon identities distinct by invocati
     },
   ]);
 
-  assert.deepEqual(
-    cleanupGroups.flat().map((context) => `${context.queryToken}:${context.invocationEpoch}`),
-    ['query-shared:1', 'query-shared:2'],
-  );
+  assert.deepEqual(cleanupGroups, [[
+    {
+      hostname: 'tenant-a.sharepoint.com',
+      hostnameHash: 'host-a',
+      queryToken: 'query-shared',
+      invocationEpoch: 1,
+    },
+    {
+      hostname: 'tenant-a.sharepoint.com',
+      hostnameHash: 'host-a',
+      queryToken: 'query-shared',
+      invocationEpoch: 2,
+    },
+  ]]);
 });
 
-test('final cleanup dedupes release and abandon identities independently', () => {
+test('final cleanup dedupes release identities and skips pre-grant contexts', () => {
   assert.equal(
     typeof __fairQueueTestHooks.buildFinalCleanupGroups,
     'function',
-    'mixed cleanup dedupe helper missing: release/abandon grouping is not implemented yet',
+    'final cleanup grouping helper missing',
   );
 
   const cleanupGroups = __fairQueueTestHooks.buildFinalCleanupGroups([
@@ -1292,6 +1223,6 @@ test('final cleanup dedupes release and abandon identities independently', () =>
 
   assert.deepEqual(
     cleanupGroups.flat().map((context) => context.slotToken || context.queryToken),
-    ['slot-dup', 'query-dup', 'slot-b', 'query-b'],
+    ['slot-dup', 'slot-b'],
   );
 });

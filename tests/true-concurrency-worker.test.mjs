@@ -6,7 +6,8 @@ import { sha256Hash } from '../src/utils.js';
 
 const {
   buildFinalCleanupGroups,
-  clearOverloadedByHost,
+  clearFairQueueOverloadState,
+  createConcurrencyHandlerClient,
   createConcurrencyReleaseController,
   createSlotHandlerClient,
   createTrueConcurrencyHeartbeatManager,
@@ -743,6 +744,32 @@ const fetchWithDefaultAckHandoff = async (input, init = {}) => {
   }
   return delegatedFetch(input, init);
 };
+
+const buildTrueConcurrencyClientTestPlan = (overrides = {}) => ({
+  hostname: 'tenant.sharepoint.com',
+  hostnameHash: 'host-hash-cq-test',
+  siteBucket: 'site-cq-test',
+  ipBucket: 'ip-cq-test',
+  requestId: 'req-cq-test',
+  hardExpireAtMs: Date.now() + 60_000,
+  nowMs: Date.now(),
+  waitToken: 'wait-cq-test',
+  deadlineMs: Date.now() + 30_000,
+  ticketHash: 'ticket-cq-test',
+  clientInstanceId: 'worker-cq-test',
+  ...overrides,
+});
+
+const createTrueConcurrencyClientForTest = () => createConcurrencyHandlerClient({
+  concurrencyHandlerConfig: {
+    url: 'https://cq.example.test',
+    authKey: 'cq-secret',
+    authHeader: 'X-CQ-Auth',
+    acquireTimeoutMs: 1_000,
+    releaseTimeoutMs: 1_000,
+    heartbeat: DEFAULT_TRUE_CONCURRENCY_HEARTBEAT,
+  },
+});
 
 Object.defineProperty(globalThis, 'fetch', {
   configurable: true,
@@ -2924,12 +2951,6 @@ test('breaker_only with true concurrency does not authorize or settle before acq
       }]);
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      cancelBody = JSON.parse(init.body);
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://tenant.sharepoint.com/file') {
       throw new Error('origin fetch should not run after acquire failure');
     }
@@ -2944,17 +2965,144 @@ test('breaker_only with true concurrency does not authorize or settle before acq
     await Promise.allSettled(waitUntilPromises);
     assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
-    assert.deepEqual(calls, [
-      'concurrency-acquire-fast',
-      'concurrency-cancel',
-    ]);
+    assert.deepEqual(calls, ['concurrency-acquire-fast']);
     assert.equal(settleBodies.length, 0);
-    assert.equal(cancelBody?.requestId, acquireBody?.requestId);
-    assert.equal(cancelBody?.hostname, acquireBody?.hostname);
   } finally {
     globalThis.fetch = originalFetch;
     crypto.randomUUID = originalRandomUUID;
     delete globalThis.bootstrapCache;
+  }
+});
+
+test('CQ client accepts wait_stream_timeout expired results across acquire, wait, and claim', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const plan = buildTrueConcurrencyClientTestPlan();
+  const client = createTrueConcurrencyClientForTest();
+
+  globalThis.fetch = async (input) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+    calls.push(url);
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      return createJsonResponse({ result: 'expired', reason: 'wait_stream_timeout' }, { status: 410 });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      return createTrueConcurrencyWaitSseResponse(
+        { result: 'expired', reason: 'wait_stream_timeout' },
+        { acceptedDeadlineMs: plan.deadlineMs },
+      );
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createJsonResponse({ result: 'expired', reason: 'wait_stream_timeout' }, { status: 410 });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    assert.deepEqual(await client.acquire(null, { ...plan, waitToken: undefined }), {
+      result: 'expired',
+      reason: 'wait_stream_timeout',
+    });
+
+    assert.deepEqual(await client.wait(null, plan, undefined), {
+      accepted: { deadlineMs: plan.deadlineMs },
+      final: {
+        result: 'expired',
+        reason: 'wait_stream_timeout',
+      },
+    });
+
+    assert.deepEqual(await client.claim(null, {
+      requestId: plan.requestId,
+      claimToken: 'claim-cq-test',
+      nowMs: Date.now(),
+      hardExpireAtMs: plan.hardExpireAtMs,
+    }), {
+      result: 'expired',
+      reason: 'wait_stream_timeout',
+    });
+
+    assert.deepEqual(calls, [
+      'https://cq.example.test/api/v1/concurrency/acquire',
+      'https://cq.example.test/api/v1/concurrency/wait',
+      'https://cq.example.test/api/v1/concurrency/claim',
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('CQ client rejects 200 non-SSE wait responses before claim normalization', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const plan = buildTrueConcurrencyClientTestPlan();
+  const client = createTrueConcurrencyClientForTest();
+
+  globalThis.fetch = async (input) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+    calls.push(url);
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-json',
+        leaseToken: 'token-json',
+        expiresAtMs: plan.hardExpireAtMs,
+        claimToken: 'claim-json',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      throw new Error('claim should not run after invalid CQ wait response');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    await assert.rejects(
+      () => client.wait(null, plan, undefined),
+      /CQ wait.*text\/event-stream/i,
+    );
+
+    assert.deepEqual(calls, ['https://cq.example.test/api/v1/concurrency/wait']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('CQ client preserves non-200 JSON wait setup failure handling', async () => {
+  const originalFetch = globalThis.fetch;
+  const plan = buildTrueConcurrencyClientTestPlan();
+  const client = createTrueConcurrencyClientForTest();
+
+  globalThis.fetch = async (input) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      return createJsonResponse(
+        { result: 'conflict', reason: 'request_id_tuple_mismatch' },
+        { status: 409 },
+      );
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    assert.deepEqual(await client.wait(null, plan, undefined), {
+      accepted: null,
+      final: {
+        result: 'conflict',
+        reason: 'request_id_tuple_mismatch',
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -3179,7 +3327,7 @@ test('queue_breaker dual mode settles breaker attempt when target expires before
   }
 });
 
-test('dual mode malformed concurrency acquire result fails closed after fairqueue release and best-effort cancel cleanup', async () => {
+test('dual mode malformed concurrency acquire result fails closed after fairqueue release on the server-owned wait path', async () => {
   const originalFetch = globalThis.fetch;
   const originalRandomUUID = crypto.randomUUID;
   const calls = [];
@@ -3220,13 +3368,6 @@ test('dual mode malformed concurrency acquire result fails closed after fairqueu
       return createJsonResponse({ result: 'allow' });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      const body = JSON.parse(init.body);
-      assert.equal(body.requestId, 'req-malformed-acquire-recovery');
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       calls.push('fairqueue-release');
       fairQueueReleaseBodies.push(JSON.parse(init.body));
@@ -3244,7 +3385,7 @@ test('dual mode malformed concurrency acquire result fails closed after fairqueu
     await Promise.allSettled(waitUntilPromises);
     assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
-    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release', 'concurrency-cancel']);
+    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
     assert.equal(fairQueueReleaseBodies.length, 1);
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
   } finally {
@@ -3254,12 +3395,11 @@ test('dual mode malformed concurrency acquire result fails closed after fairqueu
   }
 });
 
-test('true concurrency malformed acquire response still triggers best-effort cancel cleanup', async () => {
+test('true concurrency malformed acquire response stops before any server-owned wait path starts', async () => {
   const originalFetch = globalThis.fetch;
   const originalRandomUUID = crypto.randomUUID;
   const calls = [];
   let acquireBody = null;
-  let cancelBody = null;
 
   crypto.randomUUID = () => 'req-ambiguous-acquire-1';
   globalThis.fetch = async (input, init = {}) => {
@@ -3290,12 +3430,6 @@ test('true concurrency malformed acquire response still triggers best-effort can
       });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      cancelBody = JSON.parse(init.body);
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://tenant.sharepoint.com/file') {
       calls.push('origin-fetch');
       throw new Error('origin fetch should not run after ambiguous acquire failure');
@@ -3312,13 +3446,8 @@ test('true concurrency malformed acquire response still triggers best-effort can
 
     assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
-    assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-cancel']);
-    assert.equal(cancelBody?.requestId, acquireBody?.requestId);
-    assert.equal(cancelBody?.hostname, acquireBody?.hostname);
-    assert.equal(cancelBody?.hostnameHash, acquireBody?.hostnameHash);
-    assert.equal(cancelBody?.siteBucket, acquireBody?.siteBucket);
-    assert.equal(cancelBody?.ipBucket, acquireBody?.ipBucket);
-    assert.equal(cancelBody?.hardExpireAtMs, acquireBody?.hardExpireAtMs);
+    assert.deepEqual(calls, ['concurrency-acquire']);
+    assert.equal(typeof acquireBody?.requestId, 'string');
   } finally {
     globalThis.fetch = originalFetch;
     crypto.randomUUID = originalRandomUUID;
@@ -3326,12 +3455,11 @@ test('true concurrency malformed acquire response still triggers best-effort can
   }
 });
 
-test('true concurrency acquire fetch rejection after dispatch still triggers best-effort cancel cleanup', async () => {
+test('true concurrency acquire fetch rejection after dispatch stops before any server-owned wait path starts', async () => {
   const originalFetch = globalThis.fetch;
   const originalRandomUUID = crypto.randomUUID;
   const calls = [];
   let acquireBody = null;
-  let cancelBody = null;
 
   crypto.randomUUID = () => 'req-ambiguous-reject-1';
   globalThis.fetch = async (input, init = {}) => {
@@ -3359,12 +3487,6 @@ test('true concurrency acquire fetch rejection after dispatch still triggers bes
       throw new TypeError('fetch failed');
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      cancelBody = JSON.parse(init.body);
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://tenant.sharepoint.com/file') {
       calls.push('origin-fetch');
       throw new Error('origin fetch should not run after acquire fetch rejection');
@@ -3381,13 +3503,8 @@ test('true concurrency acquire fetch rejection after dispatch still triggers bes
 
     assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
-    assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-cancel']);
-    assert.equal(cancelBody?.requestId, acquireBody?.requestId);
-    assert.equal(cancelBody?.hostname, acquireBody?.hostname);
-    assert.equal(cancelBody?.hostnameHash, acquireBody?.hostnameHash);
-    assert.equal(cancelBody?.siteBucket, acquireBody?.siteBucket);
-    assert.equal(cancelBody?.ipBucket, acquireBody?.ipBucket);
-    assert.equal(cancelBody?.hardExpireAtMs, acquireBody?.hardExpireAtMs);
+    assert.deepEqual(calls, ['concurrency-acquire']);
+    assert.equal(typeof acquireBody?.requestId, 'string');
   } finally {
     globalThis.fetch = originalFetch;
     crypto.randomUUID = originalRandomUUID;
@@ -3395,12 +3512,11 @@ test('true concurrency acquire fetch rejection after dispatch still triggers bes
   }
 });
 
-test('true concurrency non-200 acquire response after dispatch still triggers best-effort cancel cleanup', async () => {
+test('true concurrency non-200 acquire response after dispatch stops before any server-owned wait path starts', async () => {
   const originalFetch = globalThis.fetch;
   const originalRandomUUID = crypto.randomUUID;
   const calls = [];
   let acquireBody = null;
-  let cancelBody = null;
 
   crypto.randomUUID = () => 'req-ambiguous-status-1';
   globalThis.fetch = async (input, init = {}) => {
@@ -3428,12 +3544,6 @@ test('true concurrency non-200 acquire response after dispatch still triggers be
       return new Response('service unavailable', { status: 503 });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      cancelBody = JSON.parse(init.body);
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://tenant.sharepoint.com/file') {
       calls.push('origin-fetch');
       throw new Error('origin fetch should not run after acquire non-200 failure');
@@ -3450,13 +3560,8 @@ test('true concurrency non-200 acquire response after dispatch still triggers be
 
     assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
-    assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-cancel']);
-    assert.equal(cancelBody?.requestId, acquireBody?.requestId);
-    assert.equal(cancelBody?.hostname, acquireBody?.hostname);
-    assert.equal(cancelBody?.hostnameHash, acquireBody?.hostnameHash);
-    assert.equal(cancelBody?.siteBucket, acquireBody?.siteBucket);
-    assert.equal(cancelBody?.ipBucket, acquireBody?.ipBucket);
-    assert.equal(cancelBody?.hardExpireAtMs, acquireBody?.hardExpireAtMs);
+    assert.deepEqual(calls, ['concurrency-acquire']);
+    assert.equal(typeof acquireBody?.requestId, 'string');
   } finally {
     globalThis.fetch = originalFetch;
     crypto.randomUUID = originalRandomUUID;
@@ -4702,10 +4807,6 @@ test('true concurrency only fast hard expiry returns link expired without fairqu
       });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      throw new Error('cancel should not run for direct expired terminal response');
-    }
     if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
       return createClaimGrantResponseFromRequest(init);
     }
@@ -4824,11 +4925,6 @@ test('dual mode treats CQ failure after fairqueue admission as unavailable and r
       return createJsonResponse({ result: 'deny', scope: 'host', reason: 'full', retryAfter: 1 });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       calls.push('fairqueue-release');
       fairQueueReleaseBodies.push(JSON.parse(init.body));
@@ -4856,7 +4952,7 @@ test('dual mode treats CQ failure after fairqueue admission as unavailable and r
     assert.match(body.message, /true concurrency unavailable/i);
     assert.equal(calls.includes('concurrency-acquire'), true);
     assert.equal(calls.includes('origin-fetch'), false);
-    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release', 'concurrency-cancel']);
+    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
     assert.equal(fairQueueReleaseBodies.length, 1);
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
   } finally {
@@ -4866,12 +4962,11 @@ test('dual mode treats CQ failure after fairqueue admission as unavailable and r
   }
 });
 
-test('dual mode client-aborted CQ acquire releases the fairqueue grant as unused before cancel cleanup', async () => {
+test('dual mode client-aborted CQ acquire releases the fairqueue grant as unused before any wait starts', async () => {
   const originalFetch = globalThis.fetch;
   const abortController = new AbortController();
   const calls = [];
   const fairQueueReleaseBodies = [];
-  const cancelBodies = [];
 
   globalThis.fetch = async (input, init = {}) => {
     const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
@@ -4915,12 +5010,6 @@ test('dual mode client-aborted CQ acquire releases the fairqueue grant as unused
       return createJsonResponse({ result: 'ok' });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      cancelBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
       throw new Error('origin fetch should not run after acquire-stage client abort');
     }
@@ -4937,11 +5026,9 @@ test('dual mode client-aborted CQ acquire releases the fairqueue grant as unused
 
     assert.equal(response.status, 499);
     assert.equal(body.message, 'client aborted request');
-    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release', 'concurrency-cancel']);
+    assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
     assert.equal(fairQueueReleaseBodies.length, 1);
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
-    assert.equal(cancelBodies.length, 1);
-    assert.equal(cancelBodies[0].reason, 'worker_aborted');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -9035,11 +9122,6 @@ test('queue_only fast wait releases unused fairqueue grant before CQ SSE wait an
       return createJsonResponse({ result: 'released' });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      throw new Error('cancel should not run after wait grant');
-    }
-
     throw new Error(`Unexpected fetch URL in test: ${url}`);
   };
 
@@ -9183,13 +9265,12 @@ test('true concurrency wait grant claims, acknowledges handoff, starts heartbeat
   }
 });
 
-test('CQ SSE wait elapsed budget exhaustion cancels accepted CQ request and returns the existing unavailable surface', async () => {
+test('CQ SSE wait elapsed budget exhaustion relies on server-owned disconnect cleanup and returns the existing unavailable surface', async () => {
   const originalFetch = globalThis.fetch;
   const originalDateNow = Date.now;
   const originalSetTimeout = globalThis.setTimeout;
   const originalClearTimeout = globalThis.clearTimeout;
   const calls = [];
-  const cancelBodies = [];
   let waitAccepted = false;
   let waitRequest = null;
   let waitStreamCancelled = false;
@@ -9268,11 +9349,15 @@ test('CQ SSE wait elapsed budget exhaustion cancels accepted CQ request and retu
       });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      assert.equal(waitAccepted, true);
-      cancelBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'cancelled' });
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel'
+      || url === 'https://cq.example.test/api/v1/concurrency/terminalize') {
+      calls.push(url.endsWith('/cancel') ? 'concurrency-cancel' : 'concurrency-terminalize');
+      return createJsonResponse({ result: 'ok' });
     }
 
     if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
@@ -9290,12 +9375,13 @@ test('CQ SSE wait elapsed budget exhaustion cancels accepted CQ request and retu
 
     assert.equal(response.status, 503);
     assert.match(body.message, /wait budget exhausted/i);
-    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse', 'concurrency-cancel']);
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse']);
     assert.equal(waitRequest?.waitToken, 'wait-budget-elapsed-1');
     assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true);
     assert.equal(waitStreamCancelled, true);
-    assert.equal(cancelBodies.length, 1);
-    assert.equal(cancelBodies[0].reason, 'worker_aborted');
+    assert.equal(calls.includes('concurrency-release'), false);
+    assert.equal(calls.includes('concurrency-cancel'), false);
+    assert.equal(calls.includes('concurrency-terminalize'), false);
   } finally {
     globalThis.fetch = originalFetch;
     Date.now = originalDateNow;
@@ -9305,11 +9391,97 @@ test('CQ SSE wait elapsed budget exhaustion cancels accepted CQ request and retu
   }
 });
 
-test('client-aborted CQ SSE wait cancels the accepted request before origin fetch', async () => {
+test('concurrency wait disconnect ends as terminal waiter death before origin fetch', async () => {
   const originalFetch = globalThis.fetch;
   const abortController = new AbortController();
   const calls = [];
-  const cancelBodies = [];
+  let waitAccepted = false;
+  let waitStreamCancelled = false;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      return createJsonResponse({
+        result: 'wait',
+        waitToken: 'wait-disconnect-1',
+        scope: 'host',
+        retryAfter: 1,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      calls.push('concurrency-wait-sse');
+      return createPendingTrueConcurrencyWaitSseResponse({
+        acceptedDeadlineMs: Date.now() + 1_000,
+        onAccepted() {
+          waitAccepted = true;
+          setTimeout(() => abortController.abort(), 0);
+        },
+        onCancel() {
+          waitStreamCancelled = true;
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel'
+      || url === 'https://cq.example.test/api/v1/concurrency/terminalize') {
+      calls.push(url.endsWith('/cancel') ? 'concurrency-cancel' : 'concurrency-terminalize');
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
+      throw new Error('origin fetch should not run after CQ wait disconnect');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const request = await buildSignedWorkerRequest({ signal: abortController.signal });
+    const response = await worker.fetch(request, buildWorkerEnv(), ctx);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 499);
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse']);
+    assert.equal(waitAccepted, true);
+    assert.equal(waitStreamCancelled, true);
+    assert.equal(calls.includes('concurrency-release'), false);
+    assert.equal(calls.includes('concurrency-cancel'), false);
+    assert.equal(calls.includes('concurrency-terminalize'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('client-aborted CQ SSE wait remains terminal before origin fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  const abortController = new AbortController();
+  const calls = [];
   let waitAccepted = false;
   let waitRequest = null;
   let waitStreamCancelled = false;
@@ -9358,13 +9530,6 @@ test('client-aborted CQ SSE wait cancels the accepted request before origin fetc
       });
     }
 
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      assert.equal(waitAccepted, true);
-      cancelBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'cancelled' });
-    }
-
     if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
       throw new Error('origin fetch should not run after client-aborted CQ SSE wait');
     }
@@ -9381,21 +9546,18 @@ test('client-aborted CQ SSE wait cancels the accepted request before origin fetc
 
     assert.equal(response.status, 499);
     assert.equal(body.message, 'client aborted request');
-    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse', 'concurrency-cancel']);
+    assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse']);
     assert.equal(waitRequest?.waitToken, 'wait-client-abort-1');
     assert.equal(waitStreamCancelled, true);
-    assert.equal(cancelBodies.length, 1);
-    assert.equal(cancelBodies[0].reason, 'worker_aborted');
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('queue_only aborts CQ wait and cancels request when unused fairqueue release cannot be confirmed', async () => {
+test('queue_only aborts CQ wait without cancel when unused fairqueue release cannot be confirmed', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
-  const cancelBodies = [];
 
   globalThis.fetch = async (input, init = {}) => {
     const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
@@ -9442,15 +9604,20 @@ test('queue_only aborts CQ wait and cancels request when unused fairqueue releas
       throw new Error('worker must not open CQ SSE wait after failed fairqueue release');
     }
 
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel'
+      || url === 'https://cq.example.test/api/v1/concurrency/terminalize') {
+      calls.push(url.endsWith('/cancel') ? 'concurrency-cancel' : 'concurrency-terminalize');
+      return createJsonResponse({ result: 'ok' });
+    }
+
     if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
       calls.push('fairqueue-release');
       return new Response('release unavailable', { status: 503 });
-    }
-
-    if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-      calls.push('concurrency-cancel');
-      cancelBodies.push(JSON.parse(init.body));
-      return createJsonResponse({ result: 'cancelled' });
     }
 
     if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
@@ -9475,16 +9642,128 @@ test('queue_only aborts CQ wait and cancels request when unused fairqueue releas
     ]);
     assert.equal(calls.includes('concurrency-wait-sse'), false);
     assert.equal(calls.includes('origin-fetch'), false);
-    assert.equal(calls.filter((call) => call === 'concurrency-cancel').length, 1);
-    assert.equal(cancelBodies.length, 1);
-    assert.equal(cancelBodies[0].reason, 'worker_aborted');
+    assert.equal(calls.includes('concurrency-release'), false);
+    assert.equal(calls.includes('concurrency-cancel'), false);
+    assert.equal(calls.includes('concurrency-terminalize'), false);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('true concurrency wait terminal SSE results map to existing terminal surfaces without cancel cleanup', async () => {
+test('queue_breaker aborts CQ wait without cancel when breaker settlement fails before CQ SSE wait', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const settleBodies = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        throttleHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
+        result: 'granted',
+        queryToken: 'query-settle-fail-1',
+        invocationEpoch: 1,
+        slotToken: 'slot-settle-fail-1',
+        meta: {
+          attemptVersion: 101,
+          attemptTicket: 7,
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire-fast');
+      return createJsonResponse({
+        result: 'wait',
+        waitToken: 'wait-settle-fail-1',
+        scope: 'host',
+        retryAfter: 1,
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      calls.push('breaker-settle');
+      settleBodies.push(JSON.parse(init.body));
+      throw new Error('settle unavailable');
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      calls.push('concurrency-wait-sse');
+      throw new Error('worker must not open CQ SSE wait after breaker settlement failure');
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/cancel'
+      || url === 'https://cq.example.test/api/v1/concurrency/terminalize') {
+      calls.push(url.endsWith('/cancel') ? 'concurrency-cancel' : 'concurrency-terminalize');
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
+      throw new Error('origin fetch should not run after breaker settlement failure');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await readJson(response);
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(response.status, 503);
+    assert.match(body.message, /attempt settlement/i);
+    assert.deepEqual(calls, [
+      'fairqueue-wait',
+      'concurrency-acquire-fast',
+      'breaker-settle',
+      'fairqueue-release',
+    ]);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_attempt_version, 101);
+    assert.equal(settleBodies[0].p_attempt_ticket, 7);
+    assert.equal(calls.includes('concurrency-wait-sse'), false);
+    assert.equal(calls.includes('origin-fetch'), false);
+    assert.equal(calls.includes('concurrency-release'), false);
+    assert.equal(calls.includes('concurrency-cancel'), false);
+    assert.equal(calls.includes('concurrency-terminalize'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency wait terminal SSE results map to existing terminal surfaces through server-owned cleanup', async () => {
   const originalFetch = globalThis.fetch;
   try {
     for (const scenario of [
@@ -9514,7 +9793,6 @@ test('true concurrency wait terminal SSE results map to existing terminal surfac
       },
     ]) {
       const calls = [];
-      const cancelBodies = [];
       let waitRequest = null;
 
       globalThis.fetch = async (input, init = {}) => {
@@ -9554,12 +9832,6 @@ test('true concurrency wait terminal SSE results map to existing terminal surfac
           });
         }
 
-        if (url === 'https://cq.example.test/api/v1/concurrency/cancel') {
-          calls.push('concurrency-cancel');
-          cancelBodies.push(JSON.parse(init.body));
-          return createJsonResponse({ result: 'cancelled' });
-        }
-
         if (url === 'https://tenant.sharepoint.com/sites/demo/file') {
           throw new Error(`origin fetch should not run after ${scenario.name} CQ wait result`);
         }
@@ -9581,7 +9853,6 @@ test('true concurrency wait terminal SSE results map to existing terminal surfac
       assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse'], scenario.name);
       assert.equal(waitRequest?.waitToken, 'wait-token-terminal', scenario.name);
       assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true, scenario.name);
-      assert.equal(cancelBodies.length, 0, scenario.name);
     }
   } finally {
     globalThis.fetch = originalFetch;
@@ -11529,7 +11800,7 @@ test('breaker authority uses actual Google Drive hostnames', async () => {
 });
 
 test('recognized Google host overload stays scoped to actual host authority', async () => {
-  clearOverloadedByHost();
+  clearFairQueueOverloadState();
 
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -11585,7 +11856,7 @@ test('recognized Google host overload stays scoped to actual host authority', as
     assert.equal(fetchCalls, 2);
   } finally {
     globalThis.fetch = originalFetch;
-    clearOverloadedByHost();
+    clearFairQueueOverloadState();
   }
 });
 

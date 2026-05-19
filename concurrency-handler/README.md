@@ -12,22 +12,23 @@ It is responsible only for:
 - active-lease handoff acknowledgement via `ack_handoff`
 - authenticated heartbeat WebSocket lifecycle
 - active-lease `release`
-- request-level `cancel`
 - bounded expiry cleanup through `ExpireScope`
 
 It does not do fairqueue scheduling, but it does own server-side waiting semantics for true-concurrency admission: fast `acquire` may return `wait`, and the worker then opens `POST /api/v1/concurrency/wait` as one SSE stream that yields exactly one `accepted` event and one final `result` event.
 
 Production deployments require sticky routing for accepted wait streams. All HTTP endpoints require auth; `auth.enabled` must be `true` and `auth.token` must be set.
 
-Process startup and concurrency business readiness are separate. The process may start while Postgres or PostgREST is still unreachable. Until startup probe and recovery complete, `acquire`, `claim`, `ack_handoff`, `heartbeat`, `release`, and `cancel` return `503 Service Unavailable`.
+Process startup and concurrency business readiness are separate. The process may start while Postgres or PostgREST is still unreachable. Until startup probe and recovery complete, `acquire`, `claim`, `ack_handoff`, `heartbeat`, and `release` return `503 Service Unavailable`.
 
 ## Admission Wait Protocol
 
 - Wait endpoints across the download stack: `POST /api/v1/fairqueue/wait` and `POST /api/v1/concurrency/wait`
 - Both wait requests use `Accept: text/event-stream`, both handlers reply with `Content-Type: text/event-stream`, and each accepted stream emits one `accepted` event plus one final `result` event.
+- FQ final SSE result events repeat the accepted ownership tuple: `queryToken` and `invocationEpoch`.
 - CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP
-- FQ: wait SSE -> accepted -> one final result -> release or abandon HTTP cleanup
-- No compatibility mode, long-poll fallback, or automatic SSE reconnect exists.
+- FQ: wait SSE -> accepted -> one final result -> disconnect is terminal, granted slots release after use
+- CQ wait 只认已 accepted 的 SSE stream 作为 active waiter；断开即终态。
+- Host-scope cleanup keeps looping inside one host pass while each `ExpireScope` call reports progress; a host wait is only returned after cleanup reports no further progress.
 
 ## Worker Coordination
 
@@ -62,9 +63,9 @@ When `concurrency.heartbeat.enabled=true`, heartbeat is required for every CQ-ma
 
 If the worker cannot reach `hello_ack` inside its bounded initial connect budget, it fails closed before origin fetch and immediately attempts active-lease `release` with reason `heartbeat_connect_failed`. If that immediate release does not finish cleanly, the worker keeps retry cleanup on the existing release-controller cadence of immediate, then `2s`, `4s`, and `8s`, attached to `ctx.waitUntil()` when available.
 
-Worker binds active-lease release to stream completion, upstream failure, client disconnect, hard expiry, heartbeat reconnect exhaustion, and target rotation. For waiting-only or ambiguous pre-active cleanup it uses request-level `cancel` instead of request-level release recovery.
+Worker binds active-lease release to stream completion, upstream failure, client disconnect, hard expiry, heartbeat reconnect exhaustion, and target rotation. Accepted CQ wait disconnects are terminal and cleaned up server-side. Fast acquire wait responses are provisional. Active waiter state begins only after `/api/v1/concurrency/wait` accepts the SSE stream. Before accepted wait SSE attachment, worker terminal paths do not require server cleanup because no active waiter exists.
 
-The Worker-side client contract is: send `handlerAuthKey` in `handlerAuthHeader` (default `X-CQ-Auth`), use `acquireTimeoutMs` for `/acquire` and `/claim`, and use `releaseTimeoutMs` for `/release` and `/cancel`.
+The Worker-side client contract is: send `handlerAuthKey` in `handlerAuthHeader` (default `X-CQ-Auth`), use `acquireTimeoutMs` for `/acquire` and `/claim`, and use `releaseTimeoutMs` for `/release`.
 
 ## HTTP API
 
@@ -74,7 +75,6 @@ The Worker-side client contract is: send `handlerAuthKey` in `handlerAuthHeader`
 - `POST /api/v1/concurrency/ack_handoff`
 - `GET /api/v1/concurrency/heartbeat` with `Upgrade: websocket`
 - `POST /api/v1/concurrency/release`
-- `POST /api/v1/concurrency/cancel`
 
 `acquire` is fast-only. It decides immediate admission and may return `wait`, but it never attaches or replays a waiting request.
 
@@ -99,7 +99,7 @@ Granted `acquire` results include a `claimToken`. Worker must call `claim` befor
 - `cancelled`
 - `expired`
 
-`wait` never emits `wait`, never auto-reconnects, and never upgrades `claim`, `ack_handoff`, `release`, `cancel`, or heartbeat onto SSE.
+`wait` never emits `wait` again, never retries the same wait token, and never upgrades `claim`, `ack_handoff`, `release`, or heartbeat onto SSE.
 
 `claim` finalizes delivery of a granted lease before origin fetch. It returns exactly these normalized outcomes:
 
@@ -121,7 +121,7 @@ Granted `acquire` results include a `claimToken`. Worker must call `claim` befor
 
 `release` remains backend-authoritative and idempotent. After a valid release request is accepted, the handler runs authoritative release under a bounded server-owned context, completes immediate local cleanup, writes the HTTP response, and then wakes attached waiters asynchronously. Client disconnect after request acceptance does not cancel the in-flight authoritative release.
 
-`cancel` is request-level tombstone cleanup for waiting requests and ambiguous pre-active cleanup. It returns `200 cancelled`, `200 noop`, or `409 conflict` for active-lease mismatch cases such as `must_release_active_lease`.
+Accepted CQ wait disconnects are terminal waiter death. The handler removes the attached waiter and waiting-row state server-side when the SSE stream ends before final delivery. Requests that never reached accepted SSE state are not cleaned by a Worker API call.
 
 ## Heartbeat WebSocket Contract
 
@@ -211,7 +211,7 @@ Worker treats every terminal heartbeat frame as a local stream abort. Cleanup ma
 - `heartbeat_timeout`, `heartbeat_start_timeout`, `hard_expired`, `already_released`, `request_cancelled`: handler already decided terminal state, so worker clears local CQ state without sending another release
 - `protocol_error`, `token_mismatch`: handler rejected the socket without moving active counters, so worker aborts and best-effort releases with `heartbeat_lost` using the original active lease credentials
 
-HTTP release is terminal and idempotent. Terminal release, terminal cancel, and terminal expiry all clear live heartbeat state while preserving heartbeat generation and audit timestamps for stale-frame rejection.
+HTTP release is terminal and idempotent. Terminal release and terminal expiry clear live heartbeat state while preserving heartbeat generation and audit timestamps for stale-frame rejection.
 
 ## Backend Modes
 
@@ -222,7 +222,7 @@ HTTP release is terminal and idempotent. Terminal release, terminal cancel, and 
 
 `backend.ticketStateTable` defaults to `DOWNLOAD_TICKET_STATE_TABLE`. Set it to the same table name used by the worker-side `download.db.ticketStateTable` when you are deploying CQ against a non-default ticket-state table.
 
-Both modes normalize to the same service-level waiting contract: `granted|wait|conflict|released|cancelled|expired` for `acquire`, `released|noop` for `release`, and `cancelled|noop|conflict` for `cancel`. The transport changes, not the contract.
+Both modes normalize to the same service-level waiting contract: `granted|wait|conflict|released|cancelled|expired` for `acquire` and `released|noop` for `release`. The transport changes, not the contract.
 
 ## Config Contract
 
@@ -277,11 +277,11 @@ The cap fields are required and each accepts integers `>= 0`.
 - Positive values keep that layer enabled at the configured maximum.
 - Each layer is evaluated independently.
 - `host=0, site=32, siteIp=4` means host is unlimited while site and site+ip caps still gate admission.
-- `host=0, site=0, siteIp=0` removes cap-based waiting, but does not disable CQ acquire, release, cancel, request-ledger, or sweep behavior.
+- `host=0, site=0, siteIp=0` removes cap-based waiting, but does not disable CQ acquire, release, request-ledger, or sweep behavior.
 
 `wait.maxStreamMs` caps a single accepted SSE wait stream. `wait.keepaliveMs` controls the keepalive comment cadence for accepted waiters.
 
-`claim` and `cancel` are fixed to the authoritative database functions `cq_claim_grant` and `cq_cancel`; they are not user-configurable.
+`claim` is fixed to the authoritative database function `cq_claim_grant`; it is not user-configurable.
 
 `hardExpireAtMs` is the hard cutoff for active streams, and Worker releases the active lease with reason `hard_expiry` when that cutoff is reached.
 

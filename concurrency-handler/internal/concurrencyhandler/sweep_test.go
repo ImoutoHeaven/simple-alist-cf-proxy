@@ -50,8 +50,8 @@ func (b *sweepRecordingBackend) PromoteWaiting(ctx context.Context, req PromoteW
 	return &AcquireResult{Result: "wait", WaitToken: "wait-1", Scope: "host", RetryAfter: 1}, nil
 }
 
-func (b *sweepRecordingBackend) Cancel(context.Context, CancelRequest) (*CancelResult, error) {
-	return &CancelResult{Result: "cancelled"}, nil
+func (b *sweepRecordingBackend) TerminalizeWaiting(context.Context, TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
+	return &TerminalizeWaitingResult{Result: "released"}, nil
 }
 
 func (b *sweepRecordingBackend) ExpireScope(_ context.Context, req ExpireScopeRequest) (*ExpireScopeResult, error) {

@@ -61,9 +61,6 @@ const DEFAULT_THROTTLE_PROTECT_HTTP_CODES = [429, 499, 500, 502, 503, 504];
 
 // Fair Queue in-memory state (per Worker instance)
 const FQ_GLOBAL_STATE = {
-  overloadedByHost: new Map(),
-  overloadedBySite: new Map(),
-  overloadedByIp: new Map(),
   overloadedGlobalUntilMs: 0,
 };
 
@@ -941,159 +938,6 @@ const normalizeHeaderMap = (value) => {
   }
   return normalized;
 };
-
-function markHostOverloaded(hostname, retryAfterMs) {
-  const hostKey = deriveProviderHostBucket(hostname);
-  if (!hostKey) {
-    return;
-  }
-
-  markScopedOverloaded(FQ_GLOBAL_STATE.overloadedByHost, hostKey, retryAfterMs);
-}
-
-function normalizeOverloadScopeValue(value, fallback = 'unknown') {
-  if (typeof value !== 'string') {
-    return fallback;
-  }
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : fallback;
-}
-
-const SCOPED_OVERLOAD_SWEEP_STEPS = 6;
-
-function buildScopedOverloadKey(parts) {
-  return JSON.stringify(parts);
-}
-
-function buildSiteOverloadKey(hostname, siteBucket) {
-  const hostKey = deriveProviderHostBucket(hostname);
-  if (!hostKey) {
-    return '';
-  }
-  return buildScopedOverloadKey([
-    hostKey,
-    normalizeOverloadScopeValue(siteBucket, 'unknown'),
-  ]);
-}
-
-function buildIpOverloadKey(hostname, siteBucket, ipBucket) {
-  const hostKey = deriveProviderHostBucket(hostname);
-  if (!hostKey) {
-    return '';
-  }
-  return buildScopedOverloadKey([
-    hostKey,
-    normalizeOverloadScopeValue(siteBucket, 'unknown'),
-    normalizeOverloadScopeValue(ipBucket, 'unknown'),
-  ]);
-}
-
-function sweepExpiredScopedOverloadEntries(store, now, steps = SCOPED_OVERLOAD_SWEEP_STEPS) {
-  if (!store || store.size === 0) {
-    return;
-  }
-
-  const maxSteps = Number.isFinite(steps) && steps > 0
-    ? Math.max(1, Math.trunc(steps))
-    : SCOPED_OVERLOAD_SWEEP_STEPS;
-
-  for (let i = 0; i < maxSteps; i += 1) {
-    const first = store.entries().next().value;
-    if (!first) {
-      break;
-    }
-    const [entryKey, state] = first;
-    store.delete(entryKey);
-
-    if (state && state.untilMs && state.untilMs > now) {
-      store.set(entryKey, state);
-    }
-  }
-}
-
-function markScopedOverloaded(store, key, retryAfterMs) {
-  if (!store || !key) {
-    return;
-  }
-
-  const durationMs = normalizePositiveMs(retryAfterMs, 0);
-  if (!durationMs) {
-    return;
-  }
-
-  const now = nowMs();
-  sweepExpiredScopedOverloadEntries(store, now);
-  const until = now + durationMs;
-  const prev = store.get(key);
-  if (!prev || until > prev.untilMs) {
-    store.set(key, { untilMs: until });
-  }
-}
-
-function getHostOverloadedRemainingMs(hostname, now = nowMs()) {
-  const hostKey = deriveProviderHostBucket(hostname);
-  if (!hostKey) {
-    return 0;
-  }
-
-  return getScopedOverloadedRemainingMs(FQ_GLOBAL_STATE.overloadedByHost, hostKey, now);
-}
-
-function markSiteOverloaded(hostname, siteBucket, retryAfterMs) {
-  const key = buildSiteOverloadKey(hostname, siteBucket);
-  if (!key) {
-    return;
-  }
-  markScopedOverloaded(FQ_GLOBAL_STATE.overloadedBySite, key, retryAfterMs);
-}
-
-function getSiteOverloadedRemainingMs(hostname, siteBucket, now = nowMs()) {
-  const key = buildSiteOverloadKey(hostname, siteBucket);
-  if (!key) {
-    return 0;
-  }
-  return getScopedOverloadedRemainingMs(FQ_GLOBAL_STATE.overloadedBySite, key, now);
-}
-
-function markIpOverloaded(hostname, siteBucket, ipBucket, retryAfterMs) {
-  const key = buildIpOverloadKey(hostname, siteBucket, ipBucket);
-  if (!key) {
-    return;
-  }
-  markScopedOverloaded(FQ_GLOBAL_STATE.overloadedByIp, key, retryAfterMs);
-}
-
-function getIpOverloadedRemainingMs(hostname, siteBucket, ipBucket, now = nowMs()) {
-  const key = buildIpOverloadKey(hostname, siteBucket, ipBucket);
-  if (!key) {
-    return 0;
-  }
-  return getScopedOverloadedRemainingMs(FQ_GLOBAL_STATE.overloadedByIp, key, now);
-}
-
-function getScopedOverloadedRemainingMs(store, key, now = nowMs()) {
-  if (!store || !key) {
-    return 0;
-  }
-
-  sweepExpiredScopedOverloadEntries(store, now);
-
-  const state = store.get(key);
-  if (!state || !state.untilMs || state.untilMs <= now) {
-    if (state && state.untilMs && state.untilMs <= now) {
-      store.delete(key);
-    }
-    return 0;
-  }
-  return Math.max(0, state.untilMs - now);
-}
-
-function getScopedOverloadRemainingMs(hostname, siteBucket, ipBucket, now = nowMs()) {
-  const hostRemain = getHostOverloadedRemainingMs(hostname, now);
-  const siteRemain = getSiteOverloadedRemainingMs(hostname, siteBucket, now);
-  const ipRemain = getIpOverloadedRemainingMs(hostname, siteBucket, ipBucket, now);
-  return Math.max(hostRemain, siteRemain, ipRemain);
-}
 
 function markGlobalOverloaded(retryAfterSeconds) {
   const seconds = normalizePositiveSeconds(retryAfterSeconds, 0);
@@ -1983,6 +1827,7 @@ const TRUE_CONCURRENCY_CANCELLED_TERMINAL_REASONS = new Set(['request_cancelled'
 const TRUE_CONCURRENCY_EXPIRED_TERMINAL_REASONS = new Set([
   'hard_expired',
   'waiter_detached_timeout',
+  'wait_stream_timeout',
 ]);
 const TRUE_CONCURRENCY_RELEASE_NOOP_REASONS = new Set([
   'already_released',
@@ -2777,7 +2622,6 @@ const createConcurrencyHandlerClient = (config) => {
   const claimUrl = `${baseUrl}/api/v1/concurrency/claim`;
   const ackHandoffUrl = `${baseUrl}/api/v1/concurrency/ack_handoff`;
   const releaseUrl = `${baseUrl}/api/v1/concurrency/release`;
-  const cancelUrl = `${baseUrl}/api/v1/concurrency/cancel`;
   const heartbeatPath = normalizePath(normalizeStringValue(handlerCfg.heartbeat?.path))
     || DEFAULT_TRUE_CONCURRENCY_HEARTBEAT_CONFIG.path;
   const heartbeatUrl = `${baseUrl}${heartbeatPath}`;
@@ -2911,6 +2755,10 @@ const createConcurrencyHandlerClient = (config) => {
             hardExpireAtMs: plan.hardExpireAtMs,
           }),
         };
+      }
+
+      if (response.status === 200) {
+        throw new Error('[CQ] CQ wait expected text/event-stream response for status 200');
       }
 
       let data;
@@ -3075,18 +2923,6 @@ const createConcurrencyHandlerClient = (config) => {
       }
     },
 
-    async cancel(_ctx, requestIdentity, reason, signal) {
-      const { data } = await postJson(
-        cancelUrl,
-        buildTrueConcurrencyCancelPayload(requestIdentity, reason),
-        {
-          timeoutMs: releaseTimeoutMs,
-          signal,
-          allowedStatuses: [200, 409],
-        },
-      );
-      return normalizeTrueConcurrencyCancelResult(data);
-    },
   };
 };
 
@@ -3657,12 +3493,10 @@ const buildFairQueueCleanupIdentity = (cleanupContext) => {
   if (cleanupContext?.slotToken) {
     return `release:${cleanupContext.slotToken}`;
   }
-  if (cleanupContext?.queryToken) {
-    const invocationEpoch = readFairQueueInvocationEpoch(cleanupContext?.invocationEpoch);
-    if (invocationEpoch !== null) {
-      return `abandon:${cleanupContext.queryToken}:${invocationEpoch}`;
-    }
-    return `abandon-local:${cleanupContext.queryToken}`;
+  const queryToken = normalizeStringValue(cleanupContext?.queryToken);
+  const invocationEpoch = readFairQueueInvocationEpoch(cleanupContext?.invocationEpoch);
+  if (queryToken && invocationEpoch !== null) {
+    return `wait:${queryToken}:${invocationEpoch}`;
   }
   return '';
 };
@@ -3726,7 +3560,7 @@ const clearReleasedFairQueueMetadata = (fqContext) => {
   fqContext.deferredReportArmed = false;
 };
 
-const clearAbandonedFairQueueMetadata = (fqContext) => {
+const clearTerminalFairQueueMetadata = (fqContext) => {
   if (!fqContext) {
     return;
   }
@@ -3764,23 +3598,8 @@ const finalizeFairQueueContext = async ({ fairQueueClient, ctx, fqContext, phase
     return true;
   }
 
-  if (!fqContext.queryToken) {
-    return true;
-  }
-
-  try {
-    const abandoned = await fairQueueClient.abandonWait(ctx, fqContext);
-    if (abandoned) {
-      clearAbandonedFairQueueMetadata(fqContext);
-      return true;
-    }
-    console.warn(`[Fair Queue] abandonWait exhausted during ${phase} for host=${fqContext.hostname}`);
-    return false;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[Fair Queue] abandonWait failed during ${phase}:`, message);
-    return false;
-  }
+  clearTerminalFairQueueMetadata(fqContext);
+  return true;
 };
 
 const reconcileFairQueueContextForTarget = async ({
@@ -3865,7 +3684,6 @@ const createSlotHandlerClient = (config) => {
 
   const waitUrl = `${baseUrl}/api/v1/fairqueue/wait`;
   const releaseUrl = `${baseUrl}/api/v1/fairqueue/release`;
-  const abandonUrl = `${baseUrl}/api/v1/fairqueue/abandon`;
   const authKey = slotCfg.authKey || '';
   const authHeader = normalizeStringValue(slotCfg.authHeader, 'X-FQ-Auth');
   const totalMaxWaitMsRaw = Number(slotCfg.totalMaxWaitMs);
@@ -3962,19 +3780,32 @@ const createSlotHandlerClient = (config) => {
         }
       };
 
-      const applyAcceptedOwnership = (result, payload) => {
-        const queryToken = typeof payload?.queryToken === 'string' && payload.queryToken
-          ? payload.queryToken
-          : null;
-        const invocationEpoch = readFairQueueInvocationEpoch(payload?.invocationEpoch);
-        if (!queryToken || invocationEpoch === null) {
-          console.error(`[FQ] slot-handler ${result} response missing accepted ownership fields`);
-          return false;
-        }
-        fqContext.queryToken = queryToken;
-        fqContext.invocationEpoch = invocationEpoch;
-        return true;
-      };
+	      const applyAcceptedOwnership = (result, payload) => {
+	        const queryToken = typeof payload?.queryToken === 'string' && payload.queryToken
+	          ? payload.queryToken
+	          : null;
+	        const invocationEpoch = readFairQueueInvocationEpoch(payload?.invocationEpoch);
+	        if (!queryToken || invocationEpoch === null) {
+	          console.error(`[FQ] slot-handler ${result} response missing accepted ownership fields`);
+	          return false;
+	        }
+	        const expectedQueryToken = typeof fqContext?.queryToken === 'string' && fqContext.queryToken
+	          ? fqContext.queryToken
+	          : null;
+	        const expectedInvocationEpoch = readFairQueueInvocationEpoch(fqContext?.invocationEpoch);
+	        if (
+	          result !== 'accepted'
+	          && expectedQueryToken
+	          && expectedInvocationEpoch !== null
+	          && (queryToken !== expectedQueryToken || invocationEpoch !== expectedInvocationEpoch)
+	        ) {
+	          console.error(`[FQ] slot-handler ${result} response ownership mismatch accepted tuple`);
+	          return false;
+	        }
+	        fqContext.queryToken = queryToken;
+	        fqContext.invocationEpoch = invocationEpoch;
+	        return true;
+	      };
 
       const buildOverloadedResult = (reason, retryAfterValue) => {
         const normalizedReason = typeof reason === 'string' && reason.trim() ? reason.trim() : 'overload_unknown';
@@ -4003,10 +3834,14 @@ const createSlotHandlerClient = (config) => {
               console.error('[FQ] slot-handler granted response missing slotToken');
               return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
+            if (typeof finalPayload?.releaseOwnerRequired !== 'boolean') {
+              console.error('[FQ] slot-handler granted response missing boolean releaseOwnerRequired');
+              return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
+            }
             const { attemptVersion, attemptTicket } = readSlotHandlerAttempt(finalPayload);
             fqContext.grantPromoted = true;
             fqContext.slotToken = finalPayload.slotToken;
-            fqContext.releaseOwnerRequired = true;
+            fqContext.releaseOwnerRequired = finalPayload.releaseOwnerRequired;
             fqContext.slotAcquiredAt = Date.now();
             fqContext.attemptVersion = Number.isFinite(attemptVersion) && Number.isFinite(attemptTicket)
               ? attemptVersion
@@ -4034,7 +3869,7 @@ const createSlotHandlerClient = (config) => {
               ? readOpenBreakerSnapshot(breakerSnapshot, 0)
               : null;
             const rawRetryAfter = Number(finalPayload?.retryAfter);
-            clearAbandonedFairQueueMetadata(fqContext);
+            clearTerminalFairQueueMetadata(fqContext);
             return {
               kind: 'throttled',
               throttleCode,
@@ -4047,13 +3882,13 @@ const createSlotHandlerClient = (config) => {
             if (!applyAcceptedOwnership('overloaded', finalPayload)) {
               return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
-            clearAbandonedFairQueueMetadata(fqContext);
+            clearTerminalFairQueueMetadata(fqContext);
             return buildOverloadedResult(finalPayload?.reason, finalPayload?.retryAfter);
           case 'timeout':
             if (!applyAcceptedOwnership('timeout', finalPayload)) {
               return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
-            clearAbandonedFairQueueMetadata(fqContext);
+            clearTerminalFairQueueMetadata(fqContext);
             return {
               kind: 'timeout',
               reason: typeof finalPayload?.reason === 'string' && finalPayload.reason
@@ -4064,7 +3899,7 @@ const createSlotHandlerClient = (config) => {
             if (!applyAcceptedOwnership('conflict', finalPayload)) {
               return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
-            clearAbandonedFairQueueMetadata(fqContext);
+            clearTerminalFairQueueMetadata(fqContext);
             return {
               kind: 'conflict',
               reason: typeof finalPayload?.reason === 'string' && finalPayload.reason
@@ -4193,6 +4028,14 @@ const createSlotHandlerClient = (config) => {
           }
         }
 
+        if (data?.result === 'conflict') {
+          const hasReason = Object.prototype.hasOwnProperty.call(data, 'reason');
+          return {
+            kind: 'conflict',
+            reason: hasReason ? data.reason : null,
+          };
+        }
+
         if (typeof data?.result === 'string') {
           console.error(`[FQ] slot-handler /wait setup must use SSE for result=${data.result}`);
           return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
@@ -4303,51 +4146,6 @@ const createSlotHandlerClient = (config) => {
       return false;
     },
 
-    async abandonWait(ctx, fqContext) {
-      const invocationEpoch = readFairQueueInvocationEpoch(fqContext?.invocationEpoch);
-      if (!fqContext?.queryToken || fqContext?.slotToken || invocationEpoch === null) {
-        return true;
-      }
-
-      const abandonMaxAttempts = 3;
-      const abandonBaseBackoffMs = 100;
-      const abandonMaxBackoffMs = 500;
-      const payload = {
-        queryToken: fqContext.queryToken,
-        invocationEpoch,
-      };
-
-      let lastError = null;
-      for (let attempt = 1; attempt <= abandonMaxAttempts; attempt += 1) {
-        let shouldRetry = false;
-        try {
-          const res = await fetchWithTimeout(abandonUrl, payload, releaseTimeoutMs);
-
-          if (res.ok) {
-            console.log('[FQ] wait abandoned via slot-handler');
-            return true;
-          }
-
-          lastError = new Error(`slot-handler abandon failed: status ${res.status}`);
-          shouldRetry = isRetryableReleaseStatus(res.status);
-        } catch (error) {
-          lastError = error instanceof Error ? error : new Error(String(error));
-          shouldRetry = true;
-        }
-
-        if (shouldRetry && attempt < abandonMaxAttempts) {
-          const backoffMs = Math.min(abandonMaxBackoffMs, abandonBaseBackoffMs * (2 ** (attempt - 1)));
-          await new Promise((resolve) => setTimeout(resolve, backoffMs));
-          continue;
-        }
-
-        break;
-      }
-
-      const message = lastError instanceof Error ? lastError.message : String(lastError || 'unknown error');
-      console.error('[FQ] abandonWait error (slot-handler):', message);
-      return false;
-    },
   };
 };
 
@@ -5655,7 +5453,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   };
 
   const createTrueConcurrencyWaitBudgetExhaustedResponse = async () => {
-    await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
     return createTrueConcurrencyUnavailableResponse(origin, 'True concurrency wait budget exhausted');
   };
 
@@ -5678,48 +5475,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     releaseController.ensureReleased(reason);
     return true;
-  };
-
-  const buildCurrentTrueConcurrencyRequestIdentity = () => {
-    if (!cqPlan) {
-      return null;
-    }
-    return {
-      requestId: cqPlan.requestId,
-      hostname: cqPlan.hostname,
-      hostnameHash: cqPlan.hostnameHash,
-      siteBucket: cqPlan.siteBucket,
-      ipBucket: cqPlan.ipBucket,
-      hardExpireAtMs: cqPlan.hardExpireAtMs,
-    };
-  };
-
-  const ensureCurrentTrueConcurrencyCancelled = async (reason, options = {}) => {
-    const allowPreActive = options && options.allowPreActive === true;
-    if (!cqPlan || cqLease || !concurrencyClient) {
-      return true;
-    }
-    if (!cqPlan.waitToken && !allowPreActive) {
-      return true;
-    }
-    if (!cqPlan.waitToken && !cqAcquireDispatched) {
-      return true;
-    }
-
-    const requestIdentity = buildCurrentTrueConcurrencyRequestIdentity();
-    clearCurrentTrueConcurrencyState();
-    if (!requestIdentity) {
-      return true;
-    }
-
-    try {
-      const result = await concurrencyClient.cancel(ctx, requestIdentity, reason);
-      return result?.result === 'cancelled' || result?.result === 'noop';
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[CQ] cancel failed for ${requestIdentity.requestId}:`, message);
-      return false;
-    }
   };
 
   const releaseUnusedFairQueueGrantIfNeeded = async (phase) => {
@@ -6063,7 +5818,6 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
             const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
             if (settleResponse instanceof Response) {
               const fairQueueReleased = await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq wait settle failure`);
-              await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
               if (!fairQueueReleased) {
                 return createErrorResponse(origin, 503, 'Fair queue unavailable');
               }
@@ -6072,7 +5826,6 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           }
           const fairQueueReleased = await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq wait release`);
           if (!fairQueueReleased) {
-            await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
             return createErrorResponse(origin, 503, 'Fair queue unavailable');
           }
 
@@ -6133,16 +5886,10 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
             if (needFairQueue) {
               await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq terminal settle failure`);
             }
-            if (cqPlan?.waitToken) {
-              await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
-            }
             return settleResponse;
           }
           if (needFairQueue) {
             await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq terminal release`);
-          }
-          if (cqPlan?.waitToken) {
-            await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
           }
           return createTrueConcurrencyTerminalResponse(acquireResult.result, acquireResult.reason);
         }
@@ -6338,7 +6085,6 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           if (needFairQueue) {
             await releaseUnusedFairQueueGrantIfNeeded(`${phase} client abort during cq acquire`);
           }
-          await ensureCurrentTrueConcurrencyCancelled('worker_aborted', { allowPreActive: true });
           return createClientAbortResponse(origin);
         }
         const message = error instanceof Error ? error.message : String(error);
@@ -6348,13 +6094,11 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           if (needFairQueue) {
             await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq failure`);
           }
-          await ensureCurrentTrueConcurrencyCancelled('worker_aborted');
           return settleResponse;
         }
         if (needFairQueue) {
           await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq failure`);
         }
-        await ensureCurrentTrueConcurrencyCancelled('worker_aborted', { allowPreActive: true });
         return createTrueConcurrencyUnavailableResponse(origin);
       }
     }
@@ -7290,22 +7034,8 @@ export const __fairQueueTestHooks = {
   resolveTicketStateConfig,
   shouldConsumeTicketResponse,
   slowFailDelay,
-  markHostOverloaded,
-  getHostOverloadedRemainingMs,
   getGlobalOverloadedRemainingSeconds,
-  markSiteOverloaded,
-  markIpOverloaded,
-  getSiteOverloadedRemainingMs,
-  getIpOverloadedRemainingMs,
-  getOverloadedMapSizes: () => ({
-    host: FQ_GLOBAL_STATE.overloadedByHost.size,
-    site: FQ_GLOBAL_STATE.overloadedBySite.size,
-    ip: FQ_GLOBAL_STATE.overloadedByIp.size,
-  }),
-  clearOverloadedByHost: () => {
-    FQ_GLOBAL_STATE.overloadedByHost.clear();
-    FQ_GLOBAL_STATE.overloadedBySite.clear();
-    FQ_GLOBAL_STATE.overloadedByIp.clear();
+  clearFairQueueOverloadState: () => {
     FQ_GLOBAL_STATE.overloadedGlobalUntilMs = 0;
   },
 };

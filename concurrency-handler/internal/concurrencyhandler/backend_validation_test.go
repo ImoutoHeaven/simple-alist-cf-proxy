@@ -37,3 +37,31 @@ func TestReleasedReplayValidatorsRejectCompensationReasons(t *testing.T) {
 		})
 	}
 }
+
+func TestClaimGrantExpiredReasonValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		reason  string
+		wantErr bool
+	}{
+		{name: "hard_expired", reason: "hard_expired"},
+		{name: "waiter_detached_timeout", reason: "waiter_detached_timeout"},
+		{name: "wait_stream_timeout", reason: "wait_stream_timeout"},
+		{name: "invalid_terminal_reason", reason: "not_a_terminal_reason", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateClaimGrantResult(&ClaimGrantResult{Result: "expired", Reason: tt.reason})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("validateClaimGrantResult unexpectedly accepted %q", tt.reason)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateClaimGrantResult rejected %q: %v", tt.reason, err)
+			}
+		})
+	}
+}

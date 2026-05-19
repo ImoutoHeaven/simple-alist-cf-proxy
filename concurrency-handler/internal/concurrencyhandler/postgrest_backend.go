@@ -166,6 +166,14 @@ func (b *postgrestBackend) Acquire(ctx context.Context, req AcquireRequest) (*Ac
 }
 
 func (b *postgrestBackend) ProbeWaitState(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
+	return b.probeWaitStateFunc(ctx, fixedContinueWaitProbeFunc, req)
+}
+
+func (b *postgrestBackend) ProbeAttachedWaitState(ctx context.Context, req AcquireRequest) (*AcquireResult, error) {
+	return b.probeWaitStateFunc(ctx, fixedAttachedWaitProbeFunc, req)
+}
+
+func (b *postgrestBackend) probeWaitStateFunc(ctx context.Context, funcName string, req AcquireRequest) (*AcquireResult, error) {
 	result := &struct {
 		Result      string  `json:"result"`
 		LeaseID     *string `json:"lease_id"`
@@ -178,7 +186,7 @@ func (b *postgrestBackend) ProbeWaitState(ctx context.Context, req AcquireReques
 		ClaimToken  *string `json:"claim_token"`
 	}{}
 	deadlineMs := waitStateProbeDeadlineMs(req)
-	err := b.doRPC(ctx, fixedContinueWaitProbeFunc, map[string]any{
+	err := b.doRPC(ctx, funcName, map[string]any{
 		"p_hostname_hash":     req.HostnameHash,
 		"p_hostname":          req.Hostname,
 		"p_site_bucket":       canonicalBucket(req.SiteBucket),
@@ -410,6 +418,30 @@ func (b *postgrestBackend) Release(ctx context.Context, req ReleaseRequest) (*Re
 }
 
 func (b *postgrestBackend) PromoteWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+	return b.promoteWaitingFunc(ctx, fixedPromoteWaitingFunc, req)
+}
+
+func (b *postgrestBackend) PromoteAttachedWaiting(ctx context.Context, req PromoteWaitingRequest) (*AcquireResult, error) {
+	return b.promoteWaitingFunc(ctx, fixedPromoteAttachedWaitingFunc, req)
+}
+
+func (b *postgrestBackend) usesSQLBackedPromotion() {}
+
+func (b *postgrestBackend) ReleaseWaitReservation(ctx context.Context, req ReleaseWaitReservationRequest) (*ReleaseWaitReservationResult, error) {
+	result := &ReleaseWaitReservationResult{}
+	err := b.doRPC(ctx, fixedReleaseWaitReservationFunc, map[string]any{
+		"p_request_id": req.RequestID,
+		"p_wait_token": req.WaitToken,
+		"p_now_ms":     req.NowMs,
+		"p_consume":    req.Consume,
+	}, result)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (b *postgrestBackend) promoteWaitingFunc(ctx context.Context, funcName string, req PromoteWaitingRequest) (*AcquireResult, error) {
 	result := &struct {
 		Result      string  `json:"result"`
 		LeaseID     *string `json:"lease_id"`
@@ -421,7 +453,7 @@ func (b *postgrestBackend) PromoteWaiting(ctx context.Context, req PromoteWaitin
 		RetryAfter  *int    `json:"retry_after"`
 		ClaimToken  *string `json:"claim_token"`
 	}{}
-	err := b.doRPC(ctx, fixedPromoteWaitingFunc, map[string]any{
+	payload := map[string]any{
 		"p_request_id":            req.RequestID,
 		"p_hostname_hash":         req.HostnameHash,
 		"p_site_bucket":           canonicalBucket(req.SiteBucket),
@@ -431,7 +463,11 @@ func (b *postgrestBackend) PromoteWaiting(ctx context.Context, req PromoteWaitin
 		"p_host_max_in_flight":    b.cfg.Concurrency.Caps.HostMaxInFlight,
 		"p_site_max_in_flight":    b.cfg.Concurrency.Caps.SiteMaxInFlight,
 		"p_site_ip_max_in_flight": b.cfg.Concurrency.Caps.SiteIPMaxInFlight,
-	}, result)
+	}
+	if funcName == fixedPromoteWaitingFunc {
+		payload["p_wait_token"] = req.WaitToken
+	}
+	err := b.doRPC(ctx, funcName, payload, result)
 	if err != nil {
 		return nil, classifyAcquireConflict(err)
 	}
@@ -452,26 +488,26 @@ func (b *postgrestBackend) PromoteWaiting(ctx context.Context, req PromoteWaitin
 	return serviceResult, nil
 }
 
-func (b *postgrestBackend) Cancel(ctx context.Context, req CancelRequest) (*CancelResult, error) {
+func (b *postgrestBackend) TerminalizeWaiting(ctx context.Context, req TerminalizeWaitingRequest) (*TerminalizeWaitingResult, error) {
 	result := &struct {
 		Result string `json:"result"`
 		Reason string `json:"reason"`
 	}{}
-	err := b.doRPC(ctx, fixedCancelFunc, map[string]any{
+	err := b.doRPC(ctx, fixedTerminalizeWaitingFunc, map[string]any{
 		"p_request_id":        req.RequestID,
 		"p_hostname":          req.Hostname,
 		"p_hostname_hash":     req.HostnameHash,
 		"p_site_bucket":       canonicalBucket(req.SiteBucket),
 		"p_ip_bucket":         canonicalBucket(req.IPBucket),
 		"p_hard_expire_at_ms": req.HardExpireAtMs,
-		"p_reason":            req.Reason,
+		"p_terminal_reason":   req.Reason,
 		"p_now_ms":            req.NowMs,
 	}, result)
 	if err != nil {
-		return nil, classifyCancelConflict(err)
+		return nil, classifyTerminalizeWaitingConflict(err)
 	}
-	serviceResult := &CancelResult{Result: result.Result, Reason: result.Reason}
-	if err := validateCancelResult(serviceResult); err != nil {
+	serviceResult := &TerminalizeWaitingResult{Result: result.Result, Reason: result.Reason}
+	if err := validateTerminalizeWaitingResult(serviceResult); err != nil {
 		return nil, err
 	}
 	return serviceResult, nil

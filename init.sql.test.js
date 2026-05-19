@@ -295,6 +295,8 @@ describe('init.sql breaker RPC definitions', () => {
   it('defines true-concurrency request-ledger tables and rpc entrypoints', () => {
     expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_leases/i);
     expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_requests/i);
+    expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_wait_tokens/i);
+    expect(initSql).toMatch(/waiter_lease_until_ms\s+bigint\s+NOT NULL/i);
     expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_host_counters/i);
     expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_site_counters/i);
     expect(initSql).toMatch(/CREATE TABLE IF NOT EXISTS\s+concurrency_site_ip_counters/i);
@@ -305,7 +307,7 @@ describe('init.sql breaker RPC definitions', () => {
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_release\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_claim_grant\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_ack_handoff\(/i);
-    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_cancel\(/i);
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_terminalize_waiting\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_promote_waiting_request\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_acquire\(/i);
     expect(initSql).not.toMatch(/CREATE OR REPLACE FUNCTION\s+cq_release_by_request\(/i);
@@ -328,14 +330,14 @@ describe('init.sql breaker RPC definitions', () => {
     expect(initSql).not.toMatch(/ALTER TABLE\s+concurrency_requests\s+ALTER COLUMN\s+handoff_state\s+SET\s+NOT\s+NULL/i);
   });
 
-  it('encodes fast-only waiting acquisition in cq_acquire', () => {
+  it('encodes provisional fast-only waiting acquisition in cq_acquire', () => {
     const acquireBody = readFunctionBody('cq_acquire');
 
     expect(acquireBody).toMatch(/v_now_ms\s+bigint := COALESCE\(p_now_ms, \(EXTRACT\(EPOCH FROM clock_timestamp\(\)\) \* 1000\)::bigint\)/i);
-    expect(acquireBody).toMatch(/v_waiter_lease_until_ms\s+bigint := p_hard_expire_at_ms/i);
     expect(acquireBody).not.toMatch(/WHERE concurrency_requests\.wait_token = v_wait_token_input/i);
     expect(acquireBody).not.toMatch(/RAISE EXCEPTION 'cq_acquire stale wait token'/i);
-    expect(acquireBody).toMatch(/INSERT INTO concurrency_requests[\s\S]*?state,[\s\S]*?'waiting'[\s\S]*?wait_token,[\s\S]*?waiter_lease_until_ms/i);
+    expect(acquireBody).toMatch(/INSERT INTO concurrency_wait_tokens[\s\S]*?wait_token,[\s\S]*?request_id,[\s\S]*?scope,[\s\S]*?retry_after/i);
+    expect(acquireBody).not.toMatch(/INSERT INTO concurrency_requests[\s\S]*?state,[\s\S]*?'waiting'[\s\S]*?wait_token,[\s\S]*?waiter_lease_until_ms/i);
   });
 
   it('removes legacy wait-state SQL surface from the CQ acquire path', () => {
@@ -355,9 +357,9 @@ describe('init.sql breaker RPC definitions', () => {
     expect(probeBody).toMatch(/reason\s*:=\s*'wait_stream_timeout'/i);
   });
 
-  it('documents request-ledger replay, cancel tombstones, and release idempotency', () => {
+  it('documents request-ledger replay, waiting terminalization, and release idempotency', () => {
     const acquireBody = readFunctionBody('cq_acquire');
-    const cancelBody = readFunctionBody('cq_cancel');
+    const terminalizeBody = readFunctionBody('cq_terminalize_waiting');
     const releaseBody = readFunctionBody('cq_release');
     const expireBody = readFunctionBody('cq_expire_scope');
     const expireActiveBody = readFunctionBody('cq_expire_active_request_if_due');
@@ -383,15 +385,18 @@ describe('init.sql breaker RPC definitions', () => {
     expect(claimBody).toMatch(/handoff_token/i);
     expect(claimBody).toMatch(/handoff_deadline_ms/i);
 
-    expect(cancelBody).toMatch(/INSERT INTO concurrency_requests/i);
-    expect(cancelBody).toMatch(/p_hostname\s+text/i);
-    expect(cancelBody).toMatch(/VALUES \([\s\S]*?'cancelled'[\s\S]*?'request_cancelled'/i);
-    expect(cancelBody).toMatch(/v_hostname\s+text := BTRIM\(COALESCE\(p_hostname, ''\)\)/i);
-    expect(cancelBody).toMatch(/v_request\.hostname IS DISTINCT FROM v_hostname/i);
-    expect(cancelBody).toMatch(/RAISE EXCEPTION 'cq_cancel request_id tuple mismatch'/i);
-    expect(cancelBody).toMatch(/RAISE EXCEPTION 'cq_cancel must release active lease'/i);
-    expect(cancelBody).not.toMatch(/v_hostname_hash,\s*\n\s*v_hostname_hash/i);
-    expect(cancelBody).toMatch(/result := 'noop';[\s\S]*?reason := 'already_terminal'/i);
+    expect(terminalizeBody).toMatch(/p_hostname\s+text/i);
+    expect(terminalizeBody).toMatch(/p_hostname_hash\s+text/i);
+    expect(terminalizeBody).toMatch(/p_site_bucket\s+text/i);
+    expect(terminalizeBody).toMatch(/p_ip_bucket\s+text/i);
+    expect(terminalizeBody).toMatch(/v_hostname\s+text := BTRIM\(COALESCE\(p_hostname, ''\)\)/i);
+    expect(terminalizeBody).toMatch(/v_site_bucket\s+text := COALESCE\(NULLIF\(BTRIM\(COALESCE\(p_site_bucket, ''\)\), ''\), 'unknown'\)/i);
+    expect(terminalizeBody).toMatch(/v_request\.hostname IS DISTINCT FROM v_hostname/i);
+    expect(terminalizeBody).toMatch(/v_request\.hard_expire_at_ms IS DISTINCT FROM p_hard_expire_at_ms/i);
+    expect(terminalizeBody).toMatch(/RAISE EXCEPTION 'cq_terminalize_waiting request_id tuple mismatch'/i);
+    expect(terminalizeBody).toMatch(/RAISE EXCEPTION 'cq_terminalize_waiting must release active lease'/i);
+    expect(terminalizeBody).toMatch(/IF v_request\.state = 'waiting' THEN[\s\S]*?state = 'released'[\s\S]*?terminal_reason = v_terminal_reason[\s\S]*?result := 'released'/i);
+    expect(terminalizeBody).toMatch(/result := 'noop';[\s\S]*?reason := 'already_terminal'/i);
 
     expect(releaseBody).toMatch(/lease_token/i);
     expect(releaseBody).toMatch(/state\s*=\s*'released'/i);
@@ -715,21 +720,23 @@ describe('init.sql heartbeat contract definitions', () => {
     const helperBody = readFunctionBody('cq_apply_request_terminal_transition');
 
     expect(helperBody).toMatch(/heartbeat_state\s*=\s*'none'/i);
-    expect(helperBody).not.toMatch(/heartbeat_deadline_ms\s*=\s*NULL/i);
-    expect(helperBody).not.toMatch(/heartbeat_grace_until_ms\s*=\s*NULL/i);
+    expect(helperBody).toMatch(/heartbeat_deadline_ms\s*=\s*NULL/i);
+    expect(helperBody).toMatch(/heartbeat_grace_until_ms\s*=\s*NULL/i);
     expect(helperBody).toMatch(/heartbeat_terminal_reason\s*=\s*p_terminal_reason/i);
     expect(helperBody).not.toMatch(/heartbeat_generation\s*=\s*0/i);
     expect(helperBody).not.toMatch(/heartbeat_last_at_ms\s*=\s*NULL/i);
   });
 
-  it('keeps terminal renewal owners non-stale until the preserved heartbeat contract expires while allowing custom ticket tables', () => {
+  it('requires active live heartbeat state for ticket renewal ownership while allowing custom ticket tables', () => {
     const helperBody = readFunctionBody('cq_heartbeat_touch_ticket_renewal');
 
     expect(helperBody).toMatch(/p_ticket_table_name\s+text\s+DEFAULT\s+'DOWNLOAD_TICKET_STATE_TABLE'/i);
     expect(helperBody).toMatch(/v_ticket_table_name\s+text\s*:=\s*COALESCE\(NULLIF\(BTRIM\(COALESCE\(p_ticket_table_name,\s*''\)\),\s*''\),\s*'DOWNLOAD_TICKET_STATE_TABLE'\)/i);
     expect(helperBody).toMatch(/SELECT \* FROM %1\$I WHERE "TICKET_HASH" = \$1 FOR UPDATE/i);
     expect(helperBody).toMatch(/WHERE lease_id = v_ticket\."IDLE_RENEW_OWNER_LEASE_ID"/i);
-    expect(helperBody).not.toMatch(/AND state = 'active'/i);
+    expect(helperBody).toMatch(/v_owner_request\.state\s*=\s*'active'/i);
+    expect(helperBody).toMatch(/COALESCE\(v_owner_request\.heartbeat_state,\s*'none'\)\s+IN\s*\('connected',\s*'grace'\)/i);
+    expect(helperBody).toMatch(/COALESCE\(v_owner_request\.heartbeat_deadline_ms,\s*0\)\s*>\s*v_now_ms/i);
     expect(helperBody).toMatch(/UPDATE %1\$I/i);
   });
 
