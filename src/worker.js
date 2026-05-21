@@ -84,6 +84,217 @@ const SITE_BUCKET_MODES = new Set(['host', 'sharepoint', 'googledrive']);
 
 const nowMs = () => Date.now();
 
+const SENSITIVE_LOG_KEY_FRAGMENTS = [
+  'token',
+  'secret',
+  'auth',
+  'payload',
+  'signature',
+  'cookie',
+  'authorization',
+];
+const RAW_CLIENT_IP_LOG_KEYS = new Set([
+  'clientip',
+  'client_ip',
+  'ip',
+  'remoteip',
+  'remote_ip',
+  'cfconnectingip',
+  'cf_connecting_ip',
+  'xforwardedfor',
+  'x_forwarded_for',
+]);
+const MAX_LOG_VALUE_LENGTH = 120;
+const OMIT_LOG_FIELD = Symbol('OMIT_LOG_FIELD');
+
+function normalizeLogKey(key) {
+  return String(key).replace(/[^a-z0-9]/gi, '').toLowerCase();
+}
+
+function isRawClientIpLogValue(value) {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const text = value.trim();
+  const addressText = text.replace(/\/\d{1,3}$/, '');
+  if (/^(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(addressText)) {
+    return true;
+  }
+  return /^(?:[a-f0-9]{0,4}:){2,}[a-f0-9]{0,4}(?:%[\w.-]+)?$/i.test(addressText);
+}
+
+function shouldOmitLogField(key, value) {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  const normalizedKey = normalizeLogKey(key);
+  return RAW_CLIENT_IP_LOG_KEYS.has(normalizedKey) || isRawClientIpLogValue(value);
+}
+
+function shouldRedactLogField(key) {
+  const normalizedKey = normalizeLogKey(key);
+  return SENSITIVE_LOG_KEY_FRAGMENTS.some((fragment) => normalizedKey.includes(fragment));
+}
+
+function stripLogUrlQuery(value) {
+  if (value instanceof URL) {
+    return `${value.origin}${value.pathname}`;
+  }
+  if (typeof value !== 'string') {
+    return value;
+  }
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return value;
+  }
+}
+
+function sanitizeLogStructuredValue(value, seen = new WeakSet()) {
+  if (isRawClientIpLogValue(value)) {
+    return OMIT_LOG_FIELD;
+  }
+  if (typeof value === 'string' || value instanceof URL) {
+    return stripLogUrlQuery(value);
+  }
+  if (!value || typeof value !== 'object' || value instanceof URL) {
+    return value;
+  }
+  if (seen.has(value)) {
+    return '[Circular]';
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    const sanitizedItems = [];
+    for (const item of value) {
+      const sanitizedItem = sanitizeLogStructuredValue(item, seen);
+      if (sanitizedItem !== OMIT_LOG_FIELD) {
+        sanitizedItems.push(sanitizedItem);
+      }
+    }
+    seen.delete(value);
+    return sanitizedItems;
+  }
+
+  const sanitizedObject = {};
+  for (const [key, childValue] of Object.entries(value)) {
+    if (shouldOmitLogField(key, childValue)) {
+      continue;
+    }
+    if (shouldRedactLogField(key)) {
+      sanitizedObject[key] = '[redacted]';
+      continue;
+    }
+    const sanitizedChild = sanitizeLogStructuredValue(childValue, seen);
+    if (sanitizedChild !== OMIT_LOG_FIELD) {
+      sanitizedObject[key] = sanitizedChild;
+    }
+  }
+  seen.delete(value);
+  return sanitizedObject;
+}
+
+function sanitizeLogValue(value) {
+  const sanitizedValue = sanitizeLogStructuredValue(value);
+  let text;
+  if (sanitizedValue instanceof URL || typeof sanitizedValue === 'string') {
+    text = stripLogUrlQuery(sanitizedValue);
+  } else if (typeof sanitizedValue === 'number' || typeof sanitizedValue === 'boolean' || typeof sanitizedValue === 'bigint') {
+    text = String(sanitizedValue);
+  } else if (sanitizedValue === null) {
+    text = 'null';
+  } else if (sanitizedValue === undefined) {
+    text = 'undefined';
+  } else {
+    try {
+      text = JSON.stringify(sanitizedValue);
+    } catch {
+      text = String(sanitizedValue);
+    }
+  }
+
+  text = String(text).replace(/\s+/g, ' ').trim();
+  if (text.length > MAX_LOG_VALUE_LENGTH) {
+    return `${text.slice(0, MAX_LOG_VALUE_LENGTH - 3)}...`;
+  }
+  return text;
+}
+
+function logEvent(level, scope, event, fields = {}) {
+  try {
+    const safeScope = sanitizeLogValue(scope || 'Worker');
+    const safeEvent = sanitizeLogValue(event || 'event');
+    const parts = [];
+    if (fields && typeof fields === 'object') {
+      for (const [key, value] of Object.entries(fields)) {
+        if (shouldOmitLogField(key, value)) {
+          continue;
+        }
+        const safeKey = sanitizeLogValue(key);
+        const safeValue = shouldRedactLogField(key) ? '[redacted]' : sanitizeLogValue(value);
+        parts.push(`${safeKey}=${safeValue}`);
+      }
+    }
+
+    const suffix = parts.length > 0 ? ` ${parts.join(' ')}` : '';
+    const line = `[${safeScope}] ${safeEvent}${suffix}`;
+    if (level === 'warn') {
+      console.warn(line);
+    } else if (level === 'error') {
+      console.error(line);
+    } else {
+      console.log(line);
+    }
+  } catch {
+    // Observability must never affect request handling.
+  }
+}
+
+function logTerminalResponse(response, reason, fields = {}) {
+  try {
+    const status = Number.isFinite(response?.status) ? response.status : 'unknown';
+    if (status !== 200 && status !== 206) {
+      logEvent('info', 'Terminal', 'response', {
+        status,
+        reason,
+        ...fields,
+      });
+    }
+  } catch {
+    // Observability must never affect request handling.
+  }
+  return response;
+}
+
+function bindWaitUntil(ctx, promise, scope, event, fields = {}) {
+  const waitUntilFields = {
+    scope,
+    event,
+    ...fields,
+  };
+  const observedPromise = Promise.resolve(promise).then(
+    (value) => {
+      logEvent('info', 'CleanupScheduler', 'wait_until_done', waitUntilFields);
+      return value;
+    },
+    (error) => {
+      logEvent('error', 'CleanupScheduler', 'wait_until_failed', waitUntilFields);
+      throw error;
+    },
+  );
+
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    logEvent('info', 'CleanupScheduler', 'wait_until_bound', waitUntilFields);
+    ctx.waitUntil(observedPromise);
+  } else {
+    logEvent('info', 'CleanupScheduler', 'wait_until_inline', waitUntilFields);
+  }
+
+  return observedPromise;
+}
+
 const normalizeHostnameValue = (hostname) => {
   if (typeof hostname !== 'string') {
     return '';
@@ -179,7 +390,7 @@ const cancelResponseBody = async (response) => {
     await response.body.cancel();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.warn('[Upstream] Failed to cancel unused response body:', message);
+    logEvent('warn', 'Upstream', 'cancel_body_failed', { message });
   }
 };
 
@@ -1537,7 +1748,7 @@ const normalizeControllerPathActions = (downloadDecision) => {
       continue;
     }
     if (!VALID_ACTIONS.has(token)) {
-      console.warn(`[controller] unsupported pathAction '${action}' ignored`);
+      logEvent('warn', 'Controller', 'unsupported_path_action', { action });
       continue;
     }
     if (!seen.has(token)) {
@@ -1555,7 +1766,7 @@ const extractControllerOriginModes = (downloadDecision, bindingConfig) => {
     return parseCheckOriginEnv(bindingConfig?.defaultModes || '');
   }
   if (typeof downloadDecision.checkOriginMode !== 'string') {
-    console.warn('[controller] checkOriginMode is not a string, ignore');
+    logEvent('warn', 'Controller', 'check_origin_mode_non_string');
     return parseCheckOriginEnv(bindingConfig?.defaultModes || '');
   }
   const parsed = parseCheckOriginEnv(downloadDecision.checkOriginMode);
@@ -2711,6 +2922,13 @@ const createConcurrencyHandlerClient = (config) => {
       if (typeof plan.waitToken === 'string' && plan.waitToken) {
         throw new Error('[CQ] fast acquire does not accept waitToken');
       }
+      const startedAt = Date.now();
+      const fields = {
+        requestId: plan.requestId,
+        host: plan.hostname,
+        phase: 'acquire',
+      };
+      logEvent('info', 'CQ', 'acquire_start', fields);
       const payload = {
         hostname: plan.hostname,
         hostnameHash: plan.hostnameHash,
@@ -2725,12 +2943,26 @@ const createConcurrencyHandlerClient = (config) => {
         signal,
         allowedStatuses: [200, 409, 410],
       });
-      return normalizeTrueConcurrencyAcquireResult(data, {
+      const result = normalizeTrueConcurrencyAcquireResult(data, {
         hardExpireAtMs: plan.hardExpireAtMs,
       });
+      logEvent('info', 'CQ', 'acquire_result', {
+        ...fields,
+        result: result.result,
+        reason: result.reason,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return result;
     },
 
     async wait(_ctx, plan, signal) {
+      const startedAt = Date.now();
+      const fields = {
+        requestId: plan.requestId,
+        host: plan.hostname,
+        phase: 'wait',
+      };
+      logEvent('info', 'CQ', 'wait_start', fields);
       const response = await postEventStream(waitUrl, {
         hostnameHash: plan.hostnameHash,
         hostname: plan.hostname,
@@ -2746,38 +2978,70 @@ const createConcurrencyHandlerClient = (config) => {
         allowedStatuses: [200, 409, 410],
       });
 
-      const contentType = String(response?.headers?.get?.('content-type') || '').toLowerCase();
-      if (contentType.includes('text/event-stream')) {
-        const { accepted, final } = await readSseResult(response, signal, TRUE_CONCURRENCY_WAIT_FINAL_RESULTS);
-        return {
-          accepted,
-          final: normalizeTrueConcurrencyWaitResult(final, {
-            hardExpireAtMs: plan.hardExpireAtMs,
-          }),
-        };
-      }
-
-      if (response.status === 200) {
-        throw new Error('[CQ] CQ wait expected text/event-stream response for status 200');
-      }
-
-      let data;
       try {
-        data = await response.json();
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`[CQ] handler response parse failed: ${message}`);
-      }
+        const contentType = String(response?.headers?.get?.('content-type') || '').toLowerCase();
+        if (contentType.includes('text/event-stream')) {
+          const { accepted, final } = await readSseResult(response, signal, TRUE_CONCURRENCY_WAIT_FINAL_RESULTS);
+          const normalizedFinal = normalizeTrueConcurrencyWaitResult(final, {
+            hardExpireAtMs: plan.hardExpireAtMs,
+          });
+          logEvent('info', 'CQ', 'wait_result', {
+            ...fields,
+            result: normalizedFinal.result,
+            reason: normalizedFinal.reason,
+            elapsedMs: Date.now() - startedAt,
+          });
+          return {
+            accepted,
+            final: normalizedFinal,
+          };
+        }
 
-      return {
-        accepted: null,
-        final: normalizeTrueConcurrencyWaitResult(data, {
+        if (response.status === 200) {
+          throw new Error('[CQ] CQ wait expected text/event-stream response for status 200');
+        }
+
+        let data;
+        try {
+          data = await response.json();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(`[CQ] handler response parse failed: ${message}`);
+        }
+
+        const normalizedFinal = normalizeTrueConcurrencyWaitResult(data, {
           hardExpireAtMs: plan.hardExpireAtMs,
-        }),
-      };
+        });
+        logEvent('info', 'CQ', 'wait_result', {
+          ...fields,
+          result: normalizedFinal.result,
+          reason: normalizedFinal.reason,
+          elapsedMs: Date.now() - startedAt,
+        });
+        return {
+          accepted: null,
+          final: normalizedFinal,
+        };
+      } catch (error) {
+        if (isAbortError(error) || signal?.aborted) {
+          logEvent('warn', 'CQ', 'wait_abort', {
+            ...fields,
+            elapsedMs: Date.now() - startedAt,
+          });
+        }
+        throw error;
+      }
     },
 
     async release(_ctx, lease, reason, signal) {
+      const startedAt = Date.now();
+      const fields = {
+        requestId: lease?.requestId,
+        host: lease?.hostname,
+        phase: 'release',
+        reason,
+      };
+      logEvent('info', 'CQ', 'release_start', fields);
       const { data } = await postJson(
         releaseUrl,
         buildTrueConcurrencyReleasePayload(lease, reason),
@@ -2786,10 +3050,22 @@ const createConcurrencyHandlerClient = (config) => {
           signal,
         },
       );
-      return normalizeTrueConcurrencyReleaseResult(data);
+      const result = normalizeTrueConcurrencyReleaseResult(data);
+      logEvent('info', 'CQ', 'release_result', {
+        ...fields,
+        result: result.result,
+        reason: result.reason || reason,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return result;
     },
 
     async claim(_ctx, claim, signal) {
+      const startedAt = Date.now();
+      const fields = {
+        requestId: claim.requestId,
+        phase: 'claim',
+      };
       const { data } = await postJson(
         claimUrl,
         {
@@ -2803,12 +3079,24 @@ const createConcurrencyHandlerClient = (config) => {
           allowedStatuses: [200, 409, 410],
         },
       );
-      return normalizeTrueConcurrencyClaimResult(data, {
+      const result = normalizeTrueConcurrencyClaimResult(data, {
         hardExpireAtMs: claim.hardExpireAtMs,
       });
+      logEvent('info', 'CQ', 'claim_result', {
+        ...fields,
+        result: result.result,
+        reason: result.reason,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return result;
     },
 
     async ackHandoff(_ctx, handoff, signal) {
+      const startedAt = Date.now();
+      const fields = {
+        requestId: handoff.requestId,
+        phase: 'ack_handoff',
+      };
       const { data } = await postJson(
         ackHandoffUrl,
         {
@@ -2822,7 +3110,14 @@ const createConcurrencyHandlerClient = (config) => {
           allowedStatuses: [200, 409, 410],
         },
       );
-      return normalizeTrueConcurrencyAckHandoffResult(data);
+      const result = normalizeTrueConcurrencyAckHandoffResult(data);
+      logEvent('info', 'CQ', 'ack_handoff_result', {
+        ...fields,
+        result: result.result,
+        reason: result.reason,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return result;
     },
 
     async connectHeartbeat(_ctx, identity, signal = new AbortController().signal) {
@@ -2830,6 +3125,11 @@ const createConcurrencyHandlerClient = (config) => {
         fieldName: 'concurrencyHandlerConfig.heartbeat',
         required: true,
       });
+      const heartbeatFields = {
+        requestId: identity?.requestId,
+        phase: 'heartbeat',
+      };
+      logEvent('info', 'CQ', 'heartbeat_start', heartbeatFields);
       const helloPayload = {
         type: 'hello',
         requestId: readTrueConcurrencyHeartbeatRequiredString(identity, 'requestId', 'heartbeat hello'),
@@ -2868,11 +3168,17 @@ const createConcurrencyHandlerClient = (config) => {
         ws.send(JSON.stringify(helloPayload));
         const helloMessage = await helloAckPromise;
         if (helloMessage?.type === 'terminal') {
+          logEvent('warn', 'CQ', 'heartbeat_terminal', {
+            ...heartbeatFields,
+            result: helloMessage.result,
+            reason: helloMessage.reason,
+          });
           throw createTrueConcurrencyHeartbeatTerminalError(
             normalizeTrueConcurrencyHeartbeatTerminal(helloMessage),
           );
         }
         const helloAck = normalizeTrueConcurrencyHelloAck(helloMessage);
+        logEvent('info', 'CQ', 'heartbeat_ready', heartbeatFields);
 
         const session = {
           ws,
@@ -2905,6 +3211,11 @@ const createConcurrencyHandlerClient = (config) => {
             }));
             const heartbeatMessage = await heartbeatPromise;
             if (heartbeatMessage?.type === 'terminal') {
+              logEvent('warn', 'CQ', 'heartbeat_terminal', {
+                ...heartbeatFields,
+                result: heartbeatMessage.result,
+                reason: heartbeatMessage.reason,
+              });
               throw createTrueConcurrencyHeartbeatTerminalError(
                 normalizeTrueConcurrencyHeartbeatTerminal(heartbeatMessage),
               );
@@ -2963,14 +3274,20 @@ const createConcurrencyReleaseController = ({ client, ctx, lease, label }) => {
       return true;
     }
     try {
+      logEvent('info', 'CQ', 'release_start', { host: label, reason });
       const result = await client.release(ctx, lease, reason);
+      logEvent('info', 'CQ', 'release_result', {
+        host: label,
+        result: result?.result,
+        reason: result?.reason || reason,
+      });
       if (result?.result === 'released' || result?.result === 'noop' || result?.result === 'expired') {
         settled = true;
         return true;
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[CQ] release failed for ${label}:`, message);
+      logEvent('warn', 'CQ', 'release_failed', { host: label, message });
     }
     return false;
   };
@@ -3010,16 +3327,18 @@ const createConcurrencyReleaseController = ({ client, ctx, lease, label }) => {
 
           for (const delayMs of TRUE_CONCURRENCY_RELEASE_RETRY_DELAYS_MS.slice(1)) {
             await sleepMs(delayMs);
+            logEvent('warn', 'CQ', 'release_retry', { host: label, reason: firstReason });
             if (await attemptRelease(firstReason)) {
               return true;
             }
           }
 
+          logEvent('error', 'CQ', 'release_exhausted', { host: label, reason: firstReason });
           return false;
         })();
-        if (ctx && typeof ctx.waitUntil === 'function') {
-          ctx.waitUntil(fullReleasePromise);
-        }
+        bindWaitUntil(ctx, fullReleasePromise, 'CQ', 'release_cleanup', {
+          reason: firstReason,
+        });
       }
       return fullReleasePromise;
     },
@@ -3406,14 +3725,19 @@ const createTrueConcurrencyHeartbeatManager = ({
   clientSignal?.addEventListener?.('abort', onClientAbort, { once: true });
 
   const ensureCleanup = (reason = '') => {
+    logEvent('info', 'CQ', 'heartbeat_cleanup', {
+      requestId: plan?.requestId,
+      host: plan?.hostname,
+      reason,
+    });
     stop(reason);
     const cleanupPromise = Promise.allSettled([
       heartbeatInFlight,
       reconnectTask,
     ].filter(Boolean));
-    if (ctx && typeof ctx.waitUntil === 'function') {
-      ctx.waitUntil(cleanupPromise);
-    }
+    bindWaitUntil(ctx, cleanupPromise, 'CQ', 'heartbeat_cleanup', {
+      reason,
+    });
     return cleanupPromise;
   };
 
@@ -3584,11 +3908,18 @@ const finalizeFairQueueContext = async ({ fairQueueClient, ctx, fqContext, phase
         clearReleasedFairQueueMetadata(fqContext);
         return true;
       }
-      console.warn(`[Fair Queue] releaseSlot exhausted during ${phase} for host=${fqContext.hostname}`);
+      logEvent('warn', 'FQ', 'release_exhausted', {
+        phase,
+        host: fqContext.hostname,
+      });
       return false;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[Fair Queue] releaseSlot failed during ${phase}:`, message);
+      logEvent('warn', 'FQ', 'release_failed', {
+        phase,
+        host: fqContext.hostname,
+        message,
+      });
       return false;
     }
   }
@@ -3786,7 +4117,7 @@ const createSlotHandlerClient = (config) => {
 	          : null;
 	        const invocationEpoch = readFairQueueInvocationEpoch(payload?.invocationEpoch);
 	        if (!queryToken || invocationEpoch === null) {
-	          console.error(`[FQ] slot-handler ${result} response missing accepted ownership fields`);
+	          logEvent('error', 'FQ', 'accepted_ownership_missing', { result });
 	          return false;
 	        }
 	        const expectedQueryToken = typeof fqContext?.queryToken === 'string' && fqContext.queryToken
@@ -3799,11 +4130,17 @@ const createSlotHandlerClient = (config) => {
 	          && expectedInvocationEpoch !== null
 	          && (queryToken !== expectedQueryToken || invocationEpoch !== expectedInvocationEpoch)
 	        ) {
-	          console.error(`[FQ] slot-handler ${result} response ownership mismatch accepted tuple`);
+	          logEvent('error', 'FQ', 'accepted_ownership_mismatch', { result });
 	          return false;
 	        }
 	        fqContext.queryToken = queryToken;
 	        fqContext.invocationEpoch = invocationEpoch;
+	        logEvent('info', 'FQ', 'accepted', {
+	          requestId: fqContext.requestId,
+	          host: fqContext.hostname,
+	          mode: admissionMode,
+	          result,
+	        });
 	        return true;
 	      };
 
@@ -3816,6 +4153,13 @@ const createSlotHandlerClient = (config) => {
         if (normalizedReason === 'overload_global') {
           markGlobalOverloaded(retryAfter);
         }
+        logEvent('warn', 'FQ', 'overload_fast_path', {
+          requestId: fqContext.requestId,
+          host: fqContext.hostname,
+          mode: admissionMode,
+          reason: normalizedReason,
+          retryAfter,
+        });
         return {
           kind: 'overloaded',
           scope: normalizedReason.replace(/^overload_/, '') || 'unknown',
@@ -3831,11 +4175,11 @@ const createSlotHandlerClient = (config) => {
               return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
             if (typeof finalPayload?.slotToken !== 'string' || !finalPayload.slotToken) {
-              console.error('[FQ] slot-handler granted response missing slotToken');
+              logEvent('error', 'FQ', 'granted_slot_token_missing');
               return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
             if (typeof finalPayload?.releaseOwnerRequired !== 'boolean') {
-              console.error('[FQ] slot-handler granted response missing boolean releaseOwnerRequired');
+              logEvent('error', 'FQ', 'granted_release_owner_required_missing');
               return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
             }
             const { attemptVersion, attemptTicket } = readSlotHandlerAttempt(finalPayload);
@@ -3852,7 +4196,12 @@ const createSlotHandlerClient = (config) => {
             if (typeof testHooks?.onGrantPromotion === 'function') {
               testHooks.onGrantPromotion(fqContext);
             }
-            console.log(`[FQ] slot granted via slot-handler host=${fqContext.hostname}`);
+            logEvent('info', 'FQ', 'slot_granted', {
+              host: fqContext.hostname,
+              requestId: fqContext.requestId,
+              attemptVersion: fqContext.attemptVersion,
+              attemptTicket: fqContext.attemptTicket,
+            });
             return {
               kind: 'granted',
               attemptVersion: fqContext.attemptVersion,
@@ -3907,7 +4256,7 @@ const createSlotHandlerClient = (config) => {
                 : null,
             };
           default:
-            console.error(`[FQ] unexpected slot-handler result: ${finalPayload?.result}`);
+            logEvent('error', 'FQ', 'unexpected_slot_handler_result', { result: finalPayload?.result });
             return { kind: 'timeout', reason: 'slot-handler-unexpected' };
         }
       };
@@ -3922,11 +4271,26 @@ const createSlotHandlerClient = (config) => {
         throw new Error('[FQ] initial wait request must not include ownership tokens');
       }
       if (Date.now() >= waitDeadlineMs) {
+        logEvent('warn', 'FQ', 'terminal_result', {
+          requestId,
+          host: fqContext.hostname,
+          mode: admissionMode,
+          result: 'timeout',
+          reason: 'worker_deadline_exceeded',
+        });
         return { kind: 'timeout', reason: 'worker_deadline_exceeded' };
       }
 
       const globalOverloadedRemain = getGlobalOverloadedRemainingSeconds(startedAt);
       if (globalOverloadedRemain > 0) {
+        logEvent('warn', 'FQ', 'overload_fast_path', {
+          requestId,
+          host: fqContext.hostname,
+          mode: admissionMode,
+          result: 'overloaded',
+          reason: 'overload_global',
+          retryAfter: globalOverloadedRemain,
+        });
         return {
           kind: 'overloaded',
           scope: 'global',
@@ -3945,6 +4309,12 @@ const createSlotHandlerClient = (config) => {
         requestId,
         admissionMode,
       };
+      logEvent('info', 'FQ', 'wait_start', {
+        requestId,
+        host: fqContext.hostname,
+        mode: admissionMode,
+        phase: 'wait',
+      });
       if (admissionMode === 'queue_breaker') {
         payload.breakerEnabled = true;
         if (Number.isFinite(fqContext?.openCapSeconds)) {
@@ -4007,7 +4377,20 @@ const createSlotHandlerClient = (config) => {
               },
             },
           );
-          return finalizeWaitResult(final);
+          const result = finalizeWaitResult(final);
+          if (result.kind !== 'granted') {
+            logEvent('info', 'FQ', 'terminal_result', {
+              requestId,
+              host: fqContext.hostname,
+              mode: admissionMode,
+              result: result.kind,
+              reason: result.reason,
+              retryAfter: result.retryAfter,
+              attemptVersion: result.attemptVersion,
+              attemptTicket: result.attemptTicket,
+            });
+          }
+          return result;
         }
 
         let data;
@@ -4024,12 +4407,28 @@ const createSlotHandlerClient = (config) => {
             && readFairQueueInvocationEpoch(data?.invocationEpoch) === null
           );
           if (setupOverloadWithoutOwnership) {
-            return buildOverloadedResult(data?.reason, data?.retryAfter);
+            const result = buildOverloadedResult(data?.reason, data?.retryAfter);
+            logEvent('info', 'FQ', 'terminal_result', {
+              requestId,
+              host: fqContext.hostname,
+              mode: admissionMode,
+              result: result.kind,
+              reason: result.reason,
+              retryAfter: result.retryAfter,
+            });
+            return result;
           }
         }
 
         if (data?.result === 'conflict') {
           const hasReason = Object.prototype.hasOwnProperty.call(data, 'reason');
+          logEvent('info', 'FQ', 'terminal_result', {
+            requestId,
+            host: fqContext.hostname,
+            mode: admissionMode,
+            result: 'conflict',
+            reason: hasReason ? data.reason : null,
+          });
           return {
             kind: 'conflict',
             reason: hasReason ? data.reason : null,
@@ -4037,7 +4436,7 @@ const createSlotHandlerClient = (config) => {
         }
 
         if (typeof data?.result === 'string') {
-          console.error(`[FQ] slot-handler /wait setup must use SSE for result=${data.result}`);
+          logEvent('error', 'FQ', 'setup_requires_sse', { result: data.result });
           return { kind: 'timeout', reason: 'slot-handler-invalid-response' };
         }
         throw new Error(`[FQ] unexpected slot-handler setup result: ${data?.result}`);
@@ -4046,13 +4445,27 @@ const createSlotHandlerClient = (config) => {
           throw createAbortError();
         }
         if (localAbortTriggered && !signal?.aborted) {
+          logEvent('warn', 'FQ', 'terminal_result', {
+            requestId,
+            host: fqContext.hostname,
+            mode: admissionMode,
+            result: 'timeout',
+            reason: 'worker_deadline_exceeded',
+          });
           return { kind: 'timeout', reason: 'worker_deadline_exceeded' };
         }
         if (isAbortError(error)) {
           throw createAbortError();
         }
         const message = error instanceof Error ? error.message : String(error);
-        console.error('[FQ] slot-handler wait error:', message);
+        logEvent('error', 'FQ', 'wait_error', { message });
+        logEvent('warn', 'FQ', 'terminal_result', {
+          requestId,
+          host: fqContext.hostname,
+          mode: admissionMode,
+          result: 'timeout',
+          reason: 'slot-handler-unreachable',
+        });
         return { kind: 'timeout', reason: 'slot-handler-unreachable' };
       } finally {
         clearTimeout(waitTimer);
@@ -4089,7 +4502,7 @@ const createSlotHandlerClient = (config) => {
         : null;
       const invocationEpoch = readFairQueueInvocationEpoch(fqContext.invocationEpoch);
       if (!hostname || !hostnameHash || !ipBucket || !siteBucket || !queryToken || invocationEpoch === null) {
-        console.error('[FQ] releaseSlot skipped: missing full release identity');
+        logEvent('error', 'FQ', 'release_identity_missing', { host: hostname });
         return false;
       }
       const hitUpstreamAtMs = Number.isFinite(fqContext.hitUpstreamAtMs)
@@ -4117,11 +4530,23 @@ const createSlotHandlerClient = (config) => {
       let lastError = null;
       for (let attempt = 1; attempt <= releaseMaxAttempts; attempt += 1) {
         let shouldRetry = false;
+        logEvent('info', 'FQ', 'release_start', {
+          requestId: fqContext.requestId,
+          host: fqContext.hostname,
+          mode: fqContext.admissionMode,
+          phase: 'release',
+        });
         try {
           const res = await fetchWithTimeout(releaseUrl, payload, releaseTimeoutMs, undefined, routingHeaders);
 
           if (res.ok) {
-            console.log(`[FQ] slot released via slot-handler host=${fqContext.hostname}`);
+            logEvent('info', 'FQ', 'slot_released', { host: fqContext.hostname });
+            logEvent('info', 'FQ', 'release_result', {
+              requestId: fqContext.requestId,
+              host: fqContext.hostname,
+              mode: fqContext.admissionMode,
+              result: 'released',
+            });
             return true;
           }
 
@@ -4134,6 +4559,12 @@ const createSlotHandlerClient = (config) => {
 
         if (shouldRetry && attempt < releaseMaxAttempts) {
           const backoffMs = Math.min(releaseMaxBackoffMs, releaseBaseBackoffMs * (2 ** (attempt - 1)));
+          logEvent('warn', 'FQ', 'release_retry', {
+            requestId: fqContext.requestId,
+            host: fqContext.hostname,
+            mode: fqContext.admissionMode,
+            reason: lastError?.message,
+          });
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
           continue;
         }
@@ -4142,7 +4573,13 @@ const createSlotHandlerClient = (config) => {
       }
 
       const message = lastError instanceof Error ? lastError.message : String(lastError || 'unknown error');
-      console.error('[FQ] releaseSlot error (slot-handler):', message);
+      logEvent('error', 'FQ', 'release_error', { message });
+      logEvent('error', 'FQ', 'release_exhausted', {
+        requestId: fqContext.requestId,
+        host: fqContext.hostname,
+        mode: fqContext.admissionMode,
+        reason: message,
+      });
       return false;
     },
 
@@ -4165,13 +4602,33 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     });
   }
 
+  const terminal = (response, reason, fields = {}) => logTerminalResponse(response, reason, {
+    phase: 'download',
+    pathClass: 'download',
+    ...fields,
+  });
+  const upstreamTerminalReason = (status) => {
+    if (Number.isInteger(status) && status >= 300 && status < 400) {
+      return 'upstream_returned_3xx';
+    }
+    if (Number.isInteger(status) && status >= 500) {
+      return 'upstream_generated_5xx';
+    }
+    if (Number.isInteger(status) && status >= 400) {
+      return 'upstream_generated_4xx';
+    }
+    return 'upstream_terminal_status';
+  };
+
   if (path === null || typeof path !== "string") {
-    return createErrorResponse(origin, 400, "invalid path encoding");
+    return terminal(createErrorResponse(origin, 400, "invalid path encoding"), 'invalid_path_encoding');
   }
 
   const downloadDecision = ctx && ctx.controllerState ? ctx.controllerState?.decision?.download : null;
   if (!downloadDecision) {
-    return createErrorResponse(origin, 503, "controller decision unavailable");
+    return terminal(createErrorResponse(origin, 503, "controller decision unavailable"), 'controller_state_unavailable', {
+      controllerGate: 'download_decision',
+    });
   }
 
   const actions = normalizeControllerPathActions(downloadDecision);
@@ -4179,7 +4636,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   // Handle block action
   if (actions.includes('block')) {
-    return createErrorResponse(origin, 403, "access denied");
+    return terminal(createErrorResponse(origin, 403, "access denied"), 'controller_blocked');
   }
 
   const needOriginCheck = originCheckModes.length > 0;
@@ -4200,18 +4657,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       );
 
       if (!cfResult.allowed) {
-        console.error(`[CF Rate Limiter] Blocked IP subnet: ${cfResult.ipSubnet}`);
-        return new Response('429 Too Many Requests - Rate limit exceeded', {
+        logEvent('error', 'RateLimit', 'cf_blocked');
+        return terminal(new Response('429 Too Many Requests - Rate limit exceeded', {
           status: 429,
           headers: {
             'Content-Type': 'text/plain',
             'Retry-After': '60',
           },
-        });
+        }), 'cf_rate_limited');
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error('[CF Rate Limiter] Error during check:', message);
+      logEvent('error', 'RateLimit', 'cf_check_failed', { message });
       // Continue processing if rate limiter check fails.
     }
   }
@@ -4221,74 +4678,72 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (remaining > 0) {
       await slowFailDelay();
       const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
-      console.warn(
-        '[Rate Limit] Blocked by local cache:',
-        ipSubnet,
-        `limit=${config.ipSubnetLimit}`,
-        `window=${windowLabel}`,
-        `retryAfter=${remaining}s`
-      );
-      return createRateLimitResponse(
+      logEvent('warn', 'RateLimit', 'local_cache_blocked', {
+        limit: config.ipSubnetLimit,
+        window: windowLabel,
+        retryAfter: remaining,
+      });
+      return terminal(createRateLimitResponse(
         origin,
         ipSubnet,
         config.ipSubnetLimit,
         windowLabel,
         remaining
-      );
+      ), 'local_rate_limited');
     }
   }
 
   const payload = url.searchParams.get("payload") ?? "";
   const payloadSign = url.searchParams.get("payloadSign") ?? "";
   if (!payload) {
-    return createUnauthorizedResponse(origin, "payload missing");
+    return terminal(createUnauthorizedResponse(origin, "payload missing"), 'payload_missing');
   }
   if (!payloadSign) {
-    return createUnauthorizedResponse(origin, "payloadSign missing");
+    return terminal(createUnauthorizedResponse(origin, "payloadSign missing"), 'payload_sign_missing');
   }
 
   const payloadVerifyResult = await verifySignature(config.token, payload, payloadSign);
   if (payloadVerifyResult !== "") {
-    return createUnauthorizedResponse(origin, payloadVerifyResult);
+    return terminal(createUnauthorizedResponse(origin, payloadVerifyResult), 'payload_sign_invalid');
   }
 
   const payloadSignExpire = extractExpireFromSign(payloadSign);
   if (!Number.isFinite(payloadSignExpire) || payloadSignExpire <= 0) {
-    return createUnauthorizedResponse(origin, 'payloadSign expire invalid');
+    return terminal(createUnauthorizedResponse(origin, 'payloadSign expire invalid'), 'payload_sign_invalid');
   }
   const decodedPayload = base64UrlDecodeToString(payload);
   if (!decodedPayload) {
-    return createUnauthorizedResponse(origin, "payload decode failed");
+    return terminal(createUnauthorizedResponse(origin, "payload decode failed"), 'payload_decode_failed');
   }
 
   let payloadData = null;
   try {
     payloadData = JSON.parse(decodedPayload);
   } catch (_error) {
-    return createUnauthorizedResponse(origin, "payload invalid");
+    return terminal(createUnauthorizedResponse(origin, "payload invalid"), 'payload_invalid');
   }
 
   const payloadVersion = Number(payloadData?.v);
   if (!Number.isFinite(payloadVersion) || payloadVersion !== 1) {
-    return createUnauthorizedResponse(origin, "payload version invalid");
+    return terminal(createUnauthorizedResponse(origin, "payload version invalid"), 'payload_version_invalid');
   }
 
   const payloadExpireTime = readPayloadExpireTime(payloadData);
   if (!Number.isFinite(payloadExpireTime) || payloadExpireTime <= 0) {
-    return createUnauthorizedResponse(origin, "payload expire invalid");
+    return terminal(createUnauthorizedResponse(origin, "payload expire invalid"), 'payload_expired');
   }
 
   const hardExpireAtMs = Math.min(payloadSignExpire, payloadExpireTime) * 1000;
   if (!Number.isFinite(hardExpireAtMs) || hardExpireAtMs <= 0) {
-    return createUnauthorizedResponse(origin, "link expired");
+    return terminal(createUnauthorizedResponse(origin, "link expired"), 'payload_expired');
   }
   if (Date.now() >= hardExpireAtMs) {
-    return createUnauthorizedResponse(origin, "link expired");
+    return terminal(createUnauthorizedResponse(origin, "link expired"), 'payload_expired');
   }
 
   const ticketHash = await sha256Hash(`${payload}:${payloadSign}`);
   if (!ticketHash) {
-    return createUnauthorizedResponse(origin, 'payload ticket hash invalid');
+    return terminal(createUnauthorizedResponse(origin, 'payload ticket hash invalid'), 'payload_ticket_nonce_invalid');
   }
 
   const ticketStateEnabled = config.dbMode === 'custom-pg-rest';
@@ -4301,44 +4756,44 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     : null;
   if (ticketStateEnabled) {
     if (!isValidTicketNonce(payloadTicketNonce)) {
-      return createUnauthorizedResponse(origin, 'payload ticketNonce invalid');
+      return terminal(createUnauthorizedResponse(origin, 'payload ticketNonce invalid'), 'payload_ticket_nonce_invalid');
     }
 
     if (idleTimeoutSeconds === null || idleTimeoutSeconds < 0) {
-      return createUnauthorizedResponse(origin, 'payload idle_timeout invalid');
+      return terminal(createUnauthorizedResponse(origin, 'payload idle_timeout invalid'), 'payload_idle_timeout_invalid');
     }
   }
 
   const encryptedPayload = typeof payloadData.encrypt === "string" ? payloadData.encrypt : "";
   if (!encryptedPayload) {
-    return createUnauthorizedResponse(origin, "payload encrypt missing");
+    return terminal(createUnauthorizedResponse(origin, "payload encrypt missing"), 'payload_encrypt_missing');
   }
   const bindingPayload = await decryptBindingPayload(encryptedPayload, config.token);
   if (!bindingPayload) {
-    console.warn('[Binding] Failed to decrypt payload');
-    return createUnauthorizedResponse(origin, "payload decrypt failed");
+    logEvent('warn', 'Binding', 'decrypt_failed');
+    return terminal(createUnauthorizedResponse(origin, "payload decrypt failed"), 'payload_decrypt_failed');
   }
 
   const issuer = normalizeOrigin(typeof bindingPayload.issuer === "string" ? bindingPayload.issuer : "");
   if (!issuer || !config.landingWorkerAddresses.includes(issuer)) {
-    return createUnauthorizedResponse(origin, "prohibited issuer");
+    return terminal(createUnauthorizedResponse(origin, "prohibited issuer"), 'prohibited_issuer');
   }
 
   const workerAddress = normalizeOrigin(typeof bindingPayload.workerAddress === "string" ? bindingPayload.workerAddress : "");
   const actualWorkerOrigin = new URL(request.url).origin;
   if (!workerAddress || workerAddress !== actualWorkerOrigin) {
-    return createUnauthorizedResponse(origin, "worker address mismatch");
+    return terminal(createUnauthorizedResponse(origin, "worker address mismatch"), 'worker_address_mismatch');
   }
 
   const bindingStr = typeof payloadData.bindingStr === "string" ? payloadData.bindingStr : "";
   const bindingVer = Number(payloadData.bindingVer);
   if (Number.isFinite(bindingVer) && bindingVer > 0 && bindingVer !== config.binding.version) {
-    return createUnauthorizedResponse(origin, "binding version mismatch");
+    return terminal(createUnauthorizedResponse(origin, "binding version mismatch"), 'binding_version_mismatch');
   }
 
   if (needOriginCheck) {
     if (!bindingStr) {
-      return createUnauthorizedResponse(origin, "bindingStr missing");
+      return terminal(createUnauthorizedResponse(origin, "bindingStr missing"), 'binding_missing');
     }
     const bindingResult = await buildBindingStr({
       modes: originCheckModes,
@@ -4349,10 +4804,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       token: config.token,
     });
     if (!bindingResult.ok) {
-      return createUnauthorizedResponse(origin, bindingResult.reason || "binding unavailable");
+      return terminal(createUnauthorizedResponse(origin, bindingResult.reason || "binding unavailable"), 'binding_unavailable');
     }
     if (bindingResult.bindingStr !== bindingStr) {
-      return createUnauthorizedResponse(origin, "origin mismatch");
+      return terminal(createUnauthorizedResponse(origin, "origin mismatch"), 'origin_mismatch');
     }
   }
 
@@ -4363,40 +4818,40 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       ticketStateConfig = resolveTicketStateConfig(config);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error('[TicketState] Config invalid:', message);
-      return createErrorResponse(origin, 500, message);
+      logEvent('error', 'TicketState', 'config_invalid', { message });
+      return terminal(createErrorResponse(origin, 500, message), 'ticket_state_invalid');
     }
 
     try {
       ticketState = await readTicketState(ticketHash, ticketStateConfig);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error('[TicketState] Read failed:', message);
-      return createErrorResponse(origin, 500, `Ticket state read failed: ${message}`);
+      logEvent('error', 'TicketState', 'read_failed', { message });
+      return terminal(createErrorResponse(origin, 500, `Ticket state read failed: ${message}`), 'ticket_state_invalid');
     }
 
     if (!ticketState?.found) {
-      return createUnauthorizedResponse(origin, 'ticket state missing');
+      return terminal(createUnauthorizedResponse(origin, 'ticket state missing'), 'ticket_state_invalid');
     }
 
     if (!Number.isInteger(ticketState.issuedAt) || ticketState.issuedAt < 0) {
-      return createUnauthorizedResponse(origin, 'ticket state issued_at invalid');
+      return terminal(createUnauthorizedResponse(origin, 'ticket state issued_at invalid'), 'ticket_state_invalid');
     }
 
     if (!Number.isInteger(ticketState.hardExpireAt) || ticketState.hardExpireAt <= 0) {
-      return createUnauthorizedResponse(origin, 'ticket state hard_expire_at invalid');
+      return terminal(createUnauthorizedResponse(origin, 'ticket state hard_expire_at invalid'), 'ticket_state_invalid');
     }
 
     if (!Number.isInteger(ticketState.idleTimeoutSeconds) || ticketState.idleTimeoutSeconds < 0) {
-      return createUnauthorizedResponse(origin, 'ticket state idle_timeout_seconds invalid');
+      return terminal(createUnauthorizedResponse(origin, 'ticket state idle_timeout_seconds invalid'), 'ticket_state_invalid');
     }
 
     if (ticketState.firstUsedAt != null && (!Number.isInteger(ticketState.firstUsedAt) || ticketState.firstUsedAt < 0)) {
-      return createUnauthorizedResponse(origin, 'ticket state first_used_at invalid');
+      return terminal(createUnauthorizedResponse(origin, 'ticket state first_used_at invalid'), 'ticket_state_invalid');
     }
 
     if (ticketState.idlePolicy !== 'first_use' && ticketState.idlePolicy !== 'renewable') {
-      return createUnauthorizedResponse(origin, 'ticket state idle_policy invalid');
+      return terminal(createUnauthorizedResponse(origin, 'ticket state idle_policy invalid'), 'ticket_state_invalid');
     }
 
     const nowSeconds = Math.floor(Date.now() / 1000);
@@ -4405,18 +4860,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const idleAge = nowSeconds - ticketState.issuedAt;
       if (idleAge >= ticketState.idleTimeoutSeconds) {
         await slowFailDelay();
-        return createErrorResponse(origin, 410, 'Link expired due to inactivity');
+        return terminal(createErrorResponse(origin, 410, 'Link expired due to inactivity'), 'ticket_state_expired');
       }
     } else if (ticketState.idlePolicy === 'renewable') {
       if (!Number.isInteger(ticketState.idleLeaseExpiresAt) || ticketState.idleLeaseExpiresAt <= 0) {
-        return createUnauthorizedResponse(origin, 'link expired');
+        return terminal(createUnauthorizedResponse(origin, 'link expired'), 'ticket_state_expired');
       }
 
       if (nowSeconds >= Math.min(ticketState.hardExpireAt, ticketState.idleLeaseExpiresAt)) {
-        return createUnauthorizedResponse(origin, 'link expired');
+        return terminal(createUnauthorizedResponse(origin, 'link expired'), 'ticket_state_expired');
       }
     } else if (nowSeconds >= ticketState.hardExpireAt) {
-      return createUnauthorizedResponse(origin, 'link expired');
+      return terminal(createUnauthorizedResponse(origin, 'link expired'), 'ticket_state_expired');
     }
   }
 
@@ -4456,19 +4911,19 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return { result };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error('[Unified Check] Failed:', errorMessage);
-      console.error('[Unified Check] Stack:', error instanceof Error ? error.stack : '');
+      logEvent('error', 'UnifiedCheck', 'failed', { message: errorMessage });
+      logEvent('error', 'UnifiedCheck', 'stack', { stack: error instanceof Error ? error.stack : '' });
 
       const FAIL_OPEN = 'fail' + '-open';
       const FAIL_CLOSED = 'fail' + '-closed';
       const pgErrorHandle = config.rateLimitConfig?.pgErrorHandle || FAIL_CLOSED;
 
       if (pgErrorHandle === FAIL_OPEN) {
-        console.warn('[Unified Check] Fail-open mode: allowing request despite error');
+        logEvent('warn', 'UnifiedCheck', 'fail_open');
         return { result: null };
       }
-      console.error('[Unified Check] Fail-closed mode: blocking request');
-      return { errorResponse: createErrorResponse(origin, 500, `Unified check failed: ${errorMessage}`) };
+      logEvent('error', 'UnifiedCheck', 'fail_closed');
+      return { errorResponse: terminal(createErrorResponse(origin, 500, `Unified check failed: ${errorMessage}`), 'unified_check_fail_closed') };
     }
   };
 
@@ -4490,8 +4945,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     if (!unifiedResult.rateLimit.allowed) {
       if (unifiedResult.rateLimit.error) {
-        console.error('[Rate Limit] fail-closed error:', unifiedResult.rateLimit.error);
-        return createErrorResponse(origin, 500, unifiedResult.rateLimit.error);
+        logEvent('error', 'RateLimit', 'fail_closed_error', { message: unifiedResult.rateLimit.error });
+        return terminal(createErrorResponse(origin, 500, unifiedResult.rateLimit.error), 'unified_rate_limit_failed');
       }
 
       const ipSubnetForBlock = unifiedResult.rateLimit.ipSubnet || ipSubnet || clientIP;
@@ -4507,20 +4962,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       await slowFailDelay();
 
       const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
-      console.warn(
-        '[Rate Limit] Subnet blocked (unified):',
-        ipSubnetForBlock,
-        `limit=${unifiedRateLimit}`,
-        `window=${windowLabel}`,
-        `retryAfter=${retryAfter}s`
-      );
-      return createRateLimitResponse(
+      logEvent('warn', 'RateLimit', 'unified_blocked', {
+        limit: unifiedRateLimit,
+        window: windowLabel,
+        retryAfter,
+      });
+      return terminal(createRateLimitResponse(
         origin,
         ipSubnetForBlock,
         unifiedRateLimit,
         windowLabel,
         retryAfter
-      );
+      ), 'unified_rate_limited');
     }
 
     if (unifiedResult.cache.hit) {
@@ -4546,17 +4999,21 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (unifiedResponse) {
       await slowFailDelay();
 
-      console.log(
-        `[Throttle] Open breaker from unified check, returning error ${unifiedBreaker.errorCode}, retry after ${unifiedBreaker.retryAfter}s`
-      );
+      logEvent('info', 'Breaker', 'unified_open_response', {
+        status: unifiedBreaker.errorCode,
+        retryAfter: unifiedBreaker.retryAfter,
+      });
 
-      return unifiedResponse;
+      return terminal(unifiedResponse, 'breaker_open', {
+        admissionMode: unifiedAdmissionMode,
+        host: resolvedUnifiedThrottleHostname,
+      });
     }
 
     if (rateLimiter && config.rateLimitConfig) {
       const probability = config.rateLimitConfig.cleanupProbability || 0.01;
       if (Math.random() < probability) {
-        console.log(`[Rate Limit Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
+        logEvent('info', 'CleanupScheduler', 'scheduled_async_cleanup', { probability });
 
         const { cleanupExpiredRecords } = await import('./ratelimit/custom-pg-rest.js');
         const cleanupPromise = cleanupExpiredRecords(
@@ -4566,11 +5023,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           config.rateLimitConfig.tableName,
           config.rateLimitConfig.windowTimeSeconds
         ).catch((cleanupError) => {
-          console.error('[Rate Limit Cleanup] Failed:', cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
+          logEvent('error', 'CleanupScheduler', 'scheduled_async_cleanup_failed', {
+            message: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+          });
         });
 
-        if (cleanupPromise && ctx && ctx.waitUntil) {
-          ctx.waitUntil(cleanupPromise);
+        if (cleanupPromise) {
+          bindWaitUntil(ctx, cleanupPromise, 'RateLimit', 'cleanup', {
+            probability,
+          });
         }
       }
     }
@@ -4596,8 +5057,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         const rateLimitResult = await rateLimiter.checkRateLimit(clientIP, { ...config.rateLimitConfig, ctx });
         if (!rateLimitResult.allowed) {
           if (rateLimitResult.error) {
-            console.error('[Rate Limit] fail-closed error:', rateLimitResult.error);
-            return createErrorResponse(origin, 500, rateLimitResult.error);
+            logEvent('error', 'RateLimit', 'fail_closed_error', { message: rateLimitResult.error });
+            return terminal(createErrorResponse(origin, 500, rateLimitResult.error), 'rate_limit_failed');
           }
           const ipSubnetForBlock = rateLimitResult.ipSubnet || ipSubnet || clientIP;
           const retryAfter = normalizePositiveSeconds(
@@ -4612,25 +5073,23 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           await slowFailDelay();
 
           const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
-          console.warn(
-            '[Rate Limit] Subnet blocked:',
-            ipSubnetForBlock,
-            `limit=${config.ipSubnetLimit}`,
-            `window=${windowLabel}`,
-            `retryAfter=${retryAfter}s`
-          );
-          return createRateLimitResponse(
+          logEvent('warn', 'RateLimit', 'fallback_blocked', {
+            limit: config.ipSubnetLimit,
+            window: windowLabel,
+            retryAfter,
+          });
+          return terminal(createRateLimitResponse(
             origin,
             ipSubnetForBlock,
             config.ipSubnetLimit,
             windowLabel,
             retryAfter
-          );
+          ), 'custom_rate_limited');
         }
       } catch (error) {
-        console.error('[Rate Limit] Unexpected error:', error instanceof Error ? error.message : String(error));
+        logEvent('error', 'RateLimit', 'unexpected_error', { message: error instanceof Error ? error.message : String(error) });
         if (config.rateLimitConfig?.pgErrorHandle === 'fail-closed') {
-          return createErrorResponse(origin, 500, 'Rate limit check failed');
+          return terminal(createErrorResponse(origin, 500, 'Rate limit check failed'), 'rate_limit_failed');
         }
       }
     }
@@ -4706,14 +5165,18 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     if (cacheManager && apiResult.data) {
       if (forceRefresh && shouldRetryAuthError(apiResult.code || 0)) {
-        console.warn('[Cache] Skip cache save due to auth error during refresh');
+        logEvent('warn', 'Cache', 'save_skipped', { reason: 'auth_error_during_refresh' });
       } else {
-        ctx.waitUntil(
+        bindWaitUntil(
+          ctx,
           cacheManager
             .saveCache(path, apiResult.data, { ...config.cacheConfig, ctx })
             .catch((error) => {
-              console.error('[Cache] Save failed:', error instanceof Error ? error.message : String(error));
-            })
+              logEvent('error', 'Cache', 'save_failed', { message: error instanceof Error ? error.message : String(error) });
+            }),
+          'Cache',
+          'save',
+          { path },
         );
       }
     }
@@ -4732,14 +5195,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         res = { code: 200, data: cached.linkData };
       }
     } catch (error) {
-      console.error('[Cache] Check failed, fallback to API:', error instanceof Error ? error.message : String(error));
+      logEvent('error', 'Cache', 'check_failed', { message: error instanceof Error ? error.message : String(error) });
     }
   }
 
   if (!res) {
     const { res: apiResult, errorResponse } = await fetchLinkDataFromApi();
     if (errorResponse) {
-      return errorResponse;
+      return terminal(errorResponse, 'alist_api_error');
     }
     res = apiResult;
   }
@@ -4807,15 +5270,23 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     try {
+      logEvent('info', 'Breaker', 'snapshot_start', { host: authorityHostname, phase: 'snapshot' });
       const snapshot = await throttleManager.getBreakerState(authorityHostname, { ...config.throttleConfig, ctx });
       if (!snapshot) {
-        console.error('[Throttle] Snapshot read returned no authority state');
-        return createBreakerAuthorityUnavailableResponse(origin, 'snapshot read');
+        logEvent('error', 'Breaker', 'snapshot_missing', { host: authorityHostname });
+        return terminal(createBreakerAuthorityUnavailableResponse(origin, 'snapshot read'), 'breaker_authority_unavailable', {
+          host: authorityHostname,
+        });
       }
+      logEvent('info', 'Breaker', 'snapshot_result', {
+        host: authorityHostname,
+        phase: 'snapshot',
+        status: snapshot.state,
+      });
       return snapshot;
     } catch (error) {
-      console.error('[Throttle] Snapshot read failed:', error instanceof Error ? error.message : String(error));
-      return createBreakerAuthorityUnavailableResponse(origin, 'snapshot read');
+      logEvent('error', 'Breaker', 'snapshot_failed', { message: error instanceof Error ? error.message : String(error) });
+      return terminal(createBreakerAuthorityUnavailableResponse(origin, 'snapshot read'), 'breaker_authority_unavailable');
     }
   };
 
@@ -4842,10 +5313,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const breakerState = readOpenBreakerSnapshot(throttleStatus, config.throttleConfig?.openCapSeconds || 60);
       if (breakerState) {
         await slowFailDelay();
-        console.log(
-          `[Throttle] Open breaker: ${throttleHostname}, returning error ${breakerState.errorCode}, retry after ${breakerState.retryAfter}s`
-        );
-        return createThrottleProtectedResponse(origin, breakerState);
+        logEvent('info', 'Breaker', 'open_precheck', {
+          host: throttleHostname,
+          status: breakerState.errorCode,
+          retryAfter: breakerState.retryAfter,
+        });
+        return terminal(createThrottleProtectedResponse(origin, breakerState), 'breaker_open', {
+          host: throttleHostname,
+          admissionMode,
+        });
       }
     }
   }
@@ -4861,11 +5337,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     try {
+      logEvent('info', 'Breaker', 'authorize_start', { host: authorityHostname, phase: 'authorize' });
       const attemptSnapshot = await throttleManager.authorizeBreakerAttempt(authorityHostname, { ...config.throttleConfig, ctx });
       if (!attemptSnapshot) {
-        console.error('[Throttle] Attempt authorize returned no authority state');
+        logEvent('error', 'Breaker', 'authorize_missing_authority_state', { host: authorityHostname });
         return {
-          blockedResponse: createBreakerAuthorityUnavailableResponse(origin, 'attempt authorize'),
+          blockedResponse: terminal(createBreakerAuthorityUnavailableResponse(origin, 'attempt authorize'), 'breaker_authority_unavailable', {
+            host: authorityHostname,
+          }),
           attemptVersion: null,
           attemptTicket: null,
         };
@@ -4877,11 +5356,21 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       );
       if (openBreaker) {
         await slowFailDelay();
-        console.log(
-          `[Throttle] Open breaker after attempt authorize: ${hostname}, returning error ${openBreaker.errorCode}, retry after ${openBreaker.retryAfter}s`
-        );
+        logEvent('info', 'Breaker', 'authorize_open', {
+          host: hostname,
+          status: openBreaker.errorCode,
+          retryAfter: openBreaker.retryAfter,
+        });
+        logEvent('info', 'Breaker', 'authorize_open_response', {
+          host: hostname,
+          status: openBreaker.errorCode,
+          retryAfter: openBreaker.retryAfter,
+        });
         return {
-          blockedResponse: createThrottleProtectedResponse(origin, openBreaker),
+          blockedResponse: terminal(createThrottleProtectedResponse(origin, openBreaker), 'breaker_open', {
+            host: hostname,
+            admissionMode: resolveAdmissionMode(config, hostname),
+          }),
           attemptVersion: null,
           attemptTicket: null,
         };
@@ -4890,29 +5379,35 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       if (attemptSnapshot.state === 'half_open' && attemptSnapshot.attemptGranted !== true) {
         const retryAfter = readHalfOpenDeadlineRetryAfter(attemptSnapshot, 1);
         await slowFailDelay();
-        console.log(
-          `[Throttle] Half-open batch full for ${hostname}, retry after ${retryAfter}s`
-        );
+        logEvent('info', 'Breaker', 'authorize_half_open_full', { host: hostname, retryAfter });
         return {
-          blockedResponse: createThrottleProtectedResponse(origin, {
+          blockedResponse: terminal(createThrottleProtectedResponse(origin, {
             errorCode: attemptSnapshot.lastErrorCode || 503,
             retryAfter,
             message: `Service temporarily unavailable (half-open batch is full, retry after ${retryAfter}s)`,
-          }),
+          }), 'breaker_half_open_full', { host: hostname }),
           attemptVersion: null,
           attemptTicket: null,
         };
       }
 
+      logEvent('info', 'Breaker', 'authorize_granted', {
+        host: hostname,
+        status: attemptSnapshot.state,
+        attemptVersion: attemptSnapshot.attemptGranted === true ? attemptSnapshot.version : null,
+        attemptTicket: attemptSnapshot.attemptGranted === true ? attemptSnapshot.attemptTicket : null,
+      });
       return {
         blockedResponse: null,
         attemptVersion: attemptSnapshot.attemptGranted === true ? attemptSnapshot.version : null,
         attemptTicket: attemptSnapshot.attemptGranted === true ? attemptSnapshot.attemptTicket : null,
       };
     } catch (error) {
-      console.error('[Throttle] Attempt authorize failed:', error instanceof Error ? error.message : String(error));
+      logEvent('error', 'Breaker', 'authorize_failed', { message: error instanceof Error ? error.message : String(error) });
       return {
-        blockedResponse: createBreakerAuthorityUnavailableResponse(origin, 'attempt authorize'),
+        blockedResponse: terminal(createBreakerAuthorityUnavailableResponse(origin, 'attempt authorize'), 'breaker_authority_unavailable', {
+          host: authorityHostname,
+        }),
         attemptVersion: null,
         attemptTicket: null,
       };
@@ -4949,6 +5444,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         return null;
       }
 
+      logEvent('info', 'Breaker', 'settle_start', {
+        host: authorityHostname,
+        mode: 'queue_breaker',
+        attemptVersion,
+        attemptTicket,
+      });
       const snapshot = await throttleManager.settleBreakerAttempt(authorityHostname, {
         attemptVersion,
         attemptTicket,
@@ -4956,10 +5457,19 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       fqContext.attemptVersion = null;
       fqContext.attemptTicket = null;
       clearDeferredQueueBreakerReport();
+      logEvent('info', 'Breaker', 'settle_done', {
+        host: authorityHostname,
+        mode: 'queue_breaker',
+        attemptVersion,
+        attemptTicket,
+        status: snapshot?.state,
+      });
       return snapshot;
     } catch (error) {
-      console.error('[Throttle] Attempt settlement failed:', error instanceof Error ? error.message : String(error));
-      return createBreakerAuthorityUnavailableResponse(origin, 'attempt settlement');
+      logEvent('error', 'Breaker', 'settle_failed', { message: error instanceof Error ? error.message : String(error) });
+      return terminal(createBreakerAuthorityUnavailableResponse(origin, 'attempt settlement'), 'breaker_settle_failed', {
+        host: hostname,
+      });
     }
   };
 
@@ -4967,6 +5477,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (!fqContext) {
       return;
     }
+    logEvent('info', 'Breaker', 'deferred_report_arm', {
+      host: fqContext.hostname,
+      mode: fqContext.admissionMode,
+      status: statusCode,
+      attemptVersion: fqContext.attemptVersion,
+      attemptTicket: fqContext.attemptTicket,
+    });
     fqContext.deferredReportStatusCode = statusCode;
     fqContext.deferredReportArmed = true;
   };
@@ -4981,6 +5498,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   const clearDeferredQueueBreakerReport = () => {
     if (!fqContext) {
       return;
+    }
+    if (fqContext.deferredReportArmed || Number.isFinite(fqContext.deferredReportStatusCode)) {
+      logEvent('info', 'Breaker', 'deferred_report_clear', {
+        host: fqContext.hostname,
+        mode: fqContext.admissionMode,
+        status: fqContext.deferredReportStatusCode,
+      });
     }
     fqContext.deferredReportStatusCode = null;
     fqContext.deferredReportArmed = false;
@@ -5013,6 +5537,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     const attempt = readQueueBreakerAttempt(fqContext.hostname, 'queue_breaker');
+    logEvent('info', 'Breaker', 'deferred_report_flush', {
+      host: fqContext.hostname,
+      mode: fqContext.admissionMode,
+      status: fqContext.deferredReportStatusCode,
+      attemptVersion: attempt.attemptVersion,
+      attemptTicket: attempt.attemptTicket,
+    });
     return reportBreakerResponseIfNeeded(
       fqContext.hostname,
       new Response(null, { status: fqContext.deferredReportStatusCode }),
@@ -5126,9 +5657,14 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         ? Math.trunc(attempt.attemptTicket)
         : null;
 
-      if (isProtectedError) {
-        console.log(`[Throttle] Error ${statusCode} from ${hostname}, reporting breaker sample`);
-      }
+      logEvent('info', 'Breaker', 'sample_report_start', {
+        host: hostname,
+        mode: hostnameAdmissionMode,
+        status: statusCode,
+        retryAfter: retryAfterSeconds,
+        attemptVersion,
+        attemptTicket,
+      });
 
       const authorityHostname = getThrottleAuthorityHostname(hostname);
       if (!authorityHostname) {
@@ -5148,16 +5684,28 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       );
 
       if (!snapshot) {
-        console.error('[Throttle] Sample report returned no authority state');
+        logEvent('error', 'Breaker', 'sample_report_missing_authority_state', { host: hostname });
         await cancelResponseBody(response);
-        return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
+        return terminal(createBreakerAuthorityUnavailableResponse(origin, 'sample report'), 'breaker_sample_report_failed', {
+          host: hostname,
+        });
       }
 
       attempt?.consumeAfterReport?.();
+      logEvent('info', 'Breaker', 'sample_report_done', {
+        host: hostname,
+        mode: hostnameAdmissionMode,
+        status: statusCode,
+        retryAfter: retryAfterSeconds,
+        attemptVersion,
+        attemptTicket,
+      });
     } catch (error) {
-      console.error('[Throttle] Sample report failed:', error instanceof Error ? error.message : String(error));
+      logEvent('error', 'Breaker', 'sample_report_failed', { message: error instanceof Error ? error.message : String(error) });
       await cancelResponseBody(response);
-      return createBreakerAuthorityUnavailableResponse(origin, 'sample report');
+      return terminal(createBreakerAuthorityUnavailableResponse(origin, 'sample report'), 'breaker_sample_report_failed', {
+        host: hostname,
+      });
     }
 
     return null;
@@ -5267,16 +5815,31 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         return null;
       }
 
+      logEvent('info', 'Breaker', 'settle_start', {
+        host: authorityHostname,
+        mode: 'breaker_only',
+        attemptVersion,
+        attemptTicket,
+      });
       const snapshot = await throttleManager.settleBreakerAttempt(authorityHostname, {
         attemptVersion,
         attemptTicket,
       }, { ...config.throttleConfig, ctx });
       clearPendingBreakerOnlyAttempt();
+      logEvent('info', 'Breaker', 'settle_done', {
+        host: authorityHostname,
+        mode: 'breaker_only',
+        attemptVersion,
+        attemptTicket,
+        status: snapshot?.state,
+      });
       return snapshot;
     } catch (error) {
-      console.error('[Throttle] Attempt settlement failed:', error instanceof Error ? error.message : String(error));
+      logEvent('error', 'Breaker', 'settle_failed', { message: error instanceof Error ? error.message : String(error) });
       clearPendingBreakerOnlyAttempt();
-      return createBreakerAuthorityUnavailableResponse(origin, 'attempt settlement');
+      return terminal(createBreakerAuthorityUnavailableResponse(origin, 'attempt settlement'), 'breaker_settle_failed', {
+        host: hostname,
+      });
     }
   };
 
@@ -5315,13 +5878,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     const clientIpSubnet = calculateIPSubnet(clientIP, config.ipv4Suffix, config.ipv6Suffix);
     if (!clientIpSubnet) {
-      console.error(`[${label}] Failed: unable to derive client subnet for admission enforcement`);
+      logEvent('error', 'Admission', 'client_subnet_derivation_failed', { scope: label });
       return unavailableResponse;
     }
 
     clientIpSubnetHash = await sha256Hash(clientIpSubnet);
     if (!clientIpSubnetHash) {
-      console.error(`[${label}] Failed: unable to hash client subnet for admission enforcement`);
+      logEvent('error', 'Admission', 'client_subnet_hash_failed', { scope: label });
       return unavailableResponse;
     }
 
@@ -5330,13 +5893,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const ensureFairQueueClientReady = async () => {
     if (!config.slotHandlerConfig?.url) {
-      console.error('[Fair Queue] enabled but slot-handler URL missing');
-      return createErrorResponse(origin, 503, 'Fair queue misconfigured (slot-handler URL missing)');
+      logEvent('error', 'FQ', 'slot_handler_url_missing');
+      return terminal(createErrorResponse(origin, 503, 'Fair queue misconfigured (slot-handler URL missing)'), 'fq_unavailable');
     }
 
-    const subnetResponse = await ensureClientIpSubnetHash('Fair Queue', createErrorResponse(origin, 503, 'Fair queue unavailable'));
+    const subnetResponse = await ensureClientIpSubnetHash(
+      'Fair Queue',
+      createErrorResponse(origin, 503, 'Fair queue unavailable'),
+    );
     if (subnetResponse) {
-      return subnetResponse;
+      return terminal(subnetResponse, 'fq_unavailable');
     }
 
     if (!fairQueueClient) {
@@ -5344,8 +5910,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         fairQueueClient = createFairQueueClient(config);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        console.error('[Fair Queue] Failed to initialize client:', message);
-        return createErrorResponse(origin, 503, 'Fair queue unavailable');
+        logEvent('error', 'FQ', 'client_initialization_failed', { message });
+        return terminal(createErrorResponse(origin, 503, 'Fair queue unavailable'), 'fq_unavailable');
       }
     }
 
@@ -5354,13 +5920,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const ensureConcurrencyClientReady = async () => {
     if (!config.concurrencyHandlerConfig?.url) {
-      console.error('[CQ] enabled but concurrency-handler URL missing');
-      return createTrueConcurrencyUnavailableResponse(origin, 'True concurrency misconfigured (handler URL missing)');
+      logEvent('error', 'CQ', 'handler_url_missing');
+      return terminal(createTrueConcurrencyUnavailableResponse(origin, 'True concurrency misconfigured (handler URL missing)'), 'cq_unavailable');
     }
 
-    const subnetResponse = await ensureClientIpSubnetHash('CQ', createTrueConcurrencyUnavailableResponse(origin));
+    const subnetResponse = await ensureClientIpSubnetHash(
+      'CQ',
+      createTrueConcurrencyUnavailableResponse(origin),
+    );
     if (subnetResponse) {
-      return subnetResponse;
+      return terminal(subnetResponse, 'cq_unavailable');
     }
 
     if (!concurrencyClient) {
@@ -5368,8 +5937,8 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         concurrencyClient = createConcurrencyHandlerClient(config);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        console.error('[CQ] Failed to initialize client:', message);
-        return createTrueConcurrencyUnavailableResponse(origin);
+        logEvent('error', 'CQ', 'client_initialization_failed', { message });
+        return terminal(createTrueConcurrencyUnavailableResponse(origin), 'cq_unavailable');
       }
     }
 
@@ -5404,10 +5973,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const createTrueConcurrencyTerminalResponse = (result, reason = '') => {
     if (result === 'expired' && reason === 'hard_expired') {
-      return createUnauthorizedResponse(origin, 'link expired');
+      return terminal(createUnauthorizedResponse(origin, 'link expired'), 'ticket_state_expired');
     }
     const suffix = reason ? ` (${reason})` : '';
-    return createTrueConcurrencyUnavailableResponse(origin, `True concurrency ${result}${suffix}`);
+    return terminal(createTrueConcurrencyUnavailableResponse(origin, `True concurrency ${result}${suffix}`), 'cq_terminal', {
+      result,
+      resultReason: reason,
+    });
   };
 
   const abortCurrentTrueConcurrencyStream = (reason = '') => {
@@ -5453,7 +6025,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   };
 
   const createTrueConcurrencyWaitBudgetExhaustedResponse = async () => {
-    return createTrueConcurrencyUnavailableResponse(origin, 'True concurrency wait budget exhausted');
+    return terminal(createTrueConcurrencyUnavailableResponse(origin, 'True concurrency wait budget exhausted'), 'cq_wait_budget_exhausted');
   };
 
   const ensureCurrentTrueConcurrencyReleased = async (reason, immediate = false) => {
@@ -5510,22 +6082,28 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         ? readOpenBreakerSnapshot(fqResult.breakerSnapshot, 0)
         : null;
       await slowFailDelay();
-      return createThrottleProtectedResponse(origin, {
+      return terminal(createThrottleProtectedResponse(origin, {
         errorCode: breakerState?.errorCode || fqResult.throttleCode || 503,
         retryAfter: fqResult.retryAfter ?? breakerState?.retryAfter,
+      }), 'breaker_open', {
+        admissionMode,
+        host: fqContext?.hostname,
       });
     }
 
     if (fqResult.kind === 'timeout') {
-      return createFairQueueTimeoutResponse();
+      return terminal(createFairQueueTimeoutResponse(), 'fq_timeout');
     }
 
     if (fqResult.kind === 'conflict') {
-      return createFairQueueTimeoutResponse();
+      return terminal(createFairQueueTimeoutResponse(), 'fq_conflict');
     }
 
     if (fqResult.kind === 'overloaded') {
-      return createFairQueueOverloadedResponse(origin, fqResult.retryAfter, fqResult.reason);
+      return terminal(createFairQueueOverloadedResponse(origin, fqResult.retryAfter, fqResult.reason), 'fq_overloaded', {
+        retryAfter: fqResult.retryAfter,
+        resultReason: fqResult.reason,
+      });
     }
 
     return null;
@@ -5537,11 +6115,11 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return await handleFairQueueWaitResult(fqResult);
     } catch (error) {
       if (didClientAbort() && isAbortError(error)) {
-        return createClientAbortResponse(origin);
+        return terminal(createClientAbortResponse(origin), 'client_aborted');
       }
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[Fair Queue] waitForSlot error during ${phase}:`, message);
-      return createErrorResponse(origin, 503, 'Fair queue unavailable');
+      logEvent('error', 'FQ', 'wait_for_slot_error', { phase, message });
+      return terminal(createErrorResponse(origin, 503, 'Fair queue unavailable'), 'fq_unavailable');
     }
   };
 
@@ -5550,11 +6128,24 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       return true;
     }
 
+    logEvent('info', 'FQ', 'cleanup_scheduled', {
+      requestId: fqContext.requestId,
+      host: fqContext.hostname,
+      mode: fqContext.admissionMode,
+      phase,
+    });
     const finalized = await finalizeFairQueueContext({
       fairQueueClient,
       ctx,
       fqContext,
       phase,
+    });
+    logEvent(finalized ? 'info' : 'warn', 'FQ', finalized ? 'cleanup_done' : 'cleanup_failed', {
+      requestId: fqContext.requestId,
+      host: fqContext.hostname,
+      mode: fqContext.admissionMode,
+      phase,
+      result: finalized ? 'done' : 'failed',
     });
     if (!finalized) {
       pendingFairQueueCleanupContexts.push(fqContext);
@@ -5581,6 +6172,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     const releaseContext = fqContext;
     releaseContext.headerReleasePromise = (async () => {
+      logEvent('info', 'FQ', 'cleanup_scheduled', {
+        requestId: releaseContext.requestId,
+        host: releaseContext.hostname,
+        mode: releaseContext.admissionMode,
+        phase: 'upstream headers',
+      });
       const finalized = await finalizeFairQueueContext({
         fairQueueClient,
         ctx,
@@ -5588,16 +6185,24 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         phase: 'upstream headers',
       });
       if (!finalized) {
-        console.warn(`[Fair Queue] early release after upstream headers failed for host=${releaseContext.hostname}`);
+        logEvent('warn', 'FQ', 'header_release_failed', { host: releaseContext.hostname });
       }
+      logEvent(finalized ? 'info' : 'warn', 'FQ', finalized ? 'cleanup_done' : 'cleanup_failed', {
+        requestId: releaseContext.requestId,
+        host: releaseContext.hostname,
+        mode: releaseContext.admissionMode,
+        phase: 'upstream headers',
+        result: finalized ? 'done' : 'failed',
+      });
       return finalized;
     })().finally(() => {
       releaseContext.headerReleasePromise = null;
     });
 
-    if (ctx && typeof ctx.waitUntil === 'function') {
-      ctx.waitUntil(releaseContext.headerReleasePromise);
-    }
+    bindWaitUntil(ctx, releaseContext.headerReleasePromise, 'FQ', 'header_release', {
+      host: releaseContext.hostname,
+      phase: 'upstream headers',
+    });
   };
 
 const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
@@ -5611,6 +6216,12 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
   fqContext.cleanupRetired = true;
 
     const cleanupPromise = (async () => {
+      logEvent('info', 'FQ', 'cleanup_scheduled', {
+        requestId: fqContext.requestId,
+        host: fqContext.hostname,
+        mode: fqContext.admissionMode,
+        phase,
+      });
       const finalized = await finalizeFairQueueContext({
         fairQueueClient,
         ctx,
@@ -5618,22 +6229,39 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         phase,
       });
       if (finalized) {
+        logEvent('info', 'FQ', 'cleanup_done', {
+          requestId: fqContext.requestId,
+          host: fqContext.hostname,
+          mode: fqContext.admissionMode,
+          phase,
+          result: 'done',
+        });
         return true;
       }
-      return finalizeFairQueueContext({
+      const retryFinalized = await finalizeFairQueueContext({
         fairQueueClient,
         ctx,
         fqContext,
         phase: `${phase} retry`,
       });
+      logEvent(retryFinalized ? 'info' : 'warn', 'FQ', retryFinalized ? 'cleanup_done' : 'cleanup_failed', {
+        requestId: fqContext.requestId,
+        host: fqContext.hostname,
+        mode: fqContext.admissionMode,
+        phase,
+        result: retryFinalized ? 'done' : 'failed',
+      });
+      return retryFinalized;
     })();
 
+    const boundCleanupPromise = bindWaitUntil(ctx, cleanupPromise, 'FQ', 'early_cleanup', {
+      phase,
+    });
     if (ctx && typeof ctx.waitUntil === 'function') {
-      ctx.waitUntil(cleanupPromise);
       return responseToReturn;
     }
 
-    await cleanupPromise;
+    await boundCleanupPromise;
     return responseToReturn;
   };
 
@@ -5747,7 +6375,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     let nextPlan = null;
     if (needTrueConcurrency) {
       if (Date.now() >= hardExpireAtMs) {
-        return createUnauthorizedResponse(origin, 'link expired');
+        return terminal(createUnauthorizedResponse(origin, 'link expired'), 'payload_expired');
       }
 
       const concurrencyInitResponse = await ensureConcurrencyClientReady();
@@ -5795,7 +6423,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           if (needFairQueue) {
             await releaseUnusedFairQueueGrantIfNeeded(`${phase} expired before concurrency acquire`);
           }
-          return createUnauthorizedResponse(origin, 'link expired');
+          return terminal(createUnauthorizedResponse(origin, 'link expired'), 'payload_expired');
         }
 
       try {
@@ -5819,18 +6447,24 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
             if (settleResponse instanceof Response) {
               const fairQueueReleased = await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq wait settle failure`);
               if (!fairQueueReleased) {
-                return createErrorResponse(origin, 503, 'Fair queue unavailable');
+                return terminal(createErrorResponse(origin, 503, 'Fair queue unavailable'), 'fq_unavailable');
               }
               return settleResponse;
             }
           }
           const fairQueueReleased = await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq wait release`);
           if (!fairQueueReleased) {
-            return createErrorResponse(origin, 503, 'Fair queue unavailable');
+            return terminal(createErrorResponse(origin, 503, 'Fair queue unavailable'), 'fq_unavailable');
           }
 
           const waitBudgetWindow = readCurrentTrueConcurrencyWaitBudgetWindow();
           if (!waitBudgetWindow || waitBudgetWindow.exhausted) {
+            logEvent('warn', 'CQ', 'wait_timeout', {
+              requestId: cqPlan.requestId,
+              host: cqPlan.hostname,
+              phase,
+              reason: 'wait_budget_exhausted',
+            });
             return createTrueConcurrencyWaitBudgetExhaustedResponse();
           }
 
@@ -5868,6 +6502,12 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
               const remainingWaitBudget = readCurrentTrueConcurrencyWaitBudgetWindow();
               if (!remainingWaitBudget || remainingWaitBudget.exhausted) {
                 delete cqPlan.deadlineMs;
+                logEvent('warn', 'CQ', 'wait_timeout', {
+                  requestId: cqPlan.requestId,
+                  host: cqPlan.hostname,
+                  phase,
+                  reason: 'wait_budget_exhausted',
+                });
                 return createTrueConcurrencyWaitBudgetExhaustedResponse();
               }
             }
@@ -5921,7 +6561,12 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           await releaseController.releaseImmediately('acquire_delivery_failed');
           const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan.hostname);
           const message = error instanceof Error ? error.message : String(error);
-          console.error(`[CQ] claim failed during ${phase}:`, message);
+          logEvent('error', 'CQ', 'claim_failed', {
+            phase,
+            host: cqPlan.hostname,
+            requestId: cqPlan.requestId,
+            message,
+          });
           if (settleResponse instanceof Response) {
             if (needFairQueue) {
               await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq claim settle failure`);
@@ -5931,7 +6576,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           if (needFairQueue) {
             await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq claim failure`);
           }
-          return createTrueConcurrencyUnavailableResponse(origin);
+          return terminal(createTrueConcurrencyUnavailableResponse(origin), 'cq_claim_failed');
         }
 
         if (claimedResult.result !== 'granted') {
@@ -5990,7 +6635,12 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           await ensureCurrentTrueConcurrencyReleased('grant_delivery_failed', true);
           const settleResponse = await settleBreakerAttemptIfNeeded(claimHostname);
           const message = error instanceof Error ? error.message : String(error);
-          console.error(`[CQ] ack_handoff failed during ${phase}:`, message);
+          logEvent('error', 'CQ', 'ack_handoff_failed', {
+            phase,
+            host: claimHostname,
+            requestId: cqPlan.requestId,
+            message,
+          });
           if (settleResponse instanceof Response) {
             if (needFairQueue) {
               await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq ack_handoff settle failure`);
@@ -6000,7 +6650,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           if (needFairQueue) {
             await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq ack_handoff failure`);
           }
-          return createTrueConcurrencyUnavailableResponse(origin);
+          return terminal(createTrueConcurrencyUnavailableResponse(origin), 'cq_ack_failed');
         }
 
         if (ackHandoffResult.result !== 'acknowledged') {
@@ -6057,7 +6707,12 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           }
           const settleResponse = await settleBreakerAttemptIfNeeded(claimHostname);
           const message = error instanceof Error ? error.message : String(error);
-          console.error(`[CQ] heartbeat start failed during ${phase}:`, message);
+          logEvent('error', 'CQ', 'heartbeat_start_failed', {
+            phase,
+            host: claimHostname,
+            requestId: cqPlan.requestId,
+            message,
+          });
           if (settleResponse instanceof Response) {
             if (needFairQueue) {
               await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq heartbeat settle failure`);
@@ -6067,7 +6722,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           if (needFairQueue) {
             await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq heartbeat failure`);
           }
-          return createTrueConcurrencyUnavailableResponse(origin);
+          return terminal(createTrueConcurrencyUnavailableResponse(origin), 'cq_heartbeat_failed');
         }
 
         cqAcquireDispatched = false;
@@ -6085,10 +6740,15 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           if (needFairQueue) {
             await releaseUnusedFairQueueGrantIfNeeded(`${phase} client abort during cq acquire`);
           }
-          return createClientAbortResponse(origin);
+          return terminal(createClientAbortResponse(origin), 'client_aborted');
         }
         const message = error instanceof Error ? error.message : String(error);
-        console.error(`[CQ] acquire failed during ${phase}:`, message);
+        logEvent('error', 'CQ', 'acquire_failed', {
+          phase,
+          host: cqPlan?.hostname,
+          requestId: cqPlan?.requestId,
+          message,
+        });
         const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan?.hostname);
         if (settleResponse instanceof Response) {
           if (needFairQueue) {
@@ -6099,7 +6759,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         if (needFairQueue) {
           await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq failure`);
         }
-        return createTrueConcurrencyUnavailableResponse(origin);
+        return terminal(createTrueConcurrencyUnavailableResponse(origin), 'cq_acquire_failed');
       }
     }
 
@@ -6365,6 +7025,11 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       : buildSafeResponseHeaders(upstreamResponse, requestToWrap);
 
     if (!upstreamResponse.body) {
+      logEvent('info', 'CQ', 'stream_cleanup', {
+        host: upstreamHostname,
+        phase: 'empty_body',
+        reason: 'stream_complete',
+      });
       cqHeartbeatManager?.ensureCleanup?.('stream_complete');
       if (cqReleaseController) {
         cqReleaseController.ensureReleased('stream_complete');
@@ -6445,17 +7110,27 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       preventCancel: false,
       preventClose: false,
     }).then(async () => {
+      logEvent('info', 'CQ', 'stream_cleanup', {
+        host: upstreamHostname,
+        phase: 'pipe_complete',
+        reason: 'stream_complete',
+      });
       await cqHeartbeatManager?.ensureCleanup?.('stream_complete');
       await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
     }).catch(async (error) => {
       const reason = readManagedStreamTerminationReason(error);
+      logEvent('info', 'CQ', 'stream_cleanup', {
+        host: upstreamHostname,
+        phase: 'pipe_error',
+        reason,
+      });
       await cqHeartbeatManager?.ensureCleanup?.(reason);
       if (!TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_NO_RELEASE_REASONS.has(reason)) {
         await ensureCurrentTrueConcurrencyReleased(reason, true);
       }
       if (!isAbortError(error) && reason === 'upstream_failure') {
         const message = error instanceof Error ? error.message : String(error);
-        console.warn('[CQ] managed stream terminated with error:', message);
+        logEvent('warn', 'CQ', 'managed_stream_terminated_error', { message });
       }
     }).finally(() => {
       clearTimeout(expireTimer);
@@ -6465,9 +7140,9 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       }
     });
 
-    if (ctx && typeof ctx.waitUntil === 'function') {
-      ctx.waitUntil(pipePromise);
-    }
+    bindWaitUntil(ctx, pipePromise, 'CQ', 'managed_stream_pipe', {
+      host: upstreamHostname,
+    });
 
     cqCleanupBoundToStream = true;
     return new Response(streamPair.readable, {
@@ -6526,12 +7201,14 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     return new Response(upstreamResponse.body, responseInit);
   };
 
-  const buildGeneratedUpstreamTerminalResponse = (upstreamResponse) => {
+  const buildGeneratedUpstreamTerminalResponse = (upstreamResponse, reasonOverride = null) => {
     const status = upstreamResponse?.status;
     const message = status >= 500
       ? 'upstream download failed'
       : 'upstream download rejected';
-    return createErrorResponse(origin, status, message);
+    return terminal(createErrorResponse(origin, status, message), reasonOverride || upstreamTerminalReason(status), {
+      host: extractHostname(upstreamResponse?.url || '')?.toLowerCase() || undefined,
+    });
   };
 
   const cancelResponseBodyAndReturn = async (responseToCancel, responseToReturn, reason) => {
@@ -6568,7 +7245,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     return await reportBreakerResponseIfNeeded(requestHostname, response, requestUrl, attempt);
   };
 
-  const finalizeUpstreamTerminalResponseIfNeeded = async (upstreamResponse, requestHostname, attempt = null) => {
+  const finalizeUpstreamTerminalResponseIfNeeded = async (upstreamResponse, requestHostname, attempt = null, options = {}) => {
     const status = upstreamResponse?.status;
     if (!isGeneratedTerminalUpstreamStatus(status)) {
       return null;
@@ -6595,7 +7272,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
 
     await cancelResponseBody(upstreamResponse);
     return await releaseAdmissionBeforeTerminalResponse(
-      buildGeneratedUpstreamTerminalResponse(upstreamResponse),
+      buildGeneratedUpstreamTerminalResponse(upstreamResponse, options.reasonOverride),
       'upstream_terminal',
     );
   };
@@ -6629,7 +7306,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error('[TicketState] Mark-used failed:', message);
+      logEvent('error', 'TicketState', 'mark_used_failed', { message });
     }
 
     if (responseToReturn?.body && typeof responseToReturn.body.cancel === 'function') {
@@ -6640,7 +7317,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       }
     }
 
-    return createErrorResponse(origin, 502, 'ticket state update failed');
+    return terminal(createErrorResponse(origin, 502, 'ticket state update failed'), 'ticket_state_invalid');
   };
 
   let retriedWithFreshLink = false;
@@ -6673,10 +7350,18 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       const location = response.headers.get("Location");
       if (location) {
         const resolvedLocation = resolveRedirectLocation(location, request.url);
+        logEvent('info', 'Upstream', 'redirect_follow', {
+          status: response.status,
+          host: requestHostname,
+        });
         if (new URL(resolvedLocation).origin === currentOrigin) {
+          logEvent('info', 'Upstream', 'redirect_internal_return', {
+            status: response.status,
+            host: requestHostname,
+          });
           const recursiveRedirectResponse = await retireAdmissionBeforeRecursiveWorkerRedirect('recursive redirect');
           if (recursiveRedirectResponse) {
-            return recursiveRedirectResponse;
+            return terminal(recursiveRedirectResponse, 'redirect_internal_return', { host: requestHostname });
           }
           request = new Request(resolvedLocation, request);
           return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
@@ -6715,7 +7400,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         }
       }
       retriedWithFreshLink = true;
-      console.warn(`[Upstream] Auth error ${response.status} for ${path}, refreshing link from API`);
+      logEvent('warn', 'Upstream', 'auth_retry_start', { status: response.status });
       const refreshType =
         typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
           ? crypto.randomUUID()
@@ -6725,7 +7410,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         linkType: refreshType,
       });
       if (errorResponse) {
-        console.warn('[Upstream] Failed to refresh link due to API error, returning original response');
+        logEvent('warn', 'Upstream', 'auth_retry_fallback', { reason: 'api_error' });
       } else if (refreshedLink && refreshedLink.data && refreshedLink.data.url) {
         downloadUrl = refreshedLink.data.url;
         res = refreshedLink;
@@ -6752,10 +7437,18 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           const location = response.headers.get("Location");
           if (location) {
             const resolvedLocation = resolveRedirectLocation(location, request.url);
+            logEvent('info', 'Upstream', 'redirect_follow', {
+              status: response.status,
+              host: requestHostname,
+            });
             if (new URL(resolvedLocation).origin === currentOrigin) {
+              logEvent('info', 'Upstream', 'redirect_internal_return', {
+                status: response.status,
+                host: requestHostname,
+              });
               const recursiveRedirectResponse = await retireAdmissionBeforeRecursiveWorkerRedirect('recursive redirect');
               if (recursiveRedirectResponse) {
-                return recursiveRedirectResponse;
+                return terminal(recursiveRedirectResponse, 'redirect_internal_return', { host: requestHostname });
               }
               request = new Request(resolvedLocation, request);
               return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
@@ -6807,15 +7500,24 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       return await cancelResponseBodyAndReturn(response, deferredTerminalReportResponse, 'prestream_terminal');
     }
 
-    const terminalUpstreamResponse = await finalizeUpstreamTerminalResponseIfNeeded(response, requestHostname, attempt);
+    const upstreamTerminalOptions = retriedWithFreshLink && shouldRetryAuthError(response.status)
+      ? { reasonOverride: 'upstream_auth_retry_exhausted' }
+      : undefined;
+    const terminalUpstreamResponse = await finalizeUpstreamTerminalResponseIfNeeded(
+      response,
+      requestHostname,
+      attempt,
+      upstreamTerminalOptions,
+    );
     if (terminalUpstreamResponse) {
       return terminalUpstreamResponse;
     }
 
     if (response.status !== 200 && response.status !== 206) {
-      console.warn(
-        `[Upstream] Unexpected status ${response.status} for ${path} (url ${downloadUrl})`
-      );
+      logEvent('warn', 'Upstream', 'unexpected_status', {
+        status: response.status,
+        host: requestHostname,
+      });
     }
 
     releaseFairQueueAfterHeadersIfNeeded();
@@ -6850,7 +7552,9 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     if (isHeadProbeRequest && !shouldRewriteHeadProbeResponse) {
       await cancelResponseBody(response);
       return await releaseAdmissionBeforeTerminalResponse(
-        createErrorResponse(origin, 502, 'Google Drive HEAD probe invalid'),
+        terminal(createErrorResponse(origin, 502, 'Google Drive HEAD probe invalid'), 'google_drive_probe_invalid', {
+          host: requestHostname,
+        }),
         'head_probe_invalid',
       );
     }
@@ -6858,13 +7562,18 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     if (isGoogleDriveSyntheticFullRangeRequest && !shouldRewriteGoogleDriveFullDownloadResponse) {
       await cancelResponseBody(response);
       return await releaseAdmissionBeforeTerminalResponse(
-        createErrorResponse(origin, 502, 'Google Drive range mismatch'),
+        terminal(createErrorResponse(origin, 502, 'Google Drive range mismatch'), 'google_drive_range_mismatch', {
+          host: requestHostname,
+        }),
         'google_drive_range_mismatch',
       );
     }
 
     if (shouldRewriteGoogleDriveFullDownloadResponse && !needTrueConcurrency) {
-      return await finalizeContentResponse(buildGoogleDriveFullDownloadResponse(response, request), response);
+      return await finalizeContentResponse(
+        terminal(buildGoogleDriveFullDownloadResponse(response, request), 'google_drive_full_range', { host: requestHostname }),
+        response,
+      );
     }
 
     // Ordinary breaker_only terminal exits must retire before any managed stream
@@ -6888,19 +7597,22 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         headers: buildSafeResponseHeaders(response, request),
       });
 
-    return await finalizeContentResponse(safeResponse, response);
+    return await finalizeContentResponse(
+      terminal(safeResponse, upstreamTerminalReason(safeResponse.status), { host: requestHostname }),
+      response,
+    );
   } catch (error) {
     const deferredFailureResponse = await flushDeferredQueueBreakerReportOnExit();
     if (deferredFailureResponse) {
-      return deferredFailureResponse;
+      return terminal(deferredFailureResponse, 'deferred_report_failed');
     }
 
     if (error instanceof Response) {
-      return error;
+      return terminal(error, 'thrown_response');
     }
 
     if (didClientAbort() && isAbortError(error)) {
-      return createClientAbortResponse(origin);
+      return terminal(createClientAbortResponse(origin), 'client_aborted');
     }
     throw error;
   } finally {
@@ -6943,10 +7655,9 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           FINAL_CLEANUP_RELEASE_CONCURRENCY,
         );
       })();
-      if (ctx && typeof ctx.waitUntil === 'function') {
-        ctx.waitUntil(cleanupPromise);
-      } else {
-        await cleanupPromise;
+      const boundCleanupPromise = bindWaitUntil(ctx, cleanupPromise, 'FQ', 'final_cleanup');
+      if (!(ctx && typeof ctx.waitUntil === 'function')) {
+        await boundCleanupPromise;
       }
     }
   }
@@ -6988,28 +7699,37 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
       safeHeaders.set("Access-Control-Allow-Origin", origin);
       safeHeaders.append("Vary", "Origin");
 
-      return new Response(
-        JSON.stringify({
-          code: 403,
-          message: "ipv6 access is prohibited"
-        }),
-        {
-          status: 403,
-          headers: safeHeaders
-        }
+      return logTerminalResponse(
+        new Response(
+          JSON.stringify({
+            code: 403,
+            message: "ipv6 access is prohibited"
+          }),
+          {
+            status: 403,
+            headers: safeHeaders
+          }
+        ),
+        'ipv6_blocked',
+        { phase: 'handle_request' },
       );
     }
   }
 
   // Continue with normal processing if not blocked
   if (request.method === "OPTIONS") {
-    return handleOptions(request);
+    return logTerminalResponse(handleOptions(request), 'options_preflight', {
+      phase: 'handle_request',
+    });
   }
 
   return await handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 }
 
 export const __fairQueueTestHooks = {
+  logEvent,
+  logTerminalResponse,
+  bindWaitUntil,
   applyUnifiedResult: (unifiedResult, options = {}) => applyUnifiedResult(unifiedResult, {
     origin: '*',
     throttleEnabled: true,
@@ -7051,7 +7771,10 @@ export default {
       if (isInternalPath) {
         const internalResponse = await handleInternalApiIfAny(request, env, ctx);
         if (internalResponse) {
-          return internalResponse;
+          return logTerminalResponse(internalResponse, 'internal_api_response', {
+            phase: 'fetch',
+            pathClass: 'internal_api',
+          });
         }
       }
 
@@ -7061,7 +7784,9 @@ export default {
         const headerName = headerNameRaw || 'X-Inner-Auth';
         const provided = request.headers.get(headerName) || '';
         if (provided !== innerAuthSecret) {
-          return new Response('Forbidden', { status: 403 });
+          return logTerminalResponse(new Response('Forbidden', { status: 403 }), 'inner_auth_rejected', {
+            phase: 'fetch',
+          });
         }
       }
 
@@ -7069,10 +7794,14 @@ export default {
       try {
         controllerState = await fetchControllerState(request, env);
       } catch (error) {
-        console.error('[controller] state fetch error:', error instanceof Error ? error.message : String(error));
+        logEvent('error', 'Controller', 'state_fetch_error', { message: error instanceof Error ? error.message : String(error) });
       }
       if (!controllerState || !controllerState.bootstrap || !controllerState.decision) {
-        return createErrorResponse("*", 503, "controller state unavailable");
+        return logTerminalResponse(
+          createErrorResponse("*", 503, "controller state unavailable"),
+          'controller_state_unavailable',
+          { phase: 'fetch', controllerGate: 'state' },
+        );
       }
 
       const config = resolveConfig(env || {}, controllerState.bootstrap, controllerState.decision);
@@ -7087,20 +7816,28 @@ export default {
       const requestOrigin = url.origin;
       if (!config.workerAddresses.includes(requestOrigin)) {
         const origin = request.headers.get('origin') || '*';
-        return createErrorResponse(origin, 403, 'prohibited source');
+        return logTerminalResponse(
+          createErrorResponse(origin, 403, 'prohibited source'),
+          'prohibited_source',
+          { phase: 'fetch', host: url.hostname },
+        );
       }
 
       const response = await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
 
       scheduleAllCleanups(config, env, ctx).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
-        console.error('[Cleanup Scheduler] Error:', message);
+        logEvent('error', 'CleanupScheduler', 'schedule_failed', { message });
       });
 
       return response;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return createErrorResponse("*", 500, message);
+      return logTerminalResponse(
+        createErrorResponse("*", 500, message),
+        'top_level_exception',
+        { phase: 'fetch' },
+      );
     }
   }
 };
