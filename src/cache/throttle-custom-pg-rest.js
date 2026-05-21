@@ -1,4 +1,5 @@
 import { sha256Hash, applyVerifyHeaders, hasVerifyCredentials } from '../utils.js';
+import { logEvent } from '../logging.js';
 const BREAKER_TABLE = 'THROTTLE_PROTECTION';
 const DEFAULT_CLOSE_THRESHOLD_PERCENT = 15;
 const DEFAULT_HALF_OPEN_SUCCESS_THRESHOLD = 2;
@@ -351,7 +352,10 @@ export const settleBreakerAttempt = async (hostname, updateData, config) => {
   const attemptTicket = Number.isFinite(attemptTicketRaw) ? Math.trunc(attemptTicketRaw) : null;
 
   if (!Number.isFinite(attemptVersion) || !Number.isFinite(attemptTicket)) {
-    console.warn('[Throttle] Skip settleBreakerAttempt: invalid attempt identity');
+    logEvent('warn', 'Throttle', 'invalid_attempt_identity', {
+      attemptVersion: updateData?.attemptVersion,
+      attemptTicket: updateData?.attemptTicket,
+    });
     return null;
   }
 
@@ -400,7 +404,7 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
   const sampleValue = Number(updateData?.sample);
   const sample = sampleValue >= 1 ? 1 : 0;
   if (!Number.isFinite(sampleValue)) {
-    console.warn('[Throttle] Skip reportBreakerSample: invalid sample:', updateData?.sample);
+    logEvent('warn', 'Throttle', 'invalid_sample', { sample: updateData?.sample });
     return null;
   }
 
@@ -423,7 +427,7 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
   const attemptTicket = Number.isFinite(attemptTicketRaw) ? Math.trunc(attemptTicketRaw) : null;
 
   if (!Number.isFinite(statusCode)) {
-    console.warn('[Throttle] Skip reportBreakerSample: invalid statusCode:', updateData?.statusCode);
+    logEvent('warn', 'Throttle', 'invalid_status_code', { statusCode: updateData?.statusCode });
     return null;
   }
 
@@ -475,9 +479,14 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
     },
   );
 
-  console.log(
-    `[Throttle] Updated breaker for ${hostname}: state=${readBreakerField(row, 'STATE')}, openUntil=${readBreakerField(row, 'OPEN_UNTIL')}, reason=${readBreakerField(row, 'OPEN_REASON')}, version=${readBreakerField(row, 'VERSION')}, code=${readBreakerField(row, 'LAST_ERROR_CODE')}`
-  );
+  logEvent('info', 'Throttle', 'breaker_updated', {
+    hostname,
+    state: readBreakerField(row, 'STATE'),
+    openUntil: readBreakerField(row, 'OPEN_UNTIL'),
+    reason: readBreakerField(row, 'OPEN_REASON'),
+    version: readBreakerField(row, 'VERSION'),
+    code: readBreakerField(row, 'LAST_ERROR_CODE'),
+  });
 
   return readBreakerSnapshot(row);
 };

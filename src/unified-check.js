@@ -1,4 +1,5 @@
 import { sha256Hash, calculateIPSubnet, applyVerifyHeaders, hasVerifyCredentials } from './utils.js';
+import { logEvent } from './logging.js';
 
 const VALID_BREAKER_STATES = new Set(['closed', 'open', 'half_open']);
 const VALID_MARK_USED_RESULTS = new Set(['transitioned', 'already_used', 'storage_error']);
@@ -132,7 +133,10 @@ export const unifiedCheck = async (path, clientIP, config) => {
   const ipv4Suffix = config.ipv4Suffix ?? '/32';
   const ipv6Suffix = config.ipv6Suffix ?? '/60';
 
-  console.log('[Unified Check] Starting unified check for path:', path);
+  logEvent('info', 'UnifiedCheck', 'start', {
+    operation: 'download_unified_check',
+    cacheEnabled: config.cacheEnabled,
+  });
 
   const pathHash = await sha256Hash(path);
   if (!pathHash) {
@@ -165,7 +169,17 @@ export const unifiedCheck = async (path, clientIP, config) => {
     p_now: now,
   };
 
-  console.log('[Unified Check] Calling RPC with params:', JSON.stringify(rpcBody, null, 2));
+  logEvent('info', 'UnifiedCheck', 'rpc_start', {
+    operation: 'download_unified_check',
+    cacheEnabled: rpcBody.p_cache_enabled,
+    cacheTtl: rpcBody.p_cache_ttl,
+    windowSeconds: rpcBody.p_window_seconds,
+    limit: rpcBody.p_limit,
+    blockSeconds: rpcBody.p_block_seconds,
+    pathHash,
+    ipHash,
+    throttleHostnameHash: rpcBody.p_throttle_hostname_hash,
+  });
 
   const response = await fetch(rpcUrl, {
     method: 'POST',
@@ -175,18 +189,33 @@ export const unifiedCheck = async (path, clientIP, config) => {
 
   if (!response.ok) {
     const errorText = await response.text();
-    console.error('[Unified Check] RPC error:', response.status, errorText);
+    logEvent('error', 'UnifiedCheck', 'rpc_error', {
+      operation: 'download_unified_check',
+      status: response.status,
+    });
     throw new Error(`Unified check RPC error (${response.status}): ${errorText}`);
   }
 
   const result = await response.json();
   if (!result || result.length === 0) {
-    console.error('[Unified Check] RPC returned no rows');
+    logEvent('error', 'UnifiedCheck', 'rpc_empty', {
+      operation: 'download_unified_check',
+    });
     throw new Error('Unified check returned no rows');
   }
 
   const row = result[0];
-  console.log('[Unified Check] RPC result:', JSON.stringify(row, null, 2));
+  logEvent('info', 'UnifiedCheck', 'rpc_success', {
+    operation: 'download_unified_check',
+    rowCount: result.length,
+    cacheHit: Boolean(config.cacheEnabled && row.cache_link_data),
+    accessCount: row.rate_access_count,
+    blockUntil: row.rate_block_until,
+    breakerRecordExists: row.throttle_record_exists,
+    breakerState: row.throttle_state,
+    breakerVersion: row.throttle_version,
+    lastErrorCode: row.throttle_last_error_code,
+  });
 
   let cacheResult = {
     hit: false,
@@ -201,14 +230,28 @@ export const unifiedCheck = async (path, clientIP, config) => {
       cacheResult.linkData = JSON.parse(row.cache_link_data);
       cacheResult.timestamp = row.cache_timestamp;
       cacheResult.hostnameHash = row.cache_hostname_hash;
-      console.log('[Unified Check] Cache HIT for path:', path);
+      logEvent('info', 'UnifiedCheck', 'cache_result', {
+        result: 'hit',
+        timestamp: cacheResult.timestamp,
+        hostnameHash: cacheResult.hostnameHash,
+        pathHash,
+      });
     } catch (error) {
-      console.error('[Unified Check] Failed to parse cache link data:', error.message);
+      logEvent('error', 'UnifiedCheck', 'cache_parse_failed', {
+        message: error?.message,
+        pathHash,
+      });
     }
   } else if (!config.cacheEnabled) {
-    console.log('[Unified Check] Cache disabled for path:', path);
+    logEvent('info', 'UnifiedCheck', 'cache_result', {
+      result: 'disabled',
+      pathHash,
+    });
   } else {
-    console.log('[Unified Check] Cache MISS for path:', path);
+    logEvent('info', 'UnifiedCheck', 'cache_result', {
+      result: 'miss',
+      pathHash,
+    });
   }
 
   const parsedAccessCount = Number.parseInt(row.rate_access_count, 10);
@@ -223,14 +266,29 @@ export const unifiedCheck = async (path, clientIP, config) => {
   if (blockUntil && blockUntil > now) {
     rateLimitAllowed = false;
     rateLimitRetryAfter = blockUntil - now;
-    console.log('[Unified Check] Rate limit BLOCKED until:', new Date(blockUntil * 1000).toISOString());
+    logEvent('info', 'UnifiedCheck', 'rate_limit_result', {
+      result: 'blocked',
+      accessCount,
+      limit,
+      retryAfter: rateLimitRetryAfter,
+      blockUntil,
+    });
   } else if (accessCount >= limit) {
     const diff = now - lastWindowTime;
     rateLimitRetryAfter = windowSeconds - diff;
     rateLimitAllowed = false;
-    console.log('[Unified Check] Rate limit EXCEEDED:', accessCount, '>=', limit);
+    logEvent('info', 'UnifiedCheck', 'rate_limit_result', {
+      result: 'exceeded',
+      accessCount,
+      limit,
+      retryAfter: rateLimitRetryAfter,
+    });
   } else {
-    console.log('[Unified Check] Rate limit OK:', accessCount, '/', limit);
+    logEvent('info', 'UnifiedCheck', 'rate_limit_result', {
+      result: 'ok',
+      accessCount,
+      limit,
+    });
   }
 
   const rateLimitResult = {
@@ -254,12 +312,30 @@ export const unifiedCheck = async (path, clientIP, config) => {
   };
 
   if (throttleResult.recordExists) {
-    console.log('[Unified Check] Breaker snapshot:', JSON.stringify(throttleResult));
+    logEvent('info', 'UnifiedCheck', 'breaker_snapshot', {
+      recordExists: throttleResult.recordExists,
+      state: throttleResult.state,
+      openUntil: throttleResult.openUntil,
+      reason: throttleResult.reason,
+      version: throttleResult.version,
+      lastErrorCode: throttleResult.lastErrorCode,
+    });
   } else {
-    console.log('[Unified Check] Breaker snapshot unavailable (no record)');
+    logEvent('info', 'UnifiedCheck', 'breaker_snapshot', {
+      recordExists: false,
+    });
   }
 
-  console.log('[Unified Check] Completed successfully');
+  logEvent('info', 'UnifiedCheck', 'complete', {
+    operation: 'download_unified_check',
+    cacheHit: cacheResult.hit,
+    rateLimitAllowed: rateLimitResult.allowed,
+    accessCount: rateLimitResult.accessCount,
+    retryAfter: rateLimitResult.retryAfter,
+    breakerState: throttleResult.state,
+    pathHash,
+    ipHash,
+  });
 
   return {
     cache: cacheResult,

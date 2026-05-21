@@ -1,4 +1,5 @@
 import { getBootstrapConfig, getDecisionForRequest } from './controller-client.js';
+import { logEvent } from './logging.js';
 import { getClientIp } from './origin-binding.js';
 
 const hasControllerBase = (env) =>
@@ -221,7 +222,9 @@ export async function fetchControllerState(request, env) {
       pathRule: rule,
     };
   } catch (error) {
-    console.error('[controller] fetch failed:', error instanceof Error ? error.message : String(error));
+    logEvent('error', 'Controller', 'fetch-failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
     return null;
   }
 }

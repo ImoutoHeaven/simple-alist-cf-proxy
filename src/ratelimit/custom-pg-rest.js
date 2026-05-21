@@ -1,6 +1,15 @@
 import { calculateIPSubnet, sha256Hash, applyVerifyHeaders, hasVerifyCredentials } from '../utils.js';
+import { logEvent } from '../logging.js';
 
 const DEFAULT_TABLE = 'DOWNLOAD_IP_RATELIMIT_TABLE';
+const getErrorMessage = (error) => error instanceof Error ? error.message : String(error);
+const getLogFields = (error, fallback = {}) => error?.logFields || { ...fallback, error: getErrorMessage(error) };
+
+const createPostgrestError = (message, fields) => {
+  const error = new Error(message);
+  error.logFields = fields;
+  return error;
+};
 
 /**
  * Execute query via PostgREST API.
@@ -35,7 +44,11 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
       );
     }
 
-    throw new Error(`PostgREST API error (${response.status}): ${errorText}`);
+    throw createPostgrestError(`PostgREST API error (${response.status}): ${errorText}`, {
+      status: response.status,
+      operation: method,
+      table: tableName,
+    });
   }
 
   let result;
@@ -100,7 +113,7 @@ export const checkRateLimit = async (ip, config) => {
     const triggerCleanup = () => {
       const probability = config.cleanupProbability || 0.01;
       if (Math.random() < probability) {
-        console.log(`[Rate Limit Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
+        logEvent('info', 'RateLimit', 'cleanup_triggered', { probability });
 
         const cleanupPromise = cleanupExpiredRecords(
           postgrestUrl,
@@ -110,18 +123,18 @@ export const checkRateLimit = async (ip, config) => {
           config.windowTimeSeconds
         )
           .then((deletedCount) => {
-            console.log(`[Rate Limit Cleanup] Background cleanup finished: ${deletedCount} records deleted`);
+            logEvent('info', 'RateLimit', 'cleanup_done', { deletedCount });
             return deletedCount;
           })
           .catch((error) => {
-            console.error('[Rate Limit Cleanup] Background cleanup failed:', error instanceof Error ? error.message : String(error));
+            logEvent('error', 'RateLimit', 'cleanup_failed', { error: getErrorMessage(error) });
           });
 
         if (config.ctx && config.ctx.waitUntil) {
           config.ctx.waitUntil(cleanupPromise);
-          console.log('[Rate Limit Cleanup] Cleanup scheduled in background (using ctx.waitUntil)');
+          logEvent('info', 'RateLimit', 'cleanup_scheduled', { waitUntil: true });
         } else {
-          console.warn('[Rate Limit Cleanup] No ctx.waitUntil available, cleanup may be interrupted');
+          logEvent('warn', 'RateLimit', 'cleanup_scheduled', { waitUntil: false });
         }
       }
     };
@@ -148,7 +161,12 @@ export const checkRateLimit = async (ip, config) => {
 
     if (!rpcResponse.ok) {
       const errorText = await rpcResponse.text();
-      throw new Error(`PostgREST RPC error (${rpcResponse.status}): ${errorText}`);
+      throw createPostgrestError(`PostgREST RPC error (${rpcResponse.status}): ${errorText}`, {
+        status: rpcResponse.status,
+        operation: 'check',
+        rpc: 'download_upsert_rate_limit',
+        table: tableName,
+      });
     }
 
     const rpcResult = await rpcResponse.json();
@@ -187,7 +205,7 @@ export const checkRateLimit = async (ip, config) => {
     const errorMessage = error instanceof Error ? error.message : String(error);
 
     if (config.pgErrorHandle === 'fail-open') {
-      console.error('Rate limit check failed (fail-open):', errorMessage);
+      logEvent('error', 'RateLimit', 'check_failed_fail_open', getLogFields(error, { operation: 'check' }));
       return { allowed: true };
     }
 
@@ -206,7 +224,7 @@ export const cleanupExpiredRecords = async (postgrestUrl, verifyHeader, verifySe
   const cutoffTime = now - (windowTimeSeconds * 2);
 
   try {
-    console.log(`[Rate Limit Cleanup] Executing DELETE query (cutoff: ${cutoffTime}, windowTime: ${windowTimeSeconds}s)`);
+    logEvent('info', 'RateLimit', 'cleanup_query_start', { cutoffTime, windowTimeSeconds });
 
     const filters = `LAST_WINDOW_TIME=lt.${cutoffTime}&and=(BLOCK_UNTIL.is.null,BLOCK_UNTIL.lt.${now})`;
     const result = await executeQuery(
@@ -221,10 +239,10 @@ export const cleanupExpiredRecords = async (postgrestUrl, verifyHeader, verifySe
     );
 
     const deletedCount = result.affectedRows || 0;
-    console.log(`[Rate Limit Cleanup] DELETE completed: ${deletedCount} expired records deleted`);
+    logEvent('info', 'RateLimit', 'cleanup_query_done', { deletedCount });
     return deletedCount;
   } catch (error) {
-    console.error('[Rate Limit Cleanup] DELETE failed:', error instanceof Error ? error.message : String(error));
+    logEvent('error', 'RateLimit', 'cleanup_query_failed', getLogFields(error, { operation: 'cleanup', table: tableName }));
     return 0;
   }
 };

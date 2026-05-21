@@ -1,3 +1,4 @@
+import { logEvent } from './logging.js';
 import { calculateIPSubnet, sha256Hash } from './utils.js';
 
 const BASE64_CHARS = { '+': '-', '/': '_', '=': '' };
@@ -179,7 +180,7 @@ export const parseCheckOriginEnv = (rawValue) => {
     if (VALID_ORIGIN_MODES.has(normalized)) {
       modes.push(normalized);
     } else {
-      console.warn(`[origin-binding] Unknown CHECK_ORIGIN field "${part}" ignored`);
+      logEvent('warn', 'OriginBinding', 'unknown-check-origin-field-ignored', { field: part });
     }
   });
   return modes;

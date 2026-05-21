@@ -1,4 +1,14 @@
 import { sha256Hash, extractHostname, applyVerifyHeaders, hasVerifyCredentials } from '../utils.js';
+import { logEvent } from '../logging.js';
+
+const getErrorMessage = (error) => error instanceof Error ? error.message : String(error);
+const getLogFields = (error, fallback = {}) => error?.logFields || { ...fallback, error: getErrorMessage(error) };
+
+const createPostgrestError = (message, fields) => {
+  const error = new Error(message);
+  error.logFields = fields;
+  return error;
+};
 
 /**
  * Execute query via PostgREST API
@@ -50,7 +60,11 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
       );
     }
 
-    throw new Error(`PostgREST API error (${response.status}): ${errorText}`);
+    throw createPostgrestError(`PostgREST API error (${response.status}): ${errorText}`, {
+      status: response.status,
+      operation: method,
+      table: tableName,
+    });
   }
 
   // For POST/PATCH/DELETE, PostgREST returns the affected rows or empty
@@ -148,11 +162,11 @@ export const checkCache = async (path, config) => {
       const linkData = JSON.parse(result.LINK_DATA);
       return { linkData };
     } catch (error) {
-      console.error('[Cache] Failed to parse LINK_DATA:', error.message);
+      logEvent('error', 'Cache', 'parse_failed', { error: getErrorMessage(error) });
       return null;
     }
   } catch (error) {
-    console.error('[Cache] Check failed:', error.message);
+    logEvent('error', 'Cache', 'check_failed', getLogFields(error, { operation: 'check' }));
     return null;
   }
 };
@@ -190,12 +204,12 @@ export const saveCache = async (path, linkData, config) => {
         const hostname = extractHostname(linkData.url);
         if (hostname) {
           hostnameHash = await sha256Hash(hostname);
-          console.log(`[Cache] Calculated hostname hash for ${hostname}: ${hostnameHash}`);
+          logEvent('info', 'Cache', 'hostname_hash_calculated', { hostname, hostnameHash });
         } else {
-          console.warn(`[Cache] Failed to extract hostname from URL: ${linkData.url}`);
+          logEvent('warn', 'Cache', 'hostname_missing');
         }
       } catch (error) {
-        console.error('[Cache] Failed to calculate hostname hash:', error instanceof Error ? error.message : String(error));
+        logEvent('error', 'Cache', 'hostname_hash_failed', { error: getErrorMessage(error) });
       }
     }
 
@@ -205,22 +219,22 @@ export const saveCache = async (path, linkData, config) => {
     const triggerCleanup = () => {
       const probability = config.cleanupProbability || 0.01;
       if (Math.random() < probability) {
-        console.log(`[Cache Cleanup] Triggered cleanup (probability: ${probability * 100}%)`);
+        logEvent('info', 'Cache', 'cleanup_triggered', { probability });
 
         const cleanupPromise = cleanupExpiredCache(postgrestUrl, verifyHeader, verifySecret, tableName, config.linkTTL)
           .then((deletedCount) => {
-            console.log(`[Cache Cleanup] Background cleanup finished: ${deletedCount} records deleted`);
+            logEvent('info', 'Cache', 'cleanup_done', { deletedCount });
             return deletedCount;
           })
           .catch((error) => {
-            console.error('[Cache Cleanup] Background cleanup failed:', error instanceof Error ? error.message : String(error));
+            logEvent('error', 'Cache', 'cleanup_failed', { error: getErrorMessage(error) });
           });
 
         if (config.ctx && config.ctx.waitUntil) {
           config.ctx.waitUntil(cleanupPromise);
-          console.log(`[Cache Cleanup] Cleanup scheduled in background (using ctx.waitUntil)`);
+          logEvent('info', 'Cache', 'cleanup_scheduled', { waitUntil: true });
         } else {
-          console.warn(`[Cache Cleanup] No ctx.waitUntil available, cleanup may be interrupted`);
+          logEvent('warn', 'Cache', 'cleanup_scheduled', { waitUntil: false });
         }
       }
     };
@@ -247,7 +261,12 @@ export const saveCache = async (path, linkData, config) => {
 
     if (!rpcResponse.ok) {
       const errorText = await rpcResponse.text();
-      throw new Error(`PostgREST RPC error (${rpcResponse.status}): ${errorText}`);
+      throw createPostgrestError(`PostgREST RPC error (${rpcResponse.status}): ${errorText}`, {
+        status: rpcResponse.status,
+        operation: 'save',
+        rpc: 'download_upsert_download_cache',
+        table: tableName,
+      });
     }
 
     // Parse RPC result (returns array with single row)
@@ -256,12 +275,12 @@ export const saveCache = async (path, linkData, config) => {
       throw new Error('RPC download_upsert_download_cache returned no rows');
     }
 
-    console.log(`[Cache] Saved with hostname_hash: ${hostnameHash}`);
+    logEvent('info', 'Cache', 'save_success', { hostnameHash });
 
     // Trigger cleanup probabilistically
     triggerCleanup();
   } catch (error) {
-    console.error('[Cache] Save failed:', error.message);
+    logEvent('error', 'Cache', 'save_failed', getLogFields(error, { operation: 'save' }));
     // Don't propagate error - cache failure should not block downloads
   }
 };
@@ -281,7 +300,7 @@ const cleanupExpiredCache = async (postgrestUrl, verifyHeader, verifySecret, tab
   const cutoffTime = now - (linkTTL * 2);
 
   try {
-    console.log(`[Cache Cleanup] Executing DELETE query (cutoff: ${cutoffTime}, linkTTL: ${linkTTL}s)`);
+    logEvent('info', 'Cache', 'cleanup_query_start', { cutoffTime, linkTTL });
 
     // Delete records where TIMESTAMP is older than cutoff
     const filters = `TIMESTAMP=lt.${cutoffTime}`;
@@ -298,12 +317,12 @@ const cleanupExpiredCache = async (postgrestUrl, verifyHeader, verifySecret, tab
     );
 
     const deletedCount = result.affectedRows || 0;
-    console.log(`[Cache Cleanup] DELETE completed: ${deletedCount} expired records deleted (older than ${linkTTL * 2}s)`);
+    logEvent('info', 'Cache', 'cleanup_query_done', { deletedCount, olderThanSeconds: linkTTL * 2 });
 
     return deletedCount;
   } catch (error) {
     // Log error but don't propagate (cleanup failure shouldn't block requests)
-    console.error('[Cache Cleanup] DELETE failed:', error instanceof Error ? error.message : String(error));
+    logEvent('error', 'Cache', 'cleanup_query_failed', getLogFields(error, { operation: 'cleanup', table: tableName }));
     return 0;
   }
 };

@@ -8,6 +8,7 @@ import { parseBoolean, extractHostname, matchHostnamePattern, applyVerifyHeaders
 import { buildBindingStr, decryptBindingPayload, getClientIp, normalizePath, parseCheckOriginEnv } from './origin-binding.js';
 import { handleInternalApiIfAny } from './internal-api.js';
 import { fetchControllerState } from './controller-adapter.js';
+import { logEvent, sanitizeLogValue, sanitizeLogStructuredValue, bindWaitUntil } from './logging.js';
 
 // Configuration constants
 const REQUIRED_ENV = [];
@@ -84,174 +85,6 @@ const SITE_BUCKET_MODES = new Set(['host', 'sharepoint', 'googledrive']);
 
 const nowMs = () => Date.now();
 
-const SENSITIVE_LOG_KEY_FRAGMENTS = [
-  'token',
-  'secret',
-  'auth',
-  'payload',
-  'signature',
-  'cookie',
-  'authorization',
-];
-const RAW_CLIENT_IP_LOG_KEYS = new Set([
-  'clientip',
-  'client_ip',
-  'ip',
-  'remoteip',
-  'remote_ip',
-  'cfconnectingip',
-  'cf_connecting_ip',
-  'xforwardedfor',
-  'x_forwarded_for',
-]);
-const MAX_LOG_VALUE_LENGTH = 120;
-const OMIT_LOG_FIELD = Symbol('OMIT_LOG_FIELD');
-
-function normalizeLogKey(key) {
-  return String(key).replace(/[^a-z0-9]/gi, '').toLowerCase();
-}
-
-function isRawClientIpLogValue(value) {
-  if (typeof value !== 'string') {
-    return false;
-  }
-  const text = value.trim();
-  const addressText = text.replace(/\/\d{1,3}$/, '');
-  if (/^(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(addressText)) {
-    return true;
-  }
-  return /^(?:[a-f0-9]{0,4}:){2,}[a-f0-9]{0,4}(?:%[\w.-]+)?$/i.test(addressText);
-}
-
-function shouldOmitLogField(key, value) {
-  if (value === undefined || value === null) {
-    return true;
-  }
-  const normalizedKey = normalizeLogKey(key);
-  return RAW_CLIENT_IP_LOG_KEYS.has(normalizedKey) || isRawClientIpLogValue(value);
-}
-
-function shouldRedactLogField(key) {
-  const normalizedKey = normalizeLogKey(key);
-  return SENSITIVE_LOG_KEY_FRAGMENTS.some((fragment) => normalizedKey.includes(fragment));
-}
-
-function stripLogUrlQuery(value) {
-  if (value instanceof URL) {
-    return `${value.origin}${value.pathname}`;
-  }
-  if (typeof value !== 'string') {
-    return value;
-  }
-  try {
-    const url = new URL(value);
-    return `${url.origin}${url.pathname}`;
-  } catch {
-    return value;
-  }
-}
-
-function sanitizeLogStructuredValue(value, seen = new WeakSet()) {
-  if (isRawClientIpLogValue(value)) {
-    return OMIT_LOG_FIELD;
-  }
-  if (typeof value === 'string' || value instanceof URL) {
-    return stripLogUrlQuery(value);
-  }
-  if (!value || typeof value !== 'object' || value instanceof URL) {
-    return value;
-  }
-  if (seen.has(value)) {
-    return '[Circular]';
-  }
-  seen.add(value);
-
-  if (Array.isArray(value)) {
-    const sanitizedItems = [];
-    for (const item of value) {
-      const sanitizedItem = sanitizeLogStructuredValue(item, seen);
-      if (sanitizedItem !== OMIT_LOG_FIELD) {
-        sanitizedItems.push(sanitizedItem);
-      }
-    }
-    seen.delete(value);
-    return sanitizedItems;
-  }
-
-  const sanitizedObject = {};
-  for (const [key, childValue] of Object.entries(value)) {
-    if (shouldOmitLogField(key, childValue)) {
-      continue;
-    }
-    if (shouldRedactLogField(key)) {
-      sanitizedObject[key] = '[redacted]';
-      continue;
-    }
-    const sanitizedChild = sanitizeLogStructuredValue(childValue, seen);
-    if (sanitizedChild !== OMIT_LOG_FIELD) {
-      sanitizedObject[key] = sanitizedChild;
-    }
-  }
-  seen.delete(value);
-  return sanitizedObject;
-}
-
-function sanitizeLogValue(value) {
-  const sanitizedValue = sanitizeLogStructuredValue(value);
-  let text;
-  if (sanitizedValue instanceof URL || typeof sanitizedValue === 'string') {
-    text = stripLogUrlQuery(sanitizedValue);
-  } else if (typeof sanitizedValue === 'number' || typeof sanitizedValue === 'boolean' || typeof sanitizedValue === 'bigint') {
-    text = String(sanitizedValue);
-  } else if (sanitizedValue === null) {
-    text = 'null';
-  } else if (sanitizedValue === undefined) {
-    text = 'undefined';
-  } else {
-    try {
-      text = JSON.stringify(sanitizedValue);
-    } catch {
-      text = String(sanitizedValue);
-    }
-  }
-
-  text = String(text).replace(/\s+/g, ' ').trim();
-  if (text.length > MAX_LOG_VALUE_LENGTH) {
-    return `${text.slice(0, MAX_LOG_VALUE_LENGTH - 3)}...`;
-  }
-  return text;
-}
-
-function logEvent(level, scope, event, fields = {}) {
-  try {
-    const safeScope = sanitizeLogValue(scope || 'Worker');
-    const safeEvent = sanitizeLogValue(event || 'event');
-    const parts = [];
-    if (fields && typeof fields === 'object') {
-      for (const [key, value] of Object.entries(fields)) {
-        if (shouldOmitLogField(key, value)) {
-          continue;
-        }
-        const safeKey = sanitizeLogValue(key);
-        const safeValue = shouldRedactLogField(key) ? '[redacted]' : sanitizeLogValue(value);
-        parts.push(`${safeKey}=${safeValue}`);
-      }
-    }
-
-    const suffix = parts.length > 0 ? ` ${parts.join(' ')}` : '';
-    const line = `[${safeScope}] ${safeEvent}${suffix}`;
-    if (level === 'warn') {
-      console.warn(line);
-    } else if (level === 'error') {
-      console.error(line);
-    } else {
-      console.log(line);
-    }
-  } catch {
-    // Observability must never affect request handling.
-  }
-}
-
 function logTerminalResponse(response, reason, fields = {}) {
   try {
     const status = Number.isFinite(response?.status) ? response.status : 'unknown';
@@ -266,33 +99,6 @@ function logTerminalResponse(response, reason, fields = {}) {
     // Observability must never affect request handling.
   }
   return response;
-}
-
-function bindWaitUntil(ctx, promise, scope, event, fields = {}) {
-  const waitUntilFields = {
-    scope,
-    event,
-    ...fields,
-  };
-  const observedPromise = Promise.resolve(promise).then(
-    (value) => {
-      logEvent('info', 'CleanupScheduler', 'wait_until_done', waitUntilFields);
-      return value;
-    },
-    (error) => {
-      logEvent('error', 'CleanupScheduler', 'wait_until_failed', waitUntilFields);
-      throw error;
-    },
-  );
-
-  if (ctx && typeof ctx.waitUntil === 'function') {
-    logEvent('info', 'CleanupScheduler', 'wait_until_bound', waitUntilFields);
-    ctx.waitUntil(observedPromise);
-  } else {
-    logEvent('info', 'CleanupScheduler', 'wait_until_inline', waitUntilFields);
-  }
-
-  return observedPromise;
 }
 
 const normalizeHostnameValue = (hostname) => {
@@ -7728,6 +7534,8 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
 
 export const __fairQueueTestHooks = {
   logEvent,
+  sanitizeLogValue,
+  sanitizeLogStructuredValue,
   logTerminalResponse,
   bindWaitUntil,
   applyUnifiedResult: (unifiedResult, options = {}) => applyUnifiedResult(unifiedResult, {

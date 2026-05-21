@@ -26,6 +26,41 @@ const buildTicketStateConfig = () => ({
   ticketStateTableName: 'DOWNLOAD_TICKET_STATE_TABLE',
 });
 
+const captureConsole = async (callback) => {
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+  const entries = [];
+
+  console.log = (...args) => {
+    entries.push(args.map(String).join(' '));
+  };
+  console.warn = (...args) => {
+    entries.push(args.map(String).join(' '));
+  };
+  console.error = (...args) => {
+    entries.push(args.map(String).join(' '));
+  };
+
+  try {
+    await callback();
+    return entries.join('\n');
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+    console.error = originalError;
+  }
+};
+
+const assertUnifiedCheckLogsAreSanitized = (allLogs) => {
+  assert.doesNotMatch(allLogs, /203\.0\.113\.9\/32/);
+  assert.doesNotMatch(allLogs, /Bearer\s+leaked/i);
+  assert.doesNotMatch(allLogs, /cache_link_data.*signed/i);
+  assert.doesNotMatch(allLogs, /payload=secret|token=secret|signature=secret/i);
+  assert.doesNotMatch(allLogs, /https:\/\/signed\.example\.test\/download\?[^\s]+/);
+  assert.match(allLogs, /\[UnifiedCheck\]/);
+};
+
 test('unifiedCheck sends cacheEnabled and throttleHostnameHash', async () => {
   const originalFetch = globalThis.fetch;
   let capturedBody = null;
@@ -89,6 +124,70 @@ test('unifiedCheck sends the canonical breaker lookup payload', async () => {
       'p_throttle_hostname_hash',
       'p_window_seconds',
     ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('unifiedCheck logs successful PostgREST responses without sensitive data', async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => [{
+      ...buildUnifiedCheckRow(),
+      cache_link_data: JSON.stringify({
+        url: 'https://signed.example.test/download?payload=secret&token=secret&signature=secret',
+        authorization: 'Bearer leaked',
+      }),
+      cache_timestamp: 1710000000,
+      cache_hostname_hash: 'hostname-hash',
+      rate_access_count: 3,
+      throttle_record_exists: true,
+      throttle_state: 'closed',
+      throttle_version: 7,
+    }],
+  });
+
+  try {
+    const allLogs = await captureConsole(async () => {
+      await unifiedCheck('/private/signed-file.txt', '203.0.113.9', {
+        postgrestUrl: 'https://postgrest.example.test',
+        verifyHeader: ['X-Verify'],
+        verifySecret: ['secret'],
+        cacheEnabled: true,
+      });
+    });
+
+    assertUnifiedCheckLogsAreSanitized(allLogs);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('unifiedCheck logs failed PostgREST responses without sensitive data', async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 500,
+    text: async () => 'Authorization: Bearer leaked for 203.0.113.9/32 at https://signed.example.test/download?payload=secret&token=secret&signature=secret',
+  });
+
+  try {
+    const allLogs = await captureConsole(async () => {
+      await assert.rejects(
+        unifiedCheck('/private/signed-file.txt', '203.0.113.9', {
+          postgrestUrl: 'https://postgrest.example.test',
+          verifyHeader: ['X-Verify'],
+          verifySecret: ['secret'],
+          cacheEnabled: false,
+        }),
+        /Unified check RPC error \(500\)/,
+      );
+    });
+
+    assertUnifiedCheckLogsAreSanitized(allLogs);
   } finally {
     globalThis.fetch = originalFetch;
   }

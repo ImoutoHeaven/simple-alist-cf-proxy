@@ -1,3 +1,5 @@
+import { logEvent } from './logging.js';
+
 const CONTROL_PREFIX = '/api/v0/';
 
 const extractBearer = (authorization) => {
@@ -47,7 +49,9 @@ const clearD1CacheIfAny = (env, targets) => {
       await db.batch(statements);
     }
   })().catch((error) => {
-    console.warn('[internal-api] clear D1 cache failed', error);
+    logEvent('warn', 'InternalApi', 'd1-cache-clear-failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
   });
 };
 

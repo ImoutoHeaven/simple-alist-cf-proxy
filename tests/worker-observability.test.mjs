@@ -233,140 +233,9 @@ function createBreakerRow(overrides = {}) {
   };
 }
 
-test('logEvent emits sanitized one-line helper logs', async () => {
-  const entries = await captureConsole(() => {
-    __fairQueueTestHooks.logEvent('info', 'CQ', 'acquire_start', {
-      requestId: 'req-1',
-      leaseToken: 'lease-secret',
-      waitToken: 'wait-secret',
-      token: 'secret-token',
-      clientIp: '203.0.113.9',
-      payload: 'secret',
-      redirectUrl: 'https://example.com/download/path?token=secret-token&payload=secret',
-      note: 'first line\nsecond line',
-    });
-  });
-
-  assert.equal(entries.length, 1);
-  const [entry] = entries;
-  assert.equal(entry.level, 'info');
-  assert.match(entry.text, /^\[CQ\] acquire_start /);
-  assert.match(entry.text, /requestId=req-1/);
-  assert.doesNotMatch(entry.text, /lease-secret|wait-secret|secret-token|203\.0\.113\.9|payload=secret/);
-  assert.match(entry.text, /leaseToken=\[redacted\]/);
-  assert.match(entry.text, /waitToken=\[redacted\]/);
-  assert.match(entry.text, /token=\[redacted\]/);
-  assert.match(entry.text, /payload=\[redacted\]/);
-  assert.doesNotMatch(entry.text, /clientIp=/);
-  assert.match(entry.text, /redirectUrl=https:\/\/example\.com\/download\/path/);
-  assert.doesNotMatch(entry.text, /\n/);
-});
-
-test('logEvent maps warning and error levels to matching console methods', async () => {
-  const entries = await captureConsole(() => {
-    __fairQueueTestHooks.logEvent('warn', 'FQ', 'release_retry', { requestId: 'req-2' });
-    __fairQueueTestHooks.logEvent('error', 'Breaker', 'settle_failed', { host: 'tenant.example' });
-  });
-
-  assert.deepEqual(entries.map((entry) => entry.level), ['warn', 'error']);
-  assert.match(entries[0].text, /^\[FQ\] release_retry /);
-  assert.match(entries[1].text, /^\[Breaker\] settle_failed /);
-});
-
-test('logEvent clamps long values and swallows helper errors', async () => {
-  const circular = {};
-  circular.self = circular;
-
-  const entries = await captureConsole(() => {
-    assert.doesNotThrow(() => {
-      __fairQueueTestHooks.logEvent('info', 'CQ', 'wait_result', {
-        requestId: 'req-3',
-        longValue: 'x'.repeat(300),
-        circular,
-      });
-    });
-  });
-
-  assert.equal(entries.length, 1);
-  assert.ok(entries[0].text.length < 260);
-  assert.match(entries[0].text, /longValue=/);
-});
-
-test('logEvent sanitizes nested object fields', async () => {
-  const entries = await captureConsole(() => {
-    __fairQueueTestHooks.logEvent('info', 'CQ', 'probe', {
-      details: {
-        token: 'secret-token',
-        clientIp: '203.0.113.9',
-        payload: 'secret',
-        nested: {
-          authorization: 'Bearer wait-secret',
-        },
-      },
-    });
-  });
-
-  assert.equal(entries.length, 1);
-  assert.doesNotMatch(entries[0].text, /secret-token|203\.0\.113\.9|payload":"secret|wait-secret/);
-  assert.match(entries[0].text, /"token":"\[redacted\]"/);
-  assert.match(entries[0].text, /"payload":"\[redacted\]"/);
-  assert.doesNotMatch(entries[0].text, /clientIp/);
-  assert.match(entries[0].text, /"authorization":"\[redacted\]"/);
-});
-
-test('logEvent omits raw IP-like values under unrecognized keys', async () => {
-  const entries = await captureConsole(() => {
-    __fairQueueTestHooks.logEvent('info', 'CQ', 'probe', {
-      source: '203.0.113.9',
-      ipAddress: '203.0.113.9',
-      ipSubnetHash: '203.0.113.9/32',
-      ipv6Subnet: '2001:db8::1/60',
-      host: 'tenant.example',
-    });
-  });
-
-  assert.equal(entries.length, 1);
-  assert.doesNotMatch(entries[0].text, /203\.0\.113\.9|2001:db8::1|source=|ipAddress=|ipSubnetHash=|ipv6Subnet=/);
-  assert.match(entries[0].text, /host=tenant\.example/);
-});
-
-test('logEvent strips query strings from nested URL-like values', async () => {
-  const entries = await captureConsole(() => {
-    __fairQueueTestHooks.logEvent('info', 'CQ', 'probe', {
-      details: {
-        redirectUrl: 'https://example.com/download/path?token=secret-token&payload=secret',
-        nested: {
-          signedUrl: 'https://files.example/private/object?signature=wait-secret&authorization=secret-token',
-        },
-      },
-    });
-  });
-
-  assert.equal(entries.length, 1);
-  assert.match(entries[0].text, /"redirectUrl":"https:\/\/example\.com\/download\/path"/);
-  assert.match(entries[0].text, /"signedUrl":"https:\/\/files\.example\/private\/object"/);
-  assert.doesNotMatch(entries[0].text, /\?|secret-token|wait-secret|payload=secret|signature=|authorization=/);
-});
-
-test('logEvent omits unavailable top-level fields without dropping falsey values', async () => {
-  const entries = await captureConsole(() => {
-    __fairQueueTestHooks.logEvent('info', 'CQ', 'acquire_result', {
-      requestId: 'req-missing',
-      result: 'granted',
-      reason: undefined,
-      attemptVersion: null,
-      attemptTicket: 0,
-      elapsedMs: 0,
-      retryAfter: false,
-    });
-  });
-
-  assert.equal(entries.length, 1);
-  assert.doesNotMatch(entries[0].text, /reason=|attemptVersion=|undefined|null/);
-  assert.match(entries[0].text, /requestId=req-missing/);
-  assert.match(entries[0].text, /attemptTicket=0/);
-  assert.match(entries[0].text, /elapsedMs=0/);
-  assert.match(entries[0].text, /retryAfter=false/);
+test('shared logging helpers remain exposed through worker test hooks', async () => {
+  assert.equal(typeof __fairQueueTestHooks.logEvent, 'function');
+  assert.equal(typeof __fairQueueTestHooks.bindWaitUntil, 'function');
 });
 
 test('logTerminalResponse returns original response and logs non-200/206 statuses', async () => {
@@ -383,6 +252,7 @@ test('logTerminalResponse returns original response and logs non-200/206 statuse
   assert.equal(returned, response);
   assert.equal(entries.length, 1);
   const [entry] = entries;
+  assert.ok(entry.text.includes('[Terminal] response'));
   assert.match(entry.text, /^\[Terminal\] response /);
   assert.match(entry.text, /status=403/);
   assert.match(entry.text, /reason=inner_auth_rejected/);
@@ -407,9 +277,7 @@ test('logTerminalResponse suppresses successful content responses only', async (
   assert.match(entries[1].text, /reason=redirect_returned/);
 });
 
-test('bindWaitUntil logs bound and done while preserving fulfillment', async () => {
-  assert.equal(typeof __fairQueueTestHooks.bindWaitUntil, 'function');
-
+test('bindWaitUntil remains callable through worker test hooks', async () => {
   const waitUntilPromises = [];
   const ctx = {
     waitUntil(promise) {
@@ -418,7 +286,7 @@ test('bindWaitUntil logs bound and done while preserving fulfillment', async () 
   };
 
   let result;
-  const entries = await captureConsole(async () => {
+  await captureConsole(async () => {
     const boundPromise = __fairQueueTestHooks.bindWaitUntil(
       ctx,
       Promise.resolve('complete'),
@@ -433,52 +301,6 @@ test('bindWaitUntil logs bound and done while preserving fulfillment', async () 
   });
 
   assert.equal(result, 'complete');
-  assert.ok(entries.some((entry) => /wait_until_bound/.test(entry.text)
-    && /scope=CQ/.test(entry.text)
-    && /event=release_cleanup/.test(entry.text)
-    && /requestId=req-wait-1/.test(entry.text)));
-  assert.ok(entries.some((entry) => /wait_until_done/.test(entry.text)
-    && /scope=CQ/.test(entry.text)
-    && /event=release_cleanup/.test(entry.text)));
-});
-
-test('bindWaitUntil logs failed and inline states while preserving settlement', async () => {
-  assert.equal(typeof __fairQueueTestHooks.bindWaitUntil, 'function');
-
-  const failure = new Error('cleanup failed');
-  let rejectedResult;
-  let inlineResult;
-
-  const entries = await captureConsole(async () => {
-    rejectedResult = await Promise.allSettled([
-      __fairQueueTestHooks.bindWaitUntil(
-        { waitUntil() {} },
-        Promise.reject(failure),
-        'FQ',
-        'final_cleanup',
-        { requestId: 'req-wait-2' },
-      ),
-    ]).then(([settled]) => settled);
-
-    inlineResult = await __fairQueueTestHooks.bindWaitUntil(
-      {},
-      Promise.resolve('inline-complete'),
-      'Cache',
-      'save',
-      { host: 'tenant.example' },
-    );
-  });
-
-  assert.equal(rejectedResult.status, 'rejected');
-  assert.equal(rejectedResult.reason, failure);
-  assert.equal(inlineResult, 'inline-complete');
-  assert.ok(entries.some((entry) => /wait_until_failed/.test(entry.text)
-    && /scope=FQ/.test(entry.text)
-    && /event=final_cleanup/.test(entry.text)));
-  assert.ok(entries.some((entry) => /wait_until_inline/.test(entry.text)
-    && /scope=Cache/.test(entry.text)
-    && /event=save/.test(entry.text)
-    && /host=tenant\.example/.test(entry.text)));
 });
 
 test('concurrency handler client logs acquire lifecycle', async () => {

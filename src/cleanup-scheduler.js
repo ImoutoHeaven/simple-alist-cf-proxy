@@ -1,6 +1,15 @@
 import { applyVerifyHeaders, hasVerifyCredentials } from './utils.js';
+import { logEvent } from './logging.js';
 
 const DEFAULT_CLEANUP_PROBABILITY = 0.01;
+const getErrorMessage = (error) => error instanceof Error ? error.message : String(error);
+const getLogFields = (error, fallback = {}) => error?.logFields || { ...fallback, error: getErrorMessage(error) };
+
+const createPostgrestError = (message, fields) => {
+  const error = new Error(message);
+  error.logFields = fields;
+  return error;
+};
 
 const formatPercentageLabel = (probability) => {
   const percentage = probability * 100;
@@ -129,7 +138,11 @@ const executePostgrestDelete = async (postgrestUrl, verifyHeader, verifySecret, 
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`PostgREST cleanup request failed (${response.status}): ${errorText}`);
+    throw createPostgrestError(`PostgREST cleanup request failed (${response.status}): ${errorText}`, {
+      status: response.status,
+      operation: 'cleanup',
+      table: tableName,
+    });
   }
 
   let payload = [];
@@ -226,14 +239,19 @@ const cleanupExpiredTicketState = async (config, env, ticketStateConfig = resolv
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`cleanup RPC failed (${response.status}): ${errorText}`);
+      throw createPostgrestError(`cleanup RPC failed (${response.status}): ${errorText}`, {
+        status: response.status,
+        operation: 'cleanup',
+        rpc: 'download_cleanup_expired_tickets',
+        table: tableName,
+      });
     }
 
     const payload = await response.json();
     return { cleaned: Number(payload?.deleted) || 0 };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error('[Cleanup] TicketState cleanup failed:', message);
+    const message = getErrorMessage(error);
+    logEvent('error', 'CleanupScheduler', 'task_failed', { task: 'TicketState', ...getLogFields(error) });
     return { cleaned: 0, error: message };
   }
 
@@ -276,21 +294,21 @@ export async function scheduleAllCleanups(config, env, ctx) {
     return;
   }
 
-  console.log(
-    `[Cleanup Scheduler] Triggered (${formatPercentageLabel(cleanupProbability)}% probability)`
-  );
+  logEvent('info', 'CleanupScheduler', 'triggered', {
+    probability: cleanupProbability,
+    percentage: formatPercentageLabel(cleanupProbability),
+  });
 
   const cleanupPromise = Promise.allSettled(
     cleanupTasks.map((task) =>
       task
         .fn()
         .then((deletedCount) => {
-          console.log(`[${task.name} Cleanup] Deleted ${deletedCount} records`);
+          logEvent('info', 'CleanupScheduler', 'task_deleted', { task: task.name, deletedCount });
           return deletedCount;
         })
         .catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          console.error(`[${task.name} Cleanup] Failed:`, message);
+          logEvent('error', 'CleanupScheduler', 'task_failed', { task: task.name, ...getLogFields(error) });
           throw error;
         })
     )
