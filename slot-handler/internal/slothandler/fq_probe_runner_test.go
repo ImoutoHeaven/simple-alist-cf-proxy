@@ -48,6 +48,77 @@ func attachProbeWakeWaiter(t *testing.T, s *server, hostnameHash, hostname, ipBu
 	return tok
 }
 
+type staticAdmitBackend struct {
+	results []*admitResult
+}
+
+func (b *staticAdmitBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
+	results := make([]*admitResult, len(reqs))
+	for i := range results {
+		if b != nil && i < len(b.results) {
+			results[i] = b.results[i]
+		}
+		if results[i] == nil {
+			results[i] = &admitResult{status: "WAIT"}
+		}
+	}
+	return results, nil
+}
+
+func (b *staticAdmitBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) error {
+	return nil
+}
+
+func TestProbeIPTooManyInternalBackoffDoesNotDeliverOverloadIP(t *testing.T) {
+	now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
+	cooldownSeconds := 7
+	backend := &staticAdmitBackend{results: []*admitResult{{status: "IP_TOO_MANY"}}}
+	cfg := &Config{FairQueue: FairQueueConfig{
+		PollIntervalMs:    1,
+		IPCooldownSeconds: cooldownSeconds,
+	}}
+	s := newTestServer()
+	s.updateRuntime(cfg, backend, "test", true)
+	s.activeSlots = newActiveTracker()
+
+	hostKey := "hash-ip-too-many"
+	hostname := "ip-too-many.example.com"
+	ipBucket := "ip-too-many-bucket"
+	siteBucket := "site-too-many"
+	tok := s.flowStore.newFlow(hostKey, hostname, ipBucket, siteBucket)
+	respCh := make(chan *AcquireResponse, 1)
+	if ok, err := s.flowStore.attachWaiter(tok, &fqWaiter{resCh: respCh, ownerRoutedGrant: true}, now); !ok || err != nil {
+		t.Fatalf("attachWaiter ok=%t err=%v", ok, err)
+	}
+	if sched := s.getOrCreateFlowScheduler(hostKey); sched != nil {
+		sched.bumpWaitCount(siteBucket, ipBucket, 4)
+	}
+
+	if got := s.probeOnceWithLimit(context.Background(), hostKey, now, 1); !got.keepAlive || got.probed != 1 {
+		t.Fatalf("expected one live IP_TOO_MANY probe, got %+v", got)
+	}
+
+	select {
+	case got := <-respCh:
+		if got != nil && got.Result == "overloaded" && got.Reason == "overload_ip" {
+			t.Fatalf("IP_TOO_MANY delivered forbidden overload_ip response: %+v", got)
+		}
+		t.Fatalf("IP_TOO_MANY should remain internal, got unexpected waiter response: %+v", got)
+	default:
+	}
+	if snap, ok := s.flowStore.getSnapshot(tok); !ok || !snap.HasWaiter {
+		t.Fatalf("expected IP_TOO_MANY to keep accepted waiter alive, ok=%t snap=%+v", ok, snap)
+	}
+	sites := s.snapshotHostSchedulerSites(hostKey)
+	bucket := sites[siteBucket].Buckets[ipBucket]
+	if bucket.WaitCount != 2 {
+		t.Fatalf("expected IP_TOO_MANY to halve bucket wait count to 2, got %d", bucket.WaitCount)
+	}
+	if !bucket.DenyUntil.Equal(now.Add(time.Duration(cooldownSeconds) * time.Second)) {
+		t.Fatalf("expected IP_TOO_MANY deny-until %s, got %s", now.Add(time.Duration(cooldownSeconds)*time.Second), bucket.DenyUntil)
+	}
+}
+
 func TestReleaseSuccessWakesHostProbeRunnerBeforePollInterval(t *testing.T) {
 	backend := &probeWakeBackend{probeCh: make(chan time.Time, 2)}
 	hostCap := 1

@@ -98,6 +98,74 @@ func TestAcquireOverloadedReasonMapping(t *testing.T) {
 	}
 }
 
+func TestOverloadVisibilityScopeClassification(t *testing.T) {
+	testCases := []struct {
+		name          string
+		scope         string
+		workerVisible bool
+		internalRetry bool
+	}{
+		{name: "global", scope: "global", workerVisible: true, internalRetry: false},
+		{name: "trimmed_global", scope: "  global\t", workerVisible: true, internalRetry: false},
+		{name: "host", scope: "host", workerVisible: false, internalRetry: true},
+		{name: "site", scope: "site", workerVisible: false, internalRetry: true},
+		{name: "ip", scope: "ip", workerVisible: false, internalRetry: true},
+		{name: "site_ip", scope: "site_ip", workerVisible: false, internalRetry: true},
+		{name: "unknown", scope: "unknown", workerVisible: false, internalRetry: true},
+		{name: "empty", scope: "", workerVisible: false, internalRetry: true},
+		{name: "malformed", scope: "overload_ip", workerVisible: false, internalRetry: true},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isWorkerVisibleOverloadScope(tc.scope); got != tc.workerVisible {
+				t.Fatalf("isWorkerVisibleOverloadScope(%q)=%t, want %t", tc.scope, got, tc.workerVisible)
+			}
+			if got := isInternalRetryOverloadScope(tc.scope); got != tc.internalRetry {
+				t.Fatalf("isInternalRetryOverloadScope(%q)=%t, want %t", tc.scope, got, tc.internalRetry)
+			}
+		})
+	}
+}
+
+func TestOverloadWorkerVisibleResponse(t *testing.T) {
+	testCases := []struct {
+		name      string
+		scope     string
+		wantFound bool
+	}{
+		{name: "global", scope: "global", wantFound: true},
+		{name: "trimmed_global", scope: "  global\n", wantFound: true},
+		{name: "host", scope: "host", wantFound: false},
+		{name: "site", scope: "site", wantFound: false},
+		{name: "ip", scope: "ip", wantFound: false},
+		{name: "site_ip", scope: "site_ip", wantFound: false},
+		{name: "unknown", scope: "unknown", wantFound: false},
+		{name: "empty", scope: "", wantFound: false},
+		{name: "malformed", scope: "overload_ip", wantFound: false},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			resp, ok := workerVisibleOverloadedResponse(tc.scope)
+			if ok != tc.wantFound {
+				t.Fatalf("workerVisibleOverloadedResponse(%q) ok=%t, want %t", tc.scope, ok, tc.wantFound)
+			}
+			if !ok {
+				if resp != nil {
+					t.Fatalf("expected nil response for non-global scope, got %+v", resp)
+				}
+				return
+			}
+			if resp == nil || resp.Result != "overloaded" || resp.Reason != "overload_global" || resp.RetryAfter != overloadRetryAfterSeconds {
+				t.Fatalf("unexpected global overload response: %+v", resp)
+			}
+		})
+	}
+}
+
 func TestOverloadScopePriority(t *testing.T) {
 	store := newFlowStore(5 * time.Second)
 	now := time.Unix(0, 0)

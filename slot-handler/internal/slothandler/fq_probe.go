@@ -1430,19 +1430,8 @@ func (s *server) probeOnceWithLimit(parentCtx context.Context, hostKey string, n
 					denySeconds = 3
 				}
 				sched.setBucketDenyUntil(snap.SiteBucket, snap.IPBucket, now.Add(time.Duration(denySeconds)*time.Second))
-				if store.acceptedInvocationOwnerRouted(snap.Token, snap.InvocationEpoch) {
-					s.incrementMetric("overloaded")
-					s.incrementMetric("overloaded_ip")
-					if store.deliverToAcceptedInvocation(snap.Token, snap.InvocationEpoch, &AcquireResponse{
-						Result:          "overloaded",
-						QueryToken:      snap.Token,
-						InvocationEpoch: snap.InvocationEpoch,
-						Reason:          "overload_ip",
-						RetryAfter:      denySeconds,
-					}) {
-						store.deleteFlow(snap.Token)
-					}
-				}
+				s.incrementMetric("overloaded")
+				s.incrementMetric("overloaded_ip")
 				markStructuralHandled(snap)
 			case "WAIT":
 				sched.bumpWaitCount(snap.SiteBucket, snap.IPBucket, 1)

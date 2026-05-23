@@ -41,6 +41,25 @@ func overloadedResponse(scope string) *AcquireResponse {
 	}
 }
 
+func isWorkerVisibleOverloadScope(scope string) bool {
+	return strings.TrimSpace(scope) == "global"
+}
+
+func isInternalRetryOverloadScope(scope string) bool {
+	return !isWorkerVisibleOverloadScope(scope)
+}
+
+func workerVisibleOverloadedResponse(scope string) (*AcquireResponse, bool) {
+	if !isWorkerVisibleOverloadScope(scope) {
+		return nil, false
+	}
+	return &AcquireResponse{
+		Result:     "overloaded",
+		Reason:     "overload_global",
+		RetryAfter: overloadRetryAfterSeconds,
+	}, true
+}
+
 func timeoutResponse(reason string) *AcquireResponse {
 	return &AcquireResponse{Result: "timeout", Reason: reason}
 }

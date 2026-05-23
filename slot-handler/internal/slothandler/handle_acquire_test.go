@@ -664,7 +664,7 @@ func TestFairQueueWaitFinalResultCarriesAcceptedOwnership(t *testing.T) {
 	}{
 		{name: "granted", result: &AcquireResponse{Result: "granted", SlotToken: validReleaseSlotToken()}},
 		{name: "throttled", result: &AcquireResponse{Result: "throttled", Reason: "try_acquire_throttled", ThrottleCode: 429, RetryAfter: 2}},
-		{name: "overloaded", result: &AcquireResponse{Result: "overloaded", Reason: "overload_host", RetryAfter: 1}},
+		{name: "overloaded", result: &AcquireResponse{Result: "overloaded", Reason: "overload_global", RetryAfter: 1}},
 		{name: "timeout", result: &AcquireResponse{Result: "timeout", Reason: "wait_stream_timeout"}},
 		{name: "conflict", result: &AcquireResponse{Result: "conflict", Reason: "waiter_already_attached"}},
 	}
@@ -1015,6 +1015,64 @@ func TestFairQueueWaitGlobalOverloadReturns503JSON(t *testing.T) {
 	if resp.Reason == "" || resp.RetryAfter <= 0 {
 		t.Fatalf("expected overloaded setup response shape, got %+v", resp)
 	}
+	if resp.Reason != "overload_global" {
+		t.Fatalf("expected setup overload to expose only overload_global, got %+v", resp)
+	}
+}
+
+func TestFairQueueWaitUnknownAndEmptyOverloadFinalsUseInvalidResponseFallback(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 15, 30, 0, time.UTC)
+	tests := []struct {
+		name   string
+		reason string
+	}{
+		{name: "host", reason: "overload_host"},
+		{name: "site", reason: "overload_site"},
+		{name: "ip", reason: "overload_ip"},
+		{name: "site_ip", reason: "overload_site_ip"},
+		{name: "unknown", reason: "overload_unknown"},
+		{name: "empty", reason: ""},
+		{name: "malformed", reason: "not_an_overload_reason"},
+		{name: "future", reason: "overload_region"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer()
+			cfg := testConfigForAcquire(25*time.Millisecond, 40*time.Millisecond)
+			cfg.Auth.Enabled = false
+			s.updateRuntime(cfg, &stubBackend{}, "test", false)
+			s.flowStore.afterFunc = nil
+			s.flowStore.nowFn = func() time.Time { return now }
+			s.flowStore.afterAcceptAcquireInvocationHook = func(token string, invocationEpoch uint64) {
+				s.flowStore.deliverToAcceptedInvocation(token, invocationEpoch, &AcquireResponse{
+					Result:     "overloaded",
+					Reason:     tc.reason,
+					RetryAfter: 1,
+				})
+			}
+			defer func() {
+				s.flowStore.afterAcceptAcquireInvocationHook = nil
+			}()
+			defer s.stopAllHostProbeRunners()
+
+			rec := handleFairQueueWaitJSONRequest(t, s, fairQueueWaitRequestPayload(now))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected wait sse 200, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			_, accepted, final := parseFairQueueWaitSSEStream(t, rec.Body.String())
+			got := decodeAcquireResponseFromMap(t, final)
+			if got.Result != "timeout" || got.Reason != "slot-handler-invalid-response" {
+				t.Fatalf("expected non-global overload final to use invalid-response fallback, got %+v", got)
+			}
+			if got.QueryToken != accepted.QueryToken || got.InvocationEpoch != accepted.InvocationEpoch {
+				t.Fatalf("expected fallback final to carry accepted ownership, got %+v accepted=%+v", got, accepted)
+			}
+			if strings.Contains(rec.Body.String(), tc.reason) && tc.reason != "" {
+				t.Fatalf("non-global overload reason %q leaked to SSE stream %q", tc.reason, rec.Body.String())
+			}
+		})
+	}
 }
 
 func TestFairQueueWaitSetupFailuresReturnJSON(t *testing.T) {
@@ -1329,10 +1387,10 @@ func TestFairQueueWaitFinalResultShapes(t *testing.T) {
 			},
 		},
 		{
-			name: "overloaded",
+			name: "global_overloaded",
 			input: &AcquireResponse{
 				Result:     "overloaded",
-				Reason:     "overload_host",
+				Reason:     "overload_global",
 				RetryAfter: 1,
 			},
 			check: func(t *testing.T, got AcquireResponse) {
@@ -1377,6 +1435,31 @@ func TestFairQueueWaitFinalResultShapes(t *testing.T) {
 				t.Fatalf("expected normalized final to repeat accepted ownership, got %+v", got)
 			}
 			tc.check(t, *got)
+		})
+	}
+}
+
+func TestNormalizeFairQueueWaitFinalResultOverloadVisibility(t *testing.T) {
+	accepted := fairQueueWaitAcceptedEvent{
+		QueryToken:      "fq-q1",
+		InvocationEpoch: 1,
+		DeadlineMs:      1710000000000,
+	}
+
+	got, err := normalizeFairQueueWaitFinalResult(accepted, &AcquireResponse{Result: "overloaded", Reason: "overload_global", RetryAfter: 1})
+	if err != nil {
+		t.Fatalf("expected overload_global to normalize, got err=%v", err)
+	}
+	if got == nil || got.Result != "overloaded" || got.Reason != "overload_global" {
+		t.Fatalf("unexpected normalized global overload: %+v", got)
+	}
+
+	for _, reason := range []string{"overload_ip", "overload_host", "overload_site", "overload_unknown", ""} {
+		t.Run(reason, func(t *testing.T) {
+			got, err := normalizeFairQueueWaitFinalResult(accepted, &AcquireResponse{Result: "overloaded", Reason: reason, RetryAfter: 1})
+			if err == nil {
+				t.Fatalf("expected non-global overload reason %q to fail normalization, got %+v", reason, got)
+			}
 		})
 	}
 }

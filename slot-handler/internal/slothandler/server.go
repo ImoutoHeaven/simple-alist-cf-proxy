@@ -1767,7 +1767,14 @@ func normalizeFairQueueWaitFinalResult(accepted fairQueueWaitAcceptedEvent, resp
 		}
 		out.ReleaseOwnerRequired = true
 		return &out, nil
-	case "throttled", "overloaded", "timeout", "conflict":
+	case "throttled", "timeout", "conflict":
+		out.SlotToken = ""
+		out.ReleaseOwnerRequired = false
+		return &out, nil
+	case "overloaded":
+		if strings.TrimSpace(out.Reason) != "overload_global" {
+			return nil, fmt.Errorf("unsupported fairqueue wait overloaded reason %q", out.Reason)
+		}
 		out.SlotToken = ""
 		out.ReleaseOwnerRequired = false
 		return &out, nil
@@ -1911,9 +1918,9 @@ func (s *server) handleWait(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, errWaiterOverloaded) {
 			scope := overloadScopeFromError(err)
-			if !isScopedOverloadScope(scope) {
+			if overloadResp, ok := workerVisibleOverloadedResponse(scope); ok {
 				store.deleteFlow(token)
-				writeJSON(w, http.StatusServiceUnavailable, overloadedResponse(scope))
+				writeJSON(w, http.StatusServiceUnavailable, overloadResp)
 				return
 			}
 			resp, err = store.allocateAcceptedInvocationForHold(token, acquireReq, now, leaseUntil)
@@ -2067,11 +2074,12 @@ func (s *server) handleWait(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					if errors.Is(err, errWaiterOverloaded) {
 						scope := overloadScopeFromError(err)
-						if isScopedOverloadScope(scope) {
+						if _, ok := workerVisibleOverloadedResponse(scope); !ok {
 							retryTimer.Reset(scopedAdmissionRetryDelay(retry))
 							continue
 						}
-						_ = writeFinal(overloadedResponse(scope))
+						overloadResp, _ := workerVisibleOverloadedResponse(scope)
+						_ = writeFinal(overloadResp)
 						store.deleteFlow(token)
 						return
 					}
