@@ -2671,10 +2671,11 @@ const createConcurrencyHandlerClient = (config) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const abortHandler = () => controller.abort();
+    const canListenForAbort = signal && typeof signal.addEventListener === 'function';
     if (signal) {
       if (signal.aborted) {
         controller.abort();
-      } else {
+      } else if (canListenForAbort) {
         signal.addEventListener('abort', abortHandler, { once: true });
       }
     }
@@ -2700,7 +2701,7 @@ const createConcurrencyHandlerClient = (config) => {
       return { status: response.status, data };
     } finally {
       clearTimeout(timer);
-      if (signal) {
+      if (canListenForAbort && typeof signal.removeEventListener === 'function') {
         signal.removeEventListener('abort', abortHandler);
       }
     }
@@ -5797,6 +5798,65 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
   };
 
+  const createTrueConcurrencyCleanupController = ({
+    abortController = null,
+    expireTimer = null,
+    onCleanup = null,
+  } = {}) => {
+    const releaseController = cqReleaseController;
+    const heartbeatManager = cqHeartbeatManager;
+    let started = false;
+    let cleanupPromise = null;
+
+    return {
+      start(reason = '') {
+        if (started) {
+          return cleanupPromise;
+        }
+        started = true;
+        const requestedReason = normalizeStringValue(reason || 'final_cleanup');
+        const cleanupReason = TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_NO_RELEASE_REASONS.has(requestedReason)
+          ? requestedReason
+          : normalizeTrueConcurrencyReleaseReason(requestedReason);
+        if (!cqStreamAbortReason && cleanupReason) {
+          cqStreamAbortReason = cleanupReason;
+        }
+        if (abortController && !abortController.signal.aborted) {
+          abortController.abort();
+        }
+        if (expireTimer) {
+          clearTimeout(expireTimer);
+        }
+
+        cleanupPromise = (async () => {
+          logEvent('info', 'CQ', 'cleanup_start', {
+            host: upstreamHostname,
+            reason: cleanupReason,
+          });
+          await heartbeatManager?.ensureCleanup?.(cleanupReason);
+          if (
+            releaseController
+            && !TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_NO_RELEASE_REASONS.has(cleanupReason)
+          ) {
+            const released = await releaseController.releaseImmediately(cleanupReason);
+            if (!released) {
+              releaseController.ensureReleased(cleanupReason);
+            }
+          }
+          onCleanup?.();
+          return true;
+        })();
+
+        bindWaitUntil(ctx, cleanupPromise, 'CQ', 'cleanup_controller', {
+          host: upstreamHostname,
+          reason: cleanupReason,
+        });
+        detachCurrentTrueConcurrencyCleanupState();
+        return cleanupPromise;
+      },
+    };
+  };
+
   const clearCurrentTrueConcurrencyState = () => {
     cqPlan = null;
     cqPlanKey = '';
@@ -5853,6 +5913,17 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     releaseController.ensureReleased(reason);
     return true;
+  };
+
+  const detachCurrentTrueConcurrencyCleanupState = () => {
+    cqPlan = null;
+    cqPlanKey = '';
+    cqTargetUrl = '';
+    cqLease = null;
+    cqReleaseController = null;
+    cqHeartbeatManager = null;
+    cqAcquireDispatched = false;
+    cqWaitBudget = null;
   };
 
   const releaseUnusedFairQueueGrantIfNeeded = async (phase) => {
@@ -6288,10 +6359,11 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           if (typeof waitTimer?.unref === 'function') {
             waitTimer.unref();
           }
+          const canListenForClientAbort = clientSignal && typeof clientSignal.addEventListener === 'function';
           if (clientSignal) {
             if (clientSignal.aborted) {
               waitController.abort();
-            } else {
+            } else if (canListenForClientAbort) {
               clientSignal.addEventListener('abort', abortWaitForClient, { once: true });
             }
           }
@@ -6320,7 +6392,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
             throw error;
           } finally {
             clearTimeout(waitTimer);
-            if (clientSignal) {
+            if (canListenForClientAbort && typeof clientSignal.removeEventListener === 'function') {
               clientSignal.removeEventListener('abort', abortWaitForClient);
             }
           }
@@ -6575,7 +6647,14 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
   const readKnownGoogleDriveDownloadSize = () => readPayloadFileSize(payloadData) ?? readPayloadFileSize(res?.data);
 
   const buildUpstreamRequest = (urlValue, headerConfig) => {
-    const upstreamRequest = new Request(urlValue, originalRequest);
+    const upstreamRequest = clientSignal && typeof clientSignal.addEventListener !== 'function'
+      ? new Request(urlValue, {
+        method: originalRequest.method,
+        headers: originalRequest.headers,
+        body: originalRequest.body,
+        redirect: originalRequest.redirect,
+      })
+      : new Request(urlValue, originalRequest);
     if (headerConfig && typeof headerConfig === 'object') {
       Object.keys(headerConfig).forEach((key) => {
         const entries = Array.isArray(headerConfig[key]) ? headerConfig[key] : [headerConfig[key]];
@@ -6836,10 +6915,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         phase: 'empty_body',
         reason: 'stream_complete',
       });
-      cqHeartbeatManager?.ensureCleanup?.('stream_complete');
-      if (cqReleaseController) {
-        cqReleaseController.ensureReleased('stream_complete');
-      }
+      createTrueConcurrencyCleanupController().start('stream_complete');
       return new Response(null, {
         status: upstreamResponse.status,
         statusText: upstreamResponse.statusText,
@@ -6865,24 +6941,32 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     const abortController = new AbortController();
     cqStreamAbortController = abortController;
     cqHeartbeatManager?.bindStreamAbortController?.(abortController);
-    if (cqStreamAbortReason && !abortController.signal.aborted) {
-      abortController.abort();
-    }
     const managedHardExpireAtMs = Number(cqLease?.hardExpireAtMs) || hardExpireAtMs;
     const msUntilExpire = Math.max(0, managedHardExpireAtMs - Date.now());
     let hardExpiryAbort = false;
     const expireTimer = setTimeout(() => {
       hardExpiryAbort = true;
-      abortCurrentTrueConcurrencyStream('hard_expiry');
+      cleanupController.start('hard_expiry');
     }, msUntilExpire);
     if (typeof expireTimer?.unref === 'function') {
       expireTimer.unref();
     }
+    const cleanupController = createTrueConcurrencyCleanupController({
+      abortController,
+      expireTimer,
+      onCleanup() {
+        cqStreamAbortController = null;
+      },
+    });
+    if (cqStreamAbortReason) {
+      cleanupController.start(cqStreamAbortReason);
+    }
     const onClientAbort = () => {
       clientAborted = true;
-      abortCurrentTrueConcurrencyStream('client_disconnect');
+      cleanupController.start('client_disconnect');
     };
-    if (clientSignal && typeof clientSignal.addEventListener === 'function') {
+    const canListenForClientAbort = clientSignal && typeof clientSignal.addEventListener === 'function';
+    if (canListenForClientAbort) {
       clientSignal.addEventListener('abort', onClientAbort, { once: true });
     }
     if (clientSignal?.aborted) {
@@ -6921,8 +7005,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         phase: 'pipe_complete',
         reason: 'stream_complete',
       });
-      await cqHeartbeatManager?.ensureCleanup?.('stream_complete');
-      await ensureCurrentTrueConcurrencyReleased('stream_complete', true);
+      await cleanupController.start('stream_complete');
     }).catch(async (error) => {
       const reason = readManagedStreamTerminationReason(error);
       logEvent('info', 'CQ', 'stream_cleanup', {
@@ -6930,18 +7013,14 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         phase: 'pipe_error',
         reason,
       });
-      await cqHeartbeatManager?.ensureCleanup?.(reason);
-      if (!TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_NO_RELEASE_REASONS.has(reason)) {
-        await ensureCurrentTrueConcurrencyReleased(reason, true);
-      }
+      await cleanupController.start(reason);
       if (!isAbortError(error) && reason === 'upstream_failure') {
         const message = error instanceof Error ? error.message : String(error);
         logEvent('warn', 'CQ', 'managed_stream_terminated_error', { message });
       }
     }).finally(() => {
       clearTimeout(expireTimer);
-      cqStreamAbortController = null;
-      if (clientSignal && typeof clientSignal.removeEventListener === 'function') {
+      if (canListenForClientAbort && typeof clientSignal.removeEventListener === 'function') {
         clientSignal.removeEventListener('abort', onClientAbort);
       }
     });

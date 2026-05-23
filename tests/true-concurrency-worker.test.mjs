@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import worker, { __fairQueueTestHooks } from '../src/worker.js';
 import { encryptBindingPayload } from '../src/origin-binding.js';
 import { sha256Hash } from '../src/utils.js';
@@ -208,6 +209,7 @@ const createFakeHeartbeatSocket = ({
   const socket = {
     accepted: false,
     sent: [],
+    closeCount: 0,
     addEventListener(type, handler) {
       const handlers = listeners.get(type) || new Set();
       handlers.add(handler);
@@ -238,6 +240,7 @@ const createFakeHeartbeatSocket = ({
       throw new Error(`unexpected socket payload type: ${payload.type}`);
     },
     close(code = 1000, reason = '') {
+      this.closeCount += 1;
       closeArgs = { code, reason };
       queueMicrotask(() => emit('close', { code, reason }));
     },
@@ -551,6 +554,13 @@ const buildSignedWorkerRequest = async ({
 };
 
 const readJson = async (response) => JSON.parse(await response.text());
+
+test('worker config keeps compatibility_date and enables enable_request_signal', () => {
+  const wranglerConfig = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
+
+  assert.match(wranglerConfig, /^compatibility_date\s*=\s*"2024-01-01"$/m);
+  assert.match(wranglerConfig, /^compatibility_flags\s*=\s*\["enable_request_signal"\]$/m);
+});
 
 test('worker normalizes CQ release reasons to the canonical contract', () => {
   const scenarios = new Map([
@@ -7344,6 +7354,15 @@ test('true concurrency heartbeat terminal reasons map duplicate-release suppress
         ),
         new Promise((resolve) => setTimeout(() => resolve('timeout'), 150)),
       ]);
+      if (!scenario.expectRelease) {
+        await waitForCondition(
+          () => heartbeatSocket.getCloseArgs()?.reason === scenario.reason,
+          {
+            timeoutMs: 150,
+            message: `expected heartbeat cleanup for ${scenario.reason}`,
+          },
+        );
+      }
       await Promise.allSettled(waitUntilPromises);
 
       assert.notEqual(terminalResult, 'timeout', scenario.reason);
@@ -7617,6 +7636,316 @@ test('true concurrency managed streaming binds CQ cleanup to waitUntil for post-
     assert.equal(heartbeatSocket.getCloseArgs()?.reason, 'client_disconnect');
   } finally {
     globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('CQ request signal cleanup releases once even when the stream later cancels', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalDelegatedFetch = delegatedFetch;
+  const abortController = new AbortController();
+  const releaseBodies = [];
+  const heartbeatSocket = createFakeHeartbeatSocket();
+  const { ctx, waitUntilPromises } = createTestContext();
+  let upstreamCancelStarted = false;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-signal-cleanup',
+        leaseToken: 'token-signal-cleanup',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-signal-cleanup',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      return {
+        status: 101,
+        webSocket: heartbeatSocket,
+      };
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('signal-cleanup-chunk'));
+        },
+        cancel() {
+          upstreamCancelStarted = true;
+          return new Promise(() => {});
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      await buildSignedWorkerRequest({ signal: abortController.signal }),
+      buildWorkerEnv(),
+      ctx,
+    );
+    const reader = response.body.getReader();
+    assert.equal(new TextDecoder().decode((await reader.read()).value), 'signal-cleanup-chunk');
+
+    abortController.abort();
+    await waitForCondition(() => upstreamCancelStarted, {
+      timeoutMs: 100,
+      message: 'upstream cancellation did not start after request signal abort',
+    });
+    await waitForCondition(() => releaseBodies.length === 1, {
+      timeoutMs: 100,
+      message: 'CQ request signal cleanup waited for pipe cancellation settlement',
+    });
+
+    assert.equal(releaseBodies.length, 1);
+    assert.equal(releaseBodies[0]?.reason, 'client_disconnect');
+    assert.equal(heartbeatSocket.closeCount, 1);
+    assert.equal(heartbeatSocket.getCloseArgs()?.reason, 'client_disconnect');
+    assert.equal(waitUntilPromises.length >= 1, true);
+  } finally {
+    globalThis.fetch = originalFetch === fetchWithDefaultAckHandoff ? originalDelegatedFetch : originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('CQ stream cancel cleanup releases once even when request signal is unavailable', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalDelegatedFetch = delegatedFetch;
+  const releaseBodies = [];
+  const heartbeatSocket = createFakeHeartbeatSocket();
+  const { ctx, waitUntilPromises } = createTestContext();
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-cancel-cleanup',
+        leaseToken: 'token-cancel-cleanup',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-token-cancel-cleanup',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      return {
+        status: 101,
+        webSocket: heartbeatSocket,
+      };
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('cancel-cleanup-chunk'));
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const request = await buildSignedWorkerRequest();
+    Object.defineProperty(request, 'signal', { value: undefined, configurable: true });
+
+    const response = await worker.fetch(request, buildWorkerEnv(), ctx);
+    const reader = response.body.getReader();
+    assert.equal(new TextDecoder().decode((await reader.read()).value), 'cancel-cleanup-chunk');
+
+    await reader.cancel('client closed download');
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.equal(releaseBodies.length, 1);
+    assert.equal(releaseBodies[0]?.reason, 'client_disconnect');
+    assert.equal(heartbeatSocket.closeCount, 1);
+    assert.equal(heartbeatSocket.getCloseArgs()?.reason, 'client_disconnect');
+  } finally {
+    globalThis.fetch = originalFetch === fetchWithDefaultAckHandoff ? originalDelegatedFetch : originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('CQ wait signal addEventListener unavailable falls back and does not throw', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalDelegatedFetch = delegatedFetch;
+  const releaseBodies = [];
+  const heartbeatSocket = createFakeHeartbeatSocket();
+  const { ctx, waitUntilPromises } = createTestContext();
+  let waitRequest = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      return createJsonResponse({
+        result: 'wait',
+        waitToken: 'wait-signal-fallback',
+        scope: 'host',
+        retryAfter: 1,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/wait') {
+      waitRequest = JSON.parse(init.body);
+      return createTrueConcurrencyWaitSseResponse({
+        result: 'granted',
+        leaseId: 'lease-signal-fallback',
+        leaseToken: 'token-signal-fallback',
+        expiresAtMs: waitRequest.hardExpireAtMs,
+        claimToken: 'claim-token-signal-fallback',
+      }, {
+        acceptedDeadlineMs: waitRequest.deadlineMs,
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      return {
+        status: 101,
+        webSocket: heartbeatSocket,
+      };
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response('signal-fallback-wait-body', {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'released' });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const request = await buildSignedWorkerRequest();
+    Object.defineProperty(request, 'signal', {
+      value: {
+        aborted: false,
+        addEventListener: undefined,
+        removeEventListener: undefined,
+      },
+      configurable: true,
+    });
+
+    let response;
+    await assert.doesNotReject(async () => {
+      response = await worker.fetch(request, buildWorkerEnv(), ctx);
+    });
+    const failureText = response.status === 200 ? '' : await response.clone().text();
+    assert.equal(response.status, 200, failureText);
+    const responseText = await response.text();
+    assert.equal(responseText, 'signal-fallback-wait-body');
+
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(waitRequest?.waitToken, 'wait-signal-fallback');
+    assert.equal(releaseBodies.length, 1);
+    assert.equal(releaseBodies[0]?.reason, 'stream_complete');
+    assert.equal(heartbeatSocket.closeCount, 1);
+    assert.equal(heartbeatSocket.getCloseArgs()?.reason, 'stream_complete');
+  } finally {
+    globalThis.fetch = originalFetch === fetchWithDefaultAckHandoff ? originalDelegatedFetch : originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
