@@ -277,6 +277,29 @@ func TestSweepDoesNotProcessBackendStateBeforeStartupReady(t *testing.T) {
 	}
 }
 
+func TestRunSweepPassDoesNotCallMaintenanceCleanup(t *testing.T) {
+	backend := newMaintenanceBackend()
+	server := newTestServerInstance(t, backend)
+	server.sweepTargetSource = func(_ context.Context, nowMs int64, batchSize int) ([]ExpireScopeRequest, error) {
+		return []ExpireScopeRequest{{
+			Scope:        "site_ip",
+			HostnameHash: "sweep-maintenance-host",
+			SiteBucket:   "site-a",
+			IPBucket:     "ip-a",
+			NowMs:        nowMs,
+			Limit:        batchSize,
+		}}, nil
+	}
+
+	if err := server.runSweepPass(context.Background()); err != nil {
+		t.Fatalf("runSweepPass error: %v", err)
+	}
+	terminal, counters, _ := backend.snapshotMaintenance()
+	if len(terminal) != 0 || len(counters) != 0 {
+		t.Fatalf("expected sweep to avoid maintenance cleanup, terminal=%d counter=%d", len(terminal), len(counters))
+	}
+}
+
 func TestStartupRecoveryExpiresActiveLeasesBeforeServing(t *testing.T) {
 	db := requireRuntimeConcurrencyDB(t)
 	nowMs := time.Now().UnixMilli()

@@ -2815,6 +2815,15 @@ func TestWaiterDisconnectTerminatesWaitingRowState(t *testing.T) {
 	if snap, ok := server.waitingRuntime.snapshotForWaitToken(req.WaitToken); !ok || snap.RequestID != req.RequestID {
 		t.Fatalf("expected accepted wait to retain waiting snapshot before disconnect, got %+v ok=%v", snap, ok)
 	}
+	waitForConditionWithMessage(t, time.Second, func() bool {
+		var state string
+		err := db.QueryRowContext(context.Background(), `
+			SELECT state
+			FROM concurrency_requests
+			WHERE request_id = $1
+		`, req.RequestID).Scan(&state)
+		return err == nil && state == "waiting"
+	}, "expected accepted wait to materialize waiting request row before disconnect")
 
 	cancel()
 	select {

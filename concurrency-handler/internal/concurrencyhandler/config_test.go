@@ -35,13 +35,21 @@ func validTestConfig() Config {
 				RequireHardExpiry: true,
 			},
 			Wait: ConcurrencyWaitConfig{
-				MaxStreamMs:     10000,
+				MaxStreamMs: 10000,
 				KeepaliveMs: 1500,
 			},
 			Sweep: ConcurrencySweepConfig{
 				Enabled:         true,
 				IntervalSeconds: 300,
 				BatchSize:       500,
+			},
+			Maintenance: ConcurrencyMaintenanceConfig{
+				Enabled:                         true,
+				IntervalSeconds:                 300,
+				TerminalHistoryRetentionSeconds: 86400,
+				TerminalHistoryBatchSize:        5000,
+				CounterRetentionSeconds:         86400,
+				CounterBatchSize:                5000,
 			},
 			Heartbeat: ConcurrencyHeartbeatConfig{
 				Enabled:            true,
@@ -204,6 +212,110 @@ func TestParseConfigBytesAppliesDefaults(t *testing.T) {
 	}
 	if cfg.Concurrency.Heartbeat.SchedulerBatchSize != 500 {
 		t.Fatalf("expected heartbeat schedulerBatchSize default 500, got %+v", cfg.Concurrency.Heartbeat)
+	}
+}
+
+func TestParseConfigBytesAppliesMaintenanceDefaults(t *testing.T) {
+	data := []byte(`{
+		"controller": {},
+		"auth": {"enabled": true, "token": "secret"},
+		"backend": {
+			"mode": "postgrest",
+			"postgrest": {"baseUrl": "https://postgrest.example.test"}
+		},
+		"concurrency": {
+			"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
+			"lease": {"requireHardExpiry": true},
+			"wait": {"maxStreamMs": 10000, "keepaliveMs": 1500},
+			"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
+			"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
+		}
+	}`)
+
+	cfg, err := ParseConfigBytes(data)
+	if err != nil {
+		t.Fatalf("ParseConfigBytes error: %v", err)
+	}
+	want := ConcurrencyMaintenanceConfig{
+		Enabled:                         true,
+		IntervalSeconds:                 300,
+		TerminalHistoryRetentionSeconds: 86400,
+		TerminalHistoryBatchSize:        5000,
+		CounterRetentionSeconds:         86400,
+		CounterBatchSize:                5000,
+	}
+	if cfg.Concurrency.Maintenance != want {
+		t.Fatalf("expected maintenance defaults %+v, got %+v", want, cfg.Concurrency.Maintenance)
+	}
+}
+
+func TestParseConfigBytesRejectsEnabledMaintenanceNonPositiveValues(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		maintenance string
+		want        string
+	}{
+		{
+			name:        "interval must be positive",
+			maintenance: `"enabled": true, "intervalSeconds": 0, "terminalHistoryRetentionSeconds": 86400, "terminalHistoryBatchSize": 5000, "counterRetentionSeconds": 86400, "counterBatchSize": 5000`,
+			want:        "intervalSeconds",
+		},
+		{
+			name:        "terminal history retention must be positive",
+			maintenance: `"enabled": true, "intervalSeconds": 300, "terminalHistoryRetentionSeconds": 0, "terminalHistoryBatchSize": 5000, "counterRetentionSeconds": 86400, "counterBatchSize": 5000`,
+			want:        "terminalHistoryRetentionSeconds",
+		},
+		{
+			name:        "terminal history batch must be positive",
+			maintenance: `"enabled": true, "intervalSeconds": 300, "terminalHistoryRetentionSeconds": 86400, "terminalHistoryBatchSize": 0, "counterRetentionSeconds": 86400, "counterBatchSize": 5000`,
+			want:        "terminalHistoryBatchSize",
+		},
+		{
+			name:        "counter retention must be positive",
+			maintenance: `"enabled": true, "intervalSeconds": 300, "terminalHistoryRetentionSeconds": 86400, "terminalHistoryBatchSize": 5000, "counterRetentionSeconds": 0, "counterBatchSize": 5000`,
+			want:        "counterRetentionSeconds",
+		},
+		{
+			name:        "counter batch must be positive",
+			maintenance: `"enabled": true, "intervalSeconds": 300, "terminalHistoryRetentionSeconds": 86400, "terminalHistoryBatchSize": 5000, "counterRetentionSeconds": 86400, "counterBatchSize": 0`,
+			want:        "counterBatchSize",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte(`{
+				"controller": {},
+				"auth": {"enabled": true, "token": "secret"},
+				"backend": {
+					"mode": "postgrest",
+					"postgrest": {"baseUrl": "https://postgrest.example.test"}
+				},
+				"concurrency": {
+					"caps": {"hostMaxInFlight": 64, "siteMaxInFlight": 32, "siteIpMaxInFlight": 4},
+					"lease": {"requireHardExpiry": true},
+					"wait": {"maxStreamMs": 10000, "keepaliveMs": 1500},
+					"sweep": {"enabled": true, "intervalSeconds": 300, "batchSize": 500},
+					"maintenance": {` + tc.maintenance + `},
+					"rpc": {"acquireFunc": "cq_acquire", "releaseFunc": "cq_release", "expireFunc": "cq_expire_scope"}
+				}
+			}`)
+
+			_, err := ParseConfigBytes(data)
+			if err == nil {
+				t.Fatal("expected maintenance validation error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q error, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestConfigValidateAllowsDisabledMaintenanceZeroValues(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Concurrency.Maintenance = ConcurrencyMaintenanceConfig{Enabled: false}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected disabled zero-valued maintenance valid, got %v", err)
 	}
 }
 

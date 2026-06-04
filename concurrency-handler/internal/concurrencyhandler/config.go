@@ -51,12 +51,13 @@ type PostgresConfig struct {
 }
 
 type ConcurrencyConfig struct {
-	Caps      ConcurrencyCapsConfig      `json:"caps"`
-	Lease     ConcurrencyLeaseConfig     `json:"lease"`
-	Wait      ConcurrencyWaitConfig      `json:"wait"`
-	Sweep     ConcurrencySweepConfig     `json:"sweep"`
-	Heartbeat ConcurrencyHeartbeatConfig `json:"heartbeat"`
-	RPC       ConcurrencyRPCConfig       `json:"rpc"`
+	Caps        ConcurrencyCapsConfig        `json:"caps"`
+	Lease       ConcurrencyLeaseConfig       `json:"lease"`
+	Wait        ConcurrencyWaitConfig        `json:"wait"`
+	Sweep       ConcurrencySweepConfig       `json:"sweep"`
+	Maintenance ConcurrencyMaintenanceConfig `json:"maintenance"`
+	Heartbeat   ConcurrencyHeartbeatConfig   `json:"heartbeat"`
+	RPC         ConcurrencyRPCConfig         `json:"rpc"`
 }
 
 type ConcurrencyCapsConfig struct {
@@ -86,6 +87,15 @@ type ConcurrencySweepConfig struct {
 	BatchSize       int  `json:"batchSize"`
 }
 
+type ConcurrencyMaintenanceConfig struct {
+	Enabled                         bool `json:"enabled"`
+	IntervalSeconds                 int  `json:"intervalSeconds"`
+	TerminalHistoryRetentionSeconds int  `json:"terminalHistoryRetentionSeconds"`
+	TerminalHistoryBatchSize        int  `json:"terminalHistoryBatchSize"`
+	CounterRetentionSeconds         int  `json:"counterRetentionSeconds"`
+	CounterBatchSize                int  `json:"counterBatchSize"`
+}
+
 type ConcurrencyHeartbeatConfig struct {
 	Enabled            bool `json:"enabled"`
 	Required           bool `json:"required"`
@@ -111,7 +121,8 @@ func ParseConfigBytes(data []byte) (Config, error) {
 	}
 	var wire struct {
 		Concurrency struct {
-			Caps concurrencyCapsConfigWire `json:"caps"`
+			Caps        concurrencyCapsConfigWire `json:"caps"`
+			Maintenance *json.RawMessage          `json:"maintenance"`
 		} `json:"concurrency"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
@@ -119,6 +130,9 @@ func ParseConfigBytes(data []byte) (Config, error) {
 	}
 	if err := wire.Concurrency.Caps.validateRequired(); err != nil {
 		return Config{}, err
+	}
+	if wire.Concurrency.Maintenance == nil {
+		cfg.Concurrency.Maintenance = defaultMaintenanceConfig()
 	}
 	if cfg.Listen == "" {
 		cfg.Listen = ":8081"
@@ -152,6 +166,17 @@ func defaultHeartbeatConfig() ConcurrencyHeartbeatConfig {
 		StartTimeoutMs:     7000,
 		AckTimeoutMs:       2000,
 		SchedulerBatchSize: 500,
+	}
+}
+
+func defaultMaintenanceConfig() ConcurrencyMaintenanceConfig {
+	return ConcurrencyMaintenanceConfig{
+		Enabled:                         true,
+		IntervalSeconds:                 300,
+		TerminalHistoryRetentionSeconds: 86400,
+		TerminalHistoryBatchSize:        5000,
+		CounterRetentionSeconds:         86400,
+		CounterBatchSize:                5000,
 	}
 }
 
@@ -243,6 +268,23 @@ func (c *Config) Validate() error {
 	}
 	if c.Concurrency.Sweep.BatchSize <= 0 {
 		return errors.New("concurrency.sweep.batchSize is required")
+	}
+	if c.Concurrency.Maintenance.Enabled {
+		if c.Concurrency.Maintenance.IntervalSeconds <= 0 {
+			return errors.New("concurrency.maintenance.intervalSeconds must be > 0 when enabled")
+		}
+		if c.Concurrency.Maintenance.TerminalHistoryRetentionSeconds <= 0 {
+			return errors.New("concurrency.maintenance.terminalHistoryRetentionSeconds must be > 0 when enabled")
+		}
+		if c.Concurrency.Maintenance.TerminalHistoryBatchSize <= 0 {
+			return errors.New("concurrency.maintenance.terminalHistoryBatchSize must be > 0 when enabled")
+		}
+		if c.Concurrency.Maintenance.CounterRetentionSeconds <= 0 {
+			return errors.New("concurrency.maintenance.counterRetentionSeconds must be > 0 when enabled")
+		}
+		if c.Concurrency.Maintenance.CounterBatchSize <= 0 {
+			return errors.New("concurrency.maintenance.counterBatchSize must be > 0 when enabled")
+		}
 	}
 	if !c.Concurrency.Heartbeat.Enabled {
 		return errors.New("concurrency.heartbeat.enabled must be true")

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -52,20 +53,24 @@ const (
 )
 
 type Server struct {
-	cfg               Config
-	backend           Backend
-	waitingRuntime    *waitingRuntime
-	heartbeatRuntime  *heartbeatRuntime
-	observability     *cqObservability
-	mux               *http.ServeMux
-	newSweepTicker    func(time.Duration) sweepTicker
-	sweepTargetSource func(context.Context, int64, int) ([]ExpireScopeRequest, error)
-	reactorStopCh     chan struct{}
-	reactorStopOnce   sync.Once
-	startupStateMu    sync.RWMutex
-	startupState      startupLifecycleState
-	startupCtx        context.Context
-	startupCancel     context.CancelFunc
+	cfg                  Config
+	backend              Backend
+	waitingRuntime       *waitingRuntime
+	heartbeatRuntime     *heartbeatRuntime
+	observability        *cqObservability
+	mux                  *http.ServeMux
+	newSweepTicker       func(time.Duration) sweepTicker
+	newMaintenanceTicker func(time.Duration) sweepTicker
+	sweepTargetSource    func(context.Context, int64, int) ([]ExpireScopeRequest, error)
+	maintenanceRunning   atomic.Bool
+	maintenanceStopMu    sync.Mutex
+	maintenanceStop      func()
+	reactorStopCh        chan struct{}
+	reactorStopOnce      sync.Once
+	startupStateMu       sync.RWMutex
+	startupState         startupLifecycleState
+	startupCtx           context.Context
+	startupCancel        context.CancelFunc
 }
 
 type startupRecoveryActivation struct {
@@ -226,6 +231,9 @@ func NewServer(cfg Config, backend Backend) (*Server, error) {
 	s.newSweepTicker = func(interval time.Duration) sweepTicker {
 		return &realSweepTicker{ticker: time.NewTicker(interval)}
 	}
+	s.newMaintenanceTicker = func(interval time.Duration) sweepTicker {
+		return &realSweepTicker{ticker: time.NewTicker(interval)}
+	}
 	s.sweepTargetSource = s.defaultSweepTargetSource
 	s.routes()
 	s.setStartupState(startupStateProbing)
@@ -239,6 +247,7 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) Close() error {
 	if s != nil {
+		s.stopMaintenanceLoop()
 		s.setStartupState(startupStateClosed)
 		if s.startupCancel != nil {
 			s.startupCancel()
@@ -467,6 +476,147 @@ func (s *Server) startSweepLoop(ctx context.Context) func() {
 		}
 	}()
 	return cancel
+}
+
+func (s *Server) startMaintenanceLoop(ctx context.Context) func() {
+	if !s.cfg.Concurrency.Maintenance.Enabled {
+		return nil
+	}
+	interval := time.Duration(s.cfg.Concurrency.Maintenance.IntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = time.Second
+	}
+	tickerFactory := s.newMaintenanceTicker
+	if tickerFactory == nil {
+		tickerFactory = func(interval time.Duration) sweepTicker {
+			return &realSweepTicker{ticker: time.NewTicker(interval)}
+		}
+	}
+	ticker := tickerFactory(interval)
+	loopCtx, cancel := context.WithCancel(ctx)
+	var stopOnce sync.Once
+	var stopFunc func()
+	stopFunc = func() {
+		stopOnce.Do(func() {
+			cancel()
+			s.clearMaintenanceStop()
+		})
+	}
+	s.setMaintenanceStop(stopFunc)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-loopCtx.Done():
+				return
+			case <-ticker.C():
+				if loopCtx.Err() != nil {
+					return
+				}
+				go s.runMaintenancePass(loopCtx)
+			}
+		}
+	}()
+	return stopFunc
+}
+
+func (s *Server) setMaintenanceStop(stop func()) {
+	if s == nil || stop == nil {
+		return
+	}
+	s.maintenanceStopMu.Lock()
+	s.maintenanceStop = stop
+	s.maintenanceStopMu.Unlock()
+}
+
+func (s *Server) clearMaintenanceStop() {
+	if s == nil {
+		return
+	}
+	s.maintenanceStopMu.Lock()
+	s.maintenanceStop = nil
+	s.maintenanceStopMu.Unlock()
+}
+
+func (s *Server) stopMaintenanceLoop() {
+	if s == nil {
+		return
+	}
+	s.maintenanceStopMu.Lock()
+	stop := s.maintenanceStop
+	s.maintenanceStop = nil
+	s.maintenanceStopMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+}
+
+func (s *Server) runMaintenancePass(ctx context.Context) {
+	if !s.isReady() {
+		log.Printf("maintenance pass skipped: server not ready")
+		return
+	}
+	if !s.maintenanceRunning.CompareAndSwap(false, true) {
+		log.Printf("maintenance pass skipped: previous pass still running")
+		s.recordObservability("maintenance_pass_skipped_busy")
+		return
+	}
+	defer s.maintenanceRunning.Store(false)
+
+	backend, ok := s.backend.(maintenanceBackend)
+	if !ok {
+		log.Printf("maintenance pass skipped: backend does not support maintenance cleanup")
+		return
+	}
+
+	nowMs := time.Now().UnixMilli()
+	cfg := s.cfg.Concurrency.Maintenance
+	terminalCutoffMs := nowMs - int64(cfg.TerminalHistoryRetentionSeconds)*1000
+	counterCutoffMs := nowMs - int64(cfg.CounterRetentionSeconds)*1000
+	log.Printf("maintenance pass start now_ms=%d terminal_cutoff_ms=%d counter_cutoff_ms=%d", nowMs, terminalCutoffMs, counterCutoffMs)
+	s.recordObservability("maintenance_pass_started")
+
+	terminalStarted := time.Now()
+	terminalResult, err := backend.CleanupTerminalHistory(ctx, TerminalHistoryCleanupRequest{CutoffMs: terminalCutoffMs, BatchLimit: cfg.TerminalHistoryBatchSize})
+	terminalDurationMs := time.Since(terminalStarted).Milliseconds()
+	if err != nil {
+		log.Printf("maintenance job failed job=terminal_history duration_ms=%d error=%v", terminalDurationMs, err)
+		s.recordObservability("maintenance_terminal_cleanup_failed", "duration_ms="+strconv.FormatInt(terminalDurationMs, 10))
+	} else if err := validateTerminalHistoryCleanupResult(terminalResult); err != nil {
+		log.Printf("maintenance job failed job=terminal_history duration_ms=%d error=%v", terminalDurationMs, err)
+		s.recordObservability("maintenance_terminal_cleanup_failed", "duration_ms="+strconv.FormatInt(terminalDurationMs, 10))
+	} else {
+		fields := []string{
+			"deleted_requests=" + strconv.Itoa(terminalResult.DeletedRequests),
+			"deleted_leases=" + strconv.Itoa(terminalResult.DeletedLeases),
+			"deleted_wait_tokens=" + strconv.Itoa(terminalResult.DeletedWaitTokens),
+			"duration_ms=" + strconv.FormatInt(terminalDurationMs, 10),
+		}
+		log.Printf("maintenance job completed job=terminal_history %s", strings.Join(fields, " "))
+		s.recordObservability("maintenance_terminal_cleanup_completed", fields...)
+	}
+
+	counterStarted := time.Now()
+	counterResult, err := backend.CleanupZeroCounters(ctx, CounterCleanupRequest{CutoffMs: counterCutoffMs, BatchLimit: cfg.CounterBatchSize})
+	counterDurationMs := time.Since(counterStarted).Milliseconds()
+	if err != nil {
+		log.Printf("maintenance job failed job=counter_gc duration_ms=%d error=%v", counterDurationMs, err)
+		s.recordObservability("maintenance_counter_cleanup_failed", "duration_ms="+strconv.FormatInt(counterDurationMs, 10))
+	} else if err := validateCounterCleanupResult(counterResult); err != nil {
+		log.Printf("maintenance job failed job=counter_gc duration_ms=%d error=%v", counterDurationMs, err)
+		s.recordObservability("maintenance_counter_cleanup_failed", "duration_ms="+strconv.FormatInt(counterDurationMs, 10))
+	} else {
+		fields := []string{
+			"deleted_host_counters=" + strconv.Itoa(counterResult.DeletedHostCounters),
+			"deleted_site_counters=" + strconv.Itoa(counterResult.DeletedSiteCounters),
+			"deleted_site_ip_counters=" + strconv.Itoa(counterResult.DeletedSiteIPCounters),
+			"duration_ms=" + strconv.FormatInt(counterDurationMs, 10),
+		}
+		log.Printf("maintenance job completed job=counter_gc %s", strings.Join(fields, " "))
+		s.recordObservability("maintenance_counter_cleanup_completed", fields...)
+	}
+	log.Printf("maintenance pass completed now_ms=%d", nowMs)
+	s.recordObservability("maintenance_pass_completed")
 }
 
 func (s *Server) runSweepPass(ctx context.Context) error {
@@ -2412,6 +2562,10 @@ func Main() {
 	stopSweep := server.startSweepLoop(stopCtx)
 	if stopSweep != nil {
 		defer stopSweep()
+	}
+	stopMaintenance := server.startMaintenanceLoop(stopCtx)
+	if stopMaintenance != nil {
+		defer stopMaintenance()
 	}
 
 	go func() {

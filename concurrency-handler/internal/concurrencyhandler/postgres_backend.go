@@ -76,6 +76,52 @@ func (p *postgresBackend) StartupProbe(ctx context.Context) error {
 	return rows.Err()
 }
 
+func (p *postgresBackend) CleanupTerminalHistory(ctx context.Context, req TerminalHistoryCleanupRequest) (*TerminalHistoryCleanupResult, error) {
+	query, err := rpcSelectAll("cq_cleanup_terminal_history", 2)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := p.db.Query(ctx, query, req.CutoffMs, req.BatchLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, errors.New("empty terminal-history cleanup result")
+	}
+	result := &TerminalHistoryCleanupResult{}
+	if err := rows.Scan(&result.DeletedRequests, &result.DeletedLeases, &result.DeletedWaitTokens); err != nil {
+		return nil, err
+	}
+	if err := validateTerminalHistoryCleanupResult(result); err != nil {
+		return nil, err
+	}
+	return result, rows.Err()
+}
+
+func (p *postgresBackend) CleanupZeroCounters(ctx context.Context, req CounterCleanupRequest) (*CounterCleanupResult, error) {
+	query, err := rpcSelectAll("cq_cleanup_zero_counters", 2)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := p.db.Query(ctx, query, req.CutoffMs, req.BatchLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, errors.New("empty counter cleanup result")
+	}
+	result := &CounterCleanupResult{}
+	if err := rows.Scan(&result.DeletedHostCounters, &result.DeletedSiteCounters, &result.DeletedSiteIPCounters); err != nil {
+		return nil, err
+	}
+	if err := validateCounterCleanupResult(result); err != nil {
+		return nil, err
+	}
+	return result, rows.Err()
+}
+
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func validatedIdentifier(name string) (string, error) {

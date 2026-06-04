@@ -64,6 +64,54 @@ func (b *postgrestBackend) StartupProbe(ctx context.Context) error {
 	return nil
 }
 
+func (b *postgrestBackend) CleanupTerminalHistory(ctx context.Context, req TerminalHistoryCleanupRequest) (*TerminalHistoryCleanupResult, error) {
+	result := &struct {
+		DeletedRequests   int `json:"deleted_requests"`
+		DeletedLeases     int `json:"deleted_leases"`
+		DeletedWaitTokens int `json:"deleted_wait_tokens"`
+	}{}
+	err := b.doRPC(ctx, "cq_cleanup_terminal_history", map[string]any{
+		"p_cutoff_ms": req.CutoffMs,
+		"p_limit":     req.BatchLimit,
+	}, result)
+	if err != nil {
+		return nil, err
+	}
+	serviceResult := &TerminalHistoryCleanupResult{
+		DeletedRequests:   result.DeletedRequests,
+		DeletedLeases:     result.DeletedLeases,
+		DeletedWaitTokens: result.DeletedWaitTokens,
+	}
+	if err := validateTerminalHistoryCleanupResult(serviceResult); err != nil {
+		return nil, err
+	}
+	return serviceResult, nil
+}
+
+func (b *postgrestBackend) CleanupZeroCounters(ctx context.Context, req CounterCleanupRequest) (*CounterCleanupResult, error) {
+	result := &struct {
+		DeletedHostCounters   int `json:"deleted_host_counters"`
+		DeletedSiteCounters   int `json:"deleted_site_counters"`
+		DeletedSiteIPCounters int `json:"deleted_site_ip_counters"`
+	}{}
+	err := b.doRPC(ctx, "cq_cleanup_zero_counters", map[string]any{
+		"p_cutoff_ms":   req.CutoffMs,
+		"p_batch_limit": req.BatchLimit,
+	}, result)
+	if err != nil {
+		return nil, err
+	}
+	serviceResult := &CounterCleanupResult{
+		DeletedHostCounters:   result.DeletedHostCounters,
+		DeletedSiteCounters:   result.DeletedSiteCounters,
+		DeletedSiteIPCounters: result.DeletedSiteIPCounters,
+	}
+	if err := validateCounterCleanupResult(serviceResult); err != nil {
+		return nil, err
+	}
+	return serviceResult, nil
+}
+
 func (b *postgrestBackend) rpcURL(name string) string {
 	return b.baseURL + "/rpc/" + name
 }
