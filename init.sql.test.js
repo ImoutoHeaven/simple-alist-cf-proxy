@@ -23,6 +23,74 @@ const expectPatternIndex = (text, pattern, message) => {
   return index;
 };
 
+const expectCreateIndex = (indexName, columns) => {
+  const columnPattern = columns.join('\\s*,\\s*');
+
+  expect(initSql).toMatch(
+    new RegExp(
+      `CREATE INDEX IF NOT EXISTS\\s+${indexName}\\s+ON\\s+concurrency_requests\\s*\\(\\s*${columnPattern}\\s*\\)\\s+WHERE\\s+state\\s*=\\s*'active'`,
+      'i',
+    ),
+  );
+};
+
+const readSqlRange = (text, startNeedle, endNeedle, label) => {
+  const start = text.indexOf(startNeedle);
+  const end = text.indexOf(endNeedle, start + startNeedle.length);
+
+  expect(start, `expected ${label} start marker`).toBeGreaterThan(-1);
+  expect(end, `expected ${label} end marker`).toBeGreaterThan(start);
+
+  return text.slice(start, end);
+};
+
+const readDeleteStatements = (text, tableName) => {
+  const pattern = new RegExp(
+    `DELETE\\s+FROM\\s+${tableName}\\b[\\s\\S]*?(?=\\bRETURNING\\b|;)`,
+    'gi',
+  );
+  return [...text.matchAll(pattern)].map((match) => match[0]);
+};
+
+const stripPlpgsqlFunctionBodies = (text) =>
+  text.replace(/CREATE OR REPLACE FUNCTION[\s\S]*?\$\$ LANGUAGE plpgsql;/gi, '');
+
+const readCleanupStepBlock = (cleanupBody, candidateName, deletedCountName) =>
+  readSqlRange(
+    cleanupBody,
+    `WITH ${candidateName} AS (`,
+    `SELECT COUNT(*) INTO ${deletedCountName}`,
+    `${candidateName} cleanup step`,
+  );
+
+const expectSingleBoundedCandidateDelete = (block, tableName, candidateName, alias, joinColumn) => {
+  const deleteStatements = readDeleteStatements(block, tableName);
+
+  expect(deleteStatements, `expected exactly one ${tableName} delete in ${candidateName} block`).toHaveLength(1);
+  expect(block).toMatch(new RegExp(`WITH\\s+${candidateName}\\s+AS\\s*\\(`, 'i'));
+  expect(block).toMatch(/LIMIT\s+v_remaining_limit/i);
+  expect(deleteStatements[0]).toMatch(new RegExp(`USING\\s+${candidateName}\\s+AS\\s+c`, 'i'));
+  expect(deleteStatements[0]).toMatch(new RegExp(`WHERE\\s+${alias}\\.${joinColumn}\\s*=\\s*c\\.${joinColumn}`, 'i'));
+};
+
+const cqSchemaSetupBlock = readSqlRange(
+  initSql,
+  'CREATE TABLE IF NOT EXISTS concurrency_leases',
+  'CREATE OR REPLACE FUNCTION cq_cleanup_terminal_history',
+  'CQ schema setup block',
+);
+const topLevelInitSql = stripPlpgsqlFunctionBodies(initSql);
+
+const cqActiveIndexBlock = (() => {
+  const start = initSql.indexOf('CREATE INDEX IF NOT EXISTS concurrency_requests_waiting_host_idx');
+  const end = initSql.indexOf('CREATE INDEX IF NOT EXISTS concurrency_requests_heartbeat_deadline_idx');
+
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+
+  return initSql.slice(start, end);
+})();
+
 describe('init.sql breaker RPC definitions', () => {
   it('defines breaker warmup runtime columns', () => {
     expect(initSql).toMatch(/"SAMPLES_SINCE_RESET"\s+INTEGER\s+NOT NULL DEFAULT 0/i);
@@ -311,6 +379,122 @@ describe('init.sql breaker RPC definitions', () => {
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_promote_waiting_request\(/i);
     expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_acquire\(/i);
     expect(initSql).not.toMatch(/CREATE OR REPLACE FUNCTION\s+cq_release_by_request\(/i);
+  });
+
+  it('defines active-only partial indexes for CQ request lookups', () => {
+    expectCreateIndex('concurrency_requests_active_host_idx', [
+      'hostname_hash',
+      'request_id',
+    ]);
+    expectCreateIndex('concurrency_requests_active_site_idx', [
+      'hostname_hash',
+      'site_bucket',
+      'request_id',
+    ]);
+    expectCreateIndex('concurrency_requests_active_site_ip_idx', [
+      'hostname_hash',
+      'site_bucket',
+      'ip_bucket',
+      'request_id',
+    ]);
+  });
+
+  it('keeps the CQ cleanup contract bounded and preserves request-centric expire scope routing', () => {
+    expect(initSql).not.toMatch(/ALTER\s+TABLE\s+concurrency_(?:requests|leases|wait_tokens)[\s\S]*?ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS/i);
+    expect(topLevelInitSql).not.toMatch(/\bUPDATE\s+concurrency_(?:requests|leases|wait_tokens)(?:\s+(?:AS\s+)?\w+)?\s+SET\b/i);
+
+    const cleanupBody = readFunctionBody('cq_cleanup_terminal_history');
+    const expireBody = readFunctionBody('cq_expire_scope');
+    const requestCleanupBlock = readCleanupStepBlock(cleanupBody, 'candidate_requests', 'deleted_requests');
+    const leaseCleanupBlock = readCleanupStepBlock(cleanupBody, 'candidate_leases', 'deleted_leases');
+    const waitTokenCleanupBlock = readCleanupStepBlock(cleanupBody, 'candidate_wait_tokens', 'deleted_wait_tokens');
+
+    expectSingleBoundedCandidateDelete(requestCleanupBlock, 'concurrency_requests', 'candidate_requests', 'r', 'request_id');
+    expect(requestCleanupBlock).toMatch(/FROM\s+concurrency_requests\s+AS\s+r/i);
+    expect(requestCleanupBlock).toMatch(/WHERE\s+r\.state IN \('released', 'expired', 'cancelled'\)\s+AND\s+r\.updated_at_ms < v_effective_cutoff/i);
+
+    expectSingleBoundedCandidateDelete(leaseCleanupBlock, 'concurrency_leases', 'candidate_leases', 'l', 'lease_id');
+    expect(leaseCleanupBlock).toMatch(/FROM\s+concurrency_leases\s+AS\s+l/i);
+    expect(leaseCleanupBlock).toMatch(/WHERE\s+l\.state IN \('released', 'expired'\)/i);
+    expect(leaseCleanupBlock).toMatch(/r\.request_id IS NULL/i);
+    expect(leaseCleanupBlock).toMatch(/r\.state IN \('released', 'expired', 'cancelled'\) AND r\.updated_at_ms < v_effective_cutoff/i);
+
+    expectSingleBoundedCandidateDelete(waitTokenCleanupBlock, 'concurrency_wait_tokens', 'candidate_wait_tokens', 'w', 'wait_token');
+    expect(waitTokenCleanupBlock).toMatch(/FROM\s+concurrency_wait_tokens\s+AS\s+w/i);
+    expect(waitTokenCleanupBlock).toMatch(/WHERE\s+w\.updated_at_ms < v_effective_cutoff/i);
+    expect(waitTokenCleanupBlock).toMatch(/r\.request_id IS NULL/i);
+    expect(waitTokenCleanupBlock).toMatch(/r\.state IN \('released', 'expired', 'cancelled'\) AND r\.updated_at_ms < v_effective_cutoff/i);
+
+    expect(cleanupBody).toMatch(/v_remaining_limit\s*:=\s*p_limit/i);
+    expect(cleanupBody).toMatch(/LIMIT\s+v_remaining_limit/i);
+    expect(cleanupBody).toMatch(/v_remaining_limit\s*:=\s*GREATEST\(v_remaining_limit\s*-\s*deleted_requests,\s*0\)/i);
+    expect(cleanupBody).toMatch(/v_remaining_limit\s*:=\s*GREATEST\(v_remaining_limit\s*-\s*deleted_leases,\s*0\)/i);
+
+    expect(expireBody).toMatch(/WITH\s+expired_rows\s+AS\s*\(/i);
+    expect(expireBody).toMatch(/pg_try_advisory_xact_lock\(3, hashtext\(v_row\.request_id\)\)/i);
+    expect(expireBody).not.toMatch(/FROM\s+concurrency_leases[\s\S]*?FOR UPDATE SKIP LOCKED/i);
+
+    expectCreateIndex('concurrency_requests_active_host_idx', [
+      'hostname_hash',
+      'request_id',
+    ]);
+    expectCreateIndex('concurrency_requests_active_site_idx', [
+      'hostname_hash',
+      'site_bucket',
+      'request_id',
+    ]);
+    expectCreateIndex('concurrency_requests_active_site_ip_idx', [
+      'hostname_hash',
+      'site_bucket',
+      'ip_bucket',
+      'request_id',
+    ]);
+  });
+
+  it('defines a bounded terminal-history cleanup function with the canonical signature', () => {
+    const functionBody = readFunctionBody('cq_cleanup_terminal_history');
+
+    expect(functionBody).toMatch(/CREATE OR REPLACE FUNCTION cq_cleanup_terminal_history\(/i);
+    expect(functionBody).toMatch(/p_cutoff_ms\s+bigint/i);
+    expect(functionBody).toMatch(/p_limit\s+integer DEFAULT 5000/i);
+    expect(functionBody).toMatch(/RETURNS TABLE\(deleted_requests integer, deleted_leases integer, deleted_wait_tokens integer\)/i);
+    expect(functionBody).toMatch(/effective_cutoff\s*:=\s*LEAST\(p_cutoff_ms,\s*v_now_ms\s*-\s*86400000\)/i);
+    expect(functionBody).toMatch(/LIMIT v_remaining_limit/i);
+    expect(functionBody).toMatch(/deleted_requests/i);
+    expect(functionBody).toMatch(/deleted_leases/i);
+    expect(functionBody).toMatch(/deleted_wait_tokens/i);
+  });
+
+  it('keeps cleanup terminal-only and rejects automatic scheduling or runtime coupling', () => {
+    const functionBody = readFunctionBody('cq_cleanup_terminal_history');
+
+    expect(functionBody).not.toMatch(/CREATE\s+TRIGGER/i);
+    expect(functionBody).not.toMatch(/cron|scheduler|schedule/i);
+    expect(functionBody).not.toMatch(/worker-runtime|runtime workaround/i);
+    expect(functionBody).not.toMatch(/active requests/i);
+    expect(functionBody).not.toMatch(/wait tokens tied to non-terminal requests/i);
+  });
+
+  it('keeps cleanup eligibility aligned with terminal row rules and no-op guards', () => {
+    const functionBody = readFunctionBody('cq_cleanup_terminal_history');
+
+    expect(functionBody).toMatch(/IF p_cutoff_ms IS NULL OR p_cutoff_ms <= 0 THEN/i);
+    expect(functionBody).toMatch(/IF p_limit IS NULL OR p_limit < 1 THEN/i);
+    expect(functionBody).toMatch(/v_effective_cutoff\s*:=\s*LEAST\(p_cutoff_ms,\s*v_now_ms\s*-\s*86400000\)/i);
+    expect(functionBody).toMatch(/state IN \('released', 'expired', 'cancelled'\)/i);
+    expect(functionBody).toMatch(/state IN \('released', 'expired'\)/i);
+    expect(functionBody).toMatch(/r\.updated_at_ms < v_effective_cutoff/i);
+    expect(functionBody).toMatch(/r\.request_id IS NULL/i);
+    expect(functionBody).toMatch(/r\.state IN \('released', 'expired', 'cancelled'\) AND r\.updated_at_ms < v_effective_cutoff/i);
+    expect(functionBody).toMatch(/w\.updated_at_ms < v_effective_cutoff/i);
+    expect(functionBody).not.toMatch(/state = 'active'/i);
+  });
+
+  it('keeps active CQ index setup fresh-only without concurrent DDL or backfills', () => {
+    expect(initSql).not.toMatch(/\bCONCURRENTLY\b/i);
+    expect(initSql).not.toMatch(/\bALTER\s+TABLE\b/i);
+    expect(cqActiveIndexBlock).not.toMatch(/\bUPDATE\s+concurrency_(requests|leases|wait_tokens)(?:\s+(?:AS\s+)?\w+)?\s+SET\b/i);
+    expect(cqActiveIndexBlock).not.toMatch(/\bINSERT\s+INTO\s+concurrency_(requests|leases|wait_tokens)\b[^;]*\bSELECT\b/i);
   });
 
   it('defines request-ledger handoff metadata for the active handoff sub-phase', () => {
