@@ -63,6 +63,44 @@ const readCleanupStepBlock = (cleanupBody, candidateName, deletedCountName) =>
     `${candidateName} cleanup step`,
   );
 
+const readCounterCandidateBlock = (cleanupBody, candidateName, deletedRowsName) =>
+  readSqlRange(
+    cleanupBody,
+    `WITH ${candidateName} AS (`,
+    `), ${deletedRowsName} AS (`,
+    `${candidateName} candidate CTE`,
+  );
+
+const counterCleanupScopes = [
+  {
+    label: 'site_ip',
+    tableName: 'concurrency_site_ip_counters',
+    candidateName: 'candidate_site_ip_counters',
+    deletedRowsName: 'deleted_site_ip_counter_rows',
+    deletedCountName: 'deleted_site_ip_counters',
+    alias: 'sic',
+    keyColumns: ['hostname_hash', 'site_bucket', 'ip_bucket'],
+  },
+  {
+    label: 'site',
+    tableName: 'concurrency_site_counters',
+    candidateName: 'candidate_site_counters',
+    deletedRowsName: 'deleted_site_counter_rows',
+    deletedCountName: 'deleted_site_counters',
+    alias: 'sc',
+    keyColumns: ['hostname_hash', 'site_bucket'],
+  },
+  {
+    label: 'host',
+    tableName: 'concurrency_host_counters',
+    candidateName: 'candidate_host_counters',
+    deletedRowsName: 'deleted_host_counter_rows',
+    deletedCountName: 'deleted_host_counters',
+    alias: 'hc',
+    keyColumns: ['hostname_hash'],
+  },
+];
+
 const expectSingleBoundedCandidateDelete = (block, tableName, candidateName, alias, joinColumn) => {
   const deleteStatements = readDeleteStatements(block, tableName);
 
@@ -519,42 +557,60 @@ describe('init.sql breaker RPC definitions', () => {
     expect(functionBody).toMatch(/IF p_cutoff_ms IS NULL OR p_cutoff_ms <= 0 THEN/i);
     expect(functionBody).toMatch(/IF p_batch_limit IS NULL OR p_batch_limit < 1 THEN/i);
 
-    for (const candidateName of [
-      'candidate_site_ip_counters',
-      'candidate_site_counters',
-      'candidate_host_counters',
-    ]) {
+    for (const { candidateName } of counterCleanupScopes) {
       expect(functionBody).toMatch(new RegExp(`WITH\\s+${candidateName}\\s+AS\\s*\\([\\s\\S]*?LIMIT\\s+p_batch_limit`, 'i'));
     }
 
-    for (const tableName of [
-      'concurrency_site_ip_counters',
-      'concurrency_site_counters',
-      'concurrency_host_counters',
-    ]) {
+    for (const { tableName } of counterCleanupScopes) {
       const deletes = readDeleteStatements(functionBody, tableName);
       expect(deletes, `expected one bounded delete from ${tableName}`).toHaveLength(1);
       expect(deletes[0]).toMatch(/USING\s+candidate_/i);
     }
   });
 
-  it('rechecks zero-active and live-reference predicates in counter delete statements', () => {
+  it('uses candidate CTEs as the only live-reference filter for counter deletes', () => {
     const functionBody = readFunctionBody('cq_cleanup_zero_counters');
-    const [siteIpDelete] = readDeleteStatements(functionBody, 'concurrency_site_ip_counters');
-    const [siteDelete] = readDeleteStatements(functionBody, 'concurrency_site_counters');
-    const [hostDelete] = readDeleteStatements(functionBody, 'concurrency_host_counters');
 
-    expect(siteIpDelete).toMatch(/sic\.active_count\s*=\s*0/i);
-    expect(siteIpDelete).toMatch(/sic\.updated_at\s*<\s*to_timestamp\(p_cutoff_ms\s*\/\s*1000\.0\)/i);
-    expect(siteIpDelete).toMatch(/NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*sic\.hostname_hash[\s\S]*?r\.site_bucket\s*=\s*sic\.site_bucket[\s\S]*?r\.ip_bucket\s*=\s*sic\.ip_bucket/i);
+    for (const {
+      label,
+      tableName,
+      candidateName,
+      deletedRowsName,
+      deletedCountName,
+      alias,
+      keyColumns,
+    } of counterCleanupScopes) {
+      const cleanupBlock = readCleanupStepBlock(functionBody, candidateName, deletedCountName);
+      const candidateBlock = readCounterCandidateBlock(functionBody, candidateName, deletedRowsName);
+      const deletes = readDeleteStatements(cleanupBlock, tableName);
 
-    expect(siteDelete).toMatch(/sc\.active_count\s*=\s*0/i);
-    expect(siteDelete).toMatch(/sc\.updated_at\s*<\s*to_timestamp\(p_cutoff_ms\s*\/\s*1000\.0\)/i);
-    expect(siteDelete).toMatch(/NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*sc\.hostname_hash[\s\S]*?r\.site_bucket\s*=\s*sc\.site_bucket/i);
+      expect(deletes, `expected one ${label} counter delete`).toHaveLength(1);
+      const [deleteStatement] = deletes;
 
-    expect(hostDelete).toMatch(/hc\.active_count\s*=\s*0/i);
-    expect(hostDelete).toMatch(/hc\.updated_at\s*<\s*to_timestamp\(p_cutoff_ms\s*\/\s*1000\.0\)/i);
-    expect(hostDelete).toMatch(/NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*hc\.hostname_hash/i);
+      expect(candidateBlock, `expected ${label} candidate to filter live requests`).toMatch(/NOT EXISTS\s*\([\s\S]*?FROM\s+concurrency_requests\s+AS\s+r/i);
+      expect(candidateBlock, `expected ${label} candidate to exclude active and waiting requests`).toMatch(/r\.state IN \('active', 'waiting'\)/i);
+      expect(candidateBlock, `expected ${label} candidate to lock bounded rows`).toMatch(/FOR UPDATE SKIP LOCKED/i);
+
+      for (const keyColumn of keyColumns) {
+        expect(candidateBlock, `expected ${label} candidate to match request ${keyColumn}`).toMatch(
+          new RegExp(`r\\.${keyColumn}\\s*=\\s*${alias}\\.${keyColumn}`, 'i'),
+        );
+        expect(deleteStatement, `expected ${label} delete to join candidate by ${keyColumn}`).toMatch(
+          new RegExp(`${alias}\\.${keyColumn}\\s*=\\s*c\\.${keyColumn}`, 'i'),
+        );
+      }
+
+      expect(deleteStatement, `expected ${label} delete to use candidate CTE`).toMatch(
+        new RegExp(`USING\\s+${candidateName}\\s+AS\\s+c`, 'i'),
+      );
+      expect(deleteStatement, `expected ${label} delete to recheck zero active count`).toMatch(
+        new RegExp(`${alias}\\.active_count\\s*=\\s*0`, 'i'),
+      );
+      expect(deleteStatement, `expected ${label} delete to recheck cutoff`).toMatch(
+        new RegExp(`${alias}\\.updated_at\\s*<\\s*to_timestamp\\(p_cutoff_ms\\s*\\/\\s*1000\\.0\\)`, 'i'),
+      );
+      expect(deleteStatement, `expected ${label} delete not to rescan request table`).not.toMatch(/concurrency_requests/i);
+    }
   });
 
   it('preserves zero-active counters referenced by live requests for every counter scope', () => {
@@ -562,9 +618,47 @@ describe('init.sql breaker RPC definitions', () => {
 
     expect(functionBody).not.toMatch(/active_count\s*>\s*0/i);
     expect(functionBody).not.toMatch(/active_count\s*<>\s*0/i);
-    expect(functionBody).toMatch(/FROM\s+concurrency_site_ip_counters\s+AS\s+sic[\s\S]*?sic\.active_count\s*=\s*0[\s\S]*?NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*sic\.hostname_hash[\s\S]*?r\.site_bucket\s*=\s*sic\.site_bucket[\s\S]*?r\.ip_bucket\s*=\s*sic\.ip_bucket/i);
-    expect(functionBody).toMatch(/FROM\s+concurrency_site_counters\s+AS\s+sc[\s\S]*?sc\.active_count\s*=\s*0[\s\S]*?NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*sc\.hostname_hash[\s\S]*?r\.site_bucket\s*=\s*sc\.site_bucket/i);
-    expect(functionBody).toMatch(/FROM\s+concurrency_host_counters\s+AS\s+hc[\s\S]*?hc\.active_count\s*=\s*0[\s\S]*?NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*hc\.hostname_hash/i);
+
+    for (const { label, candidateName, deletedRowsName, tableName, alias, keyColumns } of counterCleanupScopes) {
+      const candidateBlock = readCounterCandidateBlock(functionBody, candidateName, deletedRowsName);
+      const [deleteStatement] = readDeleteStatements(functionBody, tableName);
+
+      expect(candidateBlock, `expected ${label} candidate to exclude non-zero active counters`).toMatch(
+        new RegExp(`${alias}\\.active_count\\s*=\\s*0`, 'i'),
+      );
+      expect(deleteStatement, `expected ${label} delete to recheck non-zero active counters`).toMatch(
+        new RegExp(`${alias}\\.active_count\\s*=\\s*0`, 'i'),
+      );
+      expect(candidateBlock, `expected ${label} candidate to exclude active request references`).toMatch(
+        /r\.state IN \('active', 'waiting'\)/i,
+      );
+      expect(candidateBlock, `expected ${label} candidate to exclude waiting request references`).toMatch(
+        /r\.state IN \('active', 'waiting'\)/i,
+      );
+
+      for (const keyColumn of keyColumns) {
+        expect(candidateBlock, `expected ${label} candidate to scope live-reference ${keyColumn}`).toMatch(
+          new RegExp(`r\\.${keyColumn}\\s*=\\s*${alias}\\.${keyColumn}`, 'i'),
+        );
+      }
+    }
+  });
+
+  it('returns zero counts before counter deletes for invalid zero-counter cleanup inputs', () => {
+    const functionBody = readFunctionBody('cq_cleanup_zero_counters');
+    const firstDeleteIndex = expectPatternIndex(
+      functionBody,
+      /WITH\s+candidate_site_ip_counters\s+AS\s*\(/i,
+      'expected site-ip cleanup to be the first delete block',
+    );
+
+    for (const guardPattern of [
+      /IF p_cutoff_ms IS NULL OR p_cutoff_ms <= 0 THEN[\s\S]*?RETURN QUERY SELECT deleted_host_counters, deleted_site_counters, deleted_site_ip_counters;[\s\S]*?RETURN;/i,
+      /IF p_batch_limit IS NULL OR p_batch_limit < 1 THEN[\s\S]*?RETURN QUERY SELECT deleted_host_counters, deleted_site_counters, deleted_site_ip_counters;[\s\S]*?RETURN;/i,
+    ]) {
+      const guardIndex = expectPatternIndex(functionBody, guardPattern, 'expected invalid cleanup input to return zero counts');
+      expect(guardIndex).toBeLessThan(firstDeleteIndex);
+    }
   });
 
   it('keeps active CQ index setup fresh-only without concurrent DDL or backfills', () => {

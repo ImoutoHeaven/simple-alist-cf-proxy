@@ -2177,14 +2177,6 @@ BEGIN
       AND sic.ip_bucket = c.ip_bucket
       AND sic.active_count = 0
       AND sic.updated_at < to_timestamp(p_cutoff_ms / 1000.0)
-      AND NOT EXISTS (
-        SELECT 1
-        FROM concurrency_requests AS r
-        WHERE r.state IN ('active', 'waiting')
-          AND r.hostname_hash = sic.hostname_hash
-          AND r.site_bucket = sic.site_bucket
-          AND r.ip_bucket = sic.ip_bucket
-      )
     RETURNING 1
   )
   SELECT COUNT(*) INTO deleted_site_ip_counters FROM deleted_site_ip_counter_rows;
@@ -2211,13 +2203,6 @@ BEGIN
       AND sc.site_bucket = c.site_bucket
       AND sc.active_count = 0
       AND sc.updated_at < to_timestamp(p_cutoff_ms / 1000.0)
-      AND NOT EXISTS (
-        SELECT 1
-        FROM concurrency_requests AS r
-        WHERE r.state IN ('active', 'waiting')
-          AND r.hostname_hash = sc.hostname_hash
-          AND r.site_bucket = sc.site_bucket
-      )
     RETURNING 1
   )
   SELECT COUNT(*) INTO deleted_site_counters FROM deleted_site_counter_rows;
@@ -2242,12 +2227,6 @@ BEGIN
     WHERE hc.hostname_hash = c.hostname_hash
       AND hc.active_count = 0
       AND hc.updated_at < to_timestamp(p_cutoff_ms / 1000.0)
-      AND NOT EXISTS (
-        SELECT 1
-        FROM concurrency_requests AS r
-        WHERE r.state IN ('active', 'waiting')
-          AND r.hostname_hash = hc.hostname_hash
-      )
     RETURNING 1
   )
   SELECT COUNT(*) INTO deleted_host_counters FROM deleted_host_counter_rows;
