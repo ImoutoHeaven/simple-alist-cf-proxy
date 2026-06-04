@@ -2006,6 +2006,18 @@ CREATE INDEX IF NOT EXISTS concurrency_requests_waiting_host_idx
   ON concurrency_requests (hostname_hash, site_bucket, ip_bucket, first_wait_at_ms, request_id)
   WHERE state = 'waiting';
 
+CREATE INDEX IF NOT EXISTS concurrency_requests_active_host_idx
+  ON concurrency_requests (hostname_hash, request_id)
+  WHERE state = 'active';
+
+CREATE INDEX IF NOT EXISTS concurrency_requests_active_site_idx
+  ON concurrency_requests (hostname_hash, site_bucket, request_id)
+  WHERE state = 'active';
+
+CREATE INDEX IF NOT EXISTS concurrency_requests_active_site_ip_idx
+  ON concurrency_requests (hostname_hash, site_bucket, ip_bucket, request_id)
+  WHERE state = 'active';
+
 CREATE INDEX IF NOT EXISTS concurrency_requests_heartbeat_deadline_idx
   ON concurrency_requests (heartbeat_deadline_ms, request_id)
   WHERE state = 'active' AND heartbeat_deadline_ms IS NOT NULL;
@@ -2026,6 +2038,96 @@ CREATE TABLE IF NOT EXISTS concurrency_wait_tokens (
   created_at_ms bigint NOT NULL,
   updated_at_ms bigint NOT NULL
 );
+
+CREATE OR REPLACE FUNCTION cq_cleanup_terminal_history(
+  p_cutoff_ms bigint,
+  p_limit integer DEFAULT 5000
+)
+RETURNS TABLE(deleted_requests integer, deleted_leases integer, deleted_wait_tokens integer) AS $$
+DECLARE
+  v_now_ms bigint := (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint;
+  v_effective_cutoff bigint;
+  v_remaining_limit integer;
+BEGIN
+  deleted_requests := 0;
+  deleted_leases := 0;
+  deleted_wait_tokens := 0;
+
+  IF p_cutoff_ms IS NULL OR p_cutoff_ms <= 0 THEN
+    RETURN QUERY SELECT deleted_requests, deleted_leases, deleted_wait_tokens;
+    RETURN;
+  END IF;
+
+  IF p_limit IS NULL OR p_limit < 1 THEN
+    RETURN QUERY SELECT deleted_requests, deleted_leases, deleted_wait_tokens;
+    RETURN;
+  END IF;
+
+  v_remaining_limit := p_limit;
+  v_effective_cutoff := LEAST(p_cutoff_ms, v_now_ms - 86400000);
+
+  WITH candidate_requests AS (
+    SELECT r.request_id
+    FROM concurrency_requests AS r
+    WHERE r.state IN ('released', 'expired', 'cancelled')
+      AND r.updated_at_ms < v_effective_cutoff
+    ORDER BY r.updated_at_ms, r.request_id
+    LIMIT v_remaining_limit
+  ), deleted_request_rows AS (
+    DELETE FROM concurrency_requests AS r
+    USING candidate_requests AS c
+    WHERE r.request_id = c.request_id
+    RETURNING 1
+  )
+  SELECT COUNT(*) INTO deleted_requests FROM deleted_request_rows;
+
+  v_remaining_limit := GREATEST(v_remaining_limit - deleted_requests, 0);
+
+  WITH candidate_leases AS (
+    SELECT l.lease_id
+    FROM concurrency_leases AS l
+    LEFT JOIN concurrency_requests AS r
+      ON r.request_id = l.request_id
+    WHERE l.state IN ('released', 'expired')
+      AND (
+        r.request_id IS NULL
+        OR (r.state IN ('released', 'expired', 'cancelled') AND r.updated_at_ms < v_effective_cutoff)
+      )
+    ORDER BY l.updated_at, l.lease_id
+    LIMIT v_remaining_limit
+  ), deleted_lease_rows AS (
+    DELETE FROM concurrency_leases AS l
+    USING candidate_leases AS c
+    WHERE l.lease_id = c.lease_id
+    RETURNING 1
+  )
+  SELECT COUNT(*) INTO deleted_leases FROM deleted_lease_rows;
+
+  v_remaining_limit := GREATEST(v_remaining_limit - deleted_leases, 0);
+
+  WITH candidate_wait_tokens AS (
+    SELECT w.wait_token
+    FROM concurrency_wait_tokens AS w
+    LEFT JOIN concurrency_requests AS r
+      ON r.request_id = w.request_id
+    WHERE w.updated_at_ms < v_effective_cutoff
+      AND (
+        r.request_id IS NULL
+        OR (r.state IN ('released', 'expired', 'cancelled') AND r.updated_at_ms < v_effective_cutoff)
+      )
+    ORDER BY w.updated_at_ms, w.wait_token
+    LIMIT v_remaining_limit
+  ), deleted_wait_token_rows AS (
+    DELETE FROM concurrency_wait_tokens AS w
+    USING candidate_wait_tokens AS c
+    WHERE w.wait_token = c.wait_token
+    RETURNING 1
+  )
+  SELECT COUNT(*) INTO deleted_wait_tokens FROM deleted_wait_token_rows;
+
+  RETURN QUERY SELECT deleted_requests, deleted_leases, deleted_wait_tokens;
+END;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION cq_apply_heartbeat_terminal_cleanup_trigger()
 RETURNS trigger AS $$
