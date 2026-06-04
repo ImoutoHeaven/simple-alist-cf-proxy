@@ -59,6 +59,8 @@ func (s *stubRows) Scan(dest ...any) error {
 			}
 		case *int64:
 			*d = row[i].(int64)
+		case *int:
+			*d = row[i].(int)
 		case *sql.NullString:
 			if row[i] == nil {
 				*d = sql.NullString{}
@@ -87,6 +89,60 @@ func (s *stubRows) Scan(dest ...any) error {
 func (s *stubRows) Err() error { return s.err }
 
 func (s *stubRows) Close() error { return nil }
+
+func TestPostgresBackendCleanupTerminalHistoryCallsSQLFunctionAndMapsResult(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "FROM cq_cleanup_terminal_history(") {
+			t.Fatalf("terminal-history cleanup must call SQL function, got %s", query)
+		}
+		if len(args) != 2 || args[0] != int64(123456) || args[1] != 77 {
+			t.Fatalf("unexpected terminal-history cleanup args: %v", args)
+		}
+		return &stubRows{rows: [][]any{{3, 2, 1}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.CleanupTerminalHistory(context.Background(), TerminalHistoryCleanupRequest{CutoffMs: 123456, BatchLimit: 77})
+	if err != nil {
+		t.Fatalf("CleanupTerminalHistory error: %v", err)
+	}
+	if result.DeletedRequests != 3 || result.DeletedLeases != 2 || result.DeletedWaitTokens != 1 {
+		t.Fatalf("unexpected terminal-history cleanup result: %+v", result)
+	}
+}
+
+func TestPostgresBackendCleanupZeroCountersCallsSQLFunctionAndMapsResult(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		if !strings.Contains(query, "FROM cq_cleanup_zero_counters(") {
+			t.Fatalf("counter cleanup must call SQL function, got %s", query)
+		}
+		if len(args) != 2 || args[0] != int64(987654) || args[1] != 88 {
+			t.Fatalf("unexpected counter cleanup args: %v", args)
+		}
+		return &stubRows{rows: [][]any{{5, 4, 3}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	result, err := backend.CleanupZeroCounters(context.Background(), CounterCleanupRequest{CutoffMs: 987654, BatchLimit: 88})
+	if err != nil {
+		t.Fatalf("CleanupZeroCounters error: %v", err)
+	}
+	if result.DeletedHostCounters != 5 || result.DeletedSiteCounters != 4 || result.DeletedSiteIPCounters != 3 {
+		t.Fatalf("unexpected counter cleanup result: %+v", result)
+	}
+}
+
+func TestPostgresBackendCleanupRejectsNegativeReturnedCounts(t *testing.T) {
+	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {
+		return &stubRows{rows: [][]any{{-1, 0, 0}}}, nil
+	}}
+
+	backend := &postgresBackend{cfg: validTestConfig(), db: client}
+	_, err := backend.CleanupTerminalHistory(context.Background(), TerminalHistoryCleanupRequest{CutoffMs: 123456, BatchLimit: 77})
+	if err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("expected negative count error, got %v", err)
+	}
+}
 
 func TestPostgresAcquireCallsConfiguredRPCAndNormalizesGrantedResult(t *testing.T) {
 	client := &stubPGClient{queryFn: func(query string, args []any) (pgRows, error) {

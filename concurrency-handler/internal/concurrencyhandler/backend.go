@@ -197,6 +197,28 @@ type ExpireScopeResult struct {
 	ExpiredRequestIDs []string `json:"expiredRequestIds,omitempty"`
 }
 
+type TerminalHistoryCleanupRequest struct {
+	CutoffMs   int64
+	BatchLimit int
+}
+
+type TerminalHistoryCleanupResult struct {
+	DeletedRequests   int
+	DeletedLeases     int
+	DeletedWaitTokens int
+}
+
+type CounterCleanupRequest struct {
+	CutoffMs   int64
+	BatchLimit int
+}
+
+type CounterCleanupResult struct {
+	DeletedHostCounters   int
+	DeletedSiteCounters   int
+	DeletedSiteIPCounters int
+}
+
 const (
 	fixedContinueWaitProbeFunc                             = "cq_wait_state_probe"
 	fixedAttachedWaitProbeFunc                             = "cq_attached_wait_state_probe"
@@ -313,6 +335,11 @@ type heartbeatBackend interface {
 
 type startupProber interface {
 	StartupProbe(ctx context.Context) error
+}
+
+type maintenanceBackend interface {
+	CleanupTerminalHistory(context.Context, TerminalHistoryCleanupRequest) (*TerminalHistoryCleanupResult, error)
+	CleanupZeroCounters(context.Context, CounterCleanupRequest) (*CounterCleanupResult, error)
 }
 
 type acquireWireResult struct {
@@ -689,6 +716,26 @@ func validateExpireScopeResult(result *ExpireScopeResult) error {
 	}
 	if result.ExpiredCount < 0 {
 		return fmt.Errorf("invalid expiredCount %d", result.ExpiredCount)
+	}
+	return nil
+}
+
+func validateTerminalHistoryCleanupResult(result *TerminalHistoryCleanupResult) error {
+	if result == nil {
+		return errors.New("missing terminal-history cleanup result")
+	}
+	if result.DeletedRequests < 0 || result.DeletedLeases < 0 || result.DeletedWaitTokens < 0 {
+		return fmt.Errorf("negative terminal-history cleanup counts: %+v", *result)
+	}
+	return nil
+}
+
+func validateCounterCleanupResult(result *CounterCleanupResult) error {
+	if result == nil {
+		return errors.New("missing counter cleanup result")
+	}
+	if result.DeletedHostCounters < 0 || result.DeletedSiteCounters < 0 || result.DeletedSiteIPCounters < 0 {
+		return fmt.Errorf("negative counter cleanup counts: %+v", *result)
 	}
 	return nil
 }

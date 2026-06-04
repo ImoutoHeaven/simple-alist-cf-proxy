@@ -2129,6 +2129,133 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION cq_cleanup_zero_counters(
+  p_cutoff_ms bigint,
+  p_batch_limit integer
+)
+RETURNS TABLE(
+  deleted_host_counters integer,
+  deleted_site_counters integer,
+  deleted_site_ip_counters integer
+) AS $$
+BEGIN
+  deleted_host_counters := 0;
+  deleted_site_counters := 0;
+  deleted_site_ip_counters := 0;
+
+  IF p_cutoff_ms IS NULL OR p_cutoff_ms <= 0 THEN
+    RETURN QUERY SELECT deleted_host_counters, deleted_site_counters, deleted_site_ip_counters;
+    RETURN;
+  END IF;
+
+  IF p_batch_limit IS NULL OR p_batch_limit < 1 THEN
+    RETURN QUERY SELECT deleted_host_counters, deleted_site_counters, deleted_site_ip_counters;
+    RETURN;
+  END IF;
+
+  WITH candidate_site_ip_counters AS (
+    SELECT sic.hostname_hash, sic.site_bucket, sic.ip_bucket
+    FROM concurrency_site_ip_counters AS sic
+    WHERE sic.active_count = 0
+      AND sic.updated_at < to_timestamp(p_cutoff_ms / 1000.0)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM concurrency_requests AS r
+        WHERE r.state IN ('active', 'waiting')
+          AND r.hostname_hash = sic.hostname_hash
+          AND r.site_bucket = sic.site_bucket
+          AND r.ip_bucket = sic.ip_bucket
+    )
+    ORDER BY sic.updated_at, sic.hostname_hash, sic.site_bucket, sic.ip_bucket
+    LIMIT p_batch_limit
+    FOR UPDATE SKIP LOCKED
+  ), deleted_site_ip_counter_rows AS (
+    DELETE FROM concurrency_site_ip_counters AS sic
+    USING candidate_site_ip_counters AS c
+    WHERE sic.hostname_hash = c.hostname_hash
+      AND sic.site_bucket = c.site_bucket
+      AND sic.ip_bucket = c.ip_bucket
+      AND sic.active_count = 0
+      AND sic.updated_at < to_timestamp(p_cutoff_ms / 1000.0)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM concurrency_requests AS r
+        WHERE r.state IN ('active', 'waiting')
+          AND r.hostname_hash = sic.hostname_hash
+          AND r.site_bucket = sic.site_bucket
+          AND r.ip_bucket = sic.ip_bucket
+      )
+    RETURNING 1
+  )
+  SELECT COUNT(*) INTO deleted_site_ip_counters FROM deleted_site_ip_counter_rows;
+
+  WITH candidate_site_counters AS (
+    SELECT sc.hostname_hash, sc.site_bucket
+    FROM concurrency_site_counters AS sc
+    WHERE sc.active_count = 0
+      AND sc.updated_at < to_timestamp(p_cutoff_ms / 1000.0)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM concurrency_requests AS r
+        WHERE r.state IN ('active', 'waiting')
+          AND r.hostname_hash = sc.hostname_hash
+          AND r.site_bucket = sc.site_bucket
+    )
+    ORDER BY sc.updated_at, sc.hostname_hash, sc.site_bucket
+    LIMIT p_batch_limit
+    FOR UPDATE SKIP LOCKED
+  ), deleted_site_counter_rows AS (
+    DELETE FROM concurrency_site_counters AS sc
+    USING candidate_site_counters AS c
+    WHERE sc.hostname_hash = c.hostname_hash
+      AND sc.site_bucket = c.site_bucket
+      AND sc.active_count = 0
+      AND sc.updated_at < to_timestamp(p_cutoff_ms / 1000.0)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM concurrency_requests AS r
+        WHERE r.state IN ('active', 'waiting')
+          AND r.hostname_hash = sc.hostname_hash
+          AND r.site_bucket = sc.site_bucket
+      )
+    RETURNING 1
+  )
+  SELECT COUNT(*) INTO deleted_site_counters FROM deleted_site_counter_rows;
+
+  WITH candidate_host_counters AS (
+    SELECT hc.hostname_hash
+    FROM concurrency_host_counters AS hc
+    WHERE hc.active_count = 0
+      AND hc.updated_at < to_timestamp(p_cutoff_ms / 1000.0)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM concurrency_requests AS r
+        WHERE r.state IN ('active', 'waiting')
+          AND r.hostname_hash = hc.hostname_hash
+    )
+    ORDER BY hc.updated_at, hc.hostname_hash
+    LIMIT p_batch_limit
+    FOR UPDATE SKIP LOCKED
+  ), deleted_host_counter_rows AS (
+    DELETE FROM concurrency_host_counters AS hc
+    USING candidate_host_counters AS c
+    WHERE hc.hostname_hash = c.hostname_hash
+      AND hc.active_count = 0
+      AND hc.updated_at < to_timestamp(p_cutoff_ms / 1000.0)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM concurrency_requests AS r
+        WHERE r.state IN ('active', 'waiting')
+          AND r.hostname_hash = hc.hostname_hash
+      )
+    RETURNING 1
+  )
+  SELECT COUNT(*) INTO deleted_host_counters FROM deleted_host_counter_rows;
+
+  RETURN QUERY SELECT deleted_host_counters, deleted_site_counters, deleted_site_ip_counters;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION cq_apply_heartbeat_terminal_cleanup_trigger()
 RETURNS trigger AS $$
 BEGIN

@@ -45,6 +45,14 @@
       "intervalSeconds": 300,
       "batchSize": 500
     },
+    "maintenance": {
+      "enabled": true,
+      "intervalSeconds": 300,
+      "terminalHistoryRetentionSeconds": 86400,
+      "terminalHistoryBatchSize": 5000,
+      "counterRetentionSeconds": 86400,
+      "counterBatchSize": 5000
+    },
     "heartbeat": {
       "enabled": true,
       "required": true,

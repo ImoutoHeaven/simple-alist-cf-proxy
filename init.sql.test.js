@@ -490,6 +490,83 @@ describe('init.sql breaker RPC definitions', () => {
     expect(functionBody).not.toMatch(/state = 'active'/i);
   });
 
+  it('defines bounded zero-active counter cleanup with canonical ordering and guards', () => {
+    expect(initSql).toMatch(/CREATE OR REPLACE FUNCTION\s+cq_cleanup_zero_counters\s*\(/i);
+
+    const functionBody = readFunctionBody('cq_cleanup_zero_counters');
+    const siteIpIndex = expectPatternIndex(
+      functionBody,
+      /concurrency_site_ip_counters/i,
+      'expected site-ip counters to be cleaned first',
+    );
+    const siteIndex = expectPatternIndex(
+      functionBody.slice(siteIpIndex + 1),
+      /concurrency_site_counters/i,
+      'expected site counters to be cleaned after site-ip counters',
+    ) + siteIpIndex + 1;
+    const hostIndex = expectPatternIndex(
+      functionBody.slice(siteIndex + 1),
+      /concurrency_host_counters/i,
+      'expected host counters to be cleaned after site counters',
+    ) + siteIndex + 1;
+
+    expect(siteIpIndex).toBeLessThan(siteIndex);
+    expect(siteIndex).toBeLessThan(hostIndex);
+    expect(functionBody).toMatch(/RETURNS TABLE\s*\(\s*deleted_host_counters\s+integer,\s*deleted_site_counters\s+integer,\s*deleted_site_ip_counters\s+integer\s*\)/i);
+    expect(functionBody).toMatch(/active_count\s*=\s*0/i);
+    expect(functionBody).toMatch(/updated_at\s*<\s*to_timestamp\(p_cutoff_ms\s*\/\s*1000\.0\)/i);
+    expect(functionBody).toMatch(/state\s+IN\s*\('active',\s*'waiting'\)/i);
+    expect(functionBody).toMatch(/IF p_cutoff_ms IS NULL OR p_cutoff_ms <= 0 THEN/i);
+    expect(functionBody).toMatch(/IF p_batch_limit IS NULL OR p_batch_limit < 1 THEN/i);
+
+    for (const candidateName of [
+      'candidate_site_ip_counters',
+      'candidate_site_counters',
+      'candidate_host_counters',
+    ]) {
+      expect(functionBody).toMatch(new RegExp(`WITH\\s+${candidateName}\\s+AS\\s*\\([\\s\\S]*?LIMIT\\s+p_batch_limit`, 'i'));
+    }
+
+    for (const tableName of [
+      'concurrency_site_ip_counters',
+      'concurrency_site_counters',
+      'concurrency_host_counters',
+    ]) {
+      const deletes = readDeleteStatements(functionBody, tableName);
+      expect(deletes, `expected one bounded delete from ${tableName}`).toHaveLength(1);
+      expect(deletes[0]).toMatch(/USING\s+candidate_/i);
+    }
+  });
+
+  it('rechecks zero-active and live-reference predicates in counter delete statements', () => {
+    const functionBody = readFunctionBody('cq_cleanup_zero_counters');
+    const [siteIpDelete] = readDeleteStatements(functionBody, 'concurrency_site_ip_counters');
+    const [siteDelete] = readDeleteStatements(functionBody, 'concurrency_site_counters');
+    const [hostDelete] = readDeleteStatements(functionBody, 'concurrency_host_counters');
+
+    expect(siteIpDelete).toMatch(/sic\.active_count\s*=\s*0/i);
+    expect(siteIpDelete).toMatch(/sic\.updated_at\s*<\s*to_timestamp\(p_cutoff_ms\s*\/\s*1000\.0\)/i);
+    expect(siteIpDelete).toMatch(/NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*sic\.hostname_hash[\s\S]*?r\.site_bucket\s*=\s*sic\.site_bucket[\s\S]*?r\.ip_bucket\s*=\s*sic\.ip_bucket/i);
+
+    expect(siteDelete).toMatch(/sc\.active_count\s*=\s*0/i);
+    expect(siteDelete).toMatch(/sc\.updated_at\s*<\s*to_timestamp\(p_cutoff_ms\s*\/\s*1000\.0\)/i);
+    expect(siteDelete).toMatch(/NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*sc\.hostname_hash[\s\S]*?r\.site_bucket\s*=\s*sc\.site_bucket/i);
+
+    expect(hostDelete).toMatch(/hc\.active_count\s*=\s*0/i);
+    expect(hostDelete).toMatch(/hc\.updated_at\s*<\s*to_timestamp\(p_cutoff_ms\s*\/\s*1000\.0\)/i);
+    expect(hostDelete).toMatch(/NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*hc\.hostname_hash/i);
+  });
+
+  it('preserves zero-active counters referenced by live requests for every counter scope', () => {
+    const functionBody = readFunctionBody('cq_cleanup_zero_counters');
+
+    expect(functionBody).not.toMatch(/active_count\s*>\s*0/i);
+    expect(functionBody).not.toMatch(/active_count\s*<>\s*0/i);
+    expect(functionBody).toMatch(/FROM\s+concurrency_site_ip_counters\s+AS\s+sic[\s\S]*?sic\.active_count\s*=\s*0[\s\S]*?NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*sic\.hostname_hash[\s\S]*?r\.site_bucket\s*=\s*sic\.site_bucket[\s\S]*?r\.ip_bucket\s*=\s*sic\.ip_bucket/i);
+    expect(functionBody).toMatch(/FROM\s+concurrency_site_counters\s+AS\s+sc[\s\S]*?sc\.active_count\s*=\s*0[\s\S]*?NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*sc\.hostname_hash[\s\S]*?r\.site_bucket\s*=\s*sc\.site_bucket/i);
+    expect(functionBody).toMatch(/FROM\s+concurrency_host_counters\s+AS\s+hc[\s\S]*?hc\.active_count\s*=\s*0[\s\S]*?NOT EXISTS\s*\([\s\S]*?r\.state IN \('active', 'waiting'\)[\s\S]*?r\.hostname_hash\s*=\s*hc\.hostname_hash/i);
+  });
+
   it('keeps active CQ index setup fresh-only without concurrent DDL or backfills', () => {
     expect(initSql).not.toMatch(/\bCONCURRENTLY\b/i);
     expect(initSql).not.toMatch(/\bALTER\s+TABLE\b/i);

@@ -4,12 +4,111 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestPostgrestBackendCleanupTerminalHistoryPostsRPCAndMapsResult(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"deleted_requests":9,"deleted_leases":8,"deleted_wait_tokens":7}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.CleanupTerminalHistory(context.Background(), TerminalHistoryCleanupRequest{CutoffMs: 123456, BatchLimit: 77})
+	if err != nil {
+		t.Fatalf("CleanupTerminalHistory error: %v", err)
+	}
+	if gotPath != "/rpc/cq_cleanup_terminal_history" {
+		t.Fatalf("expected terminal cleanup rpc path, got %s", gotPath)
+	}
+	if gotBody["p_cutoff_ms"] != float64(123456) || gotBody["p_limit"] != float64(77) {
+		t.Fatalf("expected p_cutoff_ms and p_limit payload, got %v", gotBody)
+	}
+	if _, ok := gotBody["p_batch_limit"]; ok {
+		t.Fatalf("terminal cleanup must use existing p_limit argument, got %v", gotBody)
+	}
+	if result.DeletedRequests != 9 || result.DeletedLeases != 8 || result.DeletedWaitTokens != 7 {
+		t.Fatalf("unexpected terminal cleanup result: %+v", result)
+	}
+}
+
+func TestPostgrestBackendCleanupZeroCountersPostsRPCAndMapsResult(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"deleted_host_counters":6,"deleted_site_counters":5,"deleted_site_ip_counters":4}]`))
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	result, err := backend.CleanupZeroCounters(context.Background(), CounterCleanupRequest{CutoffMs: 987654, BatchLimit: 88})
+	if err != nil {
+		t.Fatalf("CleanupZeroCounters error: %v", err)
+	}
+	if gotPath != "/rpc/cq_cleanup_zero_counters" {
+		t.Fatalf("expected counter cleanup rpc path, got %s", gotPath)
+	}
+	if gotBody["p_cutoff_ms"] != float64(987654) || gotBody["p_batch_limit"] != float64(88) {
+		t.Fatalf("expected p_cutoff_ms and p_batch_limit payload, got %v", gotBody)
+	}
+	if result.DeletedHostCounters != 6 || result.DeletedSiteCounters != 5 || result.DeletedSiteIPCounters != 4 {
+		t.Fatalf("unexpected counter cleanup result: %+v", result)
+	}
+}
+
+func TestPostgrestBackendCleanupRejectsNegativeReturnedCounts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `[{"deleted_host_counters":-1,"deleted_site_counters":0,"deleted_site_ip_counters":0}]`)
+	}))
+	defer srv.Close()
+
+	cfg := validTestConfig()
+	cfg.Backend.Mode = "postgrest"
+	cfg.Backend.Postgres.DSN = ""
+	cfg.Backend.Postgrest.BaseURL = srv.URL
+	backend := newPostgrestBackend(cfg, srv.Client())
+
+	_, err := backend.CleanupZeroCounters(context.Background(), CounterCleanupRequest{CutoffMs: 987654, BatchLimit: 88})
+	if err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("expected negative count error, got %v", err)
+	}
+}
 
 func TestPostgrestAcquireNormalizesGrantedResultAndUsesConfiguredRPC(t *testing.T) {
 	var gotPath string
