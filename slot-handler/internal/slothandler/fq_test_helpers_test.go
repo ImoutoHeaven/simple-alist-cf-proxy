@@ -187,6 +187,12 @@ func releaseOwnerRequiredPtr(v bool) *bool {
 	return &value
 }
 
+func withPublicReleaseFingerprintForTest(req ReleaseRequest, kind publicReleaseKind, hitUpstreamAt int64) ReleaseRequest {
+	req.ReleaseKind = kind
+	req.HitUpstreamAt = hitUpstreamAt
+	return req
+}
+
 type flowGrantedSlotCommitter interface {
 	commitReadyGrant(token, slotToken string, attemptVersion int64, attemptTicket int, latchTTL time.Duration, now time.Time) bool
 }

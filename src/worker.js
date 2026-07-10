@@ -3620,6 +3620,46 @@ const readFairQueueInvocationEpoch = (value) => {
 
 const readReleaseOwnerRequired = (value) => value === true;
 
+const FAIR_QUEUE_RELEASE_KIND_AFTER_USE = 'after_use';
+const FAIR_QUEUE_RELEASE_KIND_UNUSED_GRANT = 'unused_grant';
+
+const readFairQueueReleaseFingerprint = (fqContext) => {
+  const releaseKind = fqContext?.releaseKind;
+  const hitUpstreamAtMs = fqContext?.hitUpstreamAtMs;
+  if (
+    releaseKind === FAIR_QUEUE_RELEASE_KIND_AFTER_USE
+    && Number.isInteger(hitUpstreamAtMs)
+    && hitUpstreamAtMs > 0
+    && hitUpstreamAtMs <= Date.now()
+  ) {
+    return { releaseKind, hitUpstreamAtMs };
+  }
+  if (
+    releaseKind === FAIR_QUEUE_RELEASE_KIND_UNUSED_GRANT
+    && hitUpstreamAtMs === 0
+  ) {
+    return { releaseKind, hitUpstreamAtMs };
+  }
+  return null;
+};
+
+const markFairQueueOriginDispatch = (fqContext) => {
+  if (!fqContext?.slotToken) {
+    return;
+  }
+  if (fqContext.releaseKind === FAIR_QUEUE_RELEASE_KIND_AFTER_USE) {
+    return;
+  }
+  if (
+    fqContext.releaseKind !== FAIR_QUEUE_RELEASE_KIND_UNUSED_GRANT
+    || fqContext.hitUpstreamAtMs !== 0
+  ) {
+    throw new Error('[FQ] invalid release fingerprint before origin dispatch');
+  }
+  fqContext.hitUpstreamAtMs = Date.now();
+  fqContext.releaseKind = FAIR_QUEUE_RELEASE_KIND_AFTER_USE;
+};
+
 const buildFairQueueCleanupIdentity = (cleanupContext) => {
   if (cleanupContext?.slotToken) {
     return `release:${cleanupContext.slotToken}`;
@@ -3643,6 +3683,8 @@ const clearFairQueueOwnershipMetadata = (fqContext) => {
   fqContext.releaseOwnerRequired = undefined;
   fqContext.grantPromoted = false;
   fqContext.slotAcquiredAt = null;
+  fqContext.releaseKind = null;
+  fqContext.hitUpstreamAtMs = null;
 };
 
 const buildFinalCleanupGroups = (cleanupContexts) => {
@@ -3994,6 +4036,8 @@ const createSlotHandlerClient = (config) => {
             fqContext.slotToken = finalPayload.slotToken;
             fqContext.releaseOwnerRequired = finalPayload.releaseOwnerRequired;
             fqContext.slotAcquiredAt = Date.now();
+            fqContext.releaseKind = FAIR_QUEUE_RELEASE_KIND_UNUSED_GRANT;
+            fqContext.hitUpstreamAtMs = 0;
             fqContext.attemptVersion = Number.isFinite(attemptVersion) && Number.isFinite(attemptTicket)
               ? attemptVersion
               : null;
@@ -4312,9 +4356,11 @@ const createSlotHandlerClient = (config) => {
         logEvent('error', 'FQ', 'release_identity_missing', { host: hostname });
         return false;
       }
-      const hitUpstreamAtMs = Number.isFinite(fqContext.hitUpstreamAtMs)
-        ? fqContext.hitUpstreamAtMs
-        : fqContext.nowMs;
+      const releaseFingerprint = readFairQueueReleaseFingerprint(fqContext);
+      if (!releaseFingerprint) {
+        logEvent('error', 'FQ', 'release_fingerprint_invalid', { host: hostname });
+        return false;
+      }
       const payload = {
         hostname,
         hostnameHash,
@@ -4324,8 +4370,7 @@ const createSlotHandlerClient = (config) => {
         queryToken,
         invocationEpoch,
         releaseOwnerRequired: ownerRoutingEnabled,
-        hitUpstreamAtMs,
-        now: Date.now(),
+        ...releaseFingerprint,
       };
       const routingHeaders = ownerRoutingEnabled
         ? {
@@ -4342,6 +4387,7 @@ const createSlotHandlerClient = (config) => {
           host: fqContext.hostname,
           mode: fqContext.admissionMode,
           phase: 'release',
+          releaseKind: releaseFingerprint.releaseKind,
         });
         try {
           const res = await fetchWithTimeout(releaseUrl, payload, releaseTimeoutMs, undefined, routingHeaders);
@@ -4353,6 +4399,7 @@ const createSlotHandlerClient = (config) => {
               host: fqContext.hostname,
               mode: fqContext.admissionMode,
               result: 'released',
+              releaseKind: releaseFingerprint.releaseKind,
             });
             return true;
           }
@@ -5930,7 +5977,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (!needFairQueue || !fqContext?.slotToken) {
       return true;
     }
-    fqContext.hitUpstreamAtMs = 0;
+    if (
+      fqContext.releaseKind !== FAIR_QUEUE_RELEASE_KIND_UNUSED_GRANT
+      || fqContext.hitUpstreamAtMs !== 0
+    ) {
+      logEvent('error', 'FQ', 'unused_release_fingerprint_invalid', {
+        phase,
+        host: fqContext.hostname,
+      });
+      return false;
+    }
     return finalizeFairQueueOnFailure(phase);
   };
 
@@ -6687,6 +6743,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
   const probeGoogleDriveDownloadSize = async (requestToProbe) => {
     try {
       const headProbeRequest = new Request(requestToProbe, { method: 'HEAD' });
+      markFairQueueOriginDispatch(fqContext);
       const headProbeResponse = await fetch(headProbeRequest);
 
       const headProbeSize = parseContentLengthHeader(headProbeResponse.headers.get('content-length'));
@@ -6701,6 +6758,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     try {
       const rangeProbeRequest = new Request(requestToProbe);
       rangeProbeRequest.headers.set('range', GOOGLE_DRIVE_HEAD_PROBE_RANGE);
+      markFairQueueOriginDispatch(fqContext);
       const rangeProbeResponse = await fetch(rangeProbeRequest);
 
       const rangeProbeSize = parseContentRangeTotal(rangeProbeResponse.headers.get('content-range'));
@@ -6800,9 +6858,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       return { blockedResponse: attempt.blockedResponse, response: null };
     }
 
-    if (fqContext && !fqContext.hitUpstreamAtMs) {
-      fqContext.hitUpstreamAtMs = Date.now();
-    }
+    markFairQueueOriginDispatch(fqContext);
 
     return {
       blockedResponse: null,

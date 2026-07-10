@@ -563,6 +563,10 @@ test('worker.fetch does not log fq/cq unavailable terminal reasons on a successf
   assert.equal(response.status, 200, await response.text());
   assert.equal(terminalEntries(entries, 'fq_unavailable').length, 0);
   assert.equal(terminalEntries(entries, 'cq_unavailable').length, 0);
+  const releaseStart = entries.find((entry) => entry.text.includes('[FQ] release_start'));
+  const releaseResult = entries.find((entry) => entry.text.includes('[FQ] release_result'));
+  assert.match(releaseStart?.text || '', /releaseKind=after_use/);
+  assert.match(releaseResult?.text || '', /releaseKind=after_use/);
 });
 
 test('worker.fetch does not log alist_api_error when auth refresh ignores the error response', async () => {

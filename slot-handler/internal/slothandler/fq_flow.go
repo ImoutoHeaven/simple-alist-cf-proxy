@@ -244,6 +244,7 @@ type deliveredGrantHandoff struct {
 
 type completedAfterUseRelease struct {
 	completedAt time.Time
+	fingerprint *releaseFingerprint
 }
 
 type failedAfterBackendCleanup struct {
@@ -273,6 +274,7 @@ const (
 	afterUseReleasePreparationFailedAfterBackend afterUseReleasePreparationState = "failed_after_backend"
 	afterUseReleasePreparationCaptured           afterUseReleasePreparationState = "captured"
 	afterUseReleasePreparationMiss               afterUseReleasePreparationState = "miss"
+	afterUseReleasePreparationPayloadMismatch    afterUseReleasePreparationState = "payload_mismatch"
 )
 
 type afterUseReleasePreparation struct {
@@ -353,11 +355,11 @@ func (s *flowStore) recordAfterUseReleaseCompletionForRequest(req ReleaseRequest
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.recordAfterUseReleaseCompletionByIdentityLocked(identity)
+	s.recordAfterUseReleaseCompletionByIdentityLocked(identity, nil)
 	return true
 }
 
-func (s *flowStore) recordAfterUseReleaseCompletionByIdentityLocked(identity releaseIdentityKey) {
+func (s *flowStore) recordAfterUseReleaseCompletionByIdentityLocked(identity releaseIdentityKey, fingerprint *releaseFingerprint) {
 	if s == nil {
 		return
 	}
@@ -367,7 +369,7 @@ func (s *flowStore) recordAfterUseReleaseCompletionByIdentityLocked(identity rel
 	if s.completedAfterUseReleases == nil {
 		s.completedAfterUseReleases = make(map[releaseIdentityKey]completedAfterUseRelease)
 	}
-	s.completedAfterUseReleases[identity] = completedAfterUseRelease{completedAt: now}
+	s.completedAfterUseReleases[identity] = completedAfterUseRelease{completedAt: now, fingerprint: fingerprint}
 }
 
 func matchingDeliveredGrantHandoff(identity releaseIdentityKey, handoff deliveredGrantHandoff) bool {
@@ -436,7 +438,7 @@ func (s *flowStore) pruneCompletedAfterUseReleasesLocked(now time.Time) {
 	}
 }
 
-func (s *flowStore) recordAfterUseReleaseCompletionLocked(target afterUseReleaseCleanupTarget) {
+func (s *flowStore) recordAfterUseReleaseCompletionLocked(target afterUseReleaseCleanupTarget, fingerprint *releaseFingerprint) {
 	if s == nil || !target.valid() {
 		return
 	}
@@ -444,7 +446,7 @@ func (s *flowStore) recordAfterUseReleaseCompletionLocked(target afterUseRelease
 	if !ok {
 		return
 	}
-	s.recordAfterUseReleaseCompletionByIdentityLocked(identity)
+	s.recordAfterUseReleaseCompletionByIdentityLocked(identity, fingerprint)
 }
 
 func (s *flowStore) pruneFailedAfterBackendLocked(now time.Time) {
@@ -544,16 +546,19 @@ func (s *flowStore) prepareAfterUseRelease(req ReleaseRequest) afterUseReleasePr
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.prepareAfterUseReleaseLocked(identity)
+	return s.prepareAfterUseReleaseLocked(identity, releaseFingerprintForRequest(req))
 }
 
-func (s *flowStore) prepareAfterUseReleaseLocked(identity releaseIdentityKey) afterUseReleasePreparation {
+func (s *flowStore) prepareAfterUseReleaseLocked(identity releaseIdentityKey, fingerprint *releaseFingerprint) afterUseReleasePreparation {
 	if s == nil {
 		return afterUseReleasePreparation{state: afterUseReleasePreparationMiss}
 	}
 	now := s.nowLocked()
 	s.pruneCompletedAfterUseReleasesLocked(now)
-	if _, ok := s.completedAfterUseReleases[identity]; ok {
+	if completed, ok := s.completedAfterUseReleases[identity]; ok {
+		if completed.fingerprint != nil && fingerprint != nil && *completed.fingerprint != *fingerprint {
+			return afterUseReleasePreparation{state: afterUseReleasePreparationPayloadMismatch}
+		}
 		return afterUseReleasePreparation{state: afterUseReleasePreparationCompleted}
 	}
 	s.pruneFailedAfterBackendLocked(now)
@@ -2223,7 +2228,7 @@ func (s *flowStore) consumeDirectReleaseProof(req ReleaseRequest) bool {
 		return false
 	}
 	s.discardDeliveredGrantHandoffLocked(identity.queryToken, identity.invocationEpoch)
-	s.recordAfterUseReleaseCompletionByIdentityLocked(identity)
+	s.recordAfterUseReleaseCompletionByIdentityLocked(identity, releaseFingerprintForRequest(req))
 	return true
 }
 
@@ -2277,7 +2282,7 @@ func (s *flowStore) captureAfterUseReleaseCleanupByIdentityLocked(identity relea
 	return s.captureExpiredClaimedCleanupProofByIdentityLocked(identity)
 }
 
-func (s *flowStore) completeAfterUseRelease(target afterUseReleaseCleanupTarget) bool {
+func (s *flowStore) completeAfterUseRelease(target afterUseReleaseCleanupTarget, fingerprint *releaseFingerprint) bool {
 	if s == nil || !target.valid() {
 		return false
 	}
@@ -2304,7 +2309,7 @@ func (s *flowStore) completeAfterUseRelease(target afterUseReleaseCleanupTarget)
 		}
 		s.discardPendingInvocationExpiryLocked(f.Token, f.committedGrantEpoch)
 		s.deleteExpiredClaimedCleanupProofLocked(target)
-		s.recordAfterUseReleaseCompletionLocked(target)
+		s.recordAfterUseReleaseCompletionLocked(target, fingerprint)
 		s.removeFlowLocked(f)
 		return true
 	}
@@ -2318,7 +2323,7 @@ func (s *flowStore) completeAfterUseRelease(target afterUseReleaseCleanupTarget)
 	}
 	s.discardPendingInvocationExpiryLocked(target.token, target.committedGrantEpoch)
 	s.deleteExpiredClaimedCleanupProofLocked(target)
-	s.recordAfterUseReleaseCompletionLocked(target)
+	s.recordAfterUseReleaseCompletionLocked(target, fingerprint)
 	return true
 }
 

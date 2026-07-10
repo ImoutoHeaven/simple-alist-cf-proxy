@@ -349,8 +349,8 @@ func TestFairQueueWaitGrantedReleaseUsesOwnerRoutedIdentity(t *testing.T) {
 		QueryToken:           got.QueryToken,
 		InvocationEpoch:      got.InvocationEpoch,
 		ReleaseOwnerRequired: releaseOwnerRequiredPtr(true),
+		ReleaseKind:          releaseKindAfterUse,
 		HitUpstreamAt:        now.UnixMilli(),
-		Now:                  now.UnixMilli(),
 	})
 	releaseRec := handleReleaseJSONRequest(t, s, releaseBody)
 	if releaseRec.Code != http.StatusOK {

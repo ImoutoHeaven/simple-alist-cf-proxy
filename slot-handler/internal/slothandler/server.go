@@ -248,18 +248,37 @@ type fairQueueWaitSetupFailureResponse struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+type publicReleaseKind string
+
+const (
+	releaseKindAfterUse    publicReleaseKind = "after_use"
+	releaseKindUnusedGrant publicReleaseKind = "unused_grant"
+)
+
+type releaseFingerprint struct {
+	kind          publicReleaseKind
+	hitUpstreamAt int64
+}
+
+func releaseFingerprintForRequest(req ReleaseRequest) *releaseFingerprint {
+	if req.ReleaseKind != releaseKindAfterUse && req.ReleaseKind != releaseKindUnusedGrant {
+		return nil
+	}
+	return &releaseFingerprint{kind: req.ReleaseKind, hitUpstreamAt: req.HitUpstreamAt}
+}
+
 type ReleaseRequest struct {
-	Hostname             string `json:"hostname"`
-	HostnameHash         string `json:"hostnameHash"`
-	IPBucket             string `json:"ipBucket"`
-	SiteBucket           string `json:"siteBucket"`
-	SlotToken            string `json:"slotToken"`
-	QueryToken           string `json:"queryToken,omitempty"`
-	InvocationEpoch      uint64 `json:"invocationEpoch,omitempty"`
-	ReleaseOwnerRequired *bool  `json:"releaseOwnerRequired"`
-	HitUpstreamAt        int64  `json:"hitUpstreamAtMs"`
-	Now                  int64  `json:"now"`
-	MinSlotHoldMs        int64  `json:"minSlotHoldMs,omitempty"`
+	Hostname             string            `json:"hostname"`
+	HostnameHash         string            `json:"hostnameHash"`
+	IPBucket             string            `json:"ipBucket"`
+	SiteBucket           string            `json:"siteBucket"`
+	SlotToken            string            `json:"slotToken"`
+	QueryToken           string            `json:"queryToken,omitempty"`
+	InvocationEpoch      uint64            `json:"invocationEpoch,omitempty"`
+	ReleaseOwnerRequired *bool             `json:"releaseOwnerRequired"`
+	ReleaseKind          publicReleaseKind `json:"releaseKind"`
+	HitUpstreamAt        int64             `json:"hitUpstreamAtMs"`
+	Now                  int64             `json:"-"`
 }
 
 type ReleaseResponse struct {
@@ -358,30 +377,76 @@ type fairQueueCleanupBackend interface {
 }
 
 type smoothHostReleaser struct {
-	mu            sync.Mutex
-	lastReleaseAt time.Time
-	lastAccessAt  time.Time
+	mu             sync.Mutex
+	gateOnce       sync.Once
+	gate           chan struct{}
+	activePins     int
+	spacingWaiters int
+	lastReleaseAt  time.Time
+	lastAccessAt   time.Time
 }
 
-func (sr *smoothHostReleaser) nextReleaseAfter(base time.Time, interval time.Duration) time.Time {
+var pinnedSmoothReleaserAccess = time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
+
+func (sr *smoothHostReleaser) recordStart(startedAt time.Time) {
 	sr.mu.Lock()
-	defer sr.mu.Unlock()
+	if startedAt.After(sr.lastReleaseAt) {
+		sr.lastReleaseAt = startedAt
+	}
+	sr.mu.Unlock()
+}
 
-	sr.lastAccessAt = time.Now()
-
+func (sr *smoothHostReleaser) run(ctx context.Context, interval time.Duration, release func(func(time.Time)) (time.Time, error)) (time.Time, error) {
 	if interval <= 0 {
-		sr.lastReleaseAt = base
-		return base
+		if err := ctx.Err(); err != nil {
+			return time.Time{}, err
+		}
+		return release(sr.recordStart)
+	}
+	sr.gateOnce.Do(func() {
+		sr.gate = make(chan struct{}, 1)
+		sr.gate <- struct{}{}
+	})
+	gate := sr.gate
+
+	select {
+	case <-ctx.Done():
+		return time.Time{}, ctx.Err()
+	case <-gate:
+	}
+	var releaseGateOnce sync.Once
+	releaseGate := func() {
+		releaseGateOnce.Do(func() { gate <- struct{}{} })
+	}
+	defer releaseGate()
+
+	sr.mu.Lock()
+	lastReleaseAt := sr.lastReleaseAt
+	nextStart := lastReleaseAt.Add(interval)
+	sr.mu.Unlock()
+	if interval > 0 && !lastReleaseAt.IsZero() {
+		if delay := time.Until(nextStart); delay > 0 {
+			sr.mu.Lock()
+			sr.spacingWaiters++
+			sr.mu.Unlock()
+			defer func() {
+				sr.mu.Lock()
+				sr.spacingWaiters--
+				sr.mu.Unlock()
+			}()
+			if err := sleepWithContext(ctx, delay); err != nil {
+				return time.Time{}, err
+			}
+		}
 	}
 
-	if sr.lastReleaseAt.IsZero() || !sr.lastReleaseAt.After(base) {
-		sr.lastReleaseAt = base
-		return base
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
 	}
-
-	next := sr.lastReleaseAt.Add(interval)
-	sr.lastReleaseAt = next
-	return next
+	return release(func(startedAt time.Time) {
+		sr.recordStart(startedAt)
+		releaseGate()
+	})
 }
 
 type runtimeMeta struct {
@@ -473,41 +538,44 @@ type server struct {
 	flowStore        *flowStore
 	inFlightAfterUse map[releaseIdentityKey]*inFlightAfterUseRelease
 
-	activeSlots      *activeTracker
-	utilMu           sync.Mutex
-	utilHost         map[string]*utilWindow
-	utilSite         map[string]*utilWindow
-	utilHostLast     map[string]int64
-	utilSiteLast     map[string]int64
-	flowSchedMu      sync.Mutex
-	flowSched        map[string]*fqHostFlowScheduler
-	flowRunnerMu     sync.Mutex
-	flowRunners      map[string]*fqHostProbeRunner
-	smoothMu         sync.Mutex
-	smoothReleasers  map[string]*smoothHostReleaser
-	controller       *controllerEnv
-	meta             runtimeMeta
-	internalAPIToken string
-	configPath       string
-	configVersion    string
-	metrics          *metricsReporter
-	metricsCounters  *metricsCounters
-	metricSamplesMu  sync.Mutex
-	metricSamples    map[string]float64
-	lastReleaseAt    map[string]time.Time
-	lastProbeAt      map[string]time.Time
-	lastGrantAt      map[string]time.Time
-	overloadLogMu    sync.Mutex
-	overloadLogLast  map[string]time.Time
-	waitShutdownOnce sync.Once
-	waitShutdownCh   chan struct{}
-	hijackedWaitMu   sync.Mutex
-	hijackedWaitConn map[net.Conn]struct{}
+	activeSlots              *activeTracker
+	utilMu                   sync.Mutex
+	utilHost                 map[string]*utilWindow
+	utilSite                 map[string]*utilWindow
+	utilHostLast             map[string]int64
+	utilSiteLast             map[string]int64
+	flowSchedMu              sync.Mutex
+	flowSched                map[string]*fqHostFlowScheduler
+	flowRunnerMu             sync.Mutex
+	flowRunners              map[string]*fqHostProbeRunner
+	smoothMu                 sync.Mutex
+	smoothReleasers          map[string]*smoothHostReleaser
+	smoothAcquireHook        func(string, *smoothHostReleaser)
+	beforeBackendReleaseHook func(ReleaseRequest)
+	controller               *controllerEnv
+	meta                     runtimeMeta
+	internalAPIToken         string
+	configPath               string
+	configVersion            string
+	metrics                  *metricsReporter
+	metricsCounters          *metricsCounters
+	metricSamplesMu          sync.Mutex
+	metricSamples            map[string]float64
+	lastReleaseAt            map[string]time.Time
+	lastProbeAt              map[string]time.Time
+	lastGrantAt              map[string]time.Time
+	overloadLogMu            sync.Mutex
+	overloadLogLast          map[string]time.Time
+	waitShutdownOnce         sync.Once
+	waitShutdownCh           chan struct{}
+	hijackedWaitMu           sync.Mutex
+	hijackedWaitConn         map[net.Conn]struct{}
 }
 
 type inFlightAfterUseRelease struct {
-	done chan struct{}
-	err  error
+	done        chan struct{}
+	err         error
+	fingerprint *releaseFingerprint
 }
 
 func (s *server) getConfig() *Config {
@@ -705,9 +773,6 @@ func (s *server) updateRuntime(cfg *Config, backend queueBackend, cfgVersion str
 		s.utilSiteLast = nil
 		s.utilMu.Unlock()
 
-		s.smoothMu.Lock()
-		s.smoothReleasers = nil
-		s.smoothMu.Unlock()
 	}
 	s.cfg = cfg
 	s.backend = backend
@@ -2219,27 +2284,106 @@ func validateReleaseRequest(req ReleaseRequest) error {
 	return validateReleaseSlotToken(req.SlotToken)
 }
 
+func validatePublicReleaseRequest(req ReleaseRequest, hitUpstreamAtPresent bool, now time.Time) error {
+	if err := validateReleaseRequest(req); err != nil {
+		return err
+	}
+	if !hitUpstreamAtPresent {
+		return errors.New("hitUpstreamAtMs is required")
+	}
+	switch req.ReleaseKind {
+	case releaseKindAfterUse:
+		if req.HitUpstreamAt <= 0 {
+			return errors.New("after_use requires a positive hitUpstreamAtMs")
+		}
+		if req.HitUpstreamAt > now.UnixMilli() {
+			return errors.New("hitUpstreamAtMs cannot be in the future")
+		}
+	case releaseKindUnusedGrant:
+		if req.HitUpstreamAt != 0 {
+			return errors.New("unused_grant requires hitUpstreamAtMs equal to zero")
+		}
+	default:
+		return errors.New("invalid releaseKind")
+	}
+	return nil
+}
+
+func decodePublicReleaseRequest(body io.Reader) (ReleaseRequest, bool, error) {
+	const maxPublicReleaseBodyBytes = 1 << 20
+
+	type publicReleaseRequest struct {
+		Hostname             string            `json:"hostname"`
+		HostnameHash         string            `json:"hostnameHash"`
+		IPBucket             string            `json:"ipBucket"`
+		SiteBucket           string            `json:"siteBucket"`
+		SlotToken            string            `json:"slotToken"`
+		QueryToken           string            `json:"queryToken"`
+		InvocationEpoch      uint64            `json:"invocationEpoch"`
+		ReleaseOwnerRequired *bool             `json:"releaseOwnerRequired"`
+		ReleaseKind          publicReleaseKind `json:"releaseKind"`
+		HitUpstreamAt        *int64            `json:"hitUpstreamAtMs"`
+	}
+	raw, err := io.ReadAll(io.LimitReader(body, maxPublicReleaseBodyBytes+1))
+	if err != nil {
+		return ReleaseRequest{}, false, err
+	}
+	if len(raw) > maxPublicReleaseBodyBytes {
+		return ReleaseRequest{}, false, errors.New("request body too large")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var payload publicReleaseRequest
+	if err := decoder.Decode(&payload); err != nil {
+		return ReleaseRequest{}, false, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple json values")
+		}
+		return ReleaseRequest{}, false, err
+	}
+	req := ReleaseRequest{
+		Hostname:             payload.Hostname,
+		HostnameHash:         payload.HostnameHash,
+		IPBucket:             payload.IPBucket,
+		SiteBucket:           payload.SiteBucket,
+		SlotToken:            payload.SlotToken,
+		QueryToken:           payload.QueryToken,
+		InvocationEpoch:      payload.InvocationEpoch,
+		ReleaseOwnerRequired: payload.ReleaseOwnerRequired,
+		ReleaseKind:          payload.ReleaseKind,
+	}
+	if payload.HitUpstreamAt != nil {
+		req.HitUpstreamAt = *payload.HitUpstreamAt
+	}
+	return req, payload.HitUpstreamAt != nil, nil
+}
+
 func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	if !s.authPassed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	defer r.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	req, hitUpstreamAtPresent, err := decodePublicReleaseRequest(r.Body)
 	if err != nil {
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
-		return
-	}
-	var req ReleaseRequest
-	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	if err := validateReleaseRequest(req); err != nil {
+	if err := validatePublicReleaseRequest(req, hitUpstreamAtPresent, s.flowStoreNow()); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := s.releaseSlotAfterUse(r.Context(), req); err != nil {
+		if errors.Is(err, errReleaseIdentityPayloadMismatch) {
+			http.Error(w, errReleaseIdentityPayloadMismatch.Error(), http.StatusConflict)
+			return
+		}
 		if errors.Is(err, errAfterUseReleaseOwnerRouteMiss) {
 			http.Error(w, "release owner unavailable", http.StatusServiceUnavailable)
 			return
@@ -2422,27 +2566,47 @@ func (s *server) runFairQueueCleanup(ctx context.Context, cfg *Config) error {
 }
 
 func (s *server) getSmoothReleaser(hostnameHash, hostname string) *smoothHostReleaser {
-	key := hostnameHash
-	if key == "" {
-		key = hostname
-	}
+	releaser, unpin := s.acquireSmoothReleaser(hostnameHash, hostname)
+	unpin()
+	return releaser
+}
 
+func (s *server) acquireSmoothReleaser(hostnameHash, hostname string) (*smoothHostReleaser, func()) {
+	key := fqHostKey(hostnameHash, hostname)
 	s.smoothMu.Lock()
-	defer s.smoothMu.Unlock()
-
 	if s.smoothReleasers == nil {
 		s.smoothReleasers = make(map[string]*smoothHostReleaser)
 	}
-
 	releaser := s.smoothReleasers[key]
 	if releaser == nil {
 		releaser = &smoothHostReleaser{}
 		s.smoothReleasers[key] = releaser
 	}
 	releaser.mu.Lock()
-	releaser.lastAccessAt = time.Now()
+	releaser.activePins++
+	releaser.lastAccessAt = pinnedSmoothReleaserAccess
 	releaser.mu.Unlock()
-	return releaser
+	if s.smoothAcquireHook != nil {
+		s.smoothAcquireHook(key, releaser)
+	}
+	s.smoothMu.Unlock()
+
+	var once sync.Once
+	unpin := func() {
+		once.Do(func() {
+			s.smoothMu.Lock()
+			releaser.mu.Lock()
+			if releaser.activePins > 0 {
+				releaser.activePins--
+			}
+			if releaser.activePins == 0 {
+				releaser.lastAccessAt = time.Now()
+			}
+			releaser.mu.Unlock()
+			s.smoothMu.Unlock()
+		})
+	}
+	return releaser, unpin
 }
 
 func sleepWithContext(ctx context.Context, d time.Duration) error {
@@ -2513,14 +2677,15 @@ func (s *server) releaseSlot(ctx context.Context, req ReleaseRequest) error {
 
 var errAfterUseReleaseOwnerRouteMiss = errors.New("after-use release owner route miss")
 var errAfterUseReleaseBackendConsistency = errors.New("after-use release backend consistency failure")
+var errReleaseIdentityPayloadMismatch = errors.New("release_identity_payload_mismatch")
 
-func (s *server) beginOwnerRoutedAfterUseRelease(req ReleaseRequest) (*inFlightAfterUseRelease, bool) {
+func (s *server) beginOwnerRoutedAfterUseRelease(req ReleaseRequest) (*inFlightAfterUseRelease, bool, error) {
 	if s == nil {
-		return nil, true
+		return nil, true, nil
 	}
 	key, ok := releaseIdentityKeyForRequest(req)
 	if !ok {
-		return nil, true
+		return nil, true, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2528,11 +2693,15 @@ func (s *server) beginOwnerRoutedAfterUseRelease(req ReleaseRequest) (*inFlightA
 		s.inFlightAfterUse = make(map[releaseIdentityKey]*inFlightAfterUseRelease)
 	}
 	if existing := s.inFlightAfterUse[key]; existing != nil {
-		return existing, false
+		fingerprint := releaseFingerprintForRequest(req)
+		if existing.fingerprint != nil && fingerprint != nil && *existing.fingerprint != *fingerprint {
+			return nil, false, errReleaseIdentityPayloadMismatch
+		}
+		return existing, false, nil
 	}
-	current := &inFlightAfterUseRelease{done: make(chan struct{})}
+	current := &inFlightAfterUseRelease{done: make(chan struct{}), fingerprint: releaseFingerprintForRequest(req)}
 	s.inFlightAfterUse[key] = current
-	return current, true
+	return current, true, nil
 }
 
 func (s *server) finishOwnerRoutedAfterUseRelease(req ReleaseRequest, release *inFlightAfterUseRelease, err error) {
@@ -2593,7 +2762,10 @@ func (s *server) releaseExpiredClaimedGrant(ctx context.Context, req ReleaseRequ
 	}
 	store := s.flowStore
 	var err error
-	inFlight, leader := s.beginOwnerRoutedAfterUseRelease(req)
+	inFlight, leader, beginErr := s.beginOwnerRoutedAfterUseRelease(req)
+	if beginErr != nil {
+		return beginErr
+	}
 	if !leader {
 		return waitForOwnerRoutedAfterUseRelease(ctx, inFlight)
 	}
@@ -2634,7 +2806,10 @@ func (s *server) releaseSlotAfterUse(ctx context.Context, req ReleaseRequest) (e
 	var inFlight *inFlightAfterUseRelease
 	leader := true
 	var releaseStartedAt time.Time
-	inFlight, leader = s.beginOwnerRoutedAfterUseRelease(req)
+	inFlight, leader, err = s.beginOwnerRoutedAfterUseRelease(req)
+	if err != nil {
+		return err
+	}
 	if !leader {
 		return waitForOwnerRoutedAfterUseRelease(ctx, inFlight)
 	}
@@ -2655,6 +2830,9 @@ func (s *server) releaseSlotAfterUse(ctx context.Context, req ReleaseRequest) (e
 			return nil
 		case afterUseReleasePreparationFailedAfterBackend:
 			err = errAfterUseReleaseBackendConsistency
+			return err
+		case afterUseReleasePreparationPayloadMismatch:
+			err = errReleaseIdentityPayloadMismatch
 			return err
 		case afterUseReleasePreparationCaptured:
 			cleanupTarget = prep.cleanupTarget
@@ -2681,14 +2859,22 @@ func (s *server) releaseSlotAfterUse(ctx context.Context, req ReleaseRequest) (e
 			return err
 		}
 	}
-	releaseStartedAt = time.Now()
-	err = s.performBackendRelease(ctx, req, releaseStartedAt, "after_use")
+	cfg := s.getConfig()
+	if cfg == nil {
+		return errors.New("config not loaded")
+	}
+	interval := cfg.FairQueue.smoothInterval()
+	releaser, unpin := s.acquireSmoothReleaser(req.HostnameHash, req.Hostname)
+	defer unpin()
+	releaseStartedAt, err = releaser.run(ctx, interval, func(recordStart func(time.Time)) (time.Time, error) {
+		return s.performBackendRelease(ctx, req, string(req.ReleaseKind), recordStart)
+	})
 	if err != nil {
 		return err
 	}
 	if store != nil {
 		if releaseModeRequiresOwner(req) {
-			if !store.completeAfterUseRelease(cleanupTarget) {
+			if !store.completeAfterUseRelease(cleanupTarget, releaseFingerprintForRequest(req)) {
 				store.recordAfterUseReleaseFailedAfterBackendLocked(cleanupTarget)
 				return errAfterUseReleaseBackendConsistency
 			}
@@ -2714,8 +2900,8 @@ func (s *server) releaseSlotCompensating(ctx context.Context, req ReleaseRequest
 			return err
 		}
 	}
-	releaseStartedAt = time.Now()
-	return s.performBackendRelease(ctx, req, releaseStartedAt, "compensating")
+	_, err = s.performBackendRelease(ctx, req, "compensating", nil)
+	return err
 }
 
 func (s *server) runAfterUseReleaseTiming(req ReleaseRequest) (time.Time, error) {
@@ -2723,60 +2909,55 @@ func (s *server) runAfterUseReleaseTiming(req ReleaseRequest) (time.Time, error)
 	if cfg == nil {
 		return time.Time{}, errors.New("config not loaded")
 	}
-	if req.HitUpstreamAt == 0 {
-		return time.Now(), nil
+	now := time.Now()
+	baseTime := now
+	switch req.ReleaseKind {
+	case releaseKindAfterUse:
+		baseTime = time.UnixMilli(req.HitUpstreamAt).Add(time.Duration(cfg.FairQueue.minHold(0)) * time.Millisecond)
+		if baseTime.Before(now) {
+			baseTime = now
+		}
+	case releaseKindUnusedGrant:
+	default:
+		return time.Time{}, errors.New("invalid public release kind")
 	}
 
-	minHoldMs := cfg.FairQueue.minHold(0)
-	hitAt := time.UnixMilli(req.HitUpstreamAt)
-	if hitAt.IsZero() {
-		hitAt = time.Now()
-	}
-
-	baseTime := hitAt.Add(time.Duration(minHoldMs) * time.Millisecond)
-	if now := time.Now(); baseTime.Before(now) {
-		baseTime = now
-	}
-
-	interval := cfg.FairQueue.smoothInterval()
-	if interval <= 0 {
-		return baseTime, nil
-	}
-
-	releaser := s.getSmoothReleaser(req.HostnameHash, req.Hostname)
-	return releaser.nextReleaseAfter(baseTime, interval), nil
+	return baseTime, nil
 }
 
 func (s *server) runCompensatingReleaseTiming(req ReleaseRequest) (time.Time, error) {
 	return time.Now(), nil
 }
 
-func (s *server) performBackendRelease(ctx context.Context, req ReleaseRequest, releaseStartedAt time.Time, releaseKind string) error {
+func (s *server) performBackendRelease(ctx context.Context, req ReleaseRequest, releaseKind string, recordStart func(time.Time)) (time.Time, error) {
 	cfg := s.getConfig()
 	if cfg == nil {
-		return errors.New("config not loaded")
+		return time.Time{}, errors.New("config not loaded")
 	}
 	backend := s.getBackend()
 	if backend == nil {
-		return errors.New("backend not initialized")
-	}
-
-	if releaseStartedAt.IsZero() {
-		releaseStartedAt = time.Now()
-	}
-
-	hitAt := time.UnixMilli(req.HitUpstreamAt)
-	if req.HitUpstreamAt == 0 || hitAt.IsZero() {
-		hitAt = releaseStartedAt
+		return time.Time{}, errors.New("backend not initialized")
 	}
 
 	var err error
+	var releaseStartedAt time.Time
 	for attempt := 1; attempt <= releaseRetryAttempts; attempt++ {
+		if attempt == 1 && s.beforeBackendReleaseHook != nil {
+			s.beforeBackendReleaseHook(req)
+		}
 		if ctx != nil {
 			if err := ctx.Err(); err != nil {
-				return err
+				return time.Time{}, err
 			}
 		}
+		attemptStartedAt := time.Now()
+		if attempt == 1 {
+			releaseStartedAt = attemptStartedAt
+			if recordStart != nil {
+				recordStart(attemptStartedAt)
+			}
+		}
+		req.Now = attemptStartedAt.UnixMilli()
 		err = backend.ReleaseSlot(ctx, req)
 		if err == nil {
 			break
@@ -2786,22 +2967,26 @@ func (s *server) performBackendRelease(ctx context.Context, req ReleaseRequest, 
 		}
 		if attempt < releaseRetryAttempts {
 			if err := sleepWithContext(ctx, releaseRetryBaseDelay*time.Duration(attempt)); err != nil {
-				return err
+				return releaseStartedAt, err
 			}
 		}
 	}
 	if err != nil {
 		s.log.Errorf("release slot error: %v", err)
-		return err
+		return releaseStartedAt, err
+	}
+	hitAt := time.UnixMilli(req.HitUpstreamAt)
+	if req.HitUpstreamAt == 0 || hitAt.IsZero() {
+		hitAt = releaseStartedAt
 	}
 
+	hostKey := strings.TrimSpace(fqHostKey(req.HostnameHash, req.Hostname))
 	if s.activeSlots != nil {
 		s.activeSlots.ReleaseLease(req.SlotToken)
-		hostKey := strings.TrimSpace(fqHostKey(req.HostnameHash, req.Hostname))
-		s.observeRelease(hostKey, releaseStartedAt)
-		if hostKey != "" {
-			s.wakeHostProbeRunner(hostKey)
-		}
+	}
+	s.observeRelease(hostKey, releaseStartedAt)
+	if hostKey != "" && s.activeSlots != nil {
+		s.wakeHostProbeRunner(hostKey)
 	}
 
 	minHoldMs := int64(0)
@@ -2819,7 +3004,7 @@ func (s *server) performBackendRelease(ctx context.Context, req ReleaseRequest, 
 		releaseKind, req.Hostname, req.IPBucket, tokenLog, holdMs, minHoldMs,
 	)
 	s.incrementMetric("released")
-	return nil
+	return releaseStartedAt, nil
 }
 
 type postgrestBackend struct {

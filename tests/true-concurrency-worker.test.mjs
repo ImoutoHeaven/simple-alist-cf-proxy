@@ -3326,6 +3326,7 @@ test('queue_breaker dual mode settles breaker attempt when target expires before
       'fairqueue-release',
     ]);
     assert.equal(fairQueueReleaseBodies.length, 1);
+    assert.equal(fairQueueReleaseBodies[0].releaseKind, 'unused_grant');
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
     assert.equal(settleBodies.length, 1);
     assert.equal(settleBodies[0].p_attempt_version, 61);
@@ -3397,6 +3398,7 @@ test('dual mode malformed concurrency acquire result fails closed after fairqueu
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
     assert.equal(fairQueueReleaseBodies.length, 1);
+    assert.equal(fairQueueReleaseBodies[0].releaseKind, 'unused_grant');
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -4964,6 +4966,7 @@ test('dual mode treats CQ failure after fairqueue admission as unavailable and r
     assert.equal(calls.includes('origin-fetch'), false);
     assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
     assert.equal(fairQueueReleaseBodies.length, 1);
+    assert.equal(fairQueueReleaseBodies[0].releaseKind, 'unused_grant');
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -5038,6 +5041,7 @@ test('dual mode client-aborted CQ acquire releases the fairqueue grant as unused
     assert.equal(body.message, 'client aborted request');
     assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
     assert.equal(fairQueueReleaseBodies.length, 1);
+    assert.equal(fairQueueReleaseBodies[0].releaseKind, 'unused_grant');
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -9477,6 +9481,7 @@ test('queue_only fast wait releases unused fairqueue grant before CQ SSE wait an
     assert.equal(fairQueueWaitRequest.admissionMode, 'queue_only');
     assert.equal(fairQueueReleaseBodies.length, 1);
     assert.equal(fairQueueReleaseBodies[0].releaseOwnerRequired, true);
+    assert.equal(fairQueueReleaseBodies[0].releaseKind, 'unused_grant');
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
     assert.equal(waitRequest?.waitToken, 'wait-token-1');
     assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true);
@@ -10917,16 +10922,20 @@ test('Google Drive GET downloads without client range rewrite full-file 206 resp
   }
 });
 
-test('Google Drive GET downloads without payload filesize probe HEAD first and rewrite full-file 206 responses into fixed-length 200 responses', async () => {
+test('Google Drive probe-first release fingerprint freezes at HEAD dispatch and survives the primary fetch', async () => {
   const originalFetch = globalThis.fetch;
   const originCalls = [];
+  const releaseBodies = [];
+  let headDispatchObservedAtMs = null;
 
   globalThis.fetch = async (input, init = {}) => {
     const request = input instanceof Request ? input : new Request(input, init);
     const { url, method, headers } = request;
 
     if (url === 'https://controller.example.test/api/v0/bootstrap') {
-      return createJsonResponse(buildRuntimeBootstrap());
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns: ['*.googleapis.com'],
+      }));
     }
 
     if (url === 'https://alist.example.com/api/fs/link') {
@@ -10939,9 +10948,26 @@ test('Google Drive GET downloads without payload filesize probe HEAD first and r
       });
     }
 
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      const payload = JSON.parse(init.body);
+      return createFairQueueWaitSseResponse({
+        result: 'granted',
+        queryToken: 'query-google-probe-first',
+        invocationEpoch: 1,
+        slotToken: 'slot-google-probe-first',
+        releaseOwnerRequired: true,
+      }, { acceptedDeadlineMs: payload.deadlineMs });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
     if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
       originCalls.push({ method, range: headers.get('range') });
       if (method === 'HEAD') {
+        headDispatchObservedAtMs = Date.now();
         return new Response(null, {
           status: 200,
           headers: {
@@ -10965,10 +10991,11 @@ test('Google Drive GET downloads without payload filesize probe HEAD first and r
   };
 
   try {
+    const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(
       await buildSignedWorkerRequest(),
       buildWorkerEnv(),
-      createTestContext().ctx,
+      ctx,
     );
 
     assert.equal(response.status, 200);
@@ -10976,10 +11003,16 @@ test('Google Drive GET downloads without payload filesize probe HEAD first and r
     assert.equal(response.headers.get('content-range'), null);
     assert.equal(response.headers.get('accept-ranges'), 'bytes');
     assert.equal(await response.text(), 'download-body');
+    await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(originCalls, [
       { method: 'HEAD', range: null },
       { method: 'GET', range: 'bytes=0-12' },
     ]);
+    assert.equal(releaseBodies.length, 1);
+    assert.equal(releaseBodies[0].releaseKind, 'after_use');
+    assert.equal(Number.isInteger(releaseBodies[0].hitUpstreamAtMs), true);
+    assert.equal(releaseBodies[0].hitUpstreamAtMs > 0, true);
+    assert.equal(releaseBodies[0].hitUpstreamAtMs <= headDispatchObservedAtMs, true);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;

@@ -26,9 +26,10 @@ Process startup and concurrency business readiness are separate. The process may
 - Both wait requests use `Accept: text/event-stream`, both handlers reply with `Content-Type: text/event-stream`, and each accepted stream emits one `accepted` event plus one final `result` event.
 - FQ final SSE result events repeat the accepted ownership tuple: `queryToken` and `invocationEpoch`.
 - CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP
-- FQ: wait SSE -> accepted -> one final result -> disconnect is terminal, granted slots release after use
+- FQ: wait SSE -> accepted -> one final result -> disconnect is terminal; a promoted grant releases as `unused_grant` before origin dispatch and as `after_use` after origin dispatch
 - CQ wait 只认已 accepted 的 SSE stream 作为 active waiter；断开即终态。
 - Host-scope cleanup keeps looping inside one host pass while each `ExpireScope` call reports progress; a host wait is only returned after cleanup reports no further progress.
+- Worker and slot-handler deploy together as one clean-break release; mixed versions are unsupported.
 
 ## Worker Coordination
 
@@ -50,14 +51,17 @@ When a target enables both fairqueue and true concurrency, Worker runs:
 1. compute `hardExpireAtMs`
 2. `slot-handler` `POST /api/v1/fairqueue/wait`
 3. `concurrency-handler acquire(fast)`
-4. if CQ returns `wait`, settle the prior breaker attempt, release the physical fairqueue slot immediately with unused-grant semantics, and open `POST /api/v1/concurrency/wait`
-5. once CQ returns `granted`, call `claim`
-6. if `claim` returns `granted`, call `ack_handoff`
-7. if `ack_handoff` returns `acknowledged`, open the authenticated heartbeat WebSocket, send `hello`, and wait for `hello_ack`
-8. only after accepted heartbeat, start origin fetch
-9. fairqueue early release after upstream headers when a physical slot is still held
-10. managed streaming response with periodic heartbeat refresh
-11. best-effort true-concurrency `release`
+4. if CQ returns `wait`, settle the prior breaker attempt and release the physical fairqueue slot as `unused_grant`; this skips the minimum hold but remains subject to slot-handler per-host smooth spacing
+5. only after the `unused_grant` release succeeds and clears FQ ownership, open `POST /api/v1/concurrency/wait`
+6. once CQ returns `granted`, call `claim`
+7. if `claim` returns `granted`, call `ack_handoff`
+8. if `ack_handoff` returns `acknowledged`, open the authenticated heartbeat WebSocket, send `hello`, and wait for `hello_ack`
+9. only after accepted heartbeat, start origin fetch without an FQ transition because the CQ wait path no longer holds an FQ grant
+10. perform no second FQ release on this CQ wait path
+11. managed streaming response with periodic heartbeat refresh
+12. best-effort true-concurrency `release`
+
+When CQ fast acquire returns `wait`, the successful `unused_grant` release clears the live FQ fingerprint before opening CQ SSE. The later origin dispatch has no live FQ fingerprint, performs no `after_use` transition, and issues no second FQ release. Only an origin dispatch that still retains a live FQ grant marks it `after_use`.
 
 When `concurrency.heartbeat.enabled=true`, heartbeat is required for every CQ-managed active stream. Worker never starts origin fetch without an accepted heartbeat session.
 

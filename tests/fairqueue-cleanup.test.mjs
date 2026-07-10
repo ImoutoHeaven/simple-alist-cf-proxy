@@ -420,6 +420,7 @@ test('slot-handler client sends claimed release with full release identity and o
     queryToken: 'query-1',
     invocationEpoch: 7,
     releaseOwnerRequired: true,
+    releaseKind: 'after_use',
     hitUpstreamAtMs: 123,
   };
   let seenUrl = null;
@@ -454,8 +455,10 @@ test('slot-handler client sends claimed release with full release identity and o
     assert.equal(seenBody.queryToken, 'query-1');
     assert.equal(seenBody.invocationEpoch, 7);
     assert.equal(seenBody.releaseOwnerRequired, true);
+    assert.equal(seenBody.releaseKind, 'after_use');
     assert.equal(seenBody.hitUpstreamAtMs, 123);
-    assert.equal(typeof seenBody.now, 'number');
+    assert.equal(Object.hasOwn(seenBody, 'now'), false);
+    assert.equal(Object.hasOwn(seenBody, 'minSlotHoldMs'), false);
     assert.equal(Object.hasOwn(seenBody, 'cleanupRetired'), false);
   } finally {
     globalThis.fetch = originalFetch;
@@ -479,7 +482,8 @@ test('slot-handler client sends direct release with full release identity but no
     queryToken: 'query-plain-release',
     invocationEpoch: 12,
     releaseOwnerRequired: false,
-    hitUpstreamAtMs: 456,
+    releaseKind: 'unused_grant',
+    hitUpstreamAtMs: 0,
   };
   let seenBody = null;
   let seenOwnerTokenHeader = null;
@@ -505,9 +509,54 @@ test('slot-handler client sends direct release with full release identity but no
     assert.equal(seenBody.queryToken, 'query-plain-release');
     assert.equal(seenBody.invocationEpoch, 12);
     assert.equal(seenBody.releaseOwnerRequired, false);
+    assert.equal(seenBody.releaseKind, 'unused_grant');
+    assert.equal(seenBody.hitUpstreamAtMs, 0);
     assert.equal(seenOwnerTokenHeader, null);
     assert.equal(seenOwnerEpochHeader, null);
     assert.equal(Object.hasOwn(seenBody, 'cleanupRetired'), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('slot-handler client rejects an invalid release fingerprint locally without fetch', async () => {
+  const client = createSlotHandlerClient({
+    slotHandlerConfig: {
+      url: 'https://slot-handler.example.com',
+      authKey: 'secret',
+      authHeader: 'X-FQ-Auth',
+    },
+  });
+  const baseContext = {
+    hostname: 'tenant.sharepoint.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    slotToken: 'slot-invalid-fingerprint',
+    queryToken: 'query-invalid-fingerprint',
+    invocationEpoch: 2,
+    releaseOwnerRequired: true,
+  };
+  const invalidFingerprints = [
+    {},
+    { releaseKind: 'compensating', hitUpstreamAtMs: 0 },
+    { releaseKind: 'unused_grant', hitUpstreamAtMs: 1 },
+    { releaseKind: 'after_use', hitUpstreamAtMs: 0 },
+    { releaseKind: 'after_use', hitUpstreamAtMs: 1.5 },
+    { releaseKind: 'after_use', hitUpstreamAtMs: Date.now() + 60_000 },
+  ];
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return new Response(null, { status: 204 });
+  };
+
+  try {
+    for (const fingerprint of invalidFingerprints) {
+      assert.equal(await client.releaseSlot({}, { ...baseContext, ...fingerprint }), false);
+    }
+    assert.equal(fetchCalls, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -956,6 +1005,44 @@ test('finalizer prefers release when slotToken exists', async () => {
   assert.deepEqual(cleanupCalls, [{ kind: 'release', token: 'slot-1' }]);
 });
 
+test('generic pre-origin final cleanup preserves the promoted unused_grant fingerprint', async () => {
+  const releaseFingerprints = [];
+  const fqContext = {
+    hostname: 'tenant.sharepoint.com',
+    hostnameHash: 'host-hash',
+    ipBucket: 'ip-bucket',
+    siteBucket: 'site-bucket',
+    slotToken: 'slot-unused-cleanup',
+    queryToken: 'query-unused-cleanup',
+    invocationEpoch: 4,
+    grantPromoted: true,
+    releaseKind: 'unused_grant',
+    hitUpstreamAtMs: 0,
+  };
+
+  const finalized = await __fairQueueTestHooks.finalizeFairQueueContext({
+    fairQueueClient: {
+      async releaseSlot(_ctx, contextToRelease) {
+        releaseFingerprints.push({
+          releaseKind: contextToRelease.releaseKind,
+          hitUpstreamAtMs: contextToRelease.hitUpstreamAtMs,
+        });
+        return true;
+      },
+    },
+    fqContext,
+    phase: 'generic pre-origin final cleanup',
+  });
+
+  assert.equal(finalized, true);
+  assert.deepEqual(releaseFingerprints, [{
+    releaseKind: 'unused_grant',
+    hitUpstreamAtMs: 0,
+  }]);
+  assert.equal(fqContext.releaseKind, null);
+  assert.equal(fqContext.hitUpstreamAtMs, null);
+});
+
 test('grant promotion keeps final cleanup on release-only path', async () => {
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -975,6 +1062,8 @@ test('grant promotion keeps final cleanup on release-only path', async () => {
           slotToken: promotedContext.slotToken,
           grantPromoted: promotedContext.grantPromoted,
           slotAcquiredAt: promotedContext.slotAcquiredAt,
+          releaseKind: promotedContext.releaseKind,
+          hitUpstreamAtMs: promotedContext.hitUpstreamAtMs,
           attemptVersion: promotedContext.attemptVersion,
           attemptTicket: promotedContext.attemptTicket,
         });
@@ -1021,6 +1110,8 @@ test('grant promotion keeps final cleanup on release-only path', async () => {
     slotToken: 'slot-granted',
     grantPromoted: true,
     slotAcquiredAt: fqContext.slotAcquiredAt,
+    releaseKind: 'unused_grant',
+    hitUpstreamAtMs: 0,
     attemptVersion: 7,
     attemptTicket: 11,
   });
@@ -1091,6 +1182,8 @@ test('successful release clears slotToken queryToken and attempt metadata', asyn
     attemptVersion: 3,
     attemptTicket: 9,
     slotAcquiredAt: 987654,
+    releaseKind: 'after_use',
+    hitUpstreamAtMs: 123456,
   };
 
   const finalized = await __fairQueueTestHooks.finalizeFairQueueContext({
@@ -1110,6 +1203,8 @@ test('successful release clears slotToken queryToken and attempt metadata', asyn
   assert.equal(fqContext.attemptVersion, null);
   assert.equal(fqContext.attemptTicket, null);
   assert.equal(fqContext.slotAcquiredAt, null);
+  assert.equal(fqContext.releaseKind, null);
+  assert.equal(fqContext.hitUpstreamAtMs, null);
 });
 
 test('successful pre-grant terminal cleanup clears queryToken and pre-grant queue metadata', async () => {

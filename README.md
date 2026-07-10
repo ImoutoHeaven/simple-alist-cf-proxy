@@ -26,8 +26,10 @@ simple-alist-cf-proxy 是 AList 下载体系里的 Cloudflare Worker 下载代�
 - Both wait requests use `Accept: text/event-stream`, both handlers reply with `Content-Type: text/event-stream`, and each accepted stream emits one `accepted` event plus one final `result` event.
 - FQ final SSE result events repeat the accepted ownership tuple: `queryToken` and `invocationEpoch`.
 - CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP
-- FQ: wait SSE -> accepted -> one final result -> disconnect is terminal, granted slots release after use
+- FQ: wait SSE -> accepted -> one final result -> disconnect is terminal; a promoted grant releases as `unused_grant` before origin dispatch and as `after_use` after origin dispatch
 - FQ 与 CQ wait 都只认已 accepted 的 SSE stream 作为 active waiter；断开即终态。
+- When CQ fast acquire returns `wait`, the successful `unused_grant` release clears the live FQ fingerprint before opening CQ SSE. The later origin dispatch has no live FQ fingerprint, performs no `after_use` transition, and issues no second FQ release. Only an origin dispatch that still retains a live FQ grant marks it `after_use`.
+- Worker and slot-handler deploy together as one clean-break release; mixed versions are unsupported.
 
 ## 快速开始
 
@@ -135,7 +137,7 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - 可选 Fair Queue（slot-handler）获取 slot；Worker 通过 `POST /api/v1/fairqueue/wait` 打开 SSE wait，slot-handler 只透传 backend `THROTTLED` / `HALF_OPEN_FULL` 和 `READY` 对应的 attempt ownership 元数据，不在本地维护 breaker 运行时状态
 - Fair Queue 的公开 wait 配置只由 `fairQueue.wait.maxStreamMs` 与 Worker 请求 `deadlineMs` 控制；公开配置示例不再暴露 `acceptedLeaseMs`。
 - 可选 True Concurrency（`concurrency-handler`）负责真实 in-flight 并发；它与 fairqueue 拆分部署，依赖 `hardExpireAtMs`、hot-path expiry cleanup 与 sweep 回收 lease
-- 当 fairqueue 与 true concurrency 同时启用时，worker 固定按 `POST /api/v1/fairqueue/wait -> accepted/result -> POST /api/v1/concurrency/acquire -> (wait 时释放未使用的 fairqueue slot) -> POST /api/v1/concurrency/wait -> POST /api/v1/concurrency/claim -> POST /api/v1/concurrency/ack_handoff -> heartbeat websocket upgrade + hello_ack -> origin fetch -> true-concurrency release on stream lifecycle` 的顺序执行；若 CQ fast acquire 返回 `wait`，worker 会先 settle 旧 breaker attempt，再释放未使用的 fairqueue slot，然后再进入 CQ SSE wait
+- 当 fairqueue 与 true concurrency 同时启用时，worker 固定按 `POST /api/v1/fairqueue/wait -> accepted/result -> POST /api/v1/concurrency/acquire -> (wait 时以 unused_grant 释放并清空 FQ ownership) -> FQ release success -> POST /api/v1/concurrency/wait -> POST /api/v1/concurrency/claim -> POST /api/v1/concurrency/ack_handoff -> heartbeat websocket upgrade + hello_ack -> origin fetch -> true-concurrency release on stream lifecycle` 的顺序执行；若 CQ fast acquire 返回 `wait`，worker 会先 settle 旧 breaker attempt，再以 `unused_grant` 释放未使用的 fairqueue slot。该释放跳过最小持有时间但仍受 slot-handler 每 host 平滑间隔约束，且只有释放成功并清空 FQ fingerprint 后才进入 CQ SSE wait。后续 origin dispatch 不再持有 live FQ grant，不做 `after_use` transition，也不发起第二次 FQ release；只有仍持有 live FQ grant 的路径才在 origin dispatch 前标记 `after_use`。
 - 当 `download.trueConcurrency.enabled=true` 时，heartbeat 是 origin fetch 之前的必经步骤；worker 若在 `initialConnectMaxAttempts` 或 `initialConnectMaxElapsedMs` 预算内拿不到 `hello_ack`，会直接 fail closed，不会发起 origin fetch，并以 `heartbeat_connect_failed` 立刻尝试释放 active lease
 - `heartbeat_connect_failed` 的首次 release 若失败，worker 会继续沿用既有 release controller，按 `立即一次 + 2s + 4s + 8s` 的节奏重试，并把清理 promise 绑到 `ctx.waitUntil()`
 - heartbeat `hello` / `heartbeat` 帧只携带 requestId、leaseId、leaseToken、generation、nowMs 等 lease 身份字段，不发送 `downloadedBytes`；stream 中途丢 heartbeat、客户端断开、hard expiry、upstream failure 都会先停掉 heartbeat cleanup，再按当前 reason 处理 active lease

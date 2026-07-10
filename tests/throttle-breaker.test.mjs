@@ -2605,6 +2605,7 @@ test('queue_breaker settles old attempt before CQ wait and reauthorizes after CQ
     assert.equal(settleBodies[0].p_attempt_version, 44);
     assert.equal(settleBodies[0].p_attempt_ticket, 6);
     assert.equal(authorizeBodies.length, 1);
+    assert.equal(fairQueueReleaseBodies[0].releaseKind, 'unused_grant');
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
     assert.equal(waitRequest?.waitToken, 'wait-qb-1');
   } finally {
@@ -3107,6 +3108,7 @@ test('queue_breaker releases CQ lease and returns breaker terminal response when
       'breaker-authorize',
       'concurrency-release',
     ]);
+    assert.equal(fairQueueReleaseBodies[0].releaseKind, 'unused_grant');
     assert.equal(fairQueueReleaseBodies[0].hitUpstreamAtMs, 0);
     assert.equal(concurrencyReleaseBodies.length, 1);
     assert.equal(waitRequest?.waitToken, 'wait-qb-deny-1');
@@ -7452,6 +7454,8 @@ test('queue_only retries release of the old managed context in finally after red
       'b.sharepoint.com',
     ]);
     assert.equal(releaseAttemptsByHost.get('a.sharepoint.com'), 4);
+    assert.equal(releaseBodies.every((body) => body.releaseKind === 'after_use'), true);
+    assert.equal(new Set(releaseBodies.filter((body) => body.hostname === 'a.sharepoint.com').map((body) => body.hitUpstreamAtMs)).size, 1);
     assert.equal(releaseAttemptsByHost.get('b.sharepoint.com'), 1);
     assert.deepEqual(releaseBodies.slice(0, 3).map((body) => body.hostname), [
       'a.sharepoint.com',

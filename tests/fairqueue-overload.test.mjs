@@ -2226,7 +2226,8 @@ test('releaseSlot retries timed out releases with dedicated 1500ms timeout', asy
     queryToken: 'query-release-timeout',
     invocationEpoch: 1,
     releaseOwnerRequired: false,
-    nowMs: Date.now(),
+    releaseKind: 'after_use',
+    hitUpstreamAtMs: Date.now(),
   };
 
   let calls = 0;
@@ -2286,7 +2287,7 @@ test('releaseSlot retries timed out releases with dedicated 1500ms timeout', asy
   }
 });
 
-test('releaseSlot retries on retryable status and network errors', async () => {
+test('releaseSlot release fingerprint remains byte-equivalent across retryable status and network errors', async () => {
   const { createSlotHandlerClient } = __fairQueueTestHooks;
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -2305,13 +2306,16 @@ test('releaseSlot retries on retryable status and network errors', async () => {
     queryToken: 'query-release-retryable',
     invocationEpoch: 1,
     releaseOwnerRequired: false,
-    nowMs: Date.now(),
+    releaseKind: 'after_use',
+    hitUpstreamAtMs: Date.now(),
   };
 
   let calls = 0;
+  const releaseBodies = [];
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
+  globalThis.fetch = async (_url, init) => {
     calls += 1;
+    releaseBodies.push(init.body);
     if (calls === 1) {
       return new Response('rate limited', { status: 429 });
     }
@@ -2324,12 +2328,25 @@ test('releaseSlot retries on retryable status and network errors', async () => {
   try {
     await client.releaseSlot({}, fqContext);
     assert.equal(calls, 3);
+    assert.equal(new Set(releaseBodies).size, 1);
+    assert.deepEqual(JSON.parse(releaseBodies[0]), {
+      hostname: 'example.com',
+      hostnameHash: 'host-hash',
+      ipBucket: 'ip-bucket',
+      siteBucket: 'site-bucket',
+      slotToken: 'slot-1',
+      queryToken: 'query-release-retryable',
+      invocationEpoch: 1,
+      releaseOwnerRequired: false,
+      releaseKind: 'after_use',
+      hitUpstreamAtMs: fqContext.hitUpstreamAtMs,
+    });
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test('releaseSlot does not retry on non-retryable 4xx', async () => {
+test('releaseSlot treats HTTP 409 as a non-retryable release fingerprint conflict', async () => {
   const { createSlotHandlerClient } = __fairQueueTestHooks;
   const client = createSlotHandlerClient({
     slotHandlerConfig: {
@@ -2348,19 +2365,22 @@ test('releaseSlot does not retry on non-retryable 4xx', async () => {
     queryToken: 'query-release-4xx',
     invocationEpoch: 1,
     releaseOwnerRequired: false,
-    nowMs: Date.now(),
+    releaseKind: 'unused_grant',
+    hitUpstreamAtMs: 0,
   };
 
   let calls = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => {
     calls += 1;
-    return new Response('bad request', { status: 400 });
+    return new Response('release_identity_payload_mismatch', { status: 409 });
   };
 
   try {
     await client.releaseSlot({}, fqContext);
     assert.equal(calls, 1);
+    assert.equal(fqContext.releaseKind, 'unused_grant');
+    assert.equal(fqContext.hitUpstreamAtMs, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -63,7 +63,8 @@ func TestRepoDocsDescribeSSEWaitProtocol(t *testing.T) {
 		"/api/v1/fairqueue/wait",
 		"text/event-stream",
 		"CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP",
-		"FQ: wait SSE -> accepted -> one final result -> disconnect is terminal, granted slots release after use",
+		"a promoted grant releases as `unused_grant` before origin dispatch",
+		"as `after_use` after origin dispatch",
 		"active waiter",
 		"final SSE result events repeat the accepted ownership tuple",
 	}
@@ -105,6 +106,57 @@ func TestRepoDocsDescribeSSEWaitProtocol(t *testing.T) {
 				t.Fatalf("expected %s to omit legacy wait polling phrase %q", doc.name, token)
 			}
 		}
+	}
+}
+
+func TestRepoDocsDescribeCQWaitFairQueueReleaseBoundary(t *testing.T) {
+	repoRoot := filepath.Join(moduleRootDir(t), "..")
+	docs := []string{
+		filepath.Join(repoRoot, "README.md"),
+		filepath.Join(repoRoot, "download-worker-architecture.md"),
+		filepath.Join(repoRoot, "concurrency-handler", "README.md"),
+	}
+	required := []string{
+		"before opening CQ SSE",
+		"no live FQ fingerprint",
+		"no `after_use` transition",
+		"no second FQ release",
+	}
+
+	for _, path := range docs {
+		text := readTextFile(t, path)
+		for _, token := range required {
+			if !strings.Contains(text, token) {
+				t.Fatalf("expected %s to contain %q", path, token)
+			}
+		}
+	}
+}
+
+func TestRepoDocsDescribeCleanBreakReleaseDeployment(t *testing.T) {
+	repoRoot := filepath.Join(moduleRootDir(t), "..")
+	docs := []string{
+		filepath.Join(repoRoot, "README.md"),
+		filepath.Join(repoRoot, "download-worker-architecture.md"),
+		filepath.Join(repoRoot, "concurrency-handler", "README.md"),
+		filepath.Join(repoRoot, "slot-handler", "README.md"),
+	}
+
+	for _, path := range docs {
+		text := readTextFile(t, path)
+		for _, token := range []string{"clean-break release", "mixed versions are unsupported"} {
+			if !strings.Contains(text, token) {
+				t.Fatalf("expected %s to contain %q", path, token)
+			}
+		}
+	}
+}
+
+func TestSlotHandlerReadmeDocumentsZeroSmoothReleaseInterval(t *testing.T) {
+	path := filepath.Join(moduleRootDir(t), "README.md")
+	text := readTextFile(t, path)
+	if !strings.Contains(text, "`smoothReleaseIntervalMs=0` disables public release spacing") {
+		t.Fatalf("expected README.md to document zero smooth release interval")
 	}
 }
 

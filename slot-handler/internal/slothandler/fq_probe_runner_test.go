@@ -13,8 +13,9 @@ import (
 )
 
 type probeWakeBackend struct {
-	probeCh    chan time.Time
-	releaseErr error
+	probeCh      chan time.Time
+	releaseErr   error
+	releaseCalls atomic.Int32
 }
 
 func (b *probeWakeBackend) AdmitBatch(ctx context.Context, reqs []AcquireRequest) ([]*admitResult, error) {
@@ -35,6 +36,7 @@ func (b *probeWakeBackend) ReleaseSlot(ctx context.Context, req ReleaseRequest) 
 	if b == nil {
 		return nil
 	}
+	b.releaseCalls.Add(1)
 	return b.releaseErr
 }
 
@@ -142,6 +144,9 @@ func TestReleaseSuccessWakesHostProbeRunnerBeforePollInterval(t *testing.T) {
 
 	firstProbeSeen := make(chan struct{})
 	var firstProbeOnce sync.Once
+	wakeDrivenInspectionStarted := make(chan struct{}, 1)
+	wakeDrivenReleaseObserved := make(chan time.Time, 1)
+	var assertReleaseObservation atomic.Bool
 	s.flowStore.listInFlightByHostHook = func(gotHostKey string) {
 		if gotHostKey != hostKey {
 			return
@@ -149,6 +154,19 @@ func TestReleaseSuccessWakesHostProbeRunnerBeforePollInterval(t *testing.T) {
 		firstProbeOnce.Do(func() {
 			close(firstProbeSeen)
 		})
+		if assertReleaseObservation.Load() {
+			select {
+			case wakeDrivenInspectionStarted <- struct{}{}:
+			default:
+			}
+			s.metricSamplesMu.Lock()
+			releasedAt := s.lastReleaseAt[hostKey]
+			s.metricSamplesMu.Unlock()
+			select {
+			case wakeDrivenReleaseObserved <- releasedAt:
+			default:
+			}
+		}
 	}
 
 	s.ensureHostProbeRunner(hostKey)
@@ -167,7 +185,7 @@ func TestReleaseSuccessWakesHostProbeRunnerBeforePollInterval(t *testing.T) {
 	}
 
 	releaseStartedAt := time.Now()
-	releaseReq := ReleaseRequest{
+	releaseReq := withPublicReleaseFingerprintForTest(ReleaseRequest{
 		Hostname:             hostKey,
 		HostnameHash:         hostKey,
 		IPBucket:             "ip-held",
@@ -176,30 +194,41 @@ func TestReleaseSuccessWakesHostProbeRunnerBeforePollInterval(t *testing.T) {
 		QueryToken:           "query-probe-runner-success",
 		InvocationEpoch:      1,
 		ReleaseOwnerRequired: releaseOwnerRequiredPtr(false),
-		HitUpstreamAt:        releaseStartedAt.UnixMilli(),
-		Now:                  releaseStartedAt.UnixMilli(),
-	}
+	}, releaseKindAfterUse, releaseStartedAt.UnixMilli())
 	recordDirectReleaseProof(t, s, releaseReq)
-	err := s.releaseSlot(context.Background(), ReleaseRequest{
-		Hostname:             releaseReq.Hostname,
-		HostnameHash:         releaseReq.HostnameHash,
-		IPBucket:             releaseReq.IPBucket,
-		SiteBucket:           releaseReq.SiteBucket,
-		SlotToken:            releaseReq.SlotToken,
-		QueryToken:           releaseReq.QueryToken,
-		InvocationEpoch:      releaseReq.InvocationEpoch,
-		ReleaseOwnerRequired: releaseReq.ReleaseOwnerRequired,
-		HitUpstreamAt:        releaseReq.HitUpstreamAt,
-		Now:                  releaseReq.Now,
-	})
-	if err != nil {
+	s.metricSamplesMu.Lock()
+	assertReleaseObservation.Store(true)
+	releaseDone := make(chan error, 1)
+	go func() {
+		releaseDone <- s.releaseSlot(context.Background(), releaseReq)
+	}()
+	select {
+	case <-wakeDrivenInspectionStarted:
+		s.metricSamplesMu.Unlock()
+		if err := <-releaseDone; err != nil {
+			t.Fatalf("releaseSlot error after premature probe inspection: %v", err)
+		}
+		t.Fatal("wake-driven probe inspected host before release observation was recorded")
+	case <-time.After(50 * time.Millisecond):
+	}
+	s.metricSamplesMu.Unlock()
+	if err := <-releaseDone; err != nil {
 		t.Fatalf("releaseSlot error: %v", err)
+	}
+
+	select {
+	case releasedAt := <-wakeDrivenReleaseObserved:
+		if releasedAt.IsZero() {
+			t.Fatal("wake-driven probe did not see the just-recorded release observation")
+		}
+	case <-time.After(pollInterval / 3):
+		t.Fatalf("expected successful release to wake an observation-aware probe before full poll interval")
 	}
 
 	select {
 	case <-backend.probeCh:
 	case <-time.After(pollInterval / 3):
-		t.Fatalf("expected successful release to wake host probe runner before full poll interval")
+		t.Fatalf("expected observation-aware wake to drive a backend probe before full poll interval")
 	}
 
 	if got := s.activeSlots.ActiveHost(hostKey, time.Now()); got != 0 {
@@ -208,9 +237,10 @@ func TestReleaseSuccessWakesHostProbeRunnerBeforePollInterval(t *testing.T) {
 }
 
 func TestReleaseFailureDoesNotWakeHostProbeRunnerEarly(t *testing.T) {
+	backendErr := errors.New("release backend failed")
 	backend := &probeWakeBackend{
 		probeCh:    make(chan time.Time, 3),
-		releaseErr: errors.New("release backend failed"),
+		releaseErr: backendErr,
 	}
 	hostCap := 2
 	pollInterval := 200 * time.Millisecond
@@ -241,7 +271,7 @@ func TestReleaseFailureDoesNotWakeHostProbeRunnerEarly(t *testing.T) {
 
 	time.Sleep(20 * time.Millisecond)
 	releaseStartedAt := time.Now()
-	releaseReq := ReleaseRequest{
+	releaseReq := withPublicReleaseFingerprintForTest(ReleaseRequest{
 		Hostname:             hostKey,
 		HostnameHash:         hostKey,
 		IPBucket:             "ip-held",
@@ -250,24 +280,14 @@ func TestReleaseFailureDoesNotWakeHostProbeRunnerEarly(t *testing.T) {
 		QueryToken:           "query-probe-runner-failure",
 		InvocationEpoch:      1,
 		ReleaseOwnerRequired: releaseOwnerRequiredPtr(false),
-		HitUpstreamAt:        releaseStartedAt.UnixMilli(),
-		Now:                  releaseStartedAt.UnixMilli(),
-	}
+	}, releaseKindAfterUse, releaseStartedAt.UnixMilli())
 	recordDirectReleaseProof(t, s, releaseReq)
-	err := s.releaseSlot(context.Background(), ReleaseRequest{
-		Hostname:             releaseReq.Hostname,
-		HostnameHash:         releaseReq.HostnameHash,
-		IPBucket:             releaseReq.IPBucket,
-		SiteBucket:           releaseReq.SiteBucket,
-		SlotToken:            releaseReq.SlotToken,
-		QueryToken:           releaseReq.QueryToken,
-		InvocationEpoch:      releaseReq.InvocationEpoch,
-		ReleaseOwnerRequired: releaseReq.ReleaseOwnerRequired,
-		HitUpstreamAt:        releaseReq.HitUpstreamAt,
-		Now:                  releaseReq.Now,
-	})
-	if err == nil {
-		t.Fatalf("expected releaseSlot error")
+	err := s.releaseSlot(context.Background(), releaseReq)
+	if !errors.Is(err, backendErr) {
+		t.Fatalf("expected configured backend error, got %v", err)
+	}
+	if calls := backend.releaseCalls.Load(); calls != 1 {
+		t.Fatalf("expected failed release to reach backend once, got %d calls", calls)
 	}
 
 	select {
@@ -308,7 +328,7 @@ func TestReleaseNilActiveSlotsDoesNotWakeHostProbeRunnerEarly(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	releaseStartedAt := time.Now()
 	slotToken := validReleaseSlotToken()
-	releaseReq := ReleaseRequest{
+	releaseReq := withPublicReleaseFingerprintForTest(ReleaseRequest{
 		Hostname:             hostKey,
 		HostnameHash:         hostKey,
 		IPBucket:             "ip-held",
@@ -317,22 +337,9 @@ func TestReleaseNilActiveSlotsDoesNotWakeHostProbeRunnerEarly(t *testing.T) {
 		QueryToken:           "query-probe-runner-nil-active",
 		InvocationEpoch:      1,
 		ReleaseOwnerRequired: releaseOwnerRequiredPtr(false),
-		HitUpstreamAt:        releaseStartedAt.UnixMilli(),
-		Now:                  releaseStartedAt.UnixMilli(),
-	}
+	}, releaseKindAfterUse, releaseStartedAt.UnixMilli())
 	recordDirectReleaseProof(t, s, releaseReq)
-	err := s.releaseSlot(context.Background(), ReleaseRequest{
-		Hostname:             releaseReq.Hostname,
-		HostnameHash:         releaseReq.HostnameHash,
-		IPBucket:             releaseReq.IPBucket,
-		SiteBucket:           releaseReq.SiteBucket,
-		SlotToken:            releaseReq.SlotToken,
-		QueryToken:           releaseReq.QueryToken,
-		InvocationEpoch:      releaseReq.InvocationEpoch,
-		ReleaseOwnerRequired: releaseReq.ReleaseOwnerRequired,
-		HitUpstreamAt:        releaseReq.HitUpstreamAt,
-		Now:                  releaseReq.Now,
-	})
+	err := s.releaseSlot(context.Background(), releaseReq)
 	if err != nil {
 		t.Fatalf("releaseSlot error: %v", err)
 	}

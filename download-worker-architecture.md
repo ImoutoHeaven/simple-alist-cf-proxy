@@ -78,8 +78,10 @@ Worker 只保留 infra 级运行配置（环境变量；若启用 `d1` 缓存还
 - Both wait requests use `Accept: text/event-stream`, both handlers reply with `Content-Type: text/event-stream`, and each accepted stream emits one `accepted` event plus one final `result` event.
 - FQ final SSE result events repeat the accepted ownership tuple: `queryToken` and `invocationEpoch`.
 - CQ: acquire fast HTTP -> wait SSE -> claim HTTP -> ack_handoff HTTP -> heartbeat WebSocket -> origin fetch -> release HTTP
-- FQ: wait SSE -> accepted -> one final result -> disconnect is terminal, granted slots release after use
+- FQ: wait SSE -> accepted -> one final result -> disconnect is terminal; a promoted grant releases as `unused_grant` before origin dispatch and as `after_use` after origin dispatch
 - FQ 与 CQ wait 都只认已 accepted 的 SSE stream 作为 active waiter；断开即终态。
+- When CQ fast acquire returns `wait`, the successful `unused_grant` release clears the live FQ fingerprint before opening CQ SSE. The later origin dispatch has no live FQ fingerprint, performs no `after_use` transition, and issues no second FQ release. Only an origin dispatch that still retains a live FQ grant marks it `after_use`.
+- Worker and slot-handler deploy together as one clean-break release; mixed versions are unsupported.
 
 ## 5. 请求处理流程
 
@@ -153,10 +155,16 @@ admission 固定为四种显式运行模式：
     - wait 请求发送 `Accept: text/event-stream`；slot-handler 在接受请求后发送一个 `accepted` 事件，其中包含 `queryToken`、`invocationEpoch` 与 `deadlineMs`，随后只会再发送一个最终 `result` 事件并关闭流；最终 `result` 会重复 `accepted` 里的 `queryToken` 与 `invocationEpoch`。
     - FQ 最终结果固定为 `granted` / `throttled` / `overloaded` / `timeout` / `conflict`。accepted 之前的鉴权失败、JSON 失败、缺字段或 pre-attachment overload 走非 SSE JSON HTTP 响应；accepted 之后的结果全部通过 SSE 发送。
     - `queue_only` 与 `queue_breaker` 都走 slot-handler admission；区别只在 `queue_breaker` 会额外携带 `breakerEnabled` 与完整 canonical breaker tuple（`openCapSeconds`、`closeThresholdPercent`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`），让 backend 原子决定 queue slot 与 breaker attempt。
-    - worker 在收到 `accepted` 后保存 `queryToken + invocationEpoch` 作为 pre-grant cleanup ownership，并要求最终 `result` 事件重复这组 ownership；收到 `granted` 后再保存 `slotToken` 与 `releaseOwnerRequired=true` 用于 after-use `release`。
+    - worker 在收到 `accepted` 后保存 `queryToken + invocationEpoch` 作为 pre-grant cleanup ownership，并要求最终 `result` 事件重复这组 ownership；收到 `granted` 后保存 `slotToken`、`releaseOwnerRequired=true`、`releaseKind=unused_grant` 与 `hitUpstreamAtMs=0`。
     - scoped overload 与 global overload 退避会在内存中做短期抑制，但这只属于 fair-queue 退避，不参与 breaker 状态机。`overload_global` 仍由 worker fail-fast 为 `503`；scope overload 仍受总 wait budget 约束。
-    - release 契约保持 backend-authoritative 与幂等；`slotToken` 语法合法但未知/已释放时仍返回 `200`。带 owner tuple 的 release 仍要求命中 claim owner，否则 fail-closed `503`，避免 split-brain cleanup 漏掉已授予 slot。
-    - accepted SSE 连接一旦断开，该 wait 就是终态；若 grant 已提交但未可靠交付，slot-handler 会在服务端补偿 release。worker 只有在拿到 `granted` 后才会调用 `/api/v1/fairqueue/release`。
+    - 公开 release 固定调用 `POST /api/v1/fairqueue/release`，请求包含完整 ownership tuple、`releaseKind` 与 `hitUpstreamAtMs`。`after_use` 要求正整数 dispatch 时间，`unused_grant` 要求整数 `0`；公开请求不接受 `compensating`、`now` 或 `minSlotHoldMs`。
+    - grant promotion 后、origin fetch dispatch 前的 cleanup 使用 `unused_grant`。它没有最小持有时间，但与 `after_use` 共用 slot-handler 的 per-host `smoothReleaseIntervalMs` 序列。
+    - 每次使用当前 FQ grant 发起 origin fetch 前，worker 先执行同一个 dispatch boundary：首次执行记录 `Date.now()` 并将 `releaseKind` 切换为 `after_use`；后续 probe、primary fetch、redirect、refresh 或 retry dispatch 保留首次记录的 fingerprint。Google Drive HEAD/range probe 同样属于 origin dispatch。
+    - release payload 在 retry loop 前构造。失败后的 inline retry 与 final cleanup 使用完全相同的 ownership identity、`releaseKind` 与 `hitUpstreamAtMs`，不重新生成或改写 fingerprint；成功 release 或放弃 ownership 时，这些字段与 slot/query/invocation/routing/attempt metadata 一起清空。
+    - slot-handler 以 ownership identity 作为幂等 key，并冻结首个已接受请求的 fingerprint。同 identity、同 fingerprint 会加入进行中的操作或重放保留窗口内的结果；同 identity、不同 fingerprint 返回 `409 release_identity_payload_mismatch`，不发起第二次 backend release。
+    - `after_use` 同时满足从 dispatch 时间计算的 `minSlotHoldMs` 与 per-host smooth spacing；`unused_grant` 只满足同一 smooth spacing。`compensating` 是 slot-handler 内部正确性恢复路径，跳过两种约束且不能由 worker 选择。
+    - 带 owner tuple 的 release 要求当前 claimed-flow、expired-claim 或 captured direct-handoff proof；owner route miss fail-closed `503`。release kind 不改变 ownership proof、backend retry 或 post-backend consistency 规则。
+    - accepted SSE 连接一旦断开，该 wait 就是终态；若 grant 已提交但未可靠交付，slot-handler 走内部 `compensating` release。worker 只有在拿到 `granted` 后才会调用公开 `/api/v1/fairqueue/release`。
     - 多实例 slot-handler 仍需要 sticky routing：已接受的 `queryToken` 流需要稳定落到同一实例，否则内存中的 attached waiter 无法稳定接收最终结果。
 
 12. **True Concurrency（concurrency-handler）**
@@ -164,7 +172,7 @@ admission 固定为四种显式运行模式：
     - worker 发给 `concurrency-handler` 的 fast `acquire` payload 固定携带 actual `hostname`、`hostnameHash`、`siteBucket`、`ipBucket`、`requestId` 与 `hardExpireAtMs`；当 fast acquire 返回 `wait` 时，再打开 `POST /api/v1/concurrency/wait` SSE，并携带 wait tuple、`waitToken`、`deadlineMs`、`ticketHash` 与 `clientInstanceId`。
     - `POST /api/v1/concurrency/wait` 同样使用 `Accept: text/event-stream`，先发送一个 `accepted` 事件，再发送一个最终 `result` 事件；最终结果固定为 `granted` / `conflict` / `released` / `cancelled` / `expired`。
     - `concurrency-handler` 返回 `granted` 时，worker 会用 `requestId + claimToken` 调用 `POST /api/v1/concurrency/claim` 绑定 active lease，再调用 `POST /api/v1/concurrency/ack_handoff`，随后建立 heartbeat WebSocket 并等待 `hello_ack`，最后才发起 origin fetch。
-    - 当 fairqueue 与 true-concurrency 同时启用时，执行顺序固定为 `POST /api/v1/fairqueue/wait -> accepted/result -> POST /api/v1/concurrency/acquire -> (wait 时 settle breaker 并释放未使用的 fairqueue slot) -> POST /api/v1/concurrency/wait -> claim -> ack_handoff -> heartbeat -> origin fetch -> release`。
+    - 当 fairqueue 与 true-concurrency 同时启用时，执行顺序固定为 `POST /api/v1/fairqueue/wait -> accepted/result -> POST /api/v1/concurrency/acquire -> (wait 时 settle breaker 并以 smooth-paced unused_grant 释放及清空 FQ ownership) -> FQ release success -> POST /api/v1/concurrency/wait -> claim -> ack_handoff -> heartbeat -> origin fetch -> CQ release`。CQ wait 路径后续不再持有 live FQ fingerprint，因此不做 `after_use` transition，也不发起第二次 FQ release；只有仍持有 live FQ grant 的路径才在 origin dispatch 前标记 `after_use`。
     - `concurrency-handler` 在生产环境必须对已接受的 `/api/v1/concurrency/wait` 流保持 sticky routing；否则 attached waiter 的最终投递会失败。
     - `concurrency-handler` HTTP auth 是必需项；worker 使用 `handlerAuthHeader` 发送 `handlerAuthKey`，`acquireTimeoutMs` 定义 fast `/acquire` 与 `/claim` 超时，`releaseTimeoutMs` 定义 `/release` 超时。accepted CQ wait 断开后的 waiting cleanup 由服务端负责，未进入 accepted SSE 的 orphan 则留给 expiry / sweep。
 
