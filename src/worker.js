@@ -9,6 +9,7 @@ import { buildBindingStr, decryptBindingPayload, getClientIp, normalizePath, par
 import { handleInternalApiIfAny } from './internal-api.js';
 import { fetchControllerState } from './controller-adapter.js';
 import { logEvent, sanitizeLogValue, sanitizeLogStructuredValue, bindWaitUntil } from './logging.js';
+import { createJsonErrorResponse } from './http/json-error.js';
 
 // Configuration constants
 const REQUIRED_ENV = [];
@@ -84,10 +85,27 @@ const HOP_BY_HOP_RESPONSE_HEADERS = new Set([
 const SITE_BUCKET_MODES = new Set(['host', 'sharepoint', 'googledrive']);
 
 const nowMs = () => Date.now();
+const generatedErrorResponses = new WeakMap();
+
+const normalizeRetryAfter = (value) => {
+  const candidate = typeof value === 'number' && Number.isFinite(value)
+    ? String(Math.ceil(value))
+    : typeof value === 'string'
+      ? value.trim()
+      : '';
+  return /^[1-9][0-9]*$/.test(candidate) ? candidate : undefined;
+};
+
+const rememberGeneratedError = (response, details) => {
+  generatedErrorResponses.set(response, details);
+  return response;
+};
 
 function logTerminalResponse(response, reason, fields = {}) {
   try {
-    const status = Number.isFinite(response?.status) ? response.status : 'unknown';
+    const status = Number.isFinite(fields?.observedStatus)
+      ? fields.observedStatus
+      : Number.isFinite(response?.status) ? response.status : 'unknown';
     if (status !== 200 && status !== 206) {
       logEvent('info', 'Terminal', 'response', {
         status,
@@ -1626,7 +1644,6 @@ const extractExpireFromSign = (signature) => {
 
 function createErrorResponse(origin, status, message, extraHeaders) {
   const safeHeaders = new Headers();
-  safeHeaders.set("content-type", "application/json;charset=UTF-8");
   safeHeaders.set("Access-Control-Allow-Origin", origin);
   safeHeaders.append("Vary", "Origin");
   if (extraHeaders && typeof extraHeaders === 'object') {
@@ -1638,16 +1655,27 @@ function createErrorResponse(origin, status, message, extraHeaders) {
     }
   }
 
-  return new Response(
-    JSON.stringify({
-      code: status,
-      message
-    }),
-    {
-      status,
-      headers: safeHeaders
-    }
-  );
+  return rememberGeneratedError(createJsonErrorResponse({
+    status,
+    message,
+    reason: 'unclassified',
+    headers: safeHeaders,
+    retryAfter: normalizeRetryAfter(safeHeaders.get('Retry-After')),
+  }), { message });
+}
+
+function createTicketStateConfigurationFailureResponse(origin, error) {
+  const diagnostic = error instanceof Error ? error.message : String(error);
+  logEvent('error', 'TicketState', 'config_invalid', { message: diagnostic });
+  return rememberGeneratedError(createJsonErrorResponse({
+    status: 500,
+    message: 'Ticket state configuration is invalid',
+    reason: 'ticket_state_invalid',
+    headers: { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' },
+  }), {
+    message: 'Ticket state configuration is invalid',
+    reason: 'ticket_state_invalid',
+  });
 }
 
 function createUnauthorizedResponse(origin, message) {
@@ -1687,40 +1715,22 @@ const formatRateLimitWindow = (windowLabel, windowSeconds) => {
 
 function createRateLimitResponse(origin, ipSubnet, limit, windowLabel, retryAfterSeconds) {
   const safeHeaders = new Headers();
-  safeHeaders.set("content-type", "application/json;charset=UTF-8");
   safeHeaders.set("Access-Control-Allow-Origin", origin);
   safeHeaders.append("Vary", "Origin");
 
-  const sanitizedRetryAfter = retryAfterSeconds && retryAfterSeconds > 0
-    ? Math.max(1, Math.ceil(retryAfterSeconds))
-    : 0;
-  if (sanitizedRetryAfter) {
-    safeHeaders.set("Retry-After", String(sanitizedRetryAfter));
-  }
-
-  const payload = {
-    code: 429,
-    message: `${ipSubnet || 'current client'} exceeds the limit of ${limit} requests in ${windowLabel}`
-  };
-  if (sanitizedRetryAfter) {
-    payload['retry-after'] = sanitizedRetryAfter;
-  }
-
-  return new Response(JSON.stringify(payload), {
+  const retryAfter = normalizeRetryAfter(retryAfterSeconds);
+  return rememberGeneratedError(createJsonErrorResponse({
     status: 429,
+    message: 'Too many requests, please retry later',
+    reason: 'unclassified',
     headers: safeHeaders
-  });
+    , retryAfter,
+  }), { message: 'Too many requests, please retry later' });
 }
 
 function createThrottleProtectedResponse(origin, throttleStatus) {
-  const retryAfter =
-    throttleStatus && Number.isFinite(throttleStatus.retryAfter) && throttleStatus.retryAfter > 0
-      ? Math.max(1, Math.ceil(throttleStatus.retryAfter))
-      : 0;
-  const statusCode =
-    throttleStatus && Number.isFinite(throttleStatus.errorCode) && throttleStatus.errorCode >= 100
-      ? throttleStatus.errorCode
-      : 503;
+  const retryAfter = normalizeRetryAfter(throttleStatus?.retryAfter);
+  const statusCode = 503;
   const message =
     (throttleStatus && throttleStatus.message) ||
     (retryAfter
@@ -1728,26 +1738,20 @@ function createThrottleProtectedResponse(origin, throttleStatus) {
       : 'Service temporarily unavailable (throttle protected)');
 
   const safeHeaders = new Headers();
-  safeHeaders.set("content-type", "application/json;charset=UTF-8");
   safeHeaders.set("Access-Control-Allow-Origin", origin);
   safeHeaders.append("Vary", "Origin");
   safeHeaders.set("X-Throttle-Protected", "true");
   if (retryAfter) {
-    const retryAfterValue = String(retryAfter);
-    safeHeaders.set("Retry-After", retryAfterValue);
-    safeHeaders.set("X-Throttle-Retry-After", retryAfterValue);
+    safeHeaders.set("X-Throttle-Retry-After", retryAfter);
   }
 
-  return new Response(
-    JSON.stringify({
-      code: statusCode,
-      message
-    }),
-    {
-      status: statusCode,
-      headers: safeHeaders
-    }
-  );
+  return rememberGeneratedError(createJsonErrorResponse({
+    status: statusCode,
+    message,
+    reason: 'breaker_open',
+    headers: safeHeaders,
+    retryAfter,
+  }), { message, reason: 'breaker_open' });
 }
 
 function createBreakerAuthorityUnavailableResponse(origin, phase) {
@@ -1780,24 +1784,17 @@ const applyUnifiedResult = (unifiedResult, options = {}) => {
 };
 
 function createFairQueueOverloadedResponse(origin, retryAfterSeconds, reason = 'overload_global') {
-  const retryAfter = normalizePositiveSeconds(retryAfterSeconds, 60);
+  const retryAfter = normalizeRetryAfter(normalizePositiveSeconds(retryAfterSeconds, 60));
   const safeHeaders = new Headers();
-  safeHeaders.set("content-type", "application/json;charset=UTF-8");
   safeHeaders.set("Access-Control-Allow-Origin", origin);
   safeHeaders.append("Vary", "Origin");
-  safeHeaders.set("Retry-After", String(retryAfter));
-
-  return new Response(
-    JSON.stringify({
-      result: 'overloaded',
-      reason,
-      retryAfter,
-    }),
-    {
-      status: 503,
-      headers: safeHeaders
-    }
-  );
+  return rememberGeneratedError(createJsonErrorResponse({
+    status: 503,
+    message: 'Upstream queue is overloaded, please retry later',
+    reason,
+    headers: safeHeaders,
+    retryAfter,
+  }), { message: 'Upstream queue is overloaded, please retry later', reason });
 }
 
 const normalizePostgrestBaseUrl = (url) => {
@@ -4456,11 +4453,32 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     });
   }
 
-  const terminal = (response, reason, fields = {}) => logTerminalResponse(response, reason, {
-    phase: 'download',
-    pathClass: 'download',
-    ...fields,
-  });
+  const terminal = (response, reason, fields = {}) => {
+    const generated = generatedErrorResponses.get(response);
+    const effectiveReason = generated?.finalized ? generated.reason : reason;
+    const terminalResponse = generated
+      ? createJsonErrorResponse({
+        status: response.status,
+        message: generated.message,
+        reason: effectiveReason,
+        headers: response.headers,
+        upstreamStatus: generated.upstreamStatus,
+        retryAfter: generated.retryAfter ?? normalizeRetryAfter(response.headers.get('Retry-After')),
+      })
+      : response;
+    if (generated) {
+      rememberGeneratedError(terminalResponse, {
+        ...generated,
+        reason: effectiveReason,
+        finalized: true,
+      });
+    }
+    return logTerminalResponse(terminalResponse, effectiveReason, {
+      phase: 'download',
+      pathClass: 'download',
+      ...fields,
+    });
+  };
   const upstreamTerminalReason = (status) => {
     if (Number.isInteger(status) && status >= 300 && status < 400) {
       return 'upstream_returned_3xx';
@@ -4512,13 +4530,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
       if (!cfResult.allowed) {
         logEvent('error', 'RateLimit', 'cf_blocked');
-        return terminal(new Response('429 Too Many Requests - Rate limit exceeded', {
+        return terminal(rememberGeneratedError(createJsonErrorResponse({
           status: 429,
-          headers: {
-            'Content-Type': 'text/plain',
-            'Retry-After': '60',
-          },
-        }), 'cf_rate_limited');
+          message: 'Too many requests, please retry later',
+          reason: 'cf_rate_limited',
+          headers: { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' },
+          retryAfter: '60',
+        }), { message: 'Too many requests, please retry later', reason: 'cf_rate_limited', retryAfter: '60' }), 'cf_rate_limited');
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4558,7 +4576,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const payloadVerifyResult = await verifySignature(config.token, payload, payloadSign);
   if (payloadVerifyResult !== "") {
-    return terminal(createUnauthorizedResponse(origin, payloadVerifyResult), 'payload_sign_invalid');
+    return terminal(createUnauthorizedResponse(origin, 'payload signature is invalid'), 'payload_sign_invalid');
   }
 
   const payloadSignExpire = extractExpireFromSign(payloadSign);
@@ -4658,7 +4676,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       token: config.token,
     });
     if (!bindingResult.ok) {
-      return terminal(createUnauthorizedResponse(origin, bindingResult.reason || "binding unavailable"), 'binding_unavailable');
+      return terminal(createUnauthorizedResponse(origin, 'binding is unavailable'), 'binding_unavailable');
     }
     if (bindingResult.bindingStr !== bindingStr) {
       return terminal(createUnauthorizedResponse(origin, "origin mismatch"), 'origin_mismatch');
@@ -4671,9 +4689,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     try {
       ticketStateConfig = resolveTicketStateConfig(config);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logEvent('error', 'TicketState', 'config_invalid', { message });
-      return terminal(createErrorResponse(origin, 500, message), 'ticket_state_invalid');
+      return terminal(createTicketStateConfigurationFailureResponse(origin, error), 'ticket_state_invalid');
     }
 
     try {
@@ -4681,7 +4697,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logEvent('error', 'TicketState', 'read_failed', { message });
-      return terminal(createErrorResponse(origin, 500, `Ticket state read failed: ${message}`), 'ticket_state_invalid');
+      return terminal(createErrorResponse(origin, 500, 'Ticket state read failed'), 'ticket_state_invalid');
     }
 
     if (!ticketState?.found) {
@@ -4777,7 +4793,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         return { result: null };
       }
       logEvent('error', 'UnifiedCheck', 'fail_closed');
-      return { errorResponse: terminal(createErrorResponse(origin, 500, `Unified check failed: ${errorMessage}`), 'unified_check_fail_closed') };
+      return { errorResponse: terminal(createErrorResponse(origin, 500, 'Unified check failed'), 'unified_check_fail_closed') };
     }
   };
 
@@ -4800,7 +4816,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (!unifiedResult.rateLimit.allowed) {
       if (unifiedResult.rateLimit.error) {
         logEvent('error', 'RateLimit', 'fail_closed_error', { message: unifiedResult.rateLimit.error });
-        return terminal(createErrorResponse(origin, 500, unifiedResult.rateLimit.error), 'unified_rate_limit_failed');
+        return terminal(createErrorResponse(origin, 500, 'Rate limit check failed'), 'unified_rate_limit_failed');
       }
 
       const ipSubnetForBlock = unifiedResult.rateLimit.ipSubnet || ipSubnet || clientIP;
@@ -4912,7 +4928,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         if (!rateLimitResult.allowed) {
           if (rateLimitResult.error) {
             logEvent('error', 'RateLimit', 'fail_closed_error', { message: rateLimitResult.error });
-            return terminal(createErrorResponse(origin, 500, rateLimitResult.error), 'rate_limit_failed');
+            return terminal(createErrorResponse(origin, 500, 'Rate limit check failed'), 'rate_limit_failed');
           }
           const ipSubnetForBlock = rateLimitResult.ipSubnet || ipSubnet || clientIP;
           const retryAfter = normalizePositiveSeconds(
@@ -4975,46 +4991,56 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       requestUrl.searchParams.set("type", linkType);
     }
     const payload = forceRefresh ? { path, refresh: true } : { path };
-    const resp = await fetch(requestUrl.toString(), {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    });
-
-    const contentType = resp.headers.get("content-type") || "";
-    if (!contentType.includes("application/json")) {
-      const originalStatus = resp.status;
-      const safeErrorMessage = JSON.stringify({
-        code: originalStatus,
-        message: `Request failed with status: ${originalStatus}`,
+    const createAlistUnavailableResponse = () => createErrorResponse(
+      origin,
+      503,
+      'Link service is temporarily unavailable, please retry later',
+    );
+    let resp;
+    let apiResult;
+    try {
+      resp = await fetch(requestUrl.toString(), {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
       });
-      const safeHeaders = new Headers();
-      safeHeaders.set("content-type", "application/json;charset=UTF-8");
-      safeHeaders.set("Access-Control-Allow-Origin", origin);
-      safeHeaders.append("Vary", "Origin");
-
-      return {
-        errorResponse: new Response(safeErrorMessage, {
-          status: originalStatus,
-          statusText: "Error",
-          headers: safeHeaders,
-        }),
-      };
+      const contentType = resp.headers.get("content-type") || "";
+      if (!contentType.toLowerCase().includes("application/json")) {
+        await cancelResponseBody(resp);
+        return { errorResponse: createAlistUnavailableResponse() };
+      }
+      try {
+        apiResult = await resp.json();
+      } catch {
+        return { errorResponse: createAlistUnavailableResponse() };
+      }
+    } catch (error) {
+      logEvent('warn', 'AList', 'link_api_failed', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return { errorResponse: createAlistUnavailableResponse() };
     }
 
-    const apiResult = await resp.json();
-    if (apiResult.code !== 200) {
-      const httpStatus = apiResult.code >= 100 && apiResult.code < 600 ? apiResult.code : 500;
-      const safeHeaders = new Headers();
-      safeHeaders.set("content-type", "application/json;charset=UTF-8");
-      safeHeaders.set("Access-Control-Allow-Origin", origin);
-      safeHeaders.append("Vary", "Origin");
-      return {
-        errorResponse: new Response(JSON.stringify(apiResult), {
-          status: httpStatus,
-          headers: safeHeaders,
-        }),
-      };
+    if (
+      !apiResult
+      || typeof apiResult !== 'object'
+      || !Number.isFinite(apiResult.code)
+      || apiResult.code !== 200
+      || !apiResult.data
+      || typeof apiResult.data !== 'object'
+      || Array.isArray(apiResult.data)
+      || typeof apiResult.data.url !== 'string'
+      || !apiResult.data.url.trim()
+    ) {
+      return { errorResponse: createAlistUnavailableResponse() };
+    }
+    try {
+      const parsedUrl = new URL(apiResult.data.url);
+      if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+        return { errorResponse: createAlistUnavailableResponse() };
+      }
+    } catch {
+      return { errorResponse: createAlistUnavailableResponse() };
     }
 
     if (cacheManager && apiResult.data) {
@@ -5056,7 +5082,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   if (!res) {
     const { res: apiResult, errorResponse } = await fetchLinkDataFromApi();
     if (errorResponse) {
-      return terminal(errorResponse, 'alist_api_error');
+      return terminal(errorResponse, 'alist_api_unavailable');
     }
     res = apiResult;
   }
@@ -5829,8 +5855,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (result === 'expired' && reason === 'hard_expired') {
       return terminal(createUnauthorizedResponse(origin, 'link expired'), 'ticket_state_expired');
     }
-    const suffix = reason ? ` (${reason})` : '';
-    return terminal(createTrueConcurrencyUnavailableResponse(origin, `True concurrency ${result}${suffix}`), 'cq_terminal', {
+    return terminal(createTrueConcurrencyUnavailableResponse(origin, 'True concurrency unavailable'), 'cq_terminal', {
       result,
       resultReason: reason,
     });
@@ -5992,21 +6017,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
   const createFairQueueTimeoutResponse = () => {
     const safeHeaders = new Headers();
-    safeHeaders.set("content-type", "application/json;charset=UTF-8");
     safeHeaders.set("Access-Control-Allow-Origin", origin);
     safeHeaders.append("Vary", "Origin");
-    safeHeaders.set("Retry-After", "60");
-
-    return new Response(
-      JSON.stringify({
-        code: 503,
-        message: 'Upstream queue timeout, please retry later'
-      }),
-      {
-        status: 503,
-        headers: safeHeaders
-      }
-    );
+    return rememberGeneratedError(createJsonErrorResponse({
+      status: 503,
+      message: 'Upstream queue timeout, please retry later',
+      reason: 'fq_timeout',
+      headers: safeHeaders,
+      retryAfter: '60',
+    }), { message: 'Upstream queue timeout, please retry later', reason: 'fq_timeout', retryAfter: '60' });
   };
 
   const handleFairQueueWaitResult = async (fqResult) => {
@@ -6559,20 +6578,22 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
 
         let ackHandoffResult;
         try {
+          const claimRequestId = cqPlan.requestId;
           ackHandoffResult = await concurrencyClient.ackHandoff(ctx, {
-            requestId: cqPlan.requestId,
+            requestId: claimRequestId,
             handoffToken: acquireResult.handoffToken,
             nowMs: Date.now(),
           }, clientSignal);
         } catch (error) {
           const claimHostname = cqPlan?.hostname;
+          const claimRequestId = cqPlan?.requestId;
           await ensureCurrentTrueConcurrencyReleased('grant_delivery_failed', true);
           const settleResponse = await settleBreakerAttemptIfNeeded(claimHostname);
           const message = error instanceof Error ? error.message : String(error);
           logEvent('error', 'CQ', 'ack_handoff_failed', {
             phase,
             host: claimHostname,
-            requestId: cqPlan.requestId,
+            requestId: claimRequestId,
             message,
           });
           if (settleResponse instanceof Response) {
@@ -6626,6 +6647,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           await cqHeartbeatManager.startBeforeOriginFetch();
         } catch (error) {
           const claimHostname = cqPlan?.hostname;
+          const claimRequestId = cqPlan?.requestId;
           if (isTrueConcurrencyHeartbeatTerminalError(error)) {
             const terminalReason = error.terminal?.reason || '';
             if (terminalReason === 'token_mismatch' || terminalReason === 'protocol_error') {
@@ -6644,7 +6666,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           logEvent('error', 'CQ', 'heartbeat_start_failed', {
             phase,
             host: claimHostname,
-            requestId: cqPlan.requestId,
+            requestId: claimRequestId,
             message,
           });
           if (settleResponse instanceof Response) {
@@ -6655,6 +6677,12 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           }
           if (needFairQueue) {
             await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq heartbeat failure`);
+          }
+          if (isTrueConcurrencyHeartbeatTerminalError(error)) {
+            return createTrueConcurrencyTerminalResponse(
+              error.terminal?.result,
+              error.terminal?.reason,
+            );
           }
           return terminal(createTrueConcurrencyUnavailableResponse(origin), 'cq_heartbeat_failed');
         }
@@ -7143,11 +7171,44 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
   };
 
   const buildGeneratedUpstreamTerminalResponse = (upstreamResponse, reasonOverride = null) => {
-    const status = upstreamResponse?.status;
-    const message = status >= 500
-      ? 'upstream download failed'
-      : 'upstream download rejected';
-    return terminal(createErrorResponse(origin, status, message), reasonOverride || upstreamTerminalReason(status), {
+    const upstreamStatus = upstreamResponse?.status;
+    let status = upstreamStatus;
+    let reason = reasonOverride;
+    let message = 'The download service rejected the request';
+    if (reasonOverride === 'upstream_auth_retry_exhausted') {
+      status = 503;
+      message = 'The download authorization could not be refreshed, please retry later';
+    } else if (upstreamStatus === 403) {
+      reason = 'upstream_forbidden';
+      message = 'The download service denied access';
+    } else if (upstreamStatus === 429) {
+      status = 503;
+      reason = 'upstream_rate_limited';
+      message = 'The download service is rate limited, please retry later';
+    } else if (upstreamStatus >= 500 && upstreamStatus <= 599) {
+      status = 503;
+      reason = 'upstream_unavailable';
+      message = 'The download service is temporarily unavailable, please retry later';
+    } else {
+      reason = 'upstream_rejected';
+    }
+    const headers = new Headers();
+    headers.set('Access-Control-Allow-Origin', origin);
+    headers.append('Vary', 'Origin');
+    return terminal(rememberGeneratedError(createJsonErrorResponse({
+      status,
+      message,
+      reason,
+      headers,
+      upstreamStatus,
+      retryAfter: normalizeRetryAfter(upstreamResponse?.headers?.get('Retry-After')),
+    }), {
+      message,
+      reason,
+      upstreamStatus,
+      retryAfter: normalizeRetryAfter(upstreamResponse?.headers?.get('Retry-After')),
+    }), reason, {
+      observedStatus: upstreamStatus,
       host: extractHostname(upstreamResponse?.url || '')?.toLowerCase() || undefined,
     });
   };
@@ -7258,7 +7319,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       }
     }
 
-    return terminal(createErrorResponse(origin, 502, 'ticket state update failed'), 'ticket_state_invalid');
+      return terminal(createErrorResponse(origin, 502, 'ticket state update failed'), 'ticket_state_invalid');
   };
 
   let retriedWithFreshLink = false;
@@ -7352,6 +7413,15 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       });
       if (errorResponse) {
         logEvent('warn', 'Upstream', 'auth_retry_fallback', { reason: 'api_error' });
+        const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+        if (deferredReportResponse) {
+          return await cancelResponseBodyAndReturn(response, deferredReportResponse, 'upstream_terminal');
+        }
+        return await cancelResponseBodyAndReturn(
+          response,
+          terminal(errorResponse, 'alist_api_unavailable'),
+          'upstream_terminal',
+        );
       } else if (refreshedLink && refreshedLink.data && refreshedLink.data.url) {
         downloadUrl = refreshedLink.data.url;
         res = refreshedLink;
@@ -7635,22 +7705,13 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
   if (config.ipv4Only) {
     const clientIP = getClientIp(request) || "";
     if (isIPv6(clientIP)) {
-      const safeHeaders = new Headers();
-      safeHeaders.set("content-type", "application/json;charset=UTF-8");
-      safeHeaders.set("Access-Control-Allow-Origin", origin);
-      safeHeaders.append("Vary", "Origin");
-
       return logTerminalResponse(
-        new Response(
-          JSON.stringify({
-            code: 403,
-            message: "ipv6 access is prohibited"
-          }),
-          {
-            status: 403,
-            headers: safeHeaders
-          }
-        ),
+        createJsonErrorResponse({
+          status: 403,
+          message: 'IPv6 access is prohibited',
+          reason: 'ipv6_blocked',
+          headers: { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' },
+        }),
         'ipv6_blocked',
         { phase: 'handle_request' },
       );
@@ -7695,6 +7756,7 @@ export const __fairQueueTestHooks = {
   resolveConfig,
   resolveAdmissionMode,
   resolveTicketStateConfig,
+  createTicketStateConfigurationFailureResponse,
   shouldConsumeTicketResponse,
   slowFailDelay,
   getGlobalOverloadedRemainingSeconds,
@@ -7727,7 +7789,11 @@ export default {
         const headerName = headerNameRaw || 'X-Inner-Auth';
         const provided = request.headers.get(headerName) || '';
         if (provided !== innerAuthSecret) {
-          return logTerminalResponse(new Response('Forbidden', { status: 403 }), 'inner_auth_rejected', {
+          return logTerminalResponse(createJsonErrorResponse({
+            status: 403,
+            message: 'Inner authentication was rejected',
+            reason: 'inner_auth_rejected',
+          }), 'inner_auth_rejected', {
             phase: 'fetch',
           });
         }
@@ -7741,7 +7807,12 @@ export default {
       }
       if (!controllerState || !controllerState.bootstrap || !controllerState.decision) {
         return logTerminalResponse(
-          createErrorResponse("*", 503, "controller state unavailable"),
+          createJsonErrorResponse({
+            status: 503,
+            message: 'Controller state is unavailable',
+            reason: 'controller_state_unavailable',
+            headers: { 'Access-Control-Allow-Origin': '*' },
+          }),
           'controller_state_unavailable',
           { phase: 'fetch', controllerGate: 'state' },
         );
@@ -7760,7 +7831,12 @@ export default {
       if (!config.workerAddresses.includes(requestOrigin)) {
         const origin = request.headers.get('origin') || '*';
         return logTerminalResponse(
-          createErrorResponse(origin, 403, 'prohibited source'),
+          createJsonErrorResponse({
+            status: 403,
+            message: 'The request source is prohibited',
+            reason: 'prohibited_source',
+            headers: { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' },
+          }),
           'prohibited_source',
           { phase: 'fetch', host: url.hostname },
         );
@@ -7775,9 +7851,25 @@ export default {
 
       return response;
     } catch (error) {
+      if (error instanceof Response) {
+        const generated = generatedErrorResponses.get(error);
+        return logTerminalResponse(error, generated?.reason || 'internal_error', {
+          phase: 'fetch',
+          thrownResponse: true,
+        });
+      }
       const message = error instanceof Error ? error.message : String(error);
+      logEvent('error', 'Worker', 'top_level_exception', {
+        message,
+        stack: error instanceof Error ? error.stack : undefined,
+      });
       return logTerminalResponse(
-        createErrorResponse("*", 500, message),
+        createJsonErrorResponse({
+          status: 500,
+          message: 'An internal error occurred',
+          reason: 'internal_error',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+        }),
         'top_level_exception',
         { phase: 'fetch' },
       );

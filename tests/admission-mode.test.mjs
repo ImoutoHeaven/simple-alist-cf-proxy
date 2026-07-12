@@ -764,9 +764,11 @@ test('breaker_only explicitly settles authorized no-sample terminal responses be
 
   assert.equal(response.status, 404);
   const body = JSON.parse(responseBodyText);
-  assert.equal(body.code, 404);
+  assert.equal(body.status, 404);
   assert.equal(typeof body.message, 'string');
   assert.notEqual(body.message, 'missing');
+  assert.equal(body.reason, 'upstream_rejected');
+  assert.equal(body.upstream_status, 404);
   assert.equal(calls.wait, 0);
   assert.equal(calls.authorize, 1);
   assert.deepEqual(reportBodies, []);
@@ -826,7 +828,11 @@ test('breaker_only settles authorized origin fetch throws before returning the w
   });
 
   assert.equal(response.status, 500);
-  assert.equal(JSON.parse(responseBodyText).message, 'origin exploded');
+  assert.deepEqual(JSON.parse(responseBodyText), {
+    status: 500,
+    message: 'An internal error occurred',
+    reason: 'internal_error',
+  });
   assert.equal(calls.wait, 0);
   assert.equal(calls.authorize, 1);
   assert.deepEqual(reportBodies, []);
@@ -864,7 +870,7 @@ test('breaker_only fails closed when settlement fails after origin fetch throws 
   assert.equal(settleBodies[0].p_attempt_ticket, 8);
 });
 
-test('queue_breaker settles slot-carried breaker attempt when direct origin fetch throws before any upstream response', async () => {
+test('queue_breaker preserves the breaker settlement response when origin fetch throws', async () => {
   const { response, responseBodyText, calls, reportBodies, settleBodies } = await runModeScenario({
     fairQueueHostPatterns: ['*.sharepoint.com'],
     throttleHostPatterns: ['*.sharepoint.com'],
@@ -879,13 +885,18 @@ test('queue_breaker settles slot-carried breaker attempt when direct origin fetc
         attemptTicket: 12,
       },
     },
+    settleError: new Error('settle unavailable'),
     upstreamResponse: () => {
       throw new Error('origin exploded');
     },
   });
 
-  assert.equal(response.status, 500);
-  assert.equal(JSON.parse(responseBodyText).message, 'origin exploded');
+  assert.equal(response.status, 503);
+  assert.deepEqual(JSON.parse(responseBodyText), {
+    status: 503,
+    message: 'Throttle breaker authority unavailable during attempt settlement',
+    reason: 'breaker_settle_failed',
+  });
   assert.equal(calls.wait, 1);
   assert.equal(calls.release, 1);
   assert.equal(calls.authorize, 0);

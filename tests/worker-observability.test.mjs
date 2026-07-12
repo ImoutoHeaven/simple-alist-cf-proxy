@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { encryptBindingPayload } from '../src/origin-binding.js';
+import { createJsonErrorResponse } from '../src/http/json-error.js';
 import worker, { __fairQueueTestHooks } from '../src/worker.js';
 
 const CONTROLLER_URL = 'https://controller.example.test';
@@ -97,6 +98,70 @@ async function withFetchStub(fetchStub, callback) {
     delete globalThis.bootstrapCache;
   }
 }
+
+function createTrackedTextBody(text) {
+  const encoded = new TextEncoder().encode(text);
+  let cancelled = false;
+  return {
+    stream: new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoded);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }),
+    get cancelled() {
+      return cancelled;
+    },
+  };
+}
+
+async function assertJsonError(response, {
+  status,
+  reason,
+  upstreamStatus = undefined,
+  retryAfter = undefined,
+}) {
+  assert.equal(response.status, status);
+  assert.equal(response.headers.get('Content-Type'), 'application/json;charset=UTF-8');
+  const body = await response.json();
+  assert.equal(body.status, response.status);
+  assert.equal(typeof body.message, 'string');
+  assert.ok(body.message.trim());
+  assert.equal(body.reason, reason);
+  const allowedKeys = ['status', 'message', 'reason'];
+  if (upstreamStatus !== undefined) allowedKeys.push('upstream_status');
+  if (retryAfter !== undefined) allowedKeys.push('retry-after');
+  assert.deepEqual(Object.keys(body).sort(), allowedKeys.sort());
+
+  if (upstreamStatus === undefined) {
+    assert.equal(Object.hasOwn(body, 'upstream_status'), false);
+  } else {
+    assert.equal(body.upstream_status, upstreamStatus);
+  }
+
+  if (retryAfter === undefined) {
+    assert.equal(Object.hasOwn(body, 'retry-after'), false);
+    assert.equal(response.headers.has('Retry-After'), false);
+  } else {
+    assert.equal(body['retry-after'], retryAfter);
+    assert.equal(response.headers.get('Retry-After'), retryAfter);
+  }
+
+  return body;
+}
+
+test('shared serializer removes copied invalid Retry-After without validated retry input', async () => {
+  const response = createJsonErrorResponse({
+    status: 503,
+    message: 'Service temporarily unavailable',
+    reason: 'test_unavailable',
+    headers: { 'Retry-After': 'Wed, 21 Oct 2015 07:28:00 GMT' },
+  });
+
+  await assertJsonError(response, { status: 503, reason: 'test_unavailable' });
+});
 
 function buildBootstrapFetch(bootstrap) {
   return async (input) => {
@@ -487,7 +552,12 @@ test('worker breaker path logs sample report lifecycle events', async () => {
     response = await worker.fetch(await buildSignedWorkerRequest('/downloads/breaker-sample.bin'), buildControllerEnv(), {});
   }));
 
-  assert.equal(response.status, 503);
+  await assertJsonError(response, {
+    status: 503,
+    reason: 'upstream_unavailable',
+    upstreamStatus: 503,
+    retryAfter: '9',
+  });
   assert.equal(reportCalls, 1);
   assert.ok(entries.some((entry) => /\[Breaker\] sample_report_start/.test(entry.text)
     && /host=tenant\.sharepoint\.com/.test(entry.text)
@@ -495,7 +565,7 @@ test('worker breaker path logs sample report lifecycle events', async () => {
   assert.ok(entries.some((entry) => /\[Breaker\] sample_report_done/.test(entry.text)
     && /host=tenant\.sharepoint\.com/.test(entry.text)
     && /status=503/.test(entry.text)));
-  assert.ok(terminalEntries(entries, 'upstream_generated_5xx').some((entry) => /status=503/.test(entry.text)));
+  assert.ok(terminalEntries(entries, 'upstream_unavailable').some((entry) => /status=503/.test(entry.text)));
 });
 
 test('worker.fetch does not log fq/cq unavailable terminal reasons on a successful managed download', async () => {
@@ -613,7 +683,10 @@ test('worker.fetch does not log alist_api_error when auth refresh ignores the er
     response = await worker.fetch(await buildSignedWorkerRequest('/downloads/auth-refresh.bin'), buildControllerEnv(), {});
   }));
 
-  assert.equal(response.status, 401, await response.text());
+  await assertJsonError(response, {
+    status: 503,
+    reason: 'alist_api_unavailable',
+  });
   assert.equal(terminalEntries(entries, 'alist_api_error').length, 0);
 });
 
@@ -655,7 +728,11 @@ test('worker.fetch logs distinct terminal reason when refreshed upstream auth re
     response = await worker.fetch(await buildSignedWorkerRequest('/downloads/auth-retry-exhausted.bin'), buildControllerEnv(), {});
   }));
 
-  assert.equal(response.status, 401, await response.text());
+  await assertJsonError(response, {
+    status: 503,
+    reason: 'upstream_auth_retry_exhausted',
+    upstreamStatus: 401,
+  });
   assert.equal(alistCalls, 2);
   assert.ok(terminalEntries(entries, 'upstream_auth_retry_exhausted').some((entry) => /status=401/.test(entry.text)));
   assert.equal(terminalEntries(entries, 'upstream_generated_4xx').filter((entry) => /status=401/.test(entry.text)).length, 0);
@@ -675,11 +752,11 @@ test('worker.fetch logs terminal response for missing download payload', async (
     response = await worker.fetch(request, buildControllerEnv(), {});
   }));
 
-  assert.equal(response.status, 401);
+  await assertJsonError(response, { status: 401, reason: 'payload_missing' });
   assert.ok(terminalEntries(entries, 'payload_missing').some((entry) => /status=401/.test(entry.text)));
 });
 
-test('worker.fetch logs terminal response for internal API non-content response', async () => {
+test('worker.fetch returns internal_api_not_found JSON for authenticated unknown internal route', async () => {
   const request = new Request('https://worker.example.com/api/v0/missing', {
     headers: { authorization: 'Bearer internal-token' },
   });
@@ -689,11 +766,11 @@ test('worker.fetch logs terminal response for internal API non-content response'
     response = await worker.fetch(request, { INTERNAL_API_TOKEN: 'internal-token' }, {});
   });
 
-  assert.equal(response.status, 404);
+  await assertJsonError(response, { status: 404, reason: 'internal_api_not_found' });
   assert.ok(terminalEntries(entries, 'internal_api_response').some((entry) => /status=404/.test(entry.text)));
 });
 
-test('worker.fetch logs terminal response for inner auth rejection', async () => {
+test('worker.fetch returns inner_auth_rejected JSON for inner auth rejection', async () => {
   const request = new Request('https://worker.example.com/download/file.bin');
 
   let response;
@@ -701,8 +778,7 @@ test('worker.fetch logs terminal response for inner auth rejection', async () =>
     response = await worker.fetch(request, buildControllerEnv({ INNER_AUTH_SECRET: 'inner-secret' }), {});
   });
 
-  assert.equal(response.status, 403);
-  assert.equal(await response.text(), 'Forbidden');
+  await assertJsonError(response, { status: 403, reason: 'inner_auth_rejected' });
   assert.ok(terminalEntries(entries, 'inner_auth_rejected').some((entry) => /status=403/.test(entry.text)));
 });
 
@@ -714,7 +790,7 @@ test('worker.fetch logs terminal response for unavailable controller state', asy
     response = await worker.fetch(request, {}, {});
   });
 
-  assert.equal(response.status, 503);
+  await assertJsonError(response, { status: 503, reason: 'controller_state_unavailable' });
   assert.ok(terminalEntries(entries, 'controller_state_unavailable').some((entry) => /status=503/.test(entry.text)));
 });
 
@@ -731,7 +807,7 @@ test('worker.fetch logs terminal response for prohibited source', async () => {
     response = await worker.fetch(request, buildControllerEnv(), {});
   }));
 
-  assert.equal(response.status, 403);
+  await assertJsonError(response, { status: 403, reason: 'prohibited_source' });
   assert.ok(terminalEntries(entries, 'prohibited_source').some((entry) => /status=403/.test(entry.text)));
 });
 
@@ -749,11 +825,7 @@ test('worker.fetch logs terminal response for IPv6 block', async () => {
     response = await worker.fetch(request, buildControllerEnv(), {});
   }));
 
-  assert.equal(response.status, 403);
-  assert.deepEqual(await response.json(), {
-    code: 403,
-    message: 'ipv6 access is prohibited',
-  });
+  await assertJsonError(response, { status: 403, reason: 'ipv6_blocked' });
   assert.ok(terminalEntries(entries, 'ipv6_blocked').some((entry) => /status=403/.test(entry.text)));
 });
 
@@ -777,7 +849,8 @@ test('worker.fetch logs terminal response for OPTIONS preflight', async () => {
   assert.ok(terminalEntries(entries, 'options_preflight').some((entry) => /status=204/.test(entry.text)));
 });
 
-test('worker.fetch logs terminal response for top-level catch-to-500', async () => {
+test('worker.fetch returns internal_error JSON for top-level catch-to-500', async () => {
+  const diagnostic = 'controller common.tokenHmacKey is required';
   const bootstrap = buildBootstrap({
     common: {
       tokenHmacKey: '',
@@ -790,6 +863,305 @@ test('worker.fetch logs terminal response for top-level catch-to-500', async () 
     response = await worker.fetch(request, buildControllerEnv(), {});
   }));
 
-  assert.equal(response.status, 500);
+  const body = await assertJsonError(response, { status: 500, reason: 'internal_error' });
+  assert.doesNotMatch(JSON.stringify(body), new RegExp(diagnostic));
+  assert.ok(entries.some((entry) => entry.text.includes('[Worker] top_level_exception')
+    && entry.text.includes(`message=${diagnostic}`)
+    && entry.text.includes(`stack=Error: ${diagnostic}`)));
   assert.ok(terminalEntries(entries, 'top_level_exception').some((entry) => /status=500/.test(entry.text)));
+});
+
+for (const [method, path] of [
+  ['GET', '/api/v0/health'],
+  ['POST', '/api/v0/refresh'],
+  ['POST', '/api/v0/flush'],
+]) {
+  test(`worker.fetch preserves bodyless 204 for authenticated ${method} ${path}`, async () => {
+    const response = await worker.fetch(new Request(`https://worker.example.com${path}`, {
+      method,
+      headers: { authorization: 'Bearer internal-token' },
+    }), { INTERNAL_API_TOKEN: 'internal-token' }, {});
+
+    assert.equal(response.status, 204);
+    assert.equal(await response.text(), '');
+    assert.equal(response.headers.get('Content-Type'), null);
+  });
+}
+
+test('worker.fetch returns cf_rate_limited JSON with coupled retry-after', async () => {
+  const bootstrap = buildBootstrap();
+  const response = await withFetchStub(buildBootstrapFetch(bootstrap), async () => worker.fetch(
+    await buildSignedWorkerRequest(),
+    buildControllerEnv({
+      ENABLE_CF_RATELIMITER: 'true',
+      CF_RATE_LIMITER: { limit: async () => ({ success: false }) },
+    }),
+    {},
+  ));
+
+  await assertJsonError(response, {
+    status: 429,
+    reason: 'cf_rate_limited',
+    retryAfter: '60',
+  });
+});
+
+test('worker.fetch keeps unified rate-limit client network details out of the public message', async () => {
+  const bootstrap = buildBootstrap({
+    download: {
+      db: {
+        mode: 'custom-pg-rest',
+        postgrestUrl: 'https://postgrest.example.test',
+        verifyHeader: ['X-Verify'],
+        verifySecret: ['secret'],
+        cacheEnabled: false,
+        cleanupPercentage: 0,
+        rateLimit: {
+          enabled: true,
+          windowSeconds: 60,
+          limit: 10,
+        },
+      },
+      throttleProfiles: {
+        default: {
+          hostPatterns: [],
+        },
+      },
+    },
+  });
+  const response = await withFetchStub(async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url === CONTROLLER_BOOTSTRAP_URL) {
+      return new Response(JSON.stringify(bootstrap), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url === 'https://postgrest.example.test/rpc/download_get_ticket_state') {
+      const requestBody = JSON.parse(init.body);
+      const now = Math.floor(Date.now() / 1000);
+      return new Response(JSON.stringify([{
+        found: true,
+        ticket_hash: requestBody.p_ticket_hash,
+        issued_at: now,
+        first_used_at: null,
+        hard_expire_at: now + 300,
+        idle_timeout_seconds: 300,
+        idle_policy: 'first_use',
+        idle_lease_expires_at: now + 300,
+      }]), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return new Response(JSON.stringify({
+        code: 200,
+        data: { url: 'https://tenant.sharepoint.com/file' },
+      }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url === 'https://postgrest.example.test/rpc/download_unified_check') {
+      return new Response(JSON.stringify([{
+        cache_link_data: null,
+        cache_timestamp: null,
+        cache_hostname_hash: null,
+        rate_access_count: 10,
+        rate_last_window_time: Math.floor(Date.now() / 1000),
+        rate_block_until: null,
+        throttle_record_exists: false,
+        throttle_state: null,
+        throttle_open_until: null,
+        throttle_reason: null,
+        throttle_version: null,
+        throttle_last_error_code: null,
+      }]), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  }, async () => worker.fetch(await buildSignedWorkerRequest(), buildControllerEnv(), {}));
+
+  const body = await assertJsonError(response, {
+    status: 429,
+    reason: 'unified_rate_limited',
+    retryAfter: '60',
+  });
+  assert.equal(body.message.includes('192.0.2.10'), false);
+});
+
+async function fetchDownloadContract({
+  upstreamStatus = 500,
+  upstreamBody = 'unique-upstream-body',
+  upstreamHeaders = {},
+  alistResponse = null,
+  alistThrows = false,
+  pathname = '/downloads/contract.bin',
+} = {}) {
+  const bootstrap = buildBootstrap();
+  return await withFetchStub(async (input) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url === CONTROLLER_BOOTSTRAP_URL) {
+      return new Response(JSON.stringify(bootstrap), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (new URL(url).origin + new URL(url).pathname === 'https://alist.example.com/api/fs/link') {
+      if (alistThrows) throw new Error('unique-alist-transport-failure');
+      return alistResponse || new Response(JSON.stringify({
+        code: 200,
+        data: { url: 'https://tenant.sharepoint.com/file', header: {} },
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response(upstreamBody, { status: upstreamStatus, headers: upstreamHeaders });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  }, async () => worker.fetch(await buildSignedWorkerRequest(pathname), buildControllerEnv(), {}));
+}
+
+for (const [upstreamStatus, status, reason] of [
+  [400, 400, 'upstream_rejected'],
+  [402, 402, 'upstream_rejected'],
+  [403, 403, 'upstream_forbidden'],
+  [404, 404, 'upstream_rejected'],
+  [405, 405, 'upstream_rejected'],
+  [428, 428, 'upstream_rejected'],
+  [429, 503, 'upstream_rate_limited'],
+  [430, 430, 'upstream_rejected'],
+  [499, 499, 'upstream_rejected'],
+  [500, 503, 'upstream_unavailable'],
+  [502, 503, 'upstream_unavailable'],
+  [503, 503, 'upstream_unavailable'],
+  [504, 503, 'upstream_unavailable'],
+]) {
+  test(`worker.fetch maps upstream ${upstreamStatus} to ${status} ${reason} without body leakage`, async () => {
+    const upstreamBody = `unique-upstream-${upstreamStatus}`;
+    const response = await fetchDownloadContract({ upstreamStatus, upstreamBody });
+    const body = await assertJsonError(response, { status, reason, upstreamStatus });
+    assert.equal(JSON.stringify(body).includes(upstreamBody), false);
+  });
+}
+
+test('worker.fetch maps a non-JSON refreshed AList response to alist_api_unavailable', async () => {
+  const bootstrap = buildBootstrap();
+  let alistCalls = 0;
+  const response = await withFetchStub(async (input) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url === CONTROLLER_BOOTSTRAP_URL) return new Response(JSON.stringify(bootstrap), { headers: { 'content-type': 'application/json' } });
+    if (new URL(url).origin + new URL(url).pathname === 'https://alist.example.com/api/fs/link') {
+      alistCalls += 1;
+      return alistCalls === 1
+        ? new Response(JSON.stringify({ code: 200, data: { url: 'https://tenant.sharepoint.com/file' } }), { headers: { 'content-type': 'application/json' } })
+        : new Response('unusable refresh response', { status: 503, headers: { 'content-type': 'text/plain' } });
+    }
+    return new Response('unique-unretried-401-body', { status: 401 });
+  }, async () => worker.fetch(await buildSignedWorkerRequest('/downloads/unretried-401.bin'), buildControllerEnv(), {}));
+
+  const body = await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable' });
+  assert.equal(JSON.stringify(body).includes('unusable refresh response'), false);
+});
+
+test('worker.fetch cancels the initial terminal upstream body when AList refresh fails', async () => {
+  const bootstrap = buildBootstrap();
+  const initialUpstreamBody = createTrackedTextBody('initial-terminal-body-must-not-leak');
+  let alistCalls = 0;
+  const response = await withFetchStub(async (input) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url === CONTROLLER_BOOTSTRAP_URL) return new Response(JSON.stringify(bootstrap), { headers: { 'content-type': 'application/json' } });
+    if (new URL(url).origin + new URL(url).pathname === 'https://alist.example.com/api/fs/link') {
+      alistCalls += 1;
+      return alistCalls === 1
+        ? new Response(JSON.stringify({ code: 200, data: { url: 'https://tenant.sharepoint.com/file' } }), { headers: { 'content-type': 'application/json' } })
+        : new Response('refresh-service-body-must-not-leak', { status: 503, headers: { 'content-type': 'text/plain' } });
+    }
+    return new Response(initialUpstreamBody.stream, { status: 401 });
+  }, async () => worker.fetch(await buildSignedWorkerRequest('/downloads/refresh-cancel.bin'), buildControllerEnv(), {}));
+
+  const body = await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable' });
+  assert.equal(Object.hasOwn(body, 'upstream_status'), false);
+  assert.equal(initialUpstreamBody.cancelled, true);
+  assert.equal(JSON.stringify(body).includes('initial-terminal-body-must-not-leak'), false);
+});
+
+test('worker.fetch maps eligible refreshed upstream 401 to upstream_auth_retry_exhausted', async () => {
+  const bootstrap = buildBootstrap();
+  let alistCalls = 0;
+  const response = await withFetchStub(async (input) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url === CONTROLLER_BOOTSTRAP_URL) return new Response(JSON.stringify(bootstrap), { headers: { 'content-type': 'application/json' } });
+    if (new URL(url).origin + new URL(url).pathname === 'https://alist.example.com/api/fs/link') {
+      alistCalls += 1;
+      return new Response(JSON.stringify({ code: 200, data: { url: `https://tenant.sharepoint.com/file-${alistCalls}` } }), { headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('unique-refreshed-401-body', { status: 401 });
+  }, async () => worker.fetch(await buildSignedWorkerRequest('/downloads/refreshed-401.bin'), buildControllerEnv(), {}));
+
+  const body = await assertJsonError(response, { status: 503, reason: 'upstream_auth_retry_exhausted', upstreamStatus: 401 });
+  assert.equal(alistCalls, 2);
+  assert.equal(JSON.stringify(body).includes('unique-refreshed-401-body'), false);
+});
+
+test('worker.fetch maps forced refreshed upstream 410 to upstream_auth_retry_exhausted', async () => {
+  const bootstrap = buildBootstrap();
+  let alistCalls = 0;
+  const response = await withFetchStub(async (input) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url === CONTROLLER_BOOTSTRAP_URL) return new Response(JSON.stringify(bootstrap), { headers: { 'content-type': 'application/json' } });
+    if (new URL(url).origin + new URL(url).pathname === 'https://alist.example.com/api/fs/link') {
+      alistCalls += 1;
+      return new Response(JSON.stringify({ code: 200, data: { url: `https://tenant.sharepoint.com/file-410-${alistCalls}` } }), { headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('unique-refreshed-410-body', { status: 410 });
+  }, async () => worker.fetch(await buildSignedWorkerRequest('/downloads/refreshed-410.bin'), buildControllerEnv(), {}));
+
+  const body = await assertJsonError(response, { status: 503, reason: 'upstream_auth_retry_exhausted', upstreamStatus: 410 });
+  assert.equal(alistCalls, 2);
+  assert.equal(JSON.stringify(body).includes('unique-refreshed-410-body'), false);
+});
+
+for (const retryAfter of ['12', 'invalid', 'Wed, 21 Oct 2015 07:28:00 GMT', '0', '-2', null]) {
+  test(`worker.fetch ${retryAfter === '12' ? 'couples' : 'omits'} retry-after for upstream 429 header ${String(retryAfter)}`, async () => {
+    const headers = retryAfter === null ? {} : { 'Retry-After': retryAfter };
+    const response = await fetchDownloadContract({ upstreamStatus: 429, upstreamHeaders: headers });
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'upstream_rate_limited',
+      upstreamStatus: 429,
+      retryAfter: retryAfter === '12' ? '12' : undefined,
+    });
+  });
+}
+
+test('worker.fetch couples retry-after for upstream 503', async () => {
+  const response = await fetchDownloadContract({ upstreamStatus: 503, upstreamHeaders: { 'Retry-After': '13' } });
+  await assertJsonError(response, { status: 503, reason: 'upstream_unavailable', upstreamStatus: 503, retryAfter: '13' });
+});
+
+for (const [name, options] of [
+  ['transport throw', { alistThrows: true }],
+  ['non-json response', { alistResponse: new Response('unique-alist-non-json', { status: 502, headers: { 'content-type': 'text/plain' } }) }],
+  ['malformed json', { alistResponse: new Response('{', { headers: { 'content-type': 'application/json' } }) }],
+  ['missing code', { alistResponse: new Response(JSON.stringify({ data: {} }), { headers: { 'content-type': 'application/json' } }) }],
+  ['non-numeric code', { alistResponse: new Response(JSON.stringify({ code: '200', data: {} }), { headers: { 'content-type': 'application/json' } }) }],
+  ['missing data', { alistResponse: new Response(JSON.stringify({ code: 200 }), { headers: { 'content-type': 'application/json' } }) }],
+  ['non-object data', { alistResponse: new Response(JSON.stringify({ code: 200, data: null }), { headers: { 'content-type': 'application/json' } }) }],
+  ['array data', { alistResponse: new Response(JSON.stringify({ code: 200, data: [] }), { headers: { 'content-type': 'application/json' } }) }],
+  ['missing url', { alistResponse: new Response(JSON.stringify({ code: 200, data: {} }), { headers: { 'content-type': 'application/json' } }) }],
+  ['empty url', { alistResponse: new Response(JSON.stringify({ code: 200, data: { url: '' } }), { headers: { 'content-type': 'application/json' } }) }],
+  ['non-string url', { alistResponse: new Response(JSON.stringify({ code: 200, data: { url: 1 } }), { headers: { 'content-type': 'application/json' } }) }],
+  ['non-http url', { alistResponse: new Response(JSON.stringify({ code: 200, data: { url: 'ftp://example.test/file' } }), { headers: { 'content-type': 'application/json' } }) }],
+  ['logical failure', { alistResponse: new Response(JSON.stringify({ code: 500, message: 'unique-alist-logical-failure' }), { headers: { 'content-type': 'application/json' } }) }],
+]) {
+  test(`worker.fetch returns alist_api_unavailable JSON for AList ${name}`, async () => {
+    const response = await fetchDownloadContract(options);
+    const body = await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable' });
+    assert.equal(JSON.stringify(body).includes('unique-alist'), false);
+  });
+}
+
+test('worker.fetch accepts a structurally usable AList success envelope', async () => {
+  const response = await fetchDownloadContract({ upstreamStatus: 200, upstreamBody: 'usable-alist-success' });
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), 'usable-alist-success');
 });

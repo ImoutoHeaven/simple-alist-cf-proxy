@@ -20,6 +20,30 @@ const createJsonResponse = (payload) => new Response(JSON.stringify(payload), {
   headers: { 'content-type': 'application/json' },
 });
 
+const assertJsonError = async (response, { status, reason, upstreamStatus = undefined, retryAfter = undefined }) => {
+  assert.equal(response.status, status);
+  assert.equal(response.headers.get('Content-Type'), 'application/json;charset=UTF-8');
+  const body = JSON.parse(await response.text());
+  assert.equal(body.status, status);
+  assert.equal(typeof body.message, 'string');
+  assert.ok(body.message.trim());
+  assert.equal(body.reason, reason);
+  const allowedKeys = ['status', 'message', 'reason'];
+  if (upstreamStatus !== undefined) allowedKeys.push('upstream_status');
+  if (retryAfter !== undefined) allowedKeys.push('retry-after');
+  assert.deepEqual(Object.keys(body).sort(), allowedKeys.sort());
+  if (upstreamStatus === undefined) assert.equal(Object.hasOwn(body, 'upstream_status'), false);
+  else assert.equal(body.upstream_status, upstreamStatus);
+  if (retryAfter === undefined) {
+    assert.equal(Object.hasOwn(body, 'retry-after'), false);
+    assert.equal(response.headers.has('Retry-After'), false);
+  } else {
+    assert.equal(body['retry-after'], retryAfter);
+    assert.equal(response.headers.get('Retry-After'), retryAfter);
+  }
+  return body;
+};
+
 const createTrackedTextBody = (text) => {
   const encoded = new TextEncoder().encode(text);
   let pulled = false;
@@ -687,7 +711,10 @@ test('worker fails closed when breaker snapshot lookup fails', async () => {
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_authority_unavailable',
+    });
     assert.equal(upstreamFetches, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -868,7 +895,10 @@ test('worker fails closed when breaker sample reporting fails after half_open au
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_sample_report_failed',
+    });
     assert.equal(upstreamFetches, 1);
     assert.equal(reportCalls, 1);
     assert.equal(originBody.cancelled, true);
@@ -1350,7 +1380,11 @@ test('worker does not retain or expose local breaker mirror state', async () => 
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 429);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_open',
+      retryAfter: '30',
+    });
     assert.equal(__fairQueueTestHooks.getBreakerMirrorSize?.() ?? 0, 0);
     assert.equal('mirrorBreakerSnapshot' in __fairQueueTestHooks, false);
     assert.equal('pruneBreakerMirrorCache' in __fairQueueTestHooks, false);
@@ -1375,7 +1409,11 @@ test('worker blocks immediately when unified breaker snapshot is open', async ()
   };
 
   const response = await applyUnifiedResult(unifiedResult);
-  assert.equal(response.status, 429);
+  await assertJsonError(response, {
+    status: 503,
+    reason: 'breaker_open',
+    retryAfter: '30',
+  });
 });
 
 test('deriveOpenSeconds caps numeric Retry-After and adds one second', () => {
@@ -2701,12 +2739,13 @@ test('queue_breaker returns generated JSON for non-protected terminal upstream r
       },
     });
 
-    const body = JSON.parse(await response.text());
+    const body = await assertJsonError(response, {
+      status: 404,
+      reason: 'upstream_rejected',
+      upstreamStatus: 404,
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 404);
-    assert.equal(body.code, 404);
-    assert.equal(typeof body.message, 'string');
     assert.notEqual(body.message, 'missing');
     assert.deepEqual(calls, [
       'fairqueue-wait',
@@ -2810,12 +2849,13 @@ test('queue_breaker returns generated JSON for protected terminal upstream respo
       },
     });
 
-    const body = JSON.parse(await response.text());
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'upstream_unavailable',
+      upstreamStatus: 500,
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 500);
-    assert.equal(body.code, 500);
-    assert.equal(typeof body.message, 'string');
     assert.notEqual(body.message, 'boom');
     assert.deepEqual(calls, [
       'fairqueue-wait',
@@ -2929,10 +2969,12 @@ test('queue_breaker cancels CQ wait when old attempt settlement fails before CQ 
       },
     });
 
-    const body = await response.json();
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_settle_failed',
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
     assert.match(body.message, /attempt settlement/i);
     assert.deepEqual(calls, [
       'fairqueue-wait',
@@ -3096,7 +3138,11 @@ test('queue_breaker releases CQ lease and returns breaker terminal response when
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 429);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_half_open_full',
+      retryAfter: '15',
+    });
     assert.deepEqual(calls, [
       'fairqueue-wait',
       'concurrency-acquire-fast',
@@ -3242,7 +3288,11 @@ test('worker blocks same-host refresh when a new authorize call returns reopened
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 429);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_open',
+      retryAfter: '30',
+    });
     assert.equal(linkFetchCount, 2);
     assert.equal(authorizeCalls, 2);
     assert.equal(initialUpstreamFetches, 1);
@@ -3381,7 +3431,11 @@ test('worker blocks same-host refresh when a new authorize call finds a full hal
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 429);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_half_open_full',
+      retryAfter: '15',
+    });
     assert.equal(linkFetchCount, 2);
     assert.equal(authorizeCalls, 2);
     assert.equal(initialUpstreamFetches, 1);
@@ -3396,7 +3450,7 @@ test('worker blocks same-host refresh when a new authorize call finds a full hal
   }
 });
 
-test('worker settles live breaker_only attempt before refresh enters queue_breaker when fair queue prep fails', async () => {
+test('worker returns fq_unavailable envelope after fair queue preparation fails during refresh', async () => {
   const originalFetch = globalThis.fetch;
   const waitUntilPromises = [];
   const calls = [];
@@ -3503,10 +3557,12 @@ test('worker settles live breaker_only attempt before refresh enters queue_break
       },
     });
 
-    const body = await response.json();
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'fq_unavailable',
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
     assert.equal(body.message, 'Fair queue unavailable');
     assert.equal(linkFetchCount, 2);
     assert.deepEqual(calls, [
@@ -3648,10 +3704,12 @@ test('worker settles live breaker_only attempt before refresh enters true concur
       },
     });
 
-    const body = await response.json();
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'cq_acquire_failed',
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
     assert.equal(body.message, 'True concurrency unavailable');
     assert.equal(linkFetchCount, 2);
     assert.deepEqual(calls, [
@@ -3907,7 +3965,12 @@ test('unified breaker lookup uses actual Google-family host authority', async ()
         waitUntilPromises.push(promise);
       },
     });
-    assert.equal(firstResponse.status, 429);
+    await assertJsonError(firstResponse, {
+      status: 503,
+      reason: 'upstream_rate_limited',
+      upstreamStatus: 429,
+      retryAfter: '8',
+    });
 
     const secondResponse = await worker.fetch(await buildSignedWorkerRequest('/downloads/unified-google-api.bin', {
       payloadFileSize: 13,
@@ -4038,7 +4101,11 @@ test('cache-hit unified breaker lookup uses cached actual Google API host hash',
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 429);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_open',
+      retryAfter: '30',
+    });
     assert.equal(unifiedBodies.length, 1);
     assert.equal(googleApiHostHash, await decodeHostnameHash('www.googleapis.com'));
     assert.notEqual(googleApiHostHash, googleAuthorityHash);
@@ -4397,8 +4464,11 @@ test('queue_breaker HALF_OPEN_FULL returns throttle-protected response and never
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
-    assert.equal(response.headers.get('Retry-After'), '9');
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_open',
+      retryAfter: '9',
+    });
     assert.equal(response.headers.get('X-Throttle-Protected'), 'true');
     assert.equal(authorizeCalls, 0);
     assert.equal(reportCalls, 0);
@@ -4834,7 +4904,11 @@ test('queue_breaker reports actual Google redirect before redirected reacquire t
 
     await Promise.all(waitUntilPromises);
 
-    assert.equal(response.status, 429);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_open',
+      retryAfter: '30',
+    });
     assert.equal(acquireBodies.length, 2);
     assert.equal(acquireBodies[0].breakerEnabled, true);
     assert.equal(acquireBodies[1].breakerEnabled, true);
@@ -5050,7 +5124,11 @@ test('queue_breaker dual mode reports actual Google redirect before fairqueue re
 
     await Promise.all(waitUntilPromises);
 
-    assert.equal(response.status, 429);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_open',
+      retryAfter: '30',
+    });
     assert.equal(fairQueueAcquireBodies.length, 2);
     assert.equal(concurrencyAcquireBodies.length, 1);
     assert.equal(fairQueueAcquireBodies[0].breakerEnabled, true);
@@ -5273,7 +5351,7 @@ test('queue_breaker dual mode reports actual Google redirect when CQ expires bef
 
     await Promise.all(waitUntilPromises);
 
-    assert.equal(response.status, 401);
+    await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     assert.equal(fairQueueAcquireBodies.length, 2);
     assert.equal(concurrencyAcquireBodies.length, 2);
     assert.equal(fairQueueAcquireBodies[0].breakerEnabled, true);
@@ -5518,7 +5596,7 @@ test('queue_breaker dual mode reports actual Google redirect when CQ wait later 
 
     await Promise.all(waitUntilPromises);
 
-    assert.equal(response.status, 401);
+    await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     assert.equal(fairQueueAcquireBodies.length, 2);
     assert.equal(concurrencyAcquireBodies.length, 2);
     assert.equal(concurrencyWaitBodies.length, 1);
@@ -5572,6 +5650,16 @@ for (const terminalCase of [
       queryToken: 'query-google-conflict-2',
       invocationEpoch: 2,
       reason: 'stale_wait_token',
+    }),
+  },
+  {
+    name: 'overload',
+    buildAcquireResponse: (init) => createFairQueueWaitResponseFromInit(init, {
+      result: 'overloaded',
+      queryToken: 'query-google-overload-2',
+      invocationEpoch: 2,
+      retryAfter: 17,
+      reason: 'capacity_exhausted',
     }),
   },
 ]) {
@@ -5685,7 +5773,15 @@ for (const terminalCase of [
 
       await Promise.all(waitUntilPromises);
 
-      assert.equal(response.status, 503);
+      await assertJsonError(response, {
+        status: 503,
+        reason: terminalCase.name === 'timeout'
+          ? 'fq_timeout'
+          : terminalCase.name === 'conflict'
+            ? 'fq_conflict'
+            : 'fq_overloaded',
+        retryAfter: terminalCase.name === 'overload' ? '17' : '60',
+      });
       assert.equal(acquireBodies.length, 2);
       assert.equal(acquireBodies[0].breakerEnabled, true);
       assert.equal(acquireBodies[1].breakerEnabled, true);
@@ -5941,7 +6037,11 @@ test('queue_breaker defers same-host same-site redirect reporting until the term
 
     await Promise.all(waitUntilPromises);
 
-    assert.equal(response.status, 500);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'upstream_unavailable',
+      upstreamStatus: 500,
+    });
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.deepEqual(authorizeBodies, []);
@@ -6060,7 +6160,10 @@ test('queue_breaker terminal report failure disarms deferred same-site redirect 
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_sample_report_failed',
+    });
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.deepEqual(authorizeBodies, []);
@@ -6183,7 +6286,11 @@ test('queue_breaker flushes a deferred same-site redirect as 302 when the termin
 
     await Promise.all(waitUntilPromises);
 
-    assert.equal(response.status, 404);
+    await assertJsonError(response, {
+      status: 404,
+      reason: 'upstream_rejected',
+      upstreamStatus: 404,
+    });
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.deepEqual(authorizeBodies, []);
@@ -6302,7 +6409,7 @@ test('queue_breaker flushes deferred same-site redirect before propagating throw
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 500);
+    await assertJsonError(response, { status: 500, reason: 'internal_error' });
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.deepEqual(authorizeBodies, []);
@@ -6425,7 +6532,7 @@ test('queue_breaker flushes deferred same-site redirect before propagating refre
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 500);
+    await assertJsonError(response, { status: 500, reason: 'internal_error' });
     assert.equal(linkFetchCount, 2);
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
@@ -6529,7 +6636,10 @@ test('queue_breaker returns authority unavailable when deferred flush fails but 
 
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_sample_report_failed',
+    });
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.deepEqual(authorizeBodies, []);
@@ -6787,9 +6897,14 @@ test('queue_breaker flushes a deferred same-site redirect as 302 after refresh w
       },
     });
 
+    const body = await assertJsonError(response, {
+      status: 403,
+      reason: 'upstream_forbidden',
+      upstreamStatus: 403,
+    });
     await Promise.all(waitUntilPromises);
 
-    assert.equal(response.status, 403);
+    assert.equal(body.message.includes('forbidden'), false);
     assert.equal(linkFetchCount, 2);
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
@@ -6929,12 +7044,13 @@ test('queue_breaker reports the final protected auth-refresh status instead of f
       },
     });
 
-    const body = JSON.parse(await response.text());
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'upstream_auth_retry_exhausted',
+      upstreamStatus: 410,
+    });
     await Promise.all(waitUntilPromises);
 
-    assert.equal(response.status, 410);
-    assert.equal(body.code, 410);
-    assert.equal(typeof body.message, 'string');
     assert.notEqual(body.message, 'expired-final');
     assert.equal(linkFetchCount, 2);
     assert.equal(acquireBodies.length, 1);
@@ -7063,7 +7179,7 @@ test('queue_breaker flushes a deferred same-site attempt only when refresh failu
 
     await Promise.all(waitUntilPromises);
 
-    assert.equal(response.status, 401);
+    await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable' });
     assert.equal(linkFetchCount, 2);
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
@@ -8470,11 +8586,7 @@ test('client abort during unmanaged redirect fair-queue bootstrap returns client
 
     assert.equal(acquireBodies.length, 1);
     assert.equal(acquireBodies[0].hostname, 'tenant.sharepoint.com');
-    assert.equal(response.status, 499);
-    assert.deepEqual(await response.json(), {
-      code: 499,
-      message: 'client aborted request',
-    });
+    await assertJsonError(response, { status: 499, reason: 'client_aborted' });
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;

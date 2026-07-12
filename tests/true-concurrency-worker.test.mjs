@@ -555,6 +555,35 @@ const buildSignedWorkerRequest = async ({
 
 const readJson = async (response) => JSON.parse(await response.text());
 
+const assertJsonError = async (response, { status, reason, upstreamStatus = undefined, retryAfter = undefined }) => {
+  assert.equal(response.status, status);
+  assert.equal(response.headers.get('Content-Type'), 'application/json;charset=UTF-8');
+  const body = await readJson(response);
+  assert.equal(body.status, status);
+  assert.equal(typeof body.message, 'string');
+  assert.ok(body.message.trim());
+  assert.equal(body.reason, reason);
+  const allowedKeys = ['status', 'message', 'reason'];
+  if (upstreamStatus !== undefined) allowedKeys.push('upstream_status');
+  if (retryAfter !== undefined) allowedKeys.push('retry-after');
+  assert.deepEqual(Object.keys(body).sort(), allowedKeys.sort());
+  if (upstreamStatus === undefined) assert.equal(Object.hasOwn(body, 'upstream_status'), false);
+  else assert.equal(body.upstream_status, upstreamStatus);
+  if (retryAfter === undefined) {
+    assert.equal(Object.hasOwn(body, 'retry-after'), false);
+    assert.equal(response.headers.has('Retry-After'), false);
+  } else {
+    assert.equal(body['retry-after'], retryAfter);
+    assert.equal(response.headers.get('Retry-After'), retryAfter);
+  }
+  return body;
+};
+
+const assertNoPublicDiagnosticMarker = async (response, marker) => {
+  const serializedClientBody = await response.clone().text();
+  assert.equal(serializedClientBody.includes(marker), false);
+};
+
 test('worker config keeps compatibility_date and enables enable_request_signal', () => {
   const wranglerConfig = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
 
@@ -1134,8 +1163,7 @@ test('dual mode fast terminal CQ hard expiry releases fairqueue and returns link
 
   try {
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), createTestContext().ctx);
-    const body = await readJson(response);
-    assert.equal(response.status, 401);
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
   } finally {
@@ -1199,8 +1227,7 @@ test('dual mode fast expired CQ result returns link expired after releasing fair
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
 
-    assert.equal(response.status, 401);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     assert.equal(body.message, 'link expired');
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls, [
@@ -1370,8 +1397,7 @@ test('dual mode fast terminal CQ hard expiry returns link expired after waiting 
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    const body = await readJson(response);
-    assert.equal(response.status, 401);
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
   } finally {
@@ -1452,9 +1478,8 @@ test('queue_breaker dual mode settles breaker attempt before returning link expi
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 401);
     assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, [
       'fairqueue-wait',
@@ -1664,7 +1689,7 @@ test('breaker_only with true concurrency does not authorize or settle before CQ 
 
   try {
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), createTestContext().ctx);
-    assert.equal(response.status, 503);
+    await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed' });
     assert.deepEqual(calls, ['breaker-snapshot', 'concurrency-acquire']);
     assert.equal(settleBodies.length, 0);
   } finally {
@@ -1673,7 +1698,7 @@ test('breaker_only with true concurrency does not authorize or settle before CQ 
   }
 });
 
-test('breaker_only with true concurrency authorizes after ack_handoff and settles granted attempts across auth refresh retries', async () => {
+test('breaker_only with true concurrency maps forced refreshed upstream 410 after preserving lease cleanup', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const settleBodies = [];
@@ -1737,9 +1762,9 @@ test('breaker_only with true concurrency authorizes after ack_handoff and settle
     }
 
     if (url === 'https://tenant.sharepoint.com/file') {
-      calls.push('origin-fetch-401');
-      return new Response('expired', {
-        status: 401,
+      calls.push('origin-fetch-410');
+      return new Response('unique-cq-refreshed-410-upstream-sentinel', {
+        status: 410,
         headers: { 'content-type': 'text/plain' },
       });
     }
@@ -1776,11 +1801,13 @@ test('breaker_only with true concurrency authorizes after ack_handoff and settle
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
-    assert.equal(response.status, 401);
-    assert.equal(body.code, 401);
-    assert.equal(typeof body.message, 'string');
-    assert.notEqual(body.message, 'expired');
+    const serializedClientBody = await response.clone().text();
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'upstream_auth_retry_exhausted',
+      upstreamStatus: 410,
+    });
+    assert.equal(serializedClientBody.includes('unique-cq-refreshed-410-upstream-sentinel'), false);
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls, [
       'link-api',
@@ -1789,11 +1816,11 @@ test('breaker_only with true concurrency authorizes after ack_handoff and settle
       'concurrency-claim',
       'concurrency-ack-handoff',
       'breaker-authorize',
-      'origin-fetch-401',
+      'origin-fetch-410',
       'breaker-settle',
       'link-api',
       'breaker-authorize',
-      'origin-fetch-401',
+      'origin-fetch-410',
       'breaker-settle',
       'concurrency-release',
     ]);
@@ -1939,12 +1966,13 @@ test('breaker_only with true concurrency reports protected auth refresh failures
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'upstream_auth_retry_exhausted',
+      upstreamStatus: 401,
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 401);
-    assert.equal(body.code, 401);
-    assert.equal(typeof body.message, 'string');
     assert.notEqual(body.message, 'expired-final');
     assert.equal(linkFetchCount, 2);
     assert.ok(calls.indexOf('origin-fetch-401-start') >= 0);
@@ -2062,9 +2090,11 @@ test('breaker_only with true concurrency returns authority unavailable when no-s
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_settle_failed',
+    });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
     assert.match(body.message, /attempt settlement/i);
     assert.deepEqual(calls, [
       'link-api',
@@ -2192,12 +2222,13 @@ test('breaker_only with true concurrency returns generated JSON for protected te
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'upstream_unavailable',
+      upstreamStatus: 500,
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 500);
-    assert.equal(body.code, 500);
-    assert.equal(typeof body.message, 'string');
     assert.notEqual(body.message, 'boom');
     assert.deepEqual(calls, [
       'link-api',
@@ -2334,12 +2365,13 @@ test('breaker_only with true concurrency returns generated JSON for non-protecte
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, {
+      status: 403,
+      reason: 'upstream_forbidden',
+      upstreamStatus: 403,
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 403);
-    assert.equal(body.code, 403);
-    assert.equal(typeof body.message, 'string');
     assert.notEqual(body.message, 'forbidden');
     assert.deepEqual(calls, [
       'link-api',
@@ -2465,10 +2497,12 @@ test('breaker_only with true concurrency fails closed and cancels the upstream b
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_sample_report_failed',
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
     assert.match(body.message, /sample report/i);
     assert.deepEqual(calls, [
       'link-api',
@@ -2567,7 +2601,7 @@ test('breaker_only with true concurrency checks handler readiness before authori
       payloadSignExpire: expireSeconds,
     });
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    assert.equal(response.status, 401);
+    await assertJsonError(response, { status: 401, reason: 'payload_expired' });
     assert.deepEqual(calls, ['breaker-snapshot']);
   } finally {
     Date.now = originalDateNow;
@@ -2651,7 +2685,7 @@ test('breaker_only with true concurrency does not authorize or settle on client-
   try {
     const request = await buildSignedWorkerRequest({ signal: abortController.signal });
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    assert.equal(response.status, 499);
+    await assertJsonError(response, { status: 499, reason: 'client_aborted' });
     assert.deepEqual(calls, ['breaker-snapshot', 'concurrency-acquire']);
     assert.equal(settleBodies.length, 0);
   } finally {
@@ -2879,8 +2913,7 @@ test('breaker_only with true concurrency does not authorize or settle before ter
 
   try {
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), createTestContext().ctx);
-    const body = await readJson(response);
-    assert.equal(response.status, 401);
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, ['concurrency-acquire-fast']);
     assert.equal(settleBodies.length, 0);
@@ -2971,9 +3004,11 @@ test('breaker_only with true concurrency does not authorize or settle before acq
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'cq_acquire_failed',
+    });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['concurrency-acquire-fast']);
     assert.equal(settleBodies.length, 0);
@@ -3214,7 +3249,7 @@ test('breaker_only with true concurrency does not authorize or settle after clai
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
+    await assertJsonError(response, { status: 503, reason: 'cq_claim_failed' });
     assert.deepEqual(calls, [
       'breaker-snapshot',
       'concurrency-acquire-fast',
@@ -3319,7 +3354,7 @@ test('queue_breaker dual mode settles breaker attempt when target expires before
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(request, buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 401);
+    await assertJsonError(response, { status: 401, reason: 'payload_expired' });
     assert.deepEqual(calls, [
       'fairqueue-wait',
       'breaker-settle',
@@ -3392,9 +3427,11 @@ test('dual mode malformed concurrency acquire result fails closed after fairqueu
     crypto.randomUUID = () => 'req-malformed-acquire-recovery';
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'cq_acquire_failed',
+    });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
     assert.equal(fairQueueReleaseBodies.length, 1);
@@ -3453,10 +3490,9 @@ test('true concurrency malformed acquire response stops before any server-owned 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed' });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['concurrency-acquire']);
     assert.equal(typeof acquireBody?.requestId, 'string');
@@ -3510,10 +3546,8 @@ test('true concurrency acquire fetch rejection after dispatch stops before any s
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed' });
     await Promise.allSettled(waitUntilPromises);
-
-    assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['concurrency-acquire']);
     assert.equal(typeof acquireBody?.requestId, 'string');
@@ -3567,10 +3601,8 @@ test('true concurrency non-200 acquire response after dispatch stops before any 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed' });
     await Promise.allSettled(waitUntilPromises);
-
-    assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['concurrency-acquire']);
     assert.equal(typeof acquireBody?.requestId, 'string');
@@ -3689,7 +3721,7 @@ test('true concurrency only skips precheck and fairqueue and acks handoff before
   }
 });
 
-test('true concurrency heartbeat hello timeout retries initial connect before origin fetch and releases heartbeat_connect_failed', async () => {
+test('true concurrency heartbeat hello timeout returns cq_heartbeat_failed before origin fetch and releases heartbeat_connect_failed', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const heartbeatSockets = [];
@@ -3770,10 +3802,12 @@ test('true concurrency heartbeat hello timeout retries initial connect before or
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'cq_heartbeat_failed',
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.equal(calls.includes('origin-fetch'), false);
     assert.equal(calls.filter((call) => call === 'heartbeat-upgrade').length, 3);
@@ -3880,10 +3914,12 @@ test('true concurrency heartbeat_connect_failed schedules release retry cleanup 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'cq_heartbeat_failed',
+    });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.equal(waitUntilPromises.length > 0, true);
     assert.equal(releaseBodies.length >= 2, true);
@@ -3988,11 +4024,17 @@ test('true concurrency initial heartbeat terminal mapping suppresses duplicate r
       delete globalThis.bootstrapCache;
       const { ctx, waitUntilPromises } = createTestContext();
       const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-      const body = await readJson(response);
+      const body = await assertJsonError(response, {
+        status: scenario.reason === 'hard_expired' ? 401 : 503,
+        reason: scenario.reason === 'hard_expired' ? 'ticket_state_expired' : 'cq_terminal',
+      });
       await Promise.allSettled(waitUntilPromises);
 
-      assert.equal(response.status, 503, scenario.reason);
-      assert.match(body.message, /true concurrency unavailable/i, scenario.reason);
+      if (scenario.reason === 'hard_expired') {
+        assert.equal(body.message, 'link expired', scenario.reason);
+      } else {
+        assert.match(body.message, /true concurrency unavailable/i, scenario.reason);
+      }
       assert.equal(originFetchCalled, false, scenario.reason);
       assert.equal(releaseBody?.reason ?? null, scenario.expectedReleaseReason, scenario.reason);
     }
@@ -4246,9 +4288,11 @@ test('true concurrency ack_handoff transport or availability or malformed-succes
       try {
         const { ctx, waitUntilPromises } = createTestContext();
         const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-        const body = await readJson(response);
+        const body = await assertJsonError(response, {
+          status: 503,
+          reason: 'cq_ack_failed',
+        });
         await Promise.allSettled(waitUntilPromises);
-        assert.equal(response.status, 503, scenario.name);
         assert.equal(body.message, 'True concurrency unavailable', scenario.name);
         assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-ack-handoff', 'concurrency-release'], scenario.name);
         assert.equal(releaseBody.leaseId, 'lease-ack-fail', scenario.name);
@@ -4271,13 +4315,15 @@ test('true concurrency explicit ack_handoff terminal response does not release a
       name: 'released',
       ackPayload: { result: 'released', reason: 'claim_handoff_timeout' },
       expectedStatus: 503,
-      expectedMessage: 'True concurrency released (claim_handoff_timeout)',
+      expectedMessage: 'True concurrency unavailable',
+      privateMarker: 'claim_handoff_timeout',
     },
     {
       name: 'cancelled',
       ackPayload: { result: 'cancelled', reason: 'request_cancelled' },
       expectedStatus: 503,
-      expectedMessage: 'True concurrency cancelled (request_cancelled)',
+      expectedMessage: 'True concurrency unavailable',
+      privateMarker: 'request_cancelled',
     },
     {
       name: 'expired',
@@ -4338,10 +4384,15 @@ test('true concurrency explicit ack_handoff terminal response does not release a
       try {
         const { ctx, waitUntilPromises } = createTestContext();
         const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-        const bodyText = await response.text();
+        if (scenario.privateMarker) {
+          await assertNoPublicDiagnosticMarker(response, scenario.privateMarker);
+        }
+        const body = await assertJsonError(response, {
+          status: scenario.expectedStatus,
+          reason: scenario.name === 'expired' ? 'ticket_state_expired' : 'cq_terminal',
+        });
         await Promise.allSettled(waitUntilPromises);
-        assert.equal(response.status, scenario.expectedStatus, scenario.name);
-        assert.match(bodyText, new RegExp(scenario.expectedMessage.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), scenario.name);
+        assert.equal(body.message, scenario.expectedMessage, scenario.name);
         assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-ack-handoff'], scenario.name);
       } finally {
         delete globalThis.bootstrapCache;
@@ -4404,10 +4455,10 @@ test('true concurrency explicit ack_handoff conflict fails closed and waits for 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    await assertNoPublicDiagnosticMarker(response, 'handoff_token_mismatch');
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
-    assert.equal(body.message, 'True concurrency conflict (handoff_token_mismatch)');
+    assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-ack-handoff']);
   } finally {
     globalThis.fetch = originalFetch;
@@ -4457,10 +4508,10 @@ test('true concurrency claim terminal replay with claim_handoff_timeout fails cl
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    await assertNoPublicDiagnosticMarker(response, 'claim_handoff_timeout');
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
-    assert.equal(body.message, 'True concurrency released (claim_handoff_timeout)');
+    assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim']);
   } finally {
     globalThis.fetch = originalFetch;
@@ -4499,10 +4550,10 @@ test('true concurrency acquire terminal replay with claim_handoff_timeout fails 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    await assertNoPublicDiagnosticMarker(response, 'claim_handoff_timeout');
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
-    assert.equal(body.message, 'True concurrency released (claim_handoff_timeout)');
+    assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast']);
   } finally {
     globalThis.fetch = originalFetch;
@@ -4541,10 +4592,10 @@ test('true concurrency acquire terminal replay with heartbeat_timeout fails clos
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    await assertNoPublicDiagnosticMarker(response, 'heartbeat_timeout');
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
-    assert.equal(body.message, 'True concurrency released (heartbeat_timeout)');
+    assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast']);
   } finally {
     globalThis.fetch = originalFetch;
@@ -4594,10 +4645,10 @@ test('true concurrency claim terminal replay with heartbeat_timeout fails closed
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    await assertNoPublicDiagnosticMarker(response, 'heartbeat_timeout');
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
-    assert.equal(body.message, 'True concurrency released (heartbeat_timeout)');
+    assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim']);
   } finally {
     globalThis.fetch = originalFetch;
@@ -4673,9 +4724,11 @@ test('true concurrency claim failure releases acquired lease before origin fetch
       try {
         const { ctx, waitUntilPromises } = createTestContext();
         const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-        const body = await readJson(response);
+        const body = await assertJsonError(response, {
+          status: 503,
+          reason: 'cq_claim_failed',
+        });
         await Promise.allSettled(waitUntilPromises);
-        assert.equal(response.status, 503, scenario.name);
         assert.equal(body.message, 'True concurrency unavailable', scenario.name);
         assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-release'], scenario.name);
         assert.equal(releaseBody.leaseId, 'lease-claim-fail', scenario.name);
@@ -4728,7 +4781,7 @@ test('true concurrency claim terminal response does not fetch origin', async () 
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
+    await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim']);
   } finally {
     globalThis.fetch = originalFetch;
@@ -4774,10 +4827,10 @@ test('true concurrency claim conflict grant_unclaimed releases acquired lease be
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    await assertNoPublicDiagnosticMarker(response, 'grant_unclaimed');
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
-    assert.equal(body.message, 'True concurrency conflict (grant_unclaimed)');
+    assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-release']);
     assert.equal(releaseBody.leaseId, 'lease-claim-conflict');
     assert.equal(releaseBody.leaseToken, 'token-claim-conflict');
@@ -4838,10 +4891,9 @@ test('true concurrency only fast hard expiry returns link expired without fairqu
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 401);
     assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, ['concurrency-acquire']);
   } finally {
@@ -4883,7 +4935,7 @@ test('expired true concurrency link rejects before handler calls', async () => {
       payloadExpireTime: Math.floor(Date.now() / 1000) - 5,
     });
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    assert.equal(response.status, 401);
+    await assertJsonError(response, { status: 401, reason: 'payload_expired' });
     assert.equal(calls.includes('https://cq.example.test/api/v1/concurrency/acquire'), false);
     assert.equal(calls.includes('https://cq.example.test/api/v1/concurrency/precheck'), false);
   } finally {
@@ -4958,9 +5010,8 @@ test('dual mode treats CQ failure after fairqueue admission as unavailable and r
       expireOffsetSeconds: 1,
       payloadExpireTime: expireAtSeconds,
     }), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed' });
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 503);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.equal(calls.includes('concurrency-acquire'), true);
     assert.equal(calls.includes('origin-fetch'), false);
@@ -5034,10 +5085,9 @@ test('dual mode client-aborted CQ acquire releases the fairqueue grant as unused
     const { ctx, waitUntilPromises } = createTestContext();
     const request = await buildSignedWorkerRequest({ signal: abortController.signal });
     const response = await worker.fetch(request, buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 499, reason: 'client_aborted' });
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 499);
     assert.equal(body.message, 'client aborted request');
     assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
     assert.equal(fairQueueReleaseBodies.length, 1);
@@ -5096,8 +5146,7 @@ test('non-positive payloadSign expiry is rejected before admission handlers run'
     const response = await worker.fetch(await buildSignedWorkerRequest({
       payloadSignExpire: 0,
     }), buildWorkerEnv(), createTestContext().ctx);
-    const body = await readJson(response);
-    assert.equal(response.status, 401);
+    const body = await assertJsonError(response, { status: 401, reason: 'payload_sign_invalid' });
     assert.match(body.message, /payloadsign expire invalid/i);
     assert.equal(calls.includes('https://cq.example.test/api/v1/concurrency/precheck'), false);
     assert.equal(calls.includes('https://cq.example.test/api/v1/concurrency/acquire'), false);
@@ -5150,9 +5199,7 @@ for (const idlePolicy of ['first_use', 'renewable']) {
         buildWorkerEnv(),
         createTestContext().ctx,
       );
-      const body = await readJson(response);
-
-      assert.equal(response.status, 410);
+      const body = await assertJsonError(response, { status: 410, reason: 'ticket_state_expired' });
       assert.equal(body.message, 'Link expired due to inactivity');
       assert.equal(ticketStateRpcState.readBodies.length, 1);
       assert.equal(ticketStateRpcState.markBodies.length, 0);
@@ -5206,9 +5253,7 @@ test('unused first_use ticket with row idle_timeout_seconds 0 is denied immediat
       buildWorkerEnv(),
       createTestContext().ctx,
     );
-    const body = await readJson(response);
-
-    assert.equal(response.status, 410);
+    const body = await assertJsonError(response, { status: 410, reason: 'ticket_state_expired' });
     assert.equal(body.message, 'Link expired due to inactivity');
     assert.equal(ticketStateRpcState.readBodies.length, 1);
     assert.equal(ticketStateRpcState.markBodies.length, 0);
@@ -5263,9 +5308,7 @@ test('renewable ticket rejects after first use when idle_lease_expires_at is in 
       buildWorkerEnv(),
       createTestContext().ctx,
     );
-    const body = await readJson(response);
-
-    assert.equal(response.status, 401);
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     assert.equal(body.message, 'link expired');
     assert.equal(ticketStateRpcState.markBodies.length, 0);
   } finally {
@@ -5318,9 +5361,7 @@ test('renewable ticket rejects after first use when idle_lease_expires_at is abs
       buildWorkerEnv(),
       createTestContext().ctx,
     );
-    const body = await readJson(response);
-
-    assert.equal(response.status, 401);
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     assert.equal(body.message, 'link expired');
     assert.equal(ticketStateRpcState.markBodies.length, 0);
   } finally {
@@ -6303,9 +6344,10 @@ test('numeric-ish signed payload expireTime and idle_timeout fields are rejected
         buildWorkerEnv(),
         createTestContext().ctx,
       );
-      const body = await readJson(response);
-
-      assert.equal(response.status, 401, testCase.label);
+      const body = await assertJsonError(response, {
+        status: 401,
+        reason: testCase.label.startsWith('expireTime') ? 'payload_expired' : 'payload_idle_timeout_invalid',
+      });
       assert.equal(body.message, testCase.expectedMessage, testCase.label);
       assert.equal(ticketStateRpcState.readBodies.length, 0, testCase.label);
       assert.equal(ticketStateRpcState.markBodies.length, 0, testCase.label);
@@ -6361,9 +6403,7 @@ test('missing ticket-state row is rejected as unauthorized protocol mismatch', a
       buildWorkerEnv(),
       createTestContext().ctx,
     );
-    const body = await readJson(response);
-
-    assert.equal(response.status, 401);
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_invalid' });
     assert.equal(body.message, 'ticket state missing');
     assert.equal(ticketStateRpcState.readBodies.length, 1);
     assert.equal(ticketStateRpcState.markBodies.length, 0);
@@ -6372,6 +6412,17 @@ test('missing ticket-state row is rejected as unauthorized protocol mismatch', a
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
+});
+
+test('ticket-state configuration failure does not serialize configuration diagnostics', async () => {
+  const sentinel = 'ticket-config-sentinel-must-not-reach-client';
+  const response = __fairQueueTestHooks.createTicketStateConfigurationFailureResponse(
+    'https://landing.example.com',
+    new Error(sentinel),
+  );
+  const body = await assertJsonError(response, { status: 500, reason: 'ticket_state_invalid' });
+  assert.equal(body.message, 'Ticket state configuration is invalid');
+  assert.equal(JSON.stringify(body).includes(sentinel), false);
 });
 
 test('missing or malformed ticketNonce is rejected before ticket-state read', async () => {
@@ -6426,9 +6477,7 @@ test('missing or malformed ticketNonce is rejected before ticket-state read', as
         buildWorkerEnv(),
         createTestContext().ctx,
       );
-      const body = await readJson(response);
-
-      assert.equal(response.status, 401);
+      const body = await assertJsonError(response, { status: 401, reason: 'payload_ticket_nonce_invalid' });
       assert.equal(body.message, 'payload ticketNonce invalid');
       assert.equal(ticketStateRpcState.readBodies.length, 0);
       assert.equal(ticketStateRpcState.markBodies.length, 0);
@@ -6551,9 +6600,7 @@ test('content response fails when mark ticket used returns storage_error', async
       buildWorkerEnv(),
       createTestContext().ctx,
     );
-    const body = await readJson(response);
-
-    assert.equal(response.status, 502);
+    const body = await assertJsonError(response, { status: 502, reason: 'ticket_state_invalid' });
     assert.equal(body.message, 'ticket state update failed');
     assert.equal(ticketStateRpcState.markBodies.length, 1);
     assert.equal(originBody.cancelled, true);
@@ -6808,9 +6855,8 @@ test('true concurrency acquire success followed by origin fetch failure releases
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    const body = await readJson(response);
-    assert.equal(response.status, 500);
-    assert.match(body.message, /origin fetch failed/);
+    const body = await assertJsonError(response, { status: 500, reason: 'internal_error' });
+    assert.equal(body.message.includes('origin fetch failed'), false);
     assert.deepEqual(calls.slice(-2), ['concurrency-release', 'fairqueue-release']);
   } finally {
     globalThis.fetch = originalFetch;
@@ -8011,8 +8057,70 @@ test('true concurrency header-only response releases immediately', async () => {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     assert.equal(response.status, 204);
+    assert.equal(await response.text(), '');
+    assert.equal(response.headers.get('Content-Type'), 'application/octet-stream');
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-release']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('true concurrency maps direct upstream 429 with coupled retry-after before releasing the lease', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ trueConcurrencyHostPatterns: ['*.sharepoint.com'] }));
+    }
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({ code: 200, data: { url: 'https://tenant.sharepoint.com/file', header: {} } });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      calls.push('concurrency-acquire');
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-upstream-429',
+        leaseToken: 'token-upstream-429',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-upstream-429',
+      });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      calls.push('concurrency-claim');
+      return createClaimGrantResponseFromRequest(init);
+    }
+    if (url === 'https://tenant.sharepoint.com/file') {
+      calls.push('origin-fetch-429');
+      return new Response('unique-direct-cq-429-body', {
+        status: 429,
+        headers: { 'content-type': 'text/plain', 'Retry-After': '8' },
+      });
+    }
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      calls.push('concurrency-release');
+      return createJsonResponse({ result: 'released' });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
+    const body = await assertJsonError(response, {
+      status: 503,
+      reason: 'upstream_rate_limited',
+      upstreamStatus: 429,
+      retryAfter: '8',
+    });
+    await Promise.allSettled(waitUntilPromises);
+    assert.equal(JSON.stringify(body).includes('unique-direct-cq-429-body'), false);
+    assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-claim', 'origin-fetch-429', 'concurrency-release']);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -8682,9 +8790,7 @@ test('true concurrency acquire abort returns 499 client abort response', async (
     abortController.abort();
 
     const response = await workerPromise;
-    const body = await readJson(response);
-
-    assert.equal(response.status, 499);
+    const body = await assertJsonError(response, { status: 499, reason: 'client_aborted' });
     assert.equal(body.message, 'client aborted request');
     assert.deepEqual(calls, ['concurrency-acquire']);
   } finally {
@@ -9704,10 +9810,8 @@ test('CQ SSE wait elapsed budget exhaustion relies on server-owned disconnect cl
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_wait_budget_exhausted' });
     await Promise.allSettled(waitUntilPromises);
-
-    assert.equal(response.status, 503);
     assert.match(body.message, /wait budget exhausted/i);
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse']);
     assert.equal(waitRequest?.waitToken, 'wait-budget-elapsed-1');
@@ -9799,7 +9903,7 @@ test('concurrency wait disconnect ends as terminal waiter death before origin fe
     const response = await worker.fetch(request, buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
 
-    assert.equal(response.status, 499);
+    await assertJsonError(response, { status: 499, reason: 'client_aborted' });
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse']);
     assert.equal(waitAccepted, true);
     assert.equal(waitStreamCancelled, true);
@@ -9875,10 +9979,8 @@ test('client-aborted CQ SSE wait remains terminal before origin fetch', async ()
     const { ctx, waitUntilPromises } = createTestContext();
     const request = await buildSignedWorkerRequest({ signal: abortController.signal });
     const response = await worker.fetch(request, buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 499, reason: 'client_aborted' });
     await Promise.allSettled(waitUntilPromises);
-
-    assert.equal(response.status, 499);
     assert.equal(body.message, 'client aborted request');
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse']);
     assert.equal(waitRequest?.waitToken, 'wait-client-abort-1');
@@ -9964,10 +10066,8 @@ test('queue_only aborts CQ wait without cancel when unused fairqueue release can
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 503, reason: 'fq_unavailable' });
     await Promise.allSettled(waitUntilPromises);
-
-    assert.equal(response.status, 503);
     assert.match(body.message, /fair queue/i);
     assert.deepEqual(calls.slice(0, 3), [
       'fairqueue-wait',
@@ -10072,10 +10172,8 @@ test('queue_breaker aborts CQ wait without cancel when breaker settlement fails 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await readJson(response);
+    const body = await assertJsonError(response, { status: 503, reason: 'breaker_settle_failed' });
     await Promise.allSettled(waitUntilPromises);
-
-    assert.equal(response.status, 503);
     assert.match(body.message, /attempt settlement/i);
     assert.deepEqual(calls, [
       'fairqueue-wait',
@@ -10111,19 +10209,22 @@ test('true concurrency wait terminal SSE results map to existing terminal surfac
         name: 'cancelled',
         finalPayload: { result: 'cancelled', reason: 'request_cancelled' },
         expectedStatus: 503,
-        expectedMessagePattern: /true concurrency cancelled/i,
+        expectedMessage: 'True concurrency unavailable',
+        privateMarker: 'request_cancelled',
       },
       {
         name: 'released',
         finalPayload: { result: 'released', reason: 'already_released' },
         expectedStatus: 503,
-        expectedMessagePattern: /true concurrency released/i,
+        expectedMessage: 'True concurrency unavailable',
+        privateMarker: 'already_released',
       },
       {
         name: 'conflict',
         finalPayload: { result: 'conflict', reason: 'stale_wait_token' },
         expectedStatus: 503,
-        expectedMessagePattern: /true concurrency conflict/i,
+        expectedMessage: 'True concurrency unavailable',
+        privateMarker: 'stale_wait_token',
       },
     ]) {
       const calls = [];
@@ -10175,15 +10276,15 @@ test('true concurrency wait terminal SSE results map to existing terminal surfac
 
       const { ctx, waitUntilPromises } = createTestContext();
       const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-      const body = await readJson(response);
-      await Promise.allSettled(waitUntilPromises);
-
-      assert.equal(response.status, scenario.expectedStatus, scenario.name);
-      if (scenario.expectedMessage) {
-        assert.equal(body.message, scenario.expectedMessage, scenario.name);
-      } else {
-        assert.match(body.message, scenario.expectedMessagePattern, scenario.name);
+      if (scenario.privateMarker) {
+        await assertNoPublicDiagnosticMarker(response, scenario.privateMarker);
       }
+      const body = await assertJsonError(response, {
+        status: scenario.expectedStatus,
+        reason: scenario.name === 'expired' ? 'ticket_state_expired' : 'cq_terminal',
+      });
+      await Promise.allSettled(waitUntilPromises);
+      assert.equal(body.message, scenario.expectedMessage, scenario.name);
       assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse'], scenario.name);
       assert.equal(waitRequest?.waitToken, 'wait-token-terminal', scenario.name);
       assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true, scenario.name);
@@ -10394,11 +10495,7 @@ test('Google Drive HEAD range probes fail safely and cancel body when upstream r
     });
 
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    assert.notEqual(response.status, 200);
-    assert.equal(await response.text(), JSON.stringify({
-      code: 502,
-      message: 'Google Drive HEAD probe invalid',
-    }));
+    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid' });
     assert.equal(originBody.cancelled, true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -10449,11 +10546,7 @@ test('Google Drive HEAD range probes fail safely and cancel body when Content-Ra
     });
 
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    assert.notEqual(response.status, 200);
-    assert.equal(await response.text(), JSON.stringify({
-      code: 502,
-      message: 'Google Drive HEAD probe invalid',
-    }));
+    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid' });
     assert.equal(originBody.cancelled, true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -10505,11 +10598,7 @@ test('Google Drive HEAD range probes fail safely and cancel body when Content-Ra
     });
 
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    assert.notEqual(response.status, 200);
-    assert.equal(await response.text(), JSON.stringify({
-      code: 502,
-      message: 'Google Drive HEAD probe invalid',
-    }));
+    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid' });
     assert.equal(originBody.cancelled, true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -10622,7 +10711,7 @@ test('Google Drive HEAD probe failure waits for in-flight fairqueue header relea
     finishHeaderRelease();
     const response = await responsePromise;
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 502);
+    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid' });
     assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.equal(releaseBodies[0].slotToken, 'slot-invalid-head');
@@ -11148,8 +11237,7 @@ test('Google Drive GET downloads do not rewrite partial 206 responses that do no
       createTestContext().ctx,
     );
 
-    assert.notEqual(response.status, 206);
-    assert.notEqual(await response.text(), 'partial-body');
+    await assertJsonError(response, { status: 502, reason: 'google_drive_range_mismatch' });
     assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -11204,8 +11292,7 @@ test('Google Drive GET downloads reject synthetic full-range 206 responses with 
       createTestContext().ctx,
     );
 
-    assert.notEqual(response.status, 206);
-    assert.notEqual(await response.text(), 'partial-body');
+    await assertJsonError(response, { status: 502, reason: 'google_drive_range_mismatch' });
     assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
     assert.equal(originBody.cancelled, true);
   } finally {
@@ -11320,7 +11407,7 @@ test('Google Drive full-range mismatch waits for in-flight fairqueue header rele
     finishHeaderRelease();
     const response = await responsePromise;
     await Promise.allSettled(waitUntilPromises);
-    assert.equal(response.status, 502);
+    await assertJsonError(response, { status: 502, reason: 'google_drive_range_mismatch' });
     assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.equal(releaseBodies[0].slotToken, 'slot-range-mismatch');
@@ -12114,8 +12201,12 @@ test('breaker authority uses actual Google Drive hostnames', async () => {
       firstCtx.ctx,
     );
     waitUntilPromises.push(...firstCtx.waitUntilPromises);
-    assert.equal(firstResponse.status, 429);
-    await firstResponse.text();
+    await assertJsonError(firstResponse, {
+      status: 503,
+      reason: 'upstream_rate_limited',
+      upstreamStatus: 429,
+      retryAfter: '8',
+    });
 
     const secondCtx = createTestContext();
     const secondResponse = await worker.fetch(

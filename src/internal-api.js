@@ -1,4 +1,5 @@
 import { logEvent } from './logging.js';
+import { createJsonErrorResponse } from './http/json-error.js';
 
 const CONTROL_PREFIX = '/api/v0/';
 
@@ -92,7 +93,11 @@ export async function handleInternalApiIfAny(request, env, ctx) {
     return handleFlush(request, env, ctx);
   }
 
-  return new Response(null, { status: 404 });
+  return createJsonErrorResponse({
+    status: 404,
+    message: 'Internal API endpoint not found',
+    reason: 'internal_api_not_found',
+  });
 }
 
 function handleHealth(env) {

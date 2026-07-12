@@ -1266,9 +1266,12 @@ test('fair queue setup-time JSON conflict returns terminal response without rele
 
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), {
-      code: 503,
+      status: 503,
       message: 'Upstream queue timeout, please retry later',
+      reason: 'fq_conflict',
+      'retry-after': '60',
     });
+    assert.equal(response.headers.get('Retry-After'), '60');
     await waitForNextTurn();
     await Promise.allSettled(waitUntilPromises);
     await waitForNextTurn();
