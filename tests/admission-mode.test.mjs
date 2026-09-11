@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { encryptBindingPayload } from '../src/origin-binding.js';
+import { addDownloadEnvelope, createCacheRpcFixture } from './cache-rpc-fixture.mjs';
 import worker, { __fairQueueTestHooks } from '../src/worker.js';
 
 const { resolveConfig, resolveAdmissionMode } = __fairQueueTestHooks;
@@ -386,7 +387,7 @@ const buildRuntimeBootstrap = ({ fairQueueHostPatterns = [], throttleHostPattern
       postgrestUrl: 'https://postgrest.example.test',
       verifyHeader: ['X-Verify'],
       verifySecret: ['secret'],
-      cacheEnabled: false,
+      cacheEnabled: true,
     },
     throttleProfiles: {
       default: {
@@ -437,12 +438,28 @@ const buildEnv = () => ({
 const wrappedFetch = globalThis.fetch;
 const wrappedFetchBound = typeof wrappedFetch === 'function' ? wrappedFetch.bind(globalThis) : wrappedFetch;
 let delegatedFetch = wrappedFetchBound;
+const cacheRpc = createCacheRpcFixture();
 
 const fetchWithDefaultTicketStateRpc = async (input, init = {}) => {
   const url = typeof input === 'string' ? input : input.url;
+  const cacheResponse = await cacheRpc.handle(input, init);
+  if (cacheResponse) {
+    return cacheResponse;
+  }
   const ticketStateResponse = await handleTicketStateRpc(url, init);
   if (ticketStateResponse) {
     return ticketStateResponse;
+  }
+  if (url === 'https://alist.example.com/api/fs/link') {
+    let action = null;
+    try {
+      action = JSON.parse(init.body || '{}')?.action;
+    } catch (_error) {
+      action = null;
+    }
+    if (action === 'report') {
+      return createJsonResponse({ code: 200, data: { applied: true, duplicate: false, stale: false } });
+    }
   }
   if (url === HEARTBEAT_URL) {
     try {
@@ -461,7 +478,7 @@ const fetchWithDefaultTicketStateRpc = async (input, init = {}) => {
   if (typeof delegatedFetch !== 'function') {
     throw new Error('global fetch handler not configured');
   }
-  return delegatedFetch(input, init);
+  return addDownloadEnvelope(await delegatedFetch(input, init));
 };
 
 Object.defineProperty(globalThis, 'fetch', {
@@ -472,6 +489,7 @@ Object.defineProperty(globalThis, 'fetch', {
   },
   set(value) {
     resetTicketStateRpcState();
+    cacheRpc.reset();
     if (value === fetchWithDefaultTicketStateRpc) {
       delegatedFetch = wrappedFetchBound;
       return;
@@ -827,12 +845,11 @@ test('breaker_only settles authorized origin fetch throws before returning the w
     },
   });
 
-  assert.equal(response.status, 500);
-  assert.deepEqual(JSON.parse(responseBodyText), {
-    status: 500,
-    message: 'An internal error occurred',
-    reason: 'internal_error',
-  });
+  assert.equal(response.status, 503);
+  const transportBody = JSON.parse(responseBodyText);
+  assert.equal(transportBody.reason, 'upstream_transport_error');
+  assert.equal(transportBody['retry-after'], '30');
+  assert.equal(response.headers.get('Retry-After'), '30');
   assert.equal(calls.wait, 0);
   assert.equal(calls.authorize, 1);
   assert.deepEqual(reportBodies, []);
@@ -896,6 +913,7 @@ test('queue_breaker preserves the breaker settlement response when origin fetch 
     status: 503,
     message: 'Throttle breaker authority unavailable during attempt settlement',
     reason: 'breaker_settle_failed',
+    'retry-after': '30',
   });
   assert.equal(calls.wait, 1);
   assert.equal(calls.release, 1);

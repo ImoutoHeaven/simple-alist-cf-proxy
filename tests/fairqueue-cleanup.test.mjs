@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { __fairQueueTestHooks } from '../src/worker.js';
 import { encryptBindingPayload } from '../src/origin-binding.js';
+import { addDownloadEnvelope, createCacheRpcFixture } from './cache-rpc-fixture.mjs';
 
 const { createSlotHandlerClient } = __fairQueueTestHooks;
 
@@ -244,7 +245,7 @@ const buildRuntimeBootstrap = ({ fairQueueHostPatterns = [] } = {}) => ({
       postgrestUrl: 'https://postgrest.example.test',
       verifyHeader: ['X-Verify'],
       verifySecret: ['secret'],
-      cacheEnabled: false,
+      cacheEnabled: true,
       cleanupPercentage: 0,
     },
     throttleProfiles: {
@@ -326,9 +327,14 @@ const buildWorkerEnv = () => ({
 const wrappedFetch = globalThis.fetch;
 const wrappedFetchBound = typeof wrappedFetch === 'function' ? wrappedFetch.bind(globalThis) : wrappedFetch;
 let delegatedFetch = wrappedFetchBound;
+const cacheRpc = createCacheRpcFixture();
 
 const fetchWithDefaultTicketStateRpc = async (input, init = {}) => {
   const url = typeof input === 'string' ? input : input.url;
+  const cacheResponse = await cacheRpc.handle(input, init);
+  if (cacheResponse) {
+    return cacheResponse;
+  }
   const ticketStateResponse = await handleTicketStateRpc(url, init);
   if (ticketStateResponse) {
     return ticketStateResponse;
@@ -336,7 +342,7 @@ const fetchWithDefaultTicketStateRpc = async (input, init = {}) => {
   if (typeof delegatedFetch !== 'function') {
     throw new Error('global fetch handler not configured');
   }
-  return delegatedFetch(input, init);
+  return addDownloadEnvelope(await delegatedFetch(input, init));
 };
 
 Object.defineProperty(globalThis, 'fetch', {
@@ -347,6 +353,7 @@ Object.defineProperty(globalThis, 'fetch', {
   },
   set(value) {
     resetTicketStateRpcState();
+    cacheRpc.reset();
     if (value === fetchWithDefaultTicketStateRpc) {
       delegatedFetch = wrappedFetchBound;
       return;

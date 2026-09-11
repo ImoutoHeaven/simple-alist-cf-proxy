@@ -16,6 +16,14 @@ export function createJsonErrorResponse({
   }
   if (retryAfter !== undefined) {
     responseHeaders.set('Retry-After', retryAfter);
+    const exposed = responseHeaders.get('Access-Control-Expose-Headers');
+    const exposedHeaders = exposed
+      ? exposed.split(',').map((header) => header.trim()).filter(Boolean)
+      : [];
+    if (!exposedHeaders.some((header) => header.toLowerCase() === 'retry-after')) {
+      exposedHeaders.push('Retry-After');
+    }
+    responseHeaders.set('Access-Control-Expose-Headers', exposedHeaders.join(', '));
     body['retry-after'] = retryAfter;
   }
 

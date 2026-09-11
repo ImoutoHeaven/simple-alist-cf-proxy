@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1727,5 +1728,581 @@ func TestInitSQLRuntimeAdmitBatchOpenMetadataMatchesCanonicalAuthorizeAfterConcu
 	}
 	if authorizeAttemptTicket.Valid {
 		t.Fatalf("expected breaker_only authorize to omit attempt ticket while open, got %v", authorizeAttemptTicket)
+	}
+}
+
+func TestInitSQLRuntimeDownloadCacheCoordination(t *testing.T) {
+	db := requireRuntimeBreakerDB(t)
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `TRUNCATE TABLE "DOWNLOAD_CACHE_TABLE", "DOWNLOAD_CACHE_REFRESH"`); err != nil {
+		t.Fatalf("truncate download cache tables: %v", err)
+	}
+
+	type acquireResult struct {
+		result      string
+		leaseID     sql.NullString
+		leaseActive sql.NullBool
+		version     sql.NullString
+		invalid     sql.NullString
+		retryActive sql.NullBool
+	}
+	acquire := func(pathHash, observedVersion string) (acquireResult, error) {
+		var result acquireResult
+		var row *sql.Row
+		if observedVersion == "" {
+			row = db.QueryRowContext(ctx, `
+				SELECT result, lease_id::text, (lease_until > clock_timestamp()), version::text,
+				       invalid_version::text, (retry_after > clock_timestamp())
+				FROM download_acquire_cache_refresh($1, NULL::uuid, 1800, 'DOWNLOAD_CACHE_TABLE')
+			`, pathHash)
+		} else {
+			row = db.QueryRowContext(ctx, `
+				SELECT result, lease_id::text, (lease_until > clock_timestamp()), version::text,
+				       invalid_version::text, (retry_after > clock_timestamp())
+				FROM download_acquire_cache_refresh($1, $2::uuid, 1800, 'DOWNLOAD_CACHE_TABLE')
+			`, pathHash, observedVersion)
+		}
+		err := row.Scan(
+			&result.result,
+			&result.leaseID,
+			&result.leaseActive,
+			&result.version,
+			&result.invalid,
+			&result.retryActive,
+		)
+		return result, err
+	}
+
+	type stateResult struct {
+		result  string
+		link    sql.NullString
+		version sql.NullString
+		lease   sql.NullString
+		invalid sql.NullString
+		backoff sql.NullBool
+	}
+	state := func(pathHash string) (stateResult, error) {
+		var result stateResult
+		err := db.QueryRowContext(ctx, `
+			SELECT result, link_data, version::text, lease_id::text, invalid_version::text,
+			       (retry_after > clock_timestamp())
+			FROM download_get_cache_state($1, 1800, 'DOWNLOAD_CACHE_TABLE')
+		`, pathHash).Scan(
+			&result.result,
+			&result.link,
+			&result.version,
+			&result.lease,
+			&result.invalid,
+			&result.backoff,
+		)
+		return result, err
+	}
+
+	type rowQuerier interface {
+		QueryRowContext(context.Context, string, ...any) *sql.Row
+	}
+	finishWith := func(queryer rowQuerier, pathHash, leaseID, linkData, failedVersion string, errorCode *int) (string, sql.NullString, error) {
+		var result string
+		var version sql.NullString
+		var retryAfter sql.NullString
+		var lastError sql.NullInt64
+		var linkArg any
+		if linkData != "" {
+			linkArg = linkData
+		}
+		var failedArg any
+		if failedVersion != "" {
+			failedArg = failedVersion
+		}
+		var codeArg any
+		if errorCode != nil {
+			codeArg = *errorCode
+		}
+		err := queryer.QueryRowContext(ctx, `
+			SELECT result, version::text, retry_after::text, last_error_code
+			FROM download_finish_cache_refresh(
+				$1, $2::uuid, $3, $4, 'runtime-cache-host', $5::uuid, $6, 'DOWNLOAD_CACHE_TABLE'
+			)
+		`, pathHash, leaseID, linkArg, pathHash, failedArg, codeArg).Scan(
+			&result,
+			&version,
+			&retryAfter,
+			&lastError,
+		)
+		return result, version, err
+	}
+	finish := func(pathHash, leaseID, linkData, failedVersion string, errorCode *int) (string, sql.NullString, error) {
+		return finishWith(db, pathHash, leaseID, linkData, failedVersion, errorCode)
+	}
+
+	linkOne := `{"url":"https://signed.example.test/one","header":{},"size":5,"download":{"provider":"generic","ticket":"test-ticket-one-abcdefghijklmnopqrstuvwxyz","expires_at":4102444800,"report_success":false}}`
+	linkTwo := `{"url":"https://signed.example.test/two","header":{},"size":5,"download":{"provider":"generic","ticket":"test-ticket-two-abcdefghijklmnopqrstuvwxyz","expires_at":4102444800,"report_success":false}}`
+
+	initial, err := state("cache-basic-path")
+	if err != nil {
+		t.Fatalf("read initial cache state: %v", err)
+	}
+	if initial.result != "missing" {
+		t.Fatalf("expected initial cache state missing, got %+v", initial)
+	}
+
+	owner, err := acquire("cache-basic-path", "")
+	if err != nil {
+		t.Fatalf("acquire initial cache owner: %v", err)
+	}
+	if owner.result != "acquired" || !owner.leaseID.Valid || !owner.leaseActive.Valid || !owner.leaseActive.Bool {
+		t.Fatalf("expected acquired owner with live lease, got %+v", owner)
+	}
+	waiter, err := acquire("cache-basic-path", "")
+	if err != nil {
+		t.Fatalf("acquire waiting cache caller: %v", err)
+	}
+	if waiter.result != "wait" || waiter.leaseID.String != owner.leaseID.String {
+		t.Fatalf("expected waiter to observe owner lease, owner=%+v waiter=%+v", owner, waiter)
+	}
+
+	finished, _, err := finish("cache-basic-path", owner.leaseID.String, linkOne, "", nil)
+	if err != nil || finished != "committed" {
+		t.Fatalf("publish initial cache link: result=%q err=%v", finished, err)
+	}
+	duplicate, _, err := finish("cache-basic-path", owner.leaseID.String, linkOne, "", nil)
+	if err != nil || duplicate != "duplicate" {
+		t.Fatalf("duplicate cache finish: result=%q err=%v", duplicate, err)
+	}
+	ready, err := state("cache-basic-path")
+	if err != nil || ready.result != "ready" || ready.link.String != linkOne {
+		t.Fatalf("expected ready cache after publish, state=%+v err=%v", ready, err)
+	}
+
+	quotedExpiryOwner, err := acquire("cache-invalid-quoted-expiry", "")
+	if err != nil || quotedExpiryOwner.result != "acquired" {
+		t.Fatalf("acquire quoted-expiry owner: result=%+v err=%v", quotedExpiryOwner, err)
+	}
+	quotedExpiryLink := `{"url":"https://signed.example.test/quoted-expiry","header":{},"size":5,"download":{"provider":"generic","ticket":"test-ticket-quoted-expiry-abcdefghijklmnopqrstuvwxyz","expires_at":"4102444800","report_success":false}}`
+	quotedResult, _, err := finish("cache-invalid-quoted-expiry", quotedExpiryOwner.leaseID.String, quotedExpiryLink, "", nil)
+	if err != nil || quotedResult != "invalid" {
+		t.Fatalf("quoted numeric expiry should reject publication, result=%q err=%v", quotedResult, err)
+	}
+	var quotedExpiryRows int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM "DOWNLOAD_CACHE_TABLE" WHERE "PATH_HASH" = 'cache-invalid-quoted-expiry'`).Scan(&quotedExpiryRows); err != nil {
+		t.Fatalf("count quoted-expiry cache row: %v", err)
+	}
+	if quotedExpiryRows != 0 {
+		t.Fatalf("quoted numeric expiry mutated cache, rows=%d", quotedExpiryRows)
+	}
+
+	databaseExpiredOwner, err := acquire("cache-invalid-database-expiry", "")
+	if err != nil || databaseExpiredOwner.result != "acquired" {
+		t.Fatalf("acquire database-expired owner: result=%+v err=%v", databaseExpiredOwner, err)
+	}
+	databaseExpiredLink := `{"url":"https://signed.example.test/database-expired","header":{},"size":5,"download":{"provider":"generic","ticket":"test-ticket-database-expired-abcdefghijklmnopqrstuvwxyz","expires_at":1,"report_success":false}}`
+	databaseExpiredResult, _, err := finish("cache-invalid-database-expiry", databaseExpiredOwner.leaseID.String, databaseExpiredLink, "", nil)
+	if err != nil || databaseExpiredResult != "invalid" {
+		t.Fatalf("database-expired numeric expiry should reject publication, result=%q err=%v", databaseExpiredResult, err)
+	}
+	var databaseExpiredRows int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM "DOWNLOAD_CACHE_TABLE" WHERE "PATH_HASH" = 'cache-invalid-database-expiry'`).Scan(&databaseExpiredRows); err != nil {
+		t.Fatalf("count database-expired cache row: %v", err)
+	}
+	if databaseExpiredRows != 0 {
+		t.Fatalf("database-expired numeric expiry mutated cache, rows=%d", databaseExpiredRows)
+	}
+	validAfterInvalid, _, err := finish("cache-invalid-database-expiry", databaseExpiredOwner.leaseID.String, linkOne, "", nil)
+	if err != nil || validAfterInvalid != "committed" {
+		t.Fatalf("valid publication should remain possible after rejected expiry, result=%q err=%v", validAfterInvalid, err)
+	}
+	readyAfterInvalid, err := state("cache-invalid-database-expiry")
+	if err != nil || readyAfterInvalid.result != "ready" || readyAfterInvalid.link.String != linkOne {
+		t.Fatalf("valid retry after rejected expiry was not published, state=%+v err=%v", readyAfterInvalid, err)
+	}
+
+	expiredOwner, err := acquire("cache-expired-lease-path", "")
+	if err != nil || expiredOwner.result != "acquired" {
+		t.Fatalf("acquire expired-lease owner: result=%+v err=%v", expiredOwner, err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE "DOWNLOAD_CACHE_REFRESH" SET "LEASE_UNTIL" = clock_timestamp() - INTERVAL '1 second' WHERE "PATH_HASH" = 'cache-expired-lease-path'`); err != nil {
+		t.Fatalf("expire cache lease: %v", err)
+	}
+	expiredTakeover, err := acquire("cache-expired-lease-path", "")
+	if err != nil || expiredTakeover.result != "acquired" || expiredTakeover.leaseID.String == expiredOwner.leaseID.String {
+		t.Fatalf("expected expired lease takeover, owner=%+v takeover=%+v err=%v", expiredOwner, expiredTakeover, err)
+	}
+	staleExpired, _, err := finish("cache-expired-lease-path", expiredOwner.leaseID.String, linkTwo, "", nil)
+	if err != nil || staleExpired != "stale" {
+		t.Fatalf("expected expired owner finish after takeover, result=%q err=%v", staleExpired, err)
+	}
+	if _, _, err := finish("cache-expired-lease-path", expiredTakeover.leaseID.String, linkTwo, "", nil); err != nil {
+		t.Fatalf("publish expired-lease takeover link: %v", err)
+	}
+
+	takeover, err := acquire("cache-basic-path", owner.leaseID.String)
+	if err != nil || takeover.result != "acquired" || takeover.leaseID.String == owner.leaseID.String || takeover.invalid.String != owner.leaseID.String {
+		t.Fatalf("expected observed-version replacement owner, owner=%+v takeover=%+v err=%v", owner, takeover, err)
+	}
+	stale, _, err := finish("cache-basic-path", owner.leaseID.String, linkTwo, "", nil)
+	if err != nil || stale != "duplicate" {
+		t.Fatalf("expected old publication retry to be idempotent while replacement is pending, result=%q err=%v", stale, err)
+	}
+	if _, _, err := finish("cache-basic-path", takeover.leaseID.String, linkTwo, "", nil); err != nil {
+		t.Fatalf("publish takeover link: %v", err)
+	}
+	replacement, err := acquire("cache-basic-path", takeover.leaseID.String)
+	if err != nil || replacement.result != "acquired" || replacement.invalid.String != takeover.leaseID.String {
+		t.Fatalf("expected observed version invalidation and replacement owner, result=%+v err=%v", replacement, err)
+	}
+	if _, _, err := finish("cache-basic-path", replacement.leaseID.String, linkOne, "", nil); err != nil {
+		t.Fatalf("publish replacement link: %v", err)
+	}
+	lateFailureCode := 503
+	lateFailure, _, err := finish("cache-basic-path", takeover.leaseID.String, "", takeover.leaseID.String, &lateFailureCode)
+	if err != nil || lateFailure != "stale" {
+		t.Fatalf("expected late failure to be fenced, result=%q err=%v", lateFailure, err)
+	}
+	ready, err = state("cache-basic-path")
+	if err != nil || ready.result != "ready" || ready.link.String != linkOne {
+		t.Fatalf("stale failure replaced cache unexpectedly, state=%+v err=%v", ready, err)
+	}
+
+	failedOwner, err := acquire("cache-empty-failure", "")
+	if err != nil || failedOwner.result != "acquired" {
+		t.Fatalf("acquire empty failure owner: result=%+v err=%v", failedOwner, err)
+	}
+	backoffCode := 429
+	failedResult, _, err := finish("cache-empty-failure", failedOwner.leaseID.String, "", "", &backoffCode)
+	if err != nil || failedResult != "committed" {
+		t.Fatalf("commit empty cache failure: result=%q err=%v", failedResult, err)
+	}
+	backoff, err := state("cache-empty-failure")
+	if err != nil || backoff.result != "backoff" || !backoff.backoff.Valid || !backoff.backoff.Bool {
+		t.Fatalf("expected active empty-cache backoff, state=%+v err=%v", backoff, err)
+	}
+	blocked, err := acquire("cache-empty-failure", "")
+	if err != nil || blocked.result != "backoff" {
+		t.Fatalf("expected backoff acquisition denial, result=%+v err=%v", blocked, err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE "DOWNLOAD_CACHE_REFRESH" SET "RETRY_AFTER" = clock_timestamp() - INTERVAL '1 second' WHERE "PATH_HASH" = 'cache-empty-failure'`); err != nil {
+		t.Fatalf("expire cache backoff: %v", err)
+	}
+	recovered, err := acquire("cache-empty-failure", "")
+	if err != nil || recovered.result != "acquired" || recovered.leaseID.String == failedOwner.leaseID.String {
+		t.Fatalf("expected expired backoff takeover, result=%+v err=%v", recovered, err)
+	}
+
+	const contentionCallers = 16
+	contentionResults := make(chan acquireResult, contentionCallers)
+	contentionErrors := make(chan error, contentionCallers)
+	var wg sync.WaitGroup
+	for i := 0; i < contentionCallers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, queryErr := acquire("cache-contention-path", "")
+			contentionResults <- result
+			contentionErrors <- queryErr
+		}()
+	}
+	wg.Wait()
+	close(contentionResults)
+	close(contentionErrors)
+	acquiredCount := 0
+	waitCount := 0
+	for result := range contentionResults {
+		switch result.result {
+		case "acquired":
+			acquiredCount++
+		case "wait":
+			waitCount++
+		default:
+			t.Fatalf("unexpected contention result: %+v", result)
+		}
+	}
+	for queryErr := range contentionErrors {
+		if queryErr != nil {
+			t.Fatalf("contention acquisition error: %v", queryErr)
+		}
+	}
+	if acquiredCount != 1 || waitCount != contentionCallers-1 {
+		t.Fatalf("expected one contention owner and %d waiters, acquired=%d waiters=%d", contentionCallers-1, acquiredCount, waitCount)
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO "DOWNLOAD_CACHE_TABLE" ("PATH_HASH", "PATH", "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH", "VERSION")
+		VALUES ('cache-cleanup-readable-invalid', '/cleanup-readable-invalid', $1, EXTRACT(EPOCH FROM clock_timestamp())::BIGINT - 100, 'cleanup-host', '00000000-0000-4000-8000-000000000001')
+	`, linkOne); err != nil {
+		t.Fatalf("seed readable invalid cache row: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO "DOWNLOAD_CACHE_REFRESH" ("PATH_HASH", "INVALID_VERSION", "UPDATED_AT")
+		VALUES ('cache-cleanup-readable-invalid', '00000000-0000-4000-8000-000000000001', clock_timestamp())
+	`); err != nil {
+		t.Fatalf("seed readable invalid marker: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `SELECT download_cleanup_expired_cache(1800, 'DOWNLOAD_CACHE_TABLE')`); err != nil {
+		t.Fatalf("cleanup readable invalid marker: %v", err)
+	}
+	var cacheRows, refreshRows int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM "DOWNLOAD_CACHE_TABLE" WHERE "PATH_HASH" = 'cache-cleanup-readable-invalid'`).Scan(&cacheRows); err != nil {
+		t.Fatalf("count readable invalid cache row: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM "DOWNLOAD_CACHE_REFRESH" WHERE "PATH_HASH" = 'cache-cleanup-readable-invalid'`).Scan(&refreshRows); err != nil {
+		t.Fatalf("count readable invalid refresh row: %v", err)
+	}
+	if cacheRows != 1 || refreshRows != 1 {
+		t.Fatalf("cleanup removed readable invalid marker, cacheRows=%d refreshRows=%d", cacheRows, refreshRows)
+	}
+
+	// Cleanup must preserve an old cache row while its coordination row keeps
+	// an active failure backoff. The row is stale by TTL, but another caller
+	// still owns the retry window.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO "DOWNLOAD_CACHE_TABLE" ("PATH_HASH", "PATH", "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH", "VERSION")
+		VALUES ('cache-cleanup-active-backoff', '/cleanup-active-backoff', $1, EXTRACT(EPOCH FROM clock_timestamp())::BIGINT - 4000, 'cleanup-host', '00000000-0000-4000-8000-000000000010')
+	`, linkOne); err != nil {
+		t.Fatalf("seed active-backoff cache row: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO "DOWNLOAD_CACHE_REFRESH" ("PATH_HASH", "RETRY_AFTER", "LAST_ERROR_CODE", "UPDATED_AT")
+		VALUES ('cache-cleanup-active-backoff', clock_timestamp() + INTERVAL '30 seconds', 429, clock_timestamp())
+	`); err != nil {
+		t.Fatalf("seed active-backoff coordination row: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `SELECT download_cleanup_expired_cache(1800, 'DOWNLOAD_CACHE_TABLE')`); err != nil {
+		t.Fatalf("cleanup active-backoff cache: %v", err)
+	}
+	var activeBackoffCacheRows, activeBackoffRefreshRows int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM "DOWNLOAD_CACHE_TABLE" WHERE "PATH_HASH" = 'cache-cleanup-active-backoff'`).Scan(&activeBackoffCacheRows); err != nil {
+		t.Fatalf("count active-backoff cache row: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM "DOWNLOAD_CACHE_REFRESH" WHERE "PATH_HASH" = 'cache-cleanup-active-backoff' AND "RETRY_AFTER" > clock_timestamp()`).Scan(&activeBackoffRefreshRows); err != nil {
+		t.Fatalf("count active-backoff coordination row: %v", err)
+	}
+	if activeBackoffCacheRows != 1 || activeBackoffRefreshRows != 1 {
+		t.Fatalf("cleanup removed active-backoff state, cacheRows=%d activeRefreshRows=%d", activeBackoffCacheRows, activeBackoffRefreshRows)
+	}
+
+	// An expired cache and expired coordination marker are both reclaimable
+	// once the cleanup transaction has locked and rechecked the row.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO "DOWNLOAD_CACHE_TABLE" ("PATH_HASH", "PATH", "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH", "VERSION")
+		VALUES ('cache-cleanup-expired-state', '/cleanup-expired-state', '{"url":"https://signed.example.test/expired","download":{"expires_at":1}}', EXTRACT(EPOCH FROM clock_timestamp())::BIGINT - 4000, 'cleanup-host', '00000000-0000-4000-8000-000000000011')
+	`); err != nil {
+		t.Fatalf("seed expired cache row: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO "DOWNLOAD_CACHE_REFRESH" ("PATH_HASH", "LEASE_UNTIL", "INVALID_VERSION", "RETRY_AFTER", "UPDATED_AT")
+		VALUES ('cache-cleanup-expired-state', clock_timestamp() - INTERVAL '1 second', '00000000-0000-4000-8000-000000000011', clock_timestamp() - INTERVAL '1 second', clock_timestamp())
+	`); err != nil {
+		t.Fatalf("seed expired coordination row: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `SELECT download_cleanup_expired_cache(1800, 'DOWNLOAD_CACHE_TABLE')`); err != nil {
+		t.Fatalf("cleanup expired cache and coordination state: %v", err)
+	}
+	var expiredCacheRows, expiredRefreshRows int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM "DOWNLOAD_CACHE_TABLE" WHERE "PATH_HASH" = 'cache-cleanup-expired-state'`).Scan(&expiredCacheRows); err != nil {
+		t.Fatalf("count expired cache row: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM "DOWNLOAD_CACHE_REFRESH" WHERE "PATH_HASH" = 'cache-cleanup-expired-state'`).Scan(&expiredRefreshRows); err != nil {
+		t.Fatalf("count expired coordination row: %v", err)
+	}
+	if expiredCacheRows != 0 || expiredRefreshRows != 0 {
+		t.Fatalf("cleanup retained expired state, cacheRows=%d refreshRows=%d", expiredCacheRows, expiredRefreshRows)
+	}
+
+	// A finish that starts while the coordination row is locked must use the
+	// lease value observed after it acquires the lock. Letting the database clock
+	// pass the future deadline while the row remains locked fences publication.
+	postLockOwner, err := acquire("cache-post-lock-expiry", "")
+	if err != nil || postLockOwner.result != "acquired" {
+		t.Fatalf("acquire post-lock-expiry owner: result=%+v err=%v", postLockOwner, err)
+	}
+	postLockCtx, postLockCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer postLockCancel()
+	postLockConn, err := db.Conn(postLockCtx)
+	if err != nil {
+		t.Fatalf("open post-lock-expiry finish connection: %v", err)
+	}
+	defer postLockConn.Close()
+	postLockAppName := fmt.Sprintf("runtime-cache-post-lock-expiry-%d", time.Now().UnixNano())
+	if _, err := postLockConn.ExecContext(postLockCtx, `SELECT set_config('application_name', $1, false)`, postLockAppName); err != nil {
+		t.Fatalf("set post-lock-expiry application_name: %v", err)
+	}
+	postLockLocker, err := db.BeginTx(postLockCtx, nil)
+	if err != nil {
+		t.Fatalf("begin post-lock-expiry locker transaction: %v", err)
+	}
+	defer postLockLocker.Rollback()
+	if _, err := postLockLocker.ExecContext(postLockCtx, `
+		UPDATE "DOWNLOAD_CACHE_REFRESH"
+		SET "LEASE_UNTIL" = clock_timestamp() + INTERVAL '1 second'
+		WHERE "PATH_HASH" = 'cache-post-lock-expiry'
+	`); err != nil {
+		postLockLocker.Rollback()
+		t.Fatalf("lock post-lock-expiry refresh row: %v", err)
+	}
+	var (
+		postLockLeaseUntil time.Time
+		livePostLockLease  bool
+	)
+	if err := postLockLocker.QueryRowContext(postLockCtx, `
+		SELECT "LEASE_UNTIL", "LEASE_UNTIL" > clock_timestamp()
+		FROM "DOWNLOAD_CACHE_REFRESH"
+		WHERE "PATH_HASH" = 'cache-post-lock-expiry'
+	`).Scan(&postLockLeaseUntil, &livePostLockLease); err != nil {
+		postLockLocker.Rollback()
+		t.Fatalf("read live post-lock-expiry lease: %v", err)
+	}
+	if !livePostLockLease {
+		postLockLocker.Rollback()
+		t.Fatalf("expected post-lock-expiry lease to be live before finish starts")
+	}
+
+	postLockFinishDone := make(chan struct {
+		result  string
+		version sql.NullString
+		err     error
+	}, 1)
+	go func() {
+		result, version, finishErr := finishWith(postLockConn, "cache-post-lock-expiry", postLockOwner.leaseID.String, linkOne, "", nil)
+		postLockFinishDone <- struct {
+			result  string
+			version sql.NullString
+			err     error
+		}{result: result, version: version, err: finishErr}
+	}()
+
+	activityDeadline := time.Now().Add(5 * time.Second)
+	finishBlocked := false
+	for time.Now().Before(activityDeadline) {
+		var state, query string
+		var waitEventType sql.NullString
+		activityErr := db.QueryRowContext(postLockCtx, `
+			SELECT state, query, wait_event_type
+			FROM pg_stat_activity
+			WHERE application_name = $1
+		`, postLockAppName).Scan(&state, &query, &waitEventType)
+		if activityErr == nil && strings.Contains(query, "download_finish_cache_refresh") && state == "active" && waitEventType.Valid && waitEventType.String == "Lock" {
+			finishBlocked = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !finishBlocked {
+		postLockLocker.Rollback()
+		outcome := <-postLockFinishDone
+		if outcome.err != nil {
+			t.Fatalf("post-lock-expiry finish before lock observation: %v", outcome.err)
+		}
+		t.Fatalf("expected finish to wait on the live post-lock-expiry coordination row, got result=%q", outcome.result)
+	}
+	leaseExpired := false
+	leaseDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(leaseDeadline) {
+		if err := db.QueryRowContext(postLockCtx, `SELECT clock_timestamp() >= $1`, postLockLeaseUntil).Scan(&leaseExpired); err != nil {
+			postLockLocker.Rollback()
+			t.Fatalf("check post-lock-expiry lease deadline: %v", err)
+		}
+		if leaseExpired {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !leaseExpired {
+		postLockLocker.Rollback()
+		outcome := <-postLockFinishDone
+		if outcome.err != nil {
+			t.Fatalf("post-lock-expiry finish after deadline wait: %v", outcome.err)
+		}
+		t.Fatalf("database clock did not pass the locked lease deadline %s", postLockLeaseUntil)
+	}
+	if err := postLockLocker.Commit(); err != nil {
+		t.Fatalf("release post-lock-expiry lock: %v", err)
+	}
+	postLockOutcome := <-postLockFinishDone
+	if postLockOutcome.err != nil || postLockOutcome.result != "stale" {
+		t.Fatalf("expected post-lock-expiry finish to be fenced, result=%q err=%v", postLockOutcome.result, postLockOutcome.err)
+	}
+	var postLockCacheRows int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM "DOWNLOAD_CACHE_TABLE" WHERE "PATH_HASH" = 'cache-post-lock-expiry'`).Scan(&postLockCacheRows); err != nil {
+		t.Fatalf("count post-lock-expiry cache row: %v", err)
+	}
+	if postLockCacheRows != 0 {
+		t.Fatalf("post-lock-expiry finish published after lease expiry, cacheRows=%d", postLockCacheRows)
+	}
+
+	owner, err = acquire("cache-cleanup-race", "")
+	if err != nil || owner.result != "acquired" {
+		t.Fatalf("acquire cleanup-race owner: result=%+v err=%v", owner, err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO "DOWNLOAD_CACHE_TABLE" ("PATH_HASH", "PATH", "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH", "VERSION")
+		VALUES ('cache-cleanup-race', '/cleanup-race', $1, EXTRACT(EPOCH FROM clock_timestamp())::BIGINT - 4000, 'cleanup-host', '00000000-0000-4000-8000-000000000012')
+	`, linkOne); err != nil {
+		t.Fatalf("seed cleanup-race stale cache candidate: %v", err)
+	}
+	locker, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin cleanup-race lock transaction: %v", err)
+	}
+	if _, err := locker.ExecContext(ctx, `UPDATE "DOWNLOAD_CACHE_REFRESH" SET "UPDATED_AT" = clock_timestamp() WHERE "PATH_HASH" = 'cache-cleanup-race'`); err != nil {
+		locker.Rollback()
+		t.Fatalf("lock cleanup-race refresh row: %v", err)
+	}
+	cleanupConn, err := db.Conn(ctx)
+	if err != nil {
+		locker.Rollback()
+		t.Fatalf("open cleanup-race cleanup connection: %v", err)
+	}
+	defer cleanupConn.Close()
+	cleanupAppName := fmt.Sprintf("runtime-cache-cleanup-race-%d", time.Now().UnixNano())
+	if _, err := cleanupConn.ExecContext(ctx, `SELECT set_config('application_name', $1, false)`, cleanupAppName); err != nil {
+		locker.Rollback()
+		t.Fatalf("set cleanup-race application_name: %v", err)
+	}
+
+	cleanupDone := make(chan error, 1)
+	go func() {
+		_, queryErr := cleanupConn.ExecContext(ctx, `SELECT download_cleanup_expired_cache(1800, 'DOWNLOAD_CACHE_TABLE')`)
+		cleanupDone <- queryErr
+	}()
+
+	cleanupActivityDeadline := time.Now().Add(5 * time.Second)
+	cleanupBlocked := false
+	for time.Now().Before(cleanupActivityDeadline) {
+		var state, query string
+		var waitEventType sql.NullString
+		activityErr := db.QueryRowContext(ctx, `
+			SELECT state, query, wait_event_type
+			FROM pg_stat_activity
+			WHERE application_name = $1
+		`, cleanupAppName).Scan(&state, &query, &waitEventType)
+		if activityErr == nil && strings.Contains(query, "download_cleanup_expired_cache") && state == "active" && waitEventType.Valid && waitEventType.String == "Lock" {
+			cleanupBlocked = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !cleanupBlocked {
+		locker.Rollback()
+		t.Fatalf("expected cleanup transaction to block on cleanup-race coordination row")
+	}
+
+	finishDone := make(chan error, 1)
+	go func() {
+		_, _, queryErr := finish("cache-cleanup-race", owner.leaseID.String, linkOne, "", nil)
+		finishDone <- queryErr
+	}()
+	if err := locker.Commit(); err != nil {
+		t.Fatalf("release cleanup-race lock: %v", err)
+	}
+	if err := <-cleanupDone; err != nil {
+		t.Fatalf("cleanup-race cleanup call: %v", err)
+	}
+	if err := <-finishDone; err != nil {
+		t.Fatalf("cleanup-race finish call: %v", err)
+	}
+	raceState, err := state("cache-cleanup-race")
+	if err != nil || raceState.result != "ready" || raceState.link.String != linkOne {
+		t.Fatalf("cleanup-race lost a valid publication, state=%+v err=%v", raceState, err)
 	}
 }

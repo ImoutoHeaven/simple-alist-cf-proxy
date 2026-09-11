@@ -1,5 +1,6 @@
 import { applyVerifyHeaders, hasVerifyCredentials } from './utils.js';
 import { logEvent } from './logging.js';
+import { cleanupExpiredCache } from './cache/custom-pg-rest.js';
 
 const DEFAULT_CLEANUP_PROBABILITY = 0.01;
 const getErrorMessage = (error) => error instanceof Error ? error.message : String(error);
@@ -172,20 +173,7 @@ const buildCustomPgRestCleanupTasks = (config) => {
     const cacheConfig = config.cacheConfig;
     tasks.push({
       name: 'Cache',
-      fn: async () => {
-        const now = Math.floor(Date.now() / 1000);
-        const cutoffTime = now - (cacheConfig.linkTTL * 2);
-        const table = cacheConfig.tableName || 'DOWNLOAD_CACHE_TABLE';
-        const filters = `TIMESTAMP=lt.${cutoffTime}`;
-        return executePostgrestDelete(
-          cacheConfig.postgrestUrl,
-          cacheConfig.verifyHeader,
-          cacheConfig.verifySecret,
-          table,
-          filters,
-          { Prefer: 'return=representation' }
-        );
-      },
+      fn: () => cleanupExpiredCache(cacheConfig),
     });
   }
 

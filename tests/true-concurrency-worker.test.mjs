@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import worker, { __fairQueueTestHooks } from '../src/worker.js';
 import { encryptBindingPayload } from '../src/origin-binding.js';
 import { sha256Hash } from '../src/utils.js';
+import { addDownloadEnvelope, createCacheRpcFixture } from './cache-rpc-fixture.mjs';
 
 const {
   buildFinalCleanupGroups,
@@ -451,7 +452,7 @@ const buildRuntimeBootstrap = ({
         postgrestUrl: 'https://postgrest.example.test',
         verifyHeader: ['X-Verify'],
         verifySecret: ['secret'],
-        cacheEnabled: false,
+        cacheEnabled: true,
       } : {}),
       cleanupPercentage: 0,
     },
@@ -728,6 +729,8 @@ const wrappedFetchBound = typeof wrappedFetch === 'function' ? wrappedFetch.bind
 let delegatedFetch = wrappedFetchBound;
 let ackHandoffMock = null;
 let heartbeatMock = null;
+const openListReportObservations = [];
+const cacheRpc = createCacheRpcFixture();
 
 const setAckHandoffMock = (handler = null) => {
   ackHandoffMock = typeof handler === 'function' ? handler : null;
@@ -739,9 +742,28 @@ const setHeartbeatMock = (handler = null) => {
 
 const fetchWithDefaultAckHandoff = async (input, init = {}) => {
   const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+  const cacheResponse = await cacheRpc.handle(input, init);
+  if (cacheResponse) {
+    return cacheResponse;
+  }
   const ticketStateResponse = await handleTicketStateRpc(url, init);
   if (ticketStateResponse) {
     return ticketStateResponse;
+  }
+  if (url === 'https://alist.example.com/api/fs/link') {
+    let action = null;
+    try {
+      action = JSON.parse(init.body || '{}')?.action;
+    } catch (_error) {
+      action = null;
+    }
+    if (action === 'report') {
+      openListReportObservations.push({
+        body: JSON.parse(init.body || '{}'),
+        signal: init.signal,
+      });
+      return createJsonResponse({ code: 200, data: { applied: true, duplicate: false, stale: false } });
+    }
   }
   if (url === ACK_HANDOFF_URL) {
     if (ackHandoffMock) {
@@ -781,7 +803,7 @@ const fetchWithDefaultAckHandoff = async (input, init = {}) => {
   if (typeof delegatedFetch !== 'function') {
     throw new Error('global fetch handler not configured');
   }
-  return delegatedFetch(input, init);
+  return addDownloadEnvelope(await delegatedFetch(input, init));
 };
 
 const buildTrueConcurrencyClientTestPlan = (overrides = {}) => ({
@@ -819,6 +841,8 @@ Object.defineProperty(globalThis, 'fetch', {
   set(value) {
     ackHandoffMock = null;
     heartbeatMock = null;
+    openListReportObservations.length = 0;
+    cacheRpc.reset();
     resetTicketStateRpcState();
     if (value === fetchWithDefaultAckHandoff) {
       delegatedFetch = wrappedFetchBound;
@@ -926,6 +950,7 @@ const captureAdmissionPayloads = async ({
         data: {
           url: targetUrl,
           header: {},
+          size: 2,
         },
       });
     }
@@ -972,7 +997,10 @@ const captureAdmissionPayloads = async ({
       calls.push('origin-fetch');
       return new Response('ok', {
         status: 200,
-        headers: { 'content-type': 'application/octet-stream' },
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '2',
+        },
       });
     }
 
@@ -1163,7 +1191,7 @@ test('dual mode fast terminal CQ hard expiry releases fairqueue and returns link
 
   try {
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), createTestContext().ctx);
-    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired', retryAfter: '30' });
     assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
   } finally {
@@ -1227,7 +1255,7 @@ test('dual mode fast expired CQ result returns link expired after releasing fair
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
 
-    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired', retryAfter: '30' });
     assert.equal(body.message, 'link expired');
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls, [
@@ -1397,7 +1425,7 @@ test('dual mode fast terminal CQ hard expiry returns link expired after waiting 
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired', retryAfter: '30' });
     assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, ['fairqueue-wait', 'concurrency-acquire', 'fairqueue-release']);
   } finally {
@@ -1478,7 +1506,7 @@ test('queue_breaker dual mode settles breaker attempt before returning link expi
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, [
@@ -1689,7 +1717,7 @@ test('breaker_only with true concurrency does not authorize or settle before CQ 
 
   try {
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), createTestContext().ctx);
-    await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed' });
+    await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed', retryAfter: '30' });
     assert.deepEqual(calls, ['breaker-snapshot', 'concurrency-acquire']);
     assert.equal(settleBodies.length, 0);
   } finally {
@@ -1806,6 +1834,7 @@ test('breaker_only with true concurrency maps forced refreshed upstream 410 afte
       status: 503,
       reason: 'upstream_auth_retry_exhausted',
       upstreamStatus: 410,
+      retryAfter: '30',
     });
     assert.equal(serializedClientBody.includes('unique-cq-refreshed-410-upstream-sentinel'), false);
     await Promise.allSettled(waitUntilPromises);
@@ -1829,6 +1858,90 @@ test('breaker_only with true concurrency maps forced refreshed upstream 410 afte
     assert.equal(settleBodies[0].p_attempt_ticket, 7);
     assert.equal(settleBodies[1].p_attempt_version, 32);
     assert.equal(settleBodies[1].p_attempt_ticket, 7);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('initial Google breaker-open precheck reports issued ticket abandonment and commits owner backoff', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const clientController = new AbortController();
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.googleapis.com'],
+        throttleHostPatterns: ['*.googleapis.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      const body = JSON.parse(init.body);
+      assert.equal(body.action, 'acquire');
+      calls.push('link-api');
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://www.googleapis.com/drive/v3/files/initial-open?alt=media',
+          size: 5,
+          header: {},
+          download: {
+            provider: 'GoogleDrive',
+            ticket: 'google-initial-open-abcdefghijklmnopqrstuvwxyz',
+            expires_at: Math.floor(Date.now() / 1000) + 300,
+            report_success: true,
+          },
+        },
+      });
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      calls.push('breaker-snapshot');
+      return createJsonResponse([{
+        STATE: 'open',
+        OPEN_UNTIL: Math.floor(Date.now() / 1000) + 30,
+        OPEN_REASON: 'http_429',
+        VERSION: 7,
+        LAST_ERROR_CODE: 429,
+      }]);
+    }
+
+    if (url.includes('/api/v1/concurrency/') || url.includes('googleapis.com/drive/v3/files/initial-open')) {
+      throw new Error(`origin or CQ admission should not run: ${url}`);
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest({ signal: clientController.signal }), buildWorkerEnv(), ctx);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'breaker_open',
+      retryAfter: '30',
+    });
+    await Promise.allSettled(waitUntilPromises);
+
+    assert.deepEqual(calls, ['link-api', 'breaker-snapshot']);
+    assert.equal(openListReportObservations.length, 1);
+    assert.equal(openListReportObservations[0].body.feedback.ticket, 'google-initial-open-abcdefghijklmnopqrstuvwxyz');
+    assert.equal(openListReportObservations[0].body.feedback.outcome, 'abandoned');
+    assert.equal(openListReportObservations[0].body.feedback.status_code, 0);
+    assert.notEqual(openListReportObservations[0].signal, clientController.signal);
+    assert.equal(openListReportObservations[0].signal?.aborted, false);
+    assert.equal(
+      cacheRpc.calls.some(({ url, body }) => (
+        url === 'https://postgrest.example.test/rpc/download_finish_cache_refresh'
+        && body.p_link_data == null
+        && body.p_error_code === 503
+      )),
+      true,
+    );
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -1970,6 +2083,7 @@ test('breaker_only with true concurrency reports protected auth refresh failures
       status: 503,
       reason: 'upstream_auth_retry_exhausted',
       upstreamStatus: 401,
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
 
@@ -2093,6 +2207,7 @@ test('breaker_only with true concurrency returns authority unavailable when no-s
     const body = await assertJsonError(response, {
       status: 503,
       reason: 'breaker_settle_failed',
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
     assert.match(body.message, /attempt settlement/i);
@@ -2226,6 +2341,7 @@ test('breaker_only with true concurrency returns generated JSON for protected te
       status: 503,
       reason: 'upstream_unavailable',
       upstreamStatus: 500,
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
 
@@ -2369,6 +2485,7 @@ test('breaker_only with true concurrency returns generated JSON for non-protecte
       status: 403,
       reason: 'upstream_forbidden',
       upstreamStatus: 403,
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
 
@@ -2500,6 +2617,7 @@ test('breaker_only with true concurrency fails closed and cancels the upstream b
     const body = await assertJsonError(response, {
       status: 503,
       reason: 'breaker_sample_report_failed',
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
 
@@ -2601,7 +2719,7 @@ test('breaker_only with true concurrency checks handler readiness before authori
       payloadSignExpire: expireSeconds,
     });
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    await assertJsonError(response, { status: 401, reason: 'payload_expired' });
+    await assertJsonError(response, { status: 401, reason: 'payload_expired', retryAfter: '30' });
     assert.deepEqual(calls, ['breaker-snapshot']);
   } finally {
     Date.now = originalDateNow;
@@ -2685,7 +2803,7 @@ test('breaker_only with true concurrency does not authorize or settle on client-
   try {
     const request = await buildSignedWorkerRequest({ signal: abortController.signal });
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    await assertJsonError(response, { status: 499, reason: 'client_aborted' });
+    await assertJsonError(response, { status: 499, reason: 'client_aborted', retryAfter: '30' });
     assert.deepEqual(calls, ['breaker-snapshot', 'concurrency-acquire']);
     assert.equal(settleBodies.length, 0);
   } finally {
@@ -2913,7 +3031,7 @@ test('breaker_only with true concurrency does not authorize or settle before ter
 
   try {
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), createTestContext().ctx);
-    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired', retryAfter: '30' });
     assert.equal(body.message, 'link expired');
     assert.deepEqual(calls, ['concurrency-acquire-fast']);
     assert.equal(settleBodies.length, 0);
@@ -3007,6 +3125,7 @@ test('breaker_only with true concurrency does not authorize or settle before acq
     const body = await assertJsonError(response, {
       status: 503,
       reason: 'cq_acquire_failed',
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
     assert.match(body.message, /true concurrency unavailable/i);
@@ -3249,7 +3368,7 @@ test('breaker_only with true concurrency does not authorize or settle after clai
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    await assertJsonError(response, { status: 503, reason: 'cq_claim_failed' });
+    await assertJsonError(response, { status: 503, reason: 'cq_claim_failed', retryAfter: '30' });
     assert.deepEqual(calls, [
       'breaker-snapshot',
       'concurrency-acquire-fast',
@@ -3354,7 +3473,7 @@ test('queue_breaker dual mode settles breaker attempt when target expires before
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(request, buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    await assertJsonError(response, { status: 401, reason: 'payload_expired' });
+    await assertJsonError(response, { status: 401, reason: 'payload_expired', retryAfter: '30' });
     assert.deepEqual(calls, [
       'fairqueue-wait',
       'breaker-settle',
@@ -3430,6 +3549,7 @@ test('dual mode malformed concurrency acquire result fails closed after fairqueu
     const body = await assertJsonError(response, {
       status: 503,
       reason: 'cq_acquire_failed',
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
     assert.match(body.message, /true concurrency unavailable/i);
@@ -3490,7 +3610,7 @@ test('true concurrency malformed acquire response stops before any server-owned 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
 
     assert.match(body.message, /true concurrency unavailable/i);
@@ -3546,7 +3666,7 @@ test('true concurrency acquire fetch rejection after dispatch stops before any s
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['concurrency-acquire']);
@@ -3601,7 +3721,7 @@ test('true concurrency non-200 acquire response after dispatch stops before any 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.deepEqual(calls, ['concurrency-acquire']);
@@ -3735,9 +3855,9 @@ test('true concurrency heartbeat hello timeout returns cq_heartbeat_failed befor
         trueConcurrencyHostPatterns: ['*.sharepoint.com'],
         trueConcurrencyHeartbeatOverrides: {
           helloTimeoutMs: 5,
-          startTimeoutMs: 50,
+          startTimeoutMs: 1100,
           initialConnectMaxAttempts: 3,
-          initialConnectMaxElapsedMs: 20,
+          initialConnectMaxElapsedMs: 1000,
           reconnectSafetyMarginMs: 1,
         },
       }));
@@ -3805,6 +3925,7 @@ test('true concurrency heartbeat hello timeout returns cq_heartbeat_failed befor
     const body = await assertJsonError(response, {
       status: 503,
       reason: 'cq_heartbeat_failed',
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
 
@@ -3837,6 +3958,9 @@ test('true concurrency heartbeat_connect_failed schedules release retry cleanup 
 
   globalThis.setTimeout = (callback, delay = 0, ...args) => {
     retryDelays.push(delay);
+    if (Number(delay) >= 100_000) {
+      return { cleared: false };
+    }
     Promise.resolve().then(() => callback(...args));
     return { cleared: false };
   };
@@ -4027,6 +4151,7 @@ test('true concurrency initial heartbeat terminal mapping suppresses duplicate r
       const body = await assertJsonError(response, {
         status: scenario.reason === 'hard_expired' ? 401 : 503,
         reason: scenario.reason === 'hard_expired' ? 'ticket_state_expired' : 'cq_terminal',
+        retryAfter: '30',
       });
       await Promise.allSettled(waitUntilPromises);
 
@@ -4291,6 +4416,7 @@ test('true concurrency ack_handoff transport or availability or malformed-succes
         const body = await assertJsonError(response, {
           status: 503,
           reason: 'cq_ack_failed',
+          retryAfter: '30',
         });
         await Promise.allSettled(waitUntilPromises);
         assert.equal(body.message, 'True concurrency unavailable', scenario.name);
@@ -4390,6 +4516,7 @@ test('true concurrency explicit ack_handoff terminal response does not release a
         const body = await assertJsonError(response, {
           status: scenario.expectedStatus,
           reason: scenario.name === 'expired' ? 'ticket_state_expired' : 'cq_terminal',
+          retryAfter: '30',
         });
         await Promise.allSettled(waitUntilPromises);
         assert.equal(body.message, scenario.expectedMessage, scenario.name);
@@ -4456,7 +4583,7 @@ test('true concurrency explicit ack_handoff conflict fails closed and waits for 
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await assertNoPublicDiagnosticMarker(response, 'handoff_token_mismatch');
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-ack-handoff']);
@@ -4509,7 +4636,7 @@ test('true concurrency claim terminal replay with claim_handoff_timeout fails cl
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await assertNoPublicDiagnosticMarker(response, 'claim_handoff_timeout');
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim']);
@@ -4551,7 +4678,7 @@ test('true concurrency acquire terminal replay with claim_handoff_timeout fails 
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await assertNoPublicDiagnosticMarker(response, 'claim_handoff_timeout');
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast']);
@@ -4593,7 +4720,7 @@ test('true concurrency acquire terminal replay with heartbeat_timeout fails clos
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await assertNoPublicDiagnosticMarker(response, 'heartbeat_timeout');
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast']);
@@ -4646,7 +4773,7 @@ test('true concurrency claim terminal replay with heartbeat_timeout fails closed
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await assertNoPublicDiagnosticMarker(response, 'heartbeat_timeout');
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim']);
@@ -4727,6 +4854,7 @@ test('true concurrency claim failure releases acquired lease before origin fetch
         const body = await assertJsonError(response, {
           status: 503,
           reason: 'cq_claim_failed',
+          retryAfter: '30',
         });
         await Promise.allSettled(waitUntilPromises);
         assert.equal(body.message, 'True concurrency unavailable', scenario.name);
@@ -4781,7 +4909,7 @@ test('true concurrency claim terminal response does not fetch origin', async () 
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
+    await assertJsonError(response, { status: 503, reason: 'cq_terminal', retryAfter: '30' });
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim']);
   } finally {
     globalThis.fetch = originalFetch;
@@ -4828,7 +4956,7 @@ test('true concurrency claim conflict grant_unclaimed releases acquired lease be
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await assertNoPublicDiagnosticMarker(response, 'grant_unclaimed');
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_terminal', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.equal(body.message, 'True concurrency unavailable');
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-claim', 'concurrency-release']);
@@ -4891,7 +5019,7 @@ test('true concurrency only fast hard expiry returns link expired without fairqu
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
+    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
 
     assert.equal(body.message, 'link expired');
@@ -5010,7 +5138,7 @@ test('dual mode treats CQ failure after fairqueue admission as unavailable and r
       expireOffsetSeconds: 1,
       payloadExpireTime: expireAtSeconds,
     }), buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_acquire_failed', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.match(body.message, /true concurrency unavailable/i);
     assert.equal(calls.includes('concurrency-acquire'), true);
@@ -5085,7 +5213,7 @@ test('dual mode client-aborted CQ acquire releases the fairqueue grant as unused
     const { ctx, waitUntilPromises } = createTestContext();
     const request = await buildSignedWorkerRequest({ signal: abortController.signal });
     const response = await worker.fetch(request, buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 499, reason: 'client_aborted' });
+    const body = await assertJsonError(response, { status: 499, reason: 'client_aborted', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
 
     assert.equal(body.message, 'client aborted request');
@@ -5308,7 +5436,7 @@ test('renewable ticket rejects after first use when idle_lease_expires_at is in 
       buildWorkerEnv(),
       createTestContext().ctx,
     );
-    const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
+  const body = await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
     assert.equal(body.message, 'link expired');
     assert.equal(ticketStateRpcState.markBodies.length, 0);
   } finally {
@@ -5484,10 +5612,12 @@ test('heartbeat hello forwards ticketHash alongside request and lease identity',
   }));
 
   try {
-    const response = await worker.fetch(new Request(signedRequest), buildWorkerEnv(), createTestContext().ctx);
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(new Request(signedRequest), buildWorkerEnv(), ctx);
 
     assert.equal(response.status, 200);
     assert.equal(await response.text(), 'hello-ok');
+    await Promise.allSettled(waitUntilPromises);
     assert.equal(sent[0]?.type, 'hello');
     assert.equal(sent[0]?.ticketHash, expectedTicketHash);
     assert.equal(typeof sent[0]?.requestId, 'string');
@@ -5582,9 +5712,10 @@ test('heartbeat refresh forwards ticketHash alongside generation and lease ident
   }
 });
 
-test('disabled mode accepts signed payloads without ticketNonce and idle_timeout', async () => {
+test('disabled cache coordination fails before OpenList for signed payloads without ticketNonce and idle_timeout', async () => {
   const originalFetch = globalThis.fetch;
   const originCalls = [];
+  const openListCalls = [];
 
   globalThis.fetch = async (input, init = {}) => {
     const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
@@ -5597,6 +5728,7 @@ test('disabled mode accepts signed payloads without ticketNonce and idle_timeout
     }
 
     if (url === 'https://alist.example.com/api/fs/link') {
+      openListCalls.push(url);
       return createJsonResponse({
         code: 200,
         data: {
@@ -5632,9 +5764,13 @@ test('disabled mode accepts signed payloads without ticketNonce and idle_timeout
       createTestContext().ctx,
     );
 
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), 'disabled-mode-ok');
-    assert.deepEqual(originCalls, ['https://tenant.sharepoint.com/file']);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'cache_coordinator_unavailable',
+      retryAfter: '5',
+    });
+    assert.deepEqual(originCalls, []);
+    assert.deepEqual(openListCalls, []);
     assert.equal(ticketStateRpcState.readBodies.length, 0);
     assert.equal(ticketStateRpcState.markBodies.length, 0);
   } finally {
@@ -5643,9 +5779,10 @@ test('disabled mode accepts signed payloads without ticketNonce and idle_timeout
   }
 });
 
-test('disabled mode never resolves ticket state during admission', async () => {
+test('disabled cache coordination never resolves ticket state or acquires OpenList', async () => {
   const originalFetch = globalThis.fetch;
   const originCalls = [];
+  const openListCalls = [];
 
   globalThis.fetch = async (input, init = {}) => {
     const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
@@ -5658,6 +5795,7 @@ test('disabled mode never resolves ticket state during admission', async () => {
     }
 
     if (url === 'https://alist.example.com/api/fs/link') {
+      openListCalls.push(url);
       return createJsonResponse({
         code: 200,
         data: {
@@ -5693,9 +5831,13 @@ test('disabled mode never resolves ticket state during admission', async () => {
       createTestContext().ctx,
     );
 
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), 'disabled-admission-ok');
-    assert.deepEqual(originCalls, ['https://tenant.sharepoint.com/file']);
+    await assertJsonError(response, {
+      status: 503,
+      reason: 'cache_coordinator_unavailable',
+      retryAfter: '5',
+    });
+    assert.deepEqual(originCalls, []);
+    assert.deepEqual(openListCalls, []);
     assert.equal(ticketStateRpcState.readBodies.length, 0);
     assert.equal(ticketStateRpcState.markBodies.length, 0);
   } finally {
@@ -6709,8 +6851,8 @@ test('fairqueue-only refresh target rotation retires old state and reacquires a 
     }
 
     if (url.startsWith('https://alist.example.com/api/fs/link')) {
-      const requestUrl = new URL(url);
-      const isRefresh = requestUrl.searchParams.get('refresh') === 'true';
+      const requestBody = JSON.parse(init.body);
+      const isRefresh = Boolean(requestBody.feedback);
       linkRequestCount += 1;
       return createJsonResponse({
         code: 200,
@@ -6855,7 +6997,7 @@ test('true concurrency acquire success followed by origin fetch failure releases
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
-    const body = await assertJsonError(response, { status: 500, reason: 'internal_error' });
+    const body = await assertJsonError(response, { status: 503, reason: 'upstream_transport_error', retryAfter: '30' });
     assert.equal(body.message.includes('origin fetch failed'), false);
     assert.deepEqual(calls.slice(-2), ['concurrency-release', 'fairqueue-release']);
   } finally {
@@ -7151,13 +7293,23 @@ test('true concurrency managed streaming reconnects after heartbeat_ack timeout 
     await waitForCondition(() => heartbeatUpgradeCount === 2, {
       message: 'expected reconnect after missing heartbeat_ack',
     });
+    await waitForCondition(() => heartbeatSockets.length === 2
+      && heartbeatSockets.every((socket) => socket.sent.some((serialized) => {
+        try {
+          return JSON.parse(serialized).type === 'heartbeat';
+        } catch (_error) {
+          return false;
+        }
+      })), {
+      message: 'expected heartbeat on both connected sessions',
+    });
     assert.equal(await response.text(), 'reconnect-ok');
     await Promise.allSettled(waitUntilPromises);
 
     assert.equal(releaseBody?.reason, 'stream_complete');
     assert.equal(heartbeatUpgradeCount, 2);
-    const firstHeartbeat = JSON.parse(heartbeatSockets[0].sent[1]);
-    const secondHeartbeat = JSON.parse(heartbeatSockets[1].sent[1]);
+    const firstHeartbeat = JSON.parse(heartbeatSockets[0].sent.find((serialized) => JSON.parse(serialized).type === 'heartbeat'));
+    const secondHeartbeat = JSON.parse(heartbeatSockets[1].sent.find((serialized) => JSON.parse(serialized).type === 'heartbeat'));
     assert.equal(firstHeartbeat.type, 'heartbeat');
     assert.equal(secondHeartbeat.type, 'heartbeat');
     assert.equal(Object.hasOwn(firstHeartbeat, 'downloadedBytes'), false);
@@ -7301,22 +7453,13 @@ test('true concurrency heartbeat terminal reasons map duplicate-release suppress
       let releaseBody = null;
       const heartbeatSocket = createFakeHeartbeatSocket({
         helloAck: buildHeartbeatHelloAck({
-          heartbeatIntervalMs: 1,
+          heartbeatIntervalMs: 5,
           ackTimeoutMs: 5,
           reconnectGraceMs: 40,
           deadlineMs: Date.now() + 1000,
           hardExpireAtMs: Date.now() + 1000,
         }),
         heartbeatAck: null,
-        onSend(payload, { emitJsonMessage }) {
-          if (payload.type === 'heartbeat') {
-            emitJsonMessage({
-              type: 'terminal',
-              result: scenario.expectRelease ? 'conflict' : 'released',
-              reason: scenario.reason,
-            });
-          }
-        },
       });
 
       globalThis.fetch = async (input, init = {}) => {
@@ -7397,6 +7540,15 @@ test('true concurrency heartbeat terminal reasons map duplicate-release suppress
       const reader = response.body.getReader();
       const firstChunk = await reader.read();
       assert.equal(new TextDecoder().decode(firstChunk.value), `terminal-${scenario.reason}`);
+      await waitForCondition(
+        () => heartbeatSocket.sent.some((payload) => JSON.parse(payload).type === 'heartbeat'),
+        { timeoutMs: 150, message: `expected heartbeat request for ${scenario.reason}` },
+      );
+      heartbeatSocket.emitJsonMessage({
+        type: 'terminal',
+        result: scenario.expectRelease ? 'conflict' : 'released',
+        reason: scenario.reason,
+      });
       const terminalResult = await Promise.race([
         reader.read().then(
           () => 'resolved',
@@ -7424,6 +7576,200 @@ test('true concurrency heartbeat terminal reasons map duplicate-release suppress
       }
     }
   } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('cache publication waits for its lease result and guards a CQ loss before stream handoff', async () => {
+  const originalFetch = globalThis.fetch;
+  let finishStartedResolve;
+  let releaseFinish;
+  const finishStarted = new Promise((resolve) => {
+    finishStartedResolve = resolve;
+  });
+  const heartbeatSocket = createFakeHeartbeatSocket({
+    helloAck: buildHeartbeatHelloAck({ heartbeatIntervalMs: 5, ackTimeoutMs: 1000 }),
+    heartbeatAck: null,
+  });
+  let upstreamCancelled = false;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        trueConcurrencyHostPatterns: ['*.sharepoint.com'],
+        trueConcurrencyHeartbeatOverrides: {
+          intervalMs: 5,
+          ackTimeoutMs: 1000,
+        },
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/file',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/acquire') {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        result: 'granted',
+        leaseId: 'lease-publication-cq-loss',
+        leaseToken: 'token-publication-cq-loss',
+        expiresAtMs: body.hardExpireAtMs,
+        claimToken: 'claim-publication-cq-loss',
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/claim') {
+      return createClaimGrantResponseFromRequest(init);
+    }
+
+    if (url === ACK_HANDOFF_URL) {
+      return createAckHandoffResponse({ result: 'acknowledged' });
+    }
+
+    if (url === HEARTBEAT_URL) {
+      return {
+        status: 101,
+        webSocket: heartbeatSocket,
+      };
+    }
+
+    if (url === 'https://tenant.sharepoint.com/file') {
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('must-not-handoff'));
+        },
+        cancel() {
+          upstreamCancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream', 'content-length': '15' },
+      });
+    }
+
+    if (url === 'https://cq.example.test/api/v1/concurrency/release') {
+      throw new Error('heartbeat_timeout must not release the already-lost CQ lease');
+    }
+
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+  cacheRpc.setFinishHandler(({ body }) => {
+    finishStartedResolve(body);
+    return new Promise((release) => {
+      releaseFinish = release;
+    });
+  });
+
+  try {
+    const testContext = createTestContext();
+    const workerPromise = worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), testContext.ctx);
+    await finishStarted;
+    await waitForCondition(
+      () => heartbeatSocket.sent.some((payload) => JSON.parse(payload).type === 'heartbeat'),
+      { timeoutMs: 200, message: 'expected heartbeat request during cache publication' },
+    );
+    heartbeatSocket.emitJsonMessage({
+      type: 'terminal',
+      result: 'released',
+      reason: 'heartbeat_timeout',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseFinish?.();
+
+    const response = await workerPromise;
+    await assertJsonError(response, { status: 503, reason: 'cq_heartbeat_failed' });
+    await Promise.allSettled(testContext.waitUntilPromises);
+    assert.equal(upstreamCancelled, true);
+    assert.equal(ticketStateRpcState.markBodies.length, 0);
+    assert.equal(openListReportObservations.length, 1);
+    assert.equal(openListReportObservations[0].body.feedback.ticket, 'test-ticket-abcdefghijklmnopqrstuvwxyz');
+    assert.equal(openListReportObservations[0].body.feedback.outcome, 'abandoned');
+    assert.equal(openListReportObservations[0].body.feedback.status_code, 0);
+  } finally {
+    releaseFinish?.();
+    cacheRpc.setFinishHandler(null);
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('cache publication guards client cancellation while its finish is pending', async () => {
+  const originalFetch = globalThis.fetch;
+  const abortController = new AbortController();
+  let finishStartedResolve;
+  let releaseFinish;
+  const finishStarted = new Promise((resolve) => {
+    finishStartedResolve = resolve;
+  });
+  let upstreamCancelled = false;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap());
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/client-cancel',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/client-cancel') {
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('must-not-handoff-client-cancel'));
+        },
+        cancel() {
+          upstreamCancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream', 'content-length': '29' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+  cacheRpc.setFinishHandler(() => {
+    finishStartedResolve();
+    return new Promise((release) => {
+      releaseFinish = release;
+    });
+  });
+
+  try {
+    const workerPromise = worker.fetch(
+      await buildSignedWorkerRequest({ signal: abortController.signal }),
+      buildWorkerEnv(),
+      createTestContext().ctx,
+    );
+    await finishStarted;
+    abortController.abort();
+    releaseFinish?.();
+
+    const response = await workerPromise;
+    await assertJsonError(response, { status: 499, reason: 'client_aborted' });
+    assert.equal(upstreamCancelled, true);
+    assert.equal(ticketStateRpcState.markBodies.length, 0);
+  } finally {
+    releaseFinish?.();
+    cacheRpc.setFinishHandler(null);
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
@@ -8116,7 +8462,7 @@ test('true concurrency maps direct upstream 429 with coupled retry-after before 
       status: 503,
       reason: 'upstream_rate_limited',
       upstreamStatus: 429,
-      retryAfter: '8',
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
     assert.equal(JSON.stringify(body).includes('unique-direct-cq-429-body'), false);
@@ -8790,7 +9136,7 @@ test('true concurrency acquire abort returns 499 client abort response', async (
     abortController.abort();
 
     const response = await workerPromise;
-    const body = await assertJsonError(response, { status: 499, reason: 'client_aborted' });
+    const body = await assertJsonError(response, { status: 499, reason: 'client_aborted', retryAfter: '30' });
     assert.equal(body.message, 'client aborted request');
     assert.deepEqual(calls, ['concurrency-acquire']);
   } finally {
@@ -8860,18 +9206,7 @@ test('true concurrency managed streaming releases when client is already aborted
   try {
     const request = await buildSignedWorkerRequest({ signal: abortController.signal });
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    const reader = response.body.getReader();
-    const readResult = await Promise.race([
-      reader.read().then(
-        () => 'resolved',
-        (error) => error,
-      ),
-      new Promise((resolve) => setTimeout(() => resolve('timeout'), 50)),
-    ]);
-
-    assert.notEqual(readResult, 'timeout');
-    assert.match(String(readResult?.message ?? readResult), /abort/i);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await assertJsonError(response, { status: 499, reason: 'client_aborted', retryAfter: '30' });
     assert.deepEqual(calls, ['concurrency-acquire', 'concurrency-release']);
   } finally {
     globalThis.fetch = originalFetch;
@@ -9810,9 +10145,13 @@ test('CQ SSE wait elapsed budget exhaustion relies on server-owned disconnect cl
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 503, reason: 'cq_wait_budget_exhausted' });
+    const body = await assertJsonError(response, { status: 503, reason: 'cq_wait_budget_exhausted', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.match(body.message, /wait budget exhausted/i);
+    assert.equal(openListReportObservations.length, 1);
+    assert.equal(openListReportObservations[0].body.feedback.ticket, 'test-ticket-abcdefghijklmnopqrstuvwxyz');
+    assert.equal(openListReportObservations[0].body.feedback.outcome, 'failure');
+    assert.equal(openListReportObservations[0].body.feedback.status_code, 0);
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse']);
     assert.equal(waitRequest?.waitToken, 'wait-budget-elapsed-1');
     assert.equal(waitRequest.deadlineMs <= waitRequest.hardExpireAtMs, true);
@@ -9825,6 +10164,322 @@ test('CQ SSE wait elapsed budget exhaustion relies on server-owned disconnect cl
     Date.now = originalDateNow;
     globalThis.setTimeout = originalSetTimeout;
     globalThis.clearTimeout = originalClearTimeout;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('fair queue timeout refusal reports the issued ticket as abandoned status0', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/fq-timeout',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      return createFairQueueWaitResponseFromInit(init, {
+        result: 'timeout',
+        queryToken: 'query-fq-timeout-observer',
+        invocationEpoch: 1,
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      calls.push('fairqueue-release');
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/fq-timeout') {
+      throw new Error('origin fetch should not run after fair queue timeout');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const response = await worker.fetch(await buildSignedWorkerRequest({
+      pathname: '/downloads/fq-timeout-observer.bin',
+    }), buildWorkerEnv(), ctx);
+    await assertJsonError(response, { status: 503, reason: 'fq_timeout', retryAfter: '60' });
+    await Promise.allSettled(waitUntilPromises);
+    assert.deepEqual(calls, ['fairqueue-wait']);
+    assert.equal(openListReportObservations.length, 1);
+    assert.equal(openListReportObservations[0].body.feedback.ticket, 'test-ticket-abcdefghijklmnopqrstuvwxyz');
+    assert.equal(openListReportObservations[0].body.feedback.outcome, 'abandoned');
+    assert.equal(openListReportObservations[0].body.feedback.status_code, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('fair queue inner timeout preserves recovery deadline identity when the worker budget expires first', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const performanceDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
+  const longTimers = [];
+  const calls = [];
+  let monotonicNow = 0;
+  let waitStarted;
+  const waitStartedPromise = new Promise((resolve) => { waitStarted = resolve; });
+  let waitStreamCancelled = false;
+  Object.defineProperty(globalThis, 'performance', {
+    configurable: true,
+    value: { now: () => monotonicNow },
+  });
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (Number(delay) >= 149_000 && Number(delay) <= 151_000) {
+      const callbackSource = String(callback);
+      const kind = callbackSource.includes('cacheOwnerAbortController')
+        ? 'owner'
+        : callbackSource.includes('localAbortTriggered')
+          ? 'fq'
+          : 'outer';
+      const handle = { cleared: false, kind, callback: () => callback(...args) };
+      longTimers.push(handle);
+      return handle;
+    }
+    return originalSetTimeout(callback, delay, ...args);
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (longTimers.includes(handle)) {
+      handle.cleared = true;
+      return;
+    }
+    return originalClearTimeout(handle);
+  };
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      const bootstrap = buildRuntimeBootstrap({
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+      });
+      bootstrap.download.fairQueue.slotHandlerTimeoutMs = 200_000;
+      return createJsonResponse(bootstrap);
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/fq-recovery-deadline',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      waitStarted();
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            `event: accepted\ndata: ${JSON.stringify({
+              queryToken: 'query-fq-recovery-deadline',
+              invocationEpoch: 1,
+              deadlineMs: Date.now() + 200_000,
+            })}\n\n`,
+          ));
+        },
+        pull() {
+          return new Promise(() => {});
+        },
+        cancel() {
+          waitStreamCancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/fq-recovery-deadline') {
+      throw new Error('origin fetch should not run after recovery deadline expiry');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const responsePromise = worker.fetch(await buildSignedWorkerRequest({
+      pathname: '/downloads/fq-recovery-deadline.bin',
+    }), buildWorkerEnv(), ctx);
+    await waitStartedPromise;
+    assert.equal(longTimers.some((timer) => timer.kind === 'owner'), true);
+    assert.equal(longTimers.some((timer) => timer.kind === 'outer'), true);
+    assert.equal(longTimers.some((timer) => timer.kind === 'fq'), true);
+    monotonicNow = 160_000;
+    const innerFqTimer = longTimers.find((timer) => timer.kind === 'fq');
+    const outerExecutionTimer = longTimers.find((timer) => timer.kind === 'outer');
+    assert.equal(innerFqTimer.cleared, false);
+    assert.equal(outerExecutionTimer.cleared, false);
+    innerFqTimer.callback();
+    const response = await responsePromise;
+    await Promise.allSettled(waitUntilPromises);
+
+    await assertJsonError(response, { status: 503, reason: 'recovery_deadline_exhausted', retryAfter: '30' });
+    assert.equal(waitStreamCancelled, true);
+    assert.deepEqual(calls, ['fairqueue-wait']);
+    assert.equal(openListReportObservations.length, 1);
+    assert.equal(openListReportObservations[0].body.feedback.ticket, 'test-ticket-abcdefghijklmnopqrstuvwxyz');
+    assert.equal(openListReportObservations[0].body.feedback.outcome, 'failure');
+    assert.equal(openListReportObservations[0].body.feedback.status_code, 0);
+    assert.equal(openListReportObservations[0].body.feedback.reason, 'recovery_deadline_exhausted');
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    if (performanceDescriptor) {
+      Object.defineProperty(globalThis, 'performance', performanceDescriptor);
+    }
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('fair queue earlier local wait budget remains an abandoned admission timeout', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const performanceDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
+  const longTimers = [];
+  const calls = [];
+  let monotonicNow = 0;
+  let waitStarted;
+  const waitStartedPromise = new Promise((resolve) => { waitStarted = resolve; });
+  let waitStreamCancelled = false;
+  Object.defineProperty(globalThis, 'performance', {
+    configurable: true,
+    value: { now: () => monotonicNow },
+  });
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (Number(delay) >= 99_000 && Number(delay) <= 151_000) {
+      const callbackSource = String(callback);
+      const kind = callbackSource.includes('cacheOwnerAbortController')
+        ? 'owner'
+        : callbackSource.includes('localAbortTriggered')
+          ? 'fq'
+          : 'outer';
+      const handle = { cleared: false, kind, callback: () => callback(...args) };
+      longTimers.push(handle);
+      return handle;
+    }
+    return originalSetTimeout(callback, delay, ...args);
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (longTimers.includes(handle)) {
+      handle.cleared = true;
+      return;
+    }
+    return originalClearTimeout(handle);
+  };
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      const bootstrap = buildRuntimeBootstrap({
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+      });
+      bootstrap.download.fairQueue.slotHandlerTimeoutMs = 100_000;
+      return createJsonResponse(bootstrap);
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://tenant.sharepoint.com/sites/demo/fq-local-budget',
+          header: {},
+        },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      calls.push('fairqueue-wait');
+      waitStarted();
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            `event: accepted\ndata: ${JSON.stringify({
+              queryToken: 'query-fq-local-budget',
+              invocationEpoch: 1,
+              deadlineMs: Date.now() + 100_000,
+            })}\n\n`,
+          ));
+        },
+        pull() {
+          return new Promise(() => {});
+        },
+        cancel() {
+          waitStreamCancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/demo/fq-local-budget') {
+      throw new Error('origin fetch should not run after local FQ timeout');
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const { ctx, waitUntilPromises } = createTestContext();
+    const responsePromise = worker.fetch(await buildSignedWorkerRequest({
+      pathname: '/downloads/fq-local-budget.bin',
+    }), buildWorkerEnv(), ctx);
+    await waitStartedPromise;
+    assert.equal(longTimers.some((timer) => timer.kind === 'owner'), true);
+    assert.equal(longTimers.some((timer) => timer.kind === 'outer'), true);
+    assert.equal(longTimers.some((timer) => timer.kind === 'fq'), true);
+    monotonicNow = 100_000;
+    longTimers.find((timer) => timer.kind === 'fq').callback();
+    const response = await responsePromise;
+    await Promise.allSettled(waitUntilPromises);
+
+    await assertJsonError(response, { status: 503, reason: 'fq_timeout', retryAfter: '60' });
+    assert.equal(waitStreamCancelled, true);
+    assert.deepEqual(calls, ['fairqueue-wait']);
+    assert.equal(openListReportObservations.length, 1);
+    assert.equal(openListReportObservations[0].body.feedback.ticket, 'test-ticket-abcdefghijklmnopqrstuvwxyz');
+    assert.equal(openListReportObservations[0].body.feedback.outcome, 'abandoned');
+    assert.equal(openListReportObservations[0].body.feedback.status_code, 0);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    if (performanceDescriptor) {
+      Object.defineProperty(globalThis, 'performance', performanceDescriptor);
+    }
+    globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
@@ -9903,7 +10558,7 @@ test('concurrency wait disconnect ends as terminal waiter death before origin fe
     const response = await worker.fetch(request, buildWorkerEnv(), ctx);
     await Promise.allSettled(waitUntilPromises);
 
-    await assertJsonError(response, { status: 499, reason: 'client_aborted' });
+    await assertJsonError(response, { status: 499, reason: 'client_aborted', retryAfter: '30' });
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse']);
     assert.equal(waitAccepted, true);
     assert.equal(waitStreamCancelled, true);
@@ -9979,7 +10634,7 @@ test('client-aborted CQ SSE wait remains terminal before origin fetch', async ()
     const { ctx, waitUntilPromises } = createTestContext();
     const request = await buildSignedWorkerRequest({ signal: abortController.signal });
     const response = await worker.fetch(request, buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 499, reason: 'client_aborted' });
+    const body = await assertJsonError(response, { status: 499, reason: 'client_aborted', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.equal(body.message, 'client aborted request');
     assert.deepEqual(calls, ['concurrency-acquire-fast', 'concurrency-wait-sse']);
@@ -10066,7 +10721,7 @@ test('queue_only aborts CQ wait without cancel when unused fairqueue release can
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 503, reason: 'fq_unavailable' });
+    const body = await assertJsonError(response, { status: 503, reason: 'fq_unavailable', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.match(body.message, /fair queue/i);
     assert.deepEqual(calls.slice(0, 3), [
@@ -10172,7 +10827,7 @@ test('queue_breaker aborts CQ wait without cancel when breaker settlement fails 
   try {
     const { ctx, waitUntilPromises } = createTestContext();
     const response = await worker.fetch(await buildSignedWorkerRequest(), buildWorkerEnv(), ctx);
-    const body = await assertJsonError(response, { status: 503, reason: 'breaker_settle_failed' });
+    const body = await assertJsonError(response, { status: 503, reason: 'breaker_settle_failed', retryAfter: '30' });
     await Promise.allSettled(waitUntilPromises);
     assert.match(body.message, /attempt settlement/i);
     assert.deepEqual(calls, [
@@ -10282,6 +10937,7 @@ test('true concurrency wait terminal SSE results map to existing terminal surfac
       const body = await assertJsonError(response, {
         status: scenario.expectedStatus,
         reason: scenario.name === 'expired' ? 'ticket_state_expired' : 'cq_terminal',
+        retryAfter: '30',
       });
       await Promise.allSettled(waitUntilPromises);
       assert.equal(body.message, scenario.expectedMessage, scenario.name);
@@ -10319,6 +10975,7 @@ test('Google Drive HEAD requests use GET range probe, expose resumable headers, 
             ? 'https://drive.google.com/uc?id=test-file&export=download'
             : 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 100,
         },
       });
     }
@@ -10388,6 +11045,7 @@ test('true concurrency Google Drive HEAD probe releases stream_complete after a 
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 100,
         },
       });
     }
@@ -10468,6 +11126,7 @@ test('Google Drive HEAD range probes fail safely and cancel body when upstream r
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 100,
         },
       });
     }
@@ -10495,7 +11154,7 @@ test('Google Drive HEAD range probes fail safely and cancel body when upstream r
     });
 
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid' });
+    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid', retryAfter: '30' });
     assert.equal(originBody.cancelled, true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -10521,6 +11180,7 @@ test('Google Drive HEAD range probes fail safely and cancel body when Content-Ra
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 100,
         },
       });
     }
@@ -10546,7 +11206,7 @@ test('Google Drive HEAD range probes fail safely and cancel body when Content-Ra
     });
 
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid' });
+    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid', retryAfter: '30' });
     assert.equal(originBody.cancelled, true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -10572,6 +11232,7 @@ test('Google Drive HEAD range probes fail safely and cancel body when Content-Ra
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 100,
         },
       });
     }
@@ -10598,7 +11259,7 @@ test('Google Drive HEAD range probes fail safely and cancel body when Content-Ra
     });
 
     const response = await worker.fetch(request, buildWorkerEnv(), createTestContext().ctx);
-    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid' });
+    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid', retryAfter: '30' });
     assert.equal(originBody.cancelled, true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -10631,6 +11292,7 @@ test('Google Drive HEAD probe failure waits for in-flight fairqueue header relea
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 100,
         },
       });
     }
@@ -10711,7 +11373,7 @@ test('Google Drive HEAD probe failure waits for in-flight fairqueue header relea
     finishHeaderRelease();
     const response = await responsePromise;
     await Promise.allSettled(waitUntilPromises);
-    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid' });
+    await assertJsonError(response, { status: 502, reason: 'google_drive_probe_invalid', retryAfter: '30' });
     assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.equal(releaseBodies[0].slotToken, 'slot-invalid-head');
@@ -10852,6 +11514,7 @@ test('Google Drive GET downloads prefer payload filesize for full-range translat
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 13,
         },
       });
     }
@@ -10915,7 +11578,7 @@ test('Google Drive synthetic full-download responses strip transfer-encoding and
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
-          filesize: 13,
+          size: 13,
         },
       });
     }
@@ -10971,7 +11634,7 @@ test('Google Drive GET downloads without client range rewrite full-file 206 resp
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
-          filesize: 13,
+          size: 13,
         },
       });
     }
@@ -11011,11 +11674,11 @@ test('Google Drive GET downloads without client range rewrite full-file 206 resp
   }
 });
 
-test('Google Drive probe-first release fingerprint freezes at HEAD dispatch and survives the primary fetch', async () => {
+test('Google Drive release fingerprint starts at the primary dispatch with authoritative size', async () => {
   const originalFetch = globalThis.fetch;
   const originCalls = [];
   const releaseBodies = [];
-  let headDispatchObservedAtMs = null;
+  let dispatchObservedAtMs = null;
 
   globalThis.fetch = async (input, init = {}) => {
     const request = input instanceof Request ? input : new Request(input, init);
@@ -11033,6 +11696,7 @@ test('Google Drive probe-first release fingerprint freezes at HEAD dispatch and 
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 13,
         },
       });
     }
@@ -11055,16 +11719,7 @@ test('Google Drive probe-first release fingerprint freezes at HEAD dispatch and 
 
     if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
       originCalls.push({ method, range: headers.get('range') });
-      if (method === 'HEAD') {
-        headDispatchObservedAtMs = Date.now();
-        return new Response(null, {
-          status: 200,
-          headers: {
-            'content-type': 'application/octet-stream',
-            'content-length': '13',
-          },
-        });
-      }
+      dispatchObservedAtMs = dispatchObservedAtMs || Date.now();
       return new Response('download-body', {
         status: 206,
         headers: {
@@ -11094,25 +11749,22 @@ test('Google Drive probe-first release fingerprint freezes at HEAD dispatch and 
     assert.equal(await response.text(), 'download-body');
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(originCalls, [
-      { method: 'HEAD', range: null },
       { method: 'GET', range: 'bytes=0-12' },
     ]);
     assert.equal(releaseBodies.length, 1);
     assert.equal(releaseBodies[0].releaseKind, 'after_use');
     assert.equal(Number.isInteger(releaseBodies[0].hitUpstreamAtMs), true);
     assert.equal(releaseBodies[0].hitUpstreamAtMs > 0, true);
-    assert.equal(releaseBodies[0].hitUpstreamAtMs <= headDispatchObservedAtMs, true);
+    assert.equal(releaseBodies[0].hitUpstreamAtMs <= dispatchObservedAtMs, true);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
 });
 
-test('Google Drive GET downloads without payload filesize fall back to a 0-0 range probe when HEAD does not expose content-length', async () => {
+test('Google Drive GET downloads fail closed when authoritative size is missing from a cold request', async () => {
   const originalFetch = globalThis.fetch;
   const originCalls = [];
-  const headProbeBody = createTrackedTextBody('head-probe-body');
-  const rangeProbeBody = createTrackedTextBody('range-probe-body');
 
   globalThis.fetch = async (input, init = {}) => {
     const request = input instanceof Request ? input : new Request(input, init);
@@ -11134,33 +11786,7 @@ test('Google Drive GET downloads without payload filesize fall back to a 0-0 ran
 
     if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
       originCalls.push({ method, range: headers.get('range') });
-      if (method === 'HEAD') {
-        return new Response(headProbeBody.stream, {
-          status: 200,
-          headers: {
-            'content-type': 'application/octet-stream',
-          },
-        });
-      }
-      if (headers.get('range') === 'bytes=0-0') {
-        return new Response(rangeProbeBody.stream, {
-          status: 206,
-          headers: {
-            'content-type': 'application/octet-stream',
-            'content-length': '1',
-            'content-range': 'bytes 0-0/13',
-          },
-        });
-      }
-      return new Response('download-body', {
-        status: 206,
-        headers: {
-          'content-type': 'application/octet-stream',
-          'content-disposition': 'attachment; filename="download.bin"',
-          'content-length': '13',
-          'content-range': 'bytes 0-12/13',
-        },
-      });
+      throw new Error('origin content must not be reached without authoritative size');
     }
 
     throw new Error(`Unexpected fetch URL in test: ${url}`);
@@ -11173,18 +11799,9 @@ test('Google Drive GET downloads without payload filesize fall back to a 0-0 ran
       createTestContext().ctx,
     );
 
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get('content-length'), '13');
-    assert.equal(response.headers.get('content-range'), null);
-    assert.equal(response.headers.get('accept-ranges'), 'bytes');
-    assert.equal(await response.text(), 'download-body');
-    assert.deepEqual(originCalls, [
-      { method: 'HEAD', range: null },
-      { method: 'GET', range: 'bytes=0-0' },
-      { method: 'GET', range: 'bytes=0-12' },
-    ]);
-    assert.equal(headProbeBody.cancelled, true);
-    assert.equal(rangeProbeBody.cancelled, true);
+    assert.equal(response.status, 503);
+    assert.equal((await response.json()).reason, 'google_drive_size_missing');
+    assert.deepEqual(originCalls, []);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -11209,7 +11826,7 @@ test('Google Drive GET downloads do not rewrite partial 206 responses that do no
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
-          filesize: 13,
+          size: 13,
         },
       });
     }
@@ -11237,7 +11854,7 @@ test('Google Drive GET downloads do not rewrite partial 206 responses that do no
       createTestContext().ctx,
     );
 
-    await assertJsonError(response, { status: 502, reason: 'google_drive_range_mismatch' });
+    await assertJsonError(response, { status: 502, reason: 'google_drive_range_mismatch', retryAfter: '30' });
     assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -11264,7 +11881,7 @@ test('Google Drive GET downloads reject synthetic full-range 206 responses with 
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
-          filesize: 13,
+          size: 13,
         },
       });
     }
@@ -11292,7 +11909,7 @@ test('Google Drive GET downloads reject synthetic full-range 206 responses with 
       createTestContext().ctx,
     );
 
-    await assertJsonError(response, { status: 502, reason: 'google_drive_range_mismatch' });
+    await assertJsonError(response, { status: 502, reason: 'google_drive_range_mismatch', retryAfter: '30' });
     assert.deepEqual(originCalls, [{ method: 'GET', range: 'bytes=0-12' }]);
     assert.equal(originBody.cancelled, true);
   } finally {
@@ -11326,7 +11943,7 @@ test('Google Drive full-range mismatch waits for in-flight fairqueue header rele
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
-          filesize: 13,
+          size: 13,
         },
       });
     }
@@ -11407,7 +12024,7 @@ test('Google Drive full-range mismatch waits for in-flight fairqueue header rele
     finishHeaderRelease();
     const response = await responsePromise;
     await Promise.allSettled(waitUntilPromises);
-    await assertJsonError(response, { status: 502, reason: 'google_drive_range_mismatch' });
+    await assertJsonError(response, { status: 502, reason: 'google_drive_range_mismatch', retryAfter: '30' });
     assert.equal(calls.filter((call) => call === 'fairqueue-release').length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.equal(releaseBodies[0].slotToken, 'slot-range-mismatch');
@@ -11419,7 +12036,7 @@ test('Google Drive full-range mismatch waits for in-flight fairqueue header rele
   }
 });
 
-test('Google Drive GET downloads fail open to the original GET path when HEAD and 0-0 probes both fail', async () => {
+test('Google Drive GET downloads fail closed when authoritative size is missing', async () => {
   const originalFetch = globalThis.fetch;
   const originCalls = [];
 
@@ -11443,20 +12060,7 @@ test('Google Drive GET downloads fail open to the original GET path when HEAD an
 
     if (url === 'https://www.googleapis.com/drive/v3/files/test-file?alt=media') {
       originCalls.push({ method, range: headers.get('range') });
-      if (method === 'HEAD') {
-        throw new Error('HEAD probe failed');
-      }
-      if (headers.get('range') === 'bytes=0-0') {
-        throw new Error('range probe failed');
-      }
-      return new Response('download-body', {
-        status: 200,
-        headers: {
-          'content-type': 'application/octet-stream',
-          'content-disposition': 'attachment; filename="download.bin"',
-          'content-length': '13',
-        },
-      });
+      throw new Error('origin content must not be reached without authoritative size');
     }
 
     throw new Error(`Unexpected fetch URL in test: ${url}`);
@@ -11469,15 +12073,9 @@ test('Google Drive GET downloads fail open to the original GET path when HEAD an
       createTestContext().ctx,
     );
 
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get('content-length'), '13');
-    assert.equal(response.headers.get('accept-ranges'), 'bytes');
-    assert.equal(await response.text(), 'download-body');
-    assert.deepEqual(originCalls, [
-      { method: 'HEAD', range: null },
-      { method: 'GET', range: 'bytes=0-0' },
-      { method: 'GET', range: null },
-    ]);
+    assert.equal(response.status, 503);
+    assert.equal((await response.json()).reason, 'google_drive_size_missing');
+    assert.deepEqual(originCalls, []);
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
@@ -11515,6 +12113,7 @@ test('true concurrency known-length downloads use FixedLengthStream to preserve 
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 13,
         },
       });
     }
@@ -11665,7 +12264,7 @@ test('true concurrency managed streaming strips transfer-encoding and preserves 
   }
 });
 
-test('true concurrency malformed content-length falls back to generic managed streaming', async () => {
+test('true concurrency rejects malformed content-length on a synthetic Google full-range response', async () => {
   const originalFetch = globalThis.fetch;
   const originalFixedLengthStream = globalThis.FixedLengthStream;
   const calls = [];
@@ -11696,6 +12295,7 @@ test('true concurrency malformed content-length falls back to generic managed st
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 13,
         },
       });
     }
@@ -11743,13 +12343,12 @@ test('true concurrency malformed content-length falls back to generic managed st
       ctx,
     );
 
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get('content-length'), null);
-    assert.equal(await response.text(), 'download-body');
+    assert.equal(response.status, 502);
+    assert.equal((await response.json()).reason, 'google_drive_content_invalid');
+    assert.equal(fixedLengthCalls.length, 0);
     await new Promise((resolve) => setTimeout(resolve, 0));
     await Promise.allSettled(waitUntilPromises);
     assert.deepEqual(calls, ['concurrency-acquire', 'origin-fetch', 'concurrency-release']);
-    assert.deepEqual(fixedLengthCalls, []);
   } finally {
     globalThis.fetch = originalFetch;
     globalThis.FixedLengthStream = originalFixedLengthStream;
@@ -11789,7 +12388,7 @@ test('true concurrency rewrites exact Google full-file 206 responses into fixed-
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
-          filesize: 13,
+          size: 13,
         },
       });
     }
@@ -11873,6 +12472,7 @@ test('Google Drive ranged GET downloads synthesize accept-ranges from 206 conten
         data: {
           url: 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 13,
         },
       });
     }
@@ -12105,6 +12705,7 @@ test('breaker authority uses actual Google Drive hostnames', async () => {
             ? 'https://drive.google.com/uc?id=test-file&export=download'
             : 'https://www.googleapis.com/drive/v3/files/test-file?alt=media',
           header: {},
+          size: 2,
         },
       });
     }
@@ -12155,20 +12756,15 @@ test('breaker authority uses actual Google Drive hostnames', async () => {
     if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
       const body = JSON.parse(init.body);
       reportBodies.push(body);
-      breakerStateByHash.set(body.p_hostname_hash, {
+      const state = {
         STATE: 'open',
         OPEN_UNTIL: Math.floor(Date.now() / 1000) + 30,
         OPEN_REASON: `http_${body.p_status_code}`,
         VERSION: 7,
         LAST_ERROR_CODE: body.p_status_code,
-      });
-      return createJsonResponse([{
-        STATE: 'open',
-        OPEN_UNTIL: Math.floor(Date.now() / 1000) + 30,
-        OPEN_REASON: `http_${body.p_status_code}`,
-        VERSION: 7,
-        LAST_ERROR_CODE: body.p_status_code,
-      }]);
+      };
+      breakerStateByHash.set(body.p_hostname_hash, state);
+      return createJsonResponse([state]);
     }
 
     if (url === 'https://drive.google.com/uc?id=test-file&export=download') {
@@ -12186,7 +12782,10 @@ test('breaker authority uses actual Google Drive hostnames', async () => {
       originHosts.push('www.googleapis.com');
       return new Response('ok', {
         status: 200,
-        headers: { 'content-type': 'application/octet-stream' },
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '2',
+        },
       });
     }
 
@@ -12205,7 +12804,7 @@ test('breaker authority uses actual Google Drive hostnames', async () => {
       status: 503,
       reason: 'upstream_rate_limited',
       upstreamStatus: 429,
-      retryAfter: '8',
+      retryAfter: '30',
     });
 
     const secondCtx = createTestContext();
@@ -12374,4 +12973,82 @@ test('final cleanup keeps SharePoint host grouping unchanged', () => {
     cleanupGroups.map((group) => group.map((context) => context.queryToken)),
     [['sharepoint-query-a'], ['sharepoint-query-b']],
   );
+});
+
+test('initial fairqueue admission merges smaller and larger retry values across HTTP and CORS surfaces', async () => {
+  const originalFetch = globalThis.fetch;
+  const retryCases = [5, 60];
+
+  try {
+    for (const admissionRetryAfter of retryCases) {
+      const path = `/downloads/initial-admission-retry-${admissionRetryAfter}.bin`;
+      const calls = [];
+      globalThis.fetch = async (input, init = {}) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const { url } = request;
+        const cacheResponse = await cacheRpc.handle(input, init);
+        if (cacheResponse) {
+          return cacheResponse;
+        }
+        const ticketResponse = await handleTicketStateRpc(url, init);
+        if (ticketResponse) {
+          return ticketResponse;
+        }
+        if (url === 'https://controller.example.test/api/v0/bootstrap') {
+          return createJsonResponse(buildRuntimeBootstrap({
+            fairQueueHostPatterns: ['*.sharepoint.com'],
+          }));
+        }
+        if (url === 'https://alist.example.com/api/fs/link') {
+          calls.push('link-api');
+          return createJsonResponse({
+            code: 200,
+            data: {
+              url: 'https://tenant.sharepoint.com/initial-admission-retry',
+              header: {},
+              download: {
+                provider: 'generic',
+                ticket: `initial-admission-${admissionRetryAfter}-abcdefghijklmnopqrstuvwxyz`,
+                expires_at: Math.floor(Date.now() / 1000) + 300,
+                report_success: false,
+              },
+            },
+          });
+        }
+        if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+          calls.push('fairqueue-wait');
+          return createFairQueueWaitResponseFromInit(init, {
+            result: 'overloaded',
+            reason: 'capacity_exhausted',
+            retryAfter: admissionRetryAfter,
+          });
+        }
+        throw new Error(`unexpected fetch URL: ${url}`);
+      };
+
+      const { ctx, waitUntilPromises } = createTestContext();
+      const response = await worker.fetch(
+        await buildSignedWorkerRequest({ pathname: path }),
+        buildWorkerEnv(),
+        ctx,
+      );
+      const body = await assertJsonError(response, {
+        status: 503,
+        reason: 'fq_overloaded',
+        retryAfter: String(Math.max(admissionRetryAfter, 30)),
+      });
+      await Promise.allSettled(waitUntilPromises);
+      assert.equal(body['retry-after'], String(Math.max(admissionRetryAfter, 30)));
+      assert.equal(response.headers.get('Access-Control-Allow-Origin'), 'https://landing.example.com');
+      assert.match(response.headers.get('Access-Control-Expose-Headers') || '', /(^|,\s*)Retry-After(,|$)/i);
+      assert.deepEqual(calls, ['link-api', 'fairqueue-wait']);
+      assert.equal(openListReportObservations.length, 1);
+      assert.equal(openListReportObservations[0].body.feedback.ticket, `initial-admission-${admissionRetryAfter}-abcdefghijklmnopqrstuvwxyz`);
+      assert.equal(openListReportObservations[0].body.feedback.outcome, 'abandoned');
+      assert.equal(openListReportObservations[0].body.feedback.status_code, 0);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
 });

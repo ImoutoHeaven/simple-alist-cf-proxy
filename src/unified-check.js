@@ -1,4 +1,4 @@
-import { sha256Hash, calculateIPSubnet, applyVerifyHeaders, hasVerifyCredentials } from './utils.js';
+import { sha256Hash, calculateIPSubnet, applyVerifyHeaders, hasVerifyCredentials, isUsableReadyLink, readResponseTextWithSignal } from './utils.js';
 import { logEvent } from './logging.js';
 
 const VALID_BREAKER_STATES = new Set(['closed', 'open', 'half_open']);
@@ -57,20 +57,62 @@ const normalizeFound = (value) => {
   return false;
 };
 
+const parseTimestampMs = (value) => {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value * 1000;
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const createRpcError = (message, fields) => {
+  const error = new Error(message);
+  error.logFields = fields;
+  return error;
+};
+
 const postRpc = async (config, rpcName, body, errorScope) => {
   const targetUrl = `${normalizePostgrestUrl(config.postgrestUrl)}/rpc/${rpcName}`;
   const response = await fetch(targetUrl, {
     method: 'POST',
     headers: createRpcHeaders(config),
     body: JSON.stringify(body),
+    signal: config.signal,
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`${errorScope} RPC error (${response.status}): ${errorText}`);
+    try {
+      await readResponseTextWithSignal(response, config.signal);
+    } catch (error) {
+      if (config.signal?.aborted) {
+        throw error;
+      }
+      // The response body is diagnostic input and is intentionally discarded.
+    }
+    throw createRpcError(`${errorScope} RPC error (${response.status})`, {
+      operation: 'rpc',
+      rpc: rpcName,
+      status: response.status,
+    });
   }
 
-  return response.json();
+  let result;
+  try {
+    result = JSON.parse(await readResponseTextWithSignal(response, config.signal));
+  } catch (error) {
+    if (config.signal?.aborted) {
+      throw error;
+    }
+    throw createRpcError(`${errorScope} RPC returned invalid JSON`, {
+      operation: 'rpc',
+      rpc: rpcName,
+      error: 'invalid_json',
+    });
+  }
+  return result;
 };
 
 const parseTicketStateRow = (row) => {
@@ -185,19 +227,43 @@ export const unifiedCheck = async (path, clientIP, config) => {
     method: 'POST',
     headers: createRpcHeaders(config),
     body: JSON.stringify(rpcBody),
+    signal: config.signal,
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
+    try {
+      await readResponseTextWithSignal(response, config.signal);
+    } catch (error) {
+      if (config.signal?.aborted) {
+        throw error;
+      }
+      // The response body is diagnostic input and is intentionally discarded.
+    }
     logEvent('error', 'UnifiedCheck', 'rpc_error', {
       operation: 'download_unified_check',
       status: response.status,
     });
-    throw new Error(`Unified check RPC error (${response.status}): ${errorText}`);
+    throw createRpcError(`Unified check RPC error (${response.status})`, {
+      operation: 'rpc',
+      rpc: 'download_unified_check',
+      status: response.status,
+    });
   }
 
-  const result = await response.json();
-  if (!result || result.length === 0) {
+  let result;
+  try {
+    result = JSON.parse(await readResponseTextWithSignal(response, config.signal));
+  } catch (error) {
+    if (config.signal?.aborted) {
+      throw error;
+    }
+    throw createRpcError('Unified check RPC returned invalid JSON', {
+      operation: 'rpc',
+      rpc: 'download_unified_check',
+      error: 'invalid_json',
+    });
+  }
+  if (!Array.isArray(result) || result.length === 0 || !result[0] || typeof result[0] !== 'object') {
     logEvent('error', 'UnifiedCheck', 'rpc_empty', {
       operation: 'download_unified_check',
     });
@@ -205,6 +271,14 @@ export const unifiedCheck = async (path, clientIP, config) => {
   }
 
   const row = result[0];
+  const cacheObservedAtMs = parseTimestampMs(row.cache_observed_at);
+  if (cacheObservedAtMs === null) {
+    throw createRpcError('Unified check returned no cache observation time', {
+      operation: 'state',
+      rpc: 'download_unified_check',
+      error: 'invalid_response',
+    });
+  }
   logEvent('info', 'UnifiedCheck', 'rpc_success', {
     operation: 'download_unified_check',
     rowCount: result.length,
@@ -222,12 +296,22 @@ export const unifiedCheck = async (path, clientIP, config) => {
     linkData: null,
     timestamp: null,
     hostnameHash: null,
+    version: null,
+    observedAt: null,
+    observedAtMs: null,
   };
+  cacheResult.version = row.cache_version || null;
+  cacheResult.observedAt = row.cache_observed_at ?? null;
+  cacheResult.observedAtMs = cacheObservedAtMs;
 
   if (config.cacheEnabled && row.cache_link_data) {
     try {
+      const parsedLinkData = JSON.parse(row.cache_link_data);
+      if (typeof row.cache_version !== 'string' || !row.cache_version.trim() || !isUsableReadyLink(parsedLinkData)) {
+        throw new Error('invalid cache link data');
+      }
       cacheResult.hit = true;
-      cacheResult.linkData = JSON.parse(row.cache_link_data);
+      cacheResult.linkData = parsedLinkData;
       cacheResult.timestamp = row.cache_timestamp;
       cacheResult.hostnameHash = row.cache_hostname_hash;
       logEvent('info', 'UnifiedCheck', 'cache_result', {
@@ -236,10 +320,15 @@ export const unifiedCheck = async (path, clientIP, config) => {
         hostnameHash: cacheResult.hostnameHash,
         pathHash,
       });
-    } catch (error) {
+    } catch {
       logEvent('error', 'UnifiedCheck', 'cache_parse_failed', {
-        message: error?.message,
+        error: 'invalid_response',
         pathHash,
+      });
+      throw createRpcError('Unified check returned an invalid ready cache state', {
+        operation: 'state',
+        rpc: 'download_unified_check',
+        error: 'invalid_response',
       });
     }
   } else if (!config.cacheEnabled) {

@@ -1,13 +1,13 @@
 # simple-alist-cf-proxy
 
-simple-alist-cf-proxy 是 AList 下载体系里的 Cloudflare Worker 下载代理（download worker）。Worker 不再从环境变量读取业务策略，运行时完全依赖控制面下发的 bootstrap/decision，并与 landing worker 协作完成票据校验、origin 绑定、缓存/限流、数据库单一权威的 Breaker 与公平排队等能力。
+simple-alist-cf-proxy 是 AList 下载体系里的 Cloudflare Worker 下载代理（download worker）。运行时业务策略来自控制面下发的 bootstrap/decision，并与 landing worker 协作完成票据校验、origin 绑定、缓存/限流、数据库单一权威的 Breaker 与公平排队等能力。
 
 ## 主要能力
 
 - `payload` / `payloadSign` 校验（HMAC + expire）
 - Origin 绑定：解密 `payload.encrypt` 并重算 `bindingStr`（ip/iprange/Geo/ASN/TLS/path）
-- PostgREST 模式缓存、限流与 Breaker 权威快照：`download_unified_check` 一次 RTT 统一检查
-- SharePoint admission 四种运行模式：`none` / `breaker_only` / `queue_only` / `queue_breaker`；其中 `queue_breaker` 由 slot-handler 原子完成 queue + breaker admission，worker 只在 `breaker_only` 调用 authorize RPC，并在 `breaker_only` / `queue_breaker` fetch 后按上游终态执行 `report` 或 `settle` RPC：仅 `2xx` 代理上游 body，保留现有 `3xx` redirect/deferred 行为，`4xx`/`5xx` 改为返回 Worker 生成的 JSON error envelope
+- PostgREST 模式下载缓存协调、限流与 Breaker 权威快照：`download_unified_check` 一次 RTT 统一检查，下载请求要求启用 `custom-pg-rest` 与共享缓存
+- SharePoint admission 四种运行模式：`none` / `breaker_only` / `queue_only` / `queue_breaker`；其中 `queue_breaker` 由 slot-handler 原子完成 queue + breaker admission，worker 只在 `breaker_only` 调用 authorize RPC，并在 `breaker_only` / `queue_breaker` fetch 后按上游终态执行 `report` 或 `settle` RPC：仅 `2xx` 代理上游 body，保留现有 `3xx` redirect/deferred 行为，`4xx`/`5xx` 返回包含 `status`、`message`、`reason` 的 Worker 生成 JSON error envelope，并按需附带 `upstream_status` 与 `retry-after`
 - 可选的 split admission：`slot-handler` 继续负责 fairqueue，`concurrency-handler` 负责 true in-flight concurrency；两者可独立启用，也可按固定顺序组合启用
 - 可选 Cloudflare 原生 Rate Limiter
 - 安全响应封装：精简 headers + 统一 CORS + 小文件 Cache-Control 覆盖
@@ -111,9 +111,10 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - `download.db.mode=custom-pg-rest` 时：
   - `download.db.postgrestUrl`
   - `download.db.verifyHeader` / `download.db.verifySecret`
-  - `download.db.linkTTLSeconds` / `download.db.idleTimeoutSeconds`
-  - `download.db.cacheTable` / `download.db.lastActiveTable`
-  - `download.db.rateLimit.*`（`windowSeconds` / `limit` / `blockSeconds` / `pgErrorHandle` 等）
+  - `download.db.cacheEnabled=true`（下载缓存协调必需）
+  - `download.db.linkTTLSeconds` / `download.db.cacheTable` / `download.db.ticketStateTable`
+- `download.db.rateLimit.*`（`windowSeconds` / `limit` / `blockSeconds` / `pgErrorHandle` 等）
+- 下载缓存协调使用 `DOWNLOAD_CACHE_TABLE` 与 `DOWNLOAD_CACHE_REFRESH`；Worker 通过 `download_get_cache_state`、`download_acquire_cache_refresh`、`download_finish_cache_refresh` 读取状态、取得 180 秒租约并条件发布。`download_cleanup_expired_cache` 保留活动租约、终端退避和仍可读取的失效版本标记。
 - `download.throttleProfiles` + `decision.download.throttleProfile`：SharePoint breaker profile 与 selector；controller/bootstrap breaker 字段集合保持不变，固定为 `hostPatterns`、`openCapSeconds`、`openThresholdPercent`、`closeThresholdPercent`、`ewmaSpan`、`consecutiveThreshold`、`minSamplesBeforeEwmaOpen`、`idleResetSeconds`、`halfOpenSuccessThreshold`、`halfOpenCloseMode`、`halfOpenMaxProbeCount`、`halfOpenMaxSeconds`、`halfOpenTimeoutMode`、`protectHttpCodes`。worker 会拒绝 `halfOpenSuccessThreshold > halfOpenMaxProbeCount` 的无效 bootstrap，也会拒绝 `halfOpenMaxProbeCount > 63`，因为 SQL 用 signed `BIGINT` mask 记录 half-open 当前批次 ticket 状态；`halfOpenCloseMode=and|or` 控制 half-open 关闭条件按“成功次数 + EWMA 阈值”取交集或并集，`halfOpenTimeoutMode=open|close|partial-close` 控制 half-open 超时后的终态；Breaker 运行时状态固定落在 `THROTTLE_PROTECTION`，并保持 DB-authoritative、traffic-driven，worker/slot-handler 都不保留本地 breaker 权威，未知 selector 直接报错
 - `download.fairQueue.*`：公平排队开关与等待策略（含 siteBucket 计算）
 - `download.trueConcurrency.*`：true-concurrency 开关、`hostPatterns`、`handlerUrl`、`handlerAuthKey`、`handlerAuthHeader`、`acquireTimeoutMs`、`releaseTimeoutMs`、`siteBucket`，以及必填的 `heartbeat`
@@ -129,13 +130,14 @@ wrangler pages deploy --config pages_entrance/wrangler.toml
 - 从控制面拉取 bootstrap/decision，解析为运行配置
 - 依据 `decision.pathAction` 执行阻断或跳过某些校验
 - 校验 `payloadSign` 与 `payload.expireTime`，解密 `payload.encrypt` 并重算 `bindingStr`
-- 可选 CF Rate Limiter；可选 PostgREST 限流/缓存/Breaker 快照（统一检查，Breaker 权威只在 `THROTTLE_PROTECTION`）
+- 可选 CF Rate Limiter；通过已配置的 PostgREST 下载缓存协调器读取缓存状态，限流启用时执行 `download_unified_check` 原子更新限流计数并读取 Breaker 快照，Breaker 权威只在 `THROTTLE_PROTECTION`
 - 访问 AList `/api/fs/link` 获取真实下载链接（带鉴权 header）
+- 缓存未命中时取得数据库租约；仅租约 owner 请求 AList 并在打开有效 2xx 内容后条件发布，其他请求通过只读状态轮询共享结果或退避
 - admission 固定为四种显式路径：`none -> fetch only`、`breaker_only -> authorize -> fetch -> report|settle`、`queue_only -> admit(queue only) -> fetch -> release`、`queue_breaker -> admit(queue + breaker) -> fetch -> report|settle -> release`
 - 命中托管 breaker hostname 时，`breaker_only` 先按权威快照对 `open` 立即 fail-fast，并在实际 fetch 前调用 `download_authorize_breaker_attempt`；`queue_breaker` 直接消费 slot-handler / `fq_admit_batch` 返回的 `attemptVersion` / `attemptTicket`，不会在拿到 slot 后再走第二套 authorize 逻辑。`download_authorize_breaker_attempt` 与 `fq_admit_batch` 共享同一套 authorize helper，而 authorize 也是唯一的 lazy-cleanup / normalization 入口。half-open bookkeeping 固定使用 `HALF_OPEN_RESOLVED_MASK` 与 `HALF_OPEN_SUCCESS_MASK`；`report` 只接受当前 live batch 的有效 ticket 作为 evidence-bearing mutation，`settle` 只负责当前 live batch 的无 sample ticket debt，stale / identity-free / duplicate / expired-batch 调用都会返回 no-mutation snapshot。live `half_open` 批次若 budget 已满但仍有 pending debt，`breaker_only` 不再发 ticket，`queue_breaker` 明确返回 `HALF_OPEN_FULL`；`halfOpenMaxProbeCount` 的有效范围固定为 `1..63`。
-- 上游响应矩阵固定为：`2xx` 继续走现有 body proxy / CQ managed streaming；`3xx` 保持当前 redirect 与 queue-breaker deferred report 行为；`4xx`/`5xx` 会在 deferred flush 之后、body proxy 之前统一进入 terminal classifier，先完成 breaker `report(sample=1)` 或 `settle(no-sample debt)`、CQ release 与 fairqueue cleanup，再返回保留原 upstream status 的 Worker-generated JSON `{ code, message }`，不会再透传 upstream body。
+- 上游响应矩阵固定为：`2xx` 继续走现有 body proxy / CQ managed streaming；`3xx` 保持当前 redirect 与 queue-breaker deferred report 行为；`4xx`/`5xx` 会在 deferred flush 之后、body proxy 之前统一进入 terminal classifier，先完成 breaker `report(sample=1)` 或 `settle(no-sample debt)`、CQ release 与 fairqueue cleanup，再返回保留原 upstream status 的 Worker-generated JSON `{ status, message, reason }`，可按需附带 `upstream_status` 与 `retry-after`，不会再透传 upstream body。
 - 可选 Fair Queue（slot-handler）获取 slot；Worker 通过 `POST /api/v1/fairqueue/wait` 打开 SSE wait，slot-handler 只透传 backend `THROTTLED` / `HALF_OPEN_FULL` 和 `READY` 对应的 attempt ownership 元数据，不在本地维护 breaker 运行时状态
-- Fair Queue 的公开 wait 配置只由 `fairQueue.wait.maxStreamMs` 与 Worker 请求 `deadlineMs` 控制；公开配置示例不再暴露 `acceptedLeaseMs`。
+- Fair Queue 的公开 wait 配置由 `fairQueue.wait.maxStreamMs` 与 Worker 请求 `deadlineMs` 控制。
 - 可选 True Concurrency（`concurrency-handler`）负责真实 in-flight 并发；它与 fairqueue 拆分部署，依赖 `hardExpireAtMs`、hot-path expiry cleanup 与 sweep 回收 lease
 - 当 fairqueue 与 true concurrency 同时启用时，worker 固定按 `POST /api/v1/fairqueue/wait -> accepted/result -> POST /api/v1/concurrency/acquire -> (wait 时以 unused_grant 释放并清空 FQ ownership) -> FQ release success -> POST /api/v1/concurrency/wait -> POST /api/v1/concurrency/claim -> POST /api/v1/concurrency/ack_handoff -> heartbeat websocket upgrade + hello_ack -> origin fetch -> true-concurrency release on stream lifecycle` 的顺序执行；若 CQ fast acquire 返回 `wait`，worker 会先 settle 旧 breaker attempt，再以 `unused_grant` 释放未使用的 fairqueue slot。该释放跳过最小持有时间但仍受 slot-handler 每 host 平滑间隔约束，且只有释放成功并清空 FQ fingerprint 后才进入 CQ SSE wait。后续 origin dispatch 不再持有 live FQ grant，不做 `after_use` transition，也不发起第二次 FQ release；只有仍持有 live FQ grant 的路径才在 origin dispatch 前标记 `after_use`。
 - 当 `download.trueConcurrency.enabled=true` 时，heartbeat 是 origin fetch 之前的必经步骤；worker 若在 `initialConnectMaxAttempts` 或 `initialConnectMaxElapsedMs` 预算内拿不到 `hello_ack`，会直接 fail closed，不会发起 origin fetch，并以 `heartbeat_connect_failed` 立刻尝试释放 active lease

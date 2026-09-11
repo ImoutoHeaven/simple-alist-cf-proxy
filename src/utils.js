@@ -225,6 +225,98 @@ export const hasVerifyCredentials = (verifyHeader, verifySecret) => {
   return Boolean(verifyHeader) && Boolean(verifySecret);
 };
 
+export const readResponseTextWithSignal = async (response, signal = null) => {
+  if (!response?.body || typeof response.body.getReader !== 'function') {
+    if (typeof response?.text === 'function') {
+      return response.text();
+    }
+    if (typeof response?.json === 'function') {
+      return JSON.stringify(await response.json());
+    }
+    return '';
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let aborted = false;
+  let abortReason = null;
+  let rejectAbort;
+  const abortPromise = new Promise((_, reject) => {
+    rejectAbort = reject;
+  });
+  const onAbort = () => {
+    aborted = true;
+    abortReason = signal?.reason || new DOMException('The operation was aborted', 'AbortError');
+    rejectAbort(abortReason);
+    reader.cancel()?.catch?.(() => {});
+  };
+
+  if (signal?.aborted) {
+    onAbort();
+  } else {
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  }
+
+  try {
+    while (true) {
+      const readResult = await Promise.race([reader.read(), abortPromise]);
+      if (aborted || signal?.aborted) {
+        throw abortReason || signal?.reason || new DOMException('The operation was aborted', 'AbortError');
+      }
+      if (readResult.done) {
+        text += decoder.decode();
+        return text;
+      }
+      text += decoder.decode(readResult.value, { stream: true });
+    }
+  } finally {
+    signal?.removeEventListener?.('abort', onAbort);
+    try {
+      reader.releaseLock();
+    } catch (_error) {
+      // Best-effort reader cleanup.
+    }
+  }
+};
+
+export const isUsableReadyLink = (linkData) => {
+  const expiresAt = linkData?.download?.expires_at;
+  if (!(
+    linkData
+    && typeof linkData === 'object'
+    && !Array.isArray(linkData)
+    && typeof linkData.url === 'string'
+    && linkData.url.trim()
+  )) {
+    return false;
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(linkData.url);
+  } catch {
+    return false;
+  }
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    return false;
+  }
+
+  return Boolean(
+    (linkData.header === undefined || linkData.header === null || (
+      typeof linkData.header === 'object' && !Array.isArray(linkData.header)
+    ))
+    && linkData.download
+    && typeof linkData.download.provider === 'string'
+    && linkData.download.provider.trim()
+    && typeof linkData.download.ticket === 'string'
+    && linkData.download.ticket.trim()
+    && Number.isSafeInteger(expiresAt)
+    && expiresAt > 0
+    && typeof linkData.download.report_success === 'boolean'
+  );
+};
+
 /**
  * Match hostname against a pattern (supports wildcard)
  * Pattern examples:

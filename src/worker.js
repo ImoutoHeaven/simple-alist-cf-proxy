@@ -1,10 +1,10 @@
 // Import cache/throttle managers, rate limiter, and utilities
-import { createCacheManager } from './cache/factory.js';
+import * as customPgRestCache from './cache/custom-pg-rest.js';
 import { createThrottleManager } from './cache/throttle-factory.js';
 import { createRateLimiter } from './ratelimit/factory.js';
 import { unifiedCheck, readTicketState, markTicketUsed } from './unified-check.js';
 import { scheduleAllCleanups } from './cleanup-scheduler.js';
-import { parseBoolean, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash } from './utils.js';
+import { parseBoolean, extractHostname, matchHostnamePattern, applyVerifyHeaders, calculateIPSubnet, sha256Hash, hasVerifyCredentials, isUsableReadyLink, readResponseTextWithSignal } from './utils.js';
 import { buildBindingStr, decryptBindingPayload, getClientIp, normalizePath, parseCheckOriginEnv } from './origin-binding.js';
 import { handleInternalApiIfAny } from './internal-api.js';
 import { fetchControllerState } from './controller-adapter.js';
@@ -60,6 +60,38 @@ const MAX_THROTTLE_HALF_OPEN_PROBE_COUNT = 63;
 const DEFAULT_THROTTLE_HALF_OPEN_MAX_SECONDS = 15;
 const DEFAULT_THROTTLE_HALF_OPEN_TIMEOUT_MODE = 'partial-close';
 const DEFAULT_THROTTLE_PROTECT_HTTP_CODES = [429, 499, 500, 502, 503, 504];
+const CACHE_REFRESH_EXECUTION_MAX_MS = 150000;
+const CACHE_REFRESH_FINISH_MAX_MS = 20000;
+const CACHE_REFRESH_POLL_MIN_MS = 100;
+const CACHE_REFRESH_POLL_MAX_MS = 1000;
+const DOWNLOAD_RECOVERY_MAX_ATTEMPTS = 4;
+const DOWNLOAD_REPORT_MAX_MS = 20000;
+const DOWNLOAD_REPORT_MAX_REASON_LENGTH = 256;
+const DOWNLOAD_ERROR_BODY_MAX_BYTES = 4096;
+const DOWNLOAD_ERROR_BODY_MAX_MS = 2000;
+const DOWNLOAD_REPORT_RETRY_DELAYS_MS = [0, 250, 1000, 3000];
+const THROTTLE_CLEANUP_MAX_MS = 2000;
+const DOWNLOAD_RECOVERY_CONTEXT = Symbol('download-recovery-context');
+const DOWNLOAD_ORIGIN_FAILURE_CONTEXT = Symbol('download-origin-failure-context');
+
+const attachDownloadFailureContext = (error, context = {}) => {
+  if (!error || (typeof error !== 'object' && typeof error !== 'function')) {
+    return error;
+  }
+  const previous = error[DOWNLOAD_ORIGIN_FAILURE_CONTEXT];
+  try {
+    Object.defineProperty(error, DOWNLOAD_ORIGIN_FAILURE_CONTEXT, {
+      configurable: true,
+      value: {
+        ...(previous && typeof previous === 'object' ? previous : {}),
+        ...context,
+      },
+    });
+  } catch (_error) {
+    // Preserve the original exception when its shape is immutable.
+  }
+  return error;
+};
 
 // Fair Queue in-memory state (per Worker instance)
 const FQ_GLOBAL_STATE = {
@@ -82,10 +114,38 @@ const HOP_BY_HOP_RESPONSE_HEADERS = new Set([
   'transfer-encoding',
   'upgrade',
 ]);
+const UPSTREAM_CLIENT_REQUEST_HEADERS = new Set([
+  'accept',
+  'accept-language',
+  'cache-control',
+  'if-match',
+  'if-modified-since',
+  'if-none-match',
+  'if-range',
+  'if-unmodified-since',
+  'range',
+]);
+const UPSTREAM_LINK_BLOCKED_HEADERS = new Set([
+  ...HOP_BY_HOP_RESPONSE_HEADERS,
+  'content-length',
+  'set-cookie',
+  'host',
+  'cf-connecting-ip',
+  'cf-connecting-ip-workers',
+  'x-inner-auth',
+  'x-worker-auth',
+  'x-internal-auth',
+]);
 const SITE_BUCKET_MODES = new Set(['host', 'sharepoint', 'googledrive']);
 
 const nowMs = () => Date.now();
+const monotonicNowMs = () => (
+  typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now()
+);
 const generatedErrorResponses = new WeakMap();
+const deadlineExpiredSignals = new WeakSet();
 
 const normalizeRetryAfter = (value) => {
   const candidate = typeof value === 'number' && Number.isFinite(value)
@@ -252,12 +312,239 @@ const isExactGoogleDriveFullRangeMatch = (requestedRangeHeader, contentRangeHead
     && Number.parseInt(contentMatch[2], 10) + 1 === Number.parseInt(contentMatch[3], 10);
 };
 
-const shouldSynthesizeGoogleDriveAcceptRanges = (responseToWrap, requestToWrap) => {
+const createDeadlineSignal = (deadlineMs, parentSignal = null, options = {}) => {
+  if (!Number.isFinite(deadlineMs)) {
+    return { signal: parentSignal, cleanup() {} };
+  }
+
+  const controller = new AbortController();
+  const recordExpiry = options.recordExpiry !== false;
+  let timer = null;
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      if (recordExpiry && !parentSignal?.aborted) {
+        deadlineExpiredSignals.add(controller.signal);
+      }
+      controller.abort(parentSignal?.reason || new DOMException('The operation was aborted', 'AbortError'));
+    }
+  };
+  const remainingMs = Math.max(0, deadlineMs - Date.now());
+  if (remainingMs <= 0 || parentSignal?.aborted) {
+    abort();
+  } else {
+    timer = setTimeout(abort, Math.max(1, remainingMs));
+    if (typeof timer?.unref === 'function') {
+      timer.unref();
+    }
+    parentSignal?.addEventListener?.('abort', abort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      parentSignal?.removeEventListener?.('abort', abort);
+    },
+  };
+};
+
+const parseByteRangeHeader = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const match = value.trim().match(/^bytes=(\d+)-(\d*)$/i);
+  const suffixMatch = value.trim().match(/^bytes=-(\d+)$/i);
+  if (suffixMatch) {
+    const suffixLength = Number.parseInt(suffixMatch[1], 10);
+    return Number.isSafeInteger(suffixLength) && suffixLength > 0
+      ? { start: null, end: null, suffixLength }
+      : null;
+  }
+  if (!match) {
+    return null;
+  }
+  const start = Number.parseInt(match[1], 10);
+  const end = match[2] === '' ? null : Number.parseInt(match[2], 10);
+  if (!Number.isSafeInteger(start) || (end !== null && !Number.isSafeInteger(end)) || (end !== null && end < start)) {
+    return null;
+  }
+  return { start, end };
+};
+
+const parseByteContentRange = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const match = value.trim().match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
+  if (!match) {
+    return null;
+  }
+  const start = Number.parseInt(match[1], 10);
+  const end = Number.parseInt(match[2], 10);
+  const total = Number.parseInt(match[3], 10);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || !Number.isSafeInteger(total)
+    || start < 0 || end < start || total <= end) {
+    return null;
+  }
+  return { start, end, total };
+};
+
+const hasValidatedGoogleQuotaReason = (bodyText) => {
+  if (typeof bodyText !== 'string' || !bodyText.trim()) {
+    return false;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(bodyText);
+  } catch (_error) {
+    return false;
+  }
+  const errorPayload = payload?.error;
+  if (!errorPayload || typeof errorPayload !== 'object' || Array.isArray(errorPayload)) {
+    return false;
+  }
+  const reasons = [];
+  if (typeof errorPayload.reason === 'string') {
+    reasons.push(errorPayload.reason);
+  }
+  if (Array.isArray(errorPayload.errors)) {
+    for (const item of errorPayload.errors) {
+      if (item && typeof item.reason === 'string') {
+        reasons.push(item.reason);
+      }
+    }
+  }
+  return reasons.some((reason) => /downloadquota/i.test(reason));
+};
+
+const isExactGoogleDriveRequestedRange = (requestedRangeHeader, contentRangeHeader, knownFileSize = null) => {
+  const requested = parseByteRangeHeader(requestedRangeHeader);
+  const content = parseByteContentRange(contentRangeHeader);
+  if (!requested || !content || (knownFileSize !== null && content.total !== knownFileSize)) {
+    return false;
+  }
+
+  const total = knownFileSize ?? content.total;
+  if (!Number.isSafeInteger(total) || total <= 0) {
+    return false;
+  }
+
+  let expectedStart;
+  let expectedEnd;
+  if (requested.suffixLength) {
+    expectedStart = Math.max(0, total - requested.suffixLength);
+    expectedEnd = total - 1;
+  } else {
+    expectedStart = requested.start;
+    expectedEnd = requested.end === null
+      ? total - 1
+      : Math.min(requested.end, total - 1);
+  }
+  const exact = expectedStart !== null
+    && expectedStart < total
+    && expectedStart === content.start
+    && expectedEnd === content.end
+    && (requested.suffixLength || requested.end === null ? content.end + 1 === content.total : true);
+  return exact;
+};
+
+const readBoundedResponseText = async (
+  response,
+  maxBytes = DOWNLOAD_ERROR_BODY_MAX_BYTES,
+  { signal = null, deadlineMs = null } = {},
+) => {
+  // Error responses are discarded by every caller after classification. Read
+  // the original body so cancellation cannot wait for a still-open clone.
+  const body = response?.body;
+  if (!body || typeof body.getReader !== 'function') {
+    return '';
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let text = '';
+  const remainingDeadlineMs = Number.isFinite(deadlineMs)
+    ? Math.max(0, deadlineMs - monotonicNowMs())
+    : Number.POSITIVE_INFINITY;
+  const timeoutMs = Math.min(DOWNLOAD_ERROR_BODY_MAX_MS, remainingDeadlineMs);
+  let timeoutTimer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    if (Number.isFinite(timeoutMs)) {
+      timeoutTimer = setTimeout(() => resolve({ timeout: true }), timeoutMs);
+    }
+  });
+  let abortResolve;
+  const abortPromise = new Promise((resolve) => {
+    abortResolve = resolve;
+  });
+  const abortHandler = () => {
+    abortResolve({ aborted: true });
+    const cancelPromise = reader.cancel();
+    cancelPromise?.catch?.(() => {});
+  };
+  if (signal?.aborted) {
+    abortHandler();
+  } else {
+    signal?.addEventListener?.('abort', abortHandler, { once: true });
+  }
+  try {
+    while (totalBytes < maxBytes) {
+      const readResult = await Promise.race([reader.read(), timeoutPromise, abortPromise]);
+      if (readResult?.timeout || readResult?.aborted) {
+        break;
+      }
+      const { done, value } = readResult;
+      if (done) {
+        text += decoder.decode();
+        break;
+      }
+      const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+      const remaining = Math.max(0, maxBytes - totalBytes);
+      if (remaining > 0) {
+        const bounded = bytes.byteLength > remaining ? bytes.subarray(0, remaining) : bytes;
+        totalBytes += bounded.byteLength;
+        text += decoder.decode(bounded, { stream: totalBytes < maxBytes });
+      }
+      if (bytes.byteLength > remaining || totalBytes >= maxBytes) {
+        break;
+      }
+    }
+    return text.slice(0, maxBytes);
+  } catch (_error) {
+    return text;
+  } finally {
+    if (timeoutTimer) {
+      clearTimeout(timeoutTimer);
+    }
+    signal?.removeEventListener?.('abort', abortHandler);
+    try {
+      const cancelPromise = reader.cancel();
+      cancelPromise?.catch?.(() => {});
+    } catch (_error) {
+      // Best-effort cancellation of the bounded error body.
+    }
+    try {
+      reader.releaseLock();
+    } catch (_error) {
+      // Best-effort release only.
+    }
+  }
+};
+
+const readJsonWithSignal = async (response, signal) => (
+  JSON.parse(await readResponseTextWithSignal(response, signal))
+);
+
+const shouldSynthesizeGoogleDriveAcceptRanges = (responseToWrap, requestToWrap, providerIsGoogle = false) => {
   if (responseToWrap.headers.get('accept-ranges')) {
     return false;
   }
   const upstreamHostname = extractHostname(requestToWrap?.url || '')?.toLowerCase() || '';
-  if (!isGoogleDriveDownloadHostname(upstreamHostname)) {
+  if (!providerIsGoogle && !isGoogleDriveDownloadHostname(upstreamHostname)) {
     return false;
   }
   if (responseToWrap.status === 206) {
@@ -1005,14 +1292,35 @@ function isNodeTestRunner() {
     && process.env.NODE_TEST_CONTEXT.length > 0;
 }
 
-async function slowFailDelay() {
+async function slowFailDelay(signal = null) {
   if (isNodeTestRunner()) {
     return;
   }
   if (!SLOW_FAIL_DELAY_MS || SLOW_FAIL_DELAY_MS <= 0) {
     return;
   }
-  await new Promise((resolve) => setTimeout(resolve, SLOW_FAIL_DELAY_MS));
+  const abortReason = () => signal?.reason || new DOMException('The operation was aborted', 'AbortError');
+  if (signal?.aborted) {
+    throw abortReason();
+  }
+  await new Promise((resolve, reject) => {
+    let timer = null;
+    const onAbort = () => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      signal?.removeEventListener?.('abort', onAbort);
+      reject(abortReason());
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve();
+    }, SLOW_FAIL_DELAY_MS);
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+    }
+  });
 }
 
 function markRateLimited(ipSubnet, retryAfterSeconds) {
@@ -1661,8 +1969,41 @@ function createErrorResponse(origin, status, message, extraHeaders) {
     reason: 'unclassified',
     headers: safeHeaders,
     retryAfter: normalizeRetryAfter(safeHeaders.get('Retry-After')),
-  }), { message });
+  }), {
+    message,
+    retryAfter: normalizeRetryAfter(safeHeaders.get('Retry-After')),
+  });
 }
+
+function createCacheCoordinatorUnavailableResponse(origin, detail = '', retryAfterSeconds = 5) {
+  const message = detail || 'Download cache coordination is temporarily unavailable, please retry later';
+  const retryAfter = normalizeRetryAfter(retryAfterSeconds) || '5';
+  const headers = { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' };
+  return rememberGeneratedError(createJsonErrorResponse({
+    status: 503,
+    message,
+    reason: 'cache_coordinator_unavailable',
+    headers,
+    retryAfter,
+  }), {
+    message,
+    reason: 'cache_coordinator_unavailable',
+    retryAfter,
+  });
+}
+
+const isCacheCoordinatorConfigurationError = (error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  return /download\.db\.(mode|cacheEnabled|postgrestUrl|verifyHeader|verifySecret)|Invalid controller download\.db\.mode/i.test(message);
+};
+
+const isCacheCoordinatorConfigured = (config) => Boolean(
+  config
+  && config.dbMode === 'custom-pg-rest'
+  && config.cacheEnabled === true
+  && config.cacheConfig?.postgrestUrl
+  && hasVerifyCredentials(config.cacheConfig.verifyHeader, config.cacheConfig.verifySecret)
+);
 
 function createTicketStateConfigurationFailureResponse(origin, error) {
   const diagnostic = error instanceof Error ? error.message : String(error);
@@ -1751,7 +2092,7 @@ function createThrottleProtectedResponse(origin, throttleStatus) {
     reason: 'breaker_open',
     headers: safeHeaders,
     retryAfter,
-  }), { message, reason: 'breaker_open' });
+  }), { message, reason: 'breaker_open', retryAfter });
 }
 
 function createBreakerAuthorityUnavailableResponse(origin, phase) {
@@ -3156,6 +3497,7 @@ const createTrueConcurrencyHeartbeatManager = ({
   lease,
   heartbeatConfig,
   clientSignal,
+  executionSignal = null,
   abortStream,
 }) => {
   const cfg = normalizeTrueConcurrencyHeartbeatConfig(heartbeatConfig, {
@@ -3164,6 +3506,12 @@ const createTrueConcurrencyHeartbeatManager = ({
   });
   const managerController = new AbortController();
   const managerSignal = managerController.signal;
+  const onExecutionAbort = () => {
+    if (!managerSignal.aborted) {
+      managerController.abort(executionSignal?.reason);
+    }
+  };
+  executionSignal?.addEventListener?.('abort', onExecutionAbort, { once: true });
   const clientInstanceId = normalizeStringValue(plan?.clientInstanceId) || 'download-worker';
   let stopped = false;
   let currentSession = null;
@@ -3520,6 +3868,7 @@ const createTrueConcurrencyHeartbeatManager = ({
     closeSession(reason);
     managerController.abort();
     clientSignal?.removeEventListener?.('abort', onClientAbort);
+    executionSignal?.removeEventListener?.('abort', onExecutionAbort);
   };
 
   const onClientAbort = () => {
@@ -3943,9 +4292,14 @@ const createSlotHandlerClient = (config) => {
       const hardExpireAtMs = Number.isFinite(Number(fqContext?.hardExpireAtMs)) && Number(fqContext.hardExpireAtMs) > 0
         ? Number(fqContext.hardExpireAtMs)
         : startedAt + totalMaxWaitMs;
+      const recoveryDeadlineValue = Number(fqContext?.recoveryDeadlineMs);
+      const recoveryDeadlineMs = Number.isFinite(recoveryDeadlineValue) && recoveryDeadlineValue > 0
+        ? recoveryDeadlineValue
+        : Number.POSITIVE_INFINITY;
       const waitDeadlineMs = Math.min(
         hardExpireAtMs,
         startedAt + totalMaxWaitMs,
+        recoveryDeadlineMs,
       );
       fqContext.requestId = requestId;
       fqContext.admissionMode = admissionMode;
@@ -4445,6 +4799,37 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   const normalizedPath = normalizePath(url.pathname);
   let path = normalizedPath;
   const clientSignal = request.signal;
+  const inheritedRecoveryContext = ctx?.[DOWNLOAD_RECOVERY_CONTEXT] || null;
+  const inheritedDeadlineMs = Number.isFinite(inheritedRecoveryContext?.deadlineMs)
+    ? inheritedRecoveryContext.deadlineMs
+    : null;
+  const inheritedDeadlineWallMs = Number.isFinite(inheritedRecoveryContext?.deadlineWallMs)
+    ? inheritedRecoveryContext.deadlineWallMs
+    : Number.isFinite(inheritedDeadlineMs)
+      ? Date.now() + Math.max(0, inheritedDeadlineMs - monotonicNowMs())
+      : null;
+  const inheritedExecutionSignalScope = Number.isFinite(inheritedDeadlineWallMs)
+    ? createDeadlineSignal(inheritedDeadlineWallMs, clientSignal)
+    : { signal: clientSignal, cleanup() {} };
+  const openingExecutionSignal = inheritedExecutionSignalScope.signal;
+  let recoveryDeadlineMs = inheritedDeadlineMs;
+  let recoveryDeadlineWallMs = inheritedDeadlineWallMs;
+  let recoveryHardExpireAtMs = Number.isFinite(inheritedRecoveryContext?.hardExpireAtMs)
+    ? inheritedRecoveryContext.hardExpireAtMs
+    : null;
+  let ownerDeadlineExpired = false;
+  const readRecoveryRemainingMs = () => {
+    if (!Number.isFinite(recoveryDeadlineMs)) {
+      return Number.POSITIVE_INFINITY;
+    }
+    return Math.max(0, recoveryDeadlineMs - monotonicNowMs());
+  };
+  const isRecoveryBudgetExpired = (signal = null) => (
+    ownerDeadlineExpired
+    || readRecoveryRemainingMs() <= 0
+    || deadlineExpiredSignals.has(openingExecutionSignal)
+    || deadlineExpiredSignals.has(signal)
+  );
   let clientAborted = clientSignal?.aborted === true;
   const didClientAbort = () => clientAborted || clientSignal?.aborted === true;
   if (clientSignal && typeof clientSignal.addEventListener === 'function') {
@@ -4452,6 +4837,27 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       clientAborted = true;
     });
   }
+  const captureOriginalAbortCause = () => {
+    if (didClientAbort()) {
+      return {
+        kind: 'client_aborted',
+        outcome: 'abandoned',
+        statusCode: 0,
+        reason: 'client_aborted',
+        reportReason: 'download_abandoned',
+      };
+    }
+    if (isRecoveryBudgetExpired()) {
+      return {
+        kind: 'execution_expired',
+        outcome: 'failure',
+        statusCode: 0,
+        reason: 'recovery_deadline_exhausted',
+        reportReason: 'recovery_deadline_exhausted',
+      };
+    }
+    return null;
+  };
 
   const terminal = (response, reason, fields = {}) => {
     const generated = generatedErrorResponses.get(response);
@@ -4491,6 +4897,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
     return 'upstream_terminal_status';
   };
+
+  const runDownload = async () => {
+
+  if (Number.isFinite(inheritedDeadlineMs) && inheritedDeadlineMs <= monotonicNowMs()) {
+    return terminal(
+      createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1),
+      'recovery_deadline_exhausted',
+      { retryAfter: 1 },
+    );
+  }
 
   if (path === null || typeof path !== "string") {
     return terminal(createErrorResponse(origin, 400, "invalid path encoding"), 'invalid_path_encoding');
@@ -4548,7 +4964,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   if (config.rateLimitEnabled && ipSubnet) {
     const remaining = getRateLimitRemainingSeconds(ipSubnet);
     if (remaining > 0) {
-      await slowFailDelay();
+      await slowFailDelay(clientSignal);
       const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
       logEvent('warn', 'RateLimit', 'local_cache_blocked', {
         limit: config.ipSubnetLimit,
@@ -4687,7 +5103,10 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let ticketState = null;
   if (ticketStateEnabled) {
     try {
-      ticketStateConfig = resolveTicketStateConfig(config);
+      ticketStateConfig = {
+        ...resolveTicketStateConfig(config),
+        signal: openingExecutionSignal,
+      };
     } catch (error) {
       return terminal(createTicketStateConfigurationFailureResponse(origin, error), 'ticket_state_invalid');
     }
@@ -4695,6 +5114,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     try {
       ticketState = await readTicketState(ticketHash, ticketStateConfig);
     } catch (error) {
+      if (isAbortError(error) && didClientAbort()) {
+        return terminal(createClientAbortResponse(origin), 'client_aborted');
+      }
+      if (isAbortError(error) && isRecoveryBudgetExpired()) {
+        return terminal(
+          createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1),
+          'recovery_deadline_exhausted',
+          { retryAfter: 1 },
+        );
+      }
       const message = error instanceof Error ? error.message : String(error);
       logEvent('error', 'TicketState', 'read_failed', { message });
       return terminal(createErrorResponse(origin, 500, 'Ticket state read failed'), 'ticket_state_invalid');
@@ -4729,7 +5158,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     if (ticketState.firstUsedAt == null) {
       const idleAge = nowSeconds - ticketState.issuedAt;
       if (idleAge >= ticketState.idleTimeoutSeconds) {
-        await slowFailDelay();
+        await slowFailDelay(clientSignal);
         return terminal(createErrorResponse(origin, 410, 'Link expired due to inactivity'), 'ticket_state_expired');
       }
     } else if (ticketState.idlePolicy === 'renewable') {
@@ -4752,6 +5181,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let cacheHit = false;
   let linkData = null;
   let unifiedThrottleHostnameHash = null;
+  let deferredUnifiedBreakerResponse = null;
 
   // Use unified check when rate limit is enabled and dbMode is custom-pg-rest
   const supportsUnifiedCheck = config.rateLimitEnabled && config.dbMode === 'custom-pg-rest';
@@ -4776,6 +5206,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         rateLimitTableName: rateLimitConfig.tableName || 'DOWNLOAD_IP_RATELIMIT_TABLE',
         cacheEnabled: config.cacheEnabled,
         throttleHostnameHash,
+        signal: openingExecutionSignal,
       });
 
       return { result };
@@ -4783,6 +5214,23 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const errorMessage = error instanceof Error ? error.message : String(error);
       logEvent('error', 'UnifiedCheck', 'failed', { message: errorMessage });
       logEvent('error', 'UnifiedCheck', 'stack', { stack: error instanceof Error ? error.stack : '' });
+
+      if (isAbortError(error) && didClientAbort()) {
+        return { errorResponse: terminal(createClientAbortResponse(origin), 'client_aborted') };
+      }
+      if (isAbortError(error) && isRecoveryBudgetExpired()) {
+        return {
+          errorResponse: terminal(
+            createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1),
+            'recovery_deadline_exhausted',
+            { retryAfter: 1 },
+          ),
+        };
+      }
+
+      if (error?.logFields?.operation === 'state' && error?.logFields?.error === 'invalid_response') {
+        return { errorResponse: terminal(createCacheCoordinatorUnavailableResponse(origin), 'cache_coordinator_unavailable') };
+      }
 
       const FAIL_OPEN = 'fail' + '-open';
       const FAIL_CLOSED = 'fail' + '-closed';
@@ -4829,7 +5277,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         markRateLimited(ipSubnetForBlock, retryAfter);
       }
 
-      await slowFailDelay();
+      await slowFailDelay(clientSignal);
 
       const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
       logEvent('warn', 'RateLimit', 'unified_blocked', {
@@ -4867,17 +5315,15 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         })
       : null;
     if (unifiedResponse) {
-      await slowFailDelay();
-
       logEvent('info', 'Breaker', 'unified_open_response', {
         status: unifiedBreaker.errorCode,
         retryAfter: unifiedBreaker.retryAfter,
       });
-
-      return terminal(unifiedResponse, 'breaker_open', {
+      deferredUnifiedBreakerResponse = terminal(unifiedResponse, 'breaker_open', {
         admissionMode: unifiedAdmissionMode,
         host: resolvedUnifiedThrottleHostname,
       });
+      return null;
     }
 
     if (rateLimiter && config.rateLimitConfig) {
@@ -4940,7 +5386,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
             markRateLimited(ipSubnetForBlock, retryAfter);
           }
 
-          await slowFailDelay();
+          await slowFailDelay(clientSignal);
 
           const windowLabel = formatRateLimitWindow(config.windowTime, config.rateLimitConfig?.windowTimeSeconds);
           logEvent('warn', 'RateLimit', 'fallback_blocked', {
@@ -4966,7 +5412,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   }
 
   const fetchLinkDataFromApi = async (options = {}) => {
-    const { forceRefresh = false, linkType } = options;
+    const {
+      action = 'acquire',
+      exclude = [],
+      feedback = null,
+      signal = null,
+    } = options;
     const headers = {
       "content-type": "application/json;charset=UTF-8",
       Authorization: config.token,
@@ -4979,23 +5430,24 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       }
     }
     const requestUrl = new URL(`${config.address}/api/fs/link`);
-    if (forceRefresh) {
-      requestUrl.searchParams.set("refresh", "true");
-      const typeVal =
-        linkType ||
-        (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-          ? crypto.randomUUID()
-          : `refresh-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-      requestUrl.searchParams.set("type", typeVal);
-    } else if (linkType) {
-      requestUrl.searchParams.set("type", linkType);
-    }
-    const payload = forceRefresh ? { path, refresh: true } : { path };
-    const createAlistUnavailableResponse = () => createErrorResponse(
+    const normalizedExclude = Array.isArray(exclude)
+      ? exclude.filter((ticket) => typeof ticket === 'string' && ticket.trim()).slice(0, DOWNLOAD_RECOVERY_MAX_ATTEMPTS)
+      : [];
+    const payload = action === 'report'
+      ? { action: 'report', path, feedback }
+      : {
+        action: 'acquire',
+        path,
+        ...(feedback ? { feedback } : {}),
+        ...(normalizedExclude.length > 0 ? { exclude: normalizedExclude } : {}),
+      };
+    const createAlistUnavailableResponse = (retryAfter = undefined) => createErrorResponse(
       origin,
       503,
       'Link service is temporarily unavailable, please retry later',
+      retryAfter ? { 'Retry-After': retryAfter } : undefined,
     );
+    const requestSignal = signal || cacheExecutionSignal();
     let resp;
     let apiResult;
     try {
@@ -5003,22 +5455,42 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         method: "POST",
         headers,
         body: JSON.stringify(payload),
+        signal: requestSignal,
       });
+      const retryAfter = normalizeRetryAfter(resp.headers.get('Retry-After'));
+      if (!resp.ok) {
+        await cancelResponseBody(resp);
+        if (requestSignal?.aborted) {
+          throw requestSignal.reason || new DOMException('The operation was aborted', 'AbortError');
+        }
+        return {
+          errorResponse: createAlistUnavailableResponse(retryAfter),
+          apiStatus: resp.status,
+          retryAfter,
+          retryable: resp.status === 429 || resp.status >= 500,
+        };
+      }
       const contentType = resp.headers.get("content-type") || "";
       if (!contentType.toLowerCase().includes("application/json")) {
         await cancelResponseBody(resp);
-        return { errorResponse: createAlistUnavailableResponse() };
+        return { errorResponse: createAlistUnavailableResponse(), apiStatus: resp.status, retryable: false };
       }
       try {
-        apiResult = await resp.json();
-      } catch {
-        return { errorResponse: createAlistUnavailableResponse() };
+        apiResult = await readJsonWithSignal(resp, requestSignal);
+      } catch (error) {
+        if (isAbortError(error) || requestSignal?.aborted) {
+          throw error;
+        }
+        return { errorResponse: createAlistUnavailableResponse(), apiStatus: resp.status, retryable: false };
       }
     } catch (error) {
+      if (isAbortError(error) || requestSignal?.aborted) {
+        throw error;
+      }
       logEvent('warn', 'AList', 'link_api_failed', {
-        message: error instanceof Error ? error.message : String(error),
+        kind: 'transport',
       });
-      return { errorResponse: createAlistUnavailableResponse() };
+      return { errorResponse: createAlistUnavailableResponse(), retryable: true };
     }
 
     if (
@@ -5029,60 +5501,449 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       || !apiResult.data
       || typeof apiResult.data !== 'object'
       || Array.isArray(apiResult.data)
-      || typeof apiResult.data.url !== 'string'
-      || !apiResult.data.url.trim()
+      || (action !== 'report' && !isUsableReadyLink(apiResult.data))
+      || (action === 'report' && (
+        typeof apiResult.data.applied !== 'boolean'
+        || typeof apiResult.data.duplicate !== 'boolean'
+        || typeof apiResult.data.stale !== 'boolean'
+        || !(apiResult.data.applied || apiResult.data.duplicate || apiResult.data.stale)
+      ))
     ) {
-      return { errorResponse: createAlistUnavailableResponse() };
+      return { errorResponse: createAlistUnavailableResponse(), apiStatus: apiResult?.code, retryable: false };
     }
-    try {
-      const parsedUrl = new URL(apiResult.data.url);
-      if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
-        return { errorResponse: createAlistUnavailableResponse() };
-      }
-    } catch {
-      return { errorResponse: createAlistUnavailableResponse() };
+    if (action === 'report') {
+      return { reportResult: apiResult.data, apiResult };
     }
-
-    if (cacheManager && apiResult.data) {
-      if (forceRefresh && shouldRetryAuthError(apiResult.code || 0)) {
-        logEvent('warn', 'Cache', 'save_skipped', { reason: 'auth_error_during_refresh' });
-      } else {
-        bindWaitUntil(
-          ctx,
-          cacheManager
-            .saveCache(path, apiResult.data, { ...config.cacheConfig, ctx })
-            .catch((error) => {
-              logEvent('error', 'Cache', 'save_failed', { message: error instanceof Error ? error.message : String(error) });
-            }),
-          'Cache',
-          'save',
-          { path },
-        );
-      }
-    }
-
     return { res: apiResult };
   };
 
-  // Check cache (if not already resolved by unified check)
-  let res;
-  if (cacheHit && linkData) {
-    res = { code: 200, data: linkData };
-  } else if (cacheManager && !unifiedResult) {
-    try {
-      const cached = await cacheManager.checkCache(path, { ...config.cacheConfig, ctx });
-      if (cached && cached.linkData) {
-        res = { code: 200, data: cached.linkData };
+  let cacheRefreshLease = null;
+  let cacheRefreshFinished = false;
+  let cacheRefreshObservedVersion = null;
+  let cacheRefreshDeadlineMs = null;
+  let cacheOwnerAbortController = null;
+  let cacheOwnerAbortTimer = null;
+  let cacheOwnerClientAbortHandler = null;
+  let cacheRefreshLeaseDeadlineMs = null;
+  let cacheFailureRetryAfterSeconds = null;
+  let finalizePreAuthorizationExit = null;
+
+  const cacheRequestConfig = () => ({
+    ...config.cacheConfig,
+    signal: openingExecutionSignal,
+  });
+
+  const cacheExecutionSignal = () => cacheOwnerAbortController?.signal || openingExecutionSignal;
+  let terminalCleanupSignalScope = null;
+  const throttleConfigWithSignal = (signal = cacheExecutionSignal()) => ({
+    ...config.throttleConfig,
+    ctx,
+    ...(signal ? { signal } : {}),
+  });
+  let terminalCleanupPhase = false;
+  const terminalCleanupSignal = () => {
+    if (!terminalCleanupSignalScope) {
+      const now = monotonicNowMs();
+      const ownershipDeadlines = [];
+      if (Number.isFinite(cacheRefreshLeaseDeadlineMs)) {
+        ownershipDeadlines.push(cacheRefreshLeaseDeadlineMs);
       }
-    } catch (error) {
-      logEvent('error', 'Cache', 'check_failed', { message: error instanceof Error ? error.message : String(error) });
+      if (Number.isFinite(hardExpireAtMs)) {
+        ownershipDeadlines.push(now + Math.max(0, hardExpireAtMs - Date.now()));
+      }
+      const linkExpiresAt = Number(currentAttempt?.linkData?.download?.expires_at);
+      if (Number.isFinite(linkExpiresAt) && linkExpiresAt > 0) {
+        ownershipDeadlines.push(now + Math.max(0, linkExpiresAt * 1000 - Date.now()));
+      }
+      const ownershipRemainingMs = ownershipDeadlines.length > 0
+        ? Math.max(0, Math.min(...ownershipDeadlines) - now)
+        : THROTTLE_CLEANUP_MAX_MS;
+      const cleanupMs = Math.min(THROTTLE_CLEANUP_MAX_MS, ownershipRemainingMs);
+      terminalCleanupSignalScope = createDeadlineSignal(Date.now() + cleanupMs, null, { recordExpiry: false });
     }
-  }
+    return terminalCleanupSignalScope.signal;
+  };
+  const beginTerminalCleanupPhase = () => {
+    terminalCleanupPhase = true;
+    return terminalCleanupSignal();
+  };
+  const throttleSettlementSignal = () => {
+    return terminalCleanupPhase ? terminalCleanupSignal() : cacheExecutionSignal();
+  };
+
+  const clearRecoveryOpeningDeadline = () => {
+    recoveryDeadlineMs = null;
+    recoveryDeadlineWallMs = null;
+    inheritedExecutionSignalScope.cleanup();
+  };
+
+  const clearCacheOwnerDeadline = () => {
+    if (cacheOwnerAbortTimer) {
+      clearTimeout(cacheOwnerAbortTimer);
+      cacheOwnerAbortTimer = null;
+    }
+    if (clientSignal && cacheOwnerClientAbortHandler && typeof clientSignal.removeEventListener === 'function') {
+      clientSignal.removeEventListener('abort', cacheOwnerClientAbortHandler);
+    }
+    cacheOwnerClientAbortHandler = null;
+    cacheOwnerAbortController = null;
+    cacheRefreshDeadlineMs = null;
+    clearRecoveryOpeningDeadline();
+  };
+
+  const startCacheOwnerDeadline = (leaseRemainingMs) => {
+    const now = monotonicNowMs();
+    const remainingMs = Number(leaseRemainingMs);
+    if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+      cacheRefreshDeadlineMs = null;
+      return false;
+    }
+    const leaseDeadline = now + remainingMs - 30000;
+    const inheritedDeadline = Number.isFinite(recoveryDeadlineMs) ? recoveryDeadlineMs : Number.POSITIVE_INFINITY;
+    cacheRefreshDeadlineMs = Math.min(now + CACHE_REFRESH_EXECUTION_MAX_MS, leaseDeadline, inheritedDeadline);
+    if (cacheRefreshDeadlineMs <= now) {
+      cacheRefreshDeadlineMs = null;
+      return false;
+    }
+    recoveryDeadlineMs = cacheRefreshDeadlineMs;
+    cacheRefreshLeaseDeadlineMs = now + remainingMs;
+    recoveryDeadlineWallMs = Date.now() + Math.max(0, cacheRefreshDeadlineMs - now);
+    recoveryHardExpireAtMs = Number.isFinite(recoveryHardExpireAtMs)
+      ? Math.min(recoveryHardExpireAtMs, hardExpireAtMs)
+      : hardExpireAtMs;
+    cacheOwnerAbortController = new AbortController();
+    const timerRemainingMs = Math.max(1, cacheRefreshDeadlineMs - now);
+    cacheOwnerAbortTimer = setTimeout(() => {
+      if (cacheOwnerAbortController) {
+        ownerDeadlineExpired = true;
+        cacheOwnerAbortController.abort();
+      }
+    }, timerRemainingMs);
+    if (clientSignal && typeof clientSignal.addEventListener === 'function') {
+      cacheOwnerClientAbortHandler = () => cacheOwnerAbortController.abort();
+      if (clientSignal.aborted) {
+        cacheOwnerClientAbortHandler();
+      } else {
+        clientSignal.addEventListener('abort', cacheOwnerClientAbortHandler, { once: true });
+      }
+    }
+    return true;
+  };
+
+  const sleepForCacheRefresh = (delayMs) => new Promise((resolve, reject) => {
+    const executionSignal = cacheExecutionSignal();
+    if (!executionSignal || typeof executionSignal.addEventListener !== 'function') {
+      setTimeout(resolve, delayMs);
+      return;
+    }
+    let timer;
+    const abort = () => {
+      clearTimeout(timer);
+      executionSignal.removeEventListener('abort', abort);
+      reject(executionSignal.reason || new DOMException('The operation was aborted', 'AbortError'));
+    };
+    timer = setTimeout(() => {
+      executionSignal.removeEventListener('abort', abort);
+      resolve();
+    }, delayMs);
+    if (executionSignal.aborted) {
+      abort();
+      return;
+    }
+    executionSignal.addEventListener('abort', abort, { once: true });
+  });
+
+  const adoptReadyCacheState = (state) => {
+    if (
+      !state
+      || state.result !== 'ready'
+      || typeof state.version !== 'string'
+      || !state.version.trim()
+      || state.observedAtMs === null
+      || !isUsableReadyLink(state.linkData)
+    ) {
+      return false;
+    }
+    cacheHit = true;
+    linkData = state.linkData;
+    cacheRefreshObservedVersion = state.version || null;
+    return true;
+  };
+
+  const waitForCacheRefresh = async (state) => {
+    const leaseId = state?.leaseId || null;
+    const leaseRemainingMs = Number(state?.leaseRemainingMs);
+    if (!leaseId || !Number.isFinite(leaseRemainingMs) || leaseRemainingMs <= 0) {
+      return { result: 'expired' };
+    }
+    let deadlineMs = Math.min(
+      monotonicNowMs() + CACHE_REFRESH_EXECUTION_MAX_MS,
+      monotonicNowMs() + leaseRemainingMs,
+    );
+    while (monotonicNowMs() < deadlineMs) {
+      const remainingMs = deadlineMs - monotonicNowMs();
+      const jitterMs = Math.min(
+        CACHE_REFRESH_POLL_MAX_MS,
+        Math.max(CACHE_REFRESH_POLL_MIN_MS, Math.floor(CACHE_REFRESH_POLL_MIN_MS + Math.random() * CACHE_REFRESH_POLL_MAX_MS)),
+        remainingMs,
+      );
+      await sleepForCacheRefresh(jitterMs);
+      const pollController = new AbortController();
+      const pollTimer = setTimeout(() => pollController.abort(), Math.max(1, deadlineMs - monotonicNowMs()));
+      const parentAbort = () => pollController.abort();
+      const executionSignal = cacheExecutionSignal();
+      if (executionSignal && typeof executionSignal.addEventListener === 'function') {
+        if (executionSignal.aborted) {
+          pollController.abort();
+        } else {
+          executionSignal.addEventListener('abort', parentAbort, { once: true });
+        }
+      }
+      let observed;
+      try {
+        observed = await cacheManager.getCacheState(path, { ...config.cacheConfig, signal: pollController.signal });
+      } catch (error) {
+        if (isAbortError(error)) {
+          if (didClientAbort()) {
+            throw error;
+          }
+          return { result: 'expired', reason: 'poll_timeout' };
+        }
+        throw error;
+      } finally {
+        clearTimeout(pollTimer);
+        executionSignal?.removeEventListener?.('abort', parentAbort);
+      }
+      if (adoptReadyCacheState(observed)) {
+        return observed;
+      }
+      if (observed.result === 'backoff') {
+        return observed;
+      }
+      if (observed.leaseId !== leaseId) {
+        return { result: 'expired' };
+      }
+      const observedRemainingMs = Number(observed.leaseRemainingMs);
+      if (!Number.isFinite(observedRemainingMs) || observedRemainingMs <= 0) {
+        return { result: 'expired' };
+      }
+      deadlineMs = Math.min(deadlineMs, monotonicNowMs() + observedRemainingMs);
+    }
+    return { result: 'expired' };
+  };
+
+  const coordinateCacheRefresh = async () => {
+    if (!cacheManager || config.cacheEnabled !== true) {
+      return null;
+    }
+
+    let initialState;
+    if (unifiedResult) {
+      initialState = {
+        result: cacheHit && linkData ? 'ready' : 'missing',
+        linkData,
+        version: unifiedResult.cache?.version || null,
+        observedAtMs: unifiedResult.cache?.observedAtMs ?? null,
+      };
+      if (adoptReadyCacheState(initialState)) {
+        return initialState;
+      }
+      cacheHit = false;
+      linkData = null;
+    } else {
+      initialState = await cacheManager.getCacheState(path, cacheRequestConfig());
+      if (adoptReadyCacheState(initialState)) {
+        return initialState;
+      }
+    }
+
+    // A read-only follower observation owns the decision to wait or back off.
+    // Do not re-acquire after that observation: the lease may expire between
+    // the two calls, and an already waiting request must not become a new
+    // refresh owner.
+    if (initialState.result === 'backoff') {
+      return initialState;
+    }
+    if (initialState.result === 'wait') {
+      return await waitForCacheRefresh(initialState);
+    }
+
+    cacheRefreshObservedVersion = initialState.version || null;
+    const acquired = await cacheManager.acquireCacheRefresh(
+      path,
+      cacheRefreshObservedVersion,
+      cacheRequestConfig(),
+    );
+    if (adoptReadyCacheState(acquired)) {
+      return acquired;
+    }
+    if (acquired.result === 'backoff') {
+      return acquired;
+    }
+    if (acquired.result === 'wait') {
+      return await waitForCacheRefresh(acquired);
+    }
+    if (acquired.result === 'acquired' && acquired.leaseId) {
+      cacheRefreshLease = {
+        id: acquired.leaseId,
+        failedVersion: acquired.version || cacheRefreshObservedVersion,
+      };
+      if (!startCacheOwnerDeadline(acquired.leaseRemainingMs)) {
+        cacheRefreshLease = null;
+        return { result: 'expired' };
+      }
+      return acquired;
+    }
+    throw new Error(`cache refresh returned invalid result: ${acquired.result}`);
+  };
+
+  const finishCacheRefresh = async (options = {}) => {
+    if (!cacheRefreshLease || cacheRefreshFinished) {
+      return null;
+    }
+    cacheRefreshFinished = true;
+    const finishController = new AbortController();
+    const finishTimer = setTimeout(() => finishController.abort(), CACHE_REFRESH_FINISH_MAX_MS);
+    try {
+      const result = await cacheManager.finishCacheRefresh(
+        path,
+        cacheRefreshLease.id,
+        {
+          ...options,
+          failedVersion: options.failedVersion ?? cacheRefreshLease.failedVersion,
+          path,
+        },
+        { ...config.cacheConfig, signal: finishController.signal },
+      );
+      logEvent('info', 'Cache', 'refresh_finished', {
+        result: result.result,
+        path,
+      });
+      if (Number.isFinite(result?.retryAfterSeconds) && result.retryAfterSeconds > 0) {
+        cacheFailureRetryAfterSeconds = Math.max(cacheFailureRetryAfterSeconds || 0, result.retryAfterSeconds);
+      }
+      return result;
+    } catch (error) {
+      logEvent('error', 'Cache', 'refresh_finish_failed', {
+        path,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    } finally {
+      clearTimeout(finishTimer);
+    }
+  };
+
+  finalizePreAuthorizationExit = async (error) => {
+    if (!isAbortError(error)) {
+      return null;
+    }
+    if (didClientAbort()) {
+      return terminal(createClientAbortResponse(origin), 'client_aborted');
+    }
+    if (!isRecoveryBudgetExpired()) {
+      return null;
+    }
+    let retryAfter = null;
+    if (cacheRefreshLease && !cacheRefreshFinished) {
+      const result = await finishCacheRefresh({ errorCode: 500 });
+      retryAfter = Number.isFinite(result?.retryAfterSeconds) ? result.retryAfterSeconds : null;
+      clearCacheOwnerDeadline();
+    }
+    return terminal(createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', retryAfter || 1), 'recovery_deadline_exhausted', {
+      retryAfter: retryAfter || 1,
+    });
+  };
+
+  const publishCacheRefreshAfterHeaders = async (response) => {
+    if (!cacheRefreshLease || cacheRefreshFinished || !response || response.status < 200 || response.status >= 300) {
+      return null;
+    }
+    const hasBody = response.body !== null;
+    const hasContentLength = parseContentLengthHeader(response.headers.get('content-length')) !== null;
+    const hasContentRange = Boolean(response.headers.get('content-range'));
+    if (!hasBody && !hasContentLength && !hasContentRange) {
+      return null;
+    }
+    const linkData = res?.data;
+    const expiresAt = linkData?.download?.expires_at;
+    if (!linkData || !Number.isSafeInteger(expiresAt) || expiresAt <= 0) {
+      return null;
+    }
+    clearCacheOwnerDeadline();
+    const responseHostname = extractHostname(res?.data?.url || downloadUrl);
+    const hostnameHash = responseHostname ? await sha256Hash(responseHostname.toLowerCase()) : null;
+    return finishCacheRefresh({
+      linkData,
+      hostnameHash,
+    });
+  };
+
+  // Cache state is read before a cold OpenList request. Only the lease owner
+  // may request a new link; followers observe one lease through read-only polls.
+  let res;
+  let currentAttempt = null;
+  let fairQueueClient = null;
+  let fqContext = null;
+  const pendingFairQueueCleanupContexts = [];
+  let cqReleaseController = null;
+  let cqHeartbeatManager = null;
+  let cqCleanupBoundToStream = false;
+  let clearPendingBreakerOnlyAttempt = () => {};
+  let flushDeferredQueueBreakerReportOnExit = async () => null;
+  let finalizePostIssuanceExit = null;
+  let finalizeOwnedTerminalExitForCatch = null;
+  const waitForInFlightFairQueueHeaderRelease = async (cleanupContext) => {
+    const inFlightRelease = cleanupContext?.headerReleasePromise;
+    if (!inFlightRelease) {
+      return null;
+    }
+    return inFlightRelease;
+  };
+  try {
+    if (isRecoveryBudgetExpired()) {
+      return terminal(createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1), 'recovery_deadline_exhausted', {
+        retryAfter: 1,
+      });
+    }
+    const cacheResolution = await coordinateCacheRefresh();
+    if (cacheResolution?.result === 'backoff') {
+      const retryAfter = Math.max(1, cacheResolution.retryAfterSeconds || 1);
+      return terminal(createCacheCoordinatorUnavailableResponse(origin, 'This download is temporarily unavailable, please retry later', retryAfter), 'cache_backoff', {
+        retryAfter,
+      });
+    }
+    if (cacheResolution?.result === 'expired') {
+      return terminal(createCacheCoordinatorUnavailableResponse(origin), 'cache_refresh_expired');
+    }
+    if (cacheHit && linkData) {
+      res = { code: 200, data: linkData };
+    }
 
   if (!res) {
     const { res: apiResult, errorResponse } = await fetchLinkDataFromApi();
     if (errorResponse) {
-      return terminal(errorResponse, 'alist_api_unavailable');
+      let cacheRetryAfter = null;
+      if (cacheRefreshLease && !cacheRefreshFinished) {
+        const finishResult = await finishCacheRefresh({ errorCode: 503 });
+        cacheRetryAfter = Number.isFinite(finishResult?.retryAfterSeconds)
+          ? finishResult.retryAfterSeconds
+          : null;
+        clearCacheOwnerDeadline();
+      }
+      const apiRetryAfter = normalizeRetryAfter(errorResponse.headers.get('Retry-After'));
+      const combinedRetryAfter = Math.max(
+        Number(cacheRetryAfter) || 0,
+        Number(apiRetryAfter) || 0,
+      ) || null;
+      const responseToReturn = combinedRetryAfter
+        ? createErrorResponse(origin, 503, 'Link service is temporarily unavailable, please retry later', {
+          'Retry-After': String(combinedRetryAfter),
+        })
+        : errorResponse;
+      return terminal(responseToReturn, 'alist_api_unavailable', {
+        retryAfter: combinedRetryAfter,
+      });
     }
     res = apiResult;
   }
@@ -5120,6 +5981,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   // ========================================
   let throttleStatus = null;
   let throttleHostname = null;
+  let initialBreakerTerminalResponse = null;
+  let initialBreakerTerminalReason = null;
+  let initialBreakerTerminalFields = {};
 
   const throttleCheckEnabled = config.throttleEnabled && throttleManager;
   const isThrottleManagedHostname = (hostname) => isManagedThrottleHost(hostname, config.throttleHostnamePatterns);
@@ -5151,7 +6015,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     try {
       logEvent('info', 'Breaker', 'snapshot_start', { host: authorityHostname, phase: 'snapshot' });
-      const snapshot = await throttleManager.getBreakerState(authorityHostname, { ...config.throttleConfig, ctx });
+      const snapshot = await throttleManager.getBreakerState(authorityHostname, throttleConfigWithSignal());
       if (!snapshot) {
         logEvent('error', 'Breaker', 'snapshot_missing', { host: authorityHostname });
         return terminal(createBreakerAuthorityUnavailableResponse(origin, 'snapshot read'), 'breaker_authority_unavailable', {
@@ -5165,46 +6029,13 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       });
       return snapshot;
     } catch (error) {
+      if (isAbortError(error) && (didClientAbort() || isRecoveryBudgetExpired())) {
+        throw error;
+      }
       logEvent('error', 'Breaker', 'snapshot_failed', { message: error instanceof Error ? error.message : String(error) });
       return terminal(createBreakerAuthorityUnavailableResponse(origin, 'snapshot read'), 'breaker_authority_unavailable');
     }
   };
-
-  if (throttleCheckEnabled && admissionMode === 'breaker_only') {
-    throttleHostname = upstreamHostname;
-
-    const unifiedThrottleUsable = Boolean(
-      unifiedResult
-      && unifiedResult.throttle
-      && unifiedThrottleHostnameHash
-      && throttleHostname
-    );
-
-    if (unifiedThrottleUsable) {
-      throttleStatus = unifiedResult.throttle;
-    } else if (throttleHostname && isThrottleManagedHostname(throttleHostname)) {
-      throttleStatus = await readAuthoritySnapshotForHostname(throttleHostname);
-      if (throttleStatus instanceof Response) {
-        return throttleStatus;
-      }
-    }
-
-    if (throttleStatus) {
-      const breakerState = readOpenBreakerSnapshot(throttleStatus, config.throttleConfig?.openCapSeconds || 60);
-      if (breakerState) {
-        await slowFailDelay();
-        logEvent('info', 'Breaker', 'open_precheck', {
-          host: throttleHostname,
-          status: breakerState.errorCode,
-          retryAfter: breakerState.retryAfter,
-        });
-        return terminal(createThrottleProtectedResponse(origin, breakerState), 'breaker_open', {
-          host: throttleHostname,
-          admissionMode,
-        });
-      }
-    }
-  }
 
   const authorizeBreakerAttempt = async (hostname) => {
     const authorityHostname = getThrottleAuthorityHostname(hostname);
@@ -5218,7 +6049,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
     try {
       logEvent('info', 'Breaker', 'authorize_start', { host: authorityHostname, phase: 'authorize' });
-      const attemptSnapshot = await throttleManager.authorizeBreakerAttempt(authorityHostname, { ...config.throttleConfig, ctx });
+      const attemptSnapshot = await throttleManager.authorizeBreakerAttempt(authorityHostname, throttleConfigWithSignal());
       if (!attemptSnapshot) {
         logEvent('error', 'Breaker', 'authorize_missing_authority_state', { host: authorityHostname });
         return {
@@ -5235,7 +6066,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         config.throttleConfig?.openCapSeconds || DEFAULT_THROTTLE_OPEN_CAP_SECONDS,
       );
       if (openBreaker) {
-        await slowFailDelay();
+        await slowFailDelay(cacheExecutionSignal());
         logEvent('info', 'Breaker', 'authorize_open', {
           host: hostname,
           status: openBreaker.errorCode,
@@ -5258,7 +6089,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
 
       if (attemptSnapshot.state === 'half_open' && attemptSnapshot.attemptGranted !== true) {
         const retryAfter = readHalfOpenDeadlineRetryAfter(attemptSnapshot, 1);
-        await slowFailDelay();
+        await slowFailDelay(cacheExecutionSignal());
         logEvent('info', 'Breaker', 'authorize_half_open_full', { host: hostname, retryAfter });
         return {
           blockedResponse: terminal(createThrottleProtectedResponse(origin, {
@@ -5283,6 +6114,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         attemptTicket: attemptSnapshot.attemptGranted === true ? attemptSnapshot.attemptTicket : null,
       };
     } catch (error) {
+      if (isAbortError(error) && (didClientAbort() || isRecoveryBudgetExpired())) {
+        throw error;
+      }
       logEvent('error', 'Breaker', 'authorize_failed', { message: error instanceof Error ? error.message : String(error) });
       return {
         blockedResponse: terminal(createBreakerAuthorityUnavailableResponse(origin, 'attempt authorize'), 'breaker_authority_unavailable', {
@@ -5333,7 +6167,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const snapshot = await throttleManager.settleBreakerAttempt(authorityHostname, {
         attemptVersion,
         attemptTicket,
-      }, { ...config.throttleConfig, ctx });
+      }, throttleConfigWithSignal(throttleSettlementSignal()));
       fqContext.attemptVersion = null;
       fqContext.attemptTicket = null;
       clearDeferredQueueBreakerReport();
@@ -5432,7 +6266,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     );
   };
 
-  const flushDeferredQueueBreakerReportOnExit = async (response = null) => {
+  flushDeferredQueueBreakerReportOnExit = async (response = null) => {
     if (!fqContext || !fqContext.deferredReportArmed || !Number.isFinite(fqContext.deferredReportStatusCode)) {
       return null;
     }
@@ -5447,6 +6281,23 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     }
 
     return flushDeferredQueueBreakerReportIfNeeded();
+  };
+
+  const flushDeferredQueueBreakerReportInTerminalPhase = async (response = null) => {
+    if (!fqContext || !fqContext.deferredReportArmed || !Number.isFinite(fqContext.deferredReportStatusCode)) {
+      return null;
+    }
+    beginTerminalCleanupPhase();
+    try {
+      return await flushDeferredQueueBreakerReportOnExit(response);
+    } catch (error) {
+      logEvent('error', 'Breaker', 'deferred_report_failed', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return terminal(createBreakerAuthorityUnavailableResponse(origin, 'sample report'), 'breaker_sample_report_failed', {
+        host: fqContext.hostname,
+      });
+    }
   };
 
   const shouldDeferQueueBreakerReportForRedirect = async (hostname, response, requestUrl) => {
@@ -5502,6 +6353,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       || (hostnameAdmissionMode !== 'breaker_only' && hostnameAdmissionMode !== 'queue_breaker')
     ) {
       return;
+    }
+    if (attempt?.sampleReported === true) {
+      return null;
     }
 
     try {
@@ -5560,7 +6414,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
           attemptTicket,
           retryAfterSeconds,
         },
-        { ...config.throttleConfig, ctx }
+        throttleConfigWithSignal(throttleSettlementSignal())
       );
 
       if (!snapshot) {
@@ -5572,6 +6426,9 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       }
 
       attempt?.consumeAfterReport?.();
+      if (attempt) {
+        attempt.sampleReported = true;
+      }
       logEvent('info', 'Breaker', 'sample_report_done', {
         host: hostname,
         mode: hostnameAdmissionMode,
@@ -5581,6 +6438,16 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
         attemptTicket,
       });
     } catch (error) {
+      attachDownloadFailureContext(error, {
+        requestHostname: hostname,
+        breakerAttempt: attempt,
+        response,
+        phase: 'breaker_sample',
+      });
+      if (isAbortError(error) && !terminalCleanupPhase && (didClientAbort() || isRecoveryBudgetExpired())) {
+        await cancelResponseBody(response);
+        throw error;
+      }
       logEvent('error', 'Breaker', 'sample_report_failed', { message: error instanceof Error ? error.message : String(error) });
       await cancelResponseBody(response);
       return terminal(createBreakerAuthorityUnavailableResponse(origin, 'sample report'), 'breaker_sample_report_failed', {
@@ -5625,6 +6492,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     requestId: createTrueConcurrencyRequestId(),
     admissionMode: mode,
     hardExpireAtMs,
+    recoveryDeadlineMs: recoveryDeadlineWallMs,
     nowMs: Date.now(),
     deferredReportStatusCode: null,
     deferredReportArmed: false,
@@ -5632,9 +6500,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
     ...buildFairQueueAdmissionFields(mode),
   });
 
-  let fairQueueClient = null;
-  let fqContext = null;
-  const pendingFairQueueCleanupContexts = [];
   let pendingBreakerOnlyAttempt = null;
   let clientIpSubnetHash = null;
   let concurrencyClient = null;
@@ -5642,15 +6507,12 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   let cqPlanKey = '';
   let cqTargetUrl = '';
   let cqLease = null;
-  let cqReleaseController = null;
-  let cqHeartbeatManager = null;
-  let cqCleanupBoundToStream = false;
   let cqStreamAbortController = null;
   let cqStreamAbortReason = '';
   let cqAcquireDispatched = false;
   let cqWaitBudget = null;
 
-  const clearPendingBreakerOnlyAttempt = () => {
+  clearPendingBreakerOnlyAttempt = () => {
     pendingBreakerOnlyAttempt = null;
   };
 
@@ -5704,7 +6566,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const snapshot = await throttleManager.settleBreakerAttempt(authorityHostname, {
         attemptVersion,
         attemptTicket,
-      }, { ...config.throttleConfig, ctx });
+      }, throttleConfigWithSignal(throttleSettlementSignal()));
       clearPendingBreakerOnlyAttempt();
       logEvent('info', 'Breaker', 'settle_done', {
         host: authorityHostname,
@@ -5846,6 +6708,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       clientInstanceId: normalizeStringValue(env?.INSTANCE_ID) || 'download-worker',
       requestId,
       hardExpireAtMs,
+      recoveryDeadlineMs: recoveryDeadlineWallMs,
       nowMs: Date.now(),
       ticketHash,
     };
@@ -6033,7 +6896,7 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       const breakerState = fqResult.breakerSnapshot
         ? readOpenBreakerSnapshot(fqResult.breakerSnapshot, 0)
         : null;
-      await slowFailDelay();
+      await slowFailDelay(cacheExecutionSignal());
       return terminal(createThrottleProtectedResponse(origin, {
         errorCode: breakerState?.errorCode || fqResult.throttleCode || 503,
         retryAfter: fqResult.retryAfter ?? breakerState?.retryAfter,
@@ -6062,16 +6925,33 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
   };
 
   const admitFairQueueContext = async (phase) => {
+    const executionSignalScope = createDeadlineSignal(fqContext?.recoveryDeadlineMs, clientSignal);
     try {
-      const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, clientSignal);
+      const fqResult = await fairQueueClient.waitForSlot(ctx, fqContext, executionSignalScope.signal);
+      if (fqResult?.kind === 'timeout'
+        && fqResult.reason === 'worker_deadline_exceeded'
+        && isRecoveryBudgetExpired(executionSignalScope.signal)) {
+        return terminal(
+          createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1),
+          'recovery_deadline_exhausted',
+          { retryAfter: 1 },
+        );
+      }
       return await handleFairQueueWaitResult(fqResult);
     } catch (error) {
       if (didClientAbort() && isAbortError(error)) {
         return terminal(createClientAbortResponse(origin), 'client_aborted');
       }
+      if (isRecoveryBudgetExpired(executionSignalScope.signal) && isAbortError(error)) {
+        return terminal(createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1), 'recovery_deadline_exhausted', {
+          retryAfter: 1,
+        });
+      }
       const message = error instanceof Error ? error.message : String(error);
       logEvent('error', 'FQ', 'wait_for_slot_error', { phase, message });
       return terminal(createErrorResponse(origin, 503, 'Fair queue unavailable'), 'fq_unavailable');
+    } finally {
+      executionSignalScope.cleanup();
     }
   };
 
@@ -6103,14 +6983,6 @@ async function handleDownload(request, env, config, cacheManager, throttleManage
       pendingFairQueueCleanupContexts.push(fqContext);
     }
     return finalized;
-  };
-
-  const waitForInFlightFairQueueHeaderRelease = async (cleanupContext) => {
-    const inFlightRelease = cleanupContext?.headerReleasePromise;
-    if (!inFlightRelease) {
-      return null;
-    }
-    return inFlightRelease;
   };
 
   const releaseFairQueueAfterHeadersIfNeeded = () => {
@@ -6162,7 +7034,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     return response;
   }
 
-  const deferredReportResponse = await flushDeferredQueueBreakerReportIfNeeded();
+  const deferredReportResponse = await flushDeferredQueueBreakerReportInTerminalPhase();
   const responseToReturn = deferredReportResponse || response;
 
   fqContext.cleanupRetired = true;
@@ -6217,7 +7089,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     return responseToReturn;
   };
 
-  const prepareFairQueueContextForTarget = async (targetUrl, phase) => {
+  const prepareFairQueueContextForTarget = async (targetUrl, phase, options = {}) => {
     const updatedHostnameRaw = extractHostname(targetUrl);
     const updatedHostname = updatedHostnameRaw ? updatedHostnameRaw.toLowerCase() : null;
     const updatedAdmissionMode = resolveAdmissionMode(config, updatedHostname);
@@ -6232,6 +7104,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       || updatedHostname !== fqContext.hostname
       || updatedSiteBucket !== fqContext.siteBucket;
     const fairQueueTargetChanged = fairQueueIdentityChanged
+      || options.forceRetire === true
       || ((updatedAdmissionMode === 'queue_only' || needTrueConcurrency)
         && (!fqContext || fqContext.targetUrl !== normalizedTargetUrl));
 
@@ -6304,14 +7177,21 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     };
   };
 
-  const prepareTargetForFetch = async (targetUrl, phase) => {
+  const prepareTargetForFetch = async (targetUrl, phase, options = {}) => {
+    if (isRecoveryBudgetExpired()) {
+      return terminal(
+        createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1),
+        'recovery_deadline_exhausted',
+        { retryAfter: 1 },
+      );
+    }
     const retireBreakerOnlyResponse = await retirePendingBreakerOnlyAttemptIfNeeded();
     if (retireBreakerOnlyResponse) {
       return retireBreakerOnlyResponse;
     }
 
     const normalizedTargetUrl = String(targetUrl);
-    const fairQueuePrepareResult = await prepareFairQueueContextForTarget(targetUrl, phase);
+    const fairQueuePrepareResult = await prepareFairQueueContextForTarget(targetUrl, phase, options);
     if (fairQueuePrepareResult instanceof Response) {
       return fairQueuePrepareResult;
     }
@@ -6326,7 +7206,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
 
     let nextPlan = null;
     if (needTrueConcurrency) {
-      if (Date.now() >= hardExpireAtMs) {
+      if (Date.now() >= hardExpireAtMs || isRecoveryBudgetExpired()) {
         return terminal(createUnauthorizedResponse(origin, 'link expired'), 'payload_expired');
       }
 
@@ -6339,11 +7219,11 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       const nextPlanKey = buildTrueConcurrencyPlanKey(nextPlan);
       const trueConcurrencyTargetChanged = cqTargetUrl !== '' && cqTargetUrl !== normalizedTargetUrl;
 
-      if (cqReleaseController && (trueConcurrencyTargetChanged || (cqPlanKey && cqPlanKey !== nextPlanKey))) {
+      if (cqReleaseController && (trueConcurrencyTargetChanged || options.forceRetire === true || (cqPlanKey && cqPlanKey !== nextPlanKey))) {
         await ensureCurrentTrueConcurrencyReleased('target_change', true);
       }
 
-      if (!cqPlan || trueConcurrencyTargetChanged || cqPlanKey !== nextPlanKey) {
+      if (!cqPlan || trueConcurrencyTargetChanged || options.forceRetire === true || cqPlanKey !== nextPlanKey) {
         cqPlan = nextPlan;
         cqPlanKey = nextPlanKey;
         cqTargetUrl = normalizedTargetUrl;
@@ -6378,16 +7258,22 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           return terminal(createUnauthorizedResponse(origin, 'link expired'), 'payload_expired');
         }
 
+      const cqExecutionSignalScope = createDeadlineSignal(cqPlan.recoveryDeadlineMs, clientSignal);
+      const cqExecutionSignal = cqExecutionSignalScope.signal;
       try {
         cqPlan.nowMs = Date.now();
         cqAcquireDispatched = true;
-        let acquireResult = await concurrencyClient.acquire(ctx, cqPlan, clientSignal);
+        let acquireResult = await concurrencyClient.acquire(ctx, cqPlan, cqExecutionSignal);
 
         if (acquireResult.result === 'wait') {
           const nextCqWaitToken = acquireResult.waitToken;
           cqPlan.waitToken = nextCqWaitToken;
           const startedAtMs = Date.now();
-          const waitDeadlineMs = Math.min(cqPlan.hardExpireAtMs, startedAtMs + config.concurrencyHandlerConfig.waitTotalMaxMs);
+          const waitDeadlineMs = Math.min(
+            cqPlan.hardExpireAtMs,
+            cqPlan.recoveryDeadlineMs || Number.POSITIVE_INFINITY,
+            startedAtMs + config.concurrencyHandlerConfig.waitTotalMaxMs,
+          );
           cqWaitBudget = {
             startedAtMs,
             totalMaxMs: config.concurrencyHandlerConfig.waitTotalMaxMs,
@@ -6434,12 +7320,12 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           if (typeof waitTimer?.unref === 'function') {
             waitTimer.unref();
           }
-          const canListenForClientAbort = clientSignal && typeof clientSignal.addEventListener === 'function';
-          if (clientSignal) {
-            if (clientSignal.aborted) {
+          const canListenForClientAbort = cqExecutionSignal && typeof cqExecutionSignal.addEventListener === 'function';
+          if (cqExecutionSignal) {
+            if (cqExecutionSignal.aborted) {
               waitController.abort();
             } else if (canListenForClientAbort) {
-              clientSignal.addEventListener('abort', abortWaitForClient, { once: true });
+              cqExecutionSignal.addEventListener('abort', abortWaitForClient, { once: true });
             }
           }
 
@@ -6467,8 +7353,8 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
             throw error;
           } finally {
             clearTimeout(waitTimer);
-            if (canListenForClientAbort && typeof clientSignal.removeEventListener === 'function') {
-              clientSignal.removeEventListener('abort', abortWaitForClient);
+            if (canListenForClientAbort && typeof cqExecutionSignal.removeEventListener === 'function') {
+              cqExecutionSignal.removeEventListener('abort', abortWaitForClient);
             }
           }
         }
@@ -6503,7 +7389,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
             claimToken: acquireResult.claimToken,
             nowMs: Date.now(),
             hardExpireAtMs: cqPlan.hardExpireAtMs,
-          }, clientSignal);
+            }, cqExecutionSignal);
         } catch (error) {
           const releaseController = createConcurrencyReleaseController({
             client: concurrencyClient,
@@ -6583,7 +7469,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
             requestId: claimRequestId,
             handoffToken: acquireResult.handoffToken,
             nowMs: Date.now(),
-          }, clientSignal);
+          }, cqExecutionSignal);
         } catch (error) {
           const claimHostname = cqPlan?.hostname;
           const claimRequestId = cqPlan?.requestId;
@@ -6641,6 +7527,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           lease: cqLease,
           heartbeatConfig: config.concurrencyHandlerConfig?.heartbeat,
           clientSignal,
+          executionSignal: cqExecutionSignal === clientSignal ? null : cqExecutionSignal,
           abortStream: abortCurrentTrueConcurrencyStream,
         });
         try {
@@ -6704,6 +7591,21 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           }
           return terminal(createClientAbortResponse(origin), 'client_aborted');
         }
+        if (isRecoveryBudgetExpired(cqExecutionSignal) && isAbortError(error)) {
+          const settleResponse = await settleBreakerAttemptIfNeeded(cqPlan?.hostname);
+          if (settleResponse instanceof Response) {
+            if (needFairQueue) {
+              await releaseUnusedFairQueueGrantIfNeeded(`${phase} recovery deadline during cq acquire`);
+            }
+            return settleResponse;
+          }
+          if (needFairQueue) {
+            await releaseUnusedFairQueueGrantIfNeeded(`${phase} recovery deadline during cq acquire`);
+          }
+          return terminal(createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1), 'recovery_deadline_exhausted', {
+            retryAfter: 1,
+          });
+        }
         const message = error instanceof Error ? error.message : String(error);
         logEvent('error', 'CQ', 'acquire_failed', {
           phase,
@@ -6722,93 +7624,113 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
           await releaseUnusedFairQueueGrantIfNeeded(`${phase} cq failure`);
         }
         return terminal(createTrueConcurrencyUnavailableResponse(origin), 'cq_acquire_failed');
+      } finally {
+        cqExecutionSignalScope.cleanup();
       }
     }
 
     return null;
   };
 
-  const readKnownGoogleDriveDownloadSize = () => readPayloadFileSize(payloadData) ?? readPayloadFileSize(res?.data);
-
-  const buildUpstreamRequest = (urlValue, headerConfig) => {
-    const upstreamRequest = clientSignal && typeof clientSignal.addEventListener !== 'function'
-      ? new Request(urlValue, {
-        method: originalRequest.method,
-        headers: originalRequest.headers,
-        body: originalRequest.body,
-        redirect: originalRequest.redirect,
-      })
-      : new Request(urlValue, originalRequest);
-    if (headerConfig && typeof headerConfig === 'object') {
-      Object.keys(headerConfig).forEach((key) => {
-        const entries = Array.isArray(headerConfig[key]) ? headerConfig[key] : [headerConfig[key]];
-        entries.forEach((value) => {
-          if (typeof value === 'string') {
-            upstreamRequest.headers.set(key, value);
-          }
-        });
-      });
+  const readLinkFileSize = (linkData) => {
+    const raw = linkData?.size;
+    if (typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0) {
+      return raw;
     }
-    const upstreamHostname = extractHostname(urlValue)?.toLowerCase() || '';
-    if (originalRequest.method === 'HEAD' && isGoogleDriveDownloadHostname(upstreamHostname)) {
-      upstreamRequest.headers.set('range', GOOGLE_DRIVE_HEAD_PROBE_RANGE);
-      return new Request(upstreamRequest, { method: 'GET' });
+    return null;
+  };
+
+  const readKnownGoogleDriveDownloadSize = () => readLinkFileSize(res?.data);
+  const buildUpstreamRequest = (urlValue, headerConfig, sourceRequest = originalRequest) => {
+    const targetUrl = new URL(urlValue);
+    const authorizedUrl = new URL(res?.data?.url || downloadUrl || urlValue);
+    const sameAuthorizedOrigin = targetUrl.origin === authorizedUrl.origin
+      && !(authorizedUrl.protocol === 'https:' && targetUrl.protocol === 'http:');
+    const sourceHeaders = sourceRequest?.headers || originalRequest.headers;
+    const requestHeaders = new Headers();
+
+    if (headerConfig && typeof headerConfig === 'object' && sameAuthorizedOrigin) {
+      for (const [key, rawValue] of Object.entries(headerConfig)) {
+        const headerName = String(key).toLowerCase();
+        if (UPSTREAM_LINK_BLOCKED_HEADERS.has(headerName)) {
+          continue;
+        }
+        const entries = Array.isArray(rawValue) ? rawValue : [rawValue];
+        for (const value of entries) {
+          if (typeof value === 'string') {
+            requestHeaders.set(key, value);
+          }
+        }
+      }
+    }
+
+    for (const headerName of UPSTREAM_CLIENT_REQUEST_HEADERS) {
+      const value = sourceHeaders.get(headerName);
+      if (value !== null) {
+        requestHeaders.set(headerName, value);
+      }
+    }
+
+    const upstreamHostname = targetUrl.hostname.toLowerCase();
+    const googleDownload = isGoogleRecoveryAttempt(currentAttempt)
+      || isGoogleDriveDownloadHostname(upstreamHostname);
+    if (googleDownload) {
+      requestHeaders.set('accept-encoding', 'identity');
+    }
+
+    let method = sourceRequest?.method || originalRequest.method;
+    if (originalRequest.method === 'HEAD' && googleDownload) {
+      if (readKnownGoogleDriveDownloadSize() === 0) {
+        method = 'HEAD';
+      } else {
+        requestHeaders.set('range', GOOGLE_DRIVE_HEAD_PROBE_RANGE);
+        method = 'GET';
+      }
     }
     if (
       originalRequest.method === 'GET'
       && !originalRequest.headers.get('range')
-      && isGoogleDriveDownloadHostname(upstreamHostname)
+      && googleDownload
     ) {
       const fileSize = readKnownGoogleDriveDownloadSize();
       const fullRangeHeader = buildGoogleDriveFullRangeHeader(fileSize);
       if (fullRangeHeader) {
-        upstreamRequest.headers.set('range', fullRangeHeader);
+        requestHeaders.set('range', fullRangeHeader);
       }
     }
-    return upstreamRequest;
-  };
 
-  const probeGoogleDriveDownloadSize = async (requestToProbe) => {
-    try {
-      const headProbeRequest = new Request(requestToProbe, { method: 'HEAD' });
-      markFairQueueOriginDispatch(fqContext);
-      const headProbeResponse = await fetch(headProbeRequest);
-
-      const headProbeSize = parseContentLengthHeader(headProbeResponse.headers.get('content-length'));
-      await cancelResponseBody(headProbeResponse);
-      if (headProbeSize !== null) {
-        return headProbeSize;
-      }
-    } catch (_error) {
-      // fall through to the range probe before giving up
-    }
-
-    try {
-      const rangeProbeRequest = new Request(requestToProbe);
-      rangeProbeRequest.headers.set('range', GOOGLE_DRIVE_HEAD_PROBE_RANGE);
-      markFairQueueOriginDispatch(fqContext);
-      const rangeProbeResponse = await fetch(rangeProbeRequest);
-
-      const rangeProbeSize = parseContentRangeTotal(rangeProbeResponse.headers.get('content-range'));
-      await cancelResponseBody(rangeProbeResponse);
-      return rangeProbeSize;
-    } catch (_error) {
-      return null;
-    }
+    return new Request(targetUrl, {
+      method,
+      headers: requestHeaders,
+      redirect: 'manual',
+    });
   };
 
   const maybeApplyGoogleDriveFullDownloadTranslation = async (requestToTranslate) => {
     const upstreamHostname = extractHostname(requestToTranslate?.url || '')?.toLowerCase() || '';
-    if (
-      originalRequest.method !== 'GET'
-      || originalRequest.headers.get('range')
-      || !isGoogleDriveDownloadHostname(upstreamHostname)
-      || requestToTranslate.headers.get('range')
-    ) {
+    const googleDownload = isGoogleRecoveryAttempt(currentAttempt)
+      || isGoogleDriveDownloadHostname(upstreamHostname);
+    if (!googleDownload) {
       return requestToTranslate;
     }
 
-    const fileSize = readKnownGoogleDriveDownloadSize() ?? await probeGoogleDriveDownloadSize(requestToTranslate);
+    if (originalRequest.method === 'HEAD') {
+      if (readKnownGoogleDriveDownloadSize() === 0) {
+        return requestToTranslate;
+      }
+      if (requestToTranslate.headers.get('range') === GOOGLE_DRIVE_HEAD_PROBE_RANGE && requestToTranslate.method === 'GET') {
+        return requestToTranslate;
+      }
+      const probeRequest = new Request(requestToTranslate);
+      probeRequest.headers.set('range', GOOGLE_DRIVE_HEAD_PROBE_RANGE);
+      return new Request(probeRequest, { method: 'GET' });
+    }
+
+    if (originalRequest.method !== 'GET' || originalRequest.headers.get('range') || requestToTranslate.headers.get('range')) {
+      return requestToTranslate;
+    }
+
+    const fileSize = readKnownGoogleDriveDownloadSize();
     const fullRangeHeader = buildGoogleDriveFullRangeHeader(fileSize);
     if (!fullRangeHeader) {
       return requestToTranslate;
@@ -6823,9 +7745,12 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
 
   const retireAdmissionBeforeRecursiveWorkerRedirect = async (phase) => {
     let deferredReportResponse = null;
+    const cause = captureOriginalAbortCause();
+
+    await finishCacheRefresh({ errorCode: 302 });
 
     if (fqContext) {
-      deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+      deferredReportResponse = await flushDeferredQueueBreakerReportInTerminalPhase();
       const previousFairQueueContext = fqContext;
       fqContext = null;
       const finalized = await finalizeFairQueueContext({
@@ -6843,7 +7768,17 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       await ensureCurrentTrueConcurrencyReleased('target_change', true);
     }
 
-    return deferredReportResponse;
+    if (!deferredReportResponse && shouldScheduleFailureReport(currentAttempt) && recoveryAttemptCount < DOWNLOAD_RECOVERY_MAX_ATTEMPTS) {
+      const reportPromise = scheduleAuthorizationReport(currentAttempt, 'abandoned', 0, 'download_abandoned');
+      if (reportPromise) {
+        await reportPromise;
+      }
+    }
+
+    return {
+      response: deferredReportResponse,
+      cause,
+    };
   };
 
   const fetchUpstreamWithBreakerAttempt = async (requestToFetch) => {
@@ -6893,26 +7828,14 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       response: await (async () => {
         let upstreamResponse;
         try {
-          upstreamResponse = await fetch(requestToFetch);
+          upstreamResponse = await fetch(requestToFetch, { signal: cacheExecutionSignal() });
         } catch (error) {
-          // Preserve deferred same-site redirect reporting; direct fetch throws with live
-          // breaker debt still need the existing no-sample settlement path.
-          const keepDeferredQueueBreakerReport = requestAdmissionMode === 'queue_breaker'
-            && fqContext?.hostname === requestHostname
-            && fqContext.deferredReportArmed === true
-            && Number.isFinite(fqContext.deferredReportStatusCode);
-          const breakerSettlementResponse = keepDeferredQueueBreakerReport
-            ? null
-            : await settleBreakerAttemptIfNeeded(requestHostname);
-          if (cqReleaseController) {
-            await ensureCurrentTrueConcurrencyReleased('origin_fetch_failure', true);
-          }
-          if (needFairQueue) {
-            await finalizeFairQueueOnFailure('origin fetch failure');
-          }
-          if (breakerSettlementResponse instanceof Response) {
-            throw breakerSettlementResponse;
-          }
+          currentAttemptRequestHostname = requestHostname;
+          attachDownloadFailureContext(error, {
+            requestHostname,
+            breakerAttempt: attempt,
+            phase: 'origin_fetch',
+          });
           throw error;
         }
         return upstreamResponse;
@@ -6920,8 +7843,6 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       attempt,
     };
   };
-  const shouldRetryAuthError = (status) => status === 401 || status === 410;
-
   const buildSafeResponseHeaders = (responseToWrap, requestToWrap) => {
     const safeHeaders = new Headers();
     const isCryptedDownload = payloadData?.isCrypted === true;
@@ -6957,7 +7878,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       }
     });
 
-    if (shouldSynthesizeGoogleDriveAcceptRanges(responseToWrap, requestToWrap)) {
+    if (shouldSynthesizeGoogleDriveAcceptRanges(responseToWrap, requestToWrap, isGoogleRecoveryAttempt(currentAttempt))) {
       safeHeaders.set('accept-ranges', 'bytes');
     }
 
@@ -7170,7 +8091,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     return new Response(upstreamResponse.body, responseInit);
   };
 
-  const buildGeneratedUpstreamTerminalResponse = (upstreamResponse, reasonOverride = null) => {
+  const buildGeneratedUpstreamTerminalResponse = (upstreamResponse, reasonOverride = null, retryAfterOverride = undefined) => {
     const upstreamStatus = upstreamResponse?.status;
     let status = upstreamStatus;
     let reason = reasonOverride;
@@ -7195,18 +8116,20 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     const headers = new Headers();
     headers.set('Access-Control-Allow-Origin', origin);
     headers.append('Vary', 'Origin');
+    const retryAfter = normalizeRetryAfter(retryAfterOverride)
+      || normalizeRetryAfter(upstreamResponse?.headers?.get('Retry-After'));
     return terminal(rememberGeneratedError(createJsonErrorResponse({
       status,
       message,
       reason,
       headers,
       upstreamStatus,
-      retryAfter: normalizeRetryAfter(upstreamResponse?.headers?.get('Retry-After')),
+      retryAfter,
     }), {
       message,
       reason,
       upstreamStatus,
-      retryAfter: normalizeRetryAfter(upstreamResponse?.headers?.get('Retry-After')),
+      retryAfter,
     }), reason, {
       observedStatus: upstreamStatus,
       host: extractHostname(upstreamResponse?.url || '')?.toLowerCase() || undefined,
@@ -7231,16 +8154,80 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     return response;
   };
 
+  const guardBeforeContentHandoff = async (upstreamResponse) => {
+    const heartbeatAbortReason = normalizeStringValue(cqStreamAbortReason);
+    const recoveryExpired = isRecoveryBudgetExpired();
+    if (!didClientAbort() && !heartbeatAbortReason && !recoveryExpired) {
+      return null;
+    }
+
+    await cancelResponseBody(upstreamResponse);
+
+    if (didClientAbort()) {
+      return await finalizePostIssuanceExit({
+        response: terminal(createClientAbortResponse(origin), 'client_aborted'),
+        cause: {
+          kind: 'client_aborted',
+          outcome: 'abandoned',
+          statusCode: 0,
+          reason: 'client_aborted',
+          reportReason: 'download_abandoned',
+        },
+      });
+    }
+
+    if (recoveryExpired) {
+      return await finalizePostIssuanceExit({
+        response: terminal(createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1), 'recovery_deadline_exhausted', {
+          retryAfter: 1,
+        }),
+        cause: {
+          kind: 'execution_expired',
+          outcome: 'failure',
+          statusCode: 0,
+          reason: 'recovery_deadline_exhausted',
+          reportReason: 'recovery_deadline_exhausted',
+        },
+      });
+    }
+
+    // Heartbeat terminal outcomes that already represent a server-side loss
+    // must not trigger a second CQ release while the stream has not yet been
+    // handed to the caller. Clear the local lease state before releasing any
+    // remaining fair-queue ownership.
+    if (TRUE_CONCURRENCY_HEARTBEAT_TERMINAL_NO_RELEASE_REASONS.has(heartbeatAbortReason)) {
+      const heartbeatManager = cqHeartbeatManager;
+      await heartbeatManager?.ensureCleanup?.(heartbeatAbortReason);
+      clearCurrentTrueConcurrencyState();
+    }
+
+    return await finalizePostIssuanceExit({
+      response: terminal(createTrueConcurrencyUnavailableResponse(origin), 'cq_heartbeat_failed', {
+        result: 'released',
+        resultReason: heartbeatAbortReason,
+      }),
+      cause: {
+        kind: 'handoff_failure',
+        outcome: 'abandoned',
+        statusCode: 0,
+        reason: 'cq_heartbeat_failed',
+        reportReason: 'download_abandoned',
+      },
+    });
+  };
+
   const reportFetchedUpstreamResponseIfNeeded = async (response, requestHostname, requestUrl, attempt, options = {}) => {
     if (!response) {
       return null;
     }
 
-    if (response.status >= 400) {
+    if (response.status >= 400 && options.skipProtectedError === true) {
       return null;
     }
-
-    if (options.skipProtectedError === true && isProtectedThrottleStatusCode(response.status)) {
+    if (options.skipAuthRefreshStatus === true && (response.status === 401 || response.status === 410)) {
+      return null;
+    }
+    if (response.status >= 400 && !isProtectedThrottleStatusCode(response.status)) {
       return null;
     }
 
@@ -7253,7 +8240,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       return null;
     }
 
-    if (isProtectedThrottleStatusCode(status)) {
+    if (isProtectedThrottleStatusCode(status) && options.skipBreakerSample !== true) {
       const reportResponse = await reportBreakerResponseIfNeeded(
         requestHostname,
         upstreamResponse,
@@ -7265,7 +8252,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       }
     }
 
-    if (!isProtectedThrottleStatusCode(status)) {
+    if (!isProtectedThrottleStatusCode(status) || options.skipBreakerSample === true) {
       const settleResponse = await settleBreakerAttemptIfNeeded(requestHostname);
       if (settleResponse instanceof Response) {
         return await cancelResponseBodyAndReturn(upstreamResponse, settleResponse, 'upstream_terminal');
@@ -7274,7 +8261,7 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
 
     await cancelResponseBody(upstreamResponse);
     return await releaseAdmissionBeforeTerminalResponse(
-      buildGeneratedUpstreamTerminalResponse(upstreamResponse, options.reasonOverride),
+      buildGeneratedUpstreamTerminalResponse(upstreamResponse, options.reasonOverride, options.retryAfterOverride),
       'upstream_terminal',
     );
   };
@@ -7296,10 +8283,14 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       return responseToReturn;
     }
 
+    const postHeaderTicketStateConfig = {
+      ...ticketStateConfig,
+      signal: clientSignal || ticketStateConfig?.signal,
+    };
     try {
       const markUsedResult = await markTicketUsed(
         ticketHash,
-        ticketStateConfig,
+        postHeaderTicketStateConfig,
         Math.floor(Date.now() / 1000)
       );
 
@@ -7309,6 +8300,25 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logEvent('error', 'TicketState', 'mark_used_failed', { message });
+      if (didClientAbort() && isAbortError(error)) {
+        if (responseToReturn?.body && typeof responseToReturn.body.cancel === 'function') {
+          try {
+            await responseToReturn.body.cancel();
+          } catch (_error) {
+            // Best effort: the client cancellation remains authoritative.
+          }
+        }
+        return finalizePostIssuanceExit({
+          response: createClientAbortResponse(origin),
+          cause: {
+            kind: 'client_aborted',
+            outcome: 'abandoned',
+            statusCode: 0,
+            reason: 'client_aborted',
+            reportReason: 'download_abandoned',
+          },
+        });
+      }
     }
 
     if (responseToReturn?.body && typeof responseToReturn.body.cancel === 'function') {
@@ -7319,314 +8329,1585 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
       }
     }
 
-      return terminal(createErrorResponse(origin, 502, 'ticket state update failed'), 'ticket_state_invalid');
+    return finalizePostIssuanceExit({
+      response: createErrorResponse(origin, 502, 'ticket state update failed'),
+      cause: {
+        kind: 'handoff_failure',
+        outcome: 'abandoned',
+        statusCode: 0,
+        reason: 'ticket_state_invalid',
+        reportReason: 'download_abandoned',
+      },
+    });
   };
 
-  let retriedWithFreshLink = false;
+  const createDownloadEventId = (prefix = 'download') => {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return `${prefix}-${crypto.randomUUID()}`;
+    }
+    return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  };
 
-  // Proceed with fetch
-  try {
-    const initialPrepareResponse = await prepareTargetForFetch(downloadUrl, 'initial');
-    if (initialPrepareResponse) {
-      return initialPrepareResponse;
+  const truncateFeedbackReason = (value) => {
+    const raw = typeof value === 'string' ? value : String(value ?? '');
+    const bytes = new TextEncoder().encode(raw);
+    if (bytes.byteLength <= DOWNLOAD_REPORT_MAX_REASON_LENGTH) {
+      return raw;
+    }
+    const bounded = new TextDecoder().decode(bytes.slice(0, DOWNLOAD_REPORT_MAX_REASON_LENGTH));
+    return bounded.replace(/\uFFFD$/, '');
+  };
+
+  const isGoogleTransportAttempt = (attempt) => (
+    isGoogleRecoveryAttempt(attempt)
+      || isGoogleDriveDownloadHostname(extractHostname(attempt?.linkData?.url || ''))
+  );
+
+  const isGoogleRecoveryAttempt = (attempt) => (
+    normalizeStringValue(attempt?.linkData?.download?.provider).toLowerCase() === 'googledrive'
+  );
+
+  const isMultipartRangeResponse = (response, requestToValidate) => {
+    const requestRange = requestToValidate?.headers?.get('range') || originalRequest.headers.get('range') || '';
+    const contentType = normalizeStringValue(response?.headers?.get('content-type')).toLowerCase();
+    return response?.status === 206
+      && Boolean(response.body)
+      && contentType.startsWith('multipart/byteranges')
+      && requestRange.includes(',');
+  };
+
+  const isConditionalNotModifiedResponse = (response) => (
+    response?.status === 304
+    && (
+      originalRequest.headers.has('if-none-match')
+      || originalRequest.headers.has('if-modified-since')
+    )
+  );
+
+  const getAttemptEventId = (attempt, outcome) => {
+    if (!attempt.reportEventIds) {
+      attempt.reportEventIds = new Map();
+    }
+    if (!attempt.reportEventIds.has(outcome)) {
+      attempt.reportEventIds.set(outcome, createDownloadEventId(`download-${outcome}`));
+    }
+    return attempt.reportEventIds.get(outcome);
+  };
+
+  const buildAuthorizationFeedback = (attempt, outcome, statusCode, reason) => {
+    const ticket = normalizeStringValue(attempt?.ticket);
+    if (!ticket) {
+      return null;
+    }
+    const normalizedStatus = Number.isInteger(statusCode) && statusCode >= 0 && statusCode <= 599
+      ? statusCode
+      : 0;
+    return {
+      ticket,
+      event_id: getAttemptEventId(attempt, outcome),
+      outcome,
+      status_code: normalizedStatus,
+      reason: truncateFeedbackReason(reason || `upstream_http_${normalizedStatus}`),
+    };
+  };
+
+  const classifyUpstreamResponse = async (response, attempt) => {
+    if (!response) {
+      return { recoverable: false, google: false, quota: false, reason: 'upstream_missing_response' };
     }
 
-    request = await maybeApplyGoogleDriveFullDownloadTranslation(buildUpstreamRequest(downloadUrl, res.data.header));
-    let { blockedResponse, response, attempt } = await fetchUpstreamWithBreakerAttempt(request);
-    if (blockedResponse) {
-      return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
+    const google = isGoogleRecoveryAttempt(attempt);
+    const status = response.status;
+    const inspectGoogleError = google
+      && ((status >= 500 && status <= 599) || status === 401 || status === 403 || status === 410 || status === 429);
+    let bodyText = '';
+    if (inspectGoogleError) {
+      bodyText = await readBoundedResponseText(response, DOWNLOAD_ERROR_BODY_MAX_BYTES, {
+        signal: cacheExecutionSignal(),
+        deadlineMs: Number.isFinite(recoveryDeadlineMs)
+          ? recoveryDeadlineMs
+          : monotonicNowMs() + DOWNLOAD_ERROR_BODY_MAX_MS,
+      });
+      if (didClientAbort()) {
+        return { recoverable: false, google, quota: false, clientAborted: true, reason: 'client_aborted' };
+      }
+      if (cacheExecutionSignal()?.aborted && isRecoveryBudgetExpired()) {
+        return { recoverable: false, google, quota: false, budgetExpired: true, reason: 'recovery_deadline_exhausted' };
+      }
     }
-    const currentOrigin = new URL(originalRequest.url).origin;
-    let requestHostname = extractHostname(request?.url || '')?.toLowerCase() || null;
-    const initialReportResponse = await reportFetchedUpstreamResponseIfNeeded(
-      response,
-      requestHostname,
-      request.url,
-      attempt,
-      { skipProtectedError: !retriedWithFreshLink && shouldRetryAuthError(response.status) },
-    );
-    if (initialReportResponse) {
-      return await cancelResponseBodyAndReturn(response, initialReportResponse, 'prestream_terminal');
+
+    const quota = inspectGoogleError && hasValidatedGoogleQuotaReason(bodyText);
+    const recoverable = google
+      ? status === 401 || status === 403 || status === 410 || status === 429 || (status >= 500 && status <= 599)
+      : status === 401 || status === 410;
+    return {
+      recoverable,
+      google,
+      quota,
+      status,
+      reason: quota ? 'downloadQuota' : `upstream_http_${status}`,
+    };
+  };
+
+  const validateGoogleDriveResponseRange = (response, requestToValidate) => {
+    if (!response || !isGoogleTransportAttempt(currentAttempt)) {
+      return null;
     }
-    while (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("Location");
-      if (location) {
-        const resolvedLocation = resolveRedirectLocation(location, request.url);
-        logEvent('info', 'Upstream', 'redirect_follow', {
-          status: response.status,
-          host: requestHostname,
-        });
-        if (new URL(resolvedLocation).origin === currentOrigin) {
-          logEvent('info', 'Upstream', 'redirect_internal_return', {
-            status: response.status,
-            host: requestHostname,
-          });
-          const recursiveRedirectResponse = await retireAdmissionBeforeRecursiveWorkerRedirect('recursive redirect');
-          if (recursiveRedirectResponse) {
-            return terminal(recursiveRedirectResponse, 'redirect_internal_return', { host: requestHostname });
-          }
-          request = new Request(resolvedLocation, request);
-          return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
-        } else {
-          const targetPrepareResponse = await prepareTargetForFetch(resolvedLocation, 'redirect');
-          if (targetPrepareResponse) {
-            return targetPrepareResponse;
-          }
-          request = await maybeApplyGoogleDriveFullDownloadTranslation(new Request(resolvedLocation, request));
-          ({ blockedResponse, response, attempt } = await fetchUpstreamWithBreakerAttempt(request));
-          if (blockedResponse) {
-            return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
-          }
-          requestHostname = extractHostname(request?.url || '')?.toLowerCase() || null;
-          const redirectedReportResponse = await reportFetchedUpstreamResponseIfNeeded(
-            response,
-            requestHostname,
-            request.url,
-            attempt,
-            { skipProtectedError: !retriedWithFreshLink && shouldRetryAuthError(response.status) },
-          );
-          if (redirectedReportResponse) {
-            return await cancelResponseBodyAndReturn(response, redirectedReportResponse, 'prestream_terminal');
-          }
+    const status = response.status;
+    if (status !== 200 && status !== 206) {
+      return 'google_drive_content_invalid';
+    }
+    const knownSize = readKnownGoogleDriveDownloadSize();
+    if (originalRequest.method === 'HEAD') {
+      const contentLength = parseContentLengthHeader(response.headers.get('content-length'));
+      if (
+        knownSize === 0
+        && requestToValidate.method === 'HEAD'
+        && status === 200
+        && !response.body
+        && (contentLength === null || contentLength === 0)
+      ) {
+        return null;
+      }
+      if (
+        requestToValidate.method === 'GET'
+        && requestToValidate.headers.get('range') === GOOGLE_DRIVE_HEAD_PROBE_RANGE
+        && status === 206
+        && response.body
+        && isExactGoogleDriveRequestedRange(
+          GOOGLE_DRIVE_HEAD_PROBE_RANGE,
+          response.headers.get('content-range'),
+          knownSize,
+        )
+        && (parseContentLengthHeader(response.headers.get('content-length')) === null
+          || parseContentLengthHeader(response.headers.get('content-length')) === 1)
+      ) {
+        return null;
+      }
+      return 'google_drive_probe_invalid';
+    }
+
+    const clientRange = originalRequest.headers.get('range');
+    const requestRange = requestToValidate.headers.get('range');
+    const requestedRange = clientRange || requestRange;
+    const conditionalFullResponse = originalRequest.method === 'GET'
+      && Boolean(clientRange)
+      && originalRequest.headers.has('if-range')
+      && status === 200
+      && knownSize !== null
+      && response.body
+      && parseContentLengthHeader(response.headers.get('content-length')) === knownSize;
+    const syntheticFullRange = !clientRange
+      && status === 200
+      && requestRange
+      && knownSize !== null
+      && isExactGoogleDriveFullRangeMatch(
+        requestRange,
+        `bytes 0-${knownSize - 1}/${knownSize}`,
+      );
+    if (requestedRange) {
+      if (conditionalFullResponse) {
+        return null;
+      }
+      if (status === 206 && isExactGoogleDriveRequestedRange(requestedRange, response.headers.get('content-range'), knownSize)) {
+        const content = parseByteContentRange(response.headers.get('content-range'));
+        const contentLength = parseContentLengthHeader(response.headers.get('content-length'));
+        if (response.body && content && (contentLength === null || contentLength === content.end - content.start + 1)) {
+          return null;
         }
-      } else {
+      }
+      if (syntheticFullRange) {
+        const contentLength = parseContentLengthHeader(response.headers.get('content-length'));
+        if (response.body && contentLength === knownSize) {
+          return null;
+        }
+        return contentLength !== null ? 'google_drive_size_mismatch' : 'google_drive_content_invalid';
+      }
+      return 'google_drive_range_mismatch';
+    }
+
+    if (status === 206) {
+      return 'google_drive_range_mismatch';
+    }
+
+    const contentLength = parseContentLengthHeader(response.headers.get('content-length'));
+    if (knownSize !== null && contentLength !== null && contentLength !== knownSize) {
+      return 'google_drive_size_mismatch';
+    }
+    if (knownSize === 0 && contentLength !== null && contentLength !== 0) {
+      return 'google_drive_size_mismatch';
+    }
+    if (!response.body && knownSize !== 0) {
+      return 'google_drive_content_invalid';
+    }
+    return null;
+  };
+
+  const reportAuthorization = async (attempt, outcome, statusCode, reason) => {
+    const feedback = buildAuthorizationFeedback(attempt, outcome, statusCode, reason);
+    if (!feedback) {
+      return false;
+    }
+
+    const now = monotonicNowMs();
+    const deadlineCandidates = [now + DOWNLOAD_REPORT_MAX_MS];
+    if (Number.isFinite(cacheRefreshLeaseDeadlineMs)) {
+      deadlineCandidates.push(cacheRefreshLeaseDeadlineMs);
+    }
+    if (Number.isFinite(hardExpireAtMs)) {
+      deadlineCandidates.push(now + Math.max(0, hardExpireAtMs - Date.now()));
+    }
+    const linkExpiresAt = Number(attempt?.linkData?.download?.expires_at);
+    if (Number.isFinite(linkExpiresAt) && linkExpiresAt > 0) {
+      deadlineCandidates.push(now + Math.max(0, linkExpiresAt * 1000 - Date.now()));
+    }
+    const deadlineMs = Math.min(...deadlineCandidates);
+    if (deadlineMs <= now) {
+      logEvent('warn', 'AList', 'download_report_exhausted', {
+        outcome,
+        status: statusCode,
+        reason: 'deadline_elapsed',
+      });
+      return false;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(1, deadlineMs - now));
+    const waitForReportDelay = (delayMs) => new Promise((resolve) => {
+      const delay = Math.max(0, Math.min(delayMs, Math.max(0, deadlineMs - monotonicNowMs())));
+      if (delay <= 0) {
+        resolve();
+        return;
+      }
+      let timer;
+      const abort = () => {
+        if (timer) {
+          clearTimeout(timer);
+        }
+        controller.signal.removeEventListener('abort', abort);
+        resolve();
+      };
+      timer = setTimeout(abort, delay);
+      controller.signal.addEventListener('abort', abort, { once: true });
+      if (controller.signal.aborted) {
+        abort();
+      }
+    });
+
+    try {
+      for (let index = 0; index < DOWNLOAD_REPORT_RETRY_DELAYS_MS.length; index += 1) {
+        if (controller.signal.aborted || monotonicNowMs() >= deadlineMs) {
+          break;
+        }
+        if (index > 0) {
+          await waitForReportDelay(DOWNLOAD_REPORT_RETRY_DELAYS_MS[index]);
+        }
+        if (controller.signal.aborted || monotonicNowMs() >= deadlineMs) {
+          break;
+        }
+        const result = await fetchLinkDataFromApi({
+          action: 'report',
+          feedback,
+          signal: controller.signal,
+        });
+        if (result.reportResult) {
+          return true;
+        }
+        if (result.retryable !== true) {
+          break;
+        }
+      }
+    } catch (error) {
+      if (!isAbortError(error)) {
+        logEvent('warn', 'AList', 'download_report_failed', {
+          outcome,
+          status: statusCode,
+        });
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    logEvent('warn', 'AList', 'download_report_exhausted', {
+      outcome,
+      status: statusCode,
+      reason: 'retry_budget_exhausted',
+    });
+    return false;
+  };
+
+  const scheduleAuthorizationReport = (attempt, outcome, statusCode, reason) => {
+    if (!attempt || attempt.reportScheduled?.has(outcome)) {
+      return null;
+    }
+    if (!attempt.reportScheduled) {
+      attempt.reportScheduled = new Set();
+    }
+    attempt.reportScheduled.add(outcome);
+    const promise = reportAuthorization(attempt, outcome, statusCode, reason);
+    try {
+      const boundPromise = bindWaitUntil(ctx, promise, 'AList', 'download_report', {
+        outcome,
+        status: Number.isInteger(statusCode) ? statusCode : 0,
+      });
+      return ctx && typeof ctx.waitUntil === 'function' ? null : boundPromise;
+    } catch (error) {
+      logEvent('warn', 'AList', 'download_report_bind_failed', {
+        outcome,
+        status: Number.isInteger(statusCode) ? statusCode : 0,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  };
+
+  const currentAttemptList = [];
+  const attemptedTickets = new Set();
+  const duplicateTicketUses = new Set();
+  let recoveryAttemptCount = Number.isSafeInteger(inheritedRecoveryContext?.attemptCount)
+    ? inheritedRecoveryContext.attemptCount
+    : 0;
+  const registerAuthorizationAttempt = (linkData) => {
+    if (!isUsableReadyLink(linkData)) {
+      return null;
+    }
+    const ticket = normalizeStringValue(linkData.download?.ticket);
+    if (!ticket || recoveryAttemptCount >= DOWNLOAD_RECOVERY_MAX_ATTEMPTS) {
+      return null;
+    }
+    if (attemptedTickets.has(ticket)) {
+      const google = normalizeStringValue(linkData.download?.provider).toLowerCase() === 'googledrive';
+      if (google || duplicateTicketUses.has(ticket)) {
+        return null;
+      }
+      duplicateTicketUses.add(ticket);
+    }
+    attemptedTickets.add(ticket);
+    const attempt = {
+      linkData,
+      ticket,
+      reportEventIds: new Map(),
+      reportScheduled: new Set(),
+    };
+    recoveryAttemptCount += 1;
+    currentAttemptList.push(attempt);
+    return attempt;
+  };
+
+  let currentAttemptRequestHostname = null;
+  const currentOrigin = new URL(originalRequest.url).origin;
+
+  const ensureCacheRefreshForRecovery = async () => {
+    if (cacheRefreshLease) {
+      return { result: 'owner' };
+    }
+    if (!cacheManager || config.cacheEnabled !== true) {
+      return { result: 'unavailable' };
+    }
+
+    const observedVersion = cacheRefreshObservedVersion || null;
+    const acquired = await cacheManager.acquireCacheRefresh(
+      path,
+      observedVersion,
+      cacheRequestConfig(),
+    );
+    if (adoptReadyCacheState(acquired)) {
+      return { result: 'ready', state: acquired };
+    }
+    if (acquired.result === 'backoff') {
+      return { result: 'backoff', state: acquired };
+    }
+    if (acquired.result === 'wait') {
+      const waited = await waitForCacheRefresh(acquired);
+      if (adoptReadyCacheState(waited)) {
+        return { result: 'ready', state: waited };
+      }
+      return { result: waited.result || 'expired', state: waited };
+    }
+    if (acquired.result === 'acquired' && acquired.leaseId) {
+      cacheRefreshLease = {
+        id: acquired.leaseId,
+        failedVersion: acquired.version || observedVersion,
+      };
+      if (!startCacheOwnerDeadline(acquired.leaseRemainingMs)) {
+        cacheRefreshLease = null;
+        return { result: 'expired' };
+      }
+      return { result: 'owner', state: acquired };
+    }
+    throw new Error(`cache refresh returned invalid recovery result: ${acquired.result}`);
+  };
+
+  const releaseAdmissionForRecovery = async (phase) => {
+    const settleResponse = await settleBreakerAttemptIfNeeded(currentAttemptRequestHostname);
+    if (settleResponse instanceof Response) {
+      return settleResponse;
+    }
+    if (cqReleaseController && !cqCleanupBoundToStream) {
+      await ensureCurrentTrueConcurrencyReleased('recovery_retry', true);
+    }
+    if (fqContext) {
+      const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+      if (deferredReportResponse) {
+        return deferredReportResponse;
+      }
+      const previousFairQueueContext = fqContext;
+      fqContext = null;
+      previousFairQueueContext.cleanupRetired = true;
+      const finalized = await finalizeFairQueueContext({
+        fairQueueClient,
+        ctx,
+        fqContext: previousFairQueueContext,
+        phase,
+      });
+      if (!finalized) {
+        pendingFairQueueCleanupContexts.push(previousFairQueueContext);
+      }
+    }
+    return null;
+  };
+
+  const openUpstreamAttempt = async (initialRequest) => {
+    let requestToFetch = initialRequest;
+    let lastAttempt = null;
+    let lastResponse = null;
+    let lastClassification = null;
+    let requestHostname = extractHostname(requestToFetch?.url || '')?.toLowerCase() || null;
+
+    for (let redirectCount = 0; redirectCount <= 10; redirectCount += 1) {
+      const fetched = await fetchUpstreamWithBreakerAttempt(requestToFetch);
+      if (fetched.blockedResponse) {
+        return { blockedResponse: fetched.blockedResponse };
+      }
+      lastAttempt = fetched.attempt;
+      lastResponse = fetched.response;
+      requestHostname = extractHostname(requestToFetch?.url || '')?.toLowerCase() || null;
+      try {
+        lastClassification = await classifyUpstreamResponse(lastResponse, currentAttempt);
+      } catch (error) {
+        currentAttemptRequestHostname = requestHostname;
+        attachDownloadFailureContext(error, {
+          requestHostname,
+          breakerAttempt: lastAttempt,
+          response: lastResponse,
+          phase: 'upstream_classification',
+        });
+        throw error;
+      }
+      if (lastClassification.clientAborted || lastClassification.budgetExpired) {
+        await cancelResponseBody(lastResponse);
+        return {
+          response: lastResponse,
+          request: requestToFetch,
+          requestHostname,
+          attempt: lastAttempt,
+          classification: lastClassification,
+        };
+      }
+
+      const multipartPassThrough = isMultipartRangeResponse(lastResponse, requestToFetch);
+      const reportResponse = multipartPassThrough
+        || isConditionalNotModifiedResponse(lastResponse)
+        || ((isGoogleTransportAttempt(currentAttempt) || originalRequest.method === 'HEAD')
+          && lastResponse.status >= 200
+          && lastResponse.status < 300)
+        ? null
+        : await reportFetchedUpstreamResponseIfNeeded(
+          lastResponse,
+          requestHostname,
+          requestToFetch.url,
+          lastAttempt,
+          {
+            skipProtectedError: lastClassification.quota === true,
+            skipAuthRefreshStatus: lastClassification.google !== true
+              && (lastResponse.status === 401 || lastResponse.status === 410),
+          },
+        );
+      if (reportResponse) {
+        return {
+          response: lastResponse,
+          request: requestToFetch,
+          requestHostname,
+          attempt: lastAttempt,
+          classification: lastClassification,
+          terminalResponse: await cancelResponseBodyAndReturn(lastResponse, reportResponse, 'prestream_terminal'),
+          multipartPassThrough: false,
+        };
+      }
+
+      if (lastResponse.status < 300 || lastResponse.status >= 400) {
         break;
       }
+      const location = lastResponse.headers.get('Location');
+      if (!location) {
+        break;
+      }
+      await cancelResponseBody(lastResponse);
+      const resolvedLocation = resolveRedirectLocation(location, requestToFetch.url);
+      logEvent('info', 'Upstream', 'redirect_follow', {
+        status: lastResponse.status,
+        host: requestHostname,
+      });
+      if (new URL(resolvedLocation).origin === currentOrigin) {
+        logEvent('info', 'Upstream', 'redirect_internal_return', {
+          status: lastResponse.status,
+          host: requestHostname,
+        });
+        const recursiveRedirectResult = await retireAdmissionBeforeRecursiveWorkerRedirect('recursive redirect');
+        if (recursiveRedirectResult?.response) {
+          return {
+            terminalResponse: terminal(recursiveRedirectResult.response, 'redirect_internal_return', { host: requestHostname }),
+            terminalCause: recursiveRedirectResult.cause,
+          };
+        }
+        // Restart the Worker request with the browser's original headers. The
+        // current upstream request may carry a synthetic Google range that is
+        // internal to this attempt and must not become the next request's
+        // client range.
+        const recursiveRequest = new Request(resolvedLocation, originalRequest);
+        return { recursiveRequest, multipartPassThrough: false };
+      }
+
+      const targetPrepareResponse = await prepareTargetForFetch(resolvedLocation, 'redirect');
+      if (targetPrepareResponse) {
+        return { terminalResponse: targetPrepareResponse };
+      }
+      requestToFetch = await maybeApplyGoogleDriveFullDownloadTranslation(
+        buildUpstreamRequest(resolvedLocation, currentAttempt?.linkData?.header, requestToFetch),
+      );
     }
 
-    if (!retriedWithFreshLink && shouldRetryAuthError(response.status)) {
-      if (needTrueConcurrency && !needFairQueue) {
-        const settleResponse = await settleBreakerOnlyAttemptIfNeeded(extractHostname(request?.url || '')?.toLowerCase() || null);
-        if (settleResponse instanceof Response) {
-          return await cancelResponseBodyAndReturn(response, settleResponse, 'prestream_terminal');
+    return {
+      response: lastResponse,
+      request: requestToFetch,
+      requestHostname,
+      attempt: lastAttempt,
+      classification: lastClassification,
+      multipartPassThrough: isMultipartRangeResponse(lastResponse, requestToFetch),
+    };
+  };
+
+  const shouldScheduleFailureReport = (attempt) => Boolean(
+    attempt
+    && (
+      attempt.linkData?.download?.report_success === true
+      || isGoogleRecoveryAttempt(attempt)
+      || cacheRefreshLease
+    )
+  );
+
+  const shouldScheduleNeutralReport = (attempt) => Boolean(
+    attempt
+    && (
+      attempt.linkData?.download?.report_success === true
+      || cacheRefreshLease
+    )
+  );
+
+  const settleNeutralContentBookkeeping = async (requestHostname) => {
+    // A bodyless or multipart response is terminal for authorization
+    // bookkeeping even when its HTTP status is usable. The opening signal has
+    // already been retired, so settlement receives the bounded terminal
+    // cleanup signal.
+    beginTerminalCleanupPhase();
+    return settleBreakerAttemptIfNeeded(requestHostname);
+  };
+
+  const scheduleNeutralAuthorizationReport = async () => {
+    if (!shouldScheduleNeutralReport(currentAttempt)) {
+      return;
+    }
+    const reportPromise = scheduleAuthorizationReport(currentAttempt, 'abandoned', 0, 'download_abandoned');
+    if (reportPromise) {
+      await reportPromise;
+    }
+  };
+
+  const finishCacheFailureForResponse = async (statusCode) => {
+    if (!cacheRefreshLease || cacheRefreshFinished) {
+      return cacheFailureRetryAfterSeconds;
+    }
+    const result = await finishCacheRefresh({
+      errorCode: Number.isInteger(statusCode) ? statusCode : 500,
+    });
+    clearCacheOwnerDeadline();
+    return Math.max(cacheFailureRetryAfterSeconds || 0, result?.retryAfterSeconds || 0) || null;
+  };
+
+  const mergeRetryAfterIntoResponse = async (responseToMerge, cacheRetryAfter) => {
+    if (!responseToMerge) {
+      return responseToMerge;
+    }
+    const generated = generatedErrorResponses.get(responseToMerge);
+    const existingValues = [
+      normalizeRetryAfter(generated?.retryAfter),
+      normalizeRetryAfter(responseToMerge.headers?.get?.('Retry-After')),
+    ].filter(Boolean).map((value) => Number(value));
+    const cacheValue = Number(normalizeRetryAfter(cacheRetryAfter));
+    const retryAfter = Math.max(
+      ...existingValues,
+      Number.isFinite(cacheValue) ? cacheValue : 0,
+    );
+    if (!Number.isFinite(retryAfter) || retryAfter <= 0) {
+      return responseToMerge;
+    }
+    const retryAfterValue = String(Math.trunc(retryAfter));
+
+    if (generated) {
+      const updated = createJsonErrorResponse({
+        status: responseToMerge.status,
+        message: generated.message,
+        reason: generated.reason || 'unclassified',
+        headers: responseToMerge.headers,
+        upstreamStatus: generated.upstreamStatus,
+        retryAfter: retryAfterValue,
+      });
+      return rememberGeneratedError(updated, {
+        ...generated,
+        retryAfter: retryAfterValue,
+      });
+    }
+
+    try {
+      responseToMerge.headers.set('Retry-After', retryAfterValue);
+    } catch (_error) {
+      // The response may expose immutable headers; its existing retry metadata remains authoritative.
+    }
+    return responseToMerge;
+  };
+
+  const readResponseRetryAfter = (responseToRead) => {
+    const generated = generatedErrorResponses.get(responseToRead);
+    const values = [
+      normalizeRetryAfter(generated?.retryAfter),
+      normalizeRetryAfter(responseToRead?.headers?.get?.('Retry-After')),
+    ].filter(Boolean).map((value) => Number(value));
+    const retryAfter = Math.max(...values, 0);
+    return retryAfter > 0 ? String(Math.trunc(retryAfter)) : undefined;
+  };
+
+  finalizePostIssuanceExit = async ({
+    response: responseToReturn = null,
+    failedResponse = null,
+    requestHostname = null,
+    breakerAttempt = null,
+    classification = null,
+    cause = {},
+  } = {}) => {
+    const attempt = currentAttempt;
+    const upstreamStatus = Number.isInteger(failedResponse?.status) ? failedResponse.status : 0;
+    const isClientAbort = cause.kind === 'client_aborted';
+    const isBudgetExpired = cause.kind === 'execution_expired';
+    const failureReason = classification?.reason || `upstream_http_${upstreamStatus}`;
+    const outcome = cause.outcome || (isClientAbort ? 'abandoned' : 'failure');
+    const statusCode = Number.isInteger(cause.statusCode)
+      ? cause.statusCode
+      : failedResponse && !isClientAbort && !isBudgetExpired
+        ? upstreamStatus
+        : 0;
+    const reason = cause.reason
+      || (isClientAbort ? 'client_aborted' : isBudgetExpired ? 'recovery_deadline_exhausted' : failureReason);
+    const cleanupReason = cause.cleanupReason || reason;
+    const reportPromiseNeeded = shouldScheduleFailureReport(attempt);
+    const cacheStatusCode = Number.isInteger(cause.cacheStatusCode)
+      ? cause.cacheStatusCode
+      : statusCode;
+
+    const cacheRetryAfter = cacheRefreshLease
+      ? await finishCacheFailureForResponse(cacheStatusCode || 500)
+      : null;
+    beginTerminalCleanupPhase();
+    let terminalSettlementResponse = null;
+
+    if (!failedResponse && requestHostname) {
+      const settlement = await settleBreakerAttemptIfNeeded(requestHostname);
+      if (settlement instanceof Response) {
+        terminalSettlementResponse = settlement;
+      }
+    }
+
+    if (failedResponse) {
+      if (isClientAbort || isBudgetExpired) {
+        await cancelResponseBody(failedResponse);
+      }
+
+      if (!isClientAbort && !isBudgetExpired) {
+        const upstreamRetryAfter = normalizeRetryAfter(failedResponse.headers?.get?.('Retry-After'));
+        const combinedRetryAfter = Math.max(
+          Number(cacheRetryAfter) || 0,
+          Number(upstreamRetryAfter) || 0,
+        ) || null;
+        const terminalUpstreamResponse = await finalizeUpstreamTerminalResponseIfNeeded(
+          failedResponse,
+          requestHostname,
+          breakerAttempt || null,
+          {
+            reasonOverride: cause.exhausted ? 'upstream_auth_retry_exhausted' : undefined,
+            skipBreakerSample: classification?.quota === true,
+            retryAfterOverride: combinedRetryAfter ? String(combinedRetryAfter) : undefined,
+          },
+        );
+        if (terminalUpstreamResponse) {
+          const mergedTerminalResponse = await mergeRetryAfterIntoResponse(terminalUpstreamResponse, cacheRetryAfter);
+          const reportPromise = reportPromiseNeeded
+            ? scheduleAuthorizationReport(attempt, 'failure', upstreamStatus, failureReason)
+            : null;
+          if (reportPromise) {
+            await reportPromise;
+          }
+          return terminal(mergedTerminalResponse, reason, {
+            retryAfter: readResponseRetryAfter(mergedTerminalResponse),
+          });
         }
       }
-      retriedWithFreshLink = true;
-      logEvent('warn', 'Upstream', 'auth_retry_start', { status: response.status });
-      const refreshType =
-        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-          ? crypto.randomUUID()
-          : `refresh-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      const { res: refreshedLink, errorResponse } = await fetchLinkDataFromApi({
-        forceRefresh: true,
-        linkType: refreshType,
+
+      responseToReturn = responseToReturn || (isClientAbort
+        ? createClientAbortResponse(origin)
+        : isBudgetExpired
+          ? createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1)
+          : createErrorResponse(origin, 502, 'The download service rejected the request'));
+    }
+
+    if (!responseToReturn && terminalSettlementResponse) {
+      responseToReturn = terminalSettlementResponse;
+    }
+
+    if (!responseToReturn) {
+      responseToReturn = isClientAbort
+        ? createClientAbortResponse(origin)
+        : isBudgetExpired
+          ? createCacheCoordinatorUnavailableResponse(origin, 'Download recovery timed out', 1)
+          : cacheRetryAfter
+            ? createCacheCoordinatorUnavailableResponse(origin, 'This download is temporarily unavailable, please retry later', cacheRetryAfter)
+            : createErrorResponse(origin, 503, 'Download service is temporarily unavailable');
+    }
+
+    const mergedResponse = await mergeRetryAfterIntoResponse(responseToReturn, cacheRetryAfter);
+    const releasedResponse = await releaseAdmissionBeforeTerminalResponse(
+      terminal(mergedResponse, reason, {
+        retryAfter: readResponseRetryAfter(mergedResponse),
+      }),
+      cleanupReason,
+    );
+    const reportPromise = reportPromiseNeeded
+      ? scheduleAuthorizationReport(attempt, outcome, statusCode, cause.reportReason || reason)
+      : null;
+    if (reportPromise) {
+      await reportPromise;
+    }
+    return releasedResponse;
+  };
+
+  const finalizeRecoveryFailure = async ({
+    response: failedResponse,
+    requestHostname,
+    breakerAttempt = null,
+    classification,
+    exhausted = false,
+    budgetExpired = false,
+    clientAborted = false,
+  }) => finalizePostIssuanceExit({
+    failedResponse,
+    requestHostname,
+    breakerAttempt,
+    classification,
+    cause: {
+      kind: clientAborted ? 'client_aborted' : budgetExpired ? 'execution_expired' : 'upstream_failure',
+      outcome: clientAborted ? 'abandoned' : 'failure',
+      statusCode: clientAborted || budgetExpired ? 0 : failedResponse?.status,
+      reason: clientAborted ? 'client_aborted' : budgetExpired ? 'recovery_deadline_exhausted' : classification?.reason,
+      reportReason: clientAborted ? 'download_abandoned' : budgetExpired ? 'recovery_deadline_exhausted' : classification?.reason,
+      exhausted,
+    },
+  });
+
+  const rejectMissingGoogleSize = async (attempt) => {
+    if (!attempt || !isGoogleTransportAttempt(attempt) || readKnownGoogleDriveDownloadSize() !== null) {
+      return null;
+    }
+    return finalizePostIssuanceExit({
+      response: createCacheCoordinatorUnavailableResponse(origin, 'Download size is unavailable'),
+      cause: {
+        kind: 'content_qualification',
+        outcome: 'failure',
+        statusCode: 503,
+        reason: 'google_drive_size_missing',
+        reportReason: 'google_drive_size_missing',
+      },
+    });
+  };
+
+  const buildReturnedTerminalCause = ({
+    response: responseToInspect = null,
+    outcome = 'failure',
+    statusCode = 0,
+    reason = 'upstream_terminal',
+  } = {}) => {
+    const generated = responseToInspect ? generatedErrorResponses.get(responseToInspect) : null;
+    const effectiveReason = generated?.reason || reason;
+    if (effectiveReason === 'client_aborted') {
+      return {
+        kind: 'client_aborted',
+        outcome: 'abandoned',
+        statusCode: 0,
+        reason: 'client_aborted',
+        reportReason: 'download_abandoned',
+      };
+    }
+    if (effectiveReason === 'recovery_deadline_exhausted' || effectiveReason === 'cq_wait_budget_exhausted') {
+      return {
+        kind: 'execution_expired',
+        outcome: 'failure',
+        statusCode: 0,
+        reason: 'recovery_deadline_exhausted',
+        reportReason: 'recovery_deadline_exhausted',
+      };
+    }
+    if (
+      effectiveReason === 'breaker_authority_unavailable'
+      || effectiveReason === 'breaker_settle_failed'
+      || effectiveReason === 'breaker_sample_report_failed'
+      || effectiveReason === 'deferred_report_failed'
+      || effectiveReason === 'alist_api_unavailable'
+      || effectiveReason === 'cache_coordinator_unavailable'
+      || effectiveReason === 'cache_refresh_expired'
+      || effectiveReason === 'cq_unavailable'
+      || effectiveReason === 'cq_acquire_failed'
+      || effectiveReason === 'cq_claim_failed'
+      || effectiveReason === 'cq_ack_failed'
+      || effectiveReason === 'cq_heartbeat_failed'
+      || effectiveReason === 'fq_unavailable'
+    ) {
+      return {
+        kind: 'authority_failure',
+        outcome: 'failure',
+        statusCode: 0,
+        reason: effectiveReason,
+        reportReason: effectiveReason,
+      };
+    }
+    if (effectiveReason === 'prestream_terminal' || effectiveReason === 'cq_terminal') {
+      return {
+        kind: 'handoff_failure',
+        outcome: 'abandoned',
+        statusCode: 0,
+        reason: effectiveReason,
+        reportReason: 'download_abandoned',
+      };
+    }
+    return {
+      kind: 'admission',
+      outcome,
+      statusCode: outcome === 'abandoned' ? 0 : statusCode,
+      cacheStatusCode: statusCode || 503,
+      reason: effectiveReason,
+      reportReason: effectiveReason,
+    };
+  };
+
+  const finalizeOwnedTerminalExit = async ({
+    response: responseToReturn = null,
+    outcome = 'failure',
+    statusCode = 0,
+    reason = 'upstream_terminal',
+    requestHostname = null,
+    breakerAttempt = null,
+    cause = null,
+  } = {}) => finalizePostIssuanceExit({
+    response: responseToReturn,
+    requestHostname,
+    breakerAttempt,
+    cause: cause || buildReturnedTerminalCause({
+      response: responseToReturn,
+      outcome,
+      statusCode,
+      reason,
+    }),
+  });
+
+  finalizeOwnedTerminalExitForCatch = async (error) => {
+    if (!currentAttempt) {
+      return null;
+    }
+
+    const originFailureContext = error?.[DOWNLOAD_ORIGIN_FAILURE_CONTEXT] || null;
+    const requestHostname = originFailureContext?.requestHostname || currentAttemptRequestHostname || null;
+    const breakerAttempt = originFailureContext?.breakerAttempt || null;
+    const fetchedResponse = originFailureContext?.response || null;
+    const clientAbort = didClientAbort() && isAbortError(error);
+    const budgetExpired = !clientAbort && isRecoveryBudgetExpired() && isAbortError(error);
+    const thrownResponse = error instanceof Response ? error : null;
+    const thrownGenerated = thrownResponse ? generatedErrorResponses.get(thrownResponse) : null;
+    const cause = {
+      kind: clientAbort ? 'client_aborted' : budgetExpired ? 'execution_expired' : 'transport',
+      outcome: clientAbort ? 'abandoned' : 'failure',
+      statusCode: 0,
+      reason: clientAbort
+        ? 'client_aborted'
+        : budgetExpired
+          ? 'recovery_deadline_exhausted'
+        : thrownGenerated?.reason || 'upstream_transport_error',
+      reportReason: clientAbort ? 'download_abandoned' : budgetExpired ? 'recovery_deadline_exhausted' : 'upstream_transport_error',
+    };
+
+    beginTerminalCleanupPhase();
+    let deferredFailureResponse = null;
+    try {
+      deferredFailureResponse = await flushDeferredQueueBreakerReportOnExit();
+    } catch (cleanupError) {
+      logEvent('error', 'Breaker', 'deferred_report_failed', {
+        message: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
       });
-      if (errorResponse) {
-        logEvent('warn', 'Upstream', 'auth_retry_fallback', { reason: 'api_error' });
-        const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
-        if (deferredReportResponse) {
-          return await cancelResponseBodyAndReturn(response, deferredReportResponse, 'upstream_terminal');
-        }
-        return await cancelResponseBodyAndReturn(
-          response,
-          terminal(errorResponse, 'alist_api_unavailable'),
-          'upstream_terminal',
-        );
-      } else if (refreshedLink && refreshedLink.data && refreshedLink.data.url) {
-        downloadUrl = refreshedLink.data.url;
-        res = refreshedLink;
-        const targetPrepareResponse = await prepareTargetForFetch(downloadUrl, 'refresh');
-        if (targetPrepareResponse) {
-          return targetPrepareResponse;
-        }
-        request = await maybeApplyGoogleDriveFullDownloadTranslation(buildUpstreamRequest(downloadUrl, res.data.header));
-        ({ blockedResponse, response, attempt } = await fetchUpstreamWithBreakerAttempt(request));
-        if (blockedResponse) {
-          return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
-        }
-        requestHostname = extractHostname(request?.url || '')?.toLowerCase() || null;
-        const refreshedReportResponse = await reportFetchedUpstreamResponseIfNeeded(
-          response,
-          requestHostname,
-          request.url,
-          attempt,
-        );
-        if (refreshedReportResponse) {
-          return await cancelResponseBodyAndReturn(response, refreshedReportResponse, 'prestream_terminal');
-        }
-        while (response.status >= 300 && response.status < 400) {
-          const location = response.headers.get("Location");
-          if (location) {
-            const resolvedLocation = resolveRedirectLocation(location, request.url);
-            logEvent('info', 'Upstream', 'redirect_follow', {
-              status: response.status,
-              host: requestHostname,
-            });
-            if (new URL(resolvedLocation).origin === currentOrigin) {
-              logEvent('info', 'Upstream', 'redirect_internal_return', {
-                status: response.status,
-                host: requestHostname,
-              });
-              const recursiveRedirectResponse = await retireAdmissionBeforeRecursiveWorkerRedirect('recursive redirect');
-              if (recursiveRedirectResponse) {
-                return terminal(recursiveRedirectResponse, 'redirect_internal_return', { host: requestHostname });
-              }
-              request = new Request(resolvedLocation, request);
-              return await handleRequest(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
-            } else {
-              const redirectPrepareResponse = await prepareTargetForFetch(resolvedLocation, 'redirect');
-              if (redirectPrepareResponse) {
-                return redirectPrepareResponse;
-              }
-              request = await maybeApplyGoogleDriveFullDownloadTranslation(new Request(resolvedLocation, request));
-              ({ blockedResponse, response, attempt } = await fetchUpstreamWithBreakerAttempt(request));
-              if (blockedResponse) {
-                return await releaseAdmissionBeforeTerminalResponse(blockedResponse, 'prestream_terminal');
-              }
-              requestHostname = extractHostname(request?.url || '')?.toLowerCase() || null;
-              const nestedRedirectReportResponse = await reportFetchedUpstreamResponseIfNeeded(
-                response,
-                requestHostname,
-                request.url,
-                attempt,
-              );
-              if (nestedRedirectReportResponse) {
-                return await cancelResponseBodyAndReturn(response, nestedRedirectReportResponse, 'prestream_terminal');
-              }
-            }
+      deferredFailureResponse = terminal(createBreakerAuthorityUnavailableResponse(origin, 'sample report'), 'breaker_sample_report_failed', {
+        host: requestHostname || fqContext?.hostname,
+      });
+    }
+
+    if (fetchedResponse) {
+      await cancelResponseBody(fetchedResponse);
+    }
+
+    let sampleSettlementResponse = null;
+    if (
+      breakerAttempt
+      && requestHostname
+      && (originFailureContext.phase === 'breaker_sample' || originFailureContext.phase === 'upstream_classification')
+    ) {
+      const settlement = await settleBreakerAttemptIfNeeded(requestHostname);
+      if (settlement instanceof Response) {
+        sampleSettlementResponse = settlement;
+      }
+    }
+
+    return finalizePostIssuanceExit({
+      response: deferredFailureResponse || sampleSettlementResponse || thrownResponse,
+      requestHostname,
+      breakerAttempt,
+      cause,
+    });
+  };
+
+  currentAttempt = registerAuthorizationAttempt(res.data);
+  if (!currentAttempt) {
+    return terminal(createCacheCoordinatorUnavailableResponse(origin, 'Download authorization is invalid'), 'link_invalid');
+  }
+
+  const missingGoogleSizeResponse = await rejectMissingGoogleSize(currentAttempt);
+  if (missingGoogleSizeResponse) {
+    return missingGoogleSizeResponse;
+  }
+
+  if (deferredUnifiedBreakerResponse) {
+    await slowFailDelay(cacheExecutionSignal());
+    return finalizeOwnedTerminalExit({
+      response: deferredUnifiedBreakerResponse,
+      outcome: 'abandoned',
+      statusCode: deferredUnifiedBreakerResponse.status || 0,
+      reason: 'breaker_open',
+    });
+  }
+
+  // Register the issued authorization before any initial breaker snapshot or
+  // cancellable slow-fail delay so a post-issuance failure can always close
+  // the ticket through the shared finalizer.
+  if (throttleCheckEnabled && admissionMode === 'breaker_only') {
+    throttleHostname = upstreamHostname;
+
+    const unifiedThrottleUsable = Boolean(
+      unifiedResult
+      && unifiedResult.throttle
+      && unifiedThrottleHostnameHash
+      && throttleHostname
+    );
+
+    if (unifiedThrottleUsable) {
+      throttleStatus = unifiedResult.throttle;
+    } else if (throttleHostname && isThrottleManagedHostname(throttleHostname)) {
+      throttleStatus = await readAuthoritySnapshotForHostname(throttleHostname);
+      if (throttleStatus instanceof Response) {
+        initialBreakerTerminalResponse = throttleStatus;
+        initialBreakerTerminalReason = 'breaker_authority_unavailable';
+        initialBreakerTerminalFields = { host: throttleHostname };
+        throttleStatus = null;
+      }
+    }
+
+    if (throttleStatus) {
+      const breakerState = readOpenBreakerSnapshot(throttleStatus, config.throttleConfig?.openCapSeconds || 60);
+      if (breakerState) {
+        await slowFailDelay(cacheExecutionSignal());
+        logEvent('info', 'Breaker', 'open_precheck', {
+          host: throttleHostname,
+          status: breakerState.errorCode,
+          retryAfter: breakerState.retryAfter,
+        });
+        initialBreakerTerminalResponse = terminal(createThrottleProtectedResponse(origin, breakerState), 'breaker_open', {
+          host: throttleHostname,
+          admissionMode,
+        });
+        initialBreakerTerminalReason = 'breaker_open';
+        initialBreakerTerminalFields = {
+          host: throttleHostname,
+          admissionMode,
+        };
+      }
+    }
+  }
+  if (initialBreakerTerminalResponse) {
+    return finalizeOwnedTerminalExit({
+      response: initialBreakerTerminalResponse,
+      outcome: 'abandoned',
+      statusCode: initialBreakerTerminalResponse.status,
+      reason: initialBreakerTerminalReason || 'breaker_open',
+      ...initialBreakerTerminalFields,
+    });
+  }
+  // Proceed with bounded owner-only recovery. Every distinct signed
+  // authorization is registered before it is opened, so a duplicate ticket
+  // cannot turn a failed account into an unbounded retry loop.
+  let requestToFetch = null;
+  let response = null;
+  let attempt = null;
+  let requestHostname = null;
+  let classification = null;
+  while (true) {
+    if (isRecoveryBudgetExpired()) {
+      return await finalizeRecoveryFailure({
+        response,
+        requestHostname,
+        attempt: currentAttempt,
+        breakerAttempt: attempt,
+        classification,
+        budgetExpired: true,
+      });
+    }
+
+    const targetPrepareResponse = await prepareTargetForFetch(
+      downloadUrl,
+      currentAttemptList.length === 1 ? 'initial' : 'recovery',
+      { forceRetire: currentAttemptList.length > 1 && isGoogleRecoveryAttempt(currentAttempt) },
+    );
+    if (targetPrepareResponse) {
+      return await finalizeOwnedTerminalExit({
+        response: targetPrepareResponse,
+        outcome: 'abandoned',
+        statusCode: targetPrepareResponse.status || 0,
+        reason: 'admission_unavailable',
+      });
+    }
+
+    requestToFetch = await maybeApplyGoogleDriveFullDownloadTranslation(
+      buildUpstreamRequest(downloadUrl, res.data.header),
+    );
+    const opened = await openUpstreamAttempt(requestToFetch);
+    if (opened.blockedResponse) {
+      return await finalizeOwnedTerminalExit({
+        response: opened.blockedResponse,
+        outcome: 'abandoned',
+        statusCode: opened.blockedResponse.status || 0,
+        reason: 'admission_blocked',
+      });
+    }
+    if (opened.terminalResponse) {
+      return await finalizeOwnedTerminalExit({
+        response: opened.terminalResponse,
+        outcome: 'abandoned',
+        statusCode: 0,
+        reason: 'admission_terminal',
+        requestHostname: opened.requestHostname,
+        breakerAttempt: opened.attempt,
+        cause: opened.terminalCause,
+      });
+    }
+    if (opened.recursiveRequest) {
+      if (recoveryAttemptCount >= DOWNLOAD_RECOVERY_MAX_ATTEMPTS) {
+        return await finalizePostIssuanceExit({
+          response: createCacheCoordinatorUnavailableResponse(origin, 'Download recovery attempt limit reached'),
+          cause: {
+            kind: 'admission',
+            outcome: 'abandoned',
+            statusCode: 0,
+            reason: 'upstream_auth_retry_exhausted',
+            reportReason: 'recovery_attempt_limit',
+          },
+        });
+      }
+      const previousRecoveryContext = ctx?.[DOWNLOAD_RECOVERY_CONTEXT];
+      if (ctx) {
+        ctx[DOWNLOAD_RECOVERY_CONTEXT] = {
+          deadlineMs: recoveryDeadlineMs,
+          deadlineWallMs: recoveryDeadlineWallMs,
+          hardExpireAtMs: recoveryHardExpireAtMs,
+          attemptCount: recoveryAttemptCount,
+        };
+      }
+      try {
+        return await handleRequest(opened.recursiveRequest, env, config, cacheManager, throttleManager, rateLimiter, ctx);
+      } finally {
+        if (ctx) {
+          if (previousRecoveryContext) {
+            ctx[DOWNLOAD_RECOVERY_CONTEXT] = previousRecoveryContext;
           } else {
-            break;
+            delete ctx[DOWNLOAD_RECOVERY_CONTEXT];
           }
         }
       }
     }
 
-    if (retriedWithFreshLink && shouldRetryAuthError(response.status)) {
-      if (needTrueConcurrency && !needFairQueue && !isProtectedThrottleStatusCode(response.status)) {
-        const settleResponse = await settleBreakerOnlyAttemptIfNeeded(extractHostname(request?.url || '')?.toLowerCase() || null);
-        if (settleResponse instanceof Response) {
-          return await cancelResponseBodyAndReturn(response, settleResponse, 'prestream_terminal');
-        }
-      }
-      if (!isProtectedThrottleStatusCode(response.status)) {
-        const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
-        if (deferredReportResponse) {
-          return await cancelResponseBodyAndReturn(response, deferredReportResponse, 'prestream_terminal');
-        }
-      }
-    }
+    requestToFetch = opened.request;
+    response = opened.response;
+    attempt = opened.attempt;
+    classification = opened.classification || await classifyUpstreamResponse(response, currentAttempt);
+    requestHostname = opened.requestHostname || extractHostname(requestToFetch?.url || '')?.toLowerCase() || null;
+    currentAttemptRequestHostname = requestHostname;
+    const multipartPassThrough = opened.multipartPassThrough === true;
 
-    const deferredTerminalReportResponse = await flushDeferredQueueBreakerReportOnExit(response);
-    if (deferredTerminalReportResponse) {
-      return await cancelResponseBodyAndReturn(response, deferredTerminalReportResponse, 'prestream_terminal');
-    }
-
-    const upstreamTerminalOptions = retriedWithFreshLink && shouldRetryAuthError(response.status)
-      ? { reasonOverride: 'upstream_auth_retry_exhausted' }
-      : undefined;
-    const terminalUpstreamResponse = await finalizeUpstreamTerminalResponseIfNeeded(
-      response,
-      requestHostname,
-      attempt,
-      upstreamTerminalOptions,
-    );
-    if (terminalUpstreamResponse) {
-      return terminalUpstreamResponse;
-    }
-
-    if (response.status !== 200 && response.status !== 206) {
-      logEvent('warn', 'Upstream', 'unexpected_status', {
-        status: response.status,
-        host: requestHostname,
-      });
-    }
-
-    releaseFairQueueAfterHeadersIfNeeded();
-
-    const shouldRewriteHeadProbeResponse = originalRequest.method === 'HEAD'
-      && isGoogleDriveDownloadHostname(extractHostname(request.url)?.toLowerCase() || '')
-      && request.headers.get('range') === GOOGLE_DRIVE_HEAD_PROBE_RANGE
-      && response.status === 206
-      && parseContentRangeTotal(response.headers.get('content-range')) !== null;
-
-    if (shouldRewriteHeadProbeResponse) {
-      return await buildHeadProbeResponse(response, request);
-    }
-
-    const isGoogleDriveSyntheticFullRangeRequest = originalRequest.method === 'GET'
-      && !originalRequest.headers.get('range')
-      && isGoogleDriveDownloadHostname(extractHostname(request.url)?.toLowerCase() || '')
-      && response.status === 206
-      && Boolean(request.headers.get('range'))
-      && request.headers.get('range') !== GOOGLE_DRIVE_HEAD_PROBE_RANGE;
-
-    const shouldRewriteGoogleDriveFullDownloadResponse = isGoogleDriveSyntheticFullRangeRequest
-      && isExactGoogleDriveFullRangeMatch(
-        request.headers.get('range'),
-        response.headers.get('content-range'),
-      );
-
-    const isHeadProbeRequest = originalRequest.method === 'HEAD'
-      && isGoogleDriveDownloadHostname(extractHostname(request.url)?.toLowerCase() || '')
-      && request.headers.get('range') === GOOGLE_DRIVE_HEAD_PROBE_RANGE;
-
-    if (isHeadProbeRequest && !shouldRewriteHeadProbeResponse) {
-      await cancelResponseBody(response);
-      return await releaseAdmissionBeforeTerminalResponse(
-        terminal(createErrorResponse(origin, 502, 'Google Drive HEAD probe invalid'), 'google_drive_probe_invalid', {
-          host: requestHostname,
-        }),
-        'head_probe_invalid',
-      );
-    }
-
-    if (isGoogleDriveSyntheticFullRangeRequest && !shouldRewriteGoogleDriveFullDownloadResponse) {
-      await cancelResponseBody(response);
-      return await releaseAdmissionBeforeTerminalResponse(
-        terminal(createErrorResponse(origin, 502, 'Google Drive range mismatch'), 'google_drive_range_mismatch', {
-          host: requestHostname,
-        }),
-        'google_drive_range_mismatch',
-      );
-    }
-
-    if (shouldRewriteGoogleDriveFullDownloadResponse && !needTrueConcurrency) {
-      return await finalizeContentResponse(
-        terminal(buildGoogleDriveFullDownloadResponse(response, request), 'google_drive_full_range', { host: requestHostname }),
+    if (classification?.clientAborted || didClientAbort()) {
+      return await finalizeRecoveryFailure({
         response,
-      );
-    }
-
-    // Ordinary breaker_only terminal exits must retire before any managed stream
-    // binds concurrency cleanup to the response body.
-    const terminalBreakerOnlyRetirementResponse = await retirePendingBreakerOnlyAttemptIfNeeded();
-    if (terminalBreakerOnlyRetirementResponse) {
-      return await cancelResponseBodyAndReturn(response, terminalBreakerOnlyRetirementResponse, 'prestream_terminal');
-    }
-
-    const safeResponse = needTrueConcurrency
-      ? buildManagedConcurrencyResponse(
-          response,
-        request,
-        shouldRewriteGoogleDriveFullDownloadResponse
-          ? buildGoogleDriveFullDownloadResponseInit(response, request)
-          : null,
-      )
-      : new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: buildSafeResponseHeaders(response, request),
+        requestHostname,
+        attempt: currentAttempt,
+        breakerAttempt: attempt,
+        classification,
+        clientAborted: true,
       });
+    }
+    if (classification?.budgetExpired || (cacheExecutionSignal()?.aborted && isRecoveryBudgetExpired())) {
+      return await finalizeRecoveryFailure({
+        response,
+        requestHostname,
+        attempt: currentAttempt,
+        breakerAttempt: attempt,
+        classification,
+        budgetExpired: true,
+      });
+    }
 
-    return await finalizeContentResponse(
-      terminal(safeResponse, upstreamTerminalReason(safeResponse.status), { host: requestHostname }),
-      response,
+    const googleRangeError = !multipartPassThrough && (response.status >= 200 && response.status < 300)
+      ? validateGoogleDriveResponseRange(response, requestToFetch)
+      : null;
+    if (googleRangeError) {
+      await cancelResponseBody(response);
+      beginTerminalCleanupPhase();
+      disarmDeferredQueueBreakerReport();
+      const noSampleSettlement = await settleBreakerAttemptIfNeeded(requestHostname);
+      const validationResponse = noSampleSettlement instanceof Response
+        ? noSampleSettlement
+        : terminal(createErrorResponse(origin, 502, googleRangeError === 'google_drive_probe_invalid'
+          ? 'Google Drive HEAD probe invalid'
+          : 'Google Drive range mismatch'), googleRangeError, {
+          host: requestHostname,
+        });
+      return await finalizePostIssuanceExit({
+        response: validationResponse,
+        cause: {
+          kind: 'content_qualification',
+          outcome: 'failure',
+          statusCode: noSampleSettlement instanceof Response ? 0 : response.status,
+          cacheStatusCode: 502,
+          reason: noSampleSettlement instanceof Response ? 'breaker_settle_failed' : googleRangeError,
+          cleanupReason: 'origin_fetch_failure',
+          reportReason: noSampleSettlement instanceof Response ? 'breaker_settle_failed' : googleRangeError,
+        },
+      });
+    }
+
+    if (response.status >= 200 && response.status < 300) {
+      const shouldRewriteHeadProbeResponse = originalRequest.method === 'HEAD'
+        && isGoogleTransportAttempt(currentAttempt)
+        && requestToFetch.method === 'GET'
+        && requestToFetch.headers.get('range') === GOOGLE_DRIVE_HEAD_PROBE_RANGE
+        && response.status === 206
+        && isExactGoogleDriveRequestedRange(
+          GOOGLE_DRIVE_HEAD_PROBE_RANGE,
+          response.headers.get('content-range'),
+          readKnownGoogleDriveDownloadSize(),
+        );
+      const isGoogleDriveSyntheticFullRangeRequest = originalRequest.method === 'GET'
+        && !originalRequest.headers.get('range')
+        && isGoogleTransportAttempt(currentAttempt)
+        && response.status === 206
+        && Boolean(requestToFetch.headers.get('range'))
+        && requestToFetch.headers.get('range') !== GOOGLE_DRIVE_HEAD_PROBE_RANGE;
+      const shouldRewriteGoogleDriveFullDownloadResponse = isGoogleDriveSyntheticFullRangeRequest
+        && isExactGoogleDriveFullRangeMatch(
+          requestToFetch.headers.get('range'),
+          response.headers.get('content-range'),
+        );
+
+      if (!multipartPassThrough && isGoogleTransportAttempt(currentAttempt)) {
+        const successReportResponse = await reportFetchedUpstreamResponseIfNeeded(
+          response,
+          requestHostname,
+          requestToFetch.url,
+          attempt,
+        );
+        if (successReportResponse) {
+          await cancelResponseBody(response);
+          return await finalizeOwnedTerminalExit({
+            response: successReportResponse,
+            outcome: 'failure',
+            statusCode: 0,
+            reason: 'breaker_sample_report_failed',
+            requestHostname,
+            breakerAttempt: attempt,
+          });
+        }
+      }
+
+      // Headers have been validated and the response is now open. The
+      // recovery deadline no longer governs handoff or body streaming.
+      if (multipartPassThrough) {
+        // ponytail: multipart/byteranges passes through without per-part parsing; add a parser only if validation is required.
+        clearCacheOwnerDeadline();
+        await finishCacheRefresh({ errorCode: response.status });
+        const neutralSettlementResponse = await settleNeutralContentBookkeeping(requestHostname);
+        if (neutralSettlementResponse instanceof Response) {
+          await cancelResponseBody(response);
+          return await finalizePostIssuanceExit({
+            response: neutralSettlementResponse,
+            cause: {
+              kind: 'content_qualification',
+              outcome: 'failure',
+              statusCode: 0,
+              reason: 'breaker_settle_failed',
+              reportReason: 'breaker_settle_failed',
+            },
+          });
+        }
+      } else {
+        clearRecoveryOpeningDeadline();
+        await publishCacheRefreshAfterHeaders(response);
+      }
+
+      const preHandoffAbortResponse = await guardBeforeContentHandoff(response);
+      if (preHandoffAbortResponse) {
+        if (didClientAbort() && shouldScheduleFailureReport(currentAttempt)) {
+          const abandonedReport = scheduleAuthorizationReport(currentAttempt, 'abandoned', 0, 'download_abandoned');
+          if (abandonedReport) {
+            await abandonedReport;
+          }
+        }
+        return preHandoffAbortResponse;
+      }
+
+      releaseFairQueueAfterHeadersIfNeeded();
+
+      let responseToReturn;
+      if (shouldRewriteHeadProbeResponse) {
+        responseToReturn = await buildHeadProbeResponse(response, requestToFetch);
+      } else if (shouldRewriteGoogleDriveFullDownloadResponse && !needTrueConcurrency) {
+        responseToReturn = terminal(
+          buildGoogleDriveFullDownloadResponse(response, requestToFetch),
+          'google_drive_full_range',
+          { host: requestHostname },
+        );
+      } else {
+        const terminalBreakerOnlyRetirementResponse = await retirePendingBreakerOnlyAttemptIfNeeded();
+        if (terminalBreakerOnlyRetirementResponse) {
+          await cancelResponseBody(response);
+          return await finalizePostIssuanceExit({
+            response: terminalBreakerOnlyRetirementResponse,
+            cause: {
+              kind: 'handoff_failure',
+              outcome: 'abandoned',
+              statusCode: 0,
+              reason: 'prestream_terminal',
+              reportReason: 'prestream_terminal',
+            },
+          });
+        }
+        responseToReturn = needTrueConcurrency
+          ? buildManagedConcurrencyResponse(
+              response,
+              requestToFetch,
+              shouldRewriteGoogleDriveFullDownloadResponse
+                ? buildGoogleDriveFullDownloadResponseInit(response, requestToFetch)
+                : null,
+            )
+          : new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: buildSafeResponseHeaders(response, requestToFetch),
+          });
+        responseToReturn = terminal(responseToReturn, upstreamTerminalReason(responseToReturn.status), {
+          host: requestHostname,
+        });
+      }
+
+      const finalizedResponse = await finalizeContentResponse(responseToReturn, response);
+      const successEligible = !multipartPassThrough && (shouldRewriteHeadProbeResponse
+        || (originalRequest.method === 'GET' && shouldConsumeTicketResponse({
+          requestMethod: originalRequest.method,
+          response: responseToReturn,
+          upstreamResponse: response,
+          knownFileSize: readKnownGoogleDriveDownloadSize(),
+          syntheticContentDisposition: payloadData?.isCrypted === true,
+        }))
+        || (originalRequest.method === 'GET'
+          && readKnownGoogleDriveDownloadSize() === 0
+          && finalizedResponse.status === 200));
+      if (
+        successEligible
+        && currentAttempt.linkData?.download?.report_success === true
+        && finalizedResponse.status >= 200
+        && finalizedResponse.status < 300
+      ) {
+        const successReportPromise = scheduleAuthorizationReport(
+          currentAttempt,
+          'success',
+          finalizedResponse.status,
+          'download_success',
+        );
+        if (successReportPromise) {
+          await successReportPromise;
+        }
+      }
+      if (multipartPassThrough) {
+        await scheduleNeutralAuthorizationReport();
+      }
+      return finalizedResponse;
+    }
+
+    if (isConditionalNotModifiedResponse(response)) {
+      await cancelResponseBody(response);
+      clearCacheOwnerDeadline();
+      await finishCacheRefresh({ errorCode: response.status });
+      const neutralSettlementResponse = await settleNeutralContentBookkeeping(requestHostname);
+      if (neutralSettlementResponse instanceof Response) {
+        return await finalizePostIssuanceExit({
+          response: neutralSettlementResponse,
+          cause: {
+            kind: 'content_qualification',
+            outcome: 'failure',
+            statusCode: 0,
+            reason: 'breaker_settle_failed',
+            reportReason: 'breaker_settle_failed',
+          },
+        });
+      }
+      const conditionalHeaders = buildSafeResponseHeaders(response, requestToFetch);
+      conditionalHeaders.delete('content-length');
+      const conditionalResponse = await releaseAdmissionBeforeTerminalResponse(
+        new Response(null, {
+          status: 304,
+          statusText: response.statusText,
+          headers: conditionalHeaders,
+        }),
+        'conditional_not_modified',
+      );
+      await scheduleNeutralAuthorizationReport();
+      return conditionalResponse;
+    }
+
+    if (!classification?.recoverable) {
+      await cancelResponseBody(response);
+      const deferredTerminalReportResponse = await flushDeferredQueueBreakerReportOnExit(response);
+      if (deferredTerminalReportResponse) {
+        return await finalizeOwnedTerminalExit({
+          response: deferredTerminalReportResponse,
+          statusCode: deferredTerminalReportResponse.status || 0,
+          reason: 'deferred_report_failed',
+        });
+      }
+      return await finalizeRecoveryFailure({
+        response,
+        requestHostname,
+        attempt: currentAttempt,
+        breakerAttempt: attempt,
+        classification,
+      });
+    }
+
+    await cancelResponseBody(response);
+    const repeatedGenericTicket = currentAttemptList.length > 1
+      && currentAttempt.ticket === currentAttemptList[currentAttemptList.length - 2]?.ticket
+      && duplicateTicketUses.has(currentAttempt.ticket);
+    if (recoveryAttemptCount >= DOWNLOAD_RECOVERY_MAX_ATTEMPTS || repeatedGenericTicket || isRecoveryBudgetExpired()) {
+      const deferredTerminalReportResponse = await flushDeferredQueueBreakerReportOnExit(response);
+      if (deferredTerminalReportResponse) {
+        await cancelResponseBody(response);
+        return await finalizeOwnedTerminalExit({
+          response: deferredTerminalReportResponse,
+          statusCode: deferredTerminalReportResponse.status || 0,
+          reason: 'deferred_report_failed',
+        });
+      }
+      return await finalizeRecoveryFailure({
+        response,
+        requestHostname,
+        attempt: currentAttempt,
+        breakerAttempt: attempt,
+        classification,
+        exhausted: repeatedGenericTicket || recoveryAttemptCount >= DOWNLOAD_RECOVERY_MAX_ATTEMPTS,
+        budgetExpired: isRecoveryBudgetExpired(),
+      });
+    }
+
+    if ((needTrueConcurrency && !needFairQueue) || isGoogleRecoveryAttempt(currentAttempt)) {
+      const settleResponse = await settleBreakerAttemptIfNeeded(requestHostname);
+      if (settleResponse instanceof Response) {
+        return await finalizePostIssuanceExit({
+          response: settleResponse,
+          cause: {
+            kind: 'admission',
+            outcome: 'abandoned',
+            statusCode: 0,
+            reason: 'prestream_terminal',
+            reportReason: 'prestream_terminal',
+          },
+        });
+      }
+    }
+
+    // A cached failure must first win the shared refresh lease. Followers
+    // release admission and observe that lease; only its owner sends the
+    // synchronous failure-plus-replacement request to OpenList.
+    if (!cacheRefreshLease) {
+      const releaseResponse = await releaseAdmissionForRecovery('recovery_cache_acquire');
+      if (releaseResponse) {
+        return await finalizePostIssuanceExit({
+          response: releaseResponse,
+          cause: {
+            kind: 'admission',
+            outcome: 'abandoned',
+            statusCode: 0,
+            reason: 'admission_unavailable',
+            reportReason: 'admission_unavailable',
+          },
+        });
+      }
+    }
+
+    const refreshState = await ensureCacheRefreshForRecovery();
+    if (refreshState.result === 'backoff') {
+      const retryAfter = Math.max(1, refreshState.state?.retryAfterSeconds || 1);
+      return await finalizeOwnedTerminalExit({
+        response: createCacheCoordinatorUnavailableResponse(
+          origin,
+          'This download is temporarily unavailable, please retry later',
+          retryAfter,
+        ),
+        statusCode: 503,
+        reason: 'cache_backoff',
+      });
+    }
+    if (refreshState.result === 'expired' || refreshState.result === 'unavailable') {
+      return await finalizeOwnedTerminalExit({
+        response: createCacheCoordinatorUnavailableResponse(origin),
+        statusCode: 503,
+        reason: 'cache_refresh_expired',
+      });
+    }
+    if (refreshState.result === 'ready') {
+      downloadUrl = linkData.url;
+      res = { code: 200, data: linkData };
+      const readyAttempt = registerAuthorizationAttempt(linkData);
+      if (!readyAttempt) {
+        return await finalizeRecoveryFailure({
+          response,
+          requestHostname,
+          attempt: currentAttempt,
+          classification,
+          exhausted: recoveryAttemptCount > 1,
+        });
+      }
+      currentAttempt = readyAttempt;
+      const missingReadyGoogleSizeResponse = await rejectMissingGoogleSize(currentAttempt);
+      if (missingReadyGoogleSizeResponse) {
+        return missingReadyGoogleSizeResponse;
+      }
+      continue;
+    }
+
+    const feedback = buildAuthorizationFeedback(
+      currentAttempt,
+      'failure',
+      response.status,
+      classification.reason,
     );
+    const replacementResult = await fetchLinkDataFromApi({
+      feedback,
+      exclude: [...attemptedTickets],
+    });
+    if (replacementResult.errorResponse) {
+      logEvent('warn', 'Upstream', 'auth_retry_fallback', { reason: 'api_error' });
+      const deferredReportResponse = await flushDeferredQueueBreakerReportOnExit();
+      if (deferredReportResponse) {
+        return await finalizePostIssuanceExit({
+          response: deferredReportResponse,
+          cause: {
+            kind: 'report_failure',
+            outcome: 'failure',
+            statusCode: 0,
+            reason: 'deferred_report_failed',
+            reportReason: 'upstream_terminal',
+          },
+        });
+      }
+      return await finalizePostIssuanceExit({
+        response: replacementResult.errorResponse,
+        cause: {
+          kind: 'upstream_failure',
+          outcome: 'failure',
+          statusCode: response.status,
+          cacheStatusCode: response.status,
+          reason: 'alist_api_unavailable',
+          reportReason: classification.reason,
+        },
+      });
+    }
+
+    if (!replacementResult.res?.data) {
+      return await finalizeRecoveryFailure({
+        response,
+        requestHostname,
+        attempt: currentAttempt,
+        breakerAttempt: attempt,
+        classification,
+        exhausted: recoveryAttemptCount > 1,
+      });
+    }
+    const replacementAttempt = registerAuthorizationAttempt(replacementResult.res.data);
+    if (!replacementAttempt) {
+      return await finalizeRecoveryFailure({
+        response,
+        requestHostname,
+        attempt: currentAttempt,
+        breakerAttempt: attempt,
+        classification,
+        exhausted: recoveryAttemptCount > 1,
+      });
+    }
+    res = replacementResult.res;
+    downloadUrl = res.data.url;
+    currentAttempt = replacementAttempt;
+    const missingReplacementGoogleSizeResponse = await rejectMissingGoogleSize(currentAttempt);
+    if (missingReplacementGoogleSizeResponse) {
+      return missingReplacementGoogleSizeResponse;
+    }
+  }
   } catch (error) {
-    const deferredFailureResponse = await flushDeferredQueueBreakerReportOnExit();
-    if (deferredFailureResponse) {
-      return terminal(deferredFailureResponse, 'deferred_report_failed');
+    const finalizedOwnedExit = await finalizeOwnedTerminalExitForCatch?.(error);
+    if (finalizedOwnedExit) {
+      return finalizedOwnedExit;
     }
-
-    if (error instanceof Response) {
-      return terminal(error, 'thrown_response');
+    const preAuthorizationExit = await finalizePreAuthorizationExit?.(error);
+    if (preAuthorizationExit) {
+      return preAuthorizationExit;
     }
-
-    if (didClientAbort() && isAbortError(error)) {
-      return terminal(createClientAbortResponse(origin), 'client_aborted');
+    if (error?.logFields?.operation === 'state' || error?.logFields?.operation === 'acquire' || error?.logFields?.operation === 'rpc') {
+      logEvent('error', 'Cache', 'coordination_failed', {
+        operation: error.logFields.operation,
+        rpc: error.logFields.rpc,
+        status: error.logFields.status,
+      });
+      return terminal(createCacheCoordinatorUnavailableResponse(origin), 'cache_coordinator_unavailable');
     }
     throw error;
   } finally {
+    await finishCacheRefresh({ errorCode: 500 });
+    clearCacheOwnerDeadline();
+
     if (cqHeartbeatManager && !cqCleanupBoundToStream) {
       cqHeartbeatManager.ensureCleanup('final_cleanup');
     }
@@ -7671,6 +9952,13 @@ const runEarlyFairQueueCleanupAndReturn = async (response, phase) => {
         await boundCleanupPromise;
       }
     }
+  }
+  };
+
+  try {
+    return await runDownload();
+  } finally {
+    inheritedExecutionSignalScope.cleanup();
   }
 }
 
@@ -7725,7 +10013,16 @@ async function handleRequest(request, env, config, cacheManager, throttleManager
     });
   }
 
-  return await handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
+  try {
+    return await handleDownload(request, env, config, cacheManager, throttleManager, rateLimiter, ctx);
+  } catch (error) {
+    if (isAbortError(error) && request.signal?.aborted) {
+      return logTerminalResponse(createClientAbortResponse(origin), 'client_aborted', {
+        phase: 'handle_request',
+      });
+    }
+    throw error;
+  }
 }
 
 export const __fairQueueTestHooks = {
@@ -7818,9 +10115,20 @@ export default {
         );
       }
 
-      const config = resolveConfig(env || {}, controllerState.bootstrap, controllerState.decision);
-      // Create cache manager instance based on DB_MODE
-      const cacheManager = config.cacheEnabled ? createCacheManager(config.dbMode) : null;
+      let config;
+      try {
+        config = resolveConfig(env || {}, controllerState.bootstrap, controllerState.decision);
+      } catch (error) {
+        if (isCacheCoordinatorConfigurationError(error)) {
+          return createCacheCoordinatorUnavailableResponse(request.headers.get('origin') || '*');
+        }
+        throw error;
+      }
+      if (!isCacheCoordinatorConfigured(config)) {
+        return createCacheCoordinatorUnavailableResponse(request.headers.get('origin') || '*');
+      }
+      // Use the validated PostgREST cache coordinator directly.
+      const cacheManager = customPgRestCache;
       // Create throttle manager instance based on DB_MODE (if throttle enabled)
       const throttleManager = config.throttleEnabled ? createThrottleManager(config.dbMode) : null;
       const rateLimiter = config.rateLimitEnabled ? createRateLimiter(config.dbMode) : null;

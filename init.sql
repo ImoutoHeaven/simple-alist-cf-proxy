@@ -21,13 +21,489 @@ CREATE TABLE IF NOT EXISTS "DOWNLOAD_CACHE_TABLE" (
   "PATH" TEXT NOT NULL,
   "LINK_DATA" TEXT NOT NULL,
   "TIMESTAMP" INTEGER NOT NULL,
-  "HOSTNAME_HASH" TEXT
+  "HOSTNAME_HASH" TEXT,
+  "VERSION" UUID NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_download_cache_timestamp
   ON "DOWNLOAD_CACHE_TABLE"("TIMESTAMP");
 CREATE INDEX IF NOT EXISTS idx_download_cache_hostname
   ON "DOWNLOAD_CACHE_TABLE"("HOSTNAME_HASH");
+
+
+-- ========================================
+-- Download Cache Refresh Coordination Table
+-- ========================================
+-- One row per cached path coordinates the single OpenList/cache namespace.
+CREATE TABLE IF NOT EXISTS "DOWNLOAD_CACHE_REFRESH" (
+  "PATH_HASH" TEXT PRIMARY KEY,
+  "LEASE_ID" UUID,
+  "LEASE_UNTIL" TIMESTAMPTZ,
+  "INVALID_VERSION" UUID,
+  "RETRY_AFTER" TIMESTAMPTZ,
+  "LAST_ERROR_CODE" INTEGER,
+  "UPDATED_AT" TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX IF NOT EXISTS idx_download_cache_refresh_lease_until
+  ON "DOWNLOAD_CACHE_REFRESH"("LEASE_UNTIL");
+CREATE INDEX IF NOT EXISTS idx_download_cache_refresh_retry_after
+  ON "DOWNLOAD_CACHE_REFRESH"("RETRY_AFTER");
+
+
+-- ========================================
+-- Download Cache Validity Helper
+-- ========================================
+-- A cached authorization can expire before the cache TTL. Treat malformed
+-- authorization JSON and malformed expiry values as misses.
+CREATE OR REPLACE FUNCTION download_cache_link_is_valid(
+  p_link_data TEXT,
+  p_timestamp BIGINT,
+  p_cache_ttl INTEGER,
+  p_now BIGINT
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+  v_link JSONB;
+  v_expires TEXT;
+  v_expiry NUMERIC;
+BEGIN
+  IF p_link_data IS NULL OR p_timestamp IS NULL OR p_now IS NULL
+    OR p_timestamp < p_now - GREATEST(COALESCE(p_cache_ttl, 0), 0) THEN
+    RETURN FALSE;
+  END IF;
+
+  BEGIN
+    v_link := p_link_data::JSONB;
+  EXCEPTION WHEN others THEN
+    RETURN FALSE;
+  END;
+
+  IF jsonb_typeof(v_link -> 'download' -> 'expires_at') <> 'number' THEN
+    RETURN FALSE;
+  END IF;
+
+  v_expires := NULLIF(BTRIM(v_link -> 'download' ->> 'expires_at'), '');
+  IF v_expires IS NULL OR v_expires !~ '^[0-9]+$' THEN
+    RETURN FALSE;
+  END IF;
+
+  v_expiry := v_expires::NUMERIC;
+  RETURN v_expiry > p_now;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+
+-- ========================================
+-- Read Download Cache Coordination State
+-- ========================================
+CREATE OR REPLACE FUNCTION download_get_cache_state(
+  p_path_hash TEXT,
+  p_cache_ttl INTEGER DEFAULT 1800,
+  p_cache_table_name TEXT DEFAULT 'DOWNLOAD_CACHE_TABLE'
+)
+RETURNS TABLE(
+  result TEXT,
+  path_hash TEXT,
+  path TEXT,
+  link_data TEXT,
+  cache_timestamp BIGINT,
+  hostname_hash TEXT,
+  version UUID,
+  lease_id UUID,
+  lease_until TIMESTAMPTZ,
+  invalid_version UUID,
+  retry_after TIMESTAMPTZ,
+  last_error_code INTEGER,
+  updated_at TIMESTAMPTZ,
+  observed_at TIMESTAMPTZ
+) AS $$
+DECLARE
+  v_now BIGINT;
+  v_now_ts TIMESTAMPTZ;
+  v_cache_path TEXT;
+  v_link_data TEXT;
+  v_cache_timestamp BIGINT;
+  v_hostname_hash TEXT;
+  v_version UUID;
+  v_lease_id UUID;
+  v_lease_until TIMESTAMPTZ;
+  v_invalid_version UUID;
+  v_retry_after TIMESTAMPTZ;
+  v_last_error_code INTEGER;
+  v_updated_at TIMESTAMPTZ;
+  v_cache_valid BOOLEAN := FALSE;
+BEGIN
+  v_now_ts := clock_timestamp();
+  v_now := EXTRACT(EPOCH FROM v_now_ts)::BIGINT;
+  IF BTRIM(COALESCE(p_path_hash, '')) = '' THEN
+    RETURN;
+  END IF;
+
+  EXECUTE format(
+    'SELECT c."PATH", c."LINK_DATA", c."TIMESTAMP", c."HOSTNAME_HASH", c."VERSION",
+            r."LEASE_ID", r."LEASE_UNTIL", r."INVALID_VERSION", r."RETRY_AFTER",
+            r."LAST_ERROR_CODE", r."UPDATED_AT"
+       FROM (VALUES ($1::TEXT)) AS p(path_hash)
+       LEFT JOIN %1$I AS c
+         ON c."PATH_HASH" = p.path_hash
+       LEFT JOIN "DOWNLOAD_CACHE_REFRESH" AS r
+         ON r."PATH_HASH" = p.path_hash',
+    p_cache_table_name
+  ) INTO v_cache_path, v_link_data, v_cache_timestamp, v_hostname_hash, v_version,
+      v_lease_id, v_lease_until, v_invalid_version, v_retry_after,
+      v_last_error_code, v_updated_at USING p_path_hash;
+  IF v_version IS NOT NULL THEN
+    v_cache_valid := download_cache_link_is_valid(v_link_data, v_cache_timestamp, p_cache_ttl, v_now)
+      AND (v_invalid_version IS NULL OR v_invalid_version IS DISTINCT FROM v_version);
+  END IF;
+
+  result := CASE
+    WHEN v_cache_valid THEN 'ready'
+    WHEN v_lease_until IS NOT NULL AND v_lease_until > v_now_ts THEN 'wait'
+    WHEN v_retry_after IS NOT NULL AND v_retry_after > v_now_ts THEN 'backoff'
+    ELSE 'missing'
+  END;
+  path_hash := p_path_hash;
+  path := v_cache_path;
+  link_data := CASE WHEN v_cache_valid THEN v_link_data ELSE NULL END;
+  cache_timestamp := CASE WHEN v_cache_valid THEN v_cache_timestamp ELSE NULL END;
+  hostname_hash := CASE WHEN v_cache_valid THEN v_hostname_hash ELSE NULL END;
+  version := v_version;
+  lease_id := v_lease_id;
+  lease_until := v_lease_until;
+  invalid_version := v_invalid_version;
+  retry_after := v_retry_after;
+  last_error_code := v_last_error_code;
+  updated_at := v_updated_at;
+  observed_at := v_now_ts;
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
+-- Acquire Download Cache Refresh Lease
+-- ========================================
+CREATE OR REPLACE FUNCTION download_acquire_cache_refresh(
+  p_path_hash TEXT,
+  p_observed_version UUID DEFAULT NULL,
+  p_cache_ttl INTEGER DEFAULT 1800,
+  p_cache_table_name TEXT DEFAULT 'DOWNLOAD_CACHE_TABLE'
+)
+RETURNS TABLE(
+  result TEXT,
+  path_hash TEXT,
+  path TEXT,
+  link_data TEXT,
+  cache_timestamp BIGINT,
+  hostname_hash TEXT,
+  version UUID,
+  lease_id UUID,
+  lease_until TIMESTAMPTZ,
+  invalid_version UUID,
+  retry_after TIMESTAMPTZ,
+  last_error_code INTEGER,
+  updated_at TIMESTAMPTZ,
+  observed_at TIMESTAMPTZ
+) AS $$
+DECLARE
+  v_now BIGINT;
+  v_now_ts TIMESTAMPTZ;
+  v_cache_path TEXT;
+  v_link_data TEXT;
+  v_cache_timestamp BIGINT;
+  v_hostname_hash TEXT;
+  v_version UUID;
+  v_cache_row_count INTEGER := 0;
+  v_refresh_row_count INTEGER := 0;
+  v_lease_id UUID;
+  v_lease_until TIMESTAMPTZ;
+  v_invalid_version UUID;
+  v_retry_after TIMESTAMPTZ;
+  v_last_error_code INTEGER;
+  v_updated_at TIMESTAMPTZ;
+  v_cache_valid BOOLEAN := FALSE;
+BEGIN
+  IF BTRIM(COALESCE(p_path_hash, '')) = '' THEN
+    RETURN;
+  END IF;
+
+  LOOP
+    SELECT r."LEASE_ID", r."LEASE_UNTIL", r."INVALID_VERSION", r."RETRY_AFTER",
+           r."LAST_ERROR_CODE", r."UPDATED_AT"
+      INTO v_lease_id, v_lease_until, v_invalid_version, v_retry_after,
+           v_last_error_code, v_updated_at
+      FROM "DOWNLOAD_CACHE_REFRESH" AS r
+     WHERE r."PATH_HASH" = p_path_hash
+     FOR UPDATE;
+    GET DIAGNOSTICS v_refresh_row_count = ROW_COUNT;
+    EXIT WHEN v_refresh_row_count > 0;
+
+    INSERT INTO "DOWNLOAD_CACHE_REFRESH" ("PATH_HASH", "UPDATED_AT")
+    VALUES (p_path_hash, clock_timestamp())
+    ON CONFLICT ("PATH_HASH") DO NOTHING;
+  END LOOP;
+
+  -- Capture the authoritative clock after the coordination row lock.
+  v_now_ts := clock_timestamp();
+  v_now := EXTRACT(EPOCH FROM v_now_ts)::BIGINT;
+
+  EXECUTE format(
+    'SELECT "PATH", "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH", "VERSION"
+       FROM %1$I WHERE "PATH_HASH" = $1',
+    p_cache_table_name
+  ) INTO v_cache_path, v_link_data, v_cache_timestamp, v_hostname_hash, v_version
+    USING p_path_hash;
+  GET DIAGNOSTICS v_cache_row_count = ROW_COUNT;
+
+  IF v_cache_row_count > 0 THEN
+    v_cache_valid := download_cache_link_is_valid(v_link_data, v_cache_timestamp, p_cache_ttl, v_now)
+      AND (v_invalid_version IS NULL OR v_invalid_version IS DISTINCT FROM v_version);
+  END IF;
+  IF p_observed_version IS NOT NULL AND v_version IS NOT NULL AND p_observed_version = v_version THEN
+    v_invalid_version := p_observed_version;
+    UPDATE "DOWNLOAD_CACHE_REFRESH"
+       SET "INVALID_VERSION" = v_invalid_version,
+           "UPDATED_AT" = v_now_ts
+     WHERE "PATH_HASH" = p_path_hash;
+    v_cache_valid := FALSE;
+  ELSIF v_invalid_version IS NOT NULL AND v_version IS NOT NULL AND v_invalid_version IS DISTINCT FROM v_version THEN
+    v_invalid_version := NULL;
+    UPDATE "DOWNLOAD_CACHE_REFRESH"
+       SET "INVALID_VERSION" = NULL,
+           "UPDATED_AT" = v_now_ts
+     WHERE "PATH_HASH" = p_path_hash;
+  END IF;
+
+  v_updated_at := v_now_ts;
+
+  IF v_cache_valid THEN
+    result := 'ready';
+  ELSIF v_lease_until IS NOT NULL AND v_lease_until > v_now_ts THEN
+    result := 'wait';
+  ELSIF v_retry_after IS NOT NULL AND v_retry_after > v_now_ts THEN
+    result := 'backoff';
+  ELSE
+    v_lease_id := gen_random_uuid();
+    v_lease_until := v_now_ts + INTERVAL '180 seconds';
+    v_retry_after := NULL;
+    UPDATE "DOWNLOAD_CACHE_REFRESH"
+       SET "LEASE_ID" = v_lease_id,
+           "LEASE_UNTIL" = v_lease_until,
+           "RETRY_AFTER" = NULL,
+           "UPDATED_AT" = v_now_ts
+     WHERE "PATH_HASH" = p_path_hash;
+    v_updated_at := v_now_ts;
+    result := 'acquired';
+  END IF;
+
+  path_hash := p_path_hash;
+  path := v_cache_path;
+  link_data := CASE WHEN result = 'ready' THEN v_link_data ELSE NULL END;
+  cache_timestamp := CASE WHEN result = 'ready' THEN v_cache_timestamp ELSE NULL END;
+  hostname_hash := CASE WHEN result = 'ready' THEN v_hostname_hash ELSE NULL END;
+  version := v_version;
+  lease_id := v_lease_id;
+  lease_until := v_lease_until;
+  invalid_version := v_invalid_version;
+  retry_after := v_retry_after;
+  last_error_code := v_last_error_code;
+  updated_at := v_updated_at;
+  observed_at := v_now_ts;
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ========================================
+-- Finish Download Cache Refresh Lease
+-- ========================================
+CREATE OR REPLACE FUNCTION download_finish_cache_refresh(
+  p_path_hash TEXT,
+  p_lease_id UUID,
+  p_link_data TEXT DEFAULT NULL,
+  p_path TEXT DEFAULT NULL,
+  p_hostname_hash TEXT DEFAULT NULL,
+  p_failed_version UUID DEFAULT NULL,
+  p_error_code INTEGER DEFAULT NULL,
+  p_cache_table_name TEXT DEFAULT 'DOWNLOAD_CACHE_TABLE'
+)
+RETURNS TABLE(
+  result TEXT,
+  version UUID,
+  invalid_version UUID,
+  retry_after TIMESTAMPTZ,
+  last_error_code INTEGER,
+  observed_at TIMESTAMPTZ
+) AS $$
+DECLARE
+  v_now_ts TIMESTAMPTZ;
+  v_now BIGINT;
+  v_cache_path TEXT;
+  v_link_data TEXT;
+  v_cache_timestamp BIGINT;
+  v_hostname_hash TEXT;
+  v_version UUID;
+  v_cache_row_count INTEGER := 0;
+  v_refresh_row_count INTEGER := 0;
+  v_current_lease_id UUID;
+  v_lease_until TIMESTAMPTZ;
+  v_invalid_version UUID;
+  v_retry_after TIMESTAMPTZ;
+  v_last_error_code INTEGER;
+  v_updated_at TIMESTAMPTZ;
+  v_json JSONB;
+  v_expires TEXT;
+BEGIN
+  IF BTRIM(COALESCE(p_path_hash, '')) = '' OR p_lease_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT r."LEASE_ID", r."LEASE_UNTIL", r."INVALID_VERSION", r."RETRY_AFTER",
+         r."LAST_ERROR_CODE", r."UPDATED_AT"
+    INTO v_current_lease_id, v_lease_until, v_invalid_version, v_retry_after,
+         v_last_error_code, v_updated_at
+    FROM "DOWNLOAD_CACHE_REFRESH" AS r
+   WHERE r."PATH_HASH" = p_path_hash
+   FOR UPDATE;
+  GET DIAGNOSTICS v_refresh_row_count = ROW_COUNT;
+
+  v_now_ts := clock_timestamp();
+  v_now := EXTRACT(EPOCH FROM v_now_ts)::BIGINT;
+  observed_at := v_now_ts;
+
+  EXECUTE format(
+    'SELECT "PATH", "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH", "VERSION"
+       FROM %1$I WHERE "PATH_HASH" = $1',
+    p_cache_table_name
+  ) INTO v_cache_path, v_link_data, v_cache_timestamp, v_hostname_hash, v_version
+    USING p_path_hash;
+  GET DIAGNOSTICS v_cache_row_count = ROW_COUNT;
+
+  IF v_cache_row_count > 0 AND v_version = p_lease_id THEN
+    result := 'duplicate';
+    version := v_version;
+    invalid_version := v_invalid_version;
+    retry_after := v_retry_after;
+    last_error_code := v_last_error_code;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_refresh_row_count > 0
+    AND v_current_lease_id = p_lease_id
+    AND v_lease_until IS NULL
+    AND v_retry_after IS NOT NULL THEN
+    result := 'duplicate';
+    version := v_version;
+    invalid_version := v_invalid_version;
+    retry_after := v_retry_after;
+    last_error_code := v_last_error_code;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_refresh_row_count = 0
+    OR v_current_lease_id IS DISTINCT FROM p_lease_id
+    OR v_lease_until IS NULL
+    OR v_lease_until <= v_now_ts THEN
+    result := 'stale';
+    version := v_version;
+    invalid_version := v_invalid_version;
+    retry_after := v_retry_after;
+    last_error_code := v_last_error_code;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF NULLIF(BTRIM(COALESCE(p_link_data, '')), '') IS NOT NULL THEN
+    BEGIN
+      v_json := p_link_data::JSONB;
+    EXCEPTION WHEN others THEN
+      result := 'invalid';
+      version := v_version;
+      invalid_version := v_invalid_version;
+      retry_after := v_retry_after;
+      last_error_code := v_last_error_code;
+      RETURN NEXT;
+      RETURN;
+    END;
+
+    IF jsonb_typeof(v_json -> 'download' -> 'expires_at') IS DISTINCT FROM 'number' THEN
+      result := 'invalid';
+      version := v_version;
+      invalid_version := v_invalid_version;
+      retry_after := v_retry_after;
+      last_error_code := v_last_error_code;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+    v_expires := NULLIF(BTRIM(v_json -> 'download' ->> 'expires_at'), '');
+    IF v_expires IS NULL OR v_expires !~ '^[0-9]+$' OR v_expires::NUMERIC <= v_now THEN
+      result := 'invalid';
+      version := v_version;
+      invalid_version := v_invalid_version;
+      retry_after := v_retry_after;
+      last_error_code := v_last_error_code;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    EXECUTE format(
+      'INSERT INTO %1$I ("PATH_HASH", "PATH", "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH", "VERSION")
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT ("PATH_HASH") DO UPDATE SET
+         "PATH" = EXCLUDED."PATH",
+         "LINK_DATA" = EXCLUDED."LINK_DATA",
+         "TIMESTAMP" = EXCLUDED."TIMESTAMP",
+         "HOSTNAME_HASH" = EXCLUDED."HOSTNAME_HASH",
+         "VERSION" = EXCLUDED."VERSION"',
+      p_cache_table_name
+    ) USING p_path_hash, COALESCE(NULLIF(BTRIM(p_path), ''), v_cache_path, p_path_hash), p_link_data,
+      v_now, COALESCE(p_hostname_hash, v_hostname_hash), p_lease_id;
+
+    UPDATE "DOWNLOAD_CACHE_REFRESH"
+       SET "LEASE_UNTIL" = NULL,
+           "INVALID_VERSION" = NULL,
+           "RETRY_AFTER" = NULL,
+           "LAST_ERROR_CODE" = NULL,
+           "UPDATED_AT" = v_now_ts
+     WHERE "PATH_HASH" = p_path_hash AND "LEASE_ID" = p_lease_id;
+    v_cache_path := COALESCE(NULLIF(BTRIM(p_path), ''), v_cache_path, p_path_hash);
+    v_link_data := p_link_data;
+    v_cache_timestamp := v_now;
+    v_hostname_hash := COALESCE(p_hostname_hash, v_hostname_hash);
+    v_version := p_lease_id;
+    v_invalid_version := NULL;
+    v_retry_after := NULL;
+    v_last_error_code := NULL;
+    v_updated_at := v_now_ts;
+    result := 'committed';
+  ELSE
+    v_invalid_version := CASE
+      WHEN p_failed_version IS NOT NULL AND v_version = p_failed_version THEN p_failed_version
+      WHEN v_version IS NOT NULL THEN v_version
+      ELSE v_invalid_version
+    END;
+    v_retry_after := v_now_ts + INTERVAL '30 seconds';
+    UPDATE "DOWNLOAD_CACHE_REFRESH"
+       SET "LEASE_UNTIL" = NULL,
+           "INVALID_VERSION" = v_invalid_version,
+           "RETRY_AFTER" = v_retry_after,
+           "LAST_ERROR_CODE" = p_error_code,
+           "UPDATED_AT" = v_now_ts
+     WHERE "PATH_HASH" = p_path_hash AND "LEASE_ID" = p_lease_id;
+    result := 'committed';
+  END IF;
+
+  version := v_version;
+  invalid_version := v_invalid_version;
+  retry_after := v_retry_after;
+  last_error_code := CASE WHEN NULLIF(BTRIM(COALESCE(p_link_data, '')), '') IS NULL THEN p_error_code ELSE NULL END;
+  RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
 
 
 -- ========================================
@@ -213,44 +689,6 @@ $$ LANGUAGE plpgsql;
 
 
 -- ========================================
--- PostgreSQL Stored Procedure: Atomic UPSERT (Download Cache)
--- ========================================
-CREATE OR REPLACE FUNCTION download_upsert_download_cache(
-  p_path_hash TEXT,
-  p_path TEXT,
-  p_link_data TEXT,
-  p_timestamp INTEGER,
-  p_hostname_hash TEXT DEFAULT NULL,
-  p_table_name TEXT DEFAULT 'DOWNLOAD_CACHE_TABLE'
-)
-RETURNS TABLE(
-  "PATH_HASH" TEXT,
-  "PATH" TEXT,
-  "LINK_DATA" TEXT,
-  "TIMESTAMP" INTEGER,
-  "HOSTNAME_HASH" TEXT
-) AS $$
-DECLARE
-  sql TEXT;
-BEGIN
-  sql := format(
-    'INSERT INTO %1$I ("PATH_HASH", "PATH", "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH")
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT ("PATH_HASH") DO UPDATE SET
-       "LINK_DATA" = EXCLUDED."LINK_DATA",
-       "TIMESTAMP" = EXCLUDED."TIMESTAMP",
-       "PATH" = EXCLUDED."PATH",
-       "HOSTNAME_HASH" = EXCLUDED."HOSTNAME_HASH"
-     RETURNING "PATH_HASH", "PATH", "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH"',
-    p_table_name
-  );
-
-  RETURN QUERY EXECUTE sql USING p_path_hash, p_path, p_link_data, p_timestamp, p_hostname_hash;
-END;
-$$ LANGUAGE plpgsql;
-
-
--- ========================================
 -- Optional: Cleanup Function (PostgreSQL)
 -- ========================================
 CREATE OR REPLACE FUNCTION download_cleanup_expired_cache(
@@ -259,17 +697,129 @@ CREATE OR REPLACE FUNCTION download_cleanup_expired_cache(
 )
 RETURNS INTEGER AS $$
 DECLARE
-  deleted_count INTEGER;
+  deleted_count INTEGER := 0;
+  row_deleted INTEGER := 0;
+  cutoff BIGINT;
+  now_ts TIMESTAMPTZ;
+  refresh_row_count INTEGER;
+  refresh_lease_until TIMESTAMPTZ;
+  refresh_invalid_version UUID;
+  refresh_retry_after TIMESTAMPTZ;
+  refresh_now TIMESTAMPTZ;
+  refresh_row RECORD;
+  cache_row RECORD;
   sql TEXT;
 BEGIN
-  sql := format(
-    'DELETE FROM %1$I
-     WHERE EXTRACT(EPOCH FROM NOW())::INTEGER - "TIMESTAMP" > $1',
-    p_table_name
-  );
+  now_ts := clock_timestamp();
+  cutoff := EXTRACT(EPOCH FROM now_ts)::BIGINT - (GREATEST(COALESCE(p_ttl_seconds, 0), 0) * 2);
 
-  EXECUTE sql USING p_ttl_seconds;
-  GET DIAGNOSTICS deleted_count = ROW_COUNT;
+  FOR cache_row IN EXECUTE format(
+    'SELECT "PATH_HASH", "VERSION"
+       FROM %1$I
+      WHERE "TIMESTAMP" < $1
+      ORDER BY "TIMESTAMP", "PATH_HASH"
+      LIMIT 500',
+    p_table_name
+  ) USING cutoff LOOP
+    -- Acquire and cache operations lock this coordination row before reading
+    -- or changing the cache row. A missing row is created to close that race.
+    INSERT INTO "DOWNLOAD_CACHE_REFRESH" ("PATH_HASH", "UPDATED_AT")
+    VALUES (cache_row."PATH_HASH", clock_timestamp())
+    ON CONFLICT ("PATH_HASH") DO NOTHING;
+
+    SELECT r."LEASE_UNTIL", r."INVALID_VERSION", r."RETRY_AFTER"
+      INTO refresh_lease_until, refresh_invalid_version, refresh_retry_after
+      FROM "DOWNLOAD_CACHE_REFRESH" AS r
+     WHERE r."PATH_HASH" = cache_row."PATH_HASH"
+     FOR UPDATE;
+    GET DIAGNOSTICS refresh_row_count = ROW_COUNT;
+    IF refresh_row_count = 0 THEN
+      CONTINUE;
+    END IF;
+
+    refresh_now := clock_timestamp();
+    sql := format(
+      'DELETE FROM %1$I AS c
+        WHERE c."PATH_HASH" = $1
+          AND c."TIMESTAMP" < $2
+          AND NOT EXISTS (
+            SELECT 1 FROM "DOWNLOAD_CACHE_REFRESH" AS r
+             WHERE r."PATH_HASH" = c."PATH_HASH"
+               AND (
+                 (r."LEASE_UNTIL" IS NOT NULL AND r."LEASE_UNTIL" > $3)
+                 OR (r."RETRY_AFTER" IS NOT NULL AND r."RETRY_AFTER" > $3)
+                 OR (
+                   r."INVALID_VERSION" IS NOT NULL
+                   AND r."INVALID_VERSION" = c."VERSION"
+                   AND download_cache_link_is_valid(c."LINK_DATA", c."TIMESTAMP", $4, EXTRACT(EPOCH FROM $3)::BIGINT)
+                 )
+               )
+          )',
+      p_table_name
+    );
+    EXECUTE sql USING cache_row."PATH_HASH", cutoff, refresh_now, p_ttl_seconds;
+    GET DIAGNOSTICS row_deleted = ROW_COUNT;
+    deleted_count := deleted_count + row_deleted;
+
+    sql := format(
+      'DELETE FROM "DOWNLOAD_CACHE_REFRESH" AS r
+        WHERE r."PATH_HASH" = $1
+          AND (r."LEASE_UNTIL" IS NULL OR r."LEASE_UNTIL" <= $2)
+          AND (r."RETRY_AFTER" IS NULL OR r."RETRY_AFTER" <= $2)
+          AND NOT EXISTS (
+            SELECT 1 FROM %1$I AS c
+             WHERE c."PATH_HASH" = r."PATH_HASH"
+               AND r."INVALID_VERSION" IS NOT NULL
+               AND c."VERSION" = r."INVALID_VERSION"
+          )',
+      p_table_name
+    );
+    EXECUTE sql USING cache_row."PATH_HASH", refresh_now;
+  END LOOP;
+
+  -- Reclaim orphaned coordination rows and rows whose invalid version is no
+  -- longer readable. Lock each row before the final recheck.
+  FOR refresh_row IN
+    SELECT "PATH_HASH"
+      FROM "DOWNLOAD_CACHE_REFRESH"
+     WHERE "LEASE_UNTIL" IS NULL OR "LEASE_UNTIL" <= now_ts
+     ORDER BY "PATH_HASH"
+     LIMIT 500
+     FOR UPDATE SKIP LOCKED
+  LOOP
+    SELECT r."LEASE_UNTIL", r."INVALID_VERSION", r."RETRY_AFTER"
+      INTO refresh_lease_until, refresh_invalid_version, refresh_retry_after
+      FROM "DOWNLOAD_CACHE_REFRESH" AS r
+     WHERE r."PATH_HASH" = refresh_row."PATH_HASH"
+     FOR UPDATE;
+    GET DIAGNOSTICS refresh_row_count = ROW_COUNT;
+    IF refresh_row_count = 0 THEN
+      CONTINUE;
+    END IF;
+
+    IF refresh_lease_until IS NOT NULL AND refresh_lease_until > clock_timestamp() THEN
+      CONTINUE;
+    END IF;
+    IF refresh_retry_after IS NOT NULL AND refresh_retry_after > clock_timestamp() THEN
+      CONTINUE;
+    END IF;
+
+    sql := format(
+      'DELETE FROM "DOWNLOAD_CACHE_REFRESH" AS r
+        WHERE r."PATH_HASH" = $1
+          AND (r."LEASE_UNTIL" IS NULL OR r."LEASE_UNTIL" <= $2)
+          AND (r."RETRY_AFTER" IS NULL OR r."RETRY_AFTER" <= $2)
+          AND NOT EXISTS (
+            SELECT 1 FROM %1$I AS c
+             WHERE c."PATH_HASH" = r."PATH_HASH"
+               AND r."INVALID_VERSION" IS NOT NULL
+               AND c."VERSION" = r."INVALID_VERSION"
+               AND download_cache_link_is_valid(c."LINK_DATA", c."TIMESTAMP", $3, EXTRACT(EPOCH FROM $2)::BIGINT)
+          )',
+      p_table_name
+    );
+    EXECUTE sql USING refresh_row."PATH_HASH", clock_timestamp(), p_ttl_seconds;
+  END LOOP;
 
   RETURN deleted_count;
 END;
@@ -1586,6 +2136,8 @@ RETURNS TABLE(
   cache_link_data TEXT,
   cache_timestamp INTEGER,
   cache_hostname_hash TEXT,
+  cache_version UUID,
+  cache_observed_at TIMESTAMPTZ,
 
   -- Rate limit result
   rate_access_count INTEGER,
@@ -1602,10 +2154,14 @@ RETURNS TABLE(
 ) AS $$
 DECLARE
   v_now BIGINT;
+  v_cache_now BIGINT;
   v_cache_record RECORD;
   v_rate_record RECORD;
   v_throttle_record RECORD;
   v_cache_hostname_hash TEXT;
+  v_cache_version UUID;
+  v_cache_invalid_version UUID;
+  v_cache_observed_at TIMESTAMPTZ;
   v_throttle_hostname_hash TEXT;
 
   v_cache_link_data TEXT := NULL;
@@ -1625,23 +2181,37 @@ DECLARE
   v_actual_path_hash TEXT := NULL;
 BEGIN
   v_now := COALESCE(p_now, EXTRACT(EPOCH FROM NOW())::BIGINT);
+  v_cache_observed_at := clock_timestamp();
+  v_cache_now := EXTRACT(EPOCH FROM v_cache_observed_at)::BIGINT;
 
   -- Step 1: Cache lookup
   v_actual_path_hash := p_path_hash;
 
   IF p_cache_enabled THEN
-    EXECUTE format('SELECT "LINK_DATA", "TIMESTAMP", "HOSTNAME_HASH" FROM %1$I WHERE "PATH_HASH" = $1', p_cache_table_name)
+    EXECUTE format(
+      'SELECT c."LINK_DATA", c."TIMESTAMP", c."HOSTNAME_HASH", c."VERSION", r."INVALID_VERSION"
+         FROM %1$I AS c
+         LEFT JOIN "DOWNLOAD_CACHE_REFRESH" AS r
+           ON r."PATH_HASH" = c."PATH_HASH"
+        WHERE c."PATH_HASH" = $1',
+      p_cache_table_name
+    )
       INTO v_cache_record
       USING v_actual_path_hash;
+    v_cache_invalid_version := v_cache_record."INVALID_VERSION";
 
-    IF v_cache_record."TIMESTAMP" IS NOT NULL AND (v_now - v_cache_record."TIMESTAMP") <= p_cache_ttl THEN
+    IF v_cache_record."TIMESTAMP" IS NOT NULL
+      AND download_cache_link_is_valid(v_cache_record."LINK_DATA", v_cache_record."TIMESTAMP", p_cache_ttl, v_cache_now)
+      AND (v_cache_invalid_version IS NULL OR v_cache_invalid_version IS DISTINCT FROM v_cache_record."VERSION") THEN
       v_cache_link_data := v_cache_record."LINK_DATA";
       v_cache_timestamp := v_cache_record."TIMESTAMP";
       v_cache_hostname_hash := v_cache_record."HOSTNAME_HASH";
+      v_cache_version := v_cache_record."VERSION";
     ELSE
       v_cache_link_data := NULL;
       v_cache_timestamp := NULL;
       v_cache_hostname_hash := NULL;
+      v_cache_version := v_cache_record."VERSION";
     END IF;
   END IF;
 
@@ -1699,6 +2269,8 @@ BEGIN
     v_cache_link_data,
     v_cache_timestamp,
     v_cache_hostname_hash,
+    v_cache_version,
+    v_cache_observed_at,
     v_rate_access_count,
     v_rate_last_window_time,
     v_rate_block_until,

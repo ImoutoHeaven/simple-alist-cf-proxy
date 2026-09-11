@@ -1,4 +1,4 @@
-import { sha256Hash, applyVerifyHeaders, hasVerifyCredentials } from '../utils.js';
+import { sha256Hash, applyVerifyHeaders, hasVerifyCredentials, readResponseTextWithSignal } from '../utils.js';
 import { logEvent } from '../logging.js';
 const BREAKER_TABLE = 'THROTTLE_PROTECTION';
 const DEFAULT_CLOSE_THRESHOLD_PERCENT = 15;
@@ -131,7 +131,7 @@ const readBreakerSnapshot = (row, options = {}) => {
  * @param {Object} extraHeaders - Additional headers
  * @returns {Promise<Object>} - Query result
  */
-const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName, method, filters = '', body = null, extraHeaders = {}) => {
+const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName, method, filters = '', body = null, extraHeaders = {}, signal = null) => {
   const url = `${postgrestUrl}/${tableName}${filters ? `?${filters}` : ''}`;
 
   const headers = {
@@ -149,10 +149,13 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
     options.body = JSON.stringify(body);
   }
 
+  if (signal) {
+    options.signal = signal;
+  }
   const response = await fetch(url, options);
 
   if (!response.ok) {
-    const errorText = await response.text();
+    const errorText = await readResponseTextWithSignal(response, signal);
 
     // Check if table doesn't exist (PGRST205 error)
     if (response.status === 404 && errorText.includes('PGRST205')) {
@@ -171,7 +174,7 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
   let result;
   const contentType = response.headers.get('content-type');
   if (contentType && contentType.includes('application/json')) {
-    result = await response.json();
+    result = JSON.parse(await readResponseTextWithSignal(response, signal));
   } else {
     result = [];
   }
@@ -204,7 +207,7 @@ const executeQuery = async (postgrestUrl, verifyHeader, verifySecret, tableName,
   };
 };
 
-const executeBreakerRpc = async (postgrestUrl, verifyHeader, verifySecret, rpcName, body) => {
+const executeBreakerRpc = async (postgrestUrl, verifyHeader, verifySecret, rpcName, body, signal = null) => {
   const rpcUrl = `${postgrestUrl}/rpc/${rpcName}`;
   const rpcHeaders = { 'Content-Type': 'application/json' };
   applyVerifyHeaders(rpcHeaders, verifyHeader, verifySecret);
@@ -213,14 +216,15 @@ const executeBreakerRpc = async (postgrestUrl, verifyHeader, verifySecret, rpcNa
     method: 'POST',
     headers: rpcHeaders,
     body: JSON.stringify(body),
+    ...(signal ? { signal } : {}),
   });
 
   if (!rpcResponse.ok) {
-    const errorText = await rpcResponse.text();
+    const errorText = await readResponseTextWithSignal(rpcResponse, signal);
     throw new Error(`PostgREST RPC ${rpcName} failed (${rpcResponse.status}): ${errorText}`);
   }
 
-  const rpcResult = await rpcResponse.json();
+  const rpcResult = JSON.parse(await readResponseTextWithSignal(rpcResponse, signal));
   if (!Array.isArray(rpcResult) || rpcResult.length === 0) {
     throw new Error(`PostgREST RPC ${rpcName} returned no rows`);
   }
@@ -261,7 +265,10 @@ export const getBreakerState = async (hostname, config) => {
     verifySecret,
     BREAKER_TABLE,
     'GET',
-    filters
+    filters,
+    undefined,
+    undefined,
+    config.signal,
   );
 
   const records = queryResult.data || [];
@@ -325,6 +332,7 @@ export const authorizeBreakerAttempt = async (hostname, config) => {
       p_half_open_max_seconds: thresholds.halfOpenMaxSeconds,
       p_half_open_timeout_mode: halfOpenTimeoutMode,
     },
+    config.signal,
   );
 
   return readBreakerSnapshot(row, {
@@ -377,6 +385,7 @@ export const settleBreakerAttempt = async (hostname, updateData, config) => {
       p_attempt_ticket: attemptTicket,
       p_now: Math.floor(Date.now() / 1000),
     },
+    config.signal,
   );
 
   return readBreakerSnapshot(row, { includeHalfOpenDeadline: true });
@@ -477,6 +486,7 @@ export const reportBreakerSample = async (hostname, updateData, config) => {
       p_attempt_ticket: attemptTicket,
       p_retry_after_seconds: retryAfterSeconds,
     },
+    config.signal,
   );
 
   logEvent('info', 'Throttle', 'breaker_updated', {

@@ -4,6 +4,7 @@ import test from 'node:test';
 import { encryptBindingPayload } from '../src/origin-binding.js';
 import { createJsonErrorResponse } from '../src/http/json-error.js';
 import worker, { __fairQueueTestHooks } from '../src/worker.js';
+import { addDownloadEnvelope, createCacheRpcFixture } from './cache-rpc-fixture.mjs';
 
 const CONTROLLER_URL = 'https://controller.example.test';
 const CONTROLLER_BOOTSTRAP_URL = `${CONTROLLER_URL}/api/v0/bootstrap`;
@@ -36,6 +37,27 @@ async function captureConsole(callback) {
 }
 
 function buildBootstrap(overrides = {}) {
+  const downloadOverrides = overrides.download && typeof overrides.download === 'object'
+    ? overrides.download
+    : {};
+  const baseDownload = {
+    address: 'https://alist.example.com',
+    auth: {
+      ipv4Only: true,
+    },
+    db: {
+      mode: 'custom-pg-rest',
+      postgrestUrl: 'https://postgrest.example.test',
+      verifyHeader: ['X-Verify'],
+      verifySecret: ['secret'],
+      cacheEnabled: true,
+    },
+    throttleProfiles: {
+      default: {
+        hostPatterns: [],
+      },
+    },
+  };
   return {
     configVersion: 'worker-observability-terminal-test',
     ttlSeconds: 300,
@@ -60,14 +82,22 @@ function buildBootstrap(overrides = {}) {
       ...(overrides.common || {}),
     },
     download: {
-      address: 'https://alist.example.com',
+      ...baseDownload,
+      ...downloadOverrides,
       auth: {
-        ipv4Only: true,
+        ...baseDownload.auth,
+        ...(downloadOverrides.auth && typeof downloadOverrides.auth === 'object' ? downloadOverrides.auth : {}),
       },
       db: {
-        mode: '',
+        ...baseDownload.db,
+        ...(downloadOverrides.db && typeof downloadOverrides.db === 'object' ? downloadOverrides.db : {}),
       },
-      ...(overrides.download || {}),
+      throttleProfiles: {
+        ...baseDownload.throttleProfiles,
+        ...(downloadOverrides.throttleProfiles && typeof downloadOverrides.throttleProfiles === 'object'
+          ? downloadOverrides.throttleProfiles
+          : {}),
+      },
     },
     ...Object.fromEntries(
       Object.entries(overrides).filter(([key]) => key !== 'common' && key !== 'download'),
@@ -89,8 +119,34 @@ function buildControllerEnv(extra = {}) {
 
 async function withFetchStub(fetchStub, callback) {
   const originalFetch = globalThis.fetch;
+  const cacheRpc = createCacheRpcFixture({ includeTicketState: true });
   delete globalThis.bootstrapCache;
-  globalThis.fetch = fetchStub;
+  globalThis.fetch = async (input, init = {}) => {
+    const cacheResponse = await cacheRpc.handle(input, init);
+    if (cacheResponse) {
+      return cacheResponse;
+    }
+    const requestUrl = new URL(typeof input === 'string' ? input : input.url);
+    let action = null;
+    try {
+      action = JSON.parse(init.body || '{}')?.action;
+    } catch (_error) {
+      action = null;
+    }
+    if (
+      requestUrl.origin === 'https://alist.example.com'
+      && requestUrl.pathname === '/api/fs/link'
+      && action === 'report'
+    ) {
+      return new Response(JSON.stringify({
+        code: 200,
+        data: { applied: true, duplicate: false, stale: false },
+      }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return addDownloadEnvelope(await fetchStub(input, init));
+  };
   try {
     return await callback();
   } finally {
@@ -451,7 +507,7 @@ test('worker breaker path logs sample report lifecycle events', async () => {
         postgrestUrl: 'https://postgrest.example.test',
         verifyHeader: ['X-Verify'],
         verifySecret: ['secret'],
-        cacheEnabled: false,
+        cacheEnabled: true,
       },
       throttleProfiles: {
         default: {
@@ -556,7 +612,7 @@ test('worker breaker path logs sample report lifecycle events', async () => {
     status: 503,
     reason: 'upstream_unavailable',
     upstreamStatus: 503,
-    retryAfter: '9',
+    retryAfter: '30',
   });
   assert.equal(reportCalls, 1);
   assert.ok(entries.some((entry) => /\[Breaker\] sample_report_start/.test(entry.text)
@@ -577,6 +633,11 @@ test('worker.fetch does not log fq/cq unavailable terminal reasons on a successf
         slotHandlerUrl: 'https://slot-handler.example.test',
         slotHandlerAuthKey: 'slot-secret',
         slotHandlerAuthHeader: 'X-FQ-Auth',
+      },
+      throttleProfiles: {
+        default: {
+          hostPatterns: [],
+        },
       },
     },
   });
@@ -686,6 +747,7 @@ test('worker.fetch does not log alist_api_error when auth refresh ignores the er
   await assertJsonError(response, {
     status: 503,
     reason: 'alist_api_unavailable',
+    retryAfter: '30',
   });
   assert.equal(terminalEntries(entries, 'alist_api_error').length, 0);
 });
@@ -732,6 +794,7 @@ test('worker.fetch logs distinct terminal reason when refreshed upstream auth re
     status: 503,
     reason: 'upstream_auth_retry_exhausted',
     upstreamStatus: 401,
+    retryAfter: '30',
   });
   assert.equal(alistCalls, 2);
   assert.ok(terminalEntries(entries, 'upstream_auth_retry_exhausted').some((entry) => /status=401/.test(entry.text)));
@@ -914,7 +977,7 @@ test('worker.fetch keeps unified rate-limit client network details out of the pu
         postgrestUrl: 'https://postgrest.example.test',
         verifyHeader: ['X-Verify'],
         verifySecret: ['secret'],
-        cacheEnabled: false,
+        cacheEnabled: true,
         cleanupPercentage: 0,
         rateLimit: {
           enabled: true,
@@ -965,6 +1028,7 @@ test('worker.fetch keeps unified rate-limit client network details out of the pu
         cache_link_data: null,
         cache_timestamp: null,
         cache_hostname_hash: null,
+        cache_observed_at: new Date().toISOString(),
         rate_access_count: 10,
         rate_last_window_time: Math.floor(Date.now() / 1000),
         rate_block_until: null,
@@ -988,6 +1052,60 @@ test('worker.fetch keeps unified rate-limit client network details out of the pu
   });
   assert.equal(body.message.includes('192.0.2.10'), false);
 });
+
+for (const [label, response] of [
+  ['raw error body', new Response(
+    'RAW_UNIFIED_BODY_MARKER Authorization: Bearer leaked for https://signed.example.test/download?token=secret',
+    { status: 500, headers: { 'content-type': 'text/plain' } },
+  )],
+  ['malformed JSON', new Response(
+    'MALFORMED_UNIFIED_JSON_MARKER Authorization: Bearer leaked',
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )],
+]) {
+  test(`worker.fetch sanitizes unified ${label} diagnostics`, async () => {
+    const bootstrap = buildBootstrap({
+      download: {
+        db: {
+          rateLimit: {
+            enabled: true,
+            windowSeconds: 60,
+            limit: 10,
+          },
+        },
+      },
+    });
+    const fetchStub = async (input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === CONTROLLER_BOOTSTRAP_URL) {
+        return new Response(JSON.stringify(bootstrap), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === 'https://postgrest.example.test/rpc/download_unified_check') {
+        return response.clone();
+      }
+      throw new Error(`Unexpected fetch URL in unified sanitization test: ${url}`);
+    };
+
+    let result;
+    const entries = await withFetchStub(fetchStub, () => captureConsole(async () => {
+      const request = await buildSignedWorkerRequest('/downloads/unified-sanitized.bin');
+      request.headers.set('CF-Connecting-IP', '192.0.2.11');
+      result = await worker.fetch(
+        request,
+        buildControllerEnv(),
+        {},
+      );
+    }));
+    const body = await assertJsonError(result, { status: 500, reason: 'unified_check_fail_closed' });
+    const serialized = JSON.stringify(body);
+    const logs = entries.map((entry) => entry.text).join('\n');
+    assert.doesNotMatch(serialized, /RAW_UNIFIED_BODY_MARKER|MALFORMED_UNIFIED_JSON_MARKER|Bearer leaked|token=secret/);
+    assert.doesNotMatch(logs, /RAW_UNIFIED_BODY_MARKER|MALFORMED_UNIFIED_JSON_MARKER|Bearer leaked|token=secret/);
+  });
+}
 
 async function fetchDownloadContract({
   upstreamStatus = 500,
@@ -1038,7 +1156,7 @@ for (const [upstreamStatus, status, reason] of [
   test(`worker.fetch maps upstream ${upstreamStatus} to ${status} ${reason} without body leakage`, async () => {
     const upstreamBody = `unique-upstream-${upstreamStatus}`;
     const response = await fetchDownloadContract({ upstreamStatus, upstreamBody });
-    const body = await assertJsonError(response, { status, reason, upstreamStatus });
+    const body = await assertJsonError(response, { status, reason, upstreamStatus, retryAfter: '30' });
     assert.equal(JSON.stringify(body).includes(upstreamBody), false);
   });
 }
@@ -1058,7 +1176,7 @@ test('worker.fetch maps a non-JSON refreshed AList response to alist_api_unavail
     return new Response('unique-unretried-401-body', { status: 401 });
   }, async () => worker.fetch(await buildSignedWorkerRequest('/downloads/unretried-401.bin'), buildControllerEnv(), {}));
 
-  const body = await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable' });
+  const body = await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable', retryAfter: '30' });
   assert.equal(JSON.stringify(body).includes('unusable refresh response'), false);
 });
 
@@ -1078,7 +1196,7 @@ test('worker.fetch cancels the initial terminal upstream body when AList refresh
     return new Response(initialUpstreamBody.stream, { status: 401 });
   }, async () => worker.fetch(await buildSignedWorkerRequest('/downloads/refresh-cancel.bin'), buildControllerEnv(), {}));
 
-  const body = await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable' });
+  const body = await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable', retryAfter: '30' });
   assert.equal(Object.hasOwn(body, 'upstream_status'), false);
   assert.equal(initialUpstreamBody.cancelled, true);
   assert.equal(JSON.stringify(body).includes('initial-terminal-body-must-not-leak'), false);
@@ -1097,7 +1215,7 @@ test('worker.fetch maps eligible refreshed upstream 401 to upstream_auth_retry_e
     return new Response('unique-refreshed-401-body', { status: 401 });
   }, async () => worker.fetch(await buildSignedWorkerRequest('/downloads/refreshed-401.bin'), buildControllerEnv(), {}));
 
-  const body = await assertJsonError(response, { status: 503, reason: 'upstream_auth_retry_exhausted', upstreamStatus: 401 });
+  const body = await assertJsonError(response, { status: 503, reason: 'upstream_auth_retry_exhausted', upstreamStatus: 401, retryAfter: '30' });
   assert.equal(alistCalls, 2);
   assert.equal(JSON.stringify(body).includes('unique-refreshed-401-body'), false);
 });
@@ -1115,7 +1233,7 @@ test('worker.fetch maps forced refreshed upstream 410 to upstream_auth_retry_exh
     return new Response('unique-refreshed-410-body', { status: 410 });
   }, async () => worker.fetch(await buildSignedWorkerRequest('/downloads/refreshed-410.bin'), buildControllerEnv(), {}));
 
-  const body = await assertJsonError(response, { status: 503, reason: 'upstream_auth_retry_exhausted', upstreamStatus: 410 });
+  const body = await assertJsonError(response, { status: 503, reason: 'upstream_auth_retry_exhausted', upstreamStatus: 410, retryAfter: '30' });
   assert.equal(alistCalls, 2);
   assert.equal(JSON.stringify(body).includes('unique-refreshed-410-body'), false);
 });
@@ -1128,14 +1246,14 @@ for (const retryAfter of ['12', 'invalid', 'Wed, 21 Oct 2015 07:28:00 GMT', '0',
       status: 503,
       reason: 'upstream_rate_limited',
       upstreamStatus: 429,
-      retryAfter: retryAfter === '12' ? '12' : undefined,
+      retryAfter: '30',
     });
   });
 }
 
 test('worker.fetch couples retry-after for upstream 503', async () => {
   const response = await fetchDownloadContract({ upstreamStatus: 503, upstreamHeaders: { 'Retry-After': '13' } });
-  await assertJsonError(response, { status: 503, reason: 'upstream_unavailable', upstreamStatus: 503, retryAfter: '13' });
+  await assertJsonError(response, { status: 503, reason: 'upstream_unavailable', upstreamStatus: 503, retryAfter: '30' });
 });
 
 for (const [name, options] of [
@@ -1155,7 +1273,7 @@ for (const [name, options] of [
 ]) {
   test(`worker.fetch returns alist_api_unavailable JSON for AList ${name}`, async () => {
     const response = await fetchDownloadContract(options);
-    const body = await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable' });
+    const body = await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable', retryAfter: '30' });
     assert.equal(JSON.stringify(body).includes('unique-alist'), false);
   });
 }

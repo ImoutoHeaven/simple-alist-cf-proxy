@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { authorizeBreakerAttempt, getBreakerState, reportBreakerSample, settleBreakerAttempt } from '../src/cache/throttle-custom-pg-rest.js';
 import { scheduleAllCleanups } from '../src/cleanup-scheduler.js';
 import { encryptBindingPayload } from '../src/origin-binding.js';
+import { addDownloadEnvelope, createCacheRpcFixture } from './cache-rpc-fixture.mjs';
 import worker from '../src/worker.js';
 import { __fairQueueTestHooks } from '../src/worker.js';
 
@@ -403,7 +404,7 @@ const buildRuntimeBootstrap = (options = {}) => ({
       postgrestUrl: 'https://postgrest.example.test',
       verifyHeader: ['X-Verify'],
       verifySecret: ['secret'],
-      cacheEnabled: options.cacheEnabled === true,
+      cacheEnabled: options.cacheEnabled !== false,
       ...(options.rateLimit ? { rateLimit: options.rateLimit } : {}),
     },
     throttleProfiles: {
@@ -534,7 +535,7 @@ const buildBootstrap = () => ({
       postgrestUrl: 'https://postgrest.example.test',
       verifyHeader: ['X-Verify'],
       verifySecret: ['secret'],
-      cacheEnabled: false,
+      cacheEnabled: true,
     },
     throttleProfiles: {
       default: {
@@ -560,12 +561,30 @@ const buildBootstrap = () => ({
 const wrappedFetch = globalThis.fetch;
 const wrappedFetchBound = typeof wrappedFetch === 'function' ? wrappedFetch.bind(globalThis) : wrappedFetch;
 let delegatedFetch = wrappedFetchBound;
+let reportObserver = null;
+const cacheRpc = createCacheRpcFixture();
 
 const fetchWithDefaultTicketStateRpc = async (input, init = {}) => {
   const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+  const cacheResponse = await cacheRpc.handle(input, init);
+  if (cacheResponse) {
+    return cacheResponse;
+  }
   const ticketStateResponse = await handleTicketStateRpc(url, init);
   if (ticketStateResponse) {
     return ticketStateResponse;
+  }
+  if (url.startsWith('https://alist.example.com/api/fs/link')) {
+    let action = null;
+    try {
+      action = JSON.parse(init.body || '{}')?.action;
+    } catch (_error) {
+      action = null;
+    }
+    if (action === 'report') {
+      reportObserver?.(JSON.parse(init.body || '{}'), init.signal);
+      return createJsonResponse({ code: 200, data: { applied: true, duplicate: false, stale: false } });
+    }
   }
   if (url === HEARTBEAT_URL) {
     try {
@@ -584,7 +603,7 @@ const fetchWithDefaultTicketStateRpc = async (input, init = {}) => {
   if (typeof delegatedFetch !== 'function') {
     throw new Error('global fetch handler not configured');
   }
-  return delegatedFetch(input, init);
+  return addDownloadEnvelope(await delegatedFetch(input, init));
 };
 
 Object.defineProperty(globalThis, 'fetch', {
@@ -595,12 +614,102 @@ Object.defineProperty(globalThis, 'fetch', {
   },
   set(value) {
     resetTicketStateRpcState();
+    cacheRpc.reset();
     if (value === fetchWithDefaultTicketStateRpc) {
       delegatedFetch = wrappedFetchBound;
       return;
     }
     delegatedFetch = value;
   },
+});
+
+test('custom PG breaker operations cancel stalled JSON bodies with the caller signal', async () => {
+  const operations = [
+    {
+      name: 'snapshot',
+      invoke: (signal) => getBreakerState('tenant.sharepoint.com', {
+        postgrestUrl: 'https://postgrest.example.test',
+        verifyHeader: ['X-Verify'],
+        verifySecret: ['secret'],
+        signal,
+      }),
+    },
+    {
+      name: 'authorize',
+      invoke: (signal) => authorizeBreakerAttempt('tenant.sharepoint.com', {
+        postgrestUrl: 'https://postgrest.example.test',
+        verifyHeader: ['X-Verify'],
+        verifySecret: ['secret'],
+        signal,
+      }),
+    },
+    {
+      name: 'sample report',
+      invoke: (signal) => reportBreakerSample('tenant.sharepoint.com', {
+        sample: 1,
+        statusCode: 503,
+        retryAfterSeconds: 30,
+        attemptVersion: 7,
+        attemptTicket: 2,
+      }, {
+        postgrestUrl: 'https://postgrest.example.test',
+        verifyHeader: ['X-Verify'],
+        verifySecret: ['secret'],
+        signal,
+      }),
+    },
+    {
+      name: 'settlement',
+      invoke: (signal) => settleBreakerAttempt('tenant.sharepoint.com', {
+        attemptVersion: 7,
+        attemptTicket: 2,
+      }, {
+        postgrestUrl: 'https://postgrest.example.test',
+        verifyHeader: ['X-Verify'],
+        verifySecret: ['secret'],
+        signal,
+      }),
+    },
+  ];
+
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const operation of operations) {
+      const controller = new AbortController();
+      const abortReason = new DOMException(`${operation.name} canceled`, 'AbortError');
+      let seenSignal = null;
+      let bodyCancelled = false;
+      let fetchStarted;
+      const fetchStartedPromise = new Promise((resolve) => { fetchStarted = resolve; });
+      globalThis.fetch = async (_input, init = {}) => {
+        seenSignal = init.signal;
+        fetchStarted();
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'application/json' }),
+          body: new ReadableStream({
+            start() {},
+            cancel() {
+              bodyCancelled = true;
+            },
+          }),
+        };
+      };
+
+      const operationPromise = operation.invoke(controller.signal);
+      await fetchStartedPromise;
+      controller.abort(abortReason);
+      await assert.rejects(operationPromise, (error) => {
+        assert.equal(error, abortReason, operation.name);
+        return true;
+      });
+      assert.equal(seenSignal, controller.signal, operation.name);
+      assert.equal(bodyCancelled, true, operation.name);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('signed worker request fixtures include ticketNonce and idle_timeout', async () => {
@@ -714,6 +823,7 @@ test('worker fails closed when breaker snapshot lookup fails', async () => {
     await assertJsonError(response, {
       status: 503,
       reason: 'breaker_authority_unavailable',
+      retryAfter: '30',
     });
     assert.equal(upstreamFetches, 0);
   } finally {
@@ -898,6 +1008,7 @@ test('worker fails closed when breaker sample reporting fails after half_open au
     await assertJsonError(response, {
       status: 503,
       reason: 'breaker_sample_report_failed',
+      retryAfter: '30',
     });
     assert.equal(upstreamFetches, 1);
     assert.equal(reportCalls, 1);
@@ -2743,6 +2854,7 @@ test('queue_breaker returns generated JSON for non-protected terminal upstream r
       status: 404,
       reason: 'upstream_rejected',
       upstreamStatus: 404,
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
 
@@ -2853,6 +2965,7 @@ test('queue_breaker returns generated JSON for protected terminal upstream respo
       status: 503,
       reason: 'upstream_unavailable',
       upstreamStatus: 500,
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
 
@@ -2972,6 +3085,7 @@ test('queue_breaker cancels CQ wait when old attempt settlement fails before CQ 
     const body = await assertJsonError(response, {
       status: 503,
       reason: 'breaker_settle_failed',
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
 
@@ -3141,7 +3255,7 @@ test('queue_breaker releases CQ lease and returns breaker terminal response when
     await assertJsonError(response, {
       status: 503,
       reason: 'breaker_half_open_full',
-      retryAfter: '15',
+      retryAfter: '30',
     });
     assert.deepEqual(calls, [
       'fairqueue-wait',
@@ -3434,7 +3548,7 @@ test('worker blocks same-host refresh when a new authorize call finds a full hal
     await assertJsonError(response, {
       status: 503,
       reason: 'breaker_half_open_full',
-      retryAfter: '15',
+      retryAfter: '30',
     });
     assert.equal(linkFetchCount, 2);
     assert.equal(authorizeCalls, 2);
@@ -3560,6 +3674,7 @@ test('worker returns fq_unavailable envelope after fair queue preparation fails 
     const body = await assertJsonError(response, {
       status: 503,
       reason: 'fq_unavailable',
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
 
@@ -3707,6 +3822,7 @@ test('worker settles live breaker_only attempt before refresh enters true concur
     const body = await assertJsonError(response, {
       status: 503,
       reason: 'cq_acquire_failed',
+      retryAfter: '30',
     });
     await Promise.allSettled(waitUntilPromises);
 
@@ -3766,6 +3882,7 @@ test('worker ignores unified-check open breaker rows for unmanaged hosts', async
         cache_link_data: null,
         cache_timestamp: null,
         cache_hostname_hash: null,
+        cache_observed_at: new Date().toISOString(),
         rate_access_count: 0,
         rate_last_window_time: Math.floor(Date.now() / 1000),
         rate_block_until: null,
@@ -3869,6 +3986,7 @@ test('unified breaker lookup uses actual Google-family host authority', async ()
             ? 'https://drive.google.com/uc?id=unified-test&export=download'
             : 'https://www.googleapis.com/drive/v3/files/unified-test?alt=media',
           header: {},
+          size: 9,
         },
       });
     }
@@ -3881,6 +3999,7 @@ test('unified breaker lookup uses actual Google-family host authority', async ()
         cache_link_data: null,
         cache_timestamp: null,
         cache_hostname_hash: null,
+        cache_observed_at: new Date().toISOString(),
         rate_access_count: 0,
         rate_last_window_time: Math.floor(Date.now() / 1000),
         rate_block_until: null,
@@ -3893,6 +4012,10 @@ test('unified breaker lookup uses actual Google-family host authority', async ()
         active_last_access_time: null,
         active_total_access_count: null,
       }]);
+    }
+
+    if (/^https:\/\/postgrest\.example\.test\/THROTTLE_PROTECTION\?HOSTNAME_HASH=eq\./.test(url)) {
+      return createJsonResponse([]);
     }
 
     if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
@@ -3943,7 +4066,10 @@ test('unified breaker lookup uses actual Google-family host authority', async ()
       originFetches += 1;
       return new Response('unexpected', {
         status: 200,
-        headers: { 'content-type': 'application/octet-stream' },
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '9',
+        },
       });
     }
 
@@ -3969,7 +4095,7 @@ test('unified breaker lookup uses actual Google-family host authority', async ()
       status: 503,
       reason: 'upstream_rate_limited',
       upstreamStatus: 429,
-      retryAfter: '8',
+      retryAfter: '30',
     });
 
     const secondResponse = await worker.fetch(await buildSignedWorkerRequest('/downloads/unified-google-api.bin', {
@@ -3992,12 +4118,9 @@ test('unified breaker lookup uses actual Google-family host authority', async ()
 
     assert.deepEqual(
       unifiedBodies.map((body) => body.p_throttle_hostname_hash),
-      [driveHostHash, googleApiHostHash],
+      [null, null],
     );
-    assert.notDeepEqual(
-      unifiedBodies.map((body) => body.p_throttle_hostname_hash),
-      [googleAuthorityHash, googleAuthorityHash],
-    );
+    assert.notDeepEqual(unifiedBodies.map((body) => body.p_throttle_hostname_hash), [googleAuthorityHash, googleAuthorityHash]);
     assert.deepEqual(
       authorizeBodies.map((body) => body.p_hostname),
       ['drive.google.com', 'www.googleapis.com'],
@@ -4055,9 +4178,18 @@ test('cache-hit unified breaker lookup uses cached actual Google API host hash',
         cache_link_data: JSON.stringify({
           url: 'https://www.googleapis.com/drive/v3/files/cache-hit?alt=media',
           header: {},
+          size: 13,
+          download: {
+            provider: 'test',
+            ticket: 'test-ticket-cache-hit-google-api-abcdefghijklmnopqrstuvwxyz',
+            expires_at: Math.floor(Date.now() / 1000) + 300,
+            report_success: false,
+          },
         }),
         cache_timestamp: Math.floor(Date.now() / 1000),
         cache_hostname_hash: googleApiHostHash,
+        cache_version: '11111111-1111-4111-8111-000000000005',
+        cache_observed_at: new Date().toISOString(),
         rate_access_count: 0,
         rate_last_window_time: Math.floor(Date.now() / 1000),
         rate_block_until: null,
@@ -4157,6 +4289,7 @@ test('queue_breaker ignores unified-check breaker rows and still reaches atomic 
         cache_link_data: null,
         cache_timestamp: null,
         cache_hostname_hash: null,
+        cache_observed_at: new Date().toISOString(),
         rate_access_count: 0,
         rate_last_window_time: Math.floor(Date.now() / 1000),
         rate_block_until: null,
@@ -4276,9 +4409,17 @@ test('queue_breaker cache-hit unified flow ignores breaker rows and still reache
         cache_link_data: JSON.stringify({
           url: 'https://tenant.sharepoint.com/file',
           header: {},
+          download: {
+            provider: 'test',
+            ticket: 'test-ticket-unified-cache-hit-abcdefghijklmnopqrstuvwxyz',
+            expires_at: Math.floor(Date.now() / 1000) + 300,
+            report_success: false,
+          },
         }),
         cache_timestamp: Math.floor(Date.now() / 1000),
         cache_hostname_hash: 'cached-host-hash',
+        cache_version: '11111111-1111-4111-8111-000000000006',
+        cache_observed_at: new Date().toISOString(),
         rate_access_count: 0,
         rate_last_window_time: Math.floor(Date.now() / 1000),
         rate_block_until: null,
@@ -4361,6 +4502,10 @@ test('queue_breaker cache-hit unified flow ignores breaker rows and still reache
 
     assert.equal(response.status, 200);
     assert.equal(unifiedBodies.length, 1);
+    assert.equal(
+      cacheRpc.calls.filter(({ url }) => /download_(?:get_cache_state|acquire_cache_refresh|finish_cache_refresh)$/.test(url)).length,
+      0,
+    );
     assert.equal(unifiedBodies[0].p_throttle_hostname_hash, null);
     assert.equal(alistLinkCalls, 0);
     assert.equal(acquireCalls, 1);
@@ -4467,7 +4612,7 @@ test('queue_breaker HALF_OPEN_FULL returns throttle-protected response and never
     await assertJsonError(response, {
       status: 503,
       reason: 'breaker_open',
-      retryAfter: '9',
+      retryAfter: '30',
     });
     assert.equal(response.headers.get('X-Throttle-Protected'), 'true');
     assert.equal(authorizeCalls, 0);
@@ -4656,6 +4801,7 @@ test('queue_breaker reacquires and reports actual Google-family host attempts ac
         code: 200,
         data: {
           url: 'https://drive.google.com/uc?id=grouped-redirect&export=download',
+          size: 2,
           header: {},
         },
       });
@@ -4708,7 +4854,10 @@ test('queue_breaker reacquires and reports actual Google-family host attempts ac
     if (url === 'https://www.googleapis.com/drive/v3/files/grouped-redirect?alt=media') {
       return new Response('ok', {
         status: 200,
-        headers: { 'content-type': 'application/octet-stream' },
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '2',
+        },
       });
     }
 
@@ -4822,6 +4971,7 @@ test('queue_breaker reports actual Google redirect before redirected reacquire t
         code: 200,
         data: {
           url: 'https://drive.google.com/uc?id=grouped-redirect-throttled&export=download',
+          size: 2,
           header: {},
         },
       });
@@ -5011,6 +5161,7 @@ test('queue_breaker dual mode reports actual Google redirect before fairqueue re
         code: 200,
         data: {
           url: 'https://drive.google.com/uc?id=grouped-dual-redirect-throttled&export=download',
+          size: 2,
           header: {},
         },
       });
@@ -5233,6 +5384,7 @@ test('queue_breaker dual mode reports actual Google redirect when CQ expires bef
         code: 200,
         data: {
           url: 'https://drive.google.com/uc?id=grouped-dual-cq-expired&export=download',
+          size: 2,
           header: {},
         },
       });
@@ -5351,7 +5503,7 @@ test('queue_breaker dual mode reports actual Google redirect when CQ expires bef
 
     await Promise.all(waitUntilPromises);
 
-    await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
+    await assertJsonError(response, { status: 401, reason: 'ticket_state_expired', retryAfter: '30' });
     assert.equal(fairQueueAcquireBodies.length, 2);
     assert.equal(concurrencyAcquireBodies.length, 2);
     assert.equal(fairQueueAcquireBodies[0].breakerEnabled, true);
@@ -5461,6 +5613,7 @@ test('queue_breaker dual mode reports actual Google redirect when CQ wait later 
         code: 200,
         data: {
           url: 'https://drive.google.com/uc?id=grouped-dual-cq-wait-expired&export=download',
+          size: 2,
           header: {},
         },
       });
@@ -5596,7 +5749,7 @@ test('queue_breaker dual mode reports actual Google redirect when CQ wait later 
 
     await Promise.all(waitUntilPromises);
 
-    await assertJsonError(response, { status: 401, reason: 'ticket_state_expired' });
+    await assertJsonError(response, { status: 401, reason: 'ticket_state_expired', retryAfter: '30' });
     assert.equal(fairQueueAcquireBodies.length, 2);
     assert.equal(concurrencyAcquireBodies.length, 2);
     assert.equal(concurrencyWaitBodies.length, 1);
@@ -5671,6 +5824,8 @@ for (const terminalCase of [
     const acquireBodies = [];
     const releaseBodies = [];
     const reportBodies = [];
+    const accountReports = [];
+    reportObserver = (body) => accountReports.push(body);
     delete globalThis.bootstrapCache;
 
     globalThis.fetch = async (input, init = {}) => {
@@ -5699,6 +5854,7 @@ for (const terminalCase of [
           code: 200,
           data: {
             url: `https://drive.google.com/uc?id=grouped-redirect-${terminalCase.name}&export=download`,
+            size: 2,
             header: {},
           },
         });
@@ -5780,7 +5936,7 @@ for (const terminalCase of [
           : terminalCase.name === 'conflict'
             ? 'fq_conflict'
             : 'fq_overloaded',
-        retryAfter: terminalCase.name === 'overload' ? '17' : '60',
+        retryAfter: terminalCase.name === 'overload' ? '30' : '60',
       });
       assert.equal(acquireBodies.length, 2);
       assert.equal(acquireBodies[0].breakerEnabled, true);
@@ -5806,7 +5962,12 @@ for (const terminalCase of [
         }],
       );
       assert.notEqual(reportBodies[0].p_hostname_hash, googleAuthorityHash);
+      assert.equal(accountReports.length, 1);
+      assert.equal(accountReports[0].feedback.ticket, 'test-ticket-abcdefghijklmnopqrstuvwxyz');
+      assert.equal(accountReports[0].feedback.outcome, 'abandoned');
+      assert.equal(accountReports[0].feedback.status_code, 0);
     } finally {
+      reportObserver = null;
       globalThis.fetch = originalFetch;
       delete globalThis.bootstrapCache;
     }
@@ -6041,6 +6202,7 @@ test('queue_breaker defers same-host same-site redirect reporting until the term
       status: 503,
       reason: 'upstream_unavailable',
       upstreamStatus: 500,
+      retryAfter: '30',
     });
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
@@ -6163,6 +6325,7 @@ test('queue_breaker terminal report failure disarms deferred same-site redirect 
     await assertJsonError(response, {
       status: 503,
       reason: 'breaker_sample_report_failed',
+      retryAfter: '30',
     });
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
@@ -6290,6 +6453,7 @@ test('queue_breaker flushes a deferred same-site redirect as 302 when the termin
       status: 404,
       reason: 'upstream_rejected',
       upstreamStatus: 404,
+      retryAfter: '30',
     });
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
@@ -6311,6 +6475,204 @@ test('queue_breaker flushes a deferred same-site redirect as 302 when the termin
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
+  }
+});
+
+test('deferred same-site 302 retires the fetched 404 body before client or deadline sample abort', async () => {
+  const scenarios = [
+    { name: 'client', cause: 'client_aborted', outcome: 'abandoned', reportReason: 'download_abandoned' },
+    { name: 'deadline', cause: 'recovery_deadline_exhausted', outcome: 'failure', reportReason: 'recovery_deadline_exhausted' },
+  ];
+
+  for (const scenario of scenarios) {
+    const originalFetch = globalThis.fetch;
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const performanceDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
+    const clientController = new AbortController();
+    const waitUntilPromises = [];
+    const accountReports = [];
+    const sampleBodies = [];
+    const releaseBodies = [];
+    const originBody = createTrackedTextBody(`missing-${scenario.name}`);
+    let sampleStarted;
+    const sampleStartedPromise = new Promise((resolve) => { sampleStarted = resolve; });
+    let sampleCalls = 0;
+    let ownerTimerHandle = null;
+    let ownerTimerCallback = null;
+    let monotonicNow = 0;
+    reportObserver = (body) => accountReports.push(body);
+
+    if (scenario.name === 'deadline') {
+      Object.defineProperty(globalThis, 'performance', {
+        configurable: true,
+        value: { now: () => monotonicNow },
+      });
+      globalThis.setTimeout = (callback, delay, ...args) => {
+        if (!ownerTimerHandle && Number(delay) >= 149_000 && Number(delay) <= 151_000) {
+          ownerTimerHandle = { ownerTimer: true, cleared: false };
+          ownerTimerCallback = () => {
+            if (!ownerTimerHandle.cleared) {
+              callback(...args);
+            }
+          };
+          return ownerTimerHandle;
+        }
+        return originalSetTimeout(callback, delay, ...args);
+      };
+      globalThis.clearTimeout = (handle) => {
+        if (handle?.ownerTimer) {
+          handle.cleared = true;
+          return;
+        }
+        return originalClearTimeout(handle);
+      };
+    }
+    delete globalThis.bootstrapCache;
+
+    globalThis.fetch = async (input, init = {}) => {
+      const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+      if (url === 'https://controller.example.test/api/v0/bootstrap') {
+        return createJsonResponse(buildRuntimeBootstrap({
+          hostPatterns: ['*.sharepoint.com'],
+          fairQueueHostPatterns: ['*.sharepoint.com'],
+        }));
+      }
+
+      if (url === 'https://alist.example.com/api/fs/link') {
+        const body = JSON.parse(init.body);
+        if (body.action === 'report') {
+          return createJsonResponse({ code: 200, data: { applied: true, duplicate: false, stale: false } });
+        }
+        return createJsonResponse({
+          code: 200,
+          data: { url: 'https://tenant.sharepoint.com/sites/alpha/deferred-404-start', header: {} },
+        });
+      }
+
+      if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+        return createFairQueueWaitResponseFromInit(init, {
+          result: 'granted',
+          queryToken: `query-deferred-404-${scenario.name}`,
+          invocationEpoch: 1,
+          slotToken: `slot-deferred-404-${scenario.name}`,
+          meta: { attemptVersion: 721, attemptTicket: 24 },
+        });
+      }
+
+      if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+        releaseBodies.push(JSON.parse(init.body));
+        return createJsonResponse({ result: 'ok' });
+      }
+
+      if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+        sampleCalls += 1;
+        sampleBodies.push(JSON.parse(init.body));
+        if (sampleCalls === 1) {
+          sampleStarted();
+          return await new Promise((_, reject) => {
+            const abort = () => reject(init.signal?.reason || new DOMException('sample canceled', 'AbortError'));
+            if (init.signal?.aborted) {
+              abort();
+            } else {
+              init.signal?.addEventListener?.('abort', abort, { once: true });
+            }
+          });
+        }
+        return createJsonResponse([{
+          STATE: 'closed',
+          OPEN_UNTIL: null,
+          OPEN_REASON: null,
+          VERSION: 2,
+          LAST_ERROR_CODE: null,
+        }]);
+      }
+
+      if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+        return createJsonResponse([{
+          STATE: 'closed',
+          OPEN_UNTIL: null,
+          OPEN_REASON: null,
+          VERSION: 3,
+          LAST_ERROR_CODE: null,
+        }]);
+      }
+
+      if (url === 'https://tenant.sharepoint.com/sites/alpha/deferred-404-start') {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: 'https://tenant.sharepoint.com/sites/alpha/deferred-404-final' },
+        });
+      }
+
+      if (url === 'https://tenant.sharepoint.com/sites/alpha/deferred-404-final') {
+        return new Response(originBody.stream, {
+          status: 404,
+          headers: {
+            'content-type': 'text/plain',
+            'x-preserve-status': 'yes',
+          },
+        });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url}`);
+    };
+
+    try {
+      const baseRequest = await buildSignedWorkerRequest(`/downloads/deferred-404-${scenario.name}.bin`);
+      const request = scenario.name === 'client'
+        ? new Request(baseRequest, { signal: clientController.signal })
+        : baseRequest;
+      const responsePromise = worker.fetch(request, {
+        CONTROLLER_URL: 'https://controller.example.test',
+        CONTROLLER_API_TOKEN: 'controller-token',
+        ENV: 'test',
+        ROLE: 'download',
+        INSTANCE_ID: 'worker-1',
+        BOOTSTRAP_CACHE_MODE: 'direct',
+      }, {
+        waitUntil(promise) {
+          waitUntilPromises.push(promise);
+        },
+      });
+
+      await sampleStartedPromise;
+      if (scenario.name === 'client') {
+        clientController.abort(new DOMException('client canceled deferred 404 sample', 'AbortError'));
+      } else {
+        assert.equal(typeof ownerTimerCallback, 'function');
+        monotonicNow = 160_000;
+        ownerTimerCallback();
+      }
+      const response = await responsePromise;
+      await Promise.allSettled(waitUntilPromises);
+
+      await assertJsonError(response, {
+        status: scenario.name === 'client' ? 499 : 503,
+        reason: scenario.cause,
+        retryAfter: '30',
+      });
+      assert.equal(originBody.cancelled, true, scenario.name);
+      assert.equal(sampleBodies.length, 1, scenario.name);
+      assert.equal(sampleBodies[0].p_status_code, 302, scenario.name);
+      assert.equal(sampleBodies[0].p_attempt_version, 721, scenario.name);
+      assert.equal(sampleBodies[0].p_attempt_ticket, 24, scenario.name);
+      assert.equal(releaseBodies.length, 1, scenario.name);
+      assert.equal(accountReports.length, 1, scenario.name);
+      assert.equal(accountReports[0].feedback.outcome, scenario.outcome, scenario.name);
+      assert.equal(accountReports[0].feedback.status_code, 0, scenario.name);
+      assert.equal(accountReports[0].feedback.reason, scenario.reportReason, scenario.name);
+    } finally {
+      reportObserver = null;
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+      if (performanceDescriptor) {
+        Object.defineProperty(globalThis, 'performance', performanceDescriptor);
+      }
+      globalThis.fetch = originalFetch;
+      delete globalThis.bootstrapCache;
+    }
   }
 });
 
@@ -6409,7 +6771,7 @@ test('queue_breaker flushes deferred same-site redirect before propagating throw
 
     await Promise.allSettled(waitUntilPromises);
 
-    await assertJsonError(response, { status: 500, reason: 'internal_error' });
+    await assertJsonError(response, { status: 503, reason: 'upstream_transport_error', retryAfter: '30' });
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
     assert.deepEqual(authorizeBodies, []);
@@ -6418,6 +6780,835 @@ test('queue_breaker flushes deferred same-site redirect before propagating throw
     assert.equal(reportBodies[0].p_attempt_version, 701);
     assert.equal(reportBodies[0].p_attempt_ticket, 8);
   } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_breaker deferred same-site client abort flushes with the terminal cleanup signal', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const reportBodies = [];
+  const sampleBodies = [];
+  const reportSignals = [];
+  const releaseBodies = [];
+  const clientController = new AbortController();
+  reportObserver = (body, signal) => {
+    reportBodies.push(body);
+    reportSignals.push(signal);
+  };
+  let finalFetchStarted;
+  const finalFetchStartedPromise = new Promise((resolve) => { finalFetchStarted = resolve; });
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: ['*.sharepoint.com'],
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      const body = JSON.parse(init.body);
+      if (body.action === 'report') {
+        reportBodies.push(body);
+        reportSignals.push(init.signal);
+        return createJsonResponse({ code: 200, data: { applied: true, duplicate: false, stale: false } });
+      }
+      return createJsonResponse({
+        code: 200,
+        data: { url: 'https://tenant.sharepoint.com/sites/alpha/start', header: {} },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      return createFairQueueWaitResponseFromInit(init, {
+        result: 'granted',
+        queryToken: 'query-client-abort',
+        invocationEpoch: 1,
+        slotToken: 'slot-client-abort',
+        meta: { attemptVersion: 711, attemptTicket: 12 },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      sampleBodies.push(JSON.parse(init.body));
+      if (init.signal?.aborted) {
+        throw init.signal.reason || new DOMException('sample signal aborted', 'AbortError');
+      }
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 1,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/alpha/start') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://tenant.sharepoint.com/sites/alpha/final' },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/alpha/final') {
+      finalFetchStarted();
+      return await new Promise((_, reject) => {
+        const abort = () => reject(init.signal?.reason || new DOMException('origin canceled', 'AbortError'));
+        if (init.signal?.aborted) {
+          abort();
+        } else {
+          init.signal?.addEventListener?.('abort', abort, { once: true });
+        }
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest('/downloads/queue-breaker-deferred-client-abort.bin');
+    const request = new Request(baseRequest, { signal: clientController.signal });
+    const responsePromise = worker.fetch(request, {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await finalFetchStartedPromise;
+    clientController.abort(new DOMException('client canceled final hop', 'AbortError'));
+    const response = await responsePromise;
+    await Promise.allSettled(waitUntilPromises);
+
+    await assertJsonError(response, { status: 499, reason: 'client_aborted', retryAfter: '30' });
+    assert.equal(sampleBodies.length, 1);
+    assert.equal(sampleBodies[0].p_status_code, 302);
+    assert.equal(sampleBodies[0].p_attempt_version, 711);
+    assert.equal(sampleBodies[0].p_attempt_ticket, 12);
+    assert.equal(reportSignals[0]?.aborted, false);
+    assert.equal(releaseBodies.length, 1);
+    assert.equal(reportBodies.length, 1);
+    assert.equal(reportBodies[0].feedback.outcome, 'abandoned');
+    assert.equal(reportBodies[0].feedback.status_code, 0);
+  } finally {
+    reportObserver = null;
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker sample fetch abort keeps the protected response context for client cleanup', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const clientController = new AbortController();
+  const originBody = createTrackedTextBody('protected');
+  const reportBodies = [];
+  const settleBodies = [];
+  reportObserver = (body) => reportBodies.push(body);
+  let sampleSignal = null;
+  let sampleStarted;
+  const sampleStartedPromise = new Promise((resolve) => { sampleStarted = resolve; });
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ hostPatterns: ['*.sharepoint.com'] }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      const body = JSON.parse(init.body);
+      if (body.action === 'report') {
+        reportBodies.push(body);
+        return createJsonResponse({ code: 200, data: { applied: true, duplicate: false, stale: false } });
+      }
+      return createJsonResponse({
+        code: 200,
+        data: { url: 'https://tenant.sharepoint.com/sites/alpha/protected', header: {} },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/THROTTLE_PROTECTION?HOSTNAME_HASH=eq.'
+      || url.startsWith('https://postgrest.example.test/THROTTLE_PROTECTION?HOSTNAME_HASH=eq.')) {
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 20,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 21,
+        LAST_ERROR_CODE: null,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 17,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      sampleSignal = init.signal;
+      sampleStarted();
+      return await new Promise((_, reject) => {
+        const abort = () => reject(init.signal?.reason || new DOMException('sample canceled', 'AbortError'));
+        if (init.signal?.aborted) {
+          abort();
+        } else {
+          init.signal?.addEventListener?.('abort', abort, { once: true });
+        }
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      settleBodies.push(JSON.parse(init.body));
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 22,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/alpha/protected') {
+      return new Response(originBody.stream, {
+        status: 500,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest('/downloads/sample-fetch-client-abort.bin');
+    const request = new Request(baseRequest, { signal: clientController.signal });
+    const responsePromise = worker.fetch(request, {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await sampleStartedPromise;
+    clientController.abort(new DOMException('client canceled sample fetch', 'AbortError'));
+    const response = await responsePromise;
+    await Promise.allSettled(waitUntilPromises);
+
+    await assertJsonError(response, { status: 499, reason: 'client_aborted', retryAfter: '30' });
+    assert.equal(originBody.cancelled, true);
+    assert.equal(sampleSignal?.aborted, true);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_hostname, 'tenant.sharepoint.com');
+    assert.equal(settleBodies[0].p_attempt_version, 21);
+    assert.equal(settleBodies[0].p_attempt_ticket, 17);
+    assert.equal(reportBodies.length, 1);
+    assert.equal(reportBodies[0].feedback.outcome, 'abandoned');
+    assert.equal(reportBodies[0].feedback.status_code, 0);
+  } finally {
+    reportObserver = null;
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('breaker sample body abort settles the protected attempt after execution expiry', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const performanceDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
+  const waitUntilPromises = [];
+  const clientController = new AbortController();
+  const originBody = createTrackedTextBody('protected');
+  const reportBodies = [];
+  const sampleBodies = [];
+  const settleBodies = [];
+  let monotonicNow = 0;
+  let ownerTimerHandle = null;
+  let ownerTimerCallback = null;
+  let ownerTimerStarted;
+  const ownerTimerStartedPromise = new Promise((resolve) => { ownerTimerStarted = resolve; });
+  let originStarted;
+  const originStartedPromise = new Promise((resolve) => { originStarted = resolve; });
+  let sampleSignal = null;
+  let sampleStarted;
+  const sampleStartedPromise = new Promise((resolve) => { sampleStarted = resolve; });
+  let sampleBodyCancelled = false;
+  let settleSignalAtStart = null;
+  reportObserver = (body) => reportBodies.push(body);
+  Object.defineProperty(globalThis, 'performance', {
+    configurable: true,
+    value: { now: () => monotonicNow },
+  });
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (!ownerTimerHandle && Number(delay) >= 100_000) {
+      ownerTimerHandle = { ownerTimer: true, cleared: false };
+      ownerTimerCallback = () => {
+        if (!ownerTimerHandle.cleared) {
+          callback(...args);
+        }
+      };
+      ownerTimerStarted();
+      return ownerTimerHandle;
+    }
+    return originalSetTimeout(callback, delay, ...args);
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (handle?.ownerTimer) {
+      handle.cleared = true;
+      return;
+    }
+    return originalClearTimeout(handle);
+  };
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({ hostPatterns: ['*.sharepoint.com'] }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      const body = JSON.parse(init.body);
+      if (body.action === 'report') {
+        return createJsonResponse({ code: 200, data: { applied: true, duplicate: false, stale: false } });
+      }
+      return createJsonResponse({
+        code: 200,
+        data: { url: 'https://tenant.sharepoint.com/protected-expiry', header: {} },
+      });
+    }
+
+    if (url.startsWith('https://postgrest.example.test/THROTTLE_PROTECTION?HOSTNAME_HASH=eq.')) {
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 40,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 41,
+        LAST_ERROR_CODE: null,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 23,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      sampleBodies.push(JSON.parse(init.body));
+      sampleSignal = init.signal;
+      sampleStarted();
+      return new Response(new ReadableStream({
+        start(controller) {
+          const abort = () => {
+            sampleBodyCancelled = true;
+            controller.error(init.signal?.reason || new DOMException('sample body expired', 'AbortError'));
+          };
+          init.signal?.addEventListener?.('abort', abort, { once: true });
+          if (init.signal?.aborted) {
+            abort();
+          }
+        },
+        cancel() {
+          sampleBodyCancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      settleBodies.push(JSON.parse(init.body));
+      settleSignalAtStart = init.signal?.aborted;
+      if (init.signal?.aborted) {
+        throw init.signal.reason || new DOMException('settlement signal expired', 'AbortError');
+      }
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 42,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://tenant.sharepoint.com/protected-expiry') {
+      originStarted();
+      return new Response(originBody.stream, {
+        status: 500,
+        headers: { 'content-type': 'text/plain' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const responsePromise = worker.fetch(await buildSignedWorkerRequest('/downloads/sample-body-deadline.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await Promise.all([ownerTimerStartedPromise, originStartedPromise]);
+    assert.equal(typeof ownerTimerCallback, 'function');
+    monotonicNow = 160_000;
+    ownerTimerCallback();
+    await sampleStartedPromise;
+    const response = await responsePromise;
+    await Promise.allSettled(waitUntilPromises);
+
+    await assertJsonError(response, { status: 503, reason: 'recovery_deadline_exhausted', retryAfter: '30' });
+    assert.equal(originBody.cancelled, true);
+    assert.equal(sampleBodyCancelled, true);
+    assert.equal(sampleSignal?.aborted, true);
+    assert.equal(sampleBodies.length, 1);
+    assert.equal(sampleBodies[0].p_hostname, 'tenant.sharepoint.com');
+    assert.equal(sampleBodies[0].p_attempt_version, 41);
+    assert.equal(sampleBodies[0].p_attempt_ticket, 23);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_hostname, 'tenant.sharepoint.com');
+    assert.equal(settleBodies[0].p_attempt_version, 41);
+    assert.equal(settleBodies[0].p_attempt_ticket, 23);
+    assert.equal(settleSignalAtStart, false);
+    assert.equal(reportBodies.length, 1);
+    assert.equal(reportBodies[0].feedback.outcome, 'failure');
+    assert.equal(reportBodies[0].feedback.status_code, 0);
+    assert.equal(reportBodies[0].feedback.reason, 'recovery_deadline_exhausted');
+  } finally {
+    reportObserver = null;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    if (performanceDescriptor) {
+      Object.defineProperty(globalThis, 'performance', performanceDescriptor);
+    }
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('Google post-validation sample abort settles the changed-host attempt and cancels its body', async () => {
+  const originalFetch = globalThis.fetch;
+  const waitUntilPromises = [];
+  const clientController = new AbortController();
+  const originBody = createTrackedTextBody('hello');
+  const reportBodies = [];
+  const sampleBodies = [];
+  const settleBodies = [];
+  let sampleStarted;
+  const sampleStartedPromise = new Promise((resolve) => { sampleStarted = resolve; });
+  let sampleSignal = null;
+  let settleSignal = null;
+  let settleSignalAtStart = null;
+  let sampleBodyCancelled = false;
+  reportObserver = (body) => reportBodies.push(body);
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: ['*.googleapis.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      const body = JSON.parse(init.body);
+      if (body.action === 'report') {
+        reportBodies.push(body);
+        return createJsonResponse({ code: 200, data: { applied: true, duplicate: false, stale: false } });
+      }
+      return createJsonResponse({
+        code: 200,
+        data: {
+          url: 'https://unmanaged.example.com/initial',
+          header: {},
+          size: 5,
+          download: {
+            provider: 'GoogleDrive',
+            ticket: 'google-post-validation-ticket-abcdefghijklmnopqrstuvwxyz',
+            expires_at: Math.floor(Date.now() / 1000) + 300,
+            report_success: true,
+          },
+        },
+      });
+    }
+
+    if (url.startsWith('https://postgrest.example.test/THROTTLE_PROTECTION?HOSTNAME_HASH=eq.')) {
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 30,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_authorize_breaker_attempt') {
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 31,
+        LAST_ERROR_CODE: null,
+        ATTEMPT_GRANTED: true,
+        ATTEMPT_TICKET: 19,
+      }]);
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      sampleBodies.push(JSON.parse(init.body));
+      sampleSignal = init.signal;
+      sampleStarted();
+      return new Response(new ReadableStream({
+        start(controller) {
+          const abort = () => {
+            sampleBodyCancelled = true;
+            controller.error(init.signal?.reason || clientController.signal.reason || new DOMException('sample canceled', 'AbortError'));
+          };
+          init.signal?.addEventListener?.('abort', abort, { once: true });
+          if (init.signal?.aborted) {
+            abort();
+          }
+        },
+        cancel() {
+          sampleBodyCancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      settleBodies.push(JSON.parse(init.body));
+      settleSignal = init.signal;
+      settleSignalAtStart = init.signal?.aborted;
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 32,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://unmanaged.example.com/initial') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://www.googleapis.com/drive/v3/files/final?alt=media' },
+      });
+    }
+
+    if (url === 'https://www.googleapis.com/drive/v3/files/final?alt=media') {
+      return new Response(originBody.stream, {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '5',
+          'content-range': 'bytes 0-4/5',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const baseRequest = await buildSignedWorkerRequest('/downloads/google-post-validation-sample-abort.bin', { payloadFileSize: 5 });
+    const request = new Request(baseRequest, { signal: clientController.signal });
+    const responsePromise = worker.fetch(request, {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await sampleStartedPromise;
+    clientController.abort(new DOMException('client canceled Google sample', 'AbortError'));
+    const response = await responsePromise;
+    await Promise.allSettled(waitUntilPromises);
+
+    await assertJsonError(response, { status: 499, reason: 'client_aborted', retryAfter: '30' });
+    assert.equal(originBody.cancelled, true);
+    assert.equal(sampleBodyCancelled, true);
+    assert.equal(sampleSignal?.aborted, true);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_hostname, 'www.googleapis.com');
+    assert.equal(settleBodies[0].p_attempt_version, 31);
+    assert.equal(settleBodies[0].p_attempt_ticket, 19);
+    assert.equal(settleSignalAtStart, false);
+    assert.notEqual(settleSignal, sampleSignal);
+    assert.equal(sampleBodies.length, 1);
+    assert.equal(sampleBodies[0].p_hostname, 'www.googleapis.com');
+    assert.equal(reportBodies.length, 1);
+    assert.equal(reportBodies[0].feedback.outcome, 'abandoned');
+    assert.equal(reportBodies[0].feedback.status_code, 0);
+  } finally {
+    reportObserver = null;
+    globalThis.fetch = originalFetch;
+    delete globalThis.bootstrapCache;
+  }
+});
+
+test('queue_breaker deferred same-site execution expiry contains a timed-out terminal flush', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const performanceDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
+  const waitUntilPromises = [];
+  const reportBodies = [];
+  const sampleBodies = [];
+  const settleBodies = [];
+  const releaseBodies = [];
+  let monotonicNow = 0;
+  let ownerTimerHandle = null;
+  let ownerTimerCallback = null;
+  let terminalCleanupTimerHandle = null;
+  let terminalCleanupTimerCallback = null;
+  let finalOriginSignal = null;
+  let finalFetchStarted;
+  const finalFetchStartedPromise = new Promise((resolve) => { finalFetchStarted = resolve; });
+  let sampleSignal = null;
+  let settleSignal = null;
+  let sampleStarted;
+  const sampleStartedPromise = new Promise((resolve) => { sampleStarted = resolve; });
+  let sampleBodyCancelled = false;
+  reportObserver = (body) => reportBodies.push(body);
+  Object.defineProperty(globalThis, 'performance', {
+    configurable: true,
+    value: { now: () => monotonicNow },
+  });
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    const numericDelay = Number(delay);
+    if (!ownerTimerHandle && numericDelay >= 100_000) {
+      ownerTimerHandle = { ownerTimer: true, cleared: false };
+      ownerTimerCallback = () => {
+        if (!ownerTimerHandle.cleared) {
+          callback(...args);
+        }
+      };
+      return ownerTimerHandle;
+    }
+    if (!terminalCleanupTimerHandle && numericDelay >= 1_990 && numericDelay <= 2_010) {
+      terminalCleanupTimerHandle = { terminalCleanupTimer: true, cleared: false };
+      terminalCleanupTimerCallback = () => {
+        if (!terminalCleanupTimerHandle.cleared) {
+          callback(...args);
+        }
+      };
+      return terminalCleanupTimerHandle;
+    }
+    return originalSetTimeout(callback, delay, ...args);
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (handle?.ownerTimer || handle?.terminalCleanupTimer) {
+      handle.cleared = true;
+      return;
+    }
+    return originalClearTimeout(handle);
+  };
+  delete globalThis.bootstrapCache;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = normalizeFairQueueTestUrl(typeof input === 'string' ? input : input.url);
+
+    if (url === 'https://controller.example.test/api/v0/bootstrap') {
+      return createJsonResponse(buildRuntimeBootstrap({
+        hostPatterns: ['*.sharepoint.com'],
+        fairQueueHostPatterns: ['*.sharepoint.com'],
+      }));
+    }
+
+    if (url === 'https://alist.example.com/api/fs/link') {
+      const body = JSON.parse(init.body);
+      if (body.action === 'report') {
+        reportBodies.push(body);
+        return createJsonResponse({ code: 200, data: { applied: true, duplicate: false, stale: false } });
+      }
+      return createJsonResponse({
+        code: 200,
+        data: { url: 'https://tenant.sharepoint.com/sites/alpha/start', header: {} },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/wait') {
+      return createFairQueueWaitResponseFromInit(init, {
+        result: 'granted',
+        queryToken: 'query-deadline-expiry',
+        invocationEpoch: 1,
+        slotToken: 'slot-deadline-expiry',
+        meta: { attemptVersion: 712, attemptTicket: 13 },
+      });
+    }
+
+    if (url === 'https://slot-handler.example.test/api/v1/fairqueue/release') {
+      releaseBodies.push(JSON.parse(init.body));
+      return createJsonResponse({ result: 'ok' });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_report_breaker_sample') {
+      sampleBodies.push(JSON.parse(init.body));
+      sampleSignal = init.signal;
+      sampleStarted();
+      return new Response(new ReadableStream({
+        start(controller) {
+          const abort = () => {
+            sampleBodyCancelled = true;
+            controller.error(init.signal?.reason || new DOMException('sample cleanup expired', 'AbortError'));
+          };
+          init.signal?.addEventListener?.('abort', abort, { once: true });
+          if (init.signal?.aborted) {
+            abort();
+          }
+        },
+        cancel() {
+          sampleBodyCancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://postgrest.example.test/rpc/download_settle_breaker_attempt') {
+      settleBodies.push(JSON.parse(init.body));
+      settleSignal = init.signal;
+      if (init.signal?.aborted) {
+        throw init.signal.reason || new DOMException('settlement signal expired', 'AbortError');
+      }
+      return createJsonResponse([{
+        STATE: 'closed',
+        OPEN_UNTIL: null,
+        OPEN_REASON: null,
+        VERSION: 713,
+        LAST_ERROR_CODE: null,
+      }]);
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/alpha/start') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://tenant.sharepoint.com/sites/alpha/final' },
+      });
+    }
+
+    if (url === 'https://tenant.sharepoint.com/sites/alpha/final') {
+      finalOriginSignal = init.signal;
+      finalFetchStarted();
+      return await new Promise((_, reject) => {
+        const abort = () => reject(init.signal?.reason || new DOMException('origin deadline', 'AbortError'));
+        if (init.signal?.aborted) {
+          abort();
+        } else {
+          init.signal?.addEventListener?.('abort', abort, { once: true });
+        }
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  try {
+    const responsePromise = worker.fetch(await buildSignedWorkerRequest('/downloads/queue-breaker-deferred-deadline-expiry.bin'), {
+      CONTROLLER_URL: 'https://controller.example.test',
+      CONTROLLER_API_TOKEN: 'controller-token',
+      ENV: 'test',
+      ROLE: 'download',
+      INSTANCE_ID: 'worker-1',
+      BOOTSTRAP_CACHE_MODE: 'direct',
+    }, {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    });
+
+    await finalFetchStartedPromise;
+    assert.equal(typeof ownerTimerCallback, 'function');
+    monotonicNow = 160_000;
+    ownerTimerCallback();
+    await sampleStartedPromise;
+    assert.notEqual(sampleSignal, finalOriginSignal);
+    assert.equal(sampleSignal?.aborted, false);
+    assert.equal(typeof terminalCleanupTimerCallback, 'function');
+    terminalCleanupTimerCallback();
+
+    const response = await responsePromise;
+    await Promise.allSettled(waitUntilPromises);
+    await assertJsonError(response, { status: 503, reason: 'breaker_sample_report_failed', retryAfter: '30' });
+    assert.equal(sampleBodyCancelled, true);
+    assert.equal(sampleBodies.length, 1);
+    assert.equal(sampleBodies[0].p_hostname, 'tenant.sharepoint.com');
+    assert.equal(sampleBodies[0].p_attempt_version, 712);
+    assert.equal(sampleBodies[0].p_attempt_ticket, 13);
+    assert.equal(settleBodies.length, 1);
+    assert.equal(settleBodies[0].p_hostname, 'tenant.sharepoint.com');
+    assert.equal(settleBodies[0].p_attempt_version, 712);
+    assert.equal(settleBodies[0].p_attempt_ticket, 13);
+    assert.equal(settleSignal?.aborted, true);
+    assert.equal(releaseBodies.length, 1);
+    assert.equal(reportBodies.length, 1);
+    assert.equal(reportBodies[0].feedback.outcome, 'failure');
+    assert.equal(reportBodies[0].feedback.status_code, 0);
+    assert.equal(reportBodies[0].feedback.reason, 'recovery_deadline_exhausted');
+  } finally {
+    reportObserver = null;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    if (performanceDescriptor) {
+      Object.defineProperty(globalThis, 'performance', performanceDescriptor);
+    }
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
   }
@@ -6532,7 +7723,7 @@ test('queue_breaker flushes deferred same-site redirect before propagating refre
 
     await Promise.allSettled(waitUntilPromises);
 
-    await assertJsonError(response, { status: 500, reason: 'internal_error' });
+    await assertJsonError(response, { status: 503, reason: 'upstream_transport_error', retryAfter: '30' });
     assert.equal(linkFetchCount, 2);
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
@@ -6639,6 +7830,7 @@ test('queue_breaker returns authority unavailable when deferred flush fails but 
     await assertJsonError(response, {
       status: 503,
       reason: 'breaker_sample_report_failed',
+      retryAfter: '30',
     });
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
@@ -6901,6 +8093,7 @@ test('queue_breaker flushes a deferred same-site redirect as 302 after refresh w
       status: 403,
       reason: 'upstream_forbidden',
       upstreamStatus: 403,
+      retryAfter: '30',
     });
     await Promise.all(waitUntilPromises);
 
@@ -7048,6 +8241,7 @@ test('queue_breaker reports the final protected auth-refresh status instead of f
       status: 503,
       reason: 'upstream_auth_retry_exhausted',
       upstreamStatus: 410,
+      retryAfter: '30',
     });
     await Promise.all(waitUntilPromises);
 
@@ -7179,7 +8373,7 @@ test('queue_breaker flushes a deferred same-site attempt only when refresh failu
 
     await Promise.all(waitUntilPromises);
 
-    await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable' });
+    await assertJsonError(response, { status: 503, reason: 'alist_api_unavailable', retryAfter: '30' });
     assert.equal(linkFetchCount, 2);
     assert.equal(acquireBodies.length, 1);
     assert.equal(releaseBodies.length, 1);
@@ -8586,7 +9780,7 @@ test('client abort during unmanaged redirect fair-queue bootstrap returns client
 
     assert.equal(acquireBodies.length, 1);
     assert.equal(acquireBodies[0].hostname, 'tenant.sharepoint.com');
-    await assertJsonError(response, { status: 499, reason: 'client_aborted' });
+    await assertJsonError(response, { status: 499, reason: 'client_aborted', retryAfter: '30' });
   } finally {
     globalThis.fetch = originalFetch;
     delete globalThis.bootstrapCache;
